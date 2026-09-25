@@ -1,0 +1,9 @@
+[package]
+name = "jka-probe"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+jka-protocol = { path = "../jka-protocol" }
+jka-assets = { path = "../jka-assets" }

@@ -1,0 +1,298 @@
+{
+  "repository": "https://github.com/JACoders/OpenJK",
+  "revision": "1a6a643427aa347553e9073dac5570b33337c4d9",
+  "files": [
+    {
+      "path": "LICENSE.txt",
+      "sha256": "db296f2f7f35bca3a174efb0eb392b3b17bd94b341851429a3dff411b1c2fc73"
+    },
+    {
+      "path": "codemp/cgame/animtable.h",
+      "sha256": "fb56f5cafd39fe5fb89c8b38964c69f86fcac36d9c61f53c465fdf663d666514"
+    },
+    {
+      "path": "codemp/cgame/cg_local.h",
+      "sha256": "5e04e6969c6f918d6af67606c4fc6647b5acf0d0baa001b24367047b8e10bfe1"
+    },
+    {
+      "path": "codemp/cgame/cg_public.h",
+      "sha256": "10f0807fc41872f2d570855100f41c952245d06a20976450ae52534c6aae4806"
+    },
+    {
+      "path": "codemp/cgame/cg_xcvar.h",
+      "sha256": "a65ba15455f717d4963bc305eb08f2500109d1ad08d87b2ce6592211af7b0499"
+    },
+    {
+      "path": "codemp/game/ai.h",
+      "sha256": "335eecb81c83f77a8fc39a1dd39fe5a2d2e997c76d9ec5342ca38361a40c7df7"
+    },
+    {
+      "path": "codemp/game/ai_main.h",
+      "sha256": "d3fac05639bfd0693da55041668689663755b0fc556863dc1bc153585be2a113"
+    },
+    {
+      "path": "codemp/game/anims.h",
+      "sha256": "ca3a57487d39f8a6f0ba1e8ad8a46ec607690b0f952300b7b5dbf570712c0ce0"
+    },
+    {
+      "path": "codemp/game/b_local.h",
+      "sha256": "0d1f2e9c8ea7ab956c6712e6330514c13abd401cb1904a5e328091afc1b8647e"
+    },
+    {
+      "path": "codemp/game/b_public.h",
+      "sha256": "c2c0dfee9c82d5f0eab3ab9d7a78b580f3bf07cd1389cfd72f63df0c4c1a9f0e"
+    },
+    {
+      "path": "codemp/game/bg_local.h",
+      "sha256": "52dcbbc476ff3ca75becac1593e34a488da4523cc3463c0909a96e09a0a27404"
+    },
+    {
+      "path": "codemp/game/bg_misc.c",
+      "sha256": "5ff31499851cfed15f73e764d38d7ac1908383ec8f9ac3fd9a51be1adfb0fbda"
+    },
+    {
+      "path": "codemp/game/bg_panimate.c",
+      "sha256": "1d57925fb78d2d4bfbc2698885bc1bb7ea60e2e63535bc600431afa8772f4a5f"
+    },
+    {
+      "path": "codemp/game/bg_pmove.c",
+      "sha256": "086958c491a6bbcdf182054ed40309b7ab238f5e544edbab5b96e7a7b2724425"
+    },
+    {
+      "path": "codemp/game/bg_public.h",
+      "sha256": "38c616f71cec5a87b74dba4e2d22576fb16337949ab05b8b3ee83496206d8593"
+    },
+    {
+      "path": "codemp/game/bg_saber.c",
+      "sha256": "d11b86664baa672bf44b8fb9fc88b688630768ebe654e4a7e85de13e31a58d67"
+    },
+    {
+      "path": "codemp/game/bg_saga.h",
+      "sha256": "ba03584cc2f2eb8d324cb2ebc4ea41a53ef4602980cac746929a7823a0fd9b4e"
+    },
+    {
+      "path": "codemp/game/bg_slidemove.c",
+      "sha256": "6662f47bb3b96bbe036af2c2fa099aca0f86f48c3fcf7934818d9d2fb88d9b1f"
+    },
+    {
+      "path": "codemp/game/bg_vehicles.h",
+      "sha256": "e5fe7b2f34163c3090318e902bd63038355cd151a30ca474f5f28c9cfb66c9b1"
+    },
+    {
+      "path": "codemp/game/bg_weapons.c",
+      "sha256": "b3ef50a3f73595b404044254bc556c5397da9a66685261b96c19be1d13282ee8"
+    },
+    {
+      "path": "codemp/game/bg_weapons.h",
+      "sha256": "1b3dcecae0e76ad5aa63b27f9847050550295415a1dbc7df1f6229f84744834b"
+    },
+    {
+      "path": "codemp/game/g_active.c",
+      "sha256": "4a26c5aa851b12718bb05e65e9f45b5a092ef86b5bbce1a78c199fc312df96d3"
+    },
+    {
+      "path": "codemp/game/g_client.c",
+      "sha256": "f4733c85e35701f76ec1a1e12080819c77d3291f6fb7886706541b4cd7d57849"
+    },
+    {
+      "path": "codemp/game/g_local.h",
+      "sha256": "a1537b7fbc0e666db96de65c111f61ae41ad12c3ea9b5ed69437217c1e75d184"
+    },
+    {
+      "path": "codemp/game/g_public.h",
+      "sha256": "d3efc20693b99d0eb3698eb518fab1578ee97872829ab17c9a40285e6c9f067e"
+    },
+    {
+      "path": "codemp/game/g_team.h",
+      "sha256": "cbf62123b23a62de76f1c04dc8e12be7524d365aea1f54352a799431af876944"
+    },
+    {
+      "path": "codemp/game/g_xcvar.h",
+      "sha256": "4cb470bf0e6e89358269265fd261de5f96fa1af26d1757b1356fdd170c557e4e"
+    },
+    {
+      "path": "codemp/game/say.h",
+      "sha256": "07c2c78f07d0d526defbe13544b7dcca2ac7faa56042f6b7d062df276bdd7cfc"
+    },
+    {
+      "path": "codemp/game/surfaceflags.h",
+      "sha256": "ef4f47d249e4be2101193a942111bf424c9aaa0ac58c3e8573c25b57e9a194a9"
+    },
+    {
+      "path": "codemp/game/teams.h",
+      "sha256": "d3b9d742c375542553cf49dd10a6d60bca785fc3b811b895d29e8c94479499f5"
+    },
+    {
+      "path": "codemp/game/w_force.c",
+      "sha256": "e9f61890874b7aa69847fdbf32f472297d742955201659af5b28292a5c58e649"
+    },
+    {
+      "path": "codemp/game/w_saber.h",
+      "sha256": "76f8357af0d8bce9afd9982a35f2d3f58e7d87a1ebb3090321f8cc2f52879da3"
+    },
+    {
+      "path": "codemp/ghoul2/G2.h",
+      "sha256": "43781288167db83c89b026efe47eb7925387c89ae347cfaec918c487bcf5d782"
+    },
+    {
+      "path": "codemp/icarus/blockstream.h",
+      "sha256": "79400be8f6b968b1a8c9b6ddff94a366dda737109e5e1b254b41830601b4bc23"
+    },
+    {
+      "path": "codemp/icarus/icarus.h",
+      "sha256": "b95e052719da6613b5e7dc019c8cabce85f3016f6806c1d46182d132727e1d30"
+    },
+    {
+      "path": "codemp/icarus/instance.h",
+      "sha256": "dd4a7aa08d04a64d4135c8a8e7864247f74067306f26811f789e08a1abbc5214"
+    },
+    {
+      "path": "codemp/icarus/interface.h",
+      "sha256": "287610013c7d24e765db05c70db5ddfc3696911778eb63ec92af111fe6a9ec47"
+    },
+    {
+      "path": "codemp/icarus/interpreter.h",
+      "sha256": "3195a489d755d52a2be95fa817a83a4c17f7090ea934372b397081b60e67f579"
+    },
+    {
+      "path": "codemp/icarus/sequence.h",
+      "sha256": "14a9e3c7fd97b0167a2be7684236e9b495b371494f97ef8062369024d9d9d4d9"
+    },
+    {
+      "path": "codemp/icarus/sequencer.h",
+      "sha256": "fd4cf37590ef954c5b6a310809a245331b9c90f89d8f0b7aacf2dd519313c20a"
+    },
+    {
+      "path": "codemp/icarus/taskmanager.h",
+      "sha256": "c026cb3a6c3d1cecf9a8b03b9a1983e7c56f55c0b7aade6b167f3828f3401c41"
+    },
+    {
+      "path": "codemp/icarus/tokenizer.h",
+      "sha256": "40fd23a75eb036035b0609ae79f1a841ecbe0b22e3dd59b201d97f80d7f6f894"
+    },
+    {
+      "path": "codemp/qcommon/cm_load.cpp",
+      "sha256": "75486a4c3c5a45c342293d15bc1851ae93625fb40890fe520b4ac5cf6bb60622"
+    },
+    {
+      "path": "codemp/qcommon/cm_local.h",
+      "sha256": "6761e4e7014306b9826c50d7f258860d797c4f49081e783b8b68844313dc317d"
+    },
+    {
+      "path": "codemp/qcommon/cm_patch.cpp",
+      "sha256": "8f89dd78e94dead4e9a3c71a006243a6b0280c52a42647daae739924ce1a591b"
+    },
+    {
+      "path": "codemp/qcommon/cm_patch.h",
+      "sha256": "ab3a006b17fd199ad12682e3f4ee88266a082481782c42a53802ca401607199d"
+    },
+    {
+      "path": "codemp/qcommon/cm_polylib.cpp",
+      "sha256": "6c81b50fff3176f39f6ee2146749f355c90019297b92f605d8a50ae0ad89db28"
+    },
+    {
+      "path": "codemp/qcommon/cm_polylib.h",
+      "sha256": "763656dbc91058db76ea1ecff99fcac221b7dce354e503e433a6fe12c0b77bec"
+    },
+    {
+      "path": "codemp/qcommon/cm_public.h",
+      "sha256": "65c6771b1145b9e822ae6ce08894963a720cd8aef5424b135ccace143625f381"
+    },
+    {
+      "path": "codemp/qcommon/cm_test.cpp",
+      "sha256": "f2d15d65fbe89ef066b99a5d6fc0bbcb8290a5de7237e7594c8a62ddadae5aab"
+    },
+    {
+      "path": "codemp/qcommon/cm_trace.cpp",
+      "sha256": "995f6d6805f792904b7f25774ab558029eb0c588a48b3bbc987a706b3a65fae3"
+    },
+    {
+      "path": "codemp/qcommon/disablewarnings.h",
+      "sha256": "af37bc176dad5f6a2308de4388d14cce5b33c641efa8701735204dd4f147a19e"
+    },
+    {
+      "path": "codemp/qcommon/q_shared.c",
+      "sha256": "9acffea684ce96d9bb2652c0c5cbfc3d16a5a1792210c517438be5fe2eb2486b"
+    },
+    {
+      "path": "codemp/qcommon/q_shared.h",
+      "sha256": "f22d4a5f0d698ecd262a5a2bb2f1bee83b3296bce3454464999dfd138ca173d3"
+    },
+    {
+      "path": "codemp/qcommon/qcommon.h",
+      "sha256": "616cea949a9c25d78aeb624cf6c7ef0ac83dfaf8a77908a7c54502827f1d4892"
+    },
+    {
+      "path": "codemp/qcommon/qfiles.h",
+      "sha256": "119346259ac7d88ed1be6e5d2aa7ee77bb705e1b4a7041f9cd118d512e0696e1"
+    },
+    {
+      "path": "codemp/qcommon/tags.h",
+      "sha256": "3ffc97deda9f5ec88cbe93e5b75886ec24efd801753cd07f55e0b2e46856a8c2"
+    },
+    {
+      "path": "codemp/rd-common/mdx_format.h",
+      "sha256": "87dd2c63d859916661f1fd7e5751c6936ca2e3496c072a78389a5a6eace62558"
+    },
+    {
+      "path": "codemp/rd-common/tr_types.h",
+      "sha256": "78cadbbd8cee051a80f3835268dc950de02e8348798b4a663fe1ea4788978519"
+    },
+    {
+      "path": "codemp/ui/keycodes.h",
+      "sha256": "0d836b446ea1f2d7a1eed09e50904b9a83e27add2d8816fe2e210055bbb0867f"
+    },
+    {
+      "path": "codemp/ui/menudef.h",
+      "sha256": "b34ac483adb1a44b55f622a6b941fea9afe47755b261adce967344f87cef4d17"
+    },
+    {
+      "path": "codemp/ui/ui_local.h",
+      "sha256": "5cc9c86a7eb1e501e0006158d2a5d43b9d47caf8b2a2e06bdfa88b76bb8459a0"
+    },
+    {
+      "path": "codemp/ui/ui_public.h",
+      "sha256": "306a6a66a60152a64faa9c455787d94d784637d78e84d5f483bc754914b92399"
+    },
+    {
+      "path": "codemp/ui/ui_shared.h",
+      "sha256": "af47be836da2de512408fef9a35c8655db4d459d4119728e830509e33690eb80"
+    },
+    {
+      "path": "codemp/ui/ui_xcvar.h",
+      "sha256": "50df361842b1d1f6358a563ad2f27615f90a977ed767384a733a395dca228dca"
+    },
+    {
+      "path": "shared/qcommon/q_color.h",
+      "sha256": "fc1126912aabfdbc4af8819f0e893465c8316fe59ea33d2da76f7b32dc185eb7"
+    },
+    {
+      "path": "shared/qcommon/q_math.c",
+      "sha256": "6a010a4f35f1bb869e504a45f6f751c305988a0868b2b8ed3addaa568078692b"
+    },
+    {
+      "path": "shared/qcommon/q_math.h",
+      "sha256": "342b9f4c07d80753707989cb5dd7da82805f2fe3d05e1748e71917a8cbb4be0e"
+    },
+    {
+      "path": "shared/qcommon/q_platform.h",
+      "sha256": "d941910aa4803d7cd30d070d19fadbd462a4eda22780387a26e639a7818bb3df"
+    },
+    {
+      "path": "shared/qcommon/q_string.c",
+      "sha256": "b5919b145473b66ea7ab83c22a6b2e891a6e55b592583abc433145db469be3af"
+    },
+    {
+      "path": "shared/qcommon/q_string.h",
+      "sha256": "8ebf9202e694c296456bfbff0281b56f5db190dd8ab7a4fd9f20305f4948f8a0"
+    },
+    {
+      "path": "shared/sys/snapvector.cpp",
+      "sha256": "ae7696a1ffef3e0b0aceb44e18419b01d01dcbd0ed72d5e01617effb8d2ddd79"
+    },
+    {
+      "path": "shared/sys/sys_public.h",
+      "sha256": "fea4a6488671b3fff6aef4d38877ae86e4ed997f20f8af35eae1fbfa68379623"
+    }
+  ]
+}

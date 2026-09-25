@@ -1,0 +1,51 @@
+{
+  "repository": "https://github.com/JACoders/OpenJK",
+  "revision": "1a6a643427aa347553e9073dac5570b33337c4d9",
+  "files": [
+    {
+      "path": "LICENSE.txt",
+      "sha256": "db296f2f7f35bca3a174efb0eb392b3b17bd94b341851429a3dff411b1c2fc73"
+    },
+    {
+      "path": "codemp/qcommon/huffman.cpp",
+      "sha256": "51288c2a8d1e7c1bdfe82a4ee5d7ad6f5abf97e7a24cb48b91b26244bda9a4fe"
+    },
+    {
+      "path": "codemp/qcommon/msg.cpp",
+      "sha256": "df52aae2423ceb954073b9353554b670681290dce3edeadf4d7fb094dbc6e6ac"
+    },
+    {
+      "path": "codemp/qcommon/qcommon.h",
+      "sha256": "616cea949a9c25d78aeb624cf6c7ef0ac83dfaf8a77908a7c54502827f1d4892"
+    },
+    {
+      "path": "codemp/qcommon/q_shared.h",
+      "sha256": "f22d4a5f0d698ecd262a5a2bb2f1bee83b3296bce3454464999dfd138ca173d3"
+    },
+    {
+      "path": "codemp/client/cl_parse.cpp",
+      "sha256": "73aa31a95296c88c5eb8b5fa51518a6b8f854a3575cfdd7f0b26cbe710e3da1a"
+    }
+  ],
+  "compiler": "g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "compiler_flags": [
+    "-std=c++17",
+    "-O0",
+    "-fwrapv",
+    "-fno-strict-aliasing",
+    "-DFINAL_BUILD"
+  ],
+  "scope": "MSG bit codec, trained Huffman table and delta entity routine; not full engine conformance",
+  "vector_count": 2016,
+  "source_functions": [
+    "MSG_WriteBits",
+    "MSG_ReadBits",
+    "MSG_ReadByte",
+    "MSG_ReadShort",
+    "MSG_ReadLong",
+    "MSG_initHuffman",
+    "MSG_ReadDeltaEntity"
+  ],
+  "entity_layout": "Surrogate slots with mapped field offsets; original C++ delta routine unchanged; not an ABI-layout test.",
+  "note": "Writer uses positive width to avoid the source's negative-shift diagnostic; reader uses recorded signed width."
+}

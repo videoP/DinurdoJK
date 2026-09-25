@@ -1,0 +1,22234 @@
+use crate::{
+    camera::Camera,
+    color_lut,
+    grass::{GrassDrawStats, GrassMapGpu, GrassRenderer},
+    materials::{BlendFactor, BlendFunc, CullMode, TextureData},
+    runtime::{RenderStats, SurfaceInspectorInfo, UserEvent, WorldUploadTimings},
+    scene::{
+        self, BlendMode, DirectionalSun, DrawBatch, DrawClass, GpuVertex,
+        PipelineKey, PreparedMap,
+    },
+    surface_deformation::{
+        SurfaceDeformationGpu, SurfaceDeformationStamp, SNOW_SHELL_CHUNK_SIZE,
+        SNOW_SHELL_DRAW_RADIUS, SNOW_SHELL_TESSELLATION,
+    },
+    weather::{self, FroxelUniform, WeatherOcclusionCache, WeatherSurfaceUniform, WeatherSystem},
+    ui::{
+        self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofQuality, FogMode,
+        DynamicShadowsMode, EntityAmbientLightingMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PvsMode, RainIntensity,
+        ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex, VsyncMode,
+    },
+};
+use bytemuck::{Pod, Zeroable};
+use futures_lite::future::block_on;
+use glam::{Mat4, Vec2, Vec3, Vec4};
+use jka_assets::{
+    bsp::MATERIAL_SNOW,
+    pk3::AssetSearchPath,
+    shader::{AlphaGen, RgbGen, TcGen, TcMod},
+};
+use std::{
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::{
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Mutex, OnceLock,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use wgpu::util::DeviceExt;
+use winit::{dpi::PhysicalSize, event_loop::EventLoopProxy, window::Window};
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
+// AUTO uses a conservative vertex-equivalent cost for an extra draw call. This
+// intentionally biases toward the old coarse batches unless FULL PVS removes a
+// meaningful amount of geometry. The comparison is precomputed per BSP cluster.
+const AUTO_DRAW_VERTEX_EQUIVALENT: u64 = 8192;
+const CLUSTER_X: u32 = 16;
+const CLUSTER_Y: u32 = 9;
+const CLUSTER_Z: u32 = 24;
+const CLUSTER_COUNT: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+const MAX_CLUSTER_LIGHTS: u32 = 32;
+const MAX_DYNAMIC_LIGHTS: usize = 256;
+const MAX_LOCAL_SHADOW_LIGHTS: usize = 4;
+const LOCAL_SHADOW_CACHE_SLOTS: usize = 8;
+const LOCAL_SHADOW_MAP_SIZE: u32 = 512;
+const LOCAL_SHADOW_NEAR: f32 = 4.0;
+const LOCAL_SHADOW_RESELECT_DISTANCE: f32 = 192.0;
+const LOCAL_SHADOW_HYSTERESIS: f32 = 1.35;
+const SHADOW_CASCADES: usize = 4;
+const LEGACY_SHADOW_CASCADES: usize = 3;
+const SHADOW_MAP_SIZE: u32 = 2048;
+const LEGACY_SHADOW_SPLITS: [f32; LEGACY_SHADOW_CASCADES] = [1024.0, 4096.0, 16384.0];
+const SHADOW_CASCADE_BLEND_FRACTION: f32 = 0.08;
+const SHADOW_CASCADE_MIN_BLEND: f32 = 64.0;
+// Bevy 0.19.1 CascadeShadowConfig::default() uses 0.1 / 10.0 / 150.0.
+// This renderer already treats 64 JKA units as one metre for weather/world effects,
+// so only the unit conversion is applied here; the Bevy cascade ratios are unchanged.
+const JKA_UNITS_PER_METER: f32 = 64.0;
+const BEVY_CSM_MINIMUM_DISTANCE: f32 = 0.1 * JKA_UNITS_PER_METER;
+const BEVY_CSM_FIRST_FAR_BOUND: f32 = 10.0 * JKA_UNITS_PER_METER;
+const BEVY_CSM_MAXIMUM_DISTANCE: f32 = 150.0 * JKA_UNITS_PER_METER;
+const BEVY_CSM_OVERLAP_PROPORTION: f32 = 0.20;
+const BEVY_CSM_SHADOW_DEPTH_BIAS: f32 = 0.02;
+const BEVY_CSM_SHADOW_NORMAL_BIAS: f32 = 1.8;
+const FALLBACK_SUN_DIRECTION: [f32; 3] = [-0.38, -0.84, -0.39];
+const FALLBACK_SUN_COLOR: [f32; 3] = [0.57735026, 0.57735026, 0.57735026];
+const FALLBACK_SUN_INTENSITY: f32 = 250.0;
+const PLANAR_AUTHORED_SCALE_DIVISOR: u32 = 2;
+const PLANAR_ENVIRONMENT_SCALE_DIVISOR: u32 = 4;
+const PLANAR_REFLECTION_SLOTS: usize = 4;
+const PLANAR_REFLECTION_HYSTERESIS: f32 = 1.15;
+/// Cloud shape now comes from `cloud_noise`: a tileable Perlin-Worley weather
+/// map plus a tileable Worley detail volume, matching the reference the cloud
+/// renderer is ported from. The old single 96^3 value-noise volume baked four
+/// FBM octaves into one texture, but only the lowest two were above Nyquist at
+/// that resolution, so the "high detail" channels contributed aliasing rather
+/// than shape.
+use crate::cloud_noise;
+
+fn camera_depth_clear() -> f32 {
+    0.0
+}
+
+fn camera_depth_compare() -> wgpu::CompareFunction {
+    wgpu::CompareFunction::GreaterEqual
+}
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x2,
+    2 => Float32x2,
+    5 => Float32x3,
+    3 => Float32x4,
+    4 => Float32
+];
+const UI_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x2,
+    1 => Float32x2,
+    2 => Float32x4,
+    3 => Float32
+];
+
+fn append_vignette_vertices(vertices: &mut Vec<UiVertex>) {
+    // Approximate the old smooth radial post-process with a few interpolated
+    // rings. The centre is an actual hole, so the rasterizer does no vignette
+    // work there. 32 segments keeps the zero-alpha boundary visually round.
+    const SEGMENTS: usize = 32;
+    const RADII_NDC: [f32; 5] = [0.56, 0.80, 1.04, 1.28, 1.56];
+
+    let alpha_at_radius = |radius_ndc: f32| {
+        let radius_uv = radius_ndc * 0.5;
+        let t = ((radius_uv - 0.28) / (0.78 - 0.28)).clamp(0.0, 1.0);
+        let edge = t * t * (3.0 - 2.0 * t);
+        edge * 0.28
+    };
+    let make_vertex = |radius: f32, angle: f32| UiVertex {
+        position: [angle.cos() * radius, angle.sin() * radius],
+        uv: [0.0, 0.0],
+        color: [0.0, 0.0, 0.0, alpha_at_radius(radius)],
+        textured: 0.0,
+    };
+
+    for ring in RADII_NDC.windows(2) {
+        let inner = ring[0];
+        let outer = ring[1];
+        for segment in 0..SEGMENTS {
+            let a0 = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+            let a1 = std::f32::consts::TAU * (segment + 1) as f32 / SEGMENTS as f32;
+            let i0 = make_vertex(inner, a0);
+            let i1 = make_vertex(inner, a1);
+            let o0 = make_vertex(outer, a0);
+            let o1 = make_vertex(outer, a1);
+            vertices.extend_from_slice(&[i0, o0, o1, i0, o1, i1]);
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InputLatencySample {
+    pub sequence: u64,
+    pub event_at: Instant,
+    pub simulation_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DynamicModelAlphaMode {
+    Opaque,
+    Mask,
+    Blend,
+    /// Alpha-tested material plus OpenJK RF_FORCE_ENT_ALPHA semantics.
+    MaskBlend,
+    /// Unlit GL_ONE GL_ONE additive stage. Alpha does not scale source RGB.
+    AdditiveOne,
+    /// Unlit GL_SRC_ALPHA GL_ONE additive presentation primitive.
+    Additive,
+    /// Unlit GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA (FX smoke, sprites).
+    BlendUnlit,
+    /// GL_DST_COLOR GL_ZERO: multiplies what is already drawn (FX filters).
+    Modulate,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct DynamicModelVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    /// OpenJK refEntity shaderRGBA equivalent. Player presentation currently
+    /// uses white RGB and the CG_CheckThirdPersonAlpha alpha channel.
+    pub color: [f32; 4],
+}
+
+/// Bind-pose GLM vertex used by the optional GPU Ghoul2 skinning path. Bone
+/// indices are GLA/global indices, resolved from the GLM surface-local table at
+/// model registration time so the shader does no hierarchy indirection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Ghoul2GpuVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub bone_indices: [u32; 4],
+    pub weights: [f32; 4],
+    pub weight_count: u32,
+    pub _padding: [u32; 3],
+}
+
+/// One final CPU-evaluated Ghoul2 bone matrix. GPU mode intentionally keeps
+/// animation, BG_G2PlayerAngles and bolt semantics on the CPU; only the GLM
+/// vertex deformation moves to the vertex shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Ghoul2GpuBone {
+    pub row0: [f32; 4],
+    pub row1: [f32; 4],
+    pub row2: [f32; 4],
+}
+
+#[derive(Clone, Debug)]
+pub struct Ghoul2GpuSkinning {
+    /// Stable geometry cache key, e.g. `models/players/kyle/model.glm#lod0#surface3`.
+    pub mesh_key: Arc<str>,
+    pub vertices: Arc<Vec<Ghoul2GpuVertex>>,
+    pub indices: Arc<Vec<u32>>,
+    /// Shared across all surfaces belonging to one evaluated pose.
+    pub bones: Arc<Vec<Ghoul2GpuBone>>,
+    /// JKA entity/model axis and origin. The shader converts the result to the
+    /// renderer's [x,z,-y] coordinate convention after skinning.
+    pub axis: [[f32; 3]; 3],
+    pub origin: [f32; 3],
+    pub color: [f32; 4],
+}
+
+#[derive(Clone)]
+pub struct DynamicModelSurface {
+    /// Presentation identity retained for diagnostics/culling work even though
+    /// the current render pass does not branch on it.
+    #[allow(dead_code)]
+    pub entity_num: u16,
+    pub vertices: Arc<Vec<DynamicModelVertex>>,
+    pub indices: Arc<Vec<u32>>,
+    /// Present only for r_ghoul2Skinning gpu. CPU geometry keeps this None.
+    pub ghoul2_gpu: Option<Ghoul2GpuSkinning>,
+    pub texture: Option<Arc<TextureData>>,
+    pub alpha_mode: DynamicModelAlphaMode,
+}
+
+impl DynamicModelSurface {
+    pub fn vertex_count(&self) -> usize {
+        self.ghoul2_gpu
+            .as_ref()
+            .map_or(self.vertices.len(), |skin| skin.vertices.len())
+    }
+
+    pub fn index_count(&self) -> usize {
+        self.ghoul2_gpu
+            .as_ref()
+            .map_or(self.indices.len(), |skin| skin.indices.len())
+    }
+}
+
+/// CGame's CG_Mover submission of an inline BSP model: R_AddRefEntityToScene
+/// with `hModel = cgs.inlineDrawModel[modelindex]`, in JKA world space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InlineModelInstance {
+    pub model: u32,
+    pub origin: [f32; 3],
+    /// AnglesToAxis(lerpAngles): forward, left, up.
+    pub axis: [[f32; 3]; 3],
+}
+
+impl InlineModelInstance {
+    /// The compiled pose, used when no CGame snapshot owns the movers.
+    fn compiled(model: u32) -> Self {
+        Self { model, origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] }
+    }
+
+    /// Render-space position of a compiled render-space point.
+    fn transform_point(&self, render: [f32; 3]) -> [f32; 3] {
+        let local = scene::jka_position(render);
+        let world = self.rotate(local);
+        scene::render_position([
+            world[0] + self.origin[0],
+            world[1] + self.origin[1],
+            world[2] + self.origin[2],
+        ])
+    }
+
+    fn transform_normal(&self, render: [f32; 3]) -> [f32; 3] {
+        scene::render_position(self.rotate(scene::jka_position(render)))
+    }
+
+    fn rotate(&self, v: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|i| self.axis[0][i] * v[0] + self.axis[1][i] * v[1] + self.axis[2][i] * v[2])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClientFramePerf {
+    pub total_ms: f64,
+    pub snapshot_ms: f64,
+    pub audio_ms: f64,
+    pub events_ms: f64,
+    pub entity_present_ms: f64,
+    pub player_present_ms: f64,
+    pub followed_player_ms: f64,
+    pub fx_ms: f64,
+    pub fx_tessellate_ms: f64,
+    pub ghoul2_pose_ms: f64,
+    pub ghoul2_motion_pose_ms: f64,
+    pub ghoul2_skin_ms: f64,
+    pub ghoul2_skinning_mode: Ghoul2SkinningMode,
+    pub ghoul2_bolt_ms: f64,
+    pub ghoul2_pose_evals: u32,
+    pub ghoul2_motion_pose_evals: u32,
+    pub ghoul2_bolt_queries: u32,
+    pub ghoul2_surfaces: u32,
+    pub ghoul2_vertices: u64,
+    pub ghoul2_frustum_tests: u32,
+    pub ghoul2_frustum_culled: u32,
+    pub ghoul2_lod_counts: [u32; 4],
+    pub dynamic_surfaces: u32,
+    pub dynamic_vertices: u64,
+    pub dynamic_indices: u64,
+}
+
+#[derive(Clone)]
+pub struct RenderSnapshot {
+    pub camera: Camera,
+    pub player_position: Option<Vec3>,
+    /// Current server snapshot portal-area mask. Set bits are areas closed off
+    /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
+    pub area_mask: Option<[u8; 32]>,
+    pub dynamic_models: Arc<Vec<DynamicModelSurface>>,
+    /// `None`: no CGame owns the scene (solo/offline), so inline models keep
+    /// their compiled pose. `Some`: exactly the movers in the current
+    /// snapshot are drawn, as OpenJK only draws bmodels CGame submits.
+    pub inline_models: Option<Arc<Vec<InlineModelInstance>>>,
+    pub dof_focus_target: f32,
+    pub input_latency: Option<InputLatencySample>,
+    pub client_perf: ClientFramePerf,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PostEffects {
+    pub hdr: bool,
+    pub auto_exposure: bool,
+    pub tone_mapping: bool,
+    pub bloom: bool,
+    pub halation: bool,
+    pub ssao: bool,
+    pub static_bsp_ao: bool,
+    pub static_bsp_ao_lightmap: bool,
+    pub static_bsp_ao_samples: u32,
+    pub static_bsp_ao_resolution: u32,
+    pub static_bsp_ao_strength: u32,
+    pub static_bsp_ao_range: u32,
+    pub static_bsp_ao_current_cell: bool,
+    pub fxaa: bool,
+    pub smaa: bool,
+    pub taa: bool,
+    pub contact_shadows: bool,
+    pub fog_mode: FogMode,
+    pub fog_strength: f32,
+    pub sun_override: bool,
+    pub sun_yaw: f32,
+    pub sun_pitch: f32,
+    pub sun_intensity: f32,
+    pub sun_color: [f32; 3],
+    pub sun_visibility: SunVisibilityMode,
+    pub clouds: bool,
+    pub cloud_type: CloudType,
+    pub cloud_quality: f32,
+    pub cloud_coverage: f32,
+    pub cloud_height: f32,
+    pub cloud_thickness: f32,
+    pub cloud_wind_speed: f32,
+    pub cloud_wind_direction: f32,
+    pub cloud_shadows: bool,
+    pub cloud_render_resolution: CloudRenderResolution,
+    pub cloud_temporal: bool,
+    pub cloud_temporal_depth_fix: bool,
+    pub cloud_shear: f32,
+    pub cloud_base_variation: f32,
+    pub cloud_wind_variation: bool,
+    pub cloud_shape_evolution: bool,
+    pub cloud_terrain_interaction: bool,
+    pub cloud_empty_skip: bool,
+    pub cloud_aerial: f32,
+    pub cloud_sky_ambient: bool,
+    pub cloud_history_blend: f32,
+    pub cloud_motion_reject: f32,
+    pub cloud_history_depth_reject: bool,
+    pub cloud_thickness_variation: f32,
+    pub cloud_size: f32,
+    pub rain: bool,
+    pub rain_intensity: RainIntensity,
+    pub reflection_quality: ReflectionQuality,
+    pub reflection_debug: bool,
+    pub chromatic_aberration: f32,
+    pub vignette: bool,
+    pub film_grain_strength: f32,
+    pub motion_blur_strength: f32,
+    pub depth_of_field_strength: f32,
+    pub dof_quality: DofQuality,
+    pub color_lut: ColorLutPreset,
+    pub color_lut_strength: f32,
+}
+
+// Rend2 material profile locked after visual/performance testing. These values
+// define the behavior used when the single runtime master switch (`r_pbr`) is ON.
+// The individual profile knobs intentionally remain non-configurable.
+pub const PBR_PROFILE_MATERIALS: bool = true;
+pub const PBR_PROFILE_PARALLAX_OCCLUSION: bool = true;
+pub const PBR_PROFILE_SHARED_MATERIAL_EVAL: bool = false;
+pub const PBR_PROFILE_SHARED_TANGENT_FRAME: bool = false;
+pub const PBR_PROFILE_POM_MIP_AWARE: bool = true;
+pub const PBR_PROFILE_POM_ADAPTIVE_STEPS: bool = false;
+pub const PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR: bool = false; // MATCH BASE
+pub const PBR_PROFILE_COMPANION_COMPRESSION: bool = true;
+pub const PBR_PROFILE_VERTEX_LIGHTGRID: bool = false; // FRAGMENT
+
+pub struct EguiRenderData {
+    pub paint_jobs: Vec<egui::ClippedPrimitive>,
+    pub textures_delta: egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
+
+pub enum RenderCommand {
+    Resize(PhysicalSize<u32>),
+    SetVsync(VsyncMode),
+    SetMsaa(u32),
+    SetTextureFilter(TextureFilter),
+    SetWireframe(bool),
+    SetPvsMode(PvsMode),
+    SetFpsCap(u32),
+    SetGamma(f32),
+    SetPostEffects(PostEffects),
+    SetFootprintMode(FootprintMode),
+    SetGrassEnabled(bool),
+    SetGrassPrecompute(bool),
+    SetGrassMidLod(bool),
+    SetGrassFrontToBack(bool),
+    SetOceanEnabled(bool),
+    SetOceanSettings(crate::ocean::OceanSettings),
+    SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
+    SetOceanTime(f32),
+    SetPerfTrace(bool),
+    SetGpuTimings(bool),
+    SetGhoul2BatchDraws(Ghoul2BatchMode),
+    SetGpuVisibility {
+        gpu_driven: bool,
+        hiz_occlusion: bool,
+    },
+    SetClusteredLighting(bool),
+    SetEmissiveAreaLights(bool),
+    SetIrradianceVolume(bool),
+    SetVoxelProbeGi(bool),
+    SetLocalLightShadows(bool),
+    SetPbrSettings {
+        enabled: bool,
+        deluxe_mapping: bool,
+        deluxe_specular: f32,
+    },
+    SetCascadedShadows(DynamicShadowsMode),
+    SetCullDebug(CullDebugMode),
+    SetPlanarReflectionDebug(PlanarReflectionDebugMode),
+    SetPuddleDebug(bool),
+    DumpMaterials {
+        filter: Option<String>,
+        all: bool,
+    },
+    InspectSurface {
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+    },
+    ClearSurfaceInspection,
+    AddSurfaceDeformation(SurfaceDeformationStamp),
+    Screenshot {
+        directory: PathBuf,
+    },
+    SetUi(UiSnapshot),
+    SetEgui(Option<EguiRenderData>),
+    UnloadMap,
+    LoadMap {
+        request_id: u64,
+        started: Instant,
+        name: String,
+        map: Box<PreparedMap>,
+    },
+    Shutdown,
+}
+
+pub struct RenderThread {
+    command_tx: Sender<RenderCommand>,
+    latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl RenderThread {
+    pub fn spawn(
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+        backend: RendererBackend,
+        initial: RenderSnapshot,
+        initial_ui: UiSnapshot,
+        base: PathBuf,
+        game: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let (command_tx, command_rx) = mpsc::channel();
+        // Render snapshots are mailbox state, not a work queue: the renderer only
+        // needs the newest camera/input state available when a frame begins.
+        // A shared latest snapshot avoids retaining stale mouse samples when input
+        // arrives faster than rendering (for example 1000 Hz input at 240-500 FPS).
+        let latest_snapshot = Arc::new(Mutex::new(initial.clone()));
+        let render_snapshot = Arc::clone(&latest_snapshot);
+        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_desc.backends = match backend {
+            RendererBackend::Vulkan => wgpu::Backends::VULKAN,
+            RendererBackend::Dx12 => wgpu::Backends::DX12,
+        };
+        if backend == RendererBackend::Dx12 {
+            // Use the shipped dynamic DXC runtime explicitly. This avoids linking
+            // static DXC (and its ATL build dependency) while also avoiding an
+            // automatic fallback to legacy FXC when DXC is expected to be present.
+            // Ship dxcompiler.dll (and its matching dxil.dll) beside DinurdoJK.exe.
+            instance_desc.backend_options.dx12.shader_compiler =
+                wgpu::Dx12Compiler::default_dynamic_dxc();
+        }
+        let instance = wgpu::Instance::new(instance_desc);
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|error| format!("Could not create WGPU surface: {error}"))?;
+        let panic_proxy = proxy.clone();
+        let join = thread::Builder::new()
+            .name("jka-render".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_thread_main(
+                        window,
+                        instance,
+                        surface,
+                        proxy,
+                        command_rx,
+                        render_snapshot,
+                        initial,
+                        initial_ui,
+                        base,
+                        game,
+                    )
+                }));
+                if let Err(payload) = result {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic");
+                    let _ = panic_proxy.send_event(UserEvent::RendererError(format!(
+                        "render thread panicked: {detail}"
+                    )));
+                }
+            })
+            .map_err(|e| format!("Could not start render thread: {e}"))?;
+        Ok(Self {
+            command_tx,
+            latest_snapshot,
+            join: Some(join),
+        })
+    }
+
+    pub fn command(&self, command: RenderCommand) {
+        let _ = self.command_tx.send(command);
+    }
+
+    pub fn publish(&self, snapshot: RenderSnapshot) {
+        match self.latest_snapshot.lock() {
+            Ok(mut latest) => *latest = snapshot,
+            Err(poisoned) => *poisoned.into_inner() = snapshot,
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.command_tx.send(RenderCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+
+}
+
+impl Drop for RenderThread {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_thread_main(
+    window: Arc<Window>,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    proxy: EventLoopProxy<UserEvent>,
+    command_rx: Receiver<RenderCommand>,
+    latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    mut snapshot: RenderSnapshot,
+    initial_ui: UiSnapshot,
+    base: PathBuf,
+    game: Option<PathBuf>,
+) {
+    let renderer_init_started = Instant::now();
+    let mut renderer = match block_on(Renderer::new(
+        window,
+        instance,
+        surface,
+        &base,
+        game.as_deref(),
+    )) {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            let _ = proxy.send_event(UserEvent::RendererError(error));
+            return;
+        }
+    };
+    println!(
+        "[RENDER INIT] base device/resources/pipelines {:.1} ms",
+        renderer_init_started.elapsed().as_secs_f64() * 1000.0
+    );
+    renderer.set_vsync(initial_ui.video.vsync);
+    renderer.set_msaa(initial_ui.video.msaa_samples);
+    renderer.set_texture_filter(initial_ui.video.texture_filter);
+    renderer.set_wireframe(initial_ui.video.show_wireframe);
+    renderer.set_pvs_mode(initial_ui.video.pvs_mode);
+    let mut fps_cap = initial_ui.video.fps_cap;
+    renderer.set_gamma(initial_ui.video.gamma);
+    renderer
+        .surface_deformation
+        .set_mode(&renderer.queue, initial_ui.video.footprints);
+    renderer.set_post_effects(PostEffects {
+        hdr: initial_ui.video.hdr,
+        auto_exposure: initial_ui.video.auto_exposure,
+        tone_mapping: initial_ui.video.tone_mapping,
+        bloom: initial_ui.video.bloom,
+        halation: initial_ui.video.halation,
+        ssao: initial_ui.video.ssao,
+        static_bsp_ao: initial_ui.video.static_bsp_ao,
+        static_bsp_ao_lightmap: initial_ui.video.static_bsp_ao_lightmap,
+        static_bsp_ao_samples: initial_ui.video.static_bsp_ao_samples,
+        static_bsp_ao_resolution: initial_ui.video.static_bsp_ao_resolution,
+        static_bsp_ao_strength: initial_ui.video.static_bsp_ao_strength,
+        static_bsp_ao_range: initial_ui.video.static_bsp_ao_range,
+        static_bsp_ao_current_cell: initial_ui.video.static_bsp_ao_current_cell,
+        fxaa: initial_ui.video.fxaa,
+        smaa: initial_ui.video.smaa,
+        taa: initial_ui.video.taa,
+        contact_shadows: initial_ui.video.contact_shadows,
+        fog_mode: initial_ui.video.fog_mode,
+        fog_strength: initial_ui.video.fog_strength,
+        sun_override: initial_ui.video.sun_override,
+        sun_yaw: initial_ui.video.sun_yaw,
+        sun_pitch: initial_ui.video.sun_pitch,
+        sun_intensity: initial_ui.video.sun_intensity,
+        sun_color: initial_ui.video.sun_color,
+        sun_visibility: initial_ui.video.sun_visibility,
+        clouds: initial_ui.video.clouds,
+        cloud_type: initial_ui.video.cloud_type,
+        cloud_quality: initial_ui.video.cloud_quality,
+        cloud_coverage: initial_ui.video.cloud_coverage,
+        cloud_height: initial_ui.video.cloud_height,
+        cloud_thickness: initial_ui.video.cloud_thickness,
+        cloud_wind_speed: initial_ui.video.cloud_wind_speed,
+        cloud_wind_direction: initial_ui.video.cloud_wind_direction,
+        cloud_shadows: initial_ui.video.cloud_shadows,
+        cloud_render_resolution: initial_ui.video.cloud_render_resolution,
+        cloud_temporal: initial_ui.video.cloud_temporal,
+        cloud_temporal_depth_fix: initial_ui.video.cloud_temporal_depth_fix,
+        cloud_shear: initial_ui.video.cloud_shear,
+        cloud_base_variation: initial_ui.video.cloud_base_variation,
+        cloud_wind_variation: initial_ui.video.cloud_wind_variation,
+        cloud_shape_evolution: initial_ui.video.cloud_shape_evolution,
+        cloud_terrain_interaction: initial_ui.video.cloud_terrain_interaction,
+        cloud_empty_skip: initial_ui.video.cloud_empty_skip,
+        cloud_aerial: initial_ui.video.cloud_aerial,
+        cloud_sky_ambient: initial_ui.video.cloud_sky_ambient,
+        cloud_history_blend: initial_ui.video.cloud_history_blend,
+        cloud_motion_reject: initial_ui.video.cloud_motion_reject,
+        cloud_history_depth_reject: initial_ui.video.cloud_history_depth_reject,
+        cloud_thickness_variation: initial_ui.video.cloud_thickness_variation,
+        cloud_size: initial_ui.video.cloud_size,
+        rain: initial_ui.video.rain,
+        rain_intensity: initial_ui.video.rain_intensity,
+        reflection_quality: initial_ui.video.reflection_quality,
+        reflection_debug: initial_ui.video.reflection_debug,
+        chromatic_aberration: initial_ui.video.chromatic_aberration,
+        vignette: initial_ui.video.vignette,
+        film_grain_strength: initial_ui.video.film_grain_strength,
+        motion_blur_strength: initial_ui.video.motion_blur_strength,
+        depth_of_field_strength: initial_ui.video.depth_of_field_strength,
+        dof_quality: initial_ui.video.dof_quality,
+        color_lut: initial_ui.video.color_lut,
+        color_lut_strength: initial_ui.video.color_lut_strength,
+    });
+    renderer.set_grass_enabled(initial_ui.video.grass);
+    renderer.set_grass_precompute(initial_ui.video.grass_precompute);
+    renderer.set_grass_mid_lod(initial_ui.video.grass_mid_lod);
+    renderer.set_grass_front_to_back(initial_ui.video.grass_front_to_back);
+    renderer.set_ocean_settings(initial_ui.video.ocean_settings);
+    renderer.set_ocean_enabled(initial_ui.video.ocean);
+    renderer.set_gpu_timings(initial_ui.video.gpu_timings);
+    renderer.set_ghoul2_batch_draws(initial_ui.video.ghoul2_batch_draws);
+    renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
+    renderer.set_clustered_lighting(initial_ui.video.clustered_lighting);
+    renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
+    renderer.set_irradiance_volume(matches!(
+        initial_ui.video.entity_ambient_lighting,
+        EntityAmbientLightingMode::BevyIrradianceVolume
+    ));
+    renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
+    renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
+    renderer.set_pbr_settings(
+        initial_ui.video.pbr,
+        initial_ui.video.deluxe_mapping,
+        initial_ui.video.deluxe_specular,
+    );
+    renderer.set_cascaded_shadows(initial_ui.video.dynamic_shadows);
+    renderer.set_cull_debug(initial_ui.video.cull_debug);
+    renderer.set_planar_reflection_debug(initial_ui.video.planar_reflection_debug);
+    let mut perf_trace = initial_ui.video.perf_trace;
+    renderer.set_ui(initial_ui);
+    println!(
+        "[RENDER INIT] ready after applying video state {:.1} ms total",
+        renderer_init_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let _ = proxy.send_event(UserEvent::RendererReady {
+        supported_msaa: renderer.supported_msaa.clone(),
+        wireframe_supported: renderer.wireframe_supported,
+    });
+
+    let mut stats_started = Instant::now();
+    let mut stats_frames = 0_u64;
+    let mut last_info = FrameInfo::default();
+    let mut last_measured_input_sequence = 0_u64;
+    let mut input_latency_samples = 0_u64;
+    let mut input_event_to_sim_sum_ms = 0.0_f64;
+    let mut input_sim_to_render_sum_ms = 0.0_f64;
+    let mut input_event_to_present_sum_ms = 0.0_f64;
+    let mut input_event_to_present_max_ms = 0.0_f64;
+    let mut pending_world_uploaded: Option<(
+        u64,
+        Instant,
+        String,
+        usize,
+        usize,
+        f64,
+        WorldUploadTimings,
+        scene::MapLoadTimings,
+        Option<scene::BspMapStats>,
+    )> = None;
+
+    // The render thread can run several times faster than camera/input updates.
+    // Track the previous *camera snapshot* rather than the previous rendered frame
+    // so camera motion remains visible instead of collapsing to zero at 2000+ FPS.
+    let mut motion_reference_camera = snapshot.camera;
+    let mut motion_camera_sample_dt = 1.0 / 120.0;
+    let mut motion_camera_changed_at = Instant::now();
+
+    // Opt-in console diagnostics. Keep the normal maximum-FPS path free of
+    // per-frame formatting/printing, and only aggregate when explicitly asked.
+    let mut trace_started = Instant::now();
+    let mut trace_frames = 0_u64;
+    let mut trace_frame_ms = 0.0_f64;
+    let mut trace_prepare_ms = 0.0_f64;
+    let mut trace_acquire_ms = 0.0_f64;
+    let mut trace_encode_ms = 0.0_f64;
+    let mut trace_submit_ms = 0.0_f64;
+    let mut trace_dynamic_model_ms = 0.0_f64;
+    let mut trace_grass_cpu_ms = 0.0_f64;
+    if perf_trace {
+        println!("JKA perf trace enabled (enable GPU TIMESTAMPS too for per-pass GPU timings)");
+    }
+
+    let mut first_frame_notified = false;
+
+    loop {
+        {
+            let _activity = crate::thread_activity::activity(
+                crate::thread_activity::ThreadSlot::Render,
+                crate::thread_activity::Task::RenderCommands,
+            );
+            loop {
+                match command_rx.try_recv() {
+                    Ok(RenderCommand::Resize(size)) => renderer.resize(size),
+                    Ok(RenderCommand::SetVsync(vsync)) => renderer.set_vsync(vsync),
+                    Ok(RenderCommand::SetMsaa(samples)) => renderer.set_msaa(samples),
+                    Ok(RenderCommand::SetTextureFilter(filter)) => {
+                        renderer.set_texture_filter(filter)
+                    }
+                    Ok(RenderCommand::SetWireframe(enabled)) => renderer.set_wireframe(enabled),
+                    Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
+                    Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
+                    Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
+                    Ok(RenderCommand::SetPostEffects(settings)) => {
+                        renderer.set_post_effects(settings)
+                    }
+                    Ok(RenderCommand::SetFootprintMode(mode)) => {
+                        renderer.surface_deformation.set_mode(&renderer.queue, mode)
+                    }
+                    Ok(RenderCommand::SetGrassEnabled(enabled)) => {
+                        renderer.set_grass_enabled(enabled)
+                    }
+                    Ok(RenderCommand::SetGrassPrecompute(enabled)) => {
+                        renderer.set_grass_precompute(enabled)
+                    }
+                    Ok(RenderCommand::SetGrassMidLod(enabled)) => {
+                        renderer.set_grass_mid_lod(enabled)
+                    }
+                    Ok(RenderCommand::SetGrassFrontToBack(enabled)) => {
+                        renderer.set_grass_front_to_back(enabled)
+                    }
+                    Ok(RenderCommand::SetOceanEnabled(enabled)) => {
+                        renderer.set_ocean_enabled(enabled)
+                    }
+                    Ok(RenderCommand::SetOceanSettings(settings)) => {
+                        renderer.set_ocean_settings(settings)
+                    }
+                    Ok(RenderCommand::SetAuthoredOceans(oceans)) => renderer.set_authored_oceans(oceans),
+                    Ok(RenderCommand::SetOceanTime(time)) => {
+                        if let Some(ocean) = &mut renderer.ocean { ocean.set_time(time); }
+                        for (_, ocean) in &mut renderer.authored_oceans { ocean.set_time(time); }
+                    }
+                    Ok(RenderCommand::SetPerfTrace(enabled)) => {
+                        perf_trace = enabled;
+                        trace_started = Instant::now();
+                        trace_frames = 0;
+                        trace_frame_ms = 0.0;
+                        trace_prepare_ms = 0.0;
+                        trace_acquire_ms = 0.0;
+                        trace_encode_ms = 0.0;
+                        trace_submit_ms = 0.0;
+                        trace_grass_cpu_ms = 0.0;
+                        println!(
+                            "JKA perf trace {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        );
+                    }
+                    Ok(RenderCommand::SetGpuTimings(enabled)) => {
+                        renderer.set_gpu_timings(enabled)
+                    }
+                    Ok(RenderCommand::SetGhoul2BatchDraws(mode)) => {
+                        renderer.set_ghoul2_batch_draws(mode)
+                    }
+                    Ok(RenderCommand::SetGpuVisibility {
+                        gpu_driven,
+                        hiz_occlusion,
+                    }) => {
+                        renderer.set_gpu_visibility(gpu_driven, hiz_occlusion);
+                    }
+                    Ok(RenderCommand::SetClusteredLighting(enabled)) => {
+                        renderer.set_clustered_lighting(enabled);
+                    }
+                    Ok(RenderCommand::SetEmissiveAreaLights(enabled)) => {
+                        renderer.set_emissive_area_lights(enabled);
+                    }
+                    Ok(RenderCommand::SetIrradianceVolume(enabled)) => {
+                        renderer.set_irradiance_volume(enabled);
+                    }
+                    Ok(RenderCommand::SetVoxelProbeGi(enabled)) => {
+                        renderer.set_voxel_probe_gi(enabled);
+                    }
+                    Ok(RenderCommand::SetLocalLightShadows(enabled)) => {
+                        renderer.set_local_light_shadows(enabled);
+                    }
+                    Ok(RenderCommand::SetPbrSettings { enabled, deluxe_mapping, deluxe_specular }) => {
+                        renderer.set_pbr_settings(enabled, deluxe_mapping, deluxe_specular);
+                    }
+                    Ok(RenderCommand::SetCascadedShadows(mode)) => {
+                        renderer.set_cascaded_shadows(mode);
+                    }
+                    Ok(RenderCommand::SetCullDebug(mode)) => {
+                        renderer.set_cull_debug(mode);
+                    }
+                    Ok(RenderCommand::SetPlanarReflectionDebug(mode)) => {
+                        renderer.set_planar_reflection_debug(mode);
+                    }
+                    Ok(RenderCommand::SetPuddleDebug(enabled)) => {
+                        renderer.set_puddle_debug(enabled);
+                    }
+                    Ok(RenderCommand::DumpMaterials { filter, all }) => {
+                        renderer.dump_materials(filter.as_deref(), all);
+                    }
+                    Ok(RenderCommand::InspectSurface {
+                        x,
+                        y,
+                        width,
+                        height,
+                    }) => {
+                        let info = renderer.inspect_surface(&snapshot.camera, x, y, width, height);
+                        let _ = proxy.send_event(UserEvent::SurfaceInspected(info));
+                    }
+                    Ok(RenderCommand::ClearSurfaceInspection) => {
+                        renderer.inspector_vertex_range = None;
+                    }
+                    Ok(RenderCommand::AddSurfaceDeformation(stamp)) => {
+                        renderer.surface_deformation.push(&renderer.queue, stamp);
+                    }
+                    Ok(RenderCommand::Screenshot { directory }) => {
+                        renderer.request_screenshot(directory)
+                    }
+                    Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::SetEgui(frame)) => renderer.set_egui(frame),
+                    Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
+                    Ok(RenderCommand::LoadMap {
+                        request_id,
+                        started,
+                        name,
+                        map,
+                    }) => {
+                        let triangles = map.triangles;
+                        let batches = map.batches.len();
+                        let timings = map.load_timings;
+                        let bsp_stats = map.bsp_stats.clone();
+                        let upload_started = Instant::now();
+                        let upload_timings = renderer.load_map(*map);
+                        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                        pending_world_uploaded = Some((
+                            request_id,
+                            started,
+                            name,
+                            triangles,
+                            batches,
+                            upload_ms,
+                            upload_timings,
+                            timings,
+                            bsp_stats,
+                        ));
+                    }
+                    Ok(RenderCommand::Shutdown) => return,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            if let Some((completed, total)) = renderer.poll_static_ao_progress() {
+                let _ = proxy.send_event(UserEvent::StaticAoProgress { completed, total });
+            }
+            renderer.poll_static_ao_updates();
+            renderer.poll_static_ao_worker();
+            let next = match latest_snapshot.lock() {
+                Ok(latest) => latest.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let position_delta = next.camera.position - snapshot.camera.position;
+            let yaw_delta = (next.camera.yaw - snapshot.camera.yaw).abs();
+            let pitch_delta = (next.camera.pitch - snapshot.camera.pitch).abs();
+            let camera_changed = position_delta.length_squared() > 1.0e-10
+                || yaw_delta > 1.0e-7
+                || pitch_delta > 1.0e-7;
+            if camera_changed {
+                let now = Instant::now();
+                let elapsed = now.duration_since(motion_camera_changed_at).as_secs_f32();
+                // Large position discontinuities are camera cuts/teleports, not shutter
+                // motion. Reset the reference instead of smearing the whole image.
+                let camera_cut = position_delta.length_squared() > 256.0 * 256.0;
+                if camera_cut {
+                    motion_reference_camera = next.camera;
+                    motion_camera_sample_dt = 1.0 / 120.0;
+                } else {
+                    // After an idle period, don't interpret the idle time as the camera's
+                    // sample interval. The first new input sample should still blur.
+                    motion_camera_sample_dt = if elapsed > 0.0 && elapsed <= 0.05 {
+                        elapsed.max(1.0 / 10_000.0)
+                    } else {
+                        1.0 / 120.0
+                    };
+                    motion_reference_camera = snapshot.camera;
+                }
+                motion_camera_changed_at = now;
+            }
+            snapshot = next;
+        }
+
+        if renderer.size.width == 0 || renderer.size.height == 0 {
+            thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        // Every settings command for this frame has been drained, so a burst that
+        // asked for the scene rebuild several times over pays for it once.
+        renderer.apply_pending_scene_rebuild();
+
+        renderer.update_inline_models(snapshot.inline_models.as_deref().map(Vec::as_slice));
+
+        let frame_loop_started = Instant::now();
+        let input_latency_sample = snapshot
+            .input_latency
+            .filter(|sample| sample.sequence != last_measured_input_sequence);
+        let render_result = {
+            let _activity = crate::thread_activity::activity(
+                crate::thread_activity::ThreadSlot::Render,
+                crate::thread_activity::Task::RenderFrame,
+            );
+            renderer.render(
+                &snapshot.camera,
+                snapshot.player_position,
+                snapshot.area_mask.as_ref(),
+                snapshot.dynamic_models.as_slice(),
+                snapshot.dof_focus_target,
+                &motion_reference_camera,
+                motion_camera_sample_dt,
+                motion_camera_changed_at.elapsed().as_secs_f32(),
+            )
+        };
+        match render_result {
+            Ok(info) => {
+                if !first_frame_notified {
+                    first_frame_notified = true;
+                    let _ = proxy.send_event(UserEvent::RendererFirstFrame);
+                }
+                if perf_trace {
+                    trace_frames += 1;
+                    trace_frame_ms += info.frame_ms;
+                    trace_prepare_ms += info.cpu_prepare_ms;
+                    trace_acquire_ms += info.cpu_acquire_ms;
+                    trace_encode_ms += info.cpu_encode_ms;
+                    trace_submit_ms += info.cpu_submit_ms;
+                    trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
+                    trace_grass_cpu_ms += info.grass.cpu_ms;
+                }
+                last_info = info;
+                if let Some(sample) = input_latency_sample {
+                    let input_event_to_sim_ms = sample
+                        .simulation_at
+                        .saturating_duration_since(sample.event_at)
+                        .as_secs_f64()
+                        * 1000.0;
+                    let input_sim_to_render_ms = frame_loop_started
+                        .saturating_duration_since(sample.simulation_at)
+                        .as_secs_f64()
+                        * 1000.0;
+                    let input_event_to_present_ms =
+                        sample.event_at.elapsed().as_secs_f64() * 1000.0;
+                    input_latency_samples += 1;
+                    input_event_to_sim_sum_ms += input_event_to_sim_ms;
+                    input_sim_to_render_sum_ms += input_sim_to_render_ms;
+                    input_event_to_present_sum_ms += input_event_to_present_ms;
+                    input_event_to_present_max_ms =
+                        input_event_to_present_max_ms.max(input_event_to_present_ms);
+                    last_measured_input_sequence = sample.sequence;
+                }
+                if let Some((
+                    request_id,
+                    started,
+                    name,
+                    triangles,
+                    batches,
+                    upload_ms,
+                    upload_timings,
+                    timings,
+                    bsp_stats,
+                )) = pending_world_uploaded.take()
+                {
+                    let _ = proxy.send_event(UserEvent::WorldUploaded {
+                        request_id,
+                        name,
+                        triangles,
+                        batches,
+                        upload_ms,
+                        upload_timings,
+                        first_frame_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        timings,
+                        bsp_stats,
+                    });
+                }
+            }
+            Err(RenderError::Lost | RenderError::Outdated) => renderer.reconfigure(),
+            Err(RenderError::Timeout | RenderError::Occluded) => {}
+            Err(RenderError::Validation) => {
+                let _ = proxy.send_event(UserEvent::RendererError(
+                    "GPU surface validation error".into(),
+                ));
+            }
+        }
+
+        if let Some(result) = renderer.take_screenshot_result() {
+            let _ = proxy.send_event(UserEvent::ScreenshotFinished(result));
+        }
+
+        stats_frames += 1;
+        let elapsed = stats_started.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            let fps = stats_frames as f64 / elapsed.as_secs_f64();
+            let threads = {
+                // Sample outside the main-thread event callback so observing the
+                // overlay does not make MAIN appear busy by definition. Mark this
+                // tiny stats section as render work so RENDER's instantaneous state
+                // remains meaningful at the sample point.
+                let _activity = crate::thread_activity::activity(
+                    crate::thread_activity::ThreadSlot::Render,
+                    crate::thread_activity::Task::RenderFrame,
+                );
+                crate::thread_activity::sample()
+            };
+            let gpu_timing = renderer.gpu_profiler.latest;
+            let gpu_pass =
+                |pass: GpuPass| gpu_timing.and_then(|timing| timing.milliseconds[pass.index()]);
+            if proxy
+                .send_event(UserEvent::RenderStats(RenderStats {
+                    fps,
+                    frame_ms: last_info.frame_ms,
+                    cpu_prepare_ms: last_info.cpu_prepare_ms,
+                    cpu_acquire_ms: last_info.cpu_acquire_ms,
+                    cpu_encode_ms: last_info.cpu_encode_ms,
+                    cpu_submit_ms: last_info.cpu_submit_ms,
+                    dynamic_model_prepare_ms: last_info.dynamic_model_prepare_ms,
+                    dynamic_model_surfaces: last_info.dynamic_model_surfaces,
+                    dynamic_model_vertices: last_info.dynamic_model_vertices,
+                    dynamic_model_indices: last_info.dynamic_model_indices,
+                    gpu_ms: last_info.gpu_ms,
+                    gpu_depth_ms: gpu_pass(GpuPass::Depth),
+                    gpu_hiz_ms: gpu_pass(GpuPass::HiZ),
+                    gpu_cull_ms: gpu_pass(GpuPass::Cull),
+                    gpu_cluster_ms: gpu_pass(GpuPass::Cluster),
+                    gpu_world_ms: gpu_pass(GpuPass::World),
+                    gpu_post_ms: gpu_pass(GpuPass::Post),
+                    gpu_ui_ms: gpu_pass(GpuPass::Ui),
+                    cull_visible: last_info.cull_visible,
+                    cull_frustum_rejected: last_info.cull_frustum_rejected,
+                    cull_hiz_rejected: last_info.cull_hiz_rejected,
+                    cull_pvs_rejected: last_info.cull_pvs_rejected,
+                    cull_area_rejected: last_info.cull_area_rejected,
+                    input_event_to_sim_ms: (input_latency_samples != 0)
+                        .then(|| input_event_to_sim_sum_ms / input_latency_samples as f64),
+                    input_sim_to_render_ms: (input_latency_samples != 0)
+                        .then(|| input_sim_to_render_sum_ms / input_latency_samples as f64),
+                    input_event_to_present_ms: (input_latency_samples != 0)
+                        .then(|| input_event_to_present_sum_ms / input_latency_samples as f64),
+                    input_event_to_present_max_ms: (input_latency_samples != 0)
+                        .then_some(input_event_to_present_max_ms),
+                    input_latency_samples: u32::try_from(input_latency_samples).unwrap_or(u32::MAX),
+                    msaa_samples: renderer.msaa_samples,
+                    vsync: renderer.vsync,
+                    threads,
+                }))
+                .is_err()
+            {
+                return;
+            }
+            stats_started = Instant::now();
+            stats_frames = 0;
+            input_latency_samples = 0;
+            input_event_to_sim_sum_ms = 0.0;
+            input_sim_to_render_sum_ms = 0.0;
+            input_event_to_present_sum_ms = 0.0;
+            input_event_to_present_max_ms = 0.0;
+        }
+
+        if perf_trace && trace_started.elapsed() >= Duration::from_secs(1) {
+            let elapsed = trace_started.elapsed().as_secs_f64();
+            let frames = trace_frames.max(1) as f64;
+            let gpu = renderer.gpu_profiler.latest;
+            let gpu_value = |pass: GpuPass| {
+                gpu.and_then(|timing| timing.milliseconds[pass.index()])
+            };
+            let gpu_ms = |pass: GpuPass| {
+                gpu_value(pass).map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"))
+            };
+            let grass_prepare_gpu = gpu_value(GpuPass::GrassPrepare);
+            let grass_draw_gpu = gpu_value(GpuPass::Grass);
+            let grass_total_gpu = match (grass_prepare_gpu, grass_draw_gpu) {
+                (Some(prepare), Some(draw)) => Some(prepare + draw),
+                (None, Some(draw)) => Some(draw),
+                _ => None,
+            };
+            let grass_total_ms = grass_total_gpu
+                .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
+            println!(
+                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit_present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} hotpath=1",
+                trace_frames as f64 / elapsed,
+                trace_frame_ms / frames,
+                trace_prepare_ms / frames,
+                trace_acquire_ms / frames,
+                trace_encode_ms / frames,
+                trace_submit_ms / frames,
+                trace_dynamic_model_ms / frames,
+                last_info.ghoul2_gpu_draw_calls,
+                last_info.ghoul2_gpu_instances,
+                renderer.dynamic_model_renderer.ghoul2_batch_draws.config_value(),
+            );
+            let client = snapshot.client_perf;
+            println!(
+                "[JKA CLIENT PERF] total={:.4}ms snapshot={:.4}ms audio={:.4}ms events={:.4}ms entities={:.4}ms players={:.4}ms followed={:.4}ms fx={:.4}ms fx_tess={:.4}ms g2_mode={} g2_pose={:.4}ms/{} motion={:.4}ms/{} g2_skin={:.4}ms g2_bolt={:.4}ms/{} surfaces={} verts={} cull={}/{} lod=[{},{},{},{}] dyn[surfaces={} verts={} indices={}]",
+                client.total_ms,
+                client.snapshot_ms,
+                client.audio_ms,
+                client.events_ms,
+                client.entity_present_ms,
+                client.player_present_ms,
+                client.followed_player_ms,
+                client.fx_ms,
+                client.fx_tessellate_ms,
+                client.ghoul2_skinning_mode.config_value(),
+                client.ghoul2_pose_ms,
+                client.ghoul2_pose_evals,
+                client.ghoul2_motion_pose_ms,
+                client.ghoul2_motion_pose_evals,
+                client.ghoul2_skin_ms,
+                client.ghoul2_bolt_ms,
+                client.ghoul2_bolt_queries,
+                client.ghoul2_surfaces,
+                client.ghoul2_vertices,
+                client.ghoul2_frustum_culled,
+                client.ghoul2_frustum_tests,
+                client.ghoul2_lod_counts[0],
+                client.ghoul2_lod_counts[1],
+                client.ghoul2_lod_counts[2],
+                client.ghoul2_lod_counts[3],
+                client.dynamic_surfaces,
+                client.dynamic_vertices,
+                client.dynamic_indices,
+            );
+            println!(
+                "[JKA PERF GPU] frame={}ms world={}ms dyn_models={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
+                gpu_ms(GpuPass::Frame),
+                gpu_ms(GpuPass::World),
+                gpu_ms(GpuPass::DynamicModels),
+                grass_total_ms,
+                gpu_ms(GpuPass::GrassPrepare),
+                gpu_ms(GpuPass::Grass),
+                gpu_ms(GpuPass::Post),
+                gpu_ms(GpuPass::Depth),
+                gpu_ms(GpuPass::HiZ),
+                gpu_ms(GpuPass::Cull),
+                gpu_ms(GpuPass::Cluster),
+                gpu_ms(GpuPass::Ui),
+            );
+            let grass = last_info.grass;
+            println!(
+                "[JKA GRASS PERF] cpu_select={:.4}ms gpu={}ms gpu_prepare={}ms gpu_draw={}ms patches={}/{} reject[pvs={} frustum={} distance={} lod_empty={}] draw_records={} submit_calls={} blades[high={} mid={} low={}] triangles={} ab[precompute={} mid_lod={} front_to_back={}]",
+                trace_grass_cpu_ms / frames,
+                grass_total_gpu.map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}")),
+                gpu_ms(GpuPass::GrassPrepare),
+                gpu_ms(GpuPass::Grass),
+                grass.patches_visible,
+                grass.patches_total,
+                grass.pvs_rejected,
+                grass.frustum_rejected,
+                grass.distance_rejected,
+                grass.lod_empty,
+                grass.draw_calls,
+                grass.submit_calls,
+                grass.high_blades,
+                grass.mid_blades,
+                grass.low_blades,
+                grass.triangles,
+                u8::from(renderer.grass_precompute_enabled),
+                u8::from(renderer.grass_mid_lod_enabled),
+                u8::from(renderer.grass_front_to_back_enabled),
+            );
+            println!(
+                "[JKA PERF PLAN] post={} gamma_fast={} linear_depth={} hiz={} gpu_cull={} compact={} clustered={} gamma={:.3} grain={:.3} lut={} lut_strength={:.2} fog={:?} hdr={} tonemap={} bloom={} ssao={} static_ao={} fxaa={} smaa={} taa={} contact={} ssr={} motion={:.2} motion_scale={:.2} dof={:.2} dof_quality={} dof_focus={:.0} ca={:.2} vignette={} local_shadows={} pbr={} pom={} cascaded={}",
+                u8::from(renderer.frame_plan.use_post),
+                u8::from(renderer.frame_plan.gamma_only_post),
+                u8::from(renderer.frame_plan.needs_linear_depth),
+                u8::from(renderer.frame_plan.use_hiz),
+                u8::from(renderer.frame_plan.use_gpu_culling),
+                u8::from(
+                    renderer.frame_plan.use_gpu_culling
+                        && renderer.gpu_compaction_supported
+                        && renderer
+                            .world
+                            .as_ref()
+                            .is_some_and(|world| !world.compact_groups.is_empty()),
+                ),
+                u8::from(renderer.frame_plan.use_clustered_lighting),
+                renderer.gamma,
+                renderer.film_grain_strength,
+                renderer.color_lut_preset.config_value(),
+                renderer.color_lut_strength,
+                renderer.weather.fog.mode,
+                u8::from(renderer.hdr_enabled),
+                u8::from(renderer.tone_mapping_enabled),
+                u8::from(renderer.bloom_enabled),
+                u8::from(renderer.ssao_enabled),
+                u8::from(renderer.static_bsp_ao_enabled),
+                u8::from(renderer.fxaa_enabled),
+                u8::from(renderer.smaa_enabled),
+                u8::from(renderer.taa_enabled),
+                u8::from(renderer.contact_shadows_enabled),
+                u8::from(renderer.ssr_enabled),
+                renderer.motion_blur_strength,
+                renderer.motion_blur_runtime_scale,
+                renderer.depth_of_field_strength,
+                renderer.dof_quality.config_value(),
+                renderer.dof_focus_distance,
+                renderer.chromatic_aberration_strength,
+                u8::from(renderer.vignette_enabled),
+                u8::from(renderer.local_light_shadows_enabled),
+                u8::from(renderer.pbr_enabled && PBR_PROFILE_MATERIALS),
+                u8::from(renderer.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+                u8::from(renderer.cascaded_shadows_enabled),
+            );
+            let (point_sources, area_sources, total_sources) =
+                renderer
+                    .world
+                    .as_ref()
+                    .map_or((0_usize, 0_usize, 0_usize), |world| {
+                        let area_sources = world
+                            .dynamic_lights
+                            .iter()
+                            .filter(|light| {
+                                light
+                                    .emitter_normal
+                                    .iter()
+                                    .any(|component| component.abs() > 1.0e-6)
+                            })
+                            .count();
+                        (
+                            world.dynamic_lights.len().saturating_sub(area_sources),
+                            area_sources,
+                            world.dynamic_lights.len(),
+                        )
+                    });
+            let (pipeline_variant_label, cached_pipeline_variants) =
+                renderer.world.as_ref().map_or_else(
+                    || (renderer.world_shader_variant_key().short_label(), 0_usize),
+                    |world| {
+                        (
+                            world.active_pipeline_variant.short_label(),
+                            world.pipeline_variants.len(),
+                        )
+                    },
+                );
+            println!(
+                "[JKA PERF STATE] camera=[{:.2},{:.2},{:.2}] yaw={:.5} pitch={:.5} point={} area={} gi={} world_path={} shader={} pipeline_variant={} cached_variants={} planar={} planar_active={} lights_total={} point_sources={} area_sources={}",
+                snapshot.camera.position.x,
+                snapshot.camera.position.y,
+                snapshot.camera.position.z,
+                snapshot.camera.yaw,
+                snapshot.camera.pitch,
+                u8::from(renderer.clustered_lighting_enabled),
+                u8::from(renderer.emissive_area_lights_enabled),
+                u8::from(renderer.voxel_probe_gi_enabled),
+                match renderer.frame_plan.world_path {
+                    WorldRenderPath::FastBaseline => "fast-baseline",
+                    WorldRenderPath::Advanced => "advanced",
+                },
+                if renderer.enhanced_world_shader_needed() {
+                    "enhanced"
+                } else {
+                    "lean"
+                },
+                pipeline_variant_label,
+                cached_pipeline_variants,
+                renderer.planar_reflection_mode.label(),
+                u8::from(renderer.planar_reflection.active),
+                total_sources,
+                point_sources,
+                area_sources,
+            );
+            trace_started = Instant::now();
+            trace_frames = 0;
+            trace_frame_ms = 0.0;
+            trace_prepare_ms = 0.0;
+            trace_acquire_ms = 0.0;
+            trace_encode_ms = 0.0;
+            trace_submit_ms = 0.0;
+            trace_dynamic_model_ms = 0.0;
+            trace_grass_cpu_ms = 0.0;
+        }
+
+        if fps_cap > 0 {
+            let target = Duration::from_secs_f64(1.0 / fps_cap as f64);
+            precise_frame_wait(frame_loop_started, target);
+        }
+    }
+}
+
+fn precise_frame_wait(frame_started: Instant, target: Duration) {
+    loop {
+        let elapsed = frame_started.elapsed();
+        if elapsed >= target {
+            break;
+        }
+        let remaining = target - elapsed;
+        if remaining > Duration::from_millis(2) {
+            thread::sleep(remaining - Duration::from_millis(1));
+        } else if remaining > Duration::from_micros(150) {
+            thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+    camera_pos_time: [f32; 4],
+    // xyz + d plane equation. A zero normal disables reflection-pass clipping.
+    clip_plane: [f32; 4],
+    // x != 0 marks the lightweight reflected view. The BSP shader uses this
+    // to skip main-camera clustered/cascade data that is invalid for that view.
+    render_flags: [u32; 4],
+    // xyz: forward vector for OpenJK-compatible eye-depth fog.
+    camera_forward: [f32; 4],
+    // Bevy TAA motion-vector prepass uses unjittered current/previous clip matrices.
+    // Keep these at the end so shaders that only consume the historical prefix remain valid.
+    unjittered_view_proj: [[f32; 4]; 4],
+    previous_unjittered_view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaterialUniform {
+    header: [u32; 4],
+    vector_s: [f32; 4],
+    vector_t: [f32; 4],
+    mods: [[f32; 4]; 8],
+    color: [f32; 4],
+    params: [f32; 4],
+    // xy normalScale, z fixed roughness (-1 = texture/default), w cached roughness hint.
+    pbr_params0: [f32; 4],
+    // xyz fixed dielectric reflectance, w != 0 when authored.
+    pbr_params1: [f32; 4],
+    reflection_probe: [f32; 4],
+    planar_plane: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct StaticLightGridUniform {
+    // xyz: JKA-space origin, w: enabled
+    origin_enabled: [f32; 4],
+    // xyz: inverse JKA grid spacing
+    inv_size: [f32; 4],
+    // xyz: grid dimensions
+    bounds: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct IrradianceVolumeUniform {
+    // Bevy LightProbe transform: renderer world space -> a 1x1x1 cube centered
+    // on the origin. The JKA adapter constructs this from the BSP lightgrid.
+    light_from_world: [[f32; 4]; 4],
+    // xyz: Bevy LightProbe falloff ratio per axis, w: IrradianceVolume intensity.
+    falloff_intensity: [f32; 4],
+    // x: volume present/enabled. Remaining components are padding.
+    volume_enabled_pad: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct VoxelProbeGiUniform {
+    // xyz: first probe center in renderer coordinates, w: data present
+    origin_enabled: [f32; 4],
+    // xyz: reciprocal cell size, w: cell size
+    inv_cell: [f32; 4],
+    // xyz: probe dimensions, w: final indirect intensity
+    bounds_strength: [f32; 4],
+}
+
+impl Default for MaterialUniform {
+    fn default() -> Self {
+        Self {
+            header: [0; 4],
+            vector_s: [0.0; 4],
+            vector_t: [0.0; 4],
+            mods: [[0.0; 4]; 8],
+            color: [1.0; 4],
+            params: [0.0; 4],
+            pbr_params0: [1.0, 1.0, -1.0, 0.0],
+            pbr_params1: [0.04, 0.04, 0.04, 0.0],
+            reflection_probe: [0.0; 4],
+            planar_plane: [0.0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlanarReflectionUniform {
+    // Up to four renderer-space mirror planes, xyz normal + d.
+    planes: [[f32; 4]; PLANAR_REFLECTION_SLOTS],
+    // xy main-frame viewport size, z active slot count,
+    // w permits planar promotion of tcGen environment stages.
+    viewport: [f32; 4],
+    // x: PlanarReflectionDebugMode shader value. Remaining lanes reserved.
+    debug: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostColorSettings {
+    gamma: f32,
+    tone_mapping: f32,
+    bloom: f32,
+    ssao: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostAaSettings {
+    fxaa: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    taa: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostSceneSettings {
+    contact_shadows: f32,
+    volumetric_fog: f32,
+    ssr: f32,
+    history_valid: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostFilmSettings {
+    halation: f32,
+    chromatic_aberration: f32,
+    vignette: f32,
+    lut_strength: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostGrainSettings {
+    strength: f32,
+    grain_size: f32,
+    time: f32,
+    exposure: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCameraFxSettings {
+    // Camera-motion shutter scale, DOF strength, smoothed autofocus distance,
+    // and DOF quality (0 performance, 1 adaptive, 2 high).
+    motion_blur_scale: f32,
+    depth_of_field: f32,
+    dof_focus_distance: f32,
+    dof_quality: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DofUniform {
+    focus_strength: [f32; 4], // focus distance, strength, viewport width, height
+    quality: [f32; 4],        // x: 0 performance, 1 adaptive, 2 high
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CloudRenderSettings {
+    values: [f32; 4], // enabled, type, quality, coverage
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CloudLayerSettings {
+    values: [f32; 4], // base height, thickness, wind speed, wind direction radians
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CloudSunSettings {
+    direction_intensity: [f32; 4],
+    color_density: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudShadowSettings {
+    values: [f32; 4], // enabled, projected shadow strength, temporal depth-gate fix, terrain interaction
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudShapingSettings {
+    // wind shear, base height variation, empty-space skip gate, aerial perspective
+    values: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudSkyAmbientSettings {
+    values: [f32; 4], // rgb average of the map skybox, w blend amount
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudTemporalTuningSettings {
+    values: [f32; 4], // history blend, motion reject, depth reject, reserved
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudVariationSettings {
+    values: [f32; 4], // thickness variation, cloud size, wind variation gate, shape evolution gate
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudTemporalSettings {
+    values: [f32; 4], // enabled, history valid, active 2x2 pattern, grid size
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostUniform {
+    color: PostColorSettings,
+    aa: PostAaSettings,
+    // x: scene is HDR (Bevy tonemaps before temporal resolve and reverses after).
+    taa_params: [f32; 4],
+    scene: PostSceneSettings,
+    film: PostFilmSettings,
+    grain: PostGrainSettings,
+    camera_fx: PostCameraFxSettings,
+    clouds: CloudRenderSettings,
+    cloud_layer: CloudLayerSettings,
+    cloud_sun: CloudSunSettings,
+    cloud_shadow: PostCloudShadowSettings,
+    cloud_shaping: PostCloudShapingSettings,
+    cloud_sky_ambient: PostCloudSkyAmbientSettings,
+    cloud_temporal_tuning: PostCloudTemporalTuningSettings,
+    cloud_variation: PostCloudVariationSettings,
+    cloud_temporal: PostCloudTemporalSettings,
+    rain: [f32; 4],           // enabled, intensity, distant haze strength, puddle accumulation
+    weather_occlusion: [f32; 4], // min render X/Z, inverse heightfield extent X/Z
+    camera_pos_time: [f32; 4],
+    prev_camera_pos_time: [f32; 4],
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    cloud_inv_view_proj: [[f32; 4]; 4],
+    cloud_prev_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    motion_prev_view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SsaoTemporalUniform {
+    // x/y: full-resolution viewport, z: temporal history valid.
+    viewport_history: [f32; 4],
+    camera_pos_time: [f32; 4],
+    previous_camera_pos: [f32; 4],
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SsrTemporalUniform {
+    // x/y: full-resolution viewport, z: temporal history valid, w: frame index.
+    viewport_history: [f32; 4],
+    camera_pos_time: [f32; 4],
+    previous_camera_pos: [f32; 4],
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GammaPostUniform {
+    values: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AutoExposureUniform {
+    // enabled, delta seconds, min EV, max EV
+    params: [f32; 4],
+    // middle gray, brighten speed, darken speed, reserved
+    adaptation: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AutoExposureState {
+    exposure_ev: f32,
+    average_luminance: f32,
+    target_ev: f32,
+    reserved: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuCullRecord {
+    minimum: [f32; 4],
+    maximum: [f32; 4],
+    draw: [u32; 4],    // index_count, first_index, sky flag, reserved
+    compact: [u32; 4], // group index, output base, compactable, reserved
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuCullSettings {
+    viewport_mips_flags: [u32; 4], // width, height, mip count, hi-z enabled
+    active_compaction: [u32; 4], // active records, groups, compaction enabled, diagnostics enabled
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DrawIndexedIndirectArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuPointLight {
+    position_radius: [f32; 4],
+    color_intensity: [f32; 4],
+    // xyz: q3map surface-emitter normal. w: 0=point, 1=one-sided, 2=two-sided.
+    emitter: [f32; 4],
+    shadow: [f32; 4], // x: cubemap slot + 1, 0 means unshadowed
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LightingSettings {
+    values: [u32; 4],        // enabled, light count, viewport width, viewport height
+    local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, reserved
+    feature_flags: [u32; 4], // emissive area lights, voxel/probe GI, point/entity lights, reflection quality
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PbrSettings {
+    values: [u32; 4], // PBR enabled, parallax enabled, height scale * 1000
+    deluxe: [f32; 4], // enabled, specular scale, reserved, reserved
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowReceiverUniform {
+    view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
+    split_depths: [f32; 4],
+    light_direction_enabled: [f32; 4],
+    params: [f32; 4], // map size, legacy bias, shadow strength, 1 = Bevy CSM
+    camera_forward: [f32; 4],
+    cascade_texel_sizes: [f32; 4],
+    bevy_params: [f32; 4], // depth bias, normal bias, overlap proportion, cascade count
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowCasterUniform {
+    view_proj: [[f32; 4]; 4],
+    camera_pos_time: [f32; 4],
+}
+
+struct ShadowResources {
+    _texture: wgpu::Texture,
+    _array_view: wgpu::TextureView,
+    layer_views: Vec<wgpu::TextureView>,
+    _sky_texture: wgpu::Texture,
+    sky_array_view: wgpu::TextureView,
+    sky_layer_views: Vec<wgpu::TextureView>,
+    legacy_sampler: wgpu::Sampler,
+    bevy_sampler: wgpu::Sampler,
+    // Static weather exposure uses the same R32F roof-height field as rain
+    // collision. A dedicated non-filtering sampler lets shaders gather the four
+    // neighboring heights in one instruction for a smooth shelter boundary.
+    _weather_fallback_texture: wgpu::Texture,
+    weather_height_view: wgpu::TextureView,
+    weather_sampler: wgpu::Sampler,
+    receiver_buffer: wgpu::Buffer,
+    weather_surface_buffer: wgpu::Buffer,
+    receiver_bind_group: wgpu::BindGroup,
+    caster_buffers: Vec<wgpu::Buffer>,
+    caster_bind_groups: Vec<wgpu::BindGroup>,
+    pipeline: wgpu::RenderPipeline,
+    mask_pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    bevy_pipeline: wgpu::RenderPipeline,
+    bevy_mask_pipeline: wgpu::RenderPipeline,
+    bevy_translucent_pipeline: wgpu::RenderPipeline,
+    bevy_sky_pipeline: wgpu::RenderPipeline,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LocalShadowCacheEntry {
+    light_index: Option<usize>,
+    last_used: u64,
+}
+
+struct LocalShadowResources {
+    _texture: wgpu::Texture,
+    cube_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    layer_views: Vec<wgpu::TextureView>,
+    caster_buffers: Vec<wgpu::Buffer>,
+    caster_bind_groups: Vec<wgpu::BindGroup>,
+    cache_entries: Vec<LocalShadowCacheEntry>,
+    active_light_indices: Vec<usize>,
+    pending_slots: Vec<usize>,
+    shadowed_light_count: u32,
+    selection_cluster: Option<Option<usize>>,
+    selection_position: Option<Vec3>,
+    selection_serial: u64,
+}
+
+struct GpuImage {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SurfaceSpriteEffectVertex {
+    position: [f32; 3],
+    uv: [f32; 2],
+    color: [f32; 4],
+}
+
+const SURFACE_SPRITE_EFFECT_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4];
+
+/// Raven's fixed deterministic table from tr_surfacesprites.cpp. Keeping this
+/// verbatim is important: surfaceSprites positions are seeded from triangle
+/// coordinates and shader time, so replacing it with a modern RNG visibly moves
+/// every splash/particle on legacy maps.
+const SURFACE_SPRITE_RANDOM: [f32; 256] = [
+    0.6554, 0.6909, 0.4806, 0.6218, 0.5717, 0.3896, 0.0677, 0.7356,
+    0.8333, 0.1105, 0.4445, 0.8161, 0.4689, 0.0433, 0.7152, 0.0336,
+    0.0186, 0.9140, 0.1626, 0.6553, 0.8340, 0.7094, 0.2020, 0.8087,
+    0.9119, 0.8009, 0.1339, 0.8492, 0.9173, 0.5003, 0.6012, 0.6117,
+    0.5525, 0.5787, 0.1586, 0.3293, 0.9273, 0.7791, 0.8589, 0.4985,
+    0.0883, 0.8545, 0.2634, 0.4727, 0.3624, 0.1631, 0.7825, 0.0662,
+    0.6704, 0.3510, 0.7525, 0.9486, 0.4685, 0.1535, 0.1545, 0.1121,
+    0.4724, 0.8483, 0.3833, 0.1917, 0.8207, 0.3885, 0.9702, 0.9200,
+    0.8348, 0.7501, 0.6675, 0.4994, 0.0301, 0.5225, 0.8011, 0.1696,
+    0.5351, 0.2752, 0.2962, 0.7550, 0.5762, 0.7303, 0.2835, 0.4717,
+    0.1818, 0.2739, 0.6914, 0.7748, 0.7640, 0.8355, 0.7314, 0.5288,
+    0.7340, 0.6692, 0.6813, 0.2810, 0.8057, 0.0648, 0.8749, 0.9199,
+    0.1462, 0.5237, 0.3014, 0.4994, 0.0278, 0.4268, 0.7238, 0.5107,
+    0.1378, 0.7303, 0.7200, 0.3819, 0.2034, 0.7157, 0.5552, 0.4887,
+    0.0871, 0.3293, 0.2892, 0.4545, 0.0088, 0.1404, 0.0275, 0.0238,
+    0.0515, 0.4494, 0.7206, 0.2893, 0.6060, 0.5785, 0.4182, 0.5528,
+    0.9118, 0.8742, 0.3859, 0.6030, 0.3495, 0.4550, 0.9875, 0.6900,
+    0.6416, 0.2337, 0.7431, 0.9788, 0.6181, 0.2464, 0.4661, 0.7621,
+    0.7020, 0.8203, 0.8869, 0.2145, 0.7724, 0.6093, 0.6692, 0.9686,
+    0.5609, 0.0310, 0.2248, 0.2950, 0.2365, 0.1347, 0.2342, 0.1668,
+    0.3378, 0.4330, 0.2775, 0.9901, 0.7053, 0.7266, 0.4840, 0.2820,
+    0.5733, 0.4555, 0.6049, 0.0770, 0.4760, 0.6060, 0.4159, 0.3427,
+    0.1234, 0.7062, 0.8569, 0.1878, 0.9057, 0.9399, 0.8139, 0.1407,
+    0.1794, 0.9123, 0.9493, 0.2827, 0.9934, 0.0952, 0.4879, 0.5160,
+    0.4118, 0.4873, 0.3642, 0.7470, 0.0866, 0.5172, 0.6365, 0.2676,
+    0.2407, 0.7223, 0.5761, 0.1143, 0.7137, 0.2342, 0.3353, 0.6880,
+    0.2296, 0.6023, 0.6027, 0.4138, 0.5408, 0.9859, 0.1503, 0.7238,
+    0.6054, 0.2477, 0.6804, 0.1432, 0.4540, 0.9776, 0.8762, 0.7607,
+    0.9025, 0.9807, 0.0652, 0.8661, 0.7663, 0.2586, 0.3994, 0.0335,
+    0.7328, 0.0166, 0.9589, 0.4348, 0.5493, 0.7269, 0.6867, 0.6614,
+    0.6800, 0.7804, 0.5591, 0.8381, 0.0910, 0.7573, 0.8985, 0.3083,
+    0.3188, 0.8481, 0.2356, 0.6736, 0.4770, 0.4560, 0.6266, 0.4677,
+];
+
+struct SurfaceSpriteEffectGpu {
+    source: scene::SurfaceSpriteEffectEmitter,
+    bind_group: wgpu::BindGroup,
+}
+
+#[derive(Default)]
+struct PreparedSurfaceSpriteEffects {
+    draws: Vec<SurfaceSpriteEffectDraw>,
+}
+
+struct SurfaceSpriteEffectDraw {
+    emitter: usize,
+    vertices: std::ops::Range<u32>,
+}
+
+struct SurfaceSpriteEffectRenderer {
+    texture_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    pipelines: BTreeMap<Option<BlendFunc>, wgpu::RenderPipeline>,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity_bytes: u64,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+}
+
+impl SurfaceSpriteEffectRenderer {
+    fn new(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> Self {
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA surfaceSprites effect texture layout"),
+            entries: &[texture_entry(0), sampler_entry(1)],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA surfaceSprites effect pipeline layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA surfaceSprites effect shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("surface_sprite_effect.wgsl").into()),
+        });
+        let vertex_capacity_bytes = 64 * 1024;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA surfaceSprites effect dynamic vertices"),
+            size: vertex_capacity_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            texture_layout,
+            pipeline_layout,
+            shader,
+            pipelines: BTreeMap::new(),
+            vertex_buffer,
+            vertex_capacity_bytes,
+            surface_format,
+            samples,
+        }
+    }
+
+    fn rebuild_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+    ) {
+        self.surface_format = surface_format;
+        self.samples = samples;
+        self.pipelines.clear();
+        // Pipelines are recreated lazily for only the blend functions the map uses.
+        let _ = device;
+    }
+
+    fn create_texture_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA surfaceSprites effect texture"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+
+    fn ensure_pipeline(&mut self, device: &wgpu::Device, blend: Option<BlendFunc>) {
+        if self.pipelines.contains_key(&blend) {
+            return;
+        }
+        let gpu_blend = blend.map(|blend| {
+            let component = wgpu::BlendComponent {
+                src_factor: gpu_blend_factor(blend.src),
+                dst_factor: gpu_blend_factor(blend.dst),
+                operation: wgpu::BlendOperation::Add,
+            };
+            wgpu::BlendState {
+                color: component,
+                alpha: component,
+            }
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("JKA surfaceSprites effect pipeline"),
+            layout: Some(&self.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &self.shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SurfaceSpriteEffectVertex>()
+                        as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &SURFACE_SPRITE_EFFECT_ATTRIBUTES,
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // CQuickSpriteSystem::StartGroup disables GL_CULL_FACE.
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(blend.is_none()),
+                depth_compare: Some(camera_depth_compare()),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: self.samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: gpu_blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.insert(blend, pipeline);
+    }
+
+    fn prepare_draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        effects: &[SurfaceSpriteEffectGpu],
+        camera: &Camera,
+        pvs_cluster: Option<usize>,
+        time_ms: f32,
+    ) -> PreparedSurfaceSpriteEffects {
+        let mut vertices = Vec::<SurfaceSpriteEffectVertex>::new();
+        let mut draws = Vec::new();
+        let camera_jka = Vec3::from_array(scene::jka_position(camera.position.to_array()));
+        let forward = camera.forward();
+        let screen_right = forward.cross(Vec3::Y).normalize_or_zero();
+        // OpenJK viewParms.ori.axis[1] is -AngleVectors(right), i.e. the
+        // engine's historical "left" basis even though surface-sprite code
+        // names it ssViewRight. Preserve that sign so legacy splash textures
+        // are not mirrored relative to retail JKA.
+        let sprite_right_render = -screen_right;
+        let up_render = screen_right.cross(forward).normalize_or_zero();
+        let right_jka = Vec3::from_array(scene::jka_position(sprite_right_render.to_array()));
+        let up_jka = Vec3::from_array(scene::jka_position(up_render.to_array()));
+
+        for (emitter_index, effect) in effects.iter().enumerate() {
+            if !surface_sprite_signature_visible(&effect.source.pvs_signature, pvs_cluster) {
+                continue;
+            }
+            self.ensure_pipeline(device, effect.source.blend);
+            let start = vertices.len() as u32;
+            append_jka_effect_surface_sprites(
+                &effect.source,
+                camera_jka,
+                right_jka,
+                up_jka,
+                time_ms,
+                &mut vertices,
+            );
+            let end = vertices.len() as u32;
+            if end > start {
+                draws.push(SurfaceSpriteEffectDraw {
+                    emitter: emitter_index,
+                    vertices: start..end,
+                });
+            }
+        }
+
+        let required_bytes = (vertices.len() * std::mem::size_of::<SurfaceSpriteEffectVertex>())
+            as u64;
+        if required_bytes > self.vertex_capacity_bytes {
+            self.vertex_capacity_bytes = required_bytes.next_power_of_two().max(64 * 1024);
+            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA surfaceSprites effect dynamic vertices"),
+                size: self.vertex_capacity_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if required_bytes != 0 {
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+        PreparedSurfaceSpriteEffects { draws }
+    }
+
+    fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        effects: &'a [SurfaceSpriteEffectGpu],
+        prepared: &PreparedSurfaceSpriteEffects,
+    ) {
+        if prepared.draws.is_empty() {
+            return;
+        }
+        pass.set_bind_group(0, camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        for draw in &prepared.draws {
+            let effect = &effects[draw.emitter];
+            let Some(pipeline) = self.pipelines.get(&effect.source.blend) else {
+                continue;
+            };
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(1, &effect.bind_group, &[]);
+            pass.draw(draw.vertices.clone(), 0..1);
+        }
+    }
+}
+
+fn surface_sprite_signature_visible(signature: &[u64], cluster: Option<usize>) -> bool {
+    let Some(cluster) = cluster else {
+        return true;
+    };
+    if signature.is_empty() {
+        return true;
+    }
+    let word = cluster / 64;
+    let bit = cluster % 64;
+    signature
+        .get(word)
+        .is_none_or(|value| *value & (1_u64 << bit) != 0)
+}
+
+fn surface_sprite_random(index: u8) -> f32 {
+    SURFACE_SPRITE_RANDOM[index as usize]
+}
+
+fn surface_sprite_byte(value: f32) -> u8 {
+    ((value.trunc() as i64).rem_euclid(256)) as u8
+}
+
+fn append_surface_sprite_quad(
+    loc: Vec3,
+    width: f32,
+    height: f32,
+    face_up: bool,
+    view_right: Vec3,
+    view_up: Vec3,
+    light: f32,
+    alpha: f32,
+    out: &mut Vec<SurfaceSpriteEffectVertex>,
+) {
+    let points = if face_up {
+        // RB_EffectSurfaceSprite intentionally makes face-up effects square:
+        // it halves height too, but only the half-width is used for X/Y.
+        let half = width * 0.5;
+        [
+            Vec3::new(loc.x + half, loc.y - half, loc.z + 1.0),
+            Vec3::new(loc.x + half, loc.y + half, loc.z + 1.0),
+            Vec3::new(loc.x - half, loc.y + half, loc.z + 1.0),
+            Vec3::new(loc.x - half, loc.y - half, loc.z + 1.0),
+        ]
+    } else {
+        let top = loc + view_up * height;
+        let right = view_right * (width * 0.5);
+        [loc + right, top + right, top - right, loc - right]
+    };
+    let uv = [[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
+    let color = [light, light, light, alpha];
+    let converted = points.map(|point| scene::render_position(point.to_array()));
+    for corner in [0usize, 1, 2, 0, 2, 3] {
+        out.push(SurfaceSpriteEffectVertex {
+            position: converted[corner],
+            uv: uv[corner],
+            color,
+        });
+    }
+}
+
+fn append_jka_effect_surface_sprites(
+    emitter: &scene::SurfaceSpriteEffectEmitter,
+    camera_jka: Vec3,
+    view_right_jka: Vec3,
+    view_up_jka: Vec3,
+    time_ms: f32,
+    out: &mut Vec<SurfaceSpriteEffectVertex>,
+) {
+    const FADE_RANGE: f32 = 250.0;
+    let sprite = emitter.sprite;
+    let cut_dist = sprite.fade_max.max(sprite.fade_dist + 0.001);
+    let fade_dist = sprite.fade_dist;
+    let cut_dist2 = cut_dist * cut_dist;
+    let fade_dist2 = fade_dist * fade_dist;
+    let inv_fade_diff = 1.0 / (cut_dist2 - fade_dist2);
+    let fade_range = (FADE_RANGE / (cut_dist - fade_dist)).min(1.0);
+    let face_up = !matches!(sprite.facing, jka_assets::shader::SurfaceSpriteFacing::Normal);
+    let min_normal = if face_up { 0.99 } else { 0.5 };
+    let fx_alpha = sprite.fx_alpha_end - sprite.fx_alpha_start;
+    let fade_in_out = sprite.fx_alpha_end < 0.05 && sprite.height >= 0.1 && sprite.width >= 0.1;
+    let additive = emitter.blend.is_some_and(|blend| {
+        blend.src == BlendFactor::One && blend.dst == BlendFactor::One
+    });
+
+    for triangle in &emitter.triangles {
+        if triangle.normal_z.iter().any(|normal| *normal < min_normal) {
+            continue;
+        }
+        let v = triangle.positions_jka.map(Vec3::from_array);
+        let alpha_at = v.map(|point| {
+            1.0 - ((camera_jka - point).length_squared() - fade_dist2) * inv_fade_diff
+        });
+        if alpha_at.iter().all(|alpha| *alpha <= 0.0) {
+            continue;
+        }
+        let e12 = v[1] - v[0];
+        let e13 = v[2] - v[0];
+        let tri_area = (e13.x * e12.y - e13.y * e12.x).abs();
+        if tri_area <= 1.0 || !tri_area.is_finite() {
+            continue;
+        }
+        let step = sprite.density / tri_area.sqrt();
+        if !step.is_finite() || step <= 0.0 {
+            continue;
+        }
+
+        let mut random_index = surface_sprite_byte(
+            v[0].x + v[0].y + v[1].x + v[1].y + v[2].x + v[2].y,
+        );
+        let random_interval = surface_sprite_byte(v[0].x + v[1].y + v[2].z) | 0x03;
+        let mut pos_i = 0.0_f32;
+        while pos_i < 1.0 {
+            let mut pos_j = 0.0_f32;
+            while pos_j < 1.0 - pos_i {
+                let effect_time =
+                    (time_ms + 10000.0 * surface_sprite_random(random_index)) / sprite.fx_duration;
+                let effect_cycle = effect_time.trunc() as i64;
+                let effect_pos = effect_time - effect_time.trunc();
+                let mut random_index2 =
+                    random_index.wrapping_add(effect_cycle.rem_euclid(256) as u8);
+                random_index = random_index.wrapping_add(random_interval);
+
+                let fa = pos_i + surface_sprite_random(random_index2) * step;
+                random_index2 = random_index2.wrapping_add(1);
+                if fa <= 1.0 {
+                    let fb = pos_j + surface_sprite_random(random_index2) * step;
+                    random_index2 = random_index2.wrapping_add(1);
+                    if fb <= 1.0 - fa {
+                        let fc = 1.0 - fa - fb;
+                        let alpha_pos =
+                            alpha_at[0] * fa + alpha_at[1] * fb + alpha_at[2] * fc;
+                        let this_fade_start = fade_range
+                            + (1.0 - fade_range) * surface_sprite_random(random_index2);
+                        random_index2 = random_index2.wrapping_add(random_interval);
+                        let _ = random_index2;
+                        let mut alpha =
+                            1.0 - ((this_fade_start - alpha_pos) / fade_range.max(1.0e-6));
+                        if alpha > 0.0 {
+                            alpha = alpha.min(1.0);
+                            let point = v[0] * fa + v[1] * fb + v[2] * fc;
+                            let mut light = f32::from(triangle.light[0]) * fa
+                                + f32::from(triangle.light[1]) * fb
+                                + f32::from(triangle.light[2]) * fc;
+
+                            let mut size_index = random_index;
+                            let variance = surface_sprite_random(size_index);
+                            let mut width = sprite.width * (1.0 + sprite.variance[0] * variance);
+                            let mut height = sprite.height * (1.0 + sprite.variance[1] * variance);
+                            size_index = size_index.wrapping_add(1);
+                            width += effect_pos * sprite.fx_grow[0] * width;
+                            height += effect_pos * sprite.fx_grow[1] * height;
+
+                            if fade_in_out {
+                                if effect_pos > 0.5 {
+                                    alpha *= sprite.fx_alpha_start
+                                        + fx_alpha * (effect_pos - 0.5) * 2.0;
+                                } else {
+                                    alpha *= sprite.fx_alpha_start
+                                        + fx_alpha * (0.5 - effect_pos) * 2.0;
+                                }
+                            } else {
+                                alpha *= sprite.fx_alpha_start + fx_alpha * effect_pos;
+                            }
+
+                            if additive {
+                                light = (128.0 + light * 0.5) * alpha;
+                                alpha = 1.0;
+                            }
+                            if surface_sprite_random(size_index) > 0.5 {
+                                width = -width;
+                            }
+                            if sprite.fade_scale != 0.0 && alpha_pos < 1.0 {
+                                width *= 1.0 + sprite.fade_scale * (1.0 - alpha_pos);
+                            }
+
+                            append_surface_sprite_quad(
+                                point,
+                                width,
+                                height,
+                                face_up,
+                                view_right_jka,
+                                view_up_jka,
+                                (light / 255.0).clamp(0.0, 1.0),
+                                alpha.clamp(0.0, 1.0),
+                                out,
+                            );
+                        }
+                    }
+                }
+                pos_j += step;
+            }
+            pos_i += step;
+        }
+    }
+}
+
+const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x3,
+    2 => Float32x2,
+    3 => Float32x4
+];
+
+const GHOUL2_GPU_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x3,
+    2 => Float32x2,
+    3 => Uint32x4,
+    4 => Float32x4,
+    5 => Uint32
+];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct Ghoul2GpuDrawUniform {
+    axis0: [f32; 4],
+    axis1: [f32; 4],
+    axis2: [f32; 4],
+    origin: [f32; 4],
+    color: [f32; 4],
+    params: [u32; 4],
+}
+
+struct Ghoul2GpuMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+struct Ghoul2PreparedDraw {
+    mesh_key: Arc<str>,
+    texture_key: Option<Arc<str>>,
+    alpha_mode: DynamicModelAlphaMode,
+    first_instance: u32,
+    instance_count: u32,
+}
+
+struct Ghoul2PendingDraw {
+    mesh_key: Arc<str>,
+    texture_key: Option<Arc<str>>,
+    alpha_mode: DynamicModelAlphaMode,
+    uniform: Ghoul2GpuDrawUniform,
+    sequence: u32,
+    // Adaptive batching starts by hashing a bounded distributed sample.  If
+    // the probe says batching is worthwhile, retain those hashes so the full
+    // grouping pass continues from the work already done instead of starting
+    // over.  Exact keys are still compared after the hash, so collisions are
+    // harmless.
+    batch_hash: Option<u64>,
+}
+
+struct DynamicGpuTexture {
+    _image: GpuImage,
+    bind_group: wgpu::BindGroup,
+}
+
+struct DynamicPreparedDraw {
+    first_index: u32,
+    index_count: u32,
+    texture_key: Option<Arc<str>>,
+    alpha_mode: DynamicModelAlphaMode,
+}
+
+/// Dynamic indexed-mesh path used by cgame entities. CPU-skinned surfaces use
+/// the legacy transient stream; GPU Ghoul2 surfaces keep static bind-pose meshes
+/// cached here and upload only final CPU-evaluated bones plus per-draw transforms.
+/// The renderer still knows nothing about demo/network provenance or JKA state.
+struct DynamicModelRenderer {
+    texture_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    opaque_pipeline: wgpu::RenderPipeline,
+    mask_pipeline: wgpu::RenderPipeline,
+    blend_pipeline: wgpu::RenderPipeline,
+    mask_blend_pipeline: wgpu::RenderPipeline,
+    additive_one_pipeline: wgpu::RenderPipeline,
+    additive_pipeline: wgpu::RenderPipeline,
+    blend_unlit_pipeline: wgpu::RenderPipeline,
+    modulate_pipeline: wgpu::RenderPipeline,
+    skin_layout: wgpu::BindGroupLayout,
+    skin_pipeline_layout: wgpu::PipelineLayout,
+    skin_shader: wgpu::ShaderModule,
+    skin_opaque_pipeline: wgpu::RenderPipeline,
+    skin_mask_pipeline: wgpu::RenderPipeline,
+    skin_blend_pipeline: wgpu::RenderPipeline,
+    skin_mask_blend_pipeline: wgpu::RenderPipeline,
+    skin_additive_one_pipeline: wgpu::RenderPipeline,
+    skin_additive_pipeline: wgpu::RenderPipeline,
+    skin_blend_unlit_pipeline: wgpu::RenderPipeline,
+    skin_modulate_pipeline: wgpu::RenderPipeline,
+    repeat_sampler: wgpu::Sampler,
+    clamp_sampler: wgpu::Sampler,
+    fallback_bind_group: wgpu::BindGroup,
+    textures: HashMap<Arc<str>, DynamicGpuTexture>,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
+    draws: Vec<DynamicPreparedDraw>,
+    ghoul2_meshes: HashMap<Arc<str>, Ghoul2GpuMesh>,
+    skin_bone_buffer: wgpu::Buffer,
+    skin_draw_buffer: wgpu::Buffer,
+    skin_bone_capacity: u64,
+    skin_draw_capacity: u64,
+    skin_bind_group: wgpu::BindGroup,
+    skin_draws: Vec<Ghoul2PreparedDraw>,
+    ghoul2_batch_draws: Ghoul2BatchMode,
+    ghoul2_input_instances: u32,
+    ghoul2_encoded_draws: u32,
+    // Reused frame scratch storage. Dynamic model preparation runs every frame;
+    // retaining these allocations avoids allocator churn in many-entity scenes.
+    scratch_vertices: Vec<DynamicModelVertex>,
+    scratch_indices: Vec<u32>,
+    scratch_bones: Vec<Ghoul2GpuBone>,
+    scratch_draw_data: Vec<Ghoul2GpuDrawUniform>,
+    scratch_bone_offsets: HashMap<usize, u32>,
+    scratch_skin_pending: Vec<Ghoul2PendingDraw>,
+    // Per-frame pointer -> stable key cache. TextureData is Arc-backed and immutable
+    // during prepare, so identical surfaces can avoid rebuilding the same formatted
+    // texture cache key hundreds of times in crowd scenes. Cleared every frame so
+    // allocator pointer reuse can never alias an older TextureData.
+    frame_texture_keys: HashMap<usize, Arc<str>>,
+}
+
+impl DynamicModelRenderer {
+    fn new(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+        white: &GpuImage,
+    ) -> Self {
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA dynamic model texture layout"),
+            entries: &[texture_entry(0), sampler_entry(1)],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA dynamic model pipeline layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA dynamic model shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("md3.wgsl").into()),
+        });
+        let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Ghoul2 GPU skinning layout"),
+            entries: &[
+                storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX),
+                storage_buffer_entry(1, true, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let skin_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Ghoul2 GPU skinning pipeline layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&texture_layout), Some(&skin_layout)],
+            immediate_size: 0,
+        });
+        let skin_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Ghoul2 GPU skinning shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ghoul2_skin.wgsl").into()),
+        });
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA dynamic model repeat sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA dynamic model clamp sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let fallback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA dynamic model white fallback"),
+            layout: &texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&clamp_sampler),
+                },
+            ],
+        });
+        let vertex_capacity = 4096;
+        let index_capacity = 4096;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA dynamic model vertex buffer"),
+            size: vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA dynamic model index buffer"),
+            size: index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let skin_bone_capacity = 4096;
+        let skin_draw_capacity = 4096;
+        let skin_bone_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA Ghoul2 GPU bone buffer"),
+            size: skin_bone_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let skin_draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA Ghoul2 GPU draw buffer"),
+            size: skin_draw_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let skin_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA Ghoul2 GPU skinning bind group"),
+            layout: &skin_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: skin_bone_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: skin_draw_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let opaque_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+        let mask_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+        let blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+        let mask_blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
+        let additive_one_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
+        let additive_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+        let blend_unlit_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+        let modulate_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+        let skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+        let skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+        let skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+        let skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
+        let skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
+        let skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+        let skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+        let skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+
+        Self {
+            texture_layout,
+            pipeline_layout,
+            shader,
+            opaque_pipeline,
+            mask_pipeline,
+            blend_pipeline,
+            mask_blend_pipeline,
+            additive_one_pipeline,
+            additive_pipeline,
+            blend_unlit_pipeline,
+            modulate_pipeline,
+            skin_layout,
+            skin_pipeline_layout,
+            skin_shader,
+            skin_opaque_pipeline,
+            skin_mask_pipeline,
+            skin_blend_pipeline,
+            skin_mask_blend_pipeline,
+            skin_additive_one_pipeline,
+            skin_additive_pipeline,
+            skin_blend_unlit_pipeline,
+            skin_modulate_pipeline,
+            repeat_sampler,
+            clamp_sampler,
+            fallback_bind_group,
+            textures: HashMap::new(),
+            vertex_buffer,
+            index_buffer,
+            vertex_capacity,
+            index_capacity,
+            draws: Vec::new(),
+            ghoul2_meshes: HashMap::new(),
+            skin_bone_buffer,
+            skin_draw_buffer,
+            skin_bone_capacity,
+            skin_draw_capacity,
+            skin_bind_group,
+            skin_draws: Vec::new(),
+            ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
+            ghoul2_input_instances: 0,
+            ghoul2_encoded_draws: 0,
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
+            scratch_bones: Vec::new(),
+            scratch_draw_data: Vec::new(),
+            scratch_bone_offsets: HashMap::new(),
+            scratch_skin_pending: Vec::new(),
+            frame_texture_keys: HashMap::new(),
+        }
+    }
+
+    fn set_ghoul2_batch_draws(&mut self, mode: Ghoul2BatchMode) {
+        self.ghoul2_batch_draws = mode;
+    }
+
+    fn ghoul2_batch_hash(draw: &Ghoul2PendingDraw) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        draw.alpha_mode.hash(&mut hasher);
+        draw.mesh_key.hash(&mut hasher);
+        draw.texture_key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn should_adaptively_batch(pending: &mut [Ghoul2PendingDraw]) -> bool {
+        const MIN_SURFACES: usize = 32;
+        const SAMPLE_SURFACES: usize = 64;
+        const MIN_MATCHING_INSTANCES: u8 = 3;
+
+        if pending.len() < MIN_SURFACES {
+            return false;
+        }
+
+        // Start the real batching analysis, but only over a bounded set of
+        // entries spread across the full frame.  The previous implementation
+        // inspected only the first 64 surfaces, which could completely miss a
+        // large repeated crowd later in the submission list.
+        let sample_count = pending.len().min(SAMPLE_SURFACES);
+        let mut counts: HashMap<u64, u8> = HashMap::with_capacity(sample_count);
+        for sample in 0..sample_count {
+            let index = if sample_count <= 1 {
+                0
+            } else {
+                sample * (pending.len() - 1) / (sample_count - 1)
+            };
+            let draw = &mut pending[index];
+            if !matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask) {
+                continue;
+            }
+            let hash = if let Some(hash) = draw.batch_hash {
+                hash
+            } else {
+                let hash = Self::ghoul2_batch_hash(draw);
+                draw.batch_hash = Some(hash);
+                hash
+            };
+            let count = counts.entry(hash).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= MIN_MATCHING_INSTANCES {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn ghoul2_draw_stats(&self) -> (u32, u32) {
+        (self.ghoul2_input_instances, self.ghoul2_encoded_draws)
+    }
+
+    fn rebuild_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+    ) {
+        self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+        self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+        self.blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+        self.mask_blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
+        self.additive_one_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
+        self.additive_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+        self.blend_unlit_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+        self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+        self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+        self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+        self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+        self.skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
+        self.skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
+        self.skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+        self.skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+        self.skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+    }
+
+    fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required: u64) {
+        if required <= self.vertex_capacity {
+            return;
+        }
+        self.vertex_capacity = required.next_power_of_two().max(4096);
+        self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA dynamic model vertex buffer"),
+            size: self.vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    fn ensure_index_capacity(&mut self, device: &wgpu::Device, required: u64) {
+        if required <= self.index_capacity {
+            return;
+        }
+        self.index_capacity = required.next_power_of_two().max(4096);
+        self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA dynamic model index buffer"),
+            size: self.index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    fn ensure_skin_capacity(&mut self, device: &wgpu::Device, bone_required: u64, draw_required: u64) {
+        let mut changed = false;
+        if bone_required > self.skin_bone_capacity {
+            self.skin_bone_capacity = bone_required.next_power_of_two().max(4096);
+            self.skin_bone_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA Ghoul2 GPU bone buffer"),
+                size: self.skin_bone_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            changed = true;
+        }
+        if draw_required > self.skin_draw_capacity {
+            self.skin_draw_capacity = draw_required.next_power_of_two().max(4096);
+            self.skin_draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA Ghoul2 GPU draw buffer"),
+                size: self.skin_draw_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            changed = true;
+        }
+        if changed {
+            self.skin_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JKA Ghoul2 GPU skinning bind group"),
+                layout: &self.skin_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.skin_bone_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.skin_draw_buffer.as_entire_binding() },
+                ],
+            });
+        }
+    }
+
+    fn ensure_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: Option<&Arc<TextureData>>,
+    ) -> Option<Arc<str>> {
+        let texture = texture?;
+        let pointer_key = Arc::as_ptr(texture) as usize;
+        if let Some(key) = self.frame_texture_keys.get(&pointer_key) {
+            return Some(Arc::clone(key));
+        }
+
+        let key: Arc<str> = Arc::from(format!(
+            "{}|{}x{}|m{}|c{}|s{}",
+            texture.label,
+            texture.width,
+            texture.height,
+            texture.mip_level_count,
+            u8::from(texture.clamp),
+            u8::from(texture.srgb),
+        ));
+        if let Entry::Vacant(entry) = self.textures.entry(Arc::clone(&key)) {
+            let image = upload_texture(device, queue, texture);
+            let sampler = if texture.clamp { &self.clamp_sampler } else { &self.repeat_sampler };
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("JKA dynamic model texture {}", texture.label)),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&image.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            entry.insert(DynamicGpuTexture { _image: image, bind_group });
+        }
+        self.frame_texture_keys.insert(pointer_key, Arc::clone(&key));
+        Some(key)
+    }
+
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surfaces: &[DynamicModelSurface],
+    ) {
+        self.draws.clear();
+        self.skin_draws.clear();
+        self.frame_texture_keys.clear();
+        self.ghoul2_input_instances = 0;
+        self.ghoul2_encoded_draws = 0;
+        if surfaces.is_empty() {
+            return;
+        }
+
+        let total_vertices = surfaces
+            .iter()
+            .filter(|surface| surface.ghoul2_gpu.is_none())
+            .map(|surface| surface.vertices.len())
+            .sum();
+        let total_indices = surfaces
+            .iter()
+            .filter(|surface| surface.ghoul2_gpu.is_none())
+            .map(|surface| surface.indices.len())
+            .sum();
+        let mut vertices = std::mem::take(&mut self.scratch_vertices);
+        vertices.clear();
+        vertices.reserve(total_vertices);
+        let mut indices = std::mem::take(&mut self.scratch_indices);
+        indices.clear();
+        indices.reserve(total_indices);
+        let mut bones = std::mem::take(&mut self.scratch_bones);
+        bones.clear();
+        let mut gpu_draw_data = std::mem::take(&mut self.scratch_draw_data);
+        gpu_draw_data.clear();
+        gpu_draw_data.reserve(surfaces.len());
+        let mut bone_offsets = std::mem::take(&mut self.scratch_bone_offsets);
+        bone_offsets.clear();
+        bone_offsets.reserve(surfaces.len());
+        let mut skin_pending = std::mem::take(&mut self.scratch_skin_pending);
+        skin_pending.clear();
+        skin_pending.reserve(surfaces.len());
+
+        for surface in surfaces {
+            let texture_key = self.ensure_texture(device, queue, surface.texture.as_ref());
+            if let Some(skin) = surface.ghoul2_gpu.as_ref() {
+                if skin.vertices.is_empty() || skin.indices.is_empty() || skin.bones.is_empty() {
+                    continue;
+                }
+                let mesh_key = Arc::clone(&skin.mesh_key);
+                if let Entry::Vacant(entry) = self.ghoul2_meshes.entry(Arc::clone(&mesh_key)) {
+                    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("JKA Ghoul2 bind-pose vertices {mesh_key}")),
+                        contents: bytemuck::cast_slice(skin.vertices.as_slice()),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("JKA Ghoul2 bind-pose indices {mesh_key}")),
+                        contents: bytemuck::cast_slice(skin.indices.as_slice()),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    entry.insert(Ghoul2GpuMesh {
+                        vertex_buffer,
+                        index_buffer,
+                        index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
+                    });
+                }
+
+                let pose_key = Arc::as_ptr(&skin.bones) as usize;
+                let bone_base = match bone_offsets.entry(pose_key) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        let base = u32::try_from(bones.len()).unwrap_or(u32::MAX);
+                        bones.extend_from_slice(skin.bones.as_slice());
+                        entry.insert(base);
+                        base
+                    }
+                };
+                let uniform = Ghoul2GpuDrawUniform {
+                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], 0.0],
+                    axis1: [skin.axis[1][0], skin.axis[1][1], skin.axis[1][2], 0.0],
+                    axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
+                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
+                    color: skin.color,
+                    params: [bone_base, 0, 0, 0],
+                };
+                skin_pending.push(Ghoul2PendingDraw {
+                    mesh_key,
+                    texture_key,
+                    alpha_mode: surface.alpha_mode,
+                    uniform,
+                    sequence: u32::try_from(skin_pending.len()).unwrap_or(u32::MAX),
+                    batch_hash: None,
+                });
+                continue;
+            }
+
+            if surface.vertices.is_empty() || surface.indices.is_empty() {
+                continue;
+            }
+            let base_vertex = vertices.len() as u32;
+            let first_index = indices.len() as u32;
+            vertices.extend_from_slice(surface.vertices.as_slice());
+            indices.extend(surface.indices.iter().map(|index| base_vertex.saturating_add(*index)));
+            self.draws.push(DynamicPreparedDraw {
+                first_index,
+                index_count: surface.indices.len() as u32,
+                texture_key,
+                alpha_mode: surface.alpha_mode,
+            });
+        }
+
+        self.ghoul2_input_instances = u32::try_from(skin_pending.len()).unwrap_or(u32::MAX);
+        let batching_active = match self.ghoul2_batch_draws {
+            Ghoul2BatchMode::Off => false,
+            Ghoul2BatchMode::Adaptive => Self::should_adaptively_batch(&mut skin_pending),
+            Ghoul2BatchMode::Force => true,
+        };
+        if batching_active {
+            // Continue the adaptive probe rather than restarting it: sampled
+            // draws already carry their hash, and only the remaining draws are
+            // hashed here.  Force mode gets the same cheaper sort key.
+            for draw in &mut skin_pending {
+                if matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                    && draw.batch_hash.is_none()
+                {
+                    draw.batch_hash = Some(Self::ghoul2_batch_hash(draw));
+                }
+            }
+            skin_pending.sort_unstable_by(|a, b| {
+                let batchable_a = matches!(a.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask);
+                let batchable_b = matches!(b.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask);
+                match (batchable_a, batchable_b) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => a.sequence.cmp(&b.sequence),
+                    (true, true) => {
+                        let alpha_a = u8::from(matches!(a.alpha_mode, DynamicModelAlphaMode::Mask));
+                        let alpha_b = u8::from(matches!(b.alpha_mode, DynamicModelAlphaMode::Mask));
+                        alpha_a
+                            .cmp(&alpha_b)
+                            .then_with(|| a.batch_hash.cmp(&b.batch_hash))
+                            .then_with(|| a.mesh_key.as_ref().cmp(b.mesh_key.as_ref()))
+                            .then_with(|| a.texture_key.as_deref().cmp(&b.texture_key.as_deref()))
+                    }
+                }
+            });
+        }
+
+        let mut pending_index = 0usize;
+        while pending_index < skin_pending.len() {
+            let pending = &skin_pending[pending_index];
+            let candidate = batching_active
+                && matches!(pending.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask);
+            let mut group_end = pending_index + 1;
+            if candidate {
+                while group_end < skin_pending.len() {
+                    let next = &skin_pending[group_end];
+                    if next.alpha_mode != pending.alpha_mode
+                        || next.mesh_key != pending.mesh_key
+                        || next.texture_key != pending.texture_key
+                    {
+                        break;
+                    }
+                    group_end += 1;
+                }
+            }
+
+            let group_len = group_end - pending_index;
+            let instance_group = candidate
+                && match self.ghoul2_batch_draws {
+                    Ghoul2BatchMode::Off => false,
+                    Ghoul2BatchMode::Adaptive => group_len >= 3,
+                    Ghoul2BatchMode::Force => group_len >= 2,
+                };
+
+            if instance_group {
+                let first_instance = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
+                for item in &skin_pending[pending_index..group_end] {
+                    gpu_draw_data.push(item.uniform);
+                }
+                self.skin_draws.push(Ghoul2PreparedDraw {
+                    mesh_key: Arc::clone(&pending.mesh_key),
+                    texture_key: pending.texture_key.as_ref().map(Arc::clone),
+                    alpha_mode: pending.alpha_mode,
+                    first_instance,
+                    instance_count: u32::try_from(group_len).unwrap_or(u32::MAX),
+                });
+            } else {
+                for item in &skin_pending[pending_index..group_end] {
+                    let first_instance = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
+                    gpu_draw_data.push(item.uniform);
+                    self.skin_draws.push(Ghoul2PreparedDraw {
+                        mesh_key: Arc::clone(&item.mesh_key),
+                        texture_key: item.texture_key.as_ref().map(Arc::clone),
+                        alpha_mode: item.alpha_mode,
+                        first_instance,
+                        instance_count: 1,
+                    });
+                }
+            }
+            pending_index = group_end;
+        }
+        self.ghoul2_encoded_draws = u32::try_from(self.skin_draws.len()).unwrap_or(u32::MAX);
+
+        let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
+        let index_bytes = bytemuck::cast_slice(indices.as_slice());
+        self.ensure_vertex_capacity(device, vertex_bytes.len() as u64);
+        self.ensure_index_capacity(device, index_bytes.len() as u64);
+        if !vertex_bytes.is_empty() {
+            queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
+        }
+        if !index_bytes.is_empty() {
+            queue.write_buffer(&self.index_buffer, 0, index_bytes);
+        }
+
+        let bone_bytes = bytemuck::cast_slice(bones.as_slice());
+        let draw_bytes = bytemuck::cast_slice(gpu_draw_data.as_slice());
+        self.ensure_skin_capacity(device, bone_bytes.len() as u64, draw_bytes.len() as u64);
+        if !bone_bytes.is_empty() {
+            queue.write_buffer(&self.skin_bone_buffer, 0, bone_bytes);
+        }
+        if !draw_bytes.is_empty() {
+            queue.write_buffer(&self.skin_draw_buffer, 0, draw_bytes);
+        }
+
+        self.scratch_vertices = vertices;
+        self.scratch_indices = indices;
+        self.scratch_bones = bones;
+        self.scratch_draw_data = gpu_draw_data;
+        self.scratch_bone_offsets = bone_offsets;
+        self.scratch_skin_pending = skin_pending;
+    }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
+        if !self.draws.is_empty() {
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_bind_group(0, camera, &[]);
+
+            for alpha_mode in [
+                DynamicModelAlphaMode::Opaque,
+                DynamicModelAlphaMode::Mask,
+                DynamicModelAlphaMode::MaskBlend,
+                DynamicModelAlphaMode::Modulate,
+                DynamicModelAlphaMode::Blend,
+                DynamicModelAlphaMode::BlendUnlit,
+                DynamicModelAlphaMode::AdditiveOne,
+                DynamicModelAlphaMode::Additive,
+            ] {
+                let pipeline = match alpha_mode {
+                    DynamicModelAlphaMode::Opaque => &self.opaque_pipeline,
+                    DynamicModelAlphaMode::Mask => &self.mask_pipeline,
+                    DynamicModelAlphaMode::Blend => &self.blend_pipeline,
+                    DynamicModelAlphaMode::MaskBlend => &self.mask_blend_pipeline,
+                    DynamicModelAlphaMode::AdditiveOne => &self.additive_one_pipeline,
+                    DynamicModelAlphaMode::Additive => &self.additive_pipeline,
+                    DynamicModelAlphaMode::BlendUnlit => &self.blend_unlit_pipeline,
+                    DynamicModelAlphaMode::Modulate => &self.modulate_pipeline,
+                };
+                pass.set_pipeline(pipeline);
+                for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+                    let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                    pass.set_bind_group(1, bind_group, &[]);
+                    pass.draw_indexed(draw.first_index..draw.first_index.saturating_add(draw.index_count), 0, 0..1);
+                }
+            }
+        }
+
+        if !self.skin_draws.is_empty() {
+            pass.set_bind_group(0, camera, &[]);
+            for alpha_mode in [
+                DynamicModelAlphaMode::Opaque,
+                DynamicModelAlphaMode::Mask,
+                DynamicModelAlphaMode::MaskBlend,
+                DynamicModelAlphaMode::Modulate,
+                DynamicModelAlphaMode::Blend,
+                DynamicModelAlphaMode::BlendUnlit,
+                DynamicModelAlphaMode::AdditiveOne,
+                DynamicModelAlphaMode::Additive,
+            ] {
+                let pipeline = match alpha_mode {
+                    DynamicModelAlphaMode::Opaque => &self.skin_opaque_pipeline,
+                    DynamicModelAlphaMode::Mask => &self.skin_mask_pipeline,
+                    DynamicModelAlphaMode::Blend => &self.skin_blend_pipeline,
+                    DynamicModelAlphaMode::MaskBlend => &self.skin_mask_blend_pipeline,
+                    DynamicModelAlphaMode::AdditiveOne => &self.skin_additive_one_pipeline,
+                    DynamicModelAlphaMode::Additive => &self.skin_additive_pipeline,
+                    DynamicModelAlphaMode::BlendUnlit => &self.skin_blend_unlit_pipeline,
+                    DynamicModelAlphaMode::Modulate => &self.skin_modulate_pipeline,
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                for draw in self.skin_draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+                    let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };
+                    let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(1, bind_group, &[]);
+                    pass.draw_indexed(
+                        0..mesh.index_count,
+                        0,
+                        draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct CloudNoiseResources {
+    _detail_texture: wgpu::Texture,
+    /// Tileable Worley volume used to erode cloud silhouette edges.
+    detail_view: wgpu::TextureView,
+    _weather_texture: wgpu::Texture,
+    /// Tileable weather map: base Perlin-Worley in `r`, remap contrast floor in
+    /// `g`, per-region cloud height in `b`.
+    weather_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorldRenderPath {
+    /// Exact low-overhead renderer used by the known-fast pre-enhancement build.
+    /// It has only camera + surface bind groups and records the simple direct
+    /// draw loop without consulting advanced renderer state per draw.
+    FastBaseline,
+    #[default]
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WorldShaderFamily {
+    Lean,
+    Enhanced,
+}
+
+/// Cold-path key for a compiled BSP shader/pipeline family.  Unlike the runtime
+/// settings uniforms, these flags are supplied as WGSL `override` constants at
+/// pipeline creation time.  A setting change selects an existing cached variant
+/// or creates it once; steady-state frames never compile pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WorldShaderVariantKey {
+    pbr: bool,
+    pom: bool,
+    pbr_shared_material_eval: bool,
+    pbr_shared_tangent_frame: bool,
+    pom_mip_aware: bool,
+    pom_adaptive_steps: bool,
+    pbr_companion_sampler: bool,
+    pbr_vertex_lightgrid: bool,
+    point_lights: bool,
+    area_lights: bool,
+    irradiance_volume: bool,
+    voxel_gi: bool,
+    local_shadows: bool,
+    cascaded_shadows: bool,
+    planar_reflections: bool,
+    legacy_fog: bool,
+    ocean: bool,
+}
+
+impl WorldShaderVariantKey {
+    fn family(self) -> WorldShaderFamily {
+        if self.point_lights || self.area_lights || self.irradiance_volume || self.voxel_gi || self.ocean {
+            WorldShaderFamily::Enhanced
+        } else {
+            WorldShaderFamily::Lean
+        }
+    }
+
+    fn compilation_constants(self) -> [(&'static str, f64); 16] {
+        [
+            ("ENABLE_PBR", f64::from(u8::from(self.pbr))),
+            ("ENABLE_POM", f64::from(u8::from(self.pom))),
+            (
+                "PBR_SHARED_MATERIAL_EVAL",
+                f64::from(u8::from(self.pbr_shared_material_eval)),
+            ),
+            (
+                "PBR_SHARED_TANGENT_FRAME",
+                f64::from(u8::from(self.pbr_shared_tangent_frame)),
+            ),
+            ("POM_MIP_AWARE", f64::from(u8::from(self.pom_mip_aware))),
+            (
+                "POM_ADAPTIVE_STEPS",
+                f64::from(u8::from(self.pom_adaptive_steps)),
+            ),
+            (
+                "PBR_COMPANION_SAMPLER",
+                f64::from(u8::from(self.pbr_companion_sampler)),
+            ),
+            (
+                "PBR_VERTEX_LIGHTGRID",
+                f64::from(u8::from(self.pbr_vertex_lightgrid)),
+            ),
+            (
+                "ENABLE_POINT_LIGHTS",
+                f64::from(u8::from(self.point_lights)),
+            ),
+            ("ENABLE_AREA_LIGHTS", f64::from(u8::from(self.area_lights))),
+            ("ENABLE_IRRADIANCE_VOLUME", f64::from(u8::from(self.irradiance_volume))),
+            ("ENABLE_VOXEL_GI", f64::from(u8::from(self.voxel_gi))),
+            (
+                "ENABLE_LOCAL_SHADOWS",
+                f64::from(u8::from(self.local_shadows)),
+            ),
+            (
+                "ENABLE_CASCADED_SHADOWS",
+                f64::from(u8::from(self.cascaded_shadows)),
+            ),
+            (
+                "ENABLE_PLANAR_REFLECTIONS",
+                f64::from(u8::from(self.planar_reflections)),
+            ),
+            ("ENABLE_OCEAN", f64::from(u8::from(self.ocean))),
+        ]
+    }
+
+    fn short_label(self) -> String {
+        let mut enabled = Vec::new();
+        if self.pbr {
+            enabled.push("pbr");
+        }
+        if self.pom {
+            enabled.push("pom");
+        }
+        if self.pbr && self.pbr_shared_material_eval {
+            enabled.push("pbr-cache");
+        }
+        if (self.pbr || self.pom) && self.pbr_shared_tangent_frame {
+            enabled.push("tbn-cache");
+        }
+        if self.pom && self.pom_mip_aware {
+            enabled.push("pom-mip");
+        }
+        if self.pom && self.pom_adaptive_steps {
+            enabled.push("pom-adapt");
+        }
+        if self.pbr && self.pbr_companion_sampler {
+            enabled.push("pbr-sampler");
+        }
+        if self.pbr && self.pbr_vertex_lightgrid {
+            enabled.push("vertex-lightgrid");
+        }
+        if self.point_lights {
+            enabled.push("point");
+        }
+        if self.area_lights {
+            enabled.push("area");
+        }
+        if self.voxel_gi {
+            enabled.push("gi");
+        }
+        if self.local_shadows {
+            enabled.push("local-shadow");
+        }
+        if self.cascaded_shadows {
+            enabled.push("sun-shadow");
+        }
+        if self.planar_reflections {
+            enabled.push("planar");
+        }
+        if self.legacy_fog {
+            enabled.push("legacy-fog");
+        }
+        if self.ocean {
+            enabled.push("ocean");
+        }
+        if enabled.is_empty() {
+            "base".to_string()
+        } else {
+            enabled.join("+")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FramePlan {
+    world_path: WorldRenderPath,
+    use_enhanced_world_shader: bool,
+    use_post: bool,
+    gamma_only_post: bool,
+    needs_linear_depth: bool,
+    use_hiz: bool,
+    use_gpu_culling: bool,
+    use_clustered_lighting: bool,
+}
+
+const GPU_PASS_COUNT: usize = 11;
+const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
+const GPU_PROFILER_SLOTS: usize = 3;
+const CULL_DIAGNOSTIC_READBACK_SLOTS: usize = 3;
+const CULL_DIAGNOSTIC_COUNTER_BYTES: u64 = 16;
+
+#[derive(Clone, Copy)]
+enum GpuPass {
+    Frame = 0,
+    Depth = 1,
+    HiZ = 2,
+    Cull = 3,
+    Cluster = 4,
+    World = 5,
+    Post = 6,
+    Ui = 7,
+    // Sub-timing inside the World interval; do not add it to frame_ms fallback.
+    Grass = 8,
+    // Compute preparation runs immediately before World and therefore *is* an
+    // independent frame interval in the no-Frame-timestamp fallback.
+    GrassPrepare = 9,
+    // Sub-timing inside World: dynamic MD3/GLM entities, including GPU Ghoul2 skinning.
+    DynamicModels = 10,
+}
+
+impl GpuPass {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct GpuTiming {
+    milliseconds: [Option<f64>; GPU_PASS_COUNT],
+}
+
+impl GpuTiming {
+    fn from_query_data(values: &[u64], active: [bool; GPU_PASS_COUNT], period: f32) -> Self {
+        let mut milliseconds = [None; GPU_PASS_COUNT];
+        let nanoseconds_per_tick = f64::from(period);
+        for pass in 0..GPU_PASS_COUNT {
+            if active[pass] {
+                let start = values[pass * 2];
+                let end = values[pass * 2 + 1];
+                milliseconds[pass] = end
+                    .checked_sub(start)
+                    .map(|ticks| ticks as f64 * nanoseconds_per_tick / 1_000_000.0);
+            }
+        }
+        Self { milliseconds }
+    }
+
+    fn frame_ms(self) -> Option<f64> {
+        if let Some(frame) = self.milliseconds[GpuPass::Frame.index()] {
+            return Some(frame);
+        }
+
+        let mut total = 0.0;
+        let mut any = false;
+        for pass in [
+            GpuPass::Depth,
+            GpuPass::HiZ,
+            GpuPass::Cull,
+            GpuPass::Cluster,
+            GpuPass::GrassPrepare,
+            GpuPass::World,
+            GpuPass::Post,
+            GpuPass::Ui,
+        ] {
+            if let Some(milliseconds) = self.milliseconds[pass.index()] {
+                total += milliseconds;
+                any = true;
+            }
+        }
+        any.then_some(total)
+    }
+}
+
+struct GpuProfilerSlot {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    pending: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    // Tracks timestamp slots that were genuinely written by the measured frame.
+    // Before resolve we fill any holes with harmless dummy timestamps so Vulkan
+    // never sees an unavailable query in the resolved range. `active` remains
+    // true only for passes with both real endpoints, so dummy values are ignored.
+    written: [bool; GPU_PASS_COUNT * 2],
+    active: [bool; GPU_PASS_COUNT],
+}
+
+struct GpuProfiler {
+    slots: Vec<GpuProfilerSlot>,
+    current: Option<usize>,
+    active: bool,
+    timestamp_period: f32,
+    timestamp_inside_encoders: bool,
+    timestamp_inside_passes: bool,
+    latest: Option<GpuTiming>,
+}
+
+impl GpuProfiler {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timestamp_supported: bool,
+        timestamp_inside_encoders: bool,
+        timestamp_inside_passes: bool,
+    ) -> Self {
+        if !timestamp_supported {
+            return Self {
+                slots: Vec::new(),
+                current: None,
+                active: false,
+                timestamp_period: 0.0,
+                timestamp_inside_encoders: false,
+                timestamp_inside_passes: false,
+                latest: None,
+            };
+        }
+
+        let slots = (0..GPU_PROFILER_SLOTS)
+            .map(|_| {
+                let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("JKA GPU frame profiler queries"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: GPU_QUERY_COUNT,
+                });
+                let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA GPU profiler resolve buffer"),
+                    size: u64::from(GPU_QUERY_COUNT) * 8,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA GPU profiler readback buffer"),
+                    size: u64::from(GPU_QUERY_COUNT) * 8,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                GpuProfilerSlot {
+                    query_set,
+                    resolve_buffer,
+                    readback_buffer,
+                    pending: None,
+                    written: [false; GPU_PASS_COUNT * 2],
+                    active: [false; GPU_PASS_COUNT],
+                }
+            })
+            .collect();
+
+        Self {
+            slots,
+            current: None,
+            active: false,
+            timestamp_period: queue.get_timestamp_period(),
+            timestamp_inside_encoders,
+            timestamp_inside_passes,
+            latest: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.active && !self.slots.is_empty()
+    }
+
+    fn available(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.active = enabled && self.available();
+        if !self.active {
+            self.current = None;
+            self.latest = None;
+        }
+    }
+
+    fn begin_frame(&mut self, device: &wgpu::Device) {
+        if !self.enabled() {
+            return;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        for slot in &mut self.slots {
+            let completed = {
+                let Some(pending) = slot.pending.as_ref() else {
+                    continue;
+                };
+                match pending.try_recv() {
+                    Ok(Ok(())) => {
+                        let bytes = slot.readback_buffer.slice(..).get_mapped_range();
+                        let values: &[u64] = bytemuck::cast_slice(&bytes);
+                        let timing =
+                            GpuTiming::from_query_data(values, slot.active, self.timestamp_period);
+                        drop(bytes);
+                        slot.readback_buffer.unmap();
+                        Some(timing)
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => None,
+                    Err(TryRecvError::Empty) => continue,
+                }
+            };
+            slot.pending = None;
+            if completed.is_some() {
+                self.latest = completed;
+            }
+        }
+
+        self.current = self.slots.iter().position(|slot| slot.pending.is_none());
+        if let Some(current) = self.current {
+            self.slots[current].written = [false; GPU_PASS_COUNT * 2];
+            self.slots[current].active = [false; GPU_PASS_COUNT];
+        }
+    }
+
+    fn write_encoder_timestamp(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: GpuPass,
+        end: bool,
+    ) {
+        if !self.timestamp_inside_encoders {
+            return;
+        }
+        let Some(current) = self.current else {
+            return;
+        };
+        let pass_index = pass.index();
+        let query_index = pass_index * 2 + usize::from(end);
+        let slot = &mut self.slots[current];
+        // A query index may only be written once per profiler frame. Guarding
+        // this also makes optional/overlapping renderer branches harmless.
+        if slot.written[query_index] {
+            return;
+        }
+        encoder.write_timestamp(&slot.query_set, query_index as u32);
+        slot.written[query_index] = true;
+        slot.active[pass_index] =
+            slot.written[pass_index * 2] && slot.written[pass_index * 2 + 1];
+    }
+
+    fn write_render_pass_timestamp(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        timed_pass: GpuPass,
+        end: bool,
+    ) {
+        if !self.timestamp_inside_passes {
+            return;
+        }
+        let Some(current) = self.current else {
+            return;
+        };
+        let pass_index = timed_pass.index();
+        let query_index = pass_index * 2 + usize::from(end);
+        let slot = &mut self.slots[current];
+        if slot.written[query_index] {
+            return;
+        }
+        pass.write_timestamp(&slot.query_set, query_index as u32);
+        slot.written[query_index] = true;
+        slot.active[pass_index] =
+            slot.written[pass_index * 2] && slot.written[pass_index * 2 + 1];
+    }
+
+    fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(current) = self.current else {
+            return;
+        };
+        if !self.slots[current].written.iter().any(|written| *written) {
+            return;
+        }
+
+        let slot = &mut self.slots[current];
+        // WebGPU/Vulkan requires every query in a resolved range to have become
+        // available. Optional renderer passes leave holes in our fixed query set,
+        // so write harmless end-of-frame timestamps into those unused slots before
+        // resolving the whole compact range. These dummy slots are not marked
+        // active and therefore never appear in reported timings.
+        for query_index in 0..GPU_QUERY_COUNT as usize {
+            if !slot.written[query_index] {
+                encoder.write_timestamp(&slot.query_set, query_index as u32);
+            }
+        }
+        encoder.resolve_query_set(&slot.query_set, 0..GPU_QUERY_COUNT, &slot.resolve_buffer, 0);
+    }
+
+    fn encode_readback_copy(&self, device: &wgpu::Device) -> Option<wgpu::CommandBuffer> {
+        let current = self.current?;
+        let slot = &self.slots[current];
+        if !slot.written.iter().any(|written| *written) {
+            return None;
+        }
+
+        // Keep the resolve and resolve-buffer copy in separate command buffers.
+        // This avoids a long-standing Vulkan/wgpu hazard where resolving a
+        // timestamp and consuming that resolve buffer in the same encoder can
+        // yield zero/stale results. Queue order still guarantees the copy waits
+        // for the main frame command buffer's resolve.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("JKA GPU profiler readback copy encoder"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &slot.resolve_buffer,
+            0,
+            &slot.readback_buffer,
+            0,
+            u64::from(GPU_QUERY_COUNT) * 8,
+        );
+        Some(encoder.finish())
+    }
+
+    fn submit(&mut self) {
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        if !self.slots[current].active.iter().any(|active| *active) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.slots[current].readback_buffer.slice(..).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
+                let _ = sender.send(result);
+            },
+        );
+        self.slots[current].pending = Some(receiver);
+    }
+
+    fn latest_frame_ms(&self) -> Option<f64> {
+        self.latest.and_then(GpuTiming::frame_ms)
+    }
+}
+
+struct CullDiagnosticReadbackSlot {
+    readback_buffer: wgpu::Buffer,
+    pending: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+struct CullDiagnosticsReadback {
+    slots: Vec<CullDiagnosticReadbackSlot>,
+    current: Option<usize>,
+    encoded: bool,
+    latest: [u32; 4],
+}
+
+impl CullDiagnosticsReadback {
+    fn new(device: &wgpu::Device) -> Self {
+        let slots = (0..CULL_DIAGNOSTIC_READBACK_SLOTS)
+            .map(|_| CullDiagnosticReadbackSlot {
+                readback_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA cull diagnostic readback"),
+                    size: CULL_DIAGNOSTIC_COUNTER_BYTES,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                pending: None,
+            })
+            .collect();
+        Self {
+            slots,
+            current: None,
+            encoded: false,
+            latest: [0; 4],
+        }
+    }
+
+    fn begin_frame(&mut self, device: &wgpu::Device) {
+        if !self.slots.iter().any(|slot| slot.pending.is_some()) {
+            self.current = self.slots.iter().position(|slot| slot.pending.is_none());
+            self.encoded = false;
+            return;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+        for slot in &mut self.slots {
+            let completed = {
+                let Some(pending) = slot.pending.as_ref() else {
+                    continue;
+                };
+                match pending.try_recv() {
+                    Ok(Ok(())) => {
+                        let bytes = slot.readback_buffer.slice(..).get_mapped_range();
+                        let values: &[u32] = bytemuck::cast_slice(&bytes);
+                        let latest = [
+                            values.first().copied().unwrap_or(0),
+                            values.get(1).copied().unwrap_or(0),
+                            values.get(2).copied().unwrap_or(0),
+                            values.get(3).copied().unwrap_or(0),
+                        ];
+                        drop(bytes);
+                        slot.readback_buffer.unmap();
+                        Some(latest)
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => None,
+                    Err(TryRecvError::Empty) => continue,
+                }
+            };
+            slot.pending = None;
+            if let Some(latest) = completed {
+                self.latest = latest;
+            }
+        }
+        self.current = self.slots.iter().position(|slot| slot.pending.is_none());
+        self.encoded = false;
+    }
+
+    fn encode_copy(&mut self, encoder: &mut wgpu::CommandEncoder, source: &wgpu::Buffer) {
+        let Some(current) = self.current else {
+            return;
+        };
+        encoder.copy_buffer_to_buffer(
+            source,
+            0,
+            &self.slots[current].readback_buffer,
+            0,
+            CULL_DIAGNOSTIC_COUNTER_BYTES,
+        );
+        self.encoded = true;
+    }
+
+    fn submit(&mut self) {
+        if !self.encoded {
+            self.current = None;
+            return;
+        }
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.slots[current].readback_buffer.slice(..).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
+                let _ = sender.send(result);
+            },
+        );
+        self.slots[current].pending = Some(receiver);
+        self.encoded = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InspectorVertex {
+    position: [f32; 3],
+    uv: [f32; 2],
+    lightmap_uv: [f32; 2],
+}
+
+#[derive(Debug, Clone)]
+struct InspectorTextureMeta {
+    label: String,
+    source: Option<PathBuf>,
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+    clamp: bool,
+    srgb: bool,
+    sampled_rgb_min: [u8; 3],
+    sampled_rgb_max: [u8; 3],
+    sampled_luma_mean: f32,
+    sampled_luma_stddev: f32,
+}
+
+fn inspector_texture_meta(texture: &TextureData) -> InspectorTextureMeta {
+    // Keep this cheap even on huge texture packs: sample at most ~4096 base-level
+    // pixels. This lets Surface Inspector distinguish a genuinely flat source image
+    // from a textured image that is being flattened later by UV/mip sampling.
+    let pixel_count = (texture.width as usize)
+        .saturating_mul(texture.height as usize)
+        .min(texture.rgba.len() / 4);
+    let step = pixel_count.div_ceil(4096).max(1);
+    let mut minimum = [u8::MAX; 3];
+    let mut maximum = [u8::MIN; 3];
+    let mut luma_sum = 0.0_f64;
+    let mut luma_sq_sum = 0.0_f64;
+    let mut samples = 0_u64;
+    for pixel in (0..pixel_count).step_by(step) {
+        let offset = pixel * 4;
+        let rgb = [
+            texture.rgba[offset],
+            texture.rgba[offset + 1],
+            texture.rgba[offset + 2],
+        ];
+        for channel in 0..3 {
+            minimum[channel] = minimum[channel].min(rgb[channel]);
+            maximum[channel] = maximum[channel].max(rgb[channel]);
+        }
+        let luma =
+            0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2]);
+        luma_sum += luma;
+        luma_sq_sum += luma * luma;
+        samples += 1;
+    }
+    let (mean, stddev) = if samples == 0 {
+        (0.0, 0.0)
+    } else {
+        let mean = luma_sum / samples as f64;
+        let variance = (luma_sq_sum / samples as f64 - mean * mean).max(0.0);
+        (mean as f32, variance.sqrt() as f32)
+    };
+    InspectorTextureMeta {
+        label: texture.label.clone(),
+        source: texture.source.clone(),
+        width: texture.width,
+        height: texture.height,
+        mip_level_count: texture.mip_level_count,
+        clamp: texture.clamp,
+        srgb: texture.srgb,
+        sampled_rgb_min: minimum,
+        sampled_rgb_max: maximum,
+        sampled_luma_mean: mean,
+        sampled_luma_stddev: stddev,
+    }
+}
+
+struct WorldBatch {
+    source: DrawBatch,
+    indexed_range: std::ops::Range<u32>,
+    /// Clipmap index ranges for this promoted water surface, low then high.
+    ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
+    bind_group: wgpu::BindGroup,
+    fast_bind_group: wgpu::BindGroup,
+    _material_buffer: wgpu::Buffer,
+    _fog_buffer: wgpu::Buffer,
+    cull_index: u32,
+    compact_group: Option<u32>,
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+}
+
+struct SnowShellDraw {
+    coarse_batch_index: usize,
+    vertices: std::ops::Range<u32>,
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+}
+
+struct SnowShellGpu {
+    // Static map-load tessellation, spatially chunked. Runtime footsteps never
+    // rebuild this buffer; the persistent Snowflow field moves vertices on GPU.
+    vertex_buffer: wgpu::Buffer,
+    draws: Vec<SnowShellDraw>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorldBatchSet {
+    Coarse,
+    Full,
+}
+
+struct WorldDrawGroup {
+    representative_set: WorldBatchSet,
+    representative_index: usize,
+    output_base: u32,
+    max_count: u32,
+}
+
+struct WorldPipelineVariant {
+    pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    reflection_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+}
+
+struct StaticLightGridGpu {
+    enabled: bool,
+    external_hdr: bool,
+    _direction_texture: wgpu::Texture,
+    direction_view: wgpu::TextureView,
+    _lighting_texture: wgpu::Texture,
+    lighting_view: wgpu::TextureView,
+    _irradiance_volume_texture: wgpu::Texture,
+    irradiance_volume_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    uniform_buffer: wgpu::Buffer,
+    irradiance_volume_uniform_buffer: wgpu::Buffer,
+}
+
+struct VoxelProbeGiGpu {
+    enabled: bool,
+    _point_texture: wgpu::Texture,
+    point_view: wgpu::TextureView,
+    _area_texture: wgpu::Texture,
+    area_view: wgpu::TextureView,
+    uniform_buffer: wgpu::Buffer,
+}
+
+struct GpuReflectionProbe {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+struct ReflectionProbeGpuSet {
+    probes: Vec<GpuReflectionProbe>,
+    sampler: wgpu::Sampler,
+    source_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanarReflectorKind {
+    Authored,
+    Environment,
+}
+
+#[derive(Clone, Copy)]
+struct PlanarReflector {
+    kind: PlanarReflectorKind,
+    plane: [f32; 4],
+    pvs_origin: [f32; 3],
+    cull: CullMode,
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    area: f32,
+    coarse_batch_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PlanarReflectionView {
+    kind: PlanarReflectorKind,
+    plane: [f32; 4],
+    view_proj: Mat4,
+    camera_position: Vec3,
+    camera_forward: Vec3,
+    cluster: Option<usize>,
+    coarse_batch_index: usize,
+}
+
+struct PlanarReflectionResources {
+    _color: wgpu::Texture,
+    color_views: Vec<wgpu::TextureView>,
+    _color_array_view: wgpu::TextureView,
+    _fallback_color: wgpu::Texture,
+    _depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    _sampler: wgpu::Sampler,
+    uniform_buffer: wgpu::Buffer,
+    _reflection_pass_uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    reflection_pass_bind_group: wgpu::BindGroup,
+    _width: u32,
+    _height: u32,
+    active: bool,
+}
+
+/// Runtime state of one inline BSP model whose vertices live in a private
+/// (never de-duplicated) region of the world vertex buffer.
+struct InlineModelGpu {
+    model: u32,
+    gpu_vertex_start: u32,
+    /// Compiled render-space vertices, in GPU order.
+    base: Vec<GpuVertex>,
+    coarse_batches: Vec<usize>,
+    full_batches: Vec<usize>,
+    /// Last uploaded pose: `None` = never updated (buffer holds the compiled
+    /// pose), `Some(None)` = hidden (not in the snapshot).
+    uploaded: Option<Option<InlineModelInstance>>,
+}
+
+struct WorldGpu {
+    /// Linear average of this map's skybox faces. Cloud ambient is tinted with
+    /// it so a desert, sunset or night sky does not leave the clouds lit by the
+    /// reference's hardcoded blue.
+    sky_average: [f32; 3],
+    /// Representative authored map skybox used by non-sky surfaces that need environment sampling (ocean).
+    primary_skybox: Option<[usize; 6]>,
+    /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
+    ocean_surfaces: Vec<crate::ocean::OceanSurface>,
+    inline_models: Vec<InlineModelGpu>,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    /// Coarsest clipmap cell size; the clipmap centre snaps to this lattice.
+    ocean_coarsest_spacing: f32,
+    cull_records_buffer: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,
+    active_cull_indices_buffer: wgpu::Buffer,
+    compact_indirect_buffer: wgpu::Buffer,
+    compact_count_buffer: wgpu::Buffer,
+    cull_debug_reason_buffer: wgpu::Buffer,
+    cull_debug_count_buffer: wgpu::Buffer,
+    cull_debug_bind_group: wgpu::BindGroup,
+    cull_record_count: usize,
+    cull_bind_group: Option<wgpu::BindGroup>,
+    active_cull_count: u32,
+    active_selection_key: Option<(PvsMode, Option<usize>, Option<[u8; 32]>)>,
+    compact_groups: Vec<WorldDrawGroup>,
+    light_buffer: wgpu::Buffer,
+    _cluster_buffer: wgpu::Buffer,
+    dynamic_lights: Vec<scene::DynamicLight>,
+    cluster_compute_bind_group: wgpu::BindGroup,
+    lighting_bind_group: wgpu::BindGroup,
+    lighting_bind_group_lean: wgpu::BindGroup,
+    _static_light_grid: StaticLightGridGpu,
+    voxel_probe_gi: VoxelProbeGiGpu,
+    reflection_probes: ReflectionProbeGpuSet,
+    froxel_bind_group: Option<wgpu::BindGroup>,
+    light_count: u32,
+    local_shadows: LocalShadowResources,
+    sun: Option<DirectionalSun>,
+    grass: Option<GrassMapGpu>,
+    surface_sprite_effects: Vec<SurfaceSpriteEffectGpu>,
+    active_pipeline_variant: WorldShaderVariantKey,
+    pipeline_variants: BTreeMap<WorldShaderVariantKey, WorldPipelineVariant>,
+    fast_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    planar_reflectors: Vec<PlanarReflector>,
+    /// Original material/lightmap-first batches. OFF draws all of these; MINIMAL
+    /// applies conservative PVS visibility to them.
+    coarse_batches: Vec<WorldBatch>,
+    /// Exact PVS-signature sub-batches referencing subranges of the same vertex buffer.
+    full_batches: Vec<WorldBatch>,
+    visibility: Option<jka_assets::bsp::Visibility>,
+    coarse_visible_batches_by_cluster: Vec<Vec<usize>>,
+    full_visible_batches_by_cluster: Vec<Vec<usize>>,
+    /// AUTO selects FULL for clusters where its reduced submitted geometry is
+    /// estimated to outweigh the extra draw calls; otherwise it selects MINIMAL.
+    auto_use_full_by_cluster: Vec<bool>,
+    coarse_all_batches: Vec<usize>,
+    last_cluster: Option<Option<usize>>,
+    textures: Vec<GpuImage>,
+    footprint_mark_textures: [Option<usize>; 2],
+    lightmaps: Vec<GpuImage>,
+    deluxemaps: Vec<GpuImage>,
+    lightmap_base_data: Vec<TextureData>,
+    static_ao_source: Option<StaticAoWorldSource>,
+    static_ao_source_to_gpu: Vec<u32>,
+    static_ao_gpu_vertices: Vec<GpuVertex>,
+    static_ao_lightmap_active: bool,
+    texture_clamp: Vec<bool>,
+    material_debug: scene::MaterialDebugInfo,
+    inspector_vertices: Vec<InspectorVertex>,
+    inspector_textures: Vec<InspectorTextureMeta>,
+    inspector_lightmaps: Vec<InspectorTextureMeta>,
+    /// Dense replacement geometry is generated only near the latest verified
+    /// snow contact. The source list retains the original (coarse) BSP snow
+    /// triangles so the rest of the map never becomes a high-density mesh.
+    snow_shell: SnowShellGpu,
+}
+
+// Lightmap-space AO should emphasize true contact/corner occlusion. A small
+// render-triangle bias keeps the bake close enough to catch wall/ceiling seams
+// without the broad "dirty room" look of the earlier 512u-heavy blend.
+const STATIC_AO_LIGHTMAP_BIAS: f32 = 0.75;
+const STATIC_AO_VERTEX_BIAS: f32 = 2.0;
+const STATIC_AO_HQ_CONTACT_RADIUS: f32 = 32.0;
+const STATIC_AO_HQ_MEDIUM_RADIUS: f32 = 128.0;
+const STATIC_AO_HQ_BROAD_RADIUS: f32 = 384.0;
+const STATIC_AO_HQ_CONTACT_WEIGHT: f32 = 0.65;
+const STATIC_AO_HQ_MEDIUM_WEIGHT: f32 = 0.30;
+const STATIC_AO_HQ_BROAD_WEIGHT: f32 = 0.05;
+const STATIC_AO_BVH_LEAF_TRIANGLES: usize = 8;
+const STATIC_AO_ADAPTIVE_MAX_VISIBILITY_RANGE: u8 = 12;
+const STATIC_AO_ADAPTIVE_MAX_CENTER_ERROR: u8 = 8;
+const STATIC_AO_ADAPTIVE_MIN_NORMAL_DOT: f32 = 0.995;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaticAoBakeMode {
+    Lightmap,
+}
+
+impl StaticAoBakeMode {
+    fn label(self) -> &'static str {
+        "baked"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaticAoJobKey {
+    map_hash: u64,
+    mode: StaticAoBakeMode,
+    samples: u32,
+    scale: u32,
+    strength: u32,
+    range: u32,
+    current_cell_only: bool,
+}
+
+#[derive(Clone)]
+struct StaticAoLightmapTriangle {
+    texture: usize,
+    owner: u32,
+    positions: [[f32; 3]; 3],
+    normals: [[f32; 3]; 3],
+    uvs: [[f32; 2]; 3],
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoRenderTriangle {
+    positions: [[f32; 3]; 3],
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoTraceTriangle {
+    origin: Vec3,
+    edge1: Vec3,
+    edge2: Vec3,
+    minimum: Vec3,
+    maximum: Vec3,
+    centroid: Vec3,
+}
+
+#[derive(Clone)]
+struct StaticAoBaseLightmap {
+    label: String,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    clamp: bool,
+    srgb: bool,
+}
+
+struct StaticAoBakedLightmap {
+    label: String,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    clamp: bool,
+    srgb: bool,
+}
+
+#[derive(Clone)]
+struct StaticAoWorldSource {
+    cache: scene::StaticBspAoCacheInfo,
+    vertices: Arc<Vec<GpuVertex>>,
+    /// Source-vertex mask for true q3map LIGHTMAP_BY_VERTEX baked-light receivers.
+    vertex_ao_receivers: Arc<Vec<u8>>,
+    lightmap_triangles: Arc<Vec<StaticAoLightmapTriangle>>,
+    render_triangles: Arc<Vec<StaticAoRenderTriangle>>,
+    lightmap_sizes: Arc<Vec<[u32; 2]>>,
+    lightmap_bases: Arc<Vec<StaticAoBaseLightmap>>,
+}
+
+enum StaticAoBakeData {
+    Lightmap {
+        /// HQ per-vertex visibility for LIGHTMAP_BY_VERTEX/static-model surfaces.
+        /// Non-receiver vertices remain neutral (255), preventing double AO on lightmaps.
+        vertex_values: Vec<u8>,
+        images: Vec<StaticAoBakedLightmap>,
+    },
+}
+
+struct StaticAoWorkerResult {
+    key: StaticAoJobKey,
+    data: StaticAoBakeData,
+    cache_hit: bool,
+    elapsed_ms: f64,
+}
+
+enum StaticAoWorkerUpdate {
+    InitLightmaps {
+        key: StaticAoJobKey,
+        images: Vec<StaticAoBakedLightmap>,
+    },
+    VertexAo {
+        key: StaticAoJobKey,
+        values: Vec<u8>,
+    },
+    LightmapTile {
+        key: StaticAoJobKey,
+        texture: usize,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+}
+
+struct StaticAoPendingJob {
+    key: StaticAoJobKey,
+    rx: Receiver<Result<StaticAoWorkerResult, String>>,
+    progress_rx: Receiver<(u32, u32)>,
+    update_rx: Receiver<StaticAoWorkerUpdate>,
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoTexelSample {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoBvhNode {
+    minimum: [f32; 3],
+    maximum: [f32; 3],
+    left: u32,
+    right: u32,
+    start: u32,
+    count: u32,
+}
+
+struct StaticAoBvh {
+    triangles: Vec<StaticAoTraceTriangle>,
+    indices: Vec<u32>,
+    nodes: Vec<StaticAoBvhNode>,
+}
+
+fn static_ao_cache_path(cache: &scene::StaticBspAoCacheInfo, key: StaticAoJobKey) -> PathBuf {
+    let safe_name = cache
+        .map_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .collect::<String>();
+    cache.directory.join(format!(
+        "{safe_name}-{:016x}-v{}-{}-{}s-{}x-{}pct-{}range{}.ao8",
+        cache.map_hash,
+        cache.version,
+        key.mode.label(),
+        key.samples,
+        key.scale,
+        key.strength,
+        key.range,
+        if key.current_cell_only { "-cell" } else { "" }
+    ))
+}
+
+fn static_ao_rotation(seed: usize) -> f32 {
+    let mut x = seed as u32;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    (x as f32 / u32::MAX as f32) * std::f32::consts::TAU
+}
+
+fn cross2(a: Vec2, b: Vec2) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
+fn rasterize_static_ao_texels(
+    source: &StaticAoWorldSource,
+    scale: u32,
+) -> Vec<Vec<Option<StaticAoTexelSample>>> {
+    let scale = scale.max(1);
+    let mut texels = source
+        .lightmap_sizes
+        .iter()
+        .map(|&[width, height]| {
+            let width = width.saturating_mul(scale);
+            let height = height.saturating_mul(scale);
+            vec![None; width as usize * height as usize]
+        })
+        .collect::<Vec<_>>();
+
+    for triangle in source.lightmap_triangles.iter() {
+        let Some(&[base_width, base_height]) = source.lightmap_sizes.get(triangle.texture) else {
+            continue;
+        };
+        let width = base_width.saturating_mul(scale);
+        let height = base_height.saturating_mul(scale);
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let size = Vec2::new(width as f32, height as f32);
+        let p = triangle.uvs.map(|uv| Vec2::from_array(uv) * size - Vec2::splat(0.5));
+        let denominator = cross2(p[1] - p[0], p[2] - p[0]);
+        if denominator.abs() < 1.0e-8 {
+            continue;
+        }
+        let min = p[0].min(p[1]).min(p[2]).floor();
+        let max = p[0].max(p[1]).max(p[2]).ceil();
+        let min_x = min.x.max(0.0) as u32;
+        let min_y = min.y.max(0.0) as u32;
+        let max_x = max.x.min(width.saturating_sub(1) as f32) as u32;
+        let max_y = max.y.min(height.saturating_sub(1) as f32) as u32;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let q = Vec2::new(x as f32, y as f32);
+                let w1 = cross2(q - p[0], p[2] - p[0]) / denominator;
+                let w2 = cross2(p[1] - p[0], q - p[0]) / denominator;
+                let w0 = 1.0 - w1 - w2;
+                if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
+                    continue;
+                }
+                let position = Vec3::from_array(triangle.positions[0]) * w0
+                    + Vec3::from_array(triangle.positions[1]) * w1
+                    + Vec3::from_array(triangle.positions[2]) * w2;
+                let normal = (Vec3::from_array(triangle.normals[0]) * w0
+                    + Vec3::from_array(triangle.normals[1]) * w1
+                    + Vec3::from_array(triangle.normals[2]) * w2)
+                    .normalize_or_zero();
+                if normal.length_squared() < 0.5 {
+                    continue;
+                }
+                let index = y as usize * width as usize + x as usize;
+                if texels[triangle.texture][index].is_none() {
+                    texels[triangle.texture][index] = Some(StaticAoTexelSample {
+                        position: position.to_array(),
+                        normal: normal.to_array(),
+                    });
+                }
+            }
+        }
+    }
+    texels
+}
+
+fn rasterize_static_ao_owners(source: &StaticAoWorldSource, scale: u32) -> Vec<Vec<u32>> {
+    let scale = scale.max(1);
+    let mut owners = source
+        .lightmap_sizes
+        .iter()
+        .map(|&[width, height]| {
+            let width = width.saturating_mul(scale);
+            let height = height.saturating_mul(scale);
+            vec![0u32; width as usize * height as usize]
+        })
+        .collect::<Vec<_>>();
+
+    for triangle in source.lightmap_triangles.iter() {
+        let Some(&[base_width, base_height]) = source.lightmap_sizes.get(triangle.texture) else {
+            continue;
+        };
+        let width = base_width.saturating_mul(scale);
+        let height = base_height.saturating_mul(scale);
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let size = Vec2::new(width as f32, height as f32);
+        let p = triangle.uvs.map(|uv| Vec2::from_array(uv) * size - Vec2::splat(0.5));
+        let denominator = cross2(p[1] - p[0], p[2] - p[0]);
+        if denominator.abs() < 1.0e-8 {
+            continue;
+        }
+        let min = p[0].min(p[1]).min(p[2]).floor();
+        let max = p[0].max(p[1]).max(p[2]).ceil();
+        let min_x = min.x.max(0.0) as u32;
+        let min_y = min.y.max(0.0) as u32;
+        let max_x = max.x.min(width.saturating_sub(1) as f32) as u32;
+        let max_y = max.y.min(height.saturating_sub(1) as f32) as u32;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let q = Vec2::new(x as f32, y as f32);
+                let w1 = cross2(q - p[0], p[2] - p[0]) / denominator;
+                let w2 = cross2(p[1] - p[0], q - p[0]) / denominator;
+                let w0 = 1.0 - w1 - w2;
+                if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
+                    continue;
+                }
+                let index = y as usize * width as usize + x as usize;
+                if owners[triangle.texture][index] == 0 {
+                    owners[triangle.texture][index] = triangle.owner;
+                }
+            }
+        }
+    }
+    owners
+}
+
+fn dilate_static_ao_owners(owners: &mut [u32], width: u32, height: u32, steps: u32) {
+    for _ in 0..steps.max(1) {
+        let previous = owners.to_vec();
+        let mut changed = false;
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let index = y as usize * width as usize + x as usize;
+                if previous[index] != 0 {
+                    continue;
+                }
+                let mut chosen = 0u32;
+                let mut count = 0u32;
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let neighbor = ny as usize * width as usize + nx as usize;
+                    let owner = previous[neighbor];
+                    if owner == 0 {
+                        continue;
+                    }
+                    if count == 0 {
+                        chosen = owner;
+                    }
+                    if owner == chosen {
+                        count += 1;
+                    } else if count == 1 {
+                        chosen = owner;
+                    }
+                }
+                if chosen != 0 {
+                    owners[index] = chosen;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn dilate_static_ao_mask(mask: &mut [u8], covered: &mut [u8], width: u32, height: u32, scale: u32) {
+    // Preserve the atlas/page padding at the AO supersampling scale. Two native
+    // texels of dilation becomes 2*scale high-resolution texels.
+    for _ in 0..(2 * scale.max(1)) {
+        let previous_mask = mask.to_vec();
+        let previous_covered = covered.to_vec();
+        let mut changed = false;
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let index = y as usize * width as usize + x as usize;
+                if previous_covered[index] != 0 {
+                    continue;
+                }
+                let mut total = 0u32;
+                let mut count = 0u32;
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let neighbor = ny as usize * width as usize + nx as usize;
+                    if previous_covered[neighbor] != 0 {
+                        total += u32::from(previous_mask[neighbor]);
+                        count += 1;
+                    }
+                }
+                if count != 0 {
+                    mask[index] = (total / count) as u8;
+                    covered[index] = 1;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn spread_static_ao_mask(
+    mask: &mut [u8],
+    covered: &[u8],
+    owners: &[u32],
+    width: u32,
+    height: u32,
+    scale: u32,
+) {
+    // A deliberately conservative post-bake shoulder: only already-dark AO may
+    // spread, only across covered texels belonging to the same lightmap owner,
+    // and it fades to roughly 25% strength after about 1.25 native lightmap
+    // texels. This slightly fatter shoulder helps contact shadows read a bit
+    // farther from the seam without reverting to broad room-scale darkening.
+    // This fattens genuine contact shadows without reintroducing the old broad
+    // room/floor darkening from large AO radii.
+    let radius = (scale.max(1).saturating_mul(5) + 3) / 4;
+    let step_decay = 0.25f32.powf(1.0 / radius as f32);
+    let mut occlusion = mask.iter().map(|&value| 255u8.saturating_sub(value)).collect::<Vec<_>>();
+    for _ in 0..radius {
+        let previous = occlusion.clone();
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let index = y as usize * width as usize + x as usize;
+                if covered[index] == 0 || owners[index] == 0 {
+                    continue;
+                }
+                let owner = owners[index];
+                let mut best = f32::from(previous[index]);
+                for (dx, dy) in [
+                    (-1, -1), (0, -1), (1, -1),
+                    (-1,  0),          (1,  0),
+                    (-1,  1), (0,  1), (1,  1),
+                ] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let neighbor = ny as usize * width as usize + nx as usize;
+                    if covered[neighbor] == 0 || owners[neighbor] != owner {
+                        continue;
+                    }
+                    best = best.max(f32::from(previous[neighbor]) * step_decay);
+                }
+                occlusion[index] = best.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    for (visibility, &darkness) in mask.iter_mut().zip(occlusion.iter()) {
+        *visibility = 255u8.saturating_sub(darkness);
+    }
+}
+
+fn static_ao_trace_triangle(triangle: StaticAoRenderTriangle) -> StaticAoTraceTriangle {
+    let origin = Vec3::from_array(triangle.positions[0]);
+    let b = Vec3::from_array(triangle.positions[1]);
+    let c = Vec3::from_array(triangle.positions[2]);
+    let edge1 = b - origin;
+    let edge2 = c - origin;
+    let minimum = origin.min(b).min(c);
+    let maximum = origin.max(b).max(c);
+    StaticAoTraceTriangle {
+        origin,
+        edge1,
+        edge2,
+        minimum,
+        maximum,
+        centroid: (origin + b + c) / 3.0,
+    }
+}
+
+impl StaticAoBvh {
+    fn build(triangles: Arc<Vec<StaticAoRenderTriangle>>) -> Result<Self, String> {
+        if triangles.is_empty() {
+            return Err("map has no opaque render triangles for HQ AO".into());
+        }
+        // Convert once into the exact representation used by the hot ray loop.
+        // This avoids rebuilding triangle edges / Vec3 values for every ray hit test.
+        let triangles = triangles
+            .iter()
+            .copied()
+            .map(static_ao_trace_triangle)
+            .collect::<Vec<_>>();
+        let mut indices = (0..triangles.len() as u32).collect::<Vec<_>>();
+        let mut nodes = Vec::with_capacity(triangles.len().saturating_mul(2));
+        Self::build_node(&triangles, &mut indices, &mut nodes, 0, triangles.len());
+        Ok(Self { triangles, indices, nodes })
+    }
+
+    fn build_node(
+        triangles: &[StaticAoTraceTriangle],
+        indices: &mut [u32],
+        nodes: &mut Vec<StaticAoBvhNode>,
+        start: usize,
+        end: usize,
+    ) -> u32 {
+        let mut minimum = Vec3::splat(f32::INFINITY);
+        let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+        let mut centroid_min = Vec3::splat(f32::INFINITY);
+        let mut centroid_max = Vec3::splat(f32::NEG_INFINITY);
+        for &index in &indices[start..end] {
+            let triangle = triangles[index as usize];
+            minimum = minimum.min(triangle.minimum);
+            maximum = maximum.max(triangle.maximum);
+            centroid_min = centroid_min.min(triangle.centroid);
+            centroid_max = centroid_max.max(triangle.centroid);
+        }
+        let node_index = nodes.len() as u32;
+        nodes.push(StaticAoBvhNode {
+            minimum: minimum.to_array(),
+            maximum: maximum.to_array(),
+            left: u32::MAX,
+            right: u32::MAX,
+            start: start as u32,
+            count: (end - start) as u32,
+        });
+        if end - start <= STATIC_AO_BVH_LEAF_TRIANGLES {
+            return node_index;
+        }
+        let extent = centroid_max - centroid_min;
+        let axis = if extent.x >= extent.y && extent.x >= extent.z {
+            0
+        } else if extent.y >= extent.z {
+            1
+        } else {
+            2
+        };
+        indices[start..end].sort_unstable_by(|&a, &b| {
+            triangles[a as usize].centroid[axis]
+                .total_cmp(&triangles[b as usize].centroid[axis])
+        });
+        let middle = start + (end - start) / 2;
+        let left = Self::build_node(triangles, indices, nodes, start, middle);
+        let right = Self::build_node(triangles, indices, nodes, middle, end);
+        nodes[node_index as usize].left = left;
+        nodes[node_index as usize].right = right;
+        nodes[node_index as usize].count = 0;
+        node_index
+    }
+
+    fn ray_bounds_near(
+        origin: Vec3,
+        direction: Vec3,
+        inverse_direction: Vec3,
+        minimum: Vec3,
+        maximum: Vec3,
+        max_t: f32,
+    ) -> Option<f32> {
+        let mut near = 0.0f32;
+        let mut far = max_t;
+        for axis in 0..3 {
+            if direction[axis].abs() < 1.0e-8 {
+                if origin[axis] < minimum[axis] || origin[axis] > maximum[axis] {
+                    return None;
+                }
+                continue;
+            }
+            let mut t0 = (minimum[axis] - origin[axis]) * inverse_direction[axis];
+            let mut t1 = (maximum[axis] - origin[axis]) * inverse_direction[axis];
+            if t0 > t1 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
+            near = near.max(t0);
+            far = far.min(t1);
+            if far < near {
+                return None;
+            }
+        }
+        (far >= 0.0 && near <= max_t).then_some(near.max(0.0))
+    }
+
+    #[inline]
+    fn ray_triangle_distance(
+        origin: Vec3,
+        direction: Vec3,
+        triangle: StaticAoTraceTriangle,
+    ) -> Option<f32> {
+        let p = direction.cross(triangle.edge2);
+        let determinant = triangle.edge1.dot(p);
+        if determinant.abs() < 1.0e-7 {
+            return None;
+        }
+        let inverse = 1.0 / determinant;
+        let t = origin - triangle.origin;
+        let u = t.dot(p) * inverse;
+        if !(0.0..=1.0).contains(&u) {
+            return None;
+        }
+        let q = t.cross(triangle.edge1);
+        let v = direction.dot(q) * inverse;
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+        let distance = triangle.edge2.dot(q) * inverse;
+        (distance > 0.001 && distance.is_finite()).then_some(distance)
+    }
+
+    fn trace(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<f32> {
+        let inverse_direction = Vec3::new(
+            if direction.x.abs() >= 1.0e-8 { 1.0 / direction.x } else { f32::INFINITY },
+            if direction.y.abs() >= 1.0e-8 { 1.0 / direction.y } else { f32::INFINITY },
+            if direction.z.abs() >= 1.0e-8 { 1.0 / direction.z } else { f32::INFINITY },
+        );
+        let root = self.nodes[0];
+        let root_near = Self::ray_bounds_near(
+            origin,
+            direction,
+            inverse_direction,
+            Vec3::from_array(root.minimum),
+            Vec3::from_array(root.maximum),
+            max_distance,
+        )?;
+
+        let mut closest = max_distance;
+        let mut hit = false;
+        // Near-first traversal lets a close hit tighten `closest` before we visit
+        // the far branch, pruning a large amount of work in dense BSP scenes.
+        let mut stack = [(0_u32, 0.0_f32); 64];
+        let mut stack_len = 1usize;
+        stack[0] = (0, root_near);
+        while stack_len != 0 {
+            stack_len -= 1;
+            let (node_index, node_near) = stack[stack_len];
+            if node_near > closest {
+                continue;
+            }
+            let node = self.nodes[node_index as usize];
+            if node.count != 0 {
+                let start = node.start as usize;
+                let end = start + node.count as usize;
+                for &triangle_index in &self.indices[start..end] {
+                    let triangle = self.triangles[triangle_index as usize];
+                    if let Some(distance) = Self::ray_triangle_distance(origin, direction, triangle) {
+                        if distance < closest {
+                            closest = distance;
+                            hit = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let left = self.nodes[node.left as usize];
+            let right = self.nodes[node.right as usize];
+            let left_near = Self::ray_bounds_near(
+                origin,
+                direction,
+                inverse_direction,
+                Vec3::from_array(left.minimum),
+                Vec3::from_array(left.maximum),
+                closest,
+            );
+            let right_near = Self::ray_bounds_near(
+                origin,
+                direction,
+                inverse_direction,
+                Vec3::from_array(right.minimum),
+                Vec3::from_array(right.maximum),
+                closest,
+            );
+            if stack_len + 2 > stack.len() {
+                break;
+            }
+            match (left_near, right_near) {
+                (Some(left_t), Some(right_t)) if left_t <= right_t => {
+                    stack[stack_len] = (node.right, right_t);
+                    stack[stack_len + 1] = (node.left, left_t);
+                    stack_len += 2;
+                }
+                (Some(left_t), Some(right_t)) => {
+                    stack[stack_len] = (node.left, left_t);
+                    stack[stack_len + 1] = (node.right, right_t);
+                    stack_len += 2;
+                }
+                (Some(left_t), None) => {
+                    stack[stack_len] = (node.left, left_t);
+                    stack_len += 1;
+                }
+                (None, Some(right_t)) => {
+                    stack[stack_len] = (node.right, right_t);
+                    stack_len += 1;
+                }
+                (None, None) => {}
+            }
+        }
+        hit.then_some(closest)
+    }
+}
+
+fn static_ao_sample_pattern(samples: u32) -> Vec<[f32; 2]> {
+    let samples = samples.clamp(1, 128);
+    (0..samples)
+        .map(|sample| {
+            let u = (sample as f32 + 0.5) / samples as f32;
+            [u.sqrt(), (1.0 - u).sqrt()]
+        })
+        .collect()
+}
+
+fn static_ao_hq_visibility(
+    bvh: &StaticAoBvh,
+    render_position: [f32; 3],
+    render_normal: [f32; 3],
+    sample_seed: usize,
+    sample_pattern: &[[f32; 2]],
+    range_scale: f32,
+) -> u8 {
+    let position = Vec3::from_array(render_position);
+    let normal = Vec3::from_array(render_normal).normalize_or_zero();
+    if normal.length_squared() < 0.5 || sample_pattern.is_empty() {
+        return 255;
+    }
+    let helper = if normal.z.abs() < 0.9 { Vec3::Z } else { Vec3::Y };
+    let tangent = normal.cross(helper).normalize_or_zero();
+    let bitangent = normal.cross(tangent).normalize_or_zero();
+    let rotation = static_ao_rotation(sample_seed);
+    let start = position + normal * STATIC_AO_LIGHTMAP_BIAS;
+    const GOLDEN_COS: f32 = -0.737_368_8;
+    const GOLDEN_SIN: f32 = 0.675_490_4;
+    let (mut sin_phi, mut cos_phi) = rotation.sin_cos();
+    let contact_radius = STATIC_AO_HQ_CONTACT_RADIUS * range_scale;
+    let medium_radius = STATIC_AO_HQ_MEDIUM_RADIUS * range_scale;
+    let broad_radius = STATIC_AO_HQ_BROAD_RADIUS * range_scale;
+    let mut contact = 0.0f32;
+    let mut medium = 0.0f32;
+    let mut broad = 0.0f32;
+    for &[radial, z] in sample_pattern {
+        let direction = tangent * (radial * cos_phi)
+            + bitangent * (radial * sin_phi)
+            + normal * z;
+        let next_cos = cos_phi * GOLDEN_COS - sin_phi * GOLDEN_SIN;
+        let next_sin = sin_phi * GOLDEN_COS + cos_phi * GOLDEN_SIN;
+        cos_phi = next_cos;
+        sin_phi = next_sin;
+        let Some(distance) = bvh.trace(start, direction, broad_radius) else {
+            continue;
+        };
+        let contribution = |radius: f32| {
+            if distance >= radius {
+                0.0
+            } else {
+                let proximity = 1.0 - distance / radius;
+                proximity * proximity
+            }
+        };
+        contact += contribution(contact_radius);
+        medium += contribution(medium_radius);
+        broad += contribution(broad_radius);
+    }
+    let inv = 1.0 / sample_pattern.len() as f32;
+    let occlusion = STATIC_AO_HQ_CONTACT_WEIGHT * contact * inv
+        + STATIC_AO_HQ_MEDIUM_WEIGHT * medium * inv
+        + STATIC_AO_HQ_BROAD_WEIGHT * broad * inv;
+    let visibility = (1.0 - occlusion).clamp(0.0, 1.0);
+    (visibility * 255.0 + 0.5) as u8
+}
+
+fn static_ao_structural_visibility(
+    bvh: &StaticAoBvh,
+    render_position: [f32; 3],
+    render_normal: [f32; 3],
+    sample_seed: usize,
+    sample_pattern: &[[f32; 2]],
+    range_scale: f32,
+) -> u8 {
+    let position = Vec3::from_array(render_position);
+    let normal = Vec3::from_array(render_normal).normalize_or_zero();
+    if normal.length_squared() < 0.5 || sample_pattern.is_empty() {
+        return 255;
+    }
+    let helper = if normal.z.abs() < 0.9 { Vec3::Z } else { Vec3::Y };
+    let tangent = normal.cross(helper).normalize_or_zero();
+    let bitangent = normal.cross(tangent).normalize_or_zero();
+    let rotation = static_ao_rotation(sample_seed);
+    let start = position + normal * STATIC_AO_VERTEX_BIAS;
+    let radius = STATIC_AO_HQ_MEDIUM_RADIUS * range_scale;
+    const GOLDEN_COS: f32 = -0.737_368_8;
+    const GOLDEN_SIN: f32 = 0.675_490_4;
+    let (mut sin_phi, mut cos_phi) = rotation.sin_cos();
+    let mut occlusion = 0.0f32;
+
+    for &[radial, z] in sample_pattern {
+        let direction = tangent * (radial * cos_phi)
+            + bitangent * (radial * sin_phi)
+            + normal * z;
+        let next_cos = cos_phi * GOLDEN_COS - sin_phi * GOLDEN_SIN;
+        let next_sin = sin_phi * GOLDEN_COS + cos_phi * GOLDEN_SIN;
+        cos_phi = next_cos;
+        sin_phi = next_sin;
+        let Some(distance) = bvh.trace(start, direction, radius) else {
+            continue;
+        };
+        let proximity = (1.0 - distance / radius).clamp(0.0, 1.0);
+        occlusion += proximity * proximity;
+    }
+
+    let visibility = (1.0 - occlusion / sample_pattern.len() as f32).clamp(0.0, 1.0);
+    (visibility * 255.0 + 0.5) as u8
+}
+
+fn static_ao_worker_count() -> usize {
+    let logical_workers = thread::available_parallelism().map_or(4, |count| count.get());
+    // The bake is asynchronous and cacheable. Use most of the CPU, but leave one
+    // logical core for the render/game threads so enabling BAKED remains responsive.
+    logical_workers.saturating_sub(1).clamp(1, 16)
+}
+
+fn bake_static_structural_vertex_ao(
+    source: &StaticAoWorldSource,
+    bvh: Arc<StaticAoBvh>,
+    sample_pattern: Arc<Vec<[f32; 2]>>,
+    range_scale: f32,
+    workers: usize,
+) -> Vec<u8> {
+    let mut values = vec![255u8; source.vertices.len()];
+    // Vertex AO is only for true LIGHTMAP_BY_VERTEX/static-model receivers.
+    // Lightmapped BSP is handled exclusively in lightmap space so large BSP
+    // polygons cannot smear one dark vertex across a huge floor or wall.
+    let mut unique_lookup = BTreeMap::<[u32; 6], usize>::new();
+    let mut unique_vertices = Vec::<([f32; 3], [f32; 3], usize)>::new();
+    let mut vertex_to_unique = vec![usize::MAX; source.vertices.len()];
+    for (index, vertex) in source.vertices.iter().enumerate() {
+        if source.vertex_ao_receivers.get(index).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let key = [
+            vertex.position[0].to_bits(),
+            vertex.position[1].to_bits(),
+            vertex.position[2].to_bits(),
+            vertex.normal[0].to_bits(),
+            vertex.normal[1].to_bits(),
+            vertex.normal[2].to_bits(),
+        ];
+        let unique_index = if let Some(&unique_index) = unique_lookup.get(&key) {
+            unique_index
+        } else {
+            let unique_index = unique_vertices.len();
+            unique_lookup.insert(key, unique_index);
+            unique_vertices.push((vertex.position, vertex.normal, index));
+            unique_index
+        };
+        vertex_to_unique[index] = unique_index;
+    }
+
+    let mut unique_values = vec![255u8; unique_vertices.len()];
+    let chunk_size = unique_values.len().div_ceil(workers).max(1);
+    thread::scope(|scope| {
+        for (value_chunk, vertex_chunk) in unique_values
+            .chunks_mut(chunk_size)
+            .zip(unique_vertices.chunks(chunk_size))
+        {
+            let bvh = Arc::clone(&bvh);
+            let sample_pattern = Arc::clone(&sample_pattern);
+            scope.spawn(move || {
+                for (visibility, &(position, normal, seed)) in
+                    value_chunk.iter_mut().zip(vertex_chunk.iter())
+                {
+                    *visibility = static_ao_structural_visibility(
+                        &bvh,
+                        position,
+                        normal,
+                        seed,
+                        &sample_pattern,
+                        range_scale,
+                    );
+                }
+            });
+        }
+    });
+
+    for (index, &unique_index) in vertex_to_unique.iter().enumerate() {
+        if unique_index != usize::MAX {
+            values[index] = unique_values[unique_index];
+        }
+    }
+    println!(
+        "Static BSP AO worker: vertex-lit AO baked {} receiver vertices / {} unique x {} rays ({} threads)",
+        vertex_to_unique.iter().filter(|&&index| index != usize::MAX).count(),
+        unique_vertices.len(),
+        sample_pattern.len(),
+        workers
+    );
+    values
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoAdaptiveCell {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+fn static_ao_cell_has_coverage(
+    texels: &[Option<StaticAoTexelSample>],
+    width: u32,
+    cell: StaticAoAdaptiveCell,
+) -> bool {
+    for y in cell.y0..cell.y1 {
+        let row = y as usize * width as usize;
+        for x in cell.x0..cell.x1 {
+            if texels[row + x as usize].is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn static_ao_cell_points(width: u32, cell: StaticAoAdaptiveCell) -> [usize; 9] {
+    let x0 = cell.x0;
+    let y0 = cell.y0;
+    let x1 = cell.x1.saturating_sub(1);
+    let y1 = cell.y1.saturating_sub(1);
+    let xc = (x0 + x1) / 2;
+    let yc = (y0 + y1) / 2;
+    let index = |x: u32, y: u32| y as usize * width as usize + x as usize;
+    [
+        index(x0, y0),
+        index(x1, y0),
+        index(x0, y1),
+        index(x1, y1),
+        index(xc, y0),
+        index(xc, y1),
+        index(x0, yc),
+        index(x1, yc),
+        index(xc, yc),
+    ]
+}
+
+fn static_ao_trace_adaptive_indices(
+    indices: &[usize],
+    mask: &mut [u8],
+    sampled: &mut [u8],
+    texels: &[Option<StaticAoTexelSample>],
+    bvh: Arc<StaticAoBvh>,
+    sample_pattern: Arc<Vec<[f32; 2]>>,
+    range_scale: f32,
+    seed_base: usize,
+    workers: usize,
+) {
+    if indices.is_empty() {
+        return;
+    }
+    let mut results = vec![255u8; indices.len()];
+    let chunk_size = indices.len().div_ceil(workers).max(1);
+    thread::scope(|scope| {
+        for (result_chunk, index_chunk) in results
+            .chunks_mut(chunk_size)
+            .zip(indices.chunks(chunk_size))
+        {
+            let bvh = Arc::clone(&bvh);
+            let sample_pattern = Arc::clone(&sample_pattern);
+            scope.spawn(move || {
+                for (result, &index) in result_chunk.iter_mut().zip(index_chunk.iter()) {
+                    if let Some(sample) = texels[index] {
+                        *result = static_ao_hq_visibility(
+                            &bvh,
+                            sample.position,
+                            sample.normal,
+                            seed_base.wrapping_add(index),
+                            &sample_pattern,
+                            range_scale,
+                        );
+                    }
+                }
+            });
+        }
+    });
+    for (&index, &visibility) in indices.iter().zip(results.iter()) {
+        mask[index] = visibility;
+        sampled[index] = 1;
+    }
+}
+
+fn static_ao_adaptive_cell_smooth(
+    cell: StaticAoAdaptiveCell,
+    width: u32,
+    texels: &[Option<StaticAoTexelSample>],
+    owners: &[u32],
+    mask: &[u8],
+    sampled: &[u8],
+) -> bool {
+    let points = static_ao_cell_points(width, cell);
+    let mut owner = 0u32;
+    let mut center_normal = Vec3::ZERO;
+    let mut min_visibility = u8::MAX;
+    let mut max_visibility = 0u8;
+    for (point_index, &index) in points.iter().enumerate() {
+        let Some(sample) = texels[index] else {
+            return false;
+        };
+        if sampled[index] == 0 || owners[index] == 0 {
+            return false;
+        }
+        if owner == 0 {
+            owner = owners[index];
+        } else if owners[index] != owner {
+            return false;
+        }
+        let normal = Vec3::from_array(sample.normal).normalize_or_zero();
+        if normal.length_squared() < 0.5 {
+            return false;
+        }
+        if point_index == 8 {
+            center_normal = normal;
+        }
+        min_visibility = min_visibility.min(mask[index]);
+        max_visibility = max_visibility.max(mask[index]);
+    }
+    if max_visibility.saturating_sub(min_visibility) > STATIC_AO_ADAPTIVE_MAX_VISIBILITY_RANGE {
+        return false;
+    }
+    for &index in &points[..8] {
+        let normal = Vec3::from_array(texels[index].unwrap().normal).normalize_or_zero();
+        if center_normal.dot(normal) < STATIC_AO_ADAPTIVE_MIN_NORMAL_DOT {
+            return false;
+        }
+    }
+    let corner_average = ((u32::from(mask[points[0]])
+        + u32::from(mask[points[1]])
+        + u32::from(mask[points[2]])
+        + u32::from(mask[points[3]])
+        + 2)
+        / 4) as u8;
+    mask[points[8]].abs_diff(corner_average) <= STATIC_AO_ADAPTIVE_MAX_CENTER_ERROR
+}
+
+fn static_ao_fill_adaptive_cell(
+    cell: StaticAoAdaptiveCell,
+    width: u32,
+    texels: &[Option<StaticAoTexelSample>],
+    owners: &[u32],
+    mask: &mut [u8],
+    sampled: &mut [u8],
+) {
+    let points = static_ao_cell_points(width, cell);
+    let owner = owners[points[8]];
+    let v00 = f32::from(mask[points[0]]);
+    let v10 = f32::from(mask[points[1]]);
+    let v01 = f32::from(mask[points[2]]);
+    let v11 = f32::from(mask[points[3]]);
+    let vc = f32::from(mask[points[8]]);
+    let center_bilinear = (v00 + v10 + v01 + v11) * 0.25;
+    let center_correction = vc - center_bilinear;
+    let span_x = cell.x1.saturating_sub(cell.x0 + 1).max(1) as f32;
+    let span_y = cell.y1.saturating_sub(cell.y0 + 1).max(1) as f32;
+    for y in cell.y0..cell.y1 {
+        let ty = (y.saturating_sub(cell.y0) as f32 / span_y).clamp(0.0, 1.0);
+        for x in cell.x0..cell.x1 {
+            let index = y as usize * width as usize + x as usize;
+            if texels[index].is_none() || owners[index] != owner {
+                continue;
+            }
+            if sampled[index] != 0 {
+                continue;
+            }
+            let tx = (x.saturating_sub(cell.x0) as f32 / span_x).clamp(0.0, 1.0);
+            let top = v00 + (v10 - v00) * tx;
+            let bottom = v01 + (v11 - v01) * tx;
+            let mut value = top + (bottom - top) * ty;
+            let center_weight = (4.0 * tx * (1.0 - tx)) * (4.0 * ty * (1.0 - ty));
+            value += center_correction * center_weight;
+            mask[index] = value.clamp(0.0, 255.0).round() as u8;
+            sampled[index] = 2;
+        }
+    }
+}
+
+fn static_ao_subdivide_cell(cell: StaticAoAdaptiveCell, output: &mut Vec<StaticAoAdaptiveCell>) {
+    let width = cell.x1 - cell.x0;
+    let height = cell.y1 - cell.y0;
+    if width <= 1 && height <= 1 {
+        return;
+    }
+    let xm = if width > 1 { cell.x0 + width / 2 } else { cell.x1 };
+    let ym = if height > 1 { cell.y0 + height / 2 } else { cell.y1 };
+    let xs = if width > 1 {
+        [(cell.x0, xm), (xm, cell.x1)]
+    } else {
+        [(cell.x0, cell.x1), (cell.x1, cell.x1)]
+    };
+    let ys = if height > 1 {
+        [(cell.y0, ym), (ym, cell.y1)]
+    } else {
+        [(cell.y0, cell.y1), (cell.y1, cell.y1)]
+    };
+    for &(y0, y1) in &ys {
+        if y0 >= y1 {
+            continue;
+        }
+        for &(x0, x1) in &xs {
+            if x0 < x1 {
+                output.push(StaticAoAdaptiveCell { x0, y0, x1, y1 });
+            }
+        }
+    }
+}
+
+fn bake_static_lightmap_texture_adaptive(
+    texels: &[Option<StaticAoTexelSample>],
+    owners: &[u32],
+    width: u32,
+    height: u32,
+    scale: u32,
+    bvh: Arc<StaticAoBvh>,
+    sample_pattern: Arc<Vec<[f32; 2]>>,
+    range_scale: f32,
+    seed_base: usize,
+    workers: usize,
+) -> (Vec<u8>, Vec<u8>, usize) {
+    let mut mask = vec![255u8; texels.len()];
+    let mut sampled = vec![0u8; texels.len()];
+    let root_span = (scale.max(1) * 2).max(2);
+    let mut cells = Vec::new();
+    let mut y = 0u32;
+    while y < height {
+        let mut x = 0u32;
+        while x < width {
+            let cell = StaticAoAdaptiveCell {
+                x0: x,
+                y0: y,
+                x1: (x + root_span).min(width),
+                y1: (y + root_span).min(height),
+            };
+            if static_ao_cell_has_coverage(texels, width, cell) {
+                cells.push(cell);
+            }
+            x += root_span;
+        }
+        y += root_span;
+    }
+
+    while !cells.is_empty() {
+        let mut needed = BTreeSet::<usize>::new();
+        for &cell in &cells {
+            for index in static_ao_cell_points(width, cell) {
+                if texels[index].is_some() && sampled[index] == 0 {
+                    needed.insert(index);
+                }
+            }
+        }
+        let needed = needed.into_iter().collect::<Vec<_>>();
+        static_ao_trace_adaptive_indices(
+            &needed,
+            &mut mask,
+            &mut sampled,
+            texels,
+            Arc::clone(&bvh),
+            Arc::clone(&sample_pattern),
+            range_scale,
+            seed_base,
+            workers,
+        );
+
+        let mut next_cells = Vec::new();
+        for cell in cells.drain(..) {
+            let cell_width = cell.x1 - cell.x0;
+            let cell_height = cell.y1 - cell.y0;
+            if static_ao_adaptive_cell_smooth(cell, width, texels, owners, &mask, &sampled) {
+                static_ao_fill_adaptive_cell(
+                    cell,
+                    width,
+                    texels,
+                    owners,
+                    &mut mask,
+                    &mut sampled,
+                );
+            } else if cell_width > 1 || cell_height > 1 {
+                static_ao_subdivide_cell(cell, &mut next_cells);
+            }
+        }
+        cells = next_cells;
+    }
+
+    // Any tiny coverage sliver that never landed on a cell's five probes gets an
+    // exact sample here. This keeps adaptive sampling conservative at UV borders.
+    let remaining = texels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sample)| (sample.is_some() && sampled[index] == 0).then_some(index))
+        .collect::<Vec<_>>();
+    static_ao_trace_adaptive_indices(
+        &remaining,
+        &mut mask,
+        &mut sampled,
+        texels,
+        bvh,
+        sample_pattern,
+        range_scale,
+        seed_base,
+        workers,
+    );
+    let traced = sampled.iter().filter(|&&state| state == 1).count();
+    let covered = texels.iter().map(|sample| u8::from(sample.is_some())).collect::<Vec<_>>();
+    (mask, covered, traced)
+}
+
+#[derive(Clone, Copy)]
+struct StaticAoBakeTile {
+    texture: usize,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    priority: f32,
+}
+
+fn static_ao_extract_region<T: Copy>(
+    source: &[T],
+    source_width: u32,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Vec<T> {
+    let mut result = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+    for y in y0..y1 {
+        let start = y as usize * source_width as usize + x0 as usize;
+        let end = start + (x1 - x0) as usize;
+        result.extend_from_slice(&source[start..end]);
+    }
+    result
+}
+
+fn static_ao_tile_priority(
+    texels: &[Option<StaticAoTexelSample>],
+    width: u32,
+    tile: StaticAoBakeTile,
+    camera_position: Vec3,
+) -> Option<f32> {
+    let mut best = f32::INFINITY;
+    let mut found = false;
+    for y in tile.y0..tile.y1 {
+        let row = y as usize * width as usize;
+        for x in tile.x0..tile.x1 {
+            if let Some(sample) = texels[row + x as usize] {
+                found = true;
+                best = best.min(Vec3::from_array(sample.position).distance_squared(camera_position));
+            }
+        }
+    }
+    found.then_some(best)
+}
+
+fn bake_static_lightmap_ao(
+    source: &StaticAoWorldSource,
+    sample_pattern: Arc<Vec<[f32; 2]>>,
+    scale: u32,
+    range_scale: f32,
+    strength: f32,
+    bvh: Arc<StaticAoBvh>,
+    workers: usize,
+    key: StaticAoJobKey,
+    camera_position: Vec3,
+    updates: &mpsc::Sender<StaticAoWorkerUpdate>,
+    progress: &mpsc::Sender<(u32, u32)>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let scale = match scale { 1 | 3 | 5 => scale, _ => 3 };
+    let raster_started = Instant::now();
+    let texels = rasterize_static_ao_texels(source, scale);
+    let owners = rasterize_static_ao_owners(source, scale);
+    let mut low_owners = rasterize_static_ao_owners(source, 1);
+    let mut baked_high_owners = owners.clone();
+    for ((low, high), &[base_width, base_height]) in low_owners
+        .iter_mut()
+        .zip(baked_high_owners.iter_mut())
+        .zip(source.lightmap_sizes.iter())
+    {
+        dilate_static_ao_owners(low, base_width, base_height, 2);
+        dilate_static_ao_owners(
+            high,
+            base_width.saturating_mul(scale),
+            base_height.saturating_mul(scale),
+            2 * scale,
+        );
+    }
+    let raster_ms = raster_started.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "Static BSP AO worker: tiled adaptive HQ lightmap raster {:.1} ms at {}x",
+        raster_ms, scale
+    );
+
+    let mut masks = source
+        .lightmap_sizes
+        .iter()
+        .map(|&[w, h]| vec![255u8; w.saturating_mul(scale) as usize * h.saturating_mul(scale) as usize])
+        .collect::<Vec<_>>();
+    let mut jobs = Vec::<StaticAoBakeTile>::new();
+    let tile_span = (32 * scale).max(32);
+    for (texture, texel_samples) in texels.iter().enumerate() {
+        let [base_width, base_height] = source.lightmap_sizes[texture];
+        let width = base_width.saturating_mul(scale);
+        let height = base_height.saturating_mul(scale);
+        let mut y = 0u32;
+        while y < height {
+            let mut x = 0u32;
+            while x < width {
+                let mut tile = StaticAoBakeTile {
+                    texture,
+                    x0: x,
+                    y0: y,
+                    x1: (x + tile_span).min(width),
+                    y1: (y + tile_span).min(height),
+                    priority: f32::INFINITY,
+                };
+                if let Some(priority) = static_ao_tile_priority(
+                    texel_samples,
+                    width,
+                    tile,
+                    camera_position,
+                ) {
+                    tile.priority = priority;
+                    jobs.push(tile);
+                }
+                x += tile_span;
+            }
+            y += tile_span;
+        }
+    }
+    jobs.sort_by(|a, b| a.priority.total_cmp(&b.priority));
+    if key.current_cell_only && jobs.len() > 1 {
+        jobs.truncate(1);
+    }
+    println!(
+        "Static BSP AO worker: {} lightmap tile(s), nearest-first from [{:.1}, {:.1}, {:.1}]{}",
+        jobs.len(), camera_position.x, camera_position.y, camera_position.z,
+        if key.current_cell_only { " (current cell only)" } else { "" }
+    );
+
+    let mut traced_per_texture = vec![0usize; source.lightmap_sizes.len()];
+    let mut covered_per_texture = vec![0usize; source.lightmap_sizes.len()];
+    for (texture, texel_samples) in texels.iter().enumerate() {
+        covered_per_texture[texture] = texel_samples.iter().filter(|sample| sample.is_some()).count();
+    }
+
+    let total_jobs = jobs.len().max(1);
+    for (job_index, tile) in jobs.into_iter().enumerate() {
+        let [base_width, base_height] = source.lightmap_sizes[tile.texture];
+        let full_width = base_width.saturating_mul(scale);
+        let full_height = base_height.saturating_mul(scale);
+        // Include a halo so the artificial AO shoulder and adaptive decisions are
+        // stable across tile boundaries. Only the central tile is streamed/uploaded.
+        let halo = 2 * scale.max(1);
+        let ex0 = tile.x0.saturating_sub(halo);
+        let ey0 = tile.y0.saturating_sub(halo);
+        let ex1 = tile.x1.saturating_add(halo).min(full_width);
+        let ey1 = tile.y1.saturating_add(halo).min(full_height);
+        let local_width = ex1 - ex0;
+        let local_height = ey1 - ey0;
+        let local_texels = static_ao_extract_region(
+            &texels[tile.texture], full_width, ex0, ey0, ex1, ey1,
+        );
+        let local_owners = static_ao_extract_region(
+            &owners[tile.texture], full_width, ex0, ey0, ex1, ey1,
+        );
+        let seed_base = tile.texture
+            .wrapping_mul(0x100000)
+            .wrapping_add(ey0 as usize * full_width as usize + ex0 as usize);
+        let (mut local_mask, mut local_covered, traced) = bake_static_lightmap_texture_adaptive(
+            &local_texels,
+            &local_owners,
+            local_width,
+            local_height,
+            scale,
+            Arc::clone(&bvh),
+            Arc::clone(&sample_pattern),
+            range_scale,
+            seed_base,
+            workers,
+        );
+        dilate_static_ao_mask(
+            &mut local_mask,
+            &mut local_covered,
+            local_width,
+            local_height,
+            scale,
+        );
+        spread_static_ao_mask(
+            &mut local_mask,
+            &local_covered,
+            &local_owners,
+            local_width,
+            local_height,
+            scale,
+        );
+        traced_per_texture[tile.texture] += traced;
+
+        for y in tile.y0..tile.y1 {
+            let local_y = y - ey0;
+            for x in tile.x0..tile.x1 {
+                let local_x = x - ex0;
+                let local_index = local_y as usize * local_width as usize + local_x as usize;
+                let global_index = y as usize * full_width as usize + x as usize;
+                masks[tile.texture][global_index] = local_mask[local_index];
+            }
+        }
+
+        let rgba = static_ao_baked_lightmap_tile(
+            &source.lightmap_bases[tile.texture],
+            &masks[tile.texture],
+            &low_owners[tile.texture],
+            &baked_high_owners[tile.texture],
+            scale,
+            strength,
+            tile.x0,
+            tile.y0,
+            tile.x1,
+            tile.y1,
+        );
+        let _ = updates.send(StaticAoWorkerUpdate::LightmapTile {
+            key,
+            texture: tile.texture,
+            x: tile.x0,
+            y: tile.y0,
+            width: tile.x1 - tile.x0,
+            height: tile.y1 - tile.y0,
+            rgba,
+        });
+        let completed = 45 + (((job_index + 1) * 45) / total_jobs) as u32;
+        let _ = progress.send((completed.min(90), 100));
+    }
+
+    for texture in 0..source.lightmap_sizes.len() {
+        let traced_percent = if covered_per_texture[texture] == 0 {
+            0.0
+        } else {
+            traced_per_texture[texture] as f64 * 100.0 / covered_per_texture[texture] as f64
+        };
+        println!(
+            "Static BSP AO worker: tiled adaptive HQ lightmap {}/{} covered {} texels, traced {} ({:.1}%) at {}x x {} rays",
+            texture + 1,
+            source.lightmap_sizes.len(),
+            covered_per_texture[texture],
+            traced_per_texture[texture],
+            traced_percent,
+            scale,
+            sample_pattern.len(),
+        );
+    }
+    Ok(masks)
+}
+
+fn static_ao_srgb_decode_lut() -> &'static [f32; 256] {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let encoded = index as f32 / 255.0;
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
+}
+
+fn static_ao_srgb_encode_lut() -> &'static [u8; 65_536] {
+    static LUT: OnceLock<[u8; 65_536]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let linear = index as f32 / 65_535.0;
+            let encoded = if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+        })
+    })
+}
+
+#[inline]
+fn static_ao_srgb_decode(value: u8) -> f32 {
+    static_ao_srgb_decode_lut()[value as usize]
+}
+
+#[inline]
+fn static_ao_srgb_encode(linear: f32) -> u8 {
+    let index = (linear.clamp(0.0, 1.0) * 65_535.0 + 0.5) as usize;
+    static_ao_srgb_encode_lut()[index]
+}
+
+fn static_ao_baked_pixel(
+    base: &StaticAoBaseLightmap,
+    low_owners: &[u32],
+    high_owners: &[u32],
+    scale: u32,
+    x: u32,
+    y: u32,
+    visibility: u8,
+    strength: f32,
+) -> [u8; 4] {
+    let scale = scale.max(1);
+    let factor = 1.0 - strength * (1.0 - f32::from(visibility) / 255.0);
+    if scale == 1 {
+        let index = (y as usize * base.width as usize + x as usize) * 4;
+        let mut out = [0u8; 4];
+        for channel in 0..3 {
+            let original = if base.srgb {
+                static_ao_srgb_decode(base.rgba[index + channel])
+            } else {
+                f32::from(base.rgba[index + channel]) / 255.0
+            };
+            let baked = (original * factor).min(original);
+            out[channel] = if base.srgb {
+                static_ao_srgb_encode(baked)
+            } else {
+                (baked.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            };
+        }
+        out[3] = 255;
+        return out;
+    }
+
+    let src_width = base.width as i32;
+    let src_height = base.height as i32;
+    let source_y = (y as f32 + 0.5) / scale as f32 - 0.5;
+    let y_floor = source_y.floor() as i32;
+    let fy = source_y - y_floor as f32;
+    let y0 = y_floor.clamp(0, src_height - 1);
+    let y1 = (y_floor + 1).clamp(0, src_height - 1);
+    let source_x = (x as f32 + 0.5) / scale as f32 - 0.5;
+    let x_floor = source_x.floor() as i32;
+    let fx = source_x - x_floor as f32;
+    let x0 = x_floor.clamp(0, src_width - 1);
+    let x1 = (x_floor + 1).clamp(0, src_width - 1);
+    let source_index = |sx: i32, sy: i32| {
+        (sy as usize * base.width as usize + sx as usize) * 4
+    };
+    let i00 = source_index(x0, y0);
+    let i10 = source_index(x1, y0);
+    let i01 = source_index(x0, y1);
+    let i11 = source_index(x1, y1);
+    let high_width = base.width.saturating_mul(scale) as usize;
+    let owner = high_owners[y as usize * high_width + x as usize];
+    let sample_owner = |sx: i32, sy: i32| -> u32 {
+        low_owners[sy as usize * base.width as usize + sx as usize]
+    };
+    let weights = [
+        ((1.0 - fx) * (1.0 - fy), i00, sample_owner(x0, y0)),
+        (fx * (1.0 - fy), i10, sample_owner(x1, y0)),
+        ((1.0 - fx) * fy, i01, sample_owner(x0, y1)),
+        (fx * fy, i11, sample_owner(x1, y1)),
+    ];
+    let decode = |value| {
+        if base.srgb {
+            static_ao_srgb_decode(value)
+        } else {
+            f32::from(value) / 255.0
+        }
+    };
+    let mut out = [0u8; 4];
+    for channel in 0..3 {
+        let mut original = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        for (weight, index, sample_owner) in weights {
+            if weight <= 0.0 {
+                continue;
+            }
+            if owner == 0 || sample_owner == owner {
+                original += decode(base.rgba[index + channel]) * weight;
+                weight_sum += weight;
+            }
+        }
+        if weight_sum <= 1.0e-6 {
+            for (weight, index, _) in weights {
+                if weight <= 0.0 {
+                    continue;
+                }
+                original += decode(base.rgba[index + channel]) * weight;
+                weight_sum += weight;
+            }
+        }
+        original /= weight_sum.max(1.0e-6);
+        let baked = (original * factor).min(original);
+        out[channel] = if base.srgb {
+            static_ao_srgb_encode(baked)
+        } else {
+            (baked.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+        };
+    }
+    out[3] = 255;
+    out
+}
+
+fn static_ao_baked_lightmap(
+    base: &StaticAoBaseLightmap,
+    mask: &[u8],
+    low_owners: &[u32],
+    high_owners: &[u32],
+    scale: u32,
+    strength: f32,
+) -> Result<StaticAoBakedLightmap, String> {
+    let scale = scale.max(1);
+    let width = base.width.saturating_mul(scale);
+    let height = base.height.saturating_mul(scale);
+    let pixels = width as usize * height as usize;
+    if mask.len() != pixels
+        || high_owners.len() != pixels
+        || low_owners.len() != base.width as usize * base.height as usize
+        || base.rgba.len() < base.width as usize * base.height as usize * 4
+    {
+        return Err("lightmap AO cache dimensions do not match current lightmap".into());
+    }
+    let mut rgba = vec![255u8; pixels * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y as usize * width as usize + x as usize;
+            let pixel = static_ao_baked_pixel(
+                base,
+                low_owners,
+                high_owners,
+                scale,
+                x,
+                y,
+                mask[index],
+                strength,
+            );
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&pixel);
+        }
+    }
+    Ok(StaticAoBakedLightmap {
+        label: if scale == 1 {
+            format!("{} + cached HQ AO", base.label)
+        } else {
+            format!("{} + cached HQ AO {}x", base.label, scale)
+        },
+        width,
+        height,
+        rgba,
+        clamp: base.clamp,
+        srgb: base.srgb,
+    })
+}
+
+fn static_ao_baked_lightmap_tile(
+    base: &StaticAoBaseLightmap,
+    mask: &[u8],
+    low_owners: &[u32],
+    high_owners: &[u32],
+    scale: u32,
+    strength: f32,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Vec<u8> {
+    let scale = scale.max(1);
+    let width = base.width.saturating_mul(scale);
+    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = y as usize * width as usize + x as usize;
+            rgba.extend_from_slice(&static_ao_baked_pixel(
+                base,
+                low_owners,
+                high_owners,
+                scale,
+                x,
+                y,
+                mask[index],
+                strength,
+            ));
+        }
+    }
+    rgba
+}
+
+fn build_static_ao_baked_lightmaps(
+    source: &StaticAoWorldSource,
+    masks: &[Vec<u8>],
+    scale: u32,
+    strength: f32,
+) -> Result<Vec<StaticAoBakedLightmap>, String> {
+    if masks.len() != source.lightmap_bases.len() {
+        return Err("lightmap AO cache does not match current lightmap set".into());
+    }
+    let mut low_owners = rasterize_static_ao_owners(source, 1);
+    let mut high_owners = rasterize_static_ao_owners(source, scale);
+    for ((low, high), &[base_width, base_height]) in low_owners
+        .iter_mut()
+        .zip(high_owners.iter_mut())
+        .zip(source.lightmap_sizes.iter())
+    {
+        dilate_static_ao_owners(low, base_width, base_height, 2);
+        dilate_static_ao_owners(
+            high,
+            base_width.saturating_mul(scale.max(1)),
+            base_height.saturating_mul(scale.max(1)),
+            2 * scale.max(1),
+        );
+    }
+    masks
+        .iter()
+        .zip(source.lightmap_bases.iter())
+        .zip(low_owners.iter().zip(high_owners.iter()))
+        .map(|((mask, base), (low, high))| {
+            static_ao_baked_lightmap(base, mask, low, high, scale, strength)
+        })
+        .collect()
+}
+
+fn read_static_ao_cache(
+    source: &StaticAoWorldSource,
+    key: StaticAoJobKey,
+) -> Option<StaticAoBakeData> {
+    let path = static_ao_cache_path(&source.cache, key);
+    let bytes = fs::read(&path).ok()?;
+    // JAL5 caches the final supersampled lightmap pixels, not just AO masks.
+    // Cache hits therefore avoid repeating the expensive upscale/sRGB composite.
+    if bytes.len() < 12 || !bytes.starts_with(b"JAL5") {
+        return None;
+    }
+    let vertex_expected = source.vertices.len();
+    let vertex_count = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let image_count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    if vertex_count != vertex_expected || image_count != source.lightmap_bases.len() {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut images = Vec::with_capacity(image_count);
+    for base in source.lightmap_bases.iter() {
+        if offset + 12 > bytes.len() {
+            return None;
+        }
+        let width = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let height = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?);
+        let len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().ok()?) as usize;
+        offset += 12;
+        let expected_len = width as usize * height as usize * 4;
+        if len != expected_len || offset + len > bytes.len() {
+            return None;
+        }
+        images.push(StaticAoBakedLightmap {
+            label: format!("{} + cached baked AO", base.label),
+            width,
+            height,
+            rgba: bytes[offset..offset + len].to_vec(),
+            clamp: base.clamp,
+            srgb: base.srgb,
+        });
+        offset += len;
+    }
+    if offset + vertex_expected != bytes.len() {
+        return None;
+    }
+    let vertex_values = bytes[offset..].to_vec();
+    Some(StaticAoBakeData::Lightmap {
+        vertex_values,
+        images,
+    })
+}
+
+fn write_static_ao_cache(
+    source: &StaticAoWorldSource,
+    key: StaticAoJobKey,
+    data: &StaticAoBakeData,
+) {
+    let path = static_ao_cache_path(&source.cache, key);
+    let Some(parent) = path.parent() else { return; };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let StaticAoBakeData::Lightmap {
+        vertex_values,
+        images,
+    } = data;
+    let pixel_bytes = images.iter().map(|image| image.rgba.len()).sum::<usize>();
+    let mut bytes = Vec::with_capacity(
+        12 + images.len() * 12 + pixel_bytes + vertex_values.len(),
+    );
+    bytes.extend_from_slice(b"JAL5");
+    bytes.extend_from_slice(&(vertex_values.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(images.len() as u32).to_le_bytes());
+    for image in images {
+        bytes.extend_from_slice(&image.width.to_le_bytes());
+        bytes.extend_from_slice(&image.height.to_le_bytes());
+        bytes.extend_from_slice(&(image.rgba.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&image.rgba);
+    }
+    bytes.extend_from_slice(vertex_values);
+    if let Err(error) = fs::write(&path, bytes) {
+        eprintln!("Static BSP AO: could not write cache {}: {error}", path.display());
+    }
+}
+
+fn run_static_ao_worker(
+    source: StaticAoWorldSource,
+    key: StaticAoJobKey,
+    force_rebuild: bool,
+    progress: &mpsc::Sender<(u32, u32)>,
+    updates: &mpsc::Sender<StaticAoWorkerUpdate>,
+    camera_position: Vec3,
+) -> Result<StaticAoWorkerResult, String> {
+    let started = Instant::now();
+    let _ = progress.send((1, 100));
+    if !force_rebuild && !key.current_cell_only {
+        if let Some(data) = read_static_ao_cache(&source, key) {
+            let _ = progress.send((100, 100));
+            return Ok(StaticAoWorkerResult {
+                key,
+                data,
+                cache_hit: true,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+    }
+
+    if source.lightmap_sizes.is_empty() || source.lightmap_triangles.is_empty() {
+        return Err("map has no usable lightmap-space BSP geometry".into());
+    }
+    let bvh_started = Instant::now();
+    let bvh = Arc::new(StaticAoBvh::build(source.render_triangles.clone())?);
+    let _ = progress.send((15, 100));
+    println!(
+        "Static BSP AO worker: render BVH {} triangles / {} nodes in {:.1} ms",
+        bvh.triangles.len(),
+        bvh.nodes.len(),
+        bvh_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    let workers = static_ao_worker_count();
+    let sample_pattern = Arc::new(static_ao_sample_pattern(key.samples));
+    let range_scale = (key.range as f32 / 100.0).clamp(0.25, 4.0);
+    let strength = (key.strength as f32 / 100.0).clamp(0.0, 1.0);
+    // Switch to the supersampled authored lightmap immediately. AO tiles then
+    // darken this texture in-place as the worker finishes them.
+    let neutral_masks = source
+        .lightmap_sizes
+        .iter()
+        .map(|&[w, h]| {
+            vec![255u8; w.saturating_mul(key.scale.max(1)) as usize
+                * h.saturating_mul(key.scale.max(1)) as usize]
+        })
+        .collect::<Vec<_>>();
+    let neutral_images = build_static_ao_baked_lightmaps(&source, &neutral_masks, key.scale, 0.0)?;
+    let _ = updates.send(StaticAoWorkerUpdate::InitLightmaps {
+        key,
+        images: neutral_images,
+    });
+    // One render-geometry BVH drives both receiver types, but they are baked
+    // independently: vertex-lit/static models use vertex AO while lightmapped
+    // BSP uses only lightmap-space AO.
+    let mut vertex_values = if key.current_cell_only {
+        // Fast test mode is intentionally lightmap-only: reset any previous
+        // vertex AO and spend the bake budget on the nearest lightmap tile.
+        vec![255u8; source.vertices.len()]
+    } else {
+        bake_static_structural_vertex_ao(
+            &source,
+            Arc::clone(&bvh),
+            Arc::clone(&sample_pattern),
+            range_scale,
+            workers,
+        )
+    };
+    let _ = progress.send((45, 100));
+    if !key.current_cell_only {
+        for visibility in &mut vertex_values {
+            let raw = f32::from(*visibility) / 255.0;
+            let effective = 1.0 - strength * (1.0 - raw);
+            *visibility = (effective.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    let _ = updates.send(StaticAoWorkerUpdate::VertexAo {
+        key,
+        values: vertex_values.clone(),
+    });
+    let masks = bake_static_lightmap_ao(
+        &source,
+        Arc::clone(&sample_pattern),
+        key.scale,
+        range_scale,
+        strength,
+        bvh,
+        workers,
+        key,
+        camera_position,
+        updates,
+        progress,
+    )?;
+    let _ = progress.send((90, 100));
+    let images = build_static_ao_baked_lightmaps(&source, &masks, key.scale, strength)?;
+    let _ = progress.send((95, 100));
+    let data = StaticAoBakeData::Lightmap {
+        vertex_values,
+        images,
+    };
+    if !key.current_cell_only {
+        write_static_ao_cache(&source, key, &data);
+    }
+    let _ = progress.send((100, 100));
+    Ok(StaticAoWorkerResult {
+        key,
+        data,
+        cache_hit: false,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+fn collect_static_ao_lightmap_triangles(
+    vertices: &[GpuVertex],
+    batches: &[DrawBatch],
+) -> Vec<StaticAoLightmapTriangle> {
+    let mut seen = BTreeSet::<(u32, u32, usize)>::new();
+    let mut triangles = Vec::new();
+    let mut next_owner = 1u32;
+    for batch in batches {
+        let Some(texture) = batch.lightmap else { continue; };
+        if batch.pipeline.class == DrawClass::Sky {
+            continue;
+        }
+        let key = (batch.vertices.start, batch.vertices.end, texture);
+        if !seen.insert(key) {
+            continue;
+        }
+        let owner = next_owner;
+        next_owner = next_owner.saturating_add(1);
+        let start = batch.vertices.start as usize;
+        let end = batch.vertices.end as usize;
+        for triangle in vertices[start..end].chunks_exact(3) {
+            if triangle.iter().any(|vertex| vertex.lightmap_uv[0] < 0.0 || vertex.lightmap_uv[1] < 0.0) {
+                continue;
+            }
+            triangles.push(StaticAoLightmapTriangle {
+                texture,
+                owner,
+                positions: [triangle[0].position, triangle[1].position, triangle[2].position],
+                normals: [triangle[0].normal, triangle[1].normal, triangle[2].normal],
+                uvs: [triangle[0].lightmap_uv, triangle[1].lightmap_uv, triangle[2].lightmap_uv],
+            });
+        }
+    }
+    triangles
+}
+
+fn collect_static_ao_vertex_receivers(vertex_count: usize, batches: &[DrawBatch]) -> Vec<u8> {
+    let mut receivers = vec![0u8; vertex_count];
+    for batch in batches {
+        // q3map LIGHTMAP_BY_VERTEX geometry stores baked lighting in vertex color.
+        // Only the stage that actually consumes that color should receive cached AO.
+        if !batch.vertex_lit
+            || !batch.rgb_gen.uses_vertex_color()
+            || !matches!(batch.pipeline.class, DrawClass::Opaque | DrawClass::Mask)
+        {
+            continue;
+        }
+        let start = batch.vertices.start as usize;
+        let end = (batch.vertices.end as usize).min(receivers.len());
+        for receiver in &mut receivers[start.min(end)..end] {
+            *receiver = 1;
+        }
+    }
+    receivers
+}
+
+
+fn collect_static_ao_render_triangles(
+    vertices: &[GpuVertex],
+    batches: &[DrawBatch],
+) -> Vec<StaticAoRenderTriangle> {
+    let mut seen = BTreeSet::<(u32, u32)>::new();
+    let mut triangles = Vec::new();
+    for batch in batches {
+        // For the quality reference bake, use only truly opaque rendered BSP
+        // surfaces. Sky/transparent never occlude; alpha-masked surfaces are
+        // skipped rather than incorrectly treating their transparent holes as solid.
+        if batch.pipeline.class != DrawClass::Opaque {
+            continue;
+        }
+        let key = (batch.vertices.start, batch.vertices.end);
+        if !seen.insert(key) {
+            continue;
+        }
+        let start = batch.vertices.start as usize;
+        let end = batch.vertices.end as usize;
+        for triangle in vertices[start..end].chunks_exact(3) {
+            triangles.push(StaticAoRenderTriangle {
+                positions: [triangle[0].position, triangle[1].position, triangle[2].position],
+            });
+        }
+    }
+    triangles
+}
+
+#[derive(Default)]
+struct FrameInfo {
+    frame_ms: f64,
+    cpu_prepare_ms: f64,
+    cpu_acquire_ms: f64,
+    cpu_encode_ms: f64,
+    cpu_submit_ms: f64,
+    dynamic_model_prepare_ms: f64,
+    dynamic_model_surfaces: u32,
+    dynamic_model_vertices: u64,
+    dynamic_model_indices: u64,
+    ghoul2_gpu_instances: u32,
+    ghoul2_gpu_draw_calls: u32,
+    gpu_ms: Option<f64>,
+    cull_visible: u32,
+    cull_frustum_rejected: u32,
+    cull_hiz_rejected: u32,
+    cull_pvs_rejected: u32,
+    cull_area_rejected: u32,
+    grass: GrassDrawStats,
+}
+
+#[derive(Debug)]
+enum RenderError {
+    Lost,
+    Outdated,
+    Timeout,
+    Occluded,
+    Validation,
+}
+
+struct BloomPyramid {
+    _textures: [wgpu::Texture; 3],
+    views: [wgpu::TextureView; 3],
+}
+
+struct DofTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+struct TemporalSsaoHistory {
+    _textures: [wgpu::Texture; 2],
+    views: [wgpu::TextureView; 2],
+}
+
+struct TemporalSsrHistory {
+    _radiance_textures: [wgpu::Texture; 2],
+    radiance_views: [wgpu::TextureView; 2],
+    _depth_textures: [wgpu::Texture; 2],
+    depth_views: [wgpu::TextureView; 2],
+}
+
+struct MenuBackdropResources {
+    width: u32,
+    height: u32,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+}
+
+struct RenderTargets {
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    _msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
+    _scene_texture: wgpu::Texture,
+    scene_view: wgpu::TextureView,
+    bloom: Option<BloomPyramid>,
+    dof: Option<DofTarget>,
+    ssao_history: Option<TemporalSsaoHistory>,
+    ssr_history: Option<TemporalSsrHistory>,
+    _history_textures: [wgpu::Texture; 2],
+    history_views: [wgpu::TextureView; 2],
+    _cloud_transfer_textures: [wgpu::Texture; 2],
+    cloud_transfer_views: [wgpu::TextureView; 2],
+    /// Sparse output of the cloud march pass, consumed by the resolve pass in
+    /// the same frame. Not ping-ponged: nothing reads it across frames.
+    _cloud_march_texture: wgpu::Texture,
+    cloud_march_view: wgpu::TextureView,
+    _ao_depth_texture: wgpu::Texture,
+    ao_depth_view: wgpu::TextureView,
+    _linear_depth_texture: wgpu::Texture,
+    linear_depth_view: wgpu::TextureView,
+    linear_depth_render_view: wgpu::TextureView,
+    _motion_vector_texture: wgpu::Texture,
+    motion_vector_view: wgpu::TextureView,
+    _reflection_mask_texture: wgpu::Texture,
+    reflection_mask_view: wgpu::TextureView,
+    linear_depth_mip_views: Vec<wgpu::TextureView>,
+    linear_depth_mip_count: u32,
+    _rain_haze_mask_texture: wgpu::Texture,
+    rain_haze_mask_view: wgpu::TextureView,
+    rain_haze_mask_width: u32,
+    rain_haze_mask_height: u32,
+}
+
+struct Renderer {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    size: PhysicalSize<u32>,
+    present_modes: Vec<wgpu::PresentMode>,
+    /// Set by [`Renderer::request_scene_rebuild`], consumed once per frame.
+    scene_rebuild_pending: bool,
+    supported_msaa: Vec<u32>,
+    hdr_supported_msaa: Vec<u32>,
+    vsync: VsyncMode,
+    msaa_samples: u32,
+    targets: RenderTargets,
+    camera_buffer: wgpu::Buffer,
+    camera_layout: wgpu::BindGroupLayout,
+    camera_bind_group: wgpu::BindGroup,
+    fast_camera_bind_group: wgpu::BindGroup,
+    planar_camera_buffers: Vec<wgpu::Buffer>,
+    planar_camera_bind_groups: Vec<wgpu::BindGroup>,
+    surface_layout: wgpu::BindGroupLayout,
+    fast_surface_layout: wgpu::BindGroupLayout,
+    surface_deformation: SurfaceDeformationGpu,
+    planar_reflection_layout: wgpu::BindGroupLayout,
+    planar_reflection: PlanarReflectionResources,
+    weather: WeatherSystem,
+    grass_renderer: GrassRenderer,
+    surface_sprite_effect_renderer: SurfaceSpriteEffectRenderer,
+    ocean_layout: wgpu::BindGroupLayout,
+    ocean_inert_bind_group: wgpu::BindGroup,
+    ocean_spray_albedo: GpuImage,
+    ocean: Option<crate::ocean::OceanGpu>,
+    authored_oceans: Vec<(crate::ocean::authoring::AuthoredOcean, crate::ocean::OceanGpu)>,
+    authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
+    ocean_enabled: bool,
+    ocean_settings: crate::ocean::OceanSettings,
+    world_pipeline_layout: wgpu::PipelineLayout,
+    world_pipeline_layout_lean: wgpu::PipelineLayout,
+    fast_world_pipeline_layout: wgpu::PipelineLayout,
+    world_shader: wgpu::ShaderModule,
+    // Advanced path without the newer area/GI bindings. The genuinely minimal
+    // known-fast renderer below is a separate shader/layout/render loop.
+    world_shader_lean: wgpu::ShaderModule,
+    fast_world_shader: wgpu::ShaderModule,
+    wireframe_supported: bool,
+    wireframe_enabled: bool,
+    pvs_mode: PvsMode,
+    wireframe_pipeline_layout: wgpu::PipelineLayout,
+    wireframe_shader: wgpu::ShaderModule,
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
+    surface_inspector_shader: wgpu::ShaderModule,
+    surface_inspector_pipeline: wgpu::RenderPipeline,
+    inspector_vertex_range: Option<std::ops::Range<u32>>,
+    ui_pipeline: wgpu::RenderPipeline,
+    ui_bind_group: wgpu::BindGroup,
+    _ui_font: GpuImage,
+    _ui_small_font: GpuImage,
+    _ui_splash: GpuImage,
+    ui_splash_size: Option<[u32; 2]>,
+    ui_small_font_metrics: Option<ui::ProportionalFont>,
+    _ui_font_sampler: wgpu::Sampler,
+    ui_vertex_buffer: wgpu::Buffer,
+    ui_vertex_count: u32,
+    ui_trace: bool,
+    ui_state: UiSnapshot,
+    egui_renderer: egui_wgpu::Renderer,
+    egui_paint_jobs: Vec<egui::ClippedPrimitive>,
+    egui_pixels_per_point: f32,
+    egui_active: bool,
+    egui_pending_free: Vec<egui::TextureId>,
+    // Created only after opening a menu page that requests the live blurred/
+    // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
+    // compile or allocate this pass.
+    menu_backdrop: Option<MenuBackdropResources>,
+    world: Option<WorldGpu>,
+    dynamic_model_renderer: DynamicModelRenderer,
+    white: GpuImage,
+    missing: GpuImage,
+    flat_normal: GpuImage,
+    repeat_sampler: wgpu::Sampler,
+    clamp_sampler: wgpu::Sampler,
+    pbr_repeat_sampler: wgpu::Sampler,
+    pbr_clamp_sampler: wgpu::Sampler,
+    lightmap_sampler: wgpu::Sampler,
+    sky_sampler: wgpu::Sampler,
+    texture_filter: TextureFilter,
+    gamma: f32,
+    hdr_enabled: bool,
+    tone_mapping_enabled: bool,
+    auto_exposure_enabled: bool,
+    bloom_enabled: bool,
+    halation_enabled: bool,
+    ssao_enabled: bool,
+    static_bsp_ao_enabled: bool,
+    static_bsp_ao_lightmap: bool,
+    static_bsp_ao_samples: u32,
+    static_bsp_ao_resolution: u32,
+    static_bsp_ao_strength: u32,
+    static_bsp_ao_range: u32,
+    static_bsp_ao_current_cell: bool,
+    static_ao_pending: Option<StaticAoPendingJob>,
+    static_ao_deferred_force_rebuild: bool,
+    fxaa_enabled: bool,
+    smaa_enabled: bool,
+    taa_enabled: bool,
+    contact_shadows_enabled: bool,
+    sun_override: bool,
+    sun_yaw: f32,
+    sun_pitch: f32,
+    sun_intensity: f32,
+    sun_color: [f32; 3],
+    sun_visibility: SunVisibilityMode,
+    clouds_enabled: bool,
+    cloud_type: CloudType,
+    cloud_quality: f32,
+    cloud_coverage: f32,
+    cloud_height: f32,
+    cloud_thickness: f32,
+    cloud_wind_speed: f32,
+    cloud_wind_direction: f32,
+    cloud_shadows_enabled: bool,
+    cloud_render_resolution: CloudRenderResolution,
+    cloud_temporal_enabled: bool,
+    cloud_temporal_depth_fix: bool,
+    cloud_shear: f32,
+    cloud_base_variation: f32,
+    cloud_wind_variation: bool,
+    cloud_shape_evolution: bool,
+    cloud_terrain_interaction: bool,
+    cloud_empty_skip: bool,
+    cloud_aerial: f32,
+    cloud_sky_ambient_enabled: bool,
+    cloud_history_blend: f32,
+    cloud_motion_reject: f32,
+    cloud_history_depth_reject: bool,
+    cloud_thickness_variation: f32,
+    cloud_size: f32,
+    /// Linear average of the current map's skybox faces, used to tint cloud
+    /// ambient so a desert or night sky does not light clouds cold blue.
+    cloud_sky_average: [f32; 3],
+    grass_enabled: bool,
+    grass_precompute_enabled: bool,
+    grass_mid_lod_enabled: bool,
+    grass_front_to_back_enabled: bool,
+    cloud_history_valid: bool,
+    cloud_history_read_index: usize,
+    cloud_temporal_frame_index: u32,
+    reflection_quality: ReflectionQuality,
+    reflection_debug_enabled: bool,
+    ssr_enabled: bool,
+    chromatic_aberration_strength: f32,
+    vignette_enabled: bool,
+    film_grain_strength: f32,
+    motion_blur_strength: f32,
+    depth_of_field_strength: f32,
+    dof_quality: DofQuality,
+    dof_focus_distance: f32,
+    dof_focus_valid: bool,
+    motion_blur_runtime_scale: f32,
+    previous_frame_time: f32,
+    color_lut_preset: ColorLutPreset,
+    color_lut_strength: f32,
+    _color_lut_texture: wgpu::Texture,
+    color_lut_view: wgpu::TextureView,
+    color_lut_sampler: wgpu::Sampler,
+    cloud_noise_resources: Option<CloudNoiseResources>,
+    cloud_noise_fallback: CloudNoiseResources,
+    frame_plan: FramePlan,
+    indirect_supported: bool,
+    gpu_compaction_supported: bool,
+    compact_group_scratch: Vec<bool>,
+    gpu_driven_enabled: bool,
+    hiz_occlusion_enabled: bool,
+    clustered_lighting_enabled: bool,
+    emissive_area_lights_enabled: bool,
+    irradiance_volume_enabled: bool,
+    voxel_probe_gi_enabled: bool,
+    local_light_shadows_enabled: bool,
+    pbr_enabled: bool,
+    deluxe_mapping_enabled: bool,
+    deluxe_specular: f32,
+    bc_compression_supported: bool,
+    cascaded_shadows_enabled: bool,
+    cascaded_shadow_mode: DynamicShadowsMode,
+    cull_debug_mode: CullDebugMode,
+    planar_reflection_mode: PlanarReflectionMode,
+    planar_reflection_debug_mode: PlanarReflectionDebugMode,
+    last_planar_debug_selection: Option<Vec<usize>>,
+    planar_slot_history: [Option<[f32; 4]>; PLANAR_REFLECTION_SLOTS],
+    planar_debug_pipeline: wgpu::RenderPipeline,
+    history_valid: bool,
+    camera_history_valid: bool,
+    previous_view_proj: Mat4,
+    previous_unjittered_view_proj: Mat4,
+    previous_cloud_view_proj: Mat4,
+    previous_camera_position: Vec3,
+    taa_frame_index: u32,
+    ssao_history_valid: bool,
+    ssao_history_read_index: usize,
+    ssr_history_valid: bool,
+    ssr_history_read_index: usize,
+    ssr_frame_index: u32,
+    depth_prepass_pipeline: wgpu::RenderPipeline,
+    depth_prepass_mask_pipeline: wgpu::RenderPipeline,
+    hiz_reduce_layout: wgpu::BindGroupLayout,
+    hiz_reduce_pipeline: wgpu::ComputePipeline,
+    hiz_reduce_bind_groups: Vec<wgpu::BindGroup>,
+    gpu_cull_layout: wgpu::BindGroupLayout,
+    gpu_cull_pipeline: wgpu::ComputePipeline,
+    gpu_cull_settings_buffer: wgpu::Buffer,
+    cull_debug_layout: wgpu::BindGroupLayout,
+    cull_debug_pipeline_layout: wgpu::PipelineLayout,
+    cull_debug_shader: wgpu::ShaderModule,
+    cull_debug_pipeline: wgpu::RenderPipeline,
+    cluster_compute_layout: wgpu::BindGroupLayout,
+    cluster_compute_pipeline: wgpu::ComputePipeline,
+    lighting_layout: wgpu::BindGroupLayout,
+    lighting_layout_lean: wgpu::BindGroupLayout,
+    shadow_receiver_layout: wgpu::BindGroupLayout,
+    shadow_caster_layout: wgpu::BindGroupLayout,
+    lighting_settings_buffer: wgpu::Buffer,
+    pbr_settings_buffer: wgpu::Buffer,
+    shadow_resources: ShadowResources,
+    auto_exposure_layout: wgpu::BindGroupLayout,
+    auto_exposure_pipeline: wgpu::ComputePipeline,
+    auto_exposure_state_buffer: wgpu::Buffer,
+    auto_exposure_settings_buffer: wgpu::Buffer,
+    auto_exposure_bind_group: wgpu::BindGroup,
+    post_layout: wgpu::BindGroupLayout,
+    post_shader: wgpu::ShaderModule,
+    post_pipeline_layout: wgpu::PipelineLayout,
+    post_pipeline: wgpu::RenderPipeline,
+    taa_post_pipeline: wgpu::RenderPipeline,
+    cloud_march_pipeline: wgpu::RenderPipeline,
+    cloud_resolve_pipeline: wgpu::RenderPipeline,
+    cloud_resolve_layout: wgpu::BindGroupLayout,
+    cloud_resolve_bind_group: wgpu::BindGroup,
+    post_sampler: wgpu::Sampler,
+    post_buffer: wgpu::Buffer,
+    post_bind_groups: [[[[wgpu::BindGroup; 2]; 2]; 2]; 2],
+    history_read_index: usize,
+    ssao_temporal_layout: wgpu::BindGroupLayout,
+    ssao_temporal_pipeline: wgpu::RenderPipeline,
+    ssao_temporal_buffer: wgpu::Buffer,
+    ssao_temporal_bind_groups: Option<[wgpu::BindGroup; 2]>,
+    ssr_temporal_layout: wgpu::BindGroupLayout,
+    ssr_temporal_pipeline: wgpu::RenderPipeline,
+    ssr_temporal_buffer: wgpu::Buffer,
+    ssr_temporal_bind_groups: Option<[wgpu::BindGroup; 2]>,
+    bloom_layout: wgpu::BindGroupLayout,
+    bloom_extract_pipeline: wgpu::RenderPipeline,
+    bloom_downsample_pipeline: wgpu::RenderPipeline,
+    bloom_bind_groups: Option<[wgpu::BindGroup; 3]>,
+    dof_layout: wgpu::BindGroupLayout,
+    dof_pipeline: wgpu::RenderPipeline,
+    dof_buffer: wgpu::Buffer,
+    dof_bind_group: Option<wgpu::BindGroup>,
+    gamma_post_layout: wgpu::BindGroupLayout,
+    gamma_post_pipeline: wgpu::RenderPipeline,
+    gamma_post_buffer: wgpu::Buffer,
+    gamma_post_bind_group: wgpu::BindGroup,
+    fast_post_layout: wgpu::BindGroupLayout,
+    fast_post_pipeline: wgpu::RenderPipeline,
+    fast_post_bind_group: wgpu::BindGroup,
+    // Created lazily on first use so SMAA adds no resources or pipeline work
+    // to the maximum-FPS path unless the user selects it.
+    smaa_target: Option<smaa::SmaaTarget>,
+    gpu_profiler: GpuProfiler,
+    cull_diagnostics_readback: CullDiagnosticsReadback,
+    surface_diag_pending: bool,
+    frame_diag_pending: bool,
+    screenshot_supported: bool,
+    screenshot_requested: Option<PathBuf>,
+    screenshot_result: Option<Result<(PathBuf, Option<String>), String>>,
+    screenshot_readback_buffer: Option<ScreenshotReadbackBuffer>,
+    screenshot_worker_tx: Sender<ScreenshotEncodeJob>,
+    screenshot_worker_rx: Receiver<Result<(PathBuf, Option<String>), String>>,
+    started: Instant,
+}
+
+struct ScreenshotReadbackBuffer {
+    buffer: wgpu::Buffer,
+    size: u64,
+}
+
+struct ScreenshotReadback {
+    screenshot_dir: PathBuf,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    buffer_size: u64,
+    format: wgpu::TextureFormat,
+    submission_index: Option<wgpu::SubmissionIndex>,
+    copy_record_ms: f64,
+    copy_submit_ms: f64,
+    inline_copy: bool,
+    reused_buffer: bool,
+    started: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum ScreenshotPixelFormat {
+    Bgra,
+    Rgba,
+}
+
+struct ScreenshotEncodeJob {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    pixel_format: ScreenshotPixelFormat,
+    screenshot_dir: PathBuf,
+    copy_record_ms: f64,
+    copy_submit_ms: f64,
+    map_request_ms: f64,
+    gpu_wait_ms: f64,
+    readback_copy_ms: f64,
+    inline_copy: bool,
+    reused_buffer: bool,
+    started: Instant,
+}
+
+#[cfg(windows)]
+fn screenshot_timestamp() -> String {
+    #[repr(C)]
+    struct WinSystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetLocalTime(system_time: *mut WinSystemTime);
+    }
+
+    let mut local = std::mem::MaybeUninit::<WinSystemTime>::uninit();
+    unsafe {
+        GetLocalTime(local.as_mut_ptr());
+        let local = local.assume_init();
+        format!(
+            "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
+            local.year, local.month, local.day, local.hour, local.minute, local.second
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn screenshot_timestamp() -> String {
+    // The client is Windows-first. Keep the same sortable filename shape on
+    // other targets without adding a date/time dependency; this fallback is UTC.
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |duration| duration.as_secs().min(i64::MAX as u64) as i64);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!(
+        "{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}"
+    )
+}
+
+fn encode_screenshot_job(
+    job: ScreenshotEncodeJob,
+) -> Result<(PathBuf, Option<String>), String> {
+    let row_bytes = job.width as usize * 4;
+    let padded_row_bytes = job.padded_bytes_per_row as usize;
+    let width = job.width as usize;
+    let height = job.height as usize;
+    let pixel_format = match job.pixel_format {
+        ScreenshotPixelFormat::Bgra => libjpeg_turbo_rs::PixelFormat::Bgra,
+        ScreenshotPixelFormat::Rgba => libjpeg_turbo_rs::PixelFormat::Rgba,
+    };
+
+    let jpeg_started = Instant::now();
+    let (jpeg, jpeg_input_mode) = if row_bytes == padded_row_bytes {
+        let byte_len = row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| "screenshot byte size overflowed usize".to_owned())?;
+        let jpeg = libjpeg_turbo_rs::compress(
+            &job.pixels[..byte_len], width, height, pixel_format, 95, libjpeg_turbo_rs::Subsampling::S420,
+        ).map_err(|error| format!("JPEG encode failed: {error}"))?;
+        (jpeg, "direct")
+    } else {
+        let mut encoder = libjpeg_turbo_rs::ScanlineEncoder::new(width, height, pixel_format);
+        encoder.set_quality(95);
+        encoder.set_subsampling(libjpeg_turbo_rs::Subsampling::S420);
+        for row_index in 0..height {
+            let row_start = row_index * padded_row_bytes;
+            encoder
+                .write_scanline(&job.pixels[row_start..row_start + row_bytes])
+                .map_err(|error| format!("JPEG scanline encode failed: {error}"))?;
+        }
+        let jpeg = encoder.finish().map_err(|error| format!("JPEG encode failed: {error}"))?;
+        (jpeg, "scanline")
+    };
+    let jpeg_ms = jpeg_started.elapsed().as_secs_f64() * 1000.0;
+
+    let file_io_started = Instant::now();
+    std::fs::create_dir_all(&job.screenshot_dir).map_err(|error| {
+        format!("could not create {}: {error}", job.screenshot_dir.display())
+    })?;
+    let path = job.screenshot_dir.join(format!("shot{}.jpg", screenshot_timestamp()));
+    std::fs::write(&path, &jpeg)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    let file_io_ms = file_io_started.elapsed().as_secs_f64() * 1000.0;
+
+    // Do this after the file encode/write. Besides keeping the renderer thread
+    // untouched, the slight worker delay means our fresh GPU capture wins over
+    // Windows' own stale desktop PrintScreen update in exclusive fullscreen.
+    let clipboard_started = Instant::now();
+    let clipboard_error = crate::clipboard::set_image_rgba8(
+        job.width,
+        job.height,
+        &job.pixels,
+        padded_row_bytes,
+        matches!(job.pixel_format, ScreenshotPixelFormat::Bgra),
+    )
+    .err();
+    let clipboard_ms = clipboard_started.elapsed().as_secs_f64() * 1000.0;
+
+    let total_ms = job.started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms jpeg_420={:.3}ms file_io={:.3}ms clipboard={:.3}ms total={:.3}ms buffer={} copy={} jpeg_input={} encode=worker",
+        job.width, job.height, job.copy_record_ms, job.copy_submit_ms, job.map_request_ms, job.gpu_wait_ms,
+        job.readback_copy_ms, jpeg_ms, file_io_ms, clipboard_ms, total_ms,
+        if job.reused_buffer { "reused" } else { "new" },
+        if job.inline_copy { "inline" } else { "late-submit" }, jpeg_input_mode,
+    );
+    if let Some(error) = &clipboard_error {
+        eprintln!("[JKA SCREENSHOT] clipboard copy failed: {error}");
+    }
+    Ok((path, clipboard_error))
+}
+
+impl Renderer {
+    fn active_sun(&self) -> DirectionalSun {
+        if self.sun_override {
+            return DirectionalSun::from_q3_angles(
+                self.sun_color,
+                self.sun_intensity,
+                self.sun_yaw,
+                self.sun_pitch,
+            );
+        }
+        self.world
+            .as_ref()
+            .and_then(|world| world.sun)
+            .unwrap_or(DirectionalSun {
+                direction: FALLBACK_SUN_DIRECTION,
+                color: FALLBACK_SUN_COLOR,
+                intensity: FALLBACK_SUN_INTENSITY,
+            })
+    }
+
+    async fn new(
+        window: Arc<Window>,
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        base: &Path,
+        game: Option<&Path>,
+    ) -> Result<Self, String> {
+        let size = window.inner_size();
+        let adapter_started = Instant::now();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|e| format!("No compatible GPU adapter: {e}"))?;
+        println!(
+            "[RENDER INIT] adapter request {:.1} ms",
+            adapter_started.elapsed().as_secs_f64() * 1000.0
+        );
+        let info = adapter.get_info();
+        println!(
+            "GPU: {} ({:?}, {:?})",
+            info.name, info.backend, info.device_type
+        );
+        let adapter_features = adapter.features();
+        // Request timestamp-query capability up front when the adapter supports it so
+        // the profiler can be switched on from the menu without recreating the wgpu
+        // device. Query writes, resolves and readbacks stay disabled on the normal
+        // maximum-FPS path until GPU TIMESTAMPS is explicitly enabled.
+        let indirect_supported = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        println!(
+            "Indirect execution: {}",
+            if indirect_supported {
+                "supported"
+            } else {
+                "unavailable"
+            }
+        );
+        let adapter_specific_formats = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        let wireframe_feature = wgpu::Features::POLYGON_MODE_LINE;
+        let multi_draw_count_feature = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        let timestamp_feature = wgpu::Features::TIMESTAMP_QUERY;
+        let timestamp_encoder_feature = wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamp_pass_feature = wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        let bc_compression_feature = wgpu::Features::TEXTURE_COMPRESSION_BC;
+        let bc_compression_supported = adapter_features.contains(bc_compression_feature);
+        let wireframe_supported = adapter_features.contains(wireframe_feature);
+        let gpu_compaction_supported =
+            indirect_supported && adapter_features.contains(multi_draw_count_feature);
+        // Normal gameplay still pays no per-frame timestamp-query cost. When the
+        // runtime profiler is enabled, use in-pass timestamps when supported so
+        // grass can be measured independently inside the World interval.
+        let timestamp_supported = adapter_features.contains(timestamp_feature)
+            && adapter_features.contains(timestamp_encoder_feature);
+        let timestamp_inside_encoders = timestamp_supported;
+        let timestamp_inside_passes = timestamp_supported
+            && adapter_features.contains(timestamp_pass_feature);
+        let mut required_features = wgpu::Features::empty();
+        if adapter_features.contains(adapter_specific_formats) {
+            required_features |= adapter_specific_formats;
+        }
+        if wireframe_supported {
+            required_features |= wireframe_feature;
+        }
+        if gpu_compaction_supported {
+            required_features |= multi_draw_count_feature;
+        }
+        if bc_compression_supported {
+            required_features |= bc_compression_feature;
+        }
+        if timestamp_supported {
+            required_features |= timestamp_feature | timestamp_encoder_feature;
+            if timestamp_inside_passes {
+                required_features |= timestamp_pass_feature;
+            }
+        }
+        println!(
+            "Wireframe polygon mode: {}",
+            if wireframe_supported {
+                "supported"
+            } else {
+                "unavailable"
+            }
+        );
+        println!(
+            "GPU indirect compaction: {}",
+            if gpu_compaction_supported {
+                "supported"
+            } else {
+                "unavailable (falling back to per-batch indirect draws)"
+            }
+        );
+        println!(
+            "PBR companion BC compression: {}",
+            if bc_compression_supported { "supported" } else { "unavailable" }
+        );
+        println!(
+            "GPU timestamps: {}{}",
+            if timestamp_supported {
+                "supported"
+            } else {
+                "unavailable (encoder timestamps required)"
+            },
+            if timestamp_inside_passes {
+                " (encoder + in-pass grass timing)"
+            } else if timestamp_supported {
+                " (encoder-only; grass GPU sub-timing unavailable)"
+            } else {
+                ""
+            }
+        );
+        let device_started = Instant::now();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("DinurdoJK renderer"),
+                required_features,
+                required_limits: adapter.limits(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .map_err(|e| format!("GPU device creation failed: {e}"))?;
+        println!(
+            "[RENDER INIT] device request {:.1} ms",
+            device_started.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // Diagnostics should print the actual wgpu validation reason instead of
+        // collapsing it into the generic CurrentSurfaceTexture::Validation path.
+        // The normal maximum-FPS path installs no callback.
+        if env_flag("JKA_SURFACE_DIAG") {
+            device.on_uncaptured_error(Arc::new(|error| {
+                eprintln!("[JKA WGPU ERROR] {error:?}");
+            }));
+        }
+
+        let caps = surface.get_capabilities(&adapter);
+        let surface_format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .unwrap_or(caps.formats[0]);
+        let mut config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .ok_or("Surface has no compatible default configuration")?;
+        config.format = surface_format;
+        config.present_mode = no_vsync_mode(&caps.present_modes);
+        config.desired_maximum_frame_latency = MAX_FRAME_LATENCY;
+        let screenshot_supported = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if screenshot_supported {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        // Surface::configure reports validation through wgpu's device error
+        // machinery. Capture the initial configure error instead of letting the
+        // default uncaptured-error handler panic the render thread. That is
+        // especially important during backend restarts: the app can immediately
+        // roll back to the last known-good renderer instead of waiting on the
+        // video confirmation timeout with a dead screen.
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        surface.configure(&device, &config);
+        if let Some(error) = error_scope.pop().await {
+            return Err(format!("Surface configuration failed: {error}"));
+        }
+        println!(
+            "Present mode: {:?}; surface: {:?}",
+            config.present_mode, config.format
+        );
+        println!(
+            "Screenshot readback: {}",
+            if screenshot_supported {
+                "supported"
+            } else {
+                "unavailable for this surface"
+            }
+        );
+
+        let surface_supported_msaa = supported_msaa(&adapter, surface_format);
+        let hdr_supported_msaa = supported_msaa(&adapter, wgpu::TextureFormat::Rgba16Float);
+        println!("MSAA supported: {surface_supported_msaa:?}");
+        println!("HDR Rgba16Float MSAA supported: {hdr_supported_msaa:?}");
+        let msaa_samples = 1;
+        let targets = create_targets(
+            &device,
+            config.width,
+            config.height,
+            config.format,
+            msaa_samples,
+            false,
+            false,
+            false,
+            false,
+            CloudRenderResolution::Half,
+        );
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA camera uniform"),
+            contents: bytemuck::bytes_of(&CameraUniform {
+                view_proj: [[0.0; 4]; 4],
+                camera_pos_time: [0.0; 4],
+                clip_plane: [0.0; 4],
+                render_flags: [0; 4],
+                camera_forward: [0.0, 0.0, -1.0, 0.0],
+                unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let planar_camera_buffers: Vec<wgpu::Buffer> = (0..PLANAR_REFLECTION_SLOTS)
+            .map(|slot| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("JKA planar reflection camera uniform {slot}")),
+                    contents: bytemuck::bytes_of(&CameraUniform {
+                        view_proj: [[0.0; 4]; 4],
+                        camera_pos_time: [0.0; 4],
+                        clip_plane: [0.0; 4],
+                        render_flags: [1, 0, 0, 0],
+                        camera_forward: [0.0, 0.0, -1.0, 0.0],
+                        unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                        previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                    }),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                })
+            })
+            .collect();
+        let surface_deformation = SurfaceDeformationGpu::new(&device);
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                // The BSP fragment shader uses camera position for clustered
+                // lighting and sky direction, so this binding must be visible
+                // to all stages that share the camera bind group.
+                visibility: wgpu::ShaderStages::VERTEX
+                    | wgpu::ShaderStages::FRAGMENT
+                    | wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let surface_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("BSP surface layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                texture_entry(2),
+                sampler_entry(3),
+                uniform_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                texture_entry(5),
+                texture_entry(6),
+                texture_entry(7),
+                texture_entry(8),
+                texture_entry(9),
+                texture_entry(10),
+                sampler_entry(11),
+                texture_entry(12),
+                texture_entry(13),
+                texture_entry(14),
+                uniform_entry(15, wgpu::ShaderStages::FRAGMENT),
+                texture_entry(16),
+                texture_entry(17),
+                texture_entry(18),
+                cube_texture_entry(19),
+                sampler_entry(20),
+                uniform_entry(
+                    21,
+                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ),
+                texture_entry(22),
+                texture_entry(23),
+                sampler_entry(24),
+                texture_entry_stages(25, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                texture_entry_stages(26, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                sampler_entry_stages(27, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                sampler_entry(28),
+                texture_entry(29),
+            ],
+        });
+        // Exact descriptor layouts used by the known-fast renderer. Advanced
+        // bindings must not leak into the maximum-FPS path merely because they
+        // exist elsewhere in the renderer. These are selected once when render
+        // settings change through FramePlan::world_path.
+        let fast_camera_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA fast camera layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let fast_surface_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA fast BSP surface layout"),
+                entries: &[
+                    texture_entry(0),
+                    sampler_entry(1),
+                    texture_entry(2),
+                    sampler_entry(3),
+                    uniform_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    texture_entry(5),
+                    texture_entry(6),
+                    texture_entry(7),
+                    texture_entry(8),
+                    texture_entry(9),
+                    texture_entry(10),
+                    sampler_entry(11),
+                    uniform_entry(
+                        21,
+                        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ),
+                    texture_entry(22),
+                    texture_entry(23),
+                    sampler_entry(24),
+                    texture_entry_stages(25, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    texture_entry_stages(26, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    sampler_entry_stages(27, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                ],
+            });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let fast_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA fast camera bind group"),
+            layout: &fast_camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let planar_camera_bind_groups: Vec<wgpu::BindGroup> = planar_camera_buffers
+            .iter()
+            .enumerate()
+            .map(|(slot, buffer)| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("JKA planar reflection camera bind group {slot}")),
+                    layout: &camera_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            })
+            .collect();
+        let planar_reflection_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA planar reflection layout"),
+                entries: &[
+                    texture_2d_array_entry(0),
+                    sampler_entry(1),
+                    uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                ],
+            });
+        let planar_reflection = create_planar_reflection_resources(
+            &device,
+            &planar_reflection_layout,
+            config.format,
+            1,
+            1,
+            false,
+        );
+        let planar_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA planar reflection debug preview shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("planar_debug.wgsl").into()),
+        });
+        let planar_debug_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA planar reflection debug preview pipeline layout"),
+                bind_group_layouts: &[Some(&planar_reflection_layout)],
+                immediate_size: 0,
+            });
+        let planar_debug_pipeline = create_planar_debug_pipeline(
+            &device,
+            &planar_debug_pipeline_layout,
+            &planar_debug_shader,
+            config.format,
+        );
+        let cluster_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA clustered-light compute layout"),
+                entries: &[
+                    storage_buffer_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                    storage_buffer_entry(1, false, wgpu::ShaderStages::COMPUTE),
+                    uniform_entry(2, wgpu::ShaderStages::COMPUTE),
+                ],
+            });
+        // Preserve the pre-area/GI descriptor interface as well as its shader.
+        // This makes the all-OFF path use the same group-2 bindings as the old
+        // renderer rather than merely branching out of the new resources.
+        let lighting_layout_lean =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA clustered-light render layout (lean baseline)"),
+                entries: &[
+                    storage_buffer_entry(0, true, wgpu::ShaderStages::FRAGMENT),
+                    storage_buffer_entry(1, true, wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+                    depth_cube_array_texture_entry(4),
+                    comparison_sampler_entry(5),
+                    texture_3d_entry_stages(6, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    texture_3d_entry_stages(7, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    sampler_entry_stages(8, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(9, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                ],
+            });
+        let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA clustered-light render layout"),
+            entries: &[
+                storage_buffer_entry(0, true, wgpu::ShaderStages::FRAGMENT),
+                storage_buffer_entry(1, true, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+                depth_cube_array_texture_entry(4),
+                comparison_sampler_entry(5),
+                texture_3d_entry_stages(6, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                texture_3d_entry_stages(7, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                sampler_entry_stages(8, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(9, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                texture_3d_entry(10),
+                texture_3d_entry(11),
+                uniform_entry(12, wgpu::ShaderStages::FRAGMENT),
+                texture_3d_entry(13),
+                uniform_entry(14, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let shadow_receiver_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA cascaded-shadow receiver layout"),
+                entries: &[
+                    depth_array_texture_entry(0),
+                    comparison_sampler_entry(1),
+                    uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+                    unfilterable_texture_entry_stages(
+                        4,
+                        wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
+                    uniform_entry(
+                        5,
+                        wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ),
+                    nonfiltering_sampler_entry(6, wgpu::ShaderStages::FRAGMENT),
+                    depth_array_texture_entry(7),
+                ],
+            });
+        // Group 5 is intentionally kept as an empty placeholder so the ocean
+        // bindings can remain group 6 without renumbering every BSP pipeline.
+        // The old per-BSP cloud-shadow receiver path was dead; projected cloud
+        // shadows are resolved in post.wgsl from reconstructed world position.
+        let cloud_shadow_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA unused BSP group 5 placeholder"),
+                entries: &[],
+            });
+        let shadow_caster_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA cascaded-shadow caster layout"),
+                entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
+            });
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA cascaded-shadow caster shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
+        });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA cascaded-shadow caster pipeline layout"),
+                bind_group_layouts: &[Some(&shadow_caster_layout)],
+                immediate_size: 0,
+            });
+        let shadow_mask_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA alpha-tested shadow caster pipeline layout"),
+                bind_group_layouts: &[Some(&shadow_caster_layout), Some(&surface_layout)],
+                immediate_size: 0,
+            });
+        let shadow_pipeline = create_shadow_pipeline(
+            &device, &shadow_pipeline_layout, &shadow_shader, false, Some(wgpu::Face::Back));
+        let shadow_sky_pipeline = create_sky_admission_pipeline(
+            &device, &shadow_pipeline_layout, &shadow_shader, false);
+        let shadow_mask_pipeline =
+            create_shadow_mask_pipeline(&device, &shadow_mask_pipeline_layout, &shadow_shader, false);
+        let shadow_translucent_pipeline = create_shadow_translucent_pipeline(
+            &device, &shadow_mask_pipeline_layout, &shadow_shader, false);
+        let bevy_shadow_pipeline = create_shadow_pipeline(
+            &device, &shadow_pipeline_layout, &shadow_shader, true, Some(wgpu::Face::Back));
+        let bevy_shadow_sky_pipeline = create_sky_admission_pipeline(
+            &device, &shadow_pipeline_layout, &shadow_shader, true);
+        let bevy_shadow_mask_pipeline =
+            create_shadow_mask_pipeline(&device, &shadow_mask_pipeline_layout, &shadow_shader, true);
+        let bevy_shadow_translucent_pipeline = create_shadow_translucent_pipeline(
+            &device, &shadow_mask_pipeline_layout, &shadow_shader, true);
+        // Grass owns the canonical GodotGrass Perlin/domain-warp wind texture.
+        // Create it before weather so rain can reuse that exact GPU resource rather
+        // than generating or uploading a second copy of the same noise.
+        let grass_renderer = GrassRenderer::new(
+            &device,
+            &queue,
+            &camera_layout,
+            &shadow_receiver_layout,
+            &shadow_caster_layout,
+            gpu_compaction_supported,
+            config.format,
+            msaa_samples,
+        );
+        let surface_sprite_effect_renderer = SurfaceSpriteEffectRenderer::new(
+            &device,
+            &camera_layout,
+            config.format,
+            msaa_samples,
+        );
+        let mut weather = WeatherSystem::new(
+            &device,
+            &queue,
+            &camera_layout,
+            config.format,
+            msaa_samples,
+            grass_renderer.wind_noise_texture(),
+        );
+        let shadow_resources = create_shadow_resources(
+            &device,
+            &shadow_receiver_layout,
+            &shadow_caster_layout,
+            shadow_pipeline,
+            shadow_mask_pipeline,
+            shadow_translucent_pipeline,
+            shadow_sky_pipeline,
+            bevy_shadow_pipeline,
+            bevy_shadow_mask_pipeline,
+            bevy_shadow_translucent_pipeline,
+            bevy_shadow_sky_pipeline,
+            weather.fog.legacy_control_buffer(),
+        );
+        let cluster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA clustered-light builder"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("cluster_lights.wgsl").into()),
+        });
+        let cluster_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA clustered-light compute pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&cluster_compute_layout)],
+                immediate_size: 0,
+            });
+        let cluster_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("JKA clustered-light compute pipeline"),
+                layout: Some(&cluster_pipeline_layout),
+                module: &cluster_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let lighting_settings_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("JKA clustered-light settings"),
+                contents: bytemuck::bytes_of(&LightingSettings {
+                    values: [0, 0, config.width.max(1), config.height.max(1)],
+                    local_shadows: [0, 0, LOCAL_SHADOW_MAP_SIZE, 0],
+                    feature_flags: [0; 4],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let pbr_settings_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA PBR enhancement settings"),
+            contents: bytemuck::bytes_of(&PbrSettings {
+                values: [
+                    u32::from(PBR_PROFILE_MATERIALS),
+                    u32::from(PBR_PROFILE_PARALLAX_OCCLUSION),
+                    40,
+                    0,
+                ],
+                deluxe: [1.0, 1.0, 0.0, 0.0],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA BSP shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("bsp.wgsl"),
+                    include_str!("surface_deformation.wgsl")
+                )
+                .into(),
+            ),
+        });
+        let world_shader_lean = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA BSP shader (lean baseline)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("bsp_lean.wgsl"),
+                    include_str!("surface_deformation.wgsl")
+                )
+                .into(),
+            ),
+        });
+        let fast_world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA BSP shader (known-fast baseline)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("bsp_fast.wgsl"),
+                    include_str!("surface_deformation.wgsl")
+                )
+                .into(),
+            ),
+        });
+        let ocean_layout = crate::ocean::OceanGpu::create_render_layout(&device);
+        let ocean_inert_bind_group =
+            crate::ocean::OceanGpu::create_inert_render_bind_group(&device, &ocean_layout);
+        let missing_texture_data = missing_texture_data();
+        let ocean_spray_albedo_data = load_texture_asset_or_missing(
+            base,
+            game,
+            "textures/japro/sea_spray",
+            false,
+            true,
+            true,
+            "Ocean sea spray",
+            &missing_texture_data,
+        );
+        let ocean_spray_albedo = upload_texture(&device, &queue, &ocean_spray_albedo_data);
+        let world_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA BSP pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&surface_layout),
+                    Some(&lighting_layout),
+                    Some(&shadow_receiver_layout),
+                    Some(&planar_reflection_layout),
+                    Some(&cloud_shadow_layout),
+                    Some(&ocean_layout),
+                ],
+                immediate_size: 0,
+            });
+        let world_pipeline_layout_lean =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA BSP pipeline layout (lean baseline)"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&surface_layout),
+                    Some(&lighting_layout_lean),
+                    Some(&shadow_receiver_layout),
+                    Some(&planar_reflection_layout),
+                ],
+                immediate_size: 0,
+            });
+        let fast_world_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA BSP pipeline layout (known-fast baseline)"),
+                bind_group_layouts: &[Some(&fast_camera_layout), Some(&fast_surface_layout)],
+                immediate_size: 0,
+            });
+        let wireframe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA wireframe overlay shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("wireframe.wgsl").into()),
+        });
+        let wireframe_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA wireframe overlay pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout)],
+                immediate_size: 0,
+            });
+        let wireframe_pipeline = wireframe_supported.then(|| {
+            create_wireframe_pipeline(
+                &device,
+                &wireframe_pipeline_layout,
+                &wireframe_shader,
+                config.format,
+                msaa_samples,
+            )
+        });
+        let surface_inspector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA surface inspector shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("surface_inspector.wgsl").into()),
+        });
+        let surface_inspector_pipeline = create_surface_inspector_pipeline(
+            &device,
+            &wireframe_pipeline_layout,
+            &surface_inspector_shader,
+            config.format,
+            msaa_samples,
+        );
+
+        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA UI shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ui.wgsl").into()),
+        });
+        let ui_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA UI font layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+            ],
+        });
+        let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA UI pipeline layout"),
+            bind_group_layouts: &[Some(&ui_texture_layout)],
+            immediate_size: 0,
+        });
+        let ui_pipeline =
+            create_ui_pipeline(&device, &ui_pipeline_layout, &ui_shader, config.format);
+        let ui_font_data = load_ui_font_texture(base, game);
+        let ui_font = upload_texture(&device, &queue, &ui_font_data);
+        let (ui_small_font_data, ui_small_font_metrics) =
+            load_ui_proportional_font(base, game, "ocr_a");
+        let ui_small_font = upload_texture(&device, &queue, &ui_small_font_data);
+        let (ui_splash_data, ui_splash_size) = load_ui_splash_texture(base, game);
+        let ui_splash = upload_texture(&device, &queue, &ui_splash_data);
+        let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA UI font sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA UI font bind group"),
+            layout: &ui_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ui_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&ui_small_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&ui_splash.view),
+                },
+            ],
+        });
+        let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA UI dynamic vertices"),
+            size: UI_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // egui is used for the modern Setup -> Video panel. It is kept as a
+        // separate late overlay so the game/world renderer and legacy HUD/menu
+        // remain untouched, and it costs nothing when the Video panel is closed.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
+        let texture_filter = TextureFilter::Trilinear;
+        let repeat_sampler = create_texture_sampler(&device, false, texture_filter);
+        let clamp_sampler = create_texture_sampler(&device, true, texture_filter);
+        // Companion maps are low-frequency material data. Keeping this pair at
+        // fixed trilinear filtering avoids inheriting expensive 8x/16x AF from
+        // the base-color sampler while preserving mipmapped linear filtering.
+        let pbr_repeat_sampler = create_texture_sampler(&device, false, TextureFilter::Trilinear);
+        let pbr_clamp_sampler = create_texture_sampler(&device, true, TextureFilter::Trilinear);
+        let lightmap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("lightmap sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        // Quake 3 / JKA outer skybox faces are sampled linearly without using
+        // the normal world-texture mip selection. Keep this sampler independent
+        // from r_textureMode so changing wall filtering does not blur the sky.
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA skybox sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            ..Default::default()
+        });
+        let white = upload_texture(
+            &device,
+            &queue,
+            &TextureData {
+                label: "white fallback".into(),
+                source: None,
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+                rgba16f: None,
+                mip_level_count: 1,
+                clamp: true,
+                srgb: true,
+            },
+        );
+        let missing = upload_texture(&device, &queue, &missing_texture_data);
+        let dynamic_model_renderer = DynamicModelRenderer::new(
+            &device,
+            &camera_layout,
+            config.format,
+            msaa_samples,
+            &white,
+        );
+        let flat_normal = upload_texture(
+            &device,
+            &queue,
+            &TextureData {
+                label: "flat normal fallback".into(),
+                source: None,
+                width: 1,
+                height: 1,
+                rgba: vec![128, 128, 255, 255],
+                rgba16f: None,
+                mip_level_count: 1,
+                clamp: true,
+                srgb: false,
+            },
+        );
+
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA post-process layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                unfilterable_texture_entry(3),
+                texture_entry(4),
+                storage_buffer_entry(5, true, wgpu::ShaderStages::FRAGMENT),
+                texture_entry(6),
+                texture_entry(7),
+                texture_entry(8),
+                texture_3d_entry(9),
+                sampler_entry(10),
+                texture_entry(11),
+                texture_entry(12),
+                unfilterable_texture_entry(13),
+                texture_entry(14),
+                texture_3d_entry(15),
+                sampler_entry(16),
+                texture_entry(17),
+                unfilterable_texture_entry(18),
+                texture_entry(19),
+                texture_entry(20),
+                texture_entry(21),
+                depth_texture_entry(22),
+                texture_entry(23),
+                storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA post-process shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("post.wgsl").into()),
+        });
+        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA post-process pipeline layout"),
+            bind_group_layouts: &[Some(&post_layout)],
+            immediate_size: 0,
+        });
+        let post_pipeline =
+            create_post_pipeline(&device, &post_pipeline_layout, &post_shader, config.format);
+        let taa_post_pipeline = create_taa_post_pipeline(
+            &device,
+            &post_pipeline_layout,
+            &post_shader,
+            config.format,
+            config.format,
+        );
+        // The resolve pass reads the march output. It gets its own bind group
+        // so the march pipeline layout never mentions the texture it renders
+        // into, which wgpu rejects outright.
+        let cloud_resolve_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA cloud resolve layout"),
+                entries: &[texture_entry(0)],
+            });
+        let cloud_resolve_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA cloud resolve pipeline layout"),
+                bind_group_layouts: &[Some(&post_layout), Some(&cloud_resolve_layout)],
+                immediate_size: 0,
+            });
+        let cloud_march_pipeline = create_cloud_pass_pipeline(
+            &device,
+            &post_pipeline_layout,
+            &post_shader,
+            "fs_cloud_march",
+            "JKA volumetric cloud march pipeline",
+        );
+        let cloud_resolve_pipeline = create_cloud_pass_pipeline(
+            &device,
+            &cloud_resolve_pipeline_layout,
+            &post_shader,
+            "fs_cloud_resolve",
+            "JKA volumetric cloud resolve pipeline",
+        );
+        let cloud_resolve_bind_group = create_cloud_resolve_bind_group(
+            &device,
+            &cloud_resolve_layout,
+            &targets.cloud_march_view,
+        );
+
+        // Port the structure Bevy tracks for its SSAO follow-up work: evaluate AO
+        // at half resolution, temporally accumulate it, then bilateral-upsample
+        // against full-resolution linear depth in the main post pass.
+        let ssao_temporal_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA temporal SSAO layout"),
+                entries: &[
+                    unfilterable_texture_entry(0),
+                    texture_entry(1),
+                    sampler_entry(2),
+                    uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+                ],
+            });
+        let ssao_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA half-resolution temporal SSAO shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ssao_temporal.wgsl").into()),
+        });
+        let ssao_temporal_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA temporal SSAO pipeline layout"),
+                bind_group_layouts: &[Some(&ssao_temporal_layout)],
+                immediate_size: 0,
+            });
+        let ssao_temporal_pipeline = create_ssao_temporal_pipeline(
+            &device,
+            &ssao_temporal_pipeline_layout,
+            &ssao_temporal_shader,
+        );
+
+        // Port Bevy's hybrid SSR ray refinement and FidelityFX's temporal
+        // reflection history as a separate half-resolution pass. The expensive
+        // ray march runs at one quarter of the output pixels; the main post pass
+        // only performs a four-tap depth-aware upsample and composite.
+        let ssr_temporal_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA temporal SSR layout"),
+                entries: &[
+                    texture_entry(0),
+                    sampler_entry(1),
+                    unfilterable_texture_entry(2),
+                    texture_entry(3),
+                    unfilterable_texture_entry(4),
+                    uniform_entry(5, wgpu::ShaderStages::FRAGMENT),
+                    // Share the same static weather-surface field/uniform used by
+                    // BSP shading so SSR sees the wet-adjusted surface response.
+                    unfilterable_texture_entry(6),
+                    nonfiltering_sampler_entry(7, wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(8, wgpu::ShaderStages::FRAGMENT),
+                    // Cached per-surface reflection eligibility from the depth prepass.
+                    texture_entry(9),
+                ],
+            });
+        let ssr_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA half-resolution temporal SSR shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ssr_temporal.wgsl").into()),
+        });
+        let ssr_temporal_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA temporal SSR pipeline layout"),
+                bind_group_layouts: &[Some(&ssr_temporal_layout)],
+                immediate_size: 0,
+            });
+        let ssr_temporal_pipeline = create_ssr_temporal_pipeline(
+            &device,
+            &ssr_temporal_pipeline_layout,
+            &ssr_temporal_shader,
+        );
+
+        // Gamma is common even in otherwise-minimal configurations. Keep a tiny
+        // specialized pipeline for the gamma-only case so advanced post features
+        // add zero shader/resource work when disabled. The full fused post path
+        // remains unchanged whenever any other post effect is active.
+        let gamma_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA gamma-only post layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                texture_3d_entry(3),
+                sampler_entry(4),
+            ],
+        });
+        let gamma_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA gamma-only post shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("post_gamma.wgsl").into()),
+        });
+        let gamma_post_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA gamma-only post pipeline layout"),
+                bind_group_layouts: &[Some(&gamma_post_layout)],
+                immediate_size: 0,
+            });
+        let gamma_post_pipeline = create_gamma_post_pipeline(
+            &device,
+            &gamma_post_pipeline_layout,
+            &gamma_post_shader,
+            config.format,
+        );
+        let fast_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA known-fast gamma post layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let fast_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA known-fast gamma post shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("post_fast.wgsl").into()),
+        });
+        let fast_post_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA known-fast gamma post pipeline layout"),
+                bind_group_layouts: &[Some(&fast_post_layout)],
+                immediate_size: 0,
+            });
+        let fast_post_pipeline = create_gamma_post_pipeline(
+            &device,
+            &fast_post_pipeline_layout,
+            &fast_post_shader,
+            config.format,
+        );
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA post-process sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let (color_lut_texture, color_lut_view) =
+            create_color_lut_texture(&device, &queue, ColorLutPreset::Off);
+        let color_lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA color LUT sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        // Finalized cloud path is lazy: the shared post pipeline is compiled once,
+        // while the heavy 96^3 noise/cached-FBM texture is only generated and
+        // uploaded if volumetric clouds are actually enabled.
+        let cloud_noise_resources = None;
+        let cloud_noise_fallback = create_cloud_fallback_resources(&device, &queue);
+        // Bloom/halation share a low-resolution highlight pyramid. The pyramid is
+        // generated only while either effect is enabled; the maximum-FPS path
+        // does not allocate the targets and records no bloom passes.
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA bloom downsample layout"),
+            entries: &[texture_entry(0), sampler_entry(1)],
+        });
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA low-resolution bloom shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("bloom.wgsl").into()),
+        });
+        let bloom_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA bloom downsample pipeline layout"),
+                bind_group_layouts: &[Some(&bloom_layout)],
+                immediate_size: 0,
+            });
+        let bloom_extract_pipeline =
+            create_bloom_pipeline(&device, &bloom_pipeline_layout, &bloom_shader, "fs_extract");
+        let bloom_downsample_pipeline = create_bloom_pipeline(
+            &device,
+            &bloom_pipeline_layout,
+            &bloom_shader,
+            "fs_downsample",
+        );
+
+        // Fast DOF follows Bevy's Gaussian mode structurally: one horizontal
+        // separable pass here, with the vertical pass fused into post.wgsl.
+        // Resources only exist while DOF is enabled.
+        let dof_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Gaussian DOF layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                unfilterable_texture_entry(2),
+                uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let dof_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Gaussian DOF shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("dof.wgsl").into()),
+        });
+        let dof_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Gaussian DOF pipeline layout"),
+            bind_group_layouts: &[Some(&dof_layout)],
+            immediate_size: 0,
+        });
+        let dof_pipeline = create_dof_pipeline(&device, &dof_pipeline_layout, &dof_shader);
+        let dof_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA Gaussian DOF uniform"),
+            contents: bytemuck::bytes_of(&DofUniform {
+                focus_strength: [4096.0, 0.0, config.width as f32, config.height as f32],
+                quality: [DofQuality::Adaptive.shader_value(), 0.0, 0.0, 0.0],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let gamma = 1.0;
+        let post_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA post-process uniform"),
+            contents: bytemuck::bytes_of(&PostUniform {
+                color: PostColorSettings {
+                    gamma,
+                    tone_mapping: 0.0,
+                    bloom: 0.0,
+                    ssao: 0.0,
+                },
+                aa: PostAaSettings {
+                    fxaa: 0.0,
+                    viewport_width: config.width as f32,
+                    viewport_height: config.height as f32,
+                    taa: 0.0,
+                },
+                taa_params: [0.0; 4],
+                scene: PostSceneSettings {
+                    contact_shadows: 0.0,
+                    volumetric_fog: 0.0,
+                    ssr: 0.0,
+                    history_valid: 0.0,
+                },
+                film: PostFilmSettings {
+                    halation: 0.0,
+                    chromatic_aberration: 0.0,
+                    vignette: 0.0,
+                    lut_strength: 0.0,
+                },
+                grain: PostGrainSettings {
+                    strength: 0.0,
+                    grain_size: 1.0,
+                    time: 0.0,
+                    exposure: 0.0,
+                },
+                camera_fx: PostCameraFxSettings {
+                    motion_blur_scale: 0.0,
+                    depth_of_field: 0.0,
+                    dof_focus_distance: 4096.0,
+                    dof_quality: DofQuality::Adaptive.shader_value(),
+                },
+                clouds: CloudRenderSettings {
+                    values: [0.0, 0.0, 0.55, 0.55],
+                },
+                cloud_layer: CloudLayerSettings {
+                    values: [2400.0, 1200.0, 120.0, 20.0_f32.to_radians()],
+                },
+                cloud_sun: CloudSunSettings {
+                    direction_intensity: [
+                        FALLBACK_SUN_DIRECTION[0],
+                        FALLBACK_SUN_DIRECTION[1],
+                        FALLBACK_SUN_DIRECTION[2],
+                        FALLBACK_SUN_INTENSITY,
+                    ],
+                    color_density: [
+                        FALLBACK_SUN_COLOR[0],
+                        FALLBACK_SUN_COLOR[1],
+                        FALLBACK_SUN_COLOR[2],
+                        1.0,
+                    ],
+                },
+                cloud_shadow: PostCloudShadowSettings {
+                    values: [0.0, 0.75, 0.0, 0.0],
+                },
+                cloud_shaping: PostCloudShapingSettings {
+                    values: [0.35, 0.25, 0.0, 0.5],
+                },
+                cloud_sky_ambient: PostCloudSkyAmbientSettings {
+                    values: [0.45, 0.55, 0.75, 1.0],
+                },
+                cloud_temporal_tuning: PostCloudTemporalTuningSettings {
+                    values: [0.85, 1.0, 1.0, 0.0],
+                },
+                cloud_variation: PostCloudVariationSettings {
+                    values: [0.4, 0.333, 0.0, 0.0],
+                },
+                cloud_temporal: PostCloudTemporalSettings {
+                    values: [0.0, 0.0, 0.88, 0.0],
+                },
+                rain: [
+                    0.0,
+                    RainIntensity::Rain.shader_value(),
+                    RainIntensity::Rain.haze_strength(),
+                    0.0,
+                ],
+                weather_occlusion: [0.0; 4],
+                camera_pos_time: [0.0; 4],
+                prev_camera_pos_time: [0.0; 4],
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                cloud_inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                cloud_prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                motion_prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let auto_exposure_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA auto-exposure layout"),
+            entries: &[
+                unfilterable_texture_entry_stages(0, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(1, false, wgpu::ShaderStages::COMPUTE),
+                uniform_entry(2, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let auto_exposure_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA auto-exposure shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("auto_exposure.wgsl").into()),
+        });
+        let auto_exposure_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA auto-exposure pipeline layout"),
+                bind_group_layouts: &[Some(&auto_exposure_layout)],
+                immediate_size: 0,
+            });
+        let auto_exposure_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("JKA auto-exposure compute pipeline"),
+            layout: Some(&auto_exposure_pipeline_layout),
+            module: &auto_exposure_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let auto_exposure_state_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA auto-exposure state"),
+            contents: bytemuck::bytes_of(&AutoExposureState {
+                exposure_ev: 0.0,
+                average_luminance: 1.0,
+                target_ev: 0.0,
+                reserved: 0.0,
+            }),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let auto_exposure_settings_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("JKA auto-exposure settings"),
+                contents: bytemuck::bytes_of(&AutoExposureUniform {
+                    params: [0.0, 0.0, -2.0, 2.0],
+                    adaptation: [0.18, 1.5, 3.0, 0.0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let auto_exposure_bind_group = create_auto_exposure_bind_group(
+            &device,
+            &auto_exposure_layout,
+            &targets.scene_view,
+            &auto_exposure_state_buffer,
+            &auto_exposure_settings_buffer,
+        );
+
+        let ssao_temporal_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA temporal SSAO uniform"),
+            contents: bytemuck::bytes_of(&SsaoTemporalUniform {
+                viewport_history: [config.width as f32, config.height as f32, 0.0, 0.0],
+                camera_pos_time: [0.0; 4],
+                previous_camera_pos: [0.0; 4],
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let ssao_temporal_bind_groups = create_ssao_temporal_bind_groups(
+            &device,
+            &ssao_temporal_layout,
+            &targets.linear_depth_view,
+            targets.ssao_history.as_ref(),
+            &post_sampler,
+            &ssao_temporal_buffer,
+        );
+        let ssr_temporal_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA temporal SSR uniform"),
+            contents: bytemuck::bytes_of(&SsrTemporalUniform {
+                viewport_history: [config.width as f32, config.height as f32, 0.0, 0.0],
+                camera_pos_time: [0.0; 4],
+                previous_camera_pos: [0.0; 4],
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let ssr_temporal_bind_groups = create_ssr_temporal_bind_groups(
+            &device,
+            &ssr_temporal_layout,
+            &targets.scene_view,
+            &targets.linear_depth_view,
+            targets.ssr_history.as_ref(),
+            &post_sampler,
+            &ssr_temporal_buffer,
+            &shadow_resources.weather_height_view,
+            &shadow_resources.weather_sampler,
+            &shadow_resources.weather_surface_buffer,
+            &targets.reflection_mask_view,
+        );
+
+        let post_bind_groups = std::array::from_fn(|history_index| {
+            std::array::from_fn(|ssao_index| {
+                std::array::from_fn(|ssr_index| {
+                    std::array::from_fn(|cloud_index| {
+                        let ssao_view = targets
+                            .ssao_history
+                            .as_ref()
+                            .map_or(&targets.scene_view, |history| &history.views[ssao_index]);
+                        let (ssr_radiance_view, ssr_depth_view) =
+                            targets.ssr_history.as_ref().map_or(
+                                (&targets.scene_view, &targets.linear_depth_view),
+                                |history| {
+                                    (
+                                        &history.radiance_views[ssr_index],
+                                        &history.depth_views[ssr_index],
+                                    )
+                                },
+                            );
+                        create_post_bind_group(
+                            &device,
+                            &post_layout,
+                            &targets.scene_view,
+                            &targets.linear_depth_view,
+                            &targets.history_views[history_index],
+                            ssao_view,
+                            ssr_radiance_view,
+                            ssr_depth_view,
+                            &post_sampler,
+                            &post_buffer,
+                            &weather.fog.resources.buffer,
+                            targets.bloom.as_ref(),
+                            targets.dof.as_ref(),
+                            &color_lut_view,
+                            &color_lut_sampler,
+                            &cloud_noise_fallback.detail_view,
+                            &cloud_noise_fallback.sampler,
+                            &targets.cloud_transfer_views[cloud_index],
+                            &targets.scene_view,
+                            &targets.rain_haze_mask_view,
+                            &cloud_noise_fallback.weather_view,
+                            &targets.motion_vector_view,
+                            &targets.ao_depth_view,
+                            &targets.reflection_mask_view,
+                            &auto_exposure_state_buffer,
+                        )
+                    })
+                })
+            })
+        });
+        let gamma_post_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA gamma-only post uniform"),
+            contents: bytemuck::bytes_of(&GammaPostUniform {
+                values: [gamma, 0.0, 0.0, 0.0],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bloom_bind_groups = create_bloom_bind_groups(
+            &device,
+            &bloom_layout,
+            &post_sampler,
+            &targets.scene_view,
+            targets.bloom.as_ref(),
+        );
+        let dof_bind_group = create_dof_bind_group(
+            &device,
+            &dof_layout,
+            &targets.scene_view,
+            &targets.linear_depth_view,
+            &post_sampler,
+            &dof_buffer,
+            targets.dof.as_ref(),
+        );
+
+        let gamma_post_bind_group = create_gamma_post_bind_group(
+            &device,
+            &gamma_post_layout,
+            &targets.scene_view,
+            &post_sampler,
+            &gamma_post_buffer,
+            &color_lut_view,
+            &color_lut_sampler,
+        );
+        let fast_post_bind_group = create_fast_post_bind_group(
+            &device,
+            &fast_post_layout,
+            &targets.scene_view,
+            &post_sampler,
+            &gamma_post_buffer,
+        );
+
+        let gpu_profiler = GpuProfiler::new(
+            &device,
+            &queue,
+            timestamp_supported,
+            timestamp_inside_encoders,
+            timestamp_inside_passes,
+        );
+
+        let depth_prepass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA AO depth prepass shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("depth_prepass.wgsl").into()),
+        });
+        let depth_prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA AO depth prepass pipeline layout"),
+            bind_group_layouts: &[
+                Some(&camera_layout),
+                Some(&surface_layout),
+                Some(&planar_reflection_layout),
+            ],
+            immediate_size: 0,
+        });
+        let depth_prepass_mask_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA alpha-tested depth prepass pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&surface_layout),
+                    Some(&planar_reflection_layout),
+                ],
+                immediate_size: 0,
+            });
+        let depth_prepass_pipeline =
+            create_depth_prepass_pipeline(&device, &depth_prepass_layout, &depth_prepass_shader);
+        let depth_prepass_mask_pipeline = create_depth_prepass_mask_pipeline(
+            &device,
+            &depth_prepass_mask_layout,
+            &depth_prepass_shader,
+        );
+
+        let hiz_reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Hi-Z reduce layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let hiz_reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Hi-Z reduce shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("hiz_reduce.wgsl").into()),
+        });
+        let hiz_reduce_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA Hi-Z reduce pipeline layout"),
+                bind_group_layouts: &[Some(&hiz_reduce_layout)],
+                immediate_size: 0,
+            });
+        let hiz_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("JKA Hi-Z reduce pipeline"),
+                layout: Some(&hiz_reduce_pipeline_layout),
+                module: &hiz_reduce_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let hiz_reduce_bind_groups =
+            create_hiz_reduce_bind_groups(&device, &hiz_reduce_layout, &targets);
+
+        let gpu_cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA GPU cull layout"),
+            entries: &[
+                storage_buffer_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(1, false, wgpu::ShaderStages::COMPUTE),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                uniform_entry(3, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(4, true, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(5, false, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(6, false, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(7, false, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(8, false, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let gpu_cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA GPU cull shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu_cull.wgsl").into()),
+        });
+        let gpu_cull_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA GPU cull pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&gpu_cull_layout)],
+                immediate_size: 0,
+            });
+        let gpu_cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("JKA GPU cull pipeline"),
+            layout: Some(&gpu_cull_pipeline_layout),
+            module: &gpu_cull_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let gpu_cull_settings_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("JKA GPU cull settings"),
+                contents: bytemuck::bytes_of(&GpuCullSettings {
+                    viewport_mips_flags: [
+                        config.width.max(1),
+                        config.height.max(1),
+                        targets.linear_depth_mip_count,
+                        0,
+                    ],
+                    active_compaction: [0, 0, u32::from(gpu_compaction_supported), 0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let cull_debug_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA cull debug layout"),
+            entries: &[storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX)],
+        });
+        let cull_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA cull debug shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("cull_debug.wgsl").into()),
+        });
+        let cull_debug_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA cull debug pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&cull_debug_layout)],
+                immediate_size: 0,
+            });
+        let cull_debug_pipeline = create_cull_debug_pipeline(
+            &device,
+            &cull_debug_pipeline_layout,
+            &cull_debug_shader,
+            config.format,
+            msaa_samples,
+        );
+        let cull_diagnostics_readback = CullDiagnosticsReadback::new(&device);
+
+        // Weather owns persistent precipitation GPU state. The haze binding is
+        // attached here because it depends on post-process targets created later
+        // than the core weather pipelines.
+        weather.rain.rebuild_haze_bind_group(
+            &device,
+            &post_buffer,
+            &targets.linear_depth_view,
+            &targets.rain_haze_mask_view,
+        );
+        let (screenshot_worker_tx, screenshot_job_rx) = mpsc::channel::<ScreenshotEncodeJob>();
+        let (screenshot_result_tx, screenshot_worker_rx) =
+            mpsc::channel::<Result<(PathBuf, Option<String>), String>>();
+        thread::Builder::new()
+            .name("screenshot-encode".into())
+            .spawn(move || {
+                while let Ok(job) = screenshot_job_rx.recv() {
+                    let result = encode_screenshot_job(job);
+                    if screenshot_result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start screenshot worker: {error}"))?;
+
+        Ok(Self {
+            window,
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            present_modes: caps.present_modes,
+            scene_rebuild_pending: false,
+            supported_msaa: surface_supported_msaa,
+            hdr_supported_msaa,
+            vsync: VsyncMode::Off,
+            msaa_samples,
+            targets,
+            camera_buffer,
+            camera_layout,
+            camera_bind_group,
+            fast_camera_bind_group,
+            planar_camera_buffers,
+            planar_camera_bind_groups,
+            surface_layout,
+            fast_surface_layout,
+            surface_deformation,
+            planar_reflection_layout,
+            planar_reflection,
+            weather,
+            grass_renderer,
+            surface_sprite_effect_renderer,
+            ocean_layout,
+            ocean_inert_bind_group,
+            ocean_spray_albedo,
+            ocean: None,
+            authored_oceans: Vec::new(),
+            authored_ocean_definitions: Vec::new(),
+            ocean_enabled: false,
+            ocean_settings: crate::ocean::OceanSettings::default(),
+            world_pipeline_layout,
+            world_pipeline_layout_lean,
+            fast_world_pipeline_layout,
+            world_shader,
+            world_shader_lean,
+            fast_world_shader,
+            wireframe_supported,
+            wireframe_enabled: false,
+            pvs_mode: PvsMode::Auto,
+            wireframe_pipeline_layout,
+            wireframe_shader,
+            wireframe_pipeline,
+            surface_inspector_shader,
+            surface_inspector_pipeline,
+            inspector_vertex_range: None,
+            ui_pipeline,
+            ui_bind_group,
+            _ui_font: ui_font,
+            _ui_small_font: ui_small_font,
+            _ui_splash: ui_splash,
+            ui_splash_size,
+            ui_small_font_metrics,
+            _ui_font_sampler: ui_font_sampler,
+            ui_vertex_buffer,
+            ui_vertex_count: 0,
+            ui_trace: env_flag("JKA_UI_TRACE"),
+            ui_state: UiSnapshot::default(),
+            egui_renderer,
+            egui_paint_jobs: Vec::new(),
+            egui_pixels_per_point: 1.0,
+            egui_active: false,
+            egui_pending_free: Vec::new(),
+            menu_backdrop: None,
+            world: None,
+            dynamic_model_renderer,
+            white,
+            missing,
+            flat_normal,
+            repeat_sampler,
+            clamp_sampler,
+            pbr_repeat_sampler,
+            pbr_clamp_sampler,
+            lightmap_sampler,
+            sky_sampler,
+            texture_filter,
+            gamma,
+            hdr_enabled: false,
+            tone_mapping_enabled: false,
+            auto_exposure_enabled: false,
+            bloom_enabled: false,
+            halation_enabled: false,
+            ssao_enabled: false,
+            static_bsp_ao_enabled: false,
+            static_bsp_ao_lightmap: true,
+            static_bsp_ao_samples: 32,
+            static_bsp_ao_resolution: 3,
+            static_bsp_ao_strength: 75,
+            static_bsp_ao_range: 100,
+            static_bsp_ao_current_cell: false,
+            static_ao_pending: None,
+            static_ao_deferred_force_rebuild: false,
+            fxaa_enabled: false,
+            smaa_enabled: false,
+            taa_enabled: false,
+            contact_shadows_enabled: false,
+            sun_override: false,
+            sun_yaw: 314.25595,
+            sun_pitch: 57.04725,
+            sun_intensity: 250.0,
+            sun_color: [1.0, 1.0, 1.0],
+            sun_visibility: SunVisibilityMode::SkyPortals,
+            clouds_enabled: true,
+            cloud_type: CloudType::Storm,
+            cloud_quality: 1.0,
+            cloud_coverage: 0.6,
+            cloud_height: 4600.0,
+            cloud_thickness: 1200.0,
+            cloud_wind_speed: 167.0,
+            cloud_wind_direction: 220.0,
+            cloud_shadows_enabled: true,
+            cloud_render_resolution: CloudRenderResolution::Full,
+            cloud_temporal_enabled: true,
+            cloud_temporal_depth_fix: true,
+            cloud_shear: 0.2,
+            cloud_base_variation: 1.0,
+            cloud_wind_variation: false,
+            cloud_shape_evolution: false,
+            cloud_terrain_interaction: false,
+            cloud_empty_skip: false,
+            cloud_aerial: 0.0,
+            cloud_sky_ambient_enabled: false,
+            cloud_history_blend: 0.85,
+            cloud_motion_reject: 1.0,
+            cloud_history_depth_reject: false,
+            cloud_thickness_variation: 0.75,
+            cloud_size: 0.333,
+            cloud_sky_average: [0.45, 0.55, 0.75],
+            grass_enabled: true,
+            grass_precompute_enabled: true,
+            grass_mid_lod_enabled: true,
+            grass_front_to_back_enabled: true,
+            cloud_history_valid: false,
+            cloud_history_read_index: 0,
+            cloud_temporal_frame_index: 0,
+            reflection_quality: ReflectionQuality::Off,
+            reflection_debug_enabled: false,
+            ssr_enabled: false,
+            chromatic_aberration_strength: 0.0,
+            vignette_enabled: false,
+            film_grain_strength: 0.0,
+            motion_blur_strength: 0.0,
+            depth_of_field_strength: 0.0,
+            dof_quality: DofQuality::Adaptive,
+            dof_focus_distance: 4096.0,
+            dof_focus_valid: false,
+            motion_blur_runtime_scale: 0.0,
+            previous_frame_time: 0.0,
+            color_lut_preset: ColorLutPreset::Off,
+            color_lut_strength: 1.0,
+            _color_lut_texture: color_lut_texture,
+            color_lut_view,
+            color_lut_sampler,
+            cloud_noise_resources,
+            cloud_noise_fallback,
+            frame_plan: FramePlan::default(),
+            indirect_supported,
+            gpu_compaction_supported,
+            compact_group_scratch: Vec::new(),
+            gpu_driven_enabled: false,
+            hiz_occlusion_enabled: false,
+            clustered_lighting_enabled: false,
+            emissive_area_lights_enabled: false,
+            irradiance_volume_enabled: false,
+            voxel_probe_gi_enabled: false,
+            local_light_shadows_enabled: false,
+            pbr_enabled: true,
+            deluxe_mapping_enabled: true,
+            deluxe_specular: 1.0,
+            bc_compression_supported,
+            cascaded_shadows_enabled: false,
+            cascaded_shadow_mode: DynamicShadowsMode::Off,
+            cull_debug_mode: CullDebugMode::Off,
+            planar_reflection_mode: PlanarReflectionMode::Off,
+            planar_reflection_debug_mode: PlanarReflectionDebugMode::Off,
+            last_planar_debug_selection: None,
+            planar_slot_history: [None; PLANAR_REFLECTION_SLOTS],
+            planar_debug_pipeline,
+            history_valid: false,
+            camera_history_valid: false,
+            previous_view_proj: Mat4::IDENTITY,
+            previous_unjittered_view_proj: Mat4::IDENTITY,
+            previous_cloud_view_proj: Mat4::IDENTITY,
+            previous_camera_position: Vec3::ZERO,
+            taa_frame_index: 0,
+            ssao_history_valid: false,
+            ssao_history_read_index: 0,
+            ssr_history_valid: false,
+            ssr_history_read_index: 0,
+            ssr_frame_index: 0,
+            depth_prepass_pipeline,
+            depth_prepass_mask_pipeline,
+            hiz_reduce_layout,
+            hiz_reduce_pipeline,
+            hiz_reduce_bind_groups,
+            gpu_cull_layout,
+            gpu_cull_pipeline,
+            gpu_cull_settings_buffer,
+            cull_debug_layout,
+            cull_debug_pipeline_layout,
+            cull_debug_shader,
+            cull_debug_pipeline,
+            cluster_compute_layout,
+            cluster_compute_pipeline,
+            lighting_layout,
+            lighting_layout_lean,
+            shadow_receiver_layout,
+            shadow_caster_layout,
+            lighting_settings_buffer,
+            pbr_settings_buffer,
+            shadow_resources,
+            auto_exposure_layout,
+            auto_exposure_pipeline,
+            auto_exposure_state_buffer,
+            auto_exposure_settings_buffer,
+            auto_exposure_bind_group,
+            post_layout,
+            post_shader,
+            post_pipeline_layout,
+            post_pipeline,
+            taa_post_pipeline,
+            cloud_march_pipeline,
+            cloud_resolve_pipeline,
+            cloud_resolve_layout,
+            cloud_resolve_bind_group,
+            post_sampler,
+            post_buffer,
+            post_bind_groups,
+            history_read_index: 0,
+            ssao_temporal_layout,
+            ssao_temporal_pipeline,
+            ssao_temporal_buffer,
+            ssao_temporal_bind_groups,
+            ssr_temporal_layout,
+            ssr_temporal_pipeline,
+            ssr_temporal_buffer,
+            ssr_temporal_bind_groups,
+            bloom_layout,
+            bloom_extract_pipeline,
+            bloom_downsample_pipeline,
+            bloom_bind_groups,
+            dof_layout,
+            dof_pipeline,
+            dof_buffer,
+            dof_bind_group,
+            gamma_post_layout,
+            gamma_post_pipeline,
+            gamma_post_buffer,
+            gamma_post_bind_group,
+            fast_post_layout,
+            fast_post_pipeline,
+            fast_post_bind_group,
+            smaa_target: None,
+            gpu_profiler,
+            cull_diagnostics_readback,
+            surface_diag_pending: env_flag("JKA_SURFACE_DIAG"),
+            frame_diag_pending: env_flag("JKA_SURFACE_DIAG"),
+            screenshot_supported,
+            screenshot_requested: None,
+            screenshot_result: None,
+            screenshot_readback_buffer: None,
+            screenshot_worker_tx,
+            screenshot_worker_rx,
+            started: Instant::now(),
+        })
+    }
+
+    fn request_screenshot(&mut self, directory: PathBuf) {
+        if !self.screenshot_supported {
+            self.screenshot_result = Some(Err(
+                "the current WGPU surface does not support COPY_SRC readback".into(),
+            ));
+            return;
+        }
+        // Capture the destination together with the request. `fs_game` can change
+        // without a renderer restart, so renderer construction time is not a safe
+        // place to decide where a game-relative write belongs.
+        self.screenshot_requested = Some(directory);
+    }
+
+    fn take_screenshot_result(
+        &mut self,
+    ) -> Option<Result<(PathBuf, Option<String>), String>> {
+        self.screenshot_result
+            .take()
+            .or_else(|| self.screenshot_worker_rx.try_recv().ok())
+    }
+
+    fn prepare_screenshot_readback(&mut self) -> Option<ScreenshotReadback> {
+        let screenshot_dir = self.screenshot_requested.take()?;
+
+        let started = Instant::now();
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+        if width > u16::MAX as u32 || height > u16::MAX as u32 {
+            self.screenshot_result = Some(Err(format!(
+                "screenshot dimensions {width}x{height} exceed JPEG's 65535-pixel limit"
+            )));
+            return None;
+        }
+        let supported_format = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+                | wgpu::TextureFormat::Rgba8Unorm
+                | wgpu::TextureFormat::Rgba8UnormSrgb
+        );
+        if !supported_format {
+            self.screenshot_result = Some(Err(format!(
+                "unsupported screenshot surface format {:?}",
+                self.config.format
+            )));
+            return None;
+        }
+
+        let bytes_per_row = width.saturating_mul(4);
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = bytes_per_row.div_ceil(alignment) * alignment;
+        let buffer_size = u64::from(padded_bytes_per_row) * u64::from(height);
+        let reused_buffer = self
+            .screenshot_readback_buffer
+            .as_ref()
+            .is_some_and(|readback| readback.size >= buffer_size);
+        if !reused_buffer {
+            self.screenshot_readback_buffer = Some(ScreenshotReadbackBuffer {
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA screenshot readback"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                size: buffer_size,
+            });
+        }
+
+        Some(ScreenshotReadback {
+            screenshot_dir,
+            width,
+            height,
+            padded_bytes_per_row,
+            buffer_size,
+            format: self.config.format,
+            submission_index: None,
+            copy_record_ms: 0.0,
+            copy_submit_ms: 0.0,
+            inline_copy: false,
+            reused_buffer,
+            started,
+        })
+    }
+
+    fn encode_screenshot_copy(
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        staging_buffer: &wgpu::Buffer,
+        readback: &mut ScreenshotReadback,
+    ) {
+        let record_started = Instant::now();
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(readback.padded_bytes_per_row),
+                    rows_per_image: Some(readback.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: readback.width,
+                height: readback.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        readback.copy_record_ms += record_started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    fn submit_screenshot_copy(
+        &self,
+        texture: &wgpu::Texture,
+        readback: &mut ScreenshotReadback,
+    ) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA screenshot copy encoder"),
+            });
+        let staging_buffer = &self
+            .screenshot_readback_buffer
+            .as_ref()
+            .expect("screenshot staging buffer must exist after preparation")
+            .buffer;
+        Self::encode_screenshot_copy(&mut encoder, texture, staging_buffer, readback);
+        let submit_started = Instant::now();
+        readback.submission_index = Some(self.queue.submit([encoder.finish()]));
+        readback.copy_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    fn finish_screenshot_readback(&mut self, readback: ScreenshotReadback) {
+        if let Err(error) = self.queue_screenshot_encode(readback) {
+            self.screenshot_result = Some(Err(error));
+        }
+    }
+
+    fn queue_screenshot_encode(&self, readback: ScreenshotReadback) -> Result<(), String> {
+        let staging = self
+            .screenshot_readback_buffer
+            .as_ref()
+            .ok_or_else(|| "screenshot readback buffer is missing".to_owned())?;
+        let slice = staging.buffer.slice(0..readback.buffer_size);
+        let (mapped_tx, mapped_rx) = mpsc::sync_channel(1);
+        let map_request_started = Instant::now();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = mapped_tx.send(result);
+        });
+        let map_request_ms = map_request_started.elapsed().as_secs_f64() * 1000.0;
+
+        let gpu_wait_started = Instant::now();
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: readback.submission_index.clone(),
+                timeout: None,
+            })
+            .map_err(|error| format!("GPU readback wait failed: {error}"))?;
+        let gpu_wait_ms = gpu_wait_started.elapsed().as_secs_f64() * 1000.0;
+        mapped_rx
+            .recv()
+            .map_err(|_| "GPU screenshot mapping callback was lost".to_owned())?
+            .map_err(|error| format!("GPU screenshot mapping failed: {error}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let copy_started = Instant::now();
+        let pixels = mapped.to_vec();
+        let readback_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
+        drop(mapped);
+        staging.buffer.unmap();
+
+        let pixel_format = if matches!(
+            readback.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            ScreenshotPixelFormat::Bgra
+        } else {
+            ScreenshotPixelFormat::Rgba
+        };
+        self.screenshot_worker_tx
+            .send(ScreenshotEncodeJob {
+                pixels,
+                width: readback.width,
+                height: readback.height,
+                padded_bytes_per_row: readback.padded_bytes_per_row,
+                pixel_format,
+                screenshot_dir: readback.screenshot_dir,
+                copy_record_ms: readback.copy_record_ms,
+                copy_submit_ms: readback.copy_submit_ms,
+                map_request_ms,
+                gpu_wait_ms,
+                readback_copy_ms,
+                inline_copy: readback.inline_copy,
+                reused_buffer: readback.reused_buffer,
+                started: readback.started,
+            })
+            .map_err(|_| "screenshot encoding worker stopped".to_owned())
+    }
+
+    fn set_ui(&mut self, ui_state: UiSnapshot) {
+        self.ui_state = ui_state;
+        self.rebuild_ui();
+    }
+
+    fn set_egui(&mut self, frame: Option<EguiRenderData>) {
+        let Some(frame) = frame else {
+            self.egui_active = false;
+            self.egui_paint_jobs.clear();
+            for texture_id in self.egui_pending_free.drain(..) {
+                self.egui_renderer.free_texture(&texture_id);
+            }
+            return;
+        };
+
+        for (texture_id, image_delta) in &frame.textures_delta.set {
+            self.egui_renderer.update_texture(
+                &self.device,
+                &self.queue,
+                *texture_id,
+                image_delta,
+            );
+        }
+        self.egui_pending_free.extend(frame.textures_delta.free);
+        self.egui_paint_jobs = frame.paint_jobs;
+        self.egui_pixels_per_point = frame.pixels_per_point.max(0.25);
+        self.egui_active = true;
+    }
+
+    fn submit_egui(&mut self, frame_view: &wgpu::TextureView) {
+        if !self.egui_active || self.egui_paint_jobs.is_empty() {
+            return;
+        }
+
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width.max(1), self.config.height.max(1)],
+            pixels_per_point: self.egui_pixels_per_point,
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA egui overlay encoder"),
+            });
+        let callback_command_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &self.egui_paint_jobs,
+            &screen,
+        );
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA egui overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            self.egui_renderer
+                .render(&mut pass, &self.egui_paint_jobs, &screen);
+        }
+        let egui_command_buffer = encoder.finish();
+        self.queue
+            .submit(callback_command_buffers.into_iter().chain(std::iter::once(egui_command_buffer)));
+
+        for texture_id in self.egui_pending_free.drain(..) {
+            self.egui_renderer.free_texture(&texture_id);
+        }
+    }
+
+    fn menu_backdrop_requested(&self) -> bool {
+        !self.ui_state.video.skip_ui
+            && self.ui_state.loading.is_none()
+            && (self.ui_state.mode == ui::OverlayMode::Game
+                || (self.ui_state.mode == ui::OverlayMode::Video
+                    && self.ui_state.setup_selected != 1))
+    }
+
+    fn ensure_menu_backdrop_resources(&mut self) {
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+        if self
+            .menu_backdrop
+            .as_ref()
+            .is_some_and(|resources| resources.width == width && resources.height == height)
+        {
+            return;
+        }
+        println!("UI backdrop: compiling lazy menu blur/desaturation pipeline");
+        self.menu_backdrop = Some(create_menu_backdrop_resources(
+            &self.device,
+            &self.post_sampler,
+            width,
+            height,
+            self.config.format,
+        ));
+    }
+
+    fn submit_menu_backdrop(&self, frame_view: &wgpu::TextureView) {
+        let Some(backdrop) = &self.menu_backdrop else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA menu backdrop encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA menu Gaussian backdrop"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&backdrop.pipeline);
+            pass.set_bind_group(0, &backdrop.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// The renderer-drawn overlay (frame rate readout, perf graphs, surface
+    /// inspector, background bake progress) as its own submit.
+    ///
+    /// With a menu open this runs *after* egui so the readout stays on top of
+    /// the menu instead of being covered by it: these are status displays the
+    /// player is usually watching while changing a setting.
+    fn submit_ui_overlay(&self, frame_view: &wgpu::TextureView) {
+        if self.ui_vertex_count == 0 {
+            return;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA UI overlay encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA UI overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_pipeline);
+            pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
+            pass.draw(0..self.ui_vertex_count, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    fn rebuild_ui(&mut self) {
+        let trace_started = self.ui_trace.then(Instant::now);
+        if self.ui_state.video.skip_ui {
+            self.ui_vertex_count = 0;
+            if let Some(started) = trace_started {
+                println!(
+                    "[JKA UI] rebuild {:.3} ms, skipped by r_skipUi",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return;
+        }
+        let ui_vertices = ui::build_vertices(
+            &self.ui_state,
+            self.config.width,
+            self.config.height,
+            self.ui_small_font_metrics.as_ref(),
+            self.ui_splash_size,
+        );
+        let mut vertices = Vec::with_capacity(ui_vertices.len() + 768);
+        // Vignette by itself is just translucent black geometry in the existing
+        // overlay path. This avoids allocating/rendering a full-size scene texture
+        // and then sampling every pixel again merely to darken the screen edges.
+        // If gamma/LUT/full post is already active, that existing pass applies the
+        // exact shader vignette instead so we do not add another fullscreen step.
+        if self.vignette_enabled && !self.frame_plan.use_post {
+            append_vignette_vertices(&mut vertices);
+        }
+        vertices.extend(ui_vertices);
+        let max_vertices = UI_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
+        if vertices.len() > max_vertices {
+            vertices.truncate(max_vertices - (max_vertices % 3));
+        }
+        self.ui_vertex_count = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        if self.ui_vertex_count != 0 {
+            self.queue
+                .write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+        if let Some(started) = trace_started {
+            println!(
+                "[JKA UI] rebuild {:.3} ms, {} vertices ({} triangles)",
+                started.elapsed().as_secs_f64() * 1000.0,
+                self.ui_vertex_count,
+                self.ui_vertex_count / 3
+            );
+        }
+    }
+
+    fn static_ao_mode(&self) -> Option<StaticAoBakeMode> {
+        self.static_bsp_ao_enabled.then_some(StaticAoBakeMode::Lightmap)
+    }
+
+    fn desired_static_ao_key(&self) -> Option<StaticAoJobKey> {
+        let mode = self.static_ao_mode()?;
+        let source = self.world.as_ref()?.static_ao_source.as_ref()?;
+        Some(StaticAoJobKey {
+            map_hash: source.cache.map_hash,
+            mode,
+            samples: self.static_bsp_ao_samples,
+            scale: self.static_bsp_ao_resolution,
+            strength: self.static_bsp_ao_strength,
+            range: self.static_bsp_ao_range,
+            current_cell_only: self.static_bsp_ao_current_cell,
+        })
+    }
+
+    fn request_static_ao(&mut self, force_rebuild: bool) {
+        let Some(key) = self.desired_static_ao_key() else {
+            return;
+        };
+        if let Some(pending) = &self.static_ao_pending {
+            if pending.key != key || force_rebuild {
+                self.static_ao_deferred_force_rebuild |= force_rebuild;
+            }
+            return;
+        }
+        let Some(source) = self
+            .world
+            .as_ref()
+            .and_then(|world| world.static_ao_source.clone())
+        else {
+            println!("Static BSP AO: no BSP collision/cache source available for this map");
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
+        let camera_position = self.previous_camera_position;
+        println!(
+            "Static BSP AO: starting {} bake/cache lookup at {} samples / {}x / {}% strength / {:.2}x range{}",
+            key.mode.label(),
+            key.samples,
+            key.scale,
+            key.strength,
+            key.range as f32 / 100.0,
+            if force_rebuild { " (forced rebuild)" } else if key.current_cell_only { " (current cell only)" } else { "" }
+        );
+        match thread::Builder::new()
+            .name("jka-static-ao".into())
+            .spawn(move || {
+                let result = run_static_ao_worker(
+                    source,
+                    key,
+                    force_rebuild,
+                    &progress_tx,
+                    &update_tx,
+                    camera_position,
+                );
+                if result.is_err() {
+                    let _ = progress_tx.send((100, 100));
+                }
+                let _ = tx.send(result);
+            })
+        {
+            Ok(_) => {
+                self.static_ao_pending = Some(StaticAoPendingJob {
+                    key,
+                    rx,
+                    progress_rx,
+                    update_rx,
+                });
+            }
+            Err(error) => {
+                eprintln!("Static BSP AO: could not start worker thread: {error}");
+            }
+        }
+    }
+
+    fn poll_static_ao_progress(&mut self) -> Option<(u32, u32)> {
+        let pending = self.static_ao_pending.as_mut()?;
+        let mut latest = None;
+        while let Ok(progress) = pending.progress_rx.try_recv() {
+            latest = Some(progress);
+        }
+        latest
+    }
+
+    fn rebuild_world_surface_bind_groups(&self, world: &mut WorldGpu) {
+        let WorldGpu {
+            sky_average: _,
+            primary_skybox,
+            textures,
+            footprint_mark_textures,
+            lightmaps,
+            deluxemaps,
+            texture_clamp,
+            reflection_probes,
+            coarse_batches,
+            full_batches,
+            ..
+        } = world;
+        let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
+            footprint_mark_textures[slot]
+                .and_then(|index| textures.get(index))
+                .unwrap_or(&self.white)
+        });
+        for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
+            batch.bind_group = create_world_bind_group(
+                &self.device,
+                &self.surface_layout,
+                &self.white,
+                &self.missing,
+                &self.flat_normal,
+                &self.repeat_sampler,
+                &self.clamp_sampler,
+                &self.pbr_repeat_sampler,
+                &self.pbr_clamp_sampler,
+                &self.lightmap_sampler,
+                &self.sky_sampler,
+                textures,
+                lightmaps,
+                deluxemaps,
+                texture_clamp,
+                *primary_skybox,
+                &footprint_marks,
+                reflection_probes,
+                &batch.source,
+                &batch._material_buffer,
+                &batch._fog_buffer,
+                self.surface_deformation.buffer(),
+                self.surface_deformation.field_views(),
+                self.surface_deformation.field_sampler(),
+            );
+            batch.fast_bind_group = create_fast_world_bind_group(
+                &self.device,
+                &self.fast_surface_layout,
+                &self.white,
+                &self.missing,
+                &self.repeat_sampler,
+                &self.clamp_sampler,
+                &self.lightmap_sampler,
+                &self.sky_sampler,
+                textures,
+                lightmaps,
+                texture_clamp,
+                *primary_skybox,
+                &footprint_marks,
+                &batch.source,
+                &batch._material_buffer,
+                self.surface_deformation.buffer(),
+                self.surface_deformation.field_views(),
+                self.surface_deformation.field_sampler(),
+            );
+        }
+    }
+
+    fn restore_static_ao_lightmaps(&mut self) {
+        let Some(mut world) = self.world.take() else { return; };
+        if !world.static_ao_lightmap_active {
+            self.world = Some(world);
+            return;
+        }
+        world.lightmaps = world
+            .lightmap_base_data
+            .iter()
+            .map(|base| upload_texture(&self.device, &self.queue, base))
+            .collect();
+        self.rebuild_world_surface_bind_groups(&mut world);
+        world.static_ao_lightmap_active = false;
+        self.world = Some(world);
+    }
+
+    fn apply_static_vertex_ao(&mut self, values: &[u8]) -> Result<(), String> {
+        let Some(world) = self.world.as_mut() else {
+            return Err("world changed before AO result could be applied".into());
+        };
+        let Some(source) = world.static_ao_source.as_ref() else {
+            return Err("map has no static AO source".into());
+        };
+        if values.len() != source.vertices.len()
+            || world.static_ao_source_to_gpu.len() != source.vertices.len()
+        {
+            return Err("vertex AO cache does not match current world geometry".into());
+        }
+        for (source_index, &visibility) in values.iter().enumerate() {
+            let gpu_index = world.static_ao_source_to_gpu[source_index];
+            if gpu_index == u32::MAX {
+                continue;
+            }
+            if let Some(vertex) = world.static_ao_gpu_vertices.get_mut(gpu_index as usize) {
+                vertex.alpha_cutoff = f32::from(visibility) / 255.0;
+            }
+        }
+        self.queue.write_buffer(
+            &world.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&world.static_ao_gpu_vertices),
+        );
+        Ok(())
+    }
+
+    fn apply_static_lightmap_ao(&mut self, images: Vec<StaticAoBakedLightmap>) -> Result<(), String> {
+        let Some(mut world) = self.world.take() else {
+            return Err("world changed before AO result could be applied".into());
+        };
+        let result = (|| {
+            if images.len() != world.lightmap_base_data.len() {
+                return Err("lightmap AO cache does not match current lightmap set".into());
+            }
+            // The existing HQ lightmap-AO cache/compositor is intentionally an
+            // 8-bit path. Replacing an HDR/FP16 lightmap with that cache would
+            // silently destroy the extra lighting range that r_floatLightmap is
+            // meant to preserve. Keep the rich lightmaps intact instead of
+            // quantizing them; vertex AO remains available with float lightmaps.
+            if world
+                .lightmap_base_data
+                .iter()
+                .any(|lightmap| lightmap.rgba16f.is_some())
+            {
+                return Err(
+                    "HQ static lightmap AO is not applied to FP16/HDR lightmaps; use vertex AO or disable r_floatLightmap"
+                        .into(),
+                );
+            }
+            let mut lightmaps = Vec::with_capacity(images.len());
+            for image in images {
+                let data = TextureData {
+                    label: image.label,
+                    source: None,
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.rgba,
+                    rgba16f: None,
+                    mip_level_count: 1,
+                    clamp: image.clamp,
+                    srgb: image.srgb,
+                };
+                lightmaps.push(upload_texture(&self.device, &self.queue, &data));
+            }
+            world.lightmaps = lightmaps;
+            self.rebuild_world_surface_bind_groups(&mut world);
+            world.static_ao_lightmap_active = true;
+            Ok(())
+        })();
+        self.world = Some(world);
+        result
+    }
+
+    fn apply_static_lightmap_tile(
+        &mut self,
+        texture: usize,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), String> {
+        let Some(world) = self.world.as_ref() else {
+            return Err("world changed before AO tile could be applied".into());
+        };
+        if !world.static_ao_lightmap_active {
+            return Err("progressive AO lightmap was not initialized".into());
+        }
+        let Some(lightmap) = world.lightmaps.get(texture) else {
+            return Err("AO tile lightmap index is out of range".into());
+        };
+        if rgba.len() != width as usize * height as usize * 4 {
+            return Err("AO tile byte count is invalid".into());
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &lightmap._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn poll_static_ao_updates(&mut self) {
+        let mut updates = Vec::new();
+        if let Some(pending) = self.static_ao_pending.as_mut() {
+            while let Ok(update) = pending.update_rx.try_recv() {
+                updates.push(update);
+            }
+        }
+        let desired = self.desired_static_ao_key();
+        for update in updates {
+            let result = match update {
+                StaticAoWorkerUpdate::InitLightmaps { key, images } if desired == Some(key) => {
+                    self.apply_static_lightmap_ao(images)
+                }
+                StaticAoWorkerUpdate::VertexAo { key, values } if desired == Some(key) => {
+                    self.apply_static_vertex_ao(&values)
+                }
+                StaticAoWorkerUpdate::LightmapTile {
+                    key,
+                    texture,
+                    x,
+                    y,
+                    width,
+                    height,
+                    rgba,
+                } if desired == Some(key) => self.apply_static_lightmap_tile(
+                    texture, x, y, width, height, &rgba,
+                ),
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                eprintln!("Static BSP AO progressive update: {error}");
+            }
+        }
+    }
+
+    fn poll_static_ao_worker(&mut self) {
+        let outcome = self.static_ao_pending.as_ref().and_then(|pending| {
+            match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("static AO worker disconnected".into())),
+            }
+        });
+        let Some(outcome) = outcome else { return; };
+        let finished_key = self.static_ao_pending.take().map(|job| job.key);
+        let desired = self.desired_static_ao_key();
+        match outcome {
+            Ok(result) if desired == Some(result.key) => {
+                let StaticAoBakeData::Lightmap {
+                    vertex_values,
+                    images,
+                } = result.data;
+                let applied = self
+                    .apply_static_vertex_ao(&vertex_values)
+                    .and_then(|()| self.apply_static_lightmap_ao(images));
+                match applied {
+                    Ok(()) => println!(
+                        "Static BSP AO: {} {} at {} samples / {}x / {}% / {:.2}x range in {:.1} ms",
+                        if result.cache_hit { "cache hit" } else { "bake complete" },
+                        result.key.mode.label(),
+                        result.key.samples,
+                        result.key.scale,
+                        result.key.strength,
+                        result.key.range as f32 / 100.0,
+                        result.elapsed_ms
+                    ),
+                    Err(error) => eprintln!("Static BSP AO: could not apply result: {error}"),
+                }
+            }
+            Ok(result) => println!(
+                "Static BSP AO: discarded stale {} {}-sample {}x / {}% / {:.2}x range result",
+                result.key.mode.label(),
+                result.key.samples,
+                result.key.scale,
+                result.key.strength,
+                result.key.range as f32 / 100.0
+            ),
+            Err(error) => eprintln!("Static BSP AO worker: {error}"),
+        }
+
+        let force = std::mem::take(&mut self.static_ao_deferred_force_rebuild);
+        if self.desired_static_ao_key().is_some()
+            && (desired != finished_key || force)
+        {
+            self.request_static_ao(force);
+        }
+    }
+
+    fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
+        // Start the pure-CPU weather heightfield solve immediately so it overlaps
+        // GPU/world upload. First rain enable should normally only upload the
+        // already-computed field instead of stalling the render thread.
+        let weather_occlusion = map.weather_occlusion.take();
+        self.weather.rain.start_map_occlusion(weather_occlusion);
+        self.inspector_vertex_range = None;
+        self.surface_deformation.clear(&self.queue);
+        let footprint_mask = map
+            .footprint_mark_textures
+            .iter()
+            .enumerate()
+            .fold(0u32, |mask, (index, texture)| {
+                mask | if texture.is_some() { 1u32 << index } else { 0 }
+            });
+        self.surface_deformation.set_legacy_mark_info(
+            &self.queue,
+            footprint_mask,
+            map.footprint_mark_blend_modes,
+        );
+        self.history_valid = false;
+        self.camera_history_valid = false;
+        self.dof_focus_valid = false;
+        self.previous_frame_time = 0.0;
+        self.previous_unjittered_view_proj = Mat4::IDENTITY;
+        self.previous_cloud_view_proj = Mat4::IDENTITY;
+        self.cloud_history_valid = false;
+        self.cloud_history_read_index = 0;
+        self.cloud_temporal_frame_index = 0;
+        self.taa_frame_index = 0;
+        self.history_read_index = 0;
+        self.ssao_history_valid = false;
+        self.ssao_history_read_index = 0;
+        self.ssr_history_valid = false;
+        self.ssr_history_read_index = 0;
+        self.ssr_frame_index = 0;
+        self.weather.fog.install_map(
+            map.global_fog,
+            map.batches.iter().map(|batch| {
+                (
+                    batch.fog,
+                    u64::from(batch.vertices.end.saturating_sub(batch.vertices.start)),
+                )
+            }),
+        );
+        let initial_shader_variant = self.world_shader_variant_key();
+        let (world_pipeline_layout, world_shader) = match initial_shader_variant.family() {
+            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+        };
+        let (mut world, mut upload_timings) = build_world(
+            &self.device,
+            &self.queue,
+            &self.surface_layout,
+            &self.fast_surface_layout,
+            world_pipeline_layout,
+            world_shader,
+            initial_shader_variant,
+            &self.fast_world_pipeline_layout,
+            &self.fast_world_shader,
+            self.scene_format(),
+            self.msaa_samples,
+            initial_shader_variant.legacy_fog,
+            &self.white,
+            &self.missing,
+            &self.flat_normal,
+            &self.repeat_sampler,
+            &self.clamp_sampler,
+            &self.pbr_repeat_sampler,
+            &self.pbr_clamp_sampler,
+            &self.lightmap_sampler,
+            &self.sky_sampler,
+            &self.cluster_compute_layout,
+            &self.lighting_layout,
+            &self.lighting_layout_lean,
+            &self.shadow_caster_layout,
+            &self.cull_debug_layout,
+            &self.lighting_settings_buffer,
+            &self.pbr_settings_buffer,
+            self.surface_deformation.buffer(),
+            self.surface_deformation.field_views(),
+            self.surface_deformation.field_sampler(),
+            &self.grass_renderer,
+            &self.surface_sprite_effect_renderer,
+            self.ocean_enabled,
+            self.pbr_enabled
+                && PBR_PROFILE_COMPANION_COMPRESSION
+                && self.bc_compression_supported,
+            map,
+        );
+        world.cull_bind_group = Some(create_gpu_cull_bind_group(
+            &self.device,
+            &self.gpu_cull_layout,
+            &world.cull_records_buffer,
+            &world.indirect_buffer,
+            &self.targets.linear_depth_view,
+            &self.gpu_cull_settings_buffer,
+            &world.active_cull_indices_buffer,
+            &world.compact_indirect_buffer,
+            &world.compact_count_buffer,
+            &world.cull_debug_reason_buffer,
+            &world.cull_debug_count_buffer,
+        ));
+        world.froxel_bind_group = Some(create_world_froxel_bind_group(
+            &self.device,
+            &self.weather.fog.resources.layout,
+            &self.weather.fog.resources.uniform_buffer,
+            &self.weather.fog.resources.buffer,
+            &self.shadow_resources._array_view,
+            &self.shadow_resources.sky_array_view,
+            &world.light_buffer,
+            &world._cluster_buffer,
+            &self.lighting_settings_buffer,
+            &world.local_shadows.cube_view,
+            &world.local_shadows.sampler,
+            self.weather.rain.collision_view(),
+            &self.weather.rain.gpu.wind_noise_view,
+            &self.weather.rain.gpu.wind_noise_sampler,
+        ));
+        self.world = Some(world);
+        self.request_static_ao(false);
+        let sun = self.active_sun();
+        self.grass_renderer.update_environment(
+            &self.queue,
+            sun,
+            self.cloud_wind_speed,
+            self.cloud_wind_direction,
+            self.pbr_enabled,
+        );
+        // The CPU solve is already running on the weather worker. Rain and the
+        // cloud terrain-interaction experiment share this same heightfield, so
+        // either feature may request the GPU upload during the map switch.
+        if self.weather.rain.enabled || self.cloud_terrain_interaction {
+            self.ensure_weather_occlusion();
+        }
+        self.rebuild_weather_surface_receiver_bind_group();
+        self.update_weather_surface_uniform();
+        self.weather.fog.write_legacy_control(&self.queue);
+        self.rebuild_planar_reflection_resources();
+        self.rebuild_frame_plan();
+        // Loading the world may discover authored/environment planar reflectors,
+        // which changes the specialized BSP feature key after build_world had to
+        // create its first variant. Activate (or lazily build) the final key now.
+        self.activate_world_pipeline_variant();
+        let finalize_started = Instant::now();
+        self.update_lighting_settings();
+        upload_timings.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings
+    }
+
+    fn unload_map(&mut self) {
+        // Returning to the front end is a real world teardown, not just another
+        // overlay over the last gameplay frame. Drop all map-owned GPU state so
+        // the renderer returns to the same world-less state used at startup.
+        self.world = None;
+        self.inspector_vertex_range = None;
+        self.surface_deformation.clear(&self.queue);
+        self.weather.rain.start_map_occlusion(None);
+        self.weather
+            .fog
+            .install_map(None, std::iter::empty::<([f32; 4], u64)>());
+        self.weather.fog.write_legacy_control(&self.queue);
+
+        self.history_valid = false;
+        self.camera_history_valid = false;
+        self.dof_focus_valid = false;
+        self.previous_frame_time = 0.0;
+        self.previous_unjittered_view_proj = Mat4::IDENTITY;
+        self.previous_cloud_view_proj = Mat4::IDENTITY;
+        self.cloud_history_valid = false;
+        self.cloud_history_read_index = 0;
+        self.cloud_temporal_frame_index = 0;
+        self.taa_frame_index = 0;
+        self.history_read_index = 0;
+        self.ssao_history_valid = false;
+        self.ssao_history_read_index = 0;
+        self.ssr_history_valid = false;
+        self.ssr_history_read_index = 0;
+        self.ssr_frame_index = 0;
+
+        self.rebuild_planar_reflection_resources();
+        self.rebuild_weather_surface_receiver_bind_group();
+        self.update_weather_surface_uniform();
+        self.rebuild_frame_plan();
+    }
+
+    fn rebuild_planar_reflection_resources(&mut self) {
+        let planar_budget = self.reflection_quality.planar_slot_budget().min(PLANAR_REFLECTION_SLOTS);
+        let active = planar_budget > 0 && self.world.as_ref().is_some_and(|world| {
+            world.planar_reflectors.iter().any(|reflector| {
+                planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
+            })
+        });
+        // Promoted tcGen-environment surfaces are intentionally broad/rough
+        // reflections, so an environment-only pool can be rendered at quarter
+        // resolution. If a real authored mirror is active, keep the pool at
+        // half resolution so the authored mirror remains crisp.
+        let has_authored = self.world.as_ref().is_some_and(|world| {
+            world.planar_reflectors.iter().any(|reflector| {
+                reflector.kind == PlanarReflectorKind::Authored
+                    && planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
+            })
+        });
+        let scale_divisor = match self.reflection_quality {
+            ReflectionQuality::Ultra => PLANAR_AUTHORED_SCALE_DIVISOR,
+            ReflectionQuality::High if has_authored => PLANAR_AUTHORED_SCALE_DIVISOR,
+            ReflectionQuality::High => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
+            _ => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
+        };
+        let (width, height) = if active {
+            (
+                self.config.width.max(1).div_ceil(scale_divisor),
+                self.config.height.max(1).div_ceil(scale_divisor),
+            )
+        } else {
+            (1, 1)
+        };
+        self.planar_reflection = create_planar_reflection_resources(
+            &self.device,
+            &self.planar_reflection_layout,
+            self.scene_format(),
+            width,
+            height,
+            active,
+        );
+        self.planar_slot_history = [None; PLANAR_REFLECTION_SLOTS];
+        self.last_planar_debug_selection = None;
+        if active {
+            let (authored, environment) = self.world.as_ref().map_or((0, 0), |world| {
+                world
+                    .planar_reflectors
+                    .iter()
+                    .fold((0, 0), |counts, reflector| match reflector.kind {
+                        PlanarReflectorKind::Authored => (counts.0 + 1, counts.1),
+                        PlanarReflectorKind::Environment => (counts.0, counts.1 + 1),
+                    })
+            });
+            println!(
+                "Planar reflections: {}x{} reflected view, {} slots, mode={} (authored={}, planar tcGen environment={})",
+                width,
+                height,
+                planar_budget,
+                self.planar_reflection_mode.label(),
+                authored,
+                environment
+            );
+        }
+    }
+
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        self.size = size;
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(&self.device, &self.config);
+        self.targets = create_targets(
+            &self.device,
+            size.width,
+            size.height,
+            self.scene_format(),
+            self.msaa_samples,
+            self.bloom_enabled || self.halation_enabled,
+            self.depth_of_field_strength > 0.001,
+            self.ssao_enabled,
+            self.ssr_enabled,
+            self.cloud_render_resolution,
+        );
+        self.rebuild_planar_reflection_resources();
+        self.rebuild_post_bind_group();
+        self.rebuild_rain_haze_mask_bind_group();
+        if let Some(target) = &mut self.smaa_target {
+            target.resize(&self.device, size.width.max(1), size.height.max(1));
+        }
+        self.rebuild_gpu_visibility_resources();
+        self.history_valid = false;
+        self.camera_history_valid = false;
+        self.dof_focus_valid = false;
+        self.previous_frame_time = 0.0;
+        self.previous_unjittered_view_proj = Mat4::IDENTITY;
+        self.previous_cloud_view_proj = Mat4::IDENTITY;
+        self.cloud_history_valid = false;
+        self.cloud_history_read_index = 0;
+        self.cloud_temporal_frame_index = 0;
+        self.taa_frame_index = 0;
+        self.history_read_index = 0;
+        self.ssao_history_valid = false;
+        self.ssao_history_read_index = 0;
+        self.ssr_history_valid = false;
+        self.ssr_history_read_index = 0;
+        self.ssr_frame_index = 0;
+        self.update_post_uniform();
+        self.update_lighting_settings();
+        self.rebuild_ui();
+    }
+
+    fn reconfigure(&mut self) {
+        if self.size.width == 0 || self.size.height == 0 {
+            return;
+        }
+        self.surface.configure(&self.device, &self.config);
+        self.targets = create_targets(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            self.scene_format(),
+            self.msaa_samples,
+            self.bloom_enabled || self.halation_enabled,
+            self.depth_of_field_strength > 0.001,
+            self.ssao_enabled,
+            self.ssr_enabled,
+            self.cloud_render_resolution,
+        );
+        self.rebuild_planar_reflection_resources();
+        self.rebuild_post_bind_group();
+        self.rebuild_rain_haze_mask_bind_group();
+        if let Some(target) = &mut self.smaa_target {
+            target.resize(
+                &self.device,
+                self.config.width.max(1),
+                self.config.height.max(1),
+            );
+        }
+        self.rebuild_gpu_visibility_resources();
+        self.history_valid = false;
+        self.camera_history_valid = false;
+        self.dof_focus_valid = false;
+        self.previous_frame_time = 0.0;
+        self.previous_unjittered_view_proj = Mat4::IDENTITY;
+        self.previous_cloud_view_proj = Mat4::IDENTITY;
+        self.cloud_history_valid = false;
+        self.cloud_history_read_index = 0;
+        self.cloud_temporal_frame_index = 0;
+        self.taa_frame_index = 0;
+        self.history_read_index = 0;
+        self.ssao_history_valid = false;
+        self.ssao_history_read_index = 0;
+        self.ssr_history_valid = false;
+        self.ssr_history_read_index = 0;
+        self.ssr_frame_index = 0;
+        self.update_post_uniform();
+        self.update_lighting_settings();
+    }
+
+    fn set_vsync(&mut self, vsync: VsyncMode) {
+        if self.vsync == vsync {
+            return;
+        }
+        self.vsync = vsync;
+        self.config.present_mode = present_mode_for_vsync(vsync, &self.present_modes);
+        self.reconfigure();
+        println!(
+            "VSync: {} -> present mode {:?}",
+            vsync.label(),
+            self.config.present_mode
+        );
+    }
+
+    fn set_msaa(&mut self, samples: u32) {
+        if self.msaa_samples == samples || !self.supported_msaa.contains(&samples) {
+            return;
+        }
+        let samples = if self.scene_format() == wgpu::TextureFormat::Rgba16Float
+            && !self.hdr_supported_msaa.contains(&samples)
+        {
+            1
+        } else {
+            samples
+        };
+        self.msaa_samples = samples;
+        self.request_scene_rebuild();
+    }
+
+    fn set_texture_filter(&mut self, filter: TextureFilter) {
+        if self.texture_filter == filter {
+            return;
+        }
+        self.texture_filter = filter;
+        self.repeat_sampler = create_texture_sampler(&self.device, false, filter);
+        self.clamp_sampler = create_texture_sampler(&self.device, true, filter);
+        if let Some(world) = &mut self.world {
+            rebuild_world_bind_groups(
+                &self.device,
+                &self.surface_layout,
+                &self.fast_surface_layout,
+                &self.white,
+                &self.missing,
+                &self.flat_normal,
+                &self.repeat_sampler,
+                &self.clamp_sampler,
+                &self.pbr_repeat_sampler,
+                &self.pbr_clamp_sampler,
+                &self.lightmap_sampler,
+                &self.sky_sampler,
+                self.surface_deformation.buffer(),
+                self.surface_deformation.field_views(),
+                self.surface_deformation.field_sampler(),
+                world,
+            );
+            for effect in &mut world.surface_sprite_effects {
+                if let Some(texture) = world.textures.get(effect.source.texture) {
+                    let sampler = if effect.source.clamp {
+                        &self.clamp_sampler
+                    } else {
+                        &self.repeat_sampler
+                    };
+                    effect.bind_group = self
+                        .surface_sprite_effect_renderer
+                        .create_texture_bind_group(&self.device, &texture.view, sampler);
+                }
+            }
+        }
+    }
+
+    fn set_wireframe(&mut self, enabled: bool) {
+        self.wireframe_enabled = enabled && self.wireframe_supported;
+    }
+
+    fn set_pvs_mode(&mut self, mode: PvsMode) {
+        self.pvs_mode = mode;
+    }
+
+    fn set_gamma(&mut self, gamma: f32) {
+        let gamma = gamma.clamp(0.5, 3.0);
+        if (self.gamma - gamma).abs() < f32::EPSILON {
+            return;
+        }
+        self.gamma = gamma;
+        self.queue.write_buffer(
+            &self.gamma_post_buffer,
+            0,
+            bytemuck::bytes_of(&GammaPostUniform {
+                values: [
+                    gamma,
+                    if self.color_lut_preset != ColorLutPreset::Off {
+                        self.color_lut_strength
+                    } else {
+                        0.0
+                    },
+                    if self.vignette_enabled { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+            }),
+        );
+        self.rebuild_frame_plan();
+        self.update_post_uniform();
+        self.rebuild_ui();
+    }
+
+    fn ensure_cloud_noise_resources(&mut self) -> bool {
+        if self.cloud_noise_resources.is_some() {
+            return false;
+        }
+        println!(
+            "Volumetric clouds: baking {}^2 Perlin-Worley weather map + {}^3 Worley detail volume",
+            cloud_noise::WEATHER_SIZE,
+            cloud_noise::DETAIL_SIZE
+        );
+        self.cloud_noise_resources = Some(create_cloud_noise_resources(&self.device, &self.queue));
+        true
+    }
+
+    fn rebuild_weather_surface_receiver_bind_group(&mut self) {
+        self.shadow_resources.receiver_bind_group = create_shadow_receiver_bind_group(
+            &self.device,
+            &self.shadow_receiver_layout,
+            &self.shadow_resources._array_view,
+            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+                &self.shadow_resources.bevy_sampler
+            } else {
+                &self.shadow_resources.legacy_sampler
+            },
+            &self.shadow_resources.sky_array_view,
+            &self.shadow_resources.receiver_buffer,
+            self.weather.fog.legacy_control_buffer(),
+            &self.shadow_resources.weather_height_view,
+            &self.shadow_resources.weather_sampler,
+            &self.shadow_resources.weather_surface_buffer,
+        );
+    }
+
+    fn advance_surface_wetness(&mut self, frame_time: f32) -> bool {
+        self.weather.rain.advance_surface_wetness(frame_time)
+    }
+
+    fn update_weather_surface_uniform(&self) {
+        self.weather.rain.write_surface_uniform(
+            &self.queue,
+            &self.shadow_resources.weather_surface_buffer,
+        );
+    }
+
+    fn ensure_weather_occlusion(&mut self) {
+        let Some(weather_height_view) = self.weather.rain.ensure_occlusion(&self.device, &self.queue) else {
+            return;
+        };
+        self.shadow_resources.weather_height_view = weather_height_view;
+        self.rebuild_weather_surface_receiver_bind_group();
+        self.rebuild_post_bind_group();
+        self.rebuild_rain_haze_mask_bind_group();
+        if let Some(world) = self.world.as_mut() {
+            world.froxel_bind_group = Some(create_world_froxel_bind_group(
+                &self.device,
+                &self.weather.fog.resources.layout,
+                &self.weather.fog.resources.uniform_buffer,
+                &self.weather.fog.resources.buffer,
+                &self.shadow_resources._array_view,
+                &self.shadow_resources.sky_array_view,
+                &world.light_buffer,
+                &world._cluster_buffer,
+                &self.lighting_settings_buffer,
+                &world.local_shadows.cube_view,
+                &world.local_shadows.sampler,
+                self.weather.rain.collision_view(),
+                &self.weather.rain.gpu.wind_noise_view,
+                &self.weather.rain.gpu.wind_noise_sampler,
+            ));
+        }
+    }
+
+    fn prepare_rain_frame(&mut self, camera: &Camera, frame_time: f32) {
+        self.ensure_weather_occlusion();
+        let sun = self.active_sun();
+        self.weather.rain.prepare_frame(
+            &self.queue,
+            camera,
+            frame_time,
+            self.previous_frame_time,
+            self.config.width,
+            self.config.height,
+            self.cloud_wind_speed,
+            self.cloud_wind_direction,
+            sun.color,
+            sun.intensity,
+        );
+    }
+
+    fn set_post_effects(&mut self, effects: PostEffects) {
+        let old_scene_format = self.scene_format();
+        let old_auto_exposure_effective =
+            self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
+        let old_bloom_pyramid = self.bloom_enabled || self.halation_enabled;
+        let old_ssao_enabled = self.ssao_enabled;
+        let old_static_bsp_ao_enabled = self.static_bsp_ao_enabled;
+        let old_ssr_enabled = self.ssr_enabled;
+        let old_reflection_quality = self.reflection_quality;
+        let old_reflection_debug = self.reflection_debug_enabled;
+        let old_dof_enabled = self.depth_of_field_strength > 0.001;
+        let old_motion_blur = self.motion_blur_strength;
+        let desired_taa = effects.taa;
+        let desired_smaa = effects.smaa && !desired_taa;
+        let desired_fxaa = effects.fxaa && !desired_taa && !desired_smaa;
+        let taa_changed = self.taa_enabled != desired_taa;
+        let smaa_changed = self.smaa_enabled != desired_smaa;
+        let lut_changed = self.color_lut_preset != effects.color_lut;
+        let old_legacy_fog_effective = self.weather.fog.legacy_effective();
+        let rain_history_changed =
+            self.weather.rain.enabled != effects.rain || self.weather.rain.intensity != effects.rain_intensity;
+        let cloud_resolution_changed =
+            self.cloud_render_resolution != effects.cloud_render_resolution;
+        let sun_changed = self.sun_override != effects.sun_override
+            || self.sun_visibility != effects.sun_visibility
+            || (self.sun_yaw - effects.sun_yaw).abs() > 0.0001
+            || (self.sun_pitch - effects.sun_pitch).abs() > 0.0001
+            || (self.sun_intensity - effects.sun_intensity).abs() > 0.0001
+            || self.sun_color != effects.sun_color;
+        let cloud_history_changed = sun_changed
+            || self.clouds_enabled != effects.clouds
+            || self.cloud_type != effects.cloud_type
+            || (self.cloud_quality - effects.cloud_quality).abs() > 0.0001
+            || (self.cloud_coverage - effects.cloud_coverage).abs() > 0.0001
+            || (self.cloud_height - effects.cloud_height).abs() > 0.01
+            || (self.cloud_thickness - effects.cloud_thickness).abs() > 0.01
+            || (self.cloud_wind_speed - effects.cloud_wind_speed).abs() > 0.001
+            || (self.cloud_wind_direction - effects.cloud_wind_direction).abs() > 0.001
+            || cloud_resolution_changed
+            || self.cloud_temporal_enabled != effects.cloud_temporal
+            || self.cloud_temporal_depth_fix != effects.cloud_temporal_depth_fix
+            || (self.cloud_shear - effects.cloud_shear).abs() > 0.0001
+            || (self.cloud_base_variation - effects.cloud_base_variation).abs() > 0.0001
+            || self.cloud_wind_variation != effects.cloud_wind_variation
+            || self.cloud_shape_evolution != effects.cloud_shape_evolution
+            || self.cloud_terrain_interaction != effects.cloud_terrain_interaction
+            || self.cloud_empty_skip != effects.cloud_empty_skip
+            || (self.cloud_aerial - effects.cloud_aerial).abs() > 0.0001
+            || self.cloud_sky_ambient_enabled != effects.cloud_sky_ambient
+            || (self.cloud_history_blend - effects.cloud_history_blend).abs() > 0.0001
+            || (self.cloud_motion_reject - effects.cloud_motion_reject).abs() > 0.0001
+            || self.cloud_history_depth_reject != effects.cloud_history_depth_reject
+            || (self.cloud_thickness_variation - effects.cloud_thickness_variation).abs() > 0.0001
+            || (self.cloud_size - effects.cloud_size).abs() > 0.0001;
+        self.hdr_enabled = effects.hdr;
+        self.tone_mapping_enabled = effects.tone_mapping;
+        self.auto_exposure_enabled = effects.auto_exposure;
+        let auto_exposure_effective =
+            self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
+        if old_auto_exposure_effective != auto_exposure_effective || !auto_exposure_effective {
+            self.queue.write_buffer(
+                &self.auto_exposure_state_buffer,
+                0,
+                bytemuck::bytes_of(&AutoExposureState {
+                    exposure_ev: 0.0,
+                    average_luminance: 1.0,
+                    target_ev: 0.0,
+                    reserved: 0.0,
+                }),
+            );
+        }
+        self.bloom_enabled = effects.bloom;
+        self.halation_enabled = effects.halation;
+        self.ssao_enabled = effects.ssao;
+        self.static_bsp_ao_enabled = effects.static_bsp_ao;
+        self.static_bsp_ao_lightmap = true;
+        let old_bake_key = (
+            self.static_bsp_ao_samples,
+            self.static_bsp_ao_resolution,
+            self.static_bsp_ao_strength,
+            self.static_bsp_ao_range,
+            self.static_bsp_ao_current_cell,
+        );
+        self.static_bsp_ao_samples = effects.static_bsp_ao_samples;
+        self.static_bsp_ao_resolution = effects.static_bsp_ao_resolution;
+        self.static_bsp_ao_strength = effects.static_bsp_ao_strength;
+        self.static_bsp_ao_range = effects.static_bsp_ao_range;
+        self.static_bsp_ao_current_cell = effects.static_bsp_ao_current_cell;
+        let bake_quality_changed = old_bake_key != (
+            self.static_bsp_ao_samples,
+            self.static_bsp_ao_resolution,
+            self.static_bsp_ao_strength,
+            self.static_bsp_ao_range,
+            self.static_bsp_ao_current_cell,
+        );
+        if old_static_bsp_ao_enabled && !self.static_bsp_ao_enabled {
+            self.restore_static_ao_lightmaps();
+        }
+        if old_static_bsp_ao_enabled != self.static_bsp_ao_enabled {
+            self.request_static_ao(false);
+        } else if self.static_bsp_ao_enabled && bake_quality_changed {
+            self.request_static_ao(true);
+        }
+        self.taa_enabled = desired_taa;
+        self.smaa_enabled = desired_smaa;
+        self.fxaa_enabled = desired_fxaa;
+        if self.smaa_enabled && self.smaa_target.is_none() {
+            self.smaa_target = Some(smaa::SmaaTarget::new(
+                &self.device,
+                &self.queue,
+                self.config.width.max(1),
+                self.config.height.max(1),
+                self.config.format,
+                smaa::SmaaMode::Smaa1X,
+            ));
+        }
+        self.contact_shadows_enabled = effects.contact_shadows;
+        self.weather.fog.mode = effects.fog_mode;
+        self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
+        self.sun_override = effects.sun_override;
+        self.sun_yaw = effects.sun_yaw.rem_euclid(360.0);
+        self.sun_pitch = effects.sun_pitch.clamp(-90.0, 90.0);
+        self.sun_intensity = effects.sun_intensity.max(0.0);
+        self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
+        self.sun_visibility = effects.sun_visibility;
+        self.clouds_enabled = effects.clouds;
+        self.cloud_type = effects.cloud_type;
+        self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);
+        self.cloud_coverage = effects.cloud_coverage.clamp(0.0, 1.0);
+        self.cloud_height = effects
+            .cloud_height
+            .clamp(ui::CLOUD_HEIGHT_MIN, ui::CLOUD_HEIGHT_MAX);
+        self.cloud_thickness = effects
+            .cloud_thickness
+            .clamp(ui::CLOUD_THICKNESS_MIN, ui::CLOUD_THICKNESS_MAX);
+        self.cloud_wind_speed = effects
+            .cloud_wind_speed
+            .clamp(0.0, ui::CLOUD_WIND_SPEED_MAX);
+        self.cloud_wind_direction = effects.cloud_wind_direction.rem_euclid(360.0);
+        let sun = self.active_sun();
+        self.grass_renderer.update_environment(
+            &self.queue,
+            sun,
+            self.cloud_wind_speed,
+            self.cloud_wind_direction,
+            self.pbr_enabled,
+        );
+        self.cloud_shadows_enabled = effects.cloud_shadows;
+        self.cloud_render_resolution = effects.cloud_render_resolution;
+        self.cloud_temporal_enabled = effects.cloud_temporal;
+        self.cloud_temporal_depth_fix = effects.cloud_temporal_depth_fix;
+        self.cloud_shear = effects.cloud_shear;
+        self.cloud_base_variation = effects.cloud_base_variation;
+        self.cloud_wind_variation = effects.cloud_wind_variation;
+        self.cloud_shape_evolution = effects.cloud_shape_evolution;
+        self.cloud_terrain_interaction = effects.cloud_terrain_interaction;
+        self.cloud_empty_skip = effects.cloud_empty_skip;
+        self.cloud_aerial = effects.cloud_aerial;
+        if self.cloud_terrain_interaction {
+            // Terrain interaction consumes the shared weather heightfield even
+            // when rain itself is disabled. Previously this resource was only
+            // uploaded by the rain path, leaving the cloud gate inert on dry maps.
+            self.ensure_weather_occlusion();
+        }
+        self.cloud_sky_ambient_enabled = effects.cloud_sky_ambient;
+        self.cloud_history_blend = effects.cloud_history_blend;
+        self.cloud_motion_reject = effects.cloud_motion_reject;
+        self.cloud_history_depth_reject = effects.cloud_history_depth_reject;
+        self.cloud_thickness_variation = effects.cloud_thickness_variation;
+        self.cloud_size = effects.cloud_size;
+        self.weather.rain.enabled = effects.rain;
+        self.weather.rain.intensity = effects.rain_intensity;
+        if cloud_history_changed || !self.clouds_enabled {
+            self.cloud_history_valid = false;
+            self.cloud_history_read_index = 0;
+            self.cloud_temporal_frame_index = 0;
+        }
+        let cloud_resources_changed = self.clouds_enabled && self.ensure_cloud_noise_resources();
+        let new_legacy_fog_effective = self.weather.fog.legacy_effective();
+        let legacy_fog_pipeline_changed = old_legacy_fog_effective != new_legacy_fog_effective;
+        self.weather.fog.write_legacy_control(&self.queue);
+        self.reflection_quality = effects.reflection_quality;
+        self.reflection_debug_enabled = effects.reflection_debug;
+        self.ssr_enabled = self.reflection_quality.ssr_enabled();
+        self.planar_reflection_mode = if self.reflection_quality.planar_slot_budget() > 0 {
+            PlanarReflectionMode::Environment
+        } else {
+            PlanarReflectionMode::Off
+        };
+        self.chromatic_aberration_strength = effects.chromatic_aberration.max(0.0);
+        self.vignette_enabled = effects.vignette;
+        self.film_grain_strength = effects.film_grain_strength.clamp(0.0, 1.0);
+        self.motion_blur_strength = effects.motion_blur_strength.clamp(0.0, 1.0);
+        self.depth_of_field_strength = effects.depth_of_field_strength.clamp(0.0, 1.0);
+        self.dof_quality = effects.dof_quality;
+        if (old_motion_blur - self.motion_blur_strength).abs() > 0.001 {
+            self.motion_blur_runtime_scale = 0.0;
+        }
+        if old_dof_enabled != (self.depth_of_field_strength > 0.001) {
+            self.dof_focus_valid = false;
+        }
+        self.color_lut_strength = effects.color_lut_strength.clamp(0.0, 1.0);
+        if lut_changed {
+            let (texture, view) =
+                create_color_lut_texture(&self.device, &self.queue, effects.color_lut);
+            self._color_lut_texture = texture;
+            self.color_lut_view = view;
+            self.color_lut_preset = effects.color_lut;
+            println!(
+                "Color LUT: {} (OxiMedia 33^3 bake)",
+                self.color_lut_preset.label()
+            );
+        } else {
+            self.color_lut_preset = effects.color_lut;
+        }
+        self.queue.write_buffer(
+            &self.gamma_post_buffer,
+            0,
+            bytemuck::bytes_of(&GammaPostUniform {
+                values: [
+                    self.gamma,
+                    if self.color_lut_preset != ColorLutPreset::Off {
+                        self.color_lut_strength
+                    } else {
+                        0.0
+                    },
+                    if self.vignette_enabled { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+            }),
+        );
+        self.rebuild_frame_plan();
+        if taa_changed || smaa_changed || rain_history_changed {
+            self.history_valid = false;
+            self.taa_frame_index = 0;
+            self.history_read_index = 0;
+            self.ssr_history_valid = false;
+            self.ssr_history_read_index = 0;
+            self.ssr_frame_index = 0;
+        }
+        if self.scene_format() == wgpu::TextureFormat::Rgba16Float
+            && !self.hdr_supported_msaa.contains(&self.msaa_samples)
+        {
+            self.msaa_samples = 1;
+        }
+        let bloom_pyramid_changed =
+            old_bloom_pyramid != (self.bloom_enabled || self.halation_enabled);
+        let ssao_resources_changed = old_ssao_enabled != self.ssao_enabled;
+        let ssr_resources_changed = old_ssr_enabled != self.ssr_enabled;
+        let reflection_policy_changed = old_reflection_quality != self.reflection_quality;
+        let reflection_debug_changed = old_reflection_debug != self.reflection_debug_enabled;
+        if reflection_policy_changed {
+            self.rebuild_planar_reflection_resources();
+            // Planar activity is itself part of the fast/advanced frame-plan
+            // decision, so rebuild once more after the resource state is final.
+            self.rebuild_frame_plan();
+            self.update_lighting_settings();
+            self.activate_world_pipeline_variant();
+            self.ssr_history_valid = false;
+            self.ssr_history_read_index = 0;
+            self.ssr_frame_index = 0;
+        }
+        if reflection_debug_changed {
+            self.history_valid = false;
+            self.ssr_history_valid = false;
+        }
+        let dof_resources_changed = old_dof_enabled != (self.depth_of_field_strength > 0.001);
+        if old_scene_format != self.scene_format()
+            || bloom_pyramid_changed
+            || dof_resources_changed
+            || ssao_resources_changed
+            || ssr_resources_changed
+            || cloud_resolution_changed
+        {
+            self.request_scene_rebuild();
+        } else {
+            if legacy_fog_pipeline_changed {
+                self.activate_world_pipeline_variant();
+            }
+            if lut_changed || cloud_resources_changed {
+                self.rebuild_post_bind_group();
+            }
+            self.update_post_uniform();
+        }
+        self.rebuild_ui();
+    }
+
+    fn set_gpu_visibility(&mut self, gpu_driven: bool, hiz_occlusion: bool) {
+        self.gpu_driven_enabled = gpu_driven && self.indirect_supported;
+        self.hiz_occlusion_enabled = hiz_occlusion && self.gpu_driven_enabled;
+        self.rebuild_frame_plan();
+        self.update_gpu_cull_settings();
+    }
+
+    fn update_gpu_cull_settings(&self) {
+        let (active_cull_count, compact_group_count) = self
+            .world
+            .as_ref()
+            .map(|world| {
+                (
+                    world.active_cull_count,
+                    u32::try_from(world.compact_groups.len()).unwrap_or(u32::MAX),
+                )
+            })
+            .unwrap_or((0, 0));
+        let settings = GpuCullSettings {
+            viewport_mips_flags: [
+                self.config.width.max(1),
+                self.config.height.max(1),
+                self.targets.linear_depth_mip_count.max(1),
+                u32::from(self.gpu_driven_enabled && self.hiz_occlusion_enabled),
+            ],
+            active_compaction: [
+                active_cull_count,
+                compact_group_count,
+                u32::from(
+                    self.gpu_driven_enabled
+                        && self.gpu_compaction_supported
+                        && compact_group_count != 0,
+                ),
+                u32::from(self.cull_debug_mode != CullDebugMode::Off),
+            ],
+        };
+        self.queue.write_buffer(
+            &self.gpu_cull_settings_buffer,
+            0,
+            bytemuck::bytes_of(&settings),
+        );
+    }
+
+    fn rebuild_gpu_visibility_resources(&mut self) {
+        self.hiz_reduce_bind_groups =
+            create_hiz_reduce_bind_groups(&self.device, &self.hiz_reduce_layout, &self.targets);
+        self.update_gpu_cull_settings();
+        if let Some(world) = &mut self.world {
+            world.cull_bind_group = Some(create_gpu_cull_bind_group(
+                &self.device,
+                &self.gpu_cull_layout,
+                &world.cull_records_buffer,
+                &world.indirect_buffer,
+                &self.targets.linear_depth_view,
+                &self.gpu_cull_settings_buffer,
+                &world.active_cull_indices_buffer,
+                &world.compact_indirect_buffer,
+                &world.compact_count_buffer,
+                &world.cull_debug_reason_buffer,
+                &world.cull_debug_count_buffer,
+            ));
+        }
+    }
+
+    fn update_local_shadow_selection(&mut self, camera: &Camera) {
+        let direct_local_lighting_enabled =
+            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
+            return;
+        }
+
+        let should_reselect = self.world.as_ref().is_some_and(|world| {
+            if world.light_count == 0 {
+                return false;
+            }
+            let shadows = &world.local_shadows;
+            let cluster_changed = shadows.selection_cluster != world.last_cluster;
+            let moved = shadows.selection_position.is_none_or(|position| {
+                position.distance_squared(camera.position)
+                    >= LOCAL_SHADOW_RESELECT_DISTANCE * LOCAL_SHADOW_RESELECT_DISTANCE
+            });
+            cluster_changed || moved
+        });
+        if !should_reselect {
+            return;
+        }
+
+        let selected = {
+            let Some(world) = self.world.as_ref() else {
+                return;
+            };
+            select_relevant_shadow_lights(
+                world,
+                camera,
+                self.clustered_lighting_enabled,
+                self.emissive_area_lights_enabled,
+            )
+        };
+
+        let mut changed = false;
+        if let Some(world) = &mut self.world {
+            let previous_active = world.local_shadows.active_light_indices.clone();
+            let shadows = &mut world.local_shadows;
+            shadows.selection_serial = shadows.selection_serial.wrapping_add(1).max(1);
+            let serial = shadows.selection_serial;
+
+            let mut active_slots = Vec::with_capacity(selected.len());
+            for &light_index in &selected {
+                let slot = if let Some(slot) = shadows
+                    .cache_entries
+                    .iter()
+                    .position(|entry| entry.light_index == Some(light_index))
+                {
+                    slot
+                } else {
+                    let slot = shadows
+                        .cache_entries
+                        .iter()
+                        .position(|entry| entry.light_index.is_none())
+                        .or_else(|| {
+                            shadows
+                                .cache_entries
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, entry)| {
+                                    entry
+                                        .light_index
+                                        .is_none_or(|cached| !selected.contains(&cached))
+                                })
+                                .min_by_key(|(_, entry)| entry.last_used)
+                                .map(|(slot, _)| slot)
+                        })
+                        .unwrap_or(0);
+
+                    shadows.cache_entries[slot] = LocalShadowCacheEntry {
+                        light_index: Some(light_index),
+                        last_used: serial,
+                    };
+                    if !shadows.pending_slots.contains(&slot) {
+                        shadows.pending_slots.push(slot);
+                    }
+
+                    let light = world.dynamic_lights[light_index];
+                    let matrices =
+                        local_shadow_face_matrices(Vec3::from_array(light.position), light.radius);
+                    for (face, matrix) in matrices.into_iter().enumerate() {
+                        let face_index = slot * 6 + face;
+                        self.queue.write_buffer(
+                            &shadows.caster_buffers[face_index],
+                            0,
+                            bytemuck::bytes_of(&ShadowCasterUniform {
+                                view_proj: matrix.to_cols_array_2d(),
+                                camera_pos_time: [
+                                    camera.position.x,
+                                    camera.position.y,
+                                    camera.position.z,
+                                    self.started.elapsed().as_secs_f32(),
+                                ],
+                            }),
+                        );
+                    }
+                    slot
+                };
+                shadows.cache_entries[slot].last_used = serial;
+                active_slots.push((light_index, slot));
+            }
+
+            shadows.active_light_indices = selected.clone();
+            shadows.shadowed_light_count = u32::try_from(selected.len()).unwrap_or(0);
+            shadows.selection_cluster = world.last_cluster;
+            shadows.selection_position = Some(camera.position);
+
+            let mut shadow_slot_by_light = vec![0_u32; world.light_count as usize];
+            for (light_index, slot) in active_slots {
+                if light_index < shadow_slot_by_light.len() {
+                    shadow_slot_by_light[light_index] = u32::try_from(slot + 1).unwrap_or(0);
+                }
+            }
+            let gpu_lights = gpu_point_lights(&world.dynamic_lights, &shadow_slot_by_light);
+            self.queue
+                .write_buffer(&world.light_buffer, 0, bytemuck::cast_slice(&gpu_lights));
+            changed = previous_active != selected;
+        }
+
+        if changed {
+            if let Some(world) = &self.world {
+                println!(
+                    "Local light shadows: {} active nearby/PVS-relevant light(s), {} cached cubemap slot(s)",
+                    world.local_shadows.shadowed_light_count,
+                    LOCAL_SHADOW_CACHE_SLOTS
+                );
+            }
+        }
+        self.update_lighting_settings();
+    }
+
+    fn ensure_local_shadow_cache(&mut self) {
+        let direct_local_lighting_enabled =
+            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
+            return;
+        }
+        let pending_slots = self
+            .world
+            .as_ref()
+            .map(|world| world.local_shadows.pending_slots.clone())
+            .unwrap_or_default();
+        if pending_slots.is_empty() {
+            return;
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA local-light shadow cache encoder"),
+            });
+        if let Some(world) = &self.world {
+            for &slot in &pending_slots {
+                let Some(light_index) = world.local_shadows.cache_entries[slot].light_index else {
+                    continue;
+                };
+                let light = world.dynamic_lights[light_index];
+                let light_sphere = [
+                    light.position[0],
+                    light.position[1],
+                    light.position[2],
+                    light.radius,
+                ];
+                let face_matrices =
+                    local_shadow_face_matrices(Vec3::from_array(light.position), light.radius);
+                for face in 0..6 {
+                    let face_index = slot * 6 + face;
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("JKA cached static local-light cubemap shadow"),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &world.local_shadows.layer_views[face_index],
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.shadow_resources.pipeline);
+                    pass.set_bind_group(
+                        0,
+                        &world.local_shadows.caster_bind_groups[face_index],
+                        &[],
+                    );
+                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    let mut mask_pipeline_active = false;
+                    for batch in &world.coarse_batches {
+                        if batch.source.pipeline.blend != BlendMode::Opaque
+                            || !aabb_intersects_sphere(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                [light_sphere[0], light_sphere[1], light_sphere[2]],
+                                light_sphere[3],
+                            )
+                            || !aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                face_matrices[face],
+                            )
+                        {
+                            continue;
+                        }
+                        match batch.source.pipeline.class {
+                            DrawClass::Opaque if batch.source.alpha_cutoff <= 0.0 => {
+                                if mask_pipeline_active {
+                                    pass.set_pipeline(&self.shadow_resources.pipeline);
+                                    mask_pipeline_active = false;
+                                }
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
+                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                                if !mask_pipeline_active {
+                                    pass.set_pipeline(&self.shadow_resources.mask_pipeline);
+                                    mask_pipeline_active = true;
+                                }
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+        if let Some(world) = &mut self.world {
+            world.local_shadows.pending_slots.clear();
+        }
+    }
+
+    fn world_shader_variant_key(&self) -> WorldShaderVariantKey {
+        let direct_local_lights =
+            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        WorldShaderVariantKey {
+            pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
+            pom: self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
+            pbr_shared_material_eval: self.pbr_enabled && PBR_PROFILE_SHARED_MATERIAL_EVAL,
+            pbr_shared_tangent_frame: self.pbr_enabled && PBR_PROFILE_SHARED_TANGENT_FRAME,
+            pom_mip_aware: self.pbr_enabled && PBR_PROFILE_POM_MIP_AWARE,
+            pom_adaptive_steps: self.pbr_enabled && PBR_PROFILE_POM_ADAPTIVE_STEPS,
+            pbr_companion_sampler: self.pbr_enabled && PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR,
+            pbr_vertex_lightgrid: self.pbr_enabled && PBR_PROFILE_VERTEX_LIGHTGRID,
+            point_lights: self.clustered_lighting_enabled,
+            area_lights: self.emissive_area_lights_enabled,
+            irradiance_volume: self.irradiance_volume_enabled,
+            voxel_gi: self.voxel_probe_gi_enabled,
+            // A local-shadow shader path is useless without a direct local-light
+            // source. Normalize it out of the key so toggling shadows alone does
+            // not create a redundant pipeline permutation.
+            local_shadows: self.local_light_shadows_enabled && direct_local_lights,
+            cascaded_shadows: self.cascaded_shadows_enabled,
+            planar_reflections: self.planar_reflection.active,
+            // MAP/DEFAULT is a no-op on maps with no authored fog. FogSystem owns
+            // the current map's authored-fog state and decides whether the legacy
+            // JKA fragment path is actually required.
+            legacy_fog: self.weather.fog.legacy_effective(),
+            ocean: self.ocean_enabled,
+        }
+    }
+
+    fn enhanced_world_shader_needed(&self) -> bool {
+        self.world_shader_variant_key().family() == WorldShaderFamily::Enhanced
+    }
+
+    fn activate_world_pipeline_variant(&mut self) {
+        let key = self.world_shader_variant_key();
+        let Some(current_key) = self
+            .world
+            .as_ref()
+            .map(|world| world.active_pipeline_variant)
+        else {
+            return;
+        };
+        if current_key == key {
+            return;
+        }
+
+        if self
+            .world
+            .as_ref()
+            .is_some_and(|world| world.pipeline_variants.contains_key(&key))
+        {
+            if let Some(world) = &mut self.world {
+                world.active_pipeline_variant = key;
+                println!(
+                    "Renderer pipeline cache: hit {} ({} cached variant(s))",
+                    key.short_label(),
+                    world.pipeline_variants.len()
+                );
+            }
+            return;
+        }
+
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        let (layout, shader) = match key.family() {
+            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+        };
+        println!(
+            "Renderer pipeline cache: miss {} -> compiling lazily",
+            key.short_label()
+        );
+        let (pipelines, reflection_pipelines) = {
+            let Some(world) = self.world.as_ref() else {
+                return;
+            };
+            let pipelines = create_world_pipelines(
+                &self.device,
+                layout,
+                shader,
+                scene_format,
+                samples,
+                &world.coarse_batches,
+                key.legacy_fog,
+                Some(key),
+            );
+            let reflection_pipelines =
+                if world.planar_reflectors.is_empty() || !key.planar_reflections {
+                    BTreeMap::new()
+                } else {
+                    create_reflection_pipelines(
+                        &self.device,
+                        layout,
+                        shader,
+                        scene_format,
+                        &world.coarse_batches,
+                        key.legacy_fog,
+                        key,
+                    )
+                };
+            (pipelines, reflection_pipelines)
+        };
+
+        if let Some(world) = &mut self.world {
+            world.pipeline_variants.insert(
+                key,
+                WorldPipelineVariant {
+                    pipelines,
+                    reflection_pipelines,
+                },
+            );
+            world.active_pipeline_variant = key;
+            println!(
+                "Renderer pipeline cache: ready {} ({} cached variant(s))",
+                key.short_label(),
+                world.pipeline_variants.len()
+            );
+        }
+    }
+
+    fn set_grass_enabled(&mut self, enabled: bool) {
+        self.grass_enabled = enabled;
+    }
+
+    fn set_grass_precompute(&mut self, enabled: bool) {
+        self.grass_precompute_enabled = enabled;
+    }
+
+    fn set_grass_mid_lod(&mut self, enabled: bool) {
+        self.grass_mid_lod_enabled = enabled;
+    }
+
+    fn set_grass_front_to_back(&mut self, enabled: bool) {
+        self.grass_front_to_back_enabled = enabled;
+    }
+
+    /// The index range promoted water draws instead of its authored face, or
+    /// `None` when the ocean is off or this world carries no clipmap.
+    fn ocean_clipmap_quality(&self) -> Option<usize> {
+        self.ocean_enabled
+            .then(|| usize::from(self.ocean_settings.mesh_quality.min(1)))
+    }
+
+    fn set_ocean_settings(&mut self, settings: crate::ocean::OceanSettings) {
+        let settings = settings.sanitize();
+        let recreate = self.ocean.as_ref().is_some_and(|ocean| ocean.map_size() != settings.map_size);
+        self.ocean_settings = settings;
+        if self.ocean_enabled {
+            if recreate {
+                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, self.ocean_settings);
+                ocean.set_enabled(&self.queue, true);
+                self.ocean = Some(ocean);
+            } else if let Some(ocean) = &mut self.ocean {
+                ocean.set_settings(&self.queue, self.ocean_settings);
+            }
+        }
+        let descriptors = self.authored_ocean_definitions.clone();
+        self.set_authored_oceans(descriptors);
+    }
+
+    fn set_authored_oceans(&mut self, descriptors: Vec<crate::ocean::authoring::AuthoredOcean>) {
+        self.authored_ocean_definitions = descriptors.clone();
+        if !self.ocean_enabled { self.authored_oceans.clear(); return; }
+        let mut previous = std::mem::take(&mut self.authored_oceans);
+        for descriptor in descriptors {
+            let mut settings = self.ocean_settings;
+            settings.authored = descriptor.waves;
+            settings.wind = descriptor.wind;
+            settings.bounds = Some(crate::ocean::OceanSurface {
+                plane_height: descriptor.height, minimum:[descriptor.mins[0],-descriptor.maxs[1]],
+                maximum:[descriptor.maxs[0],-descriptor.mins[1]],
+            });
+            let mut gpu = if let Some(index) = previous.iter().position(|(a,g)| a.index == descriptor.index && g.map_size() == settings.map_size) {
+                previous.swap_remove(index).1
+            } else {
+                crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout,
+                    &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, settings)
+            };
+            gpu.set_settings(&self.queue, settings);
+            gpu.set_enabled(&self.queue, self.ocean_enabled);
+            self.authored_oceans.push((descriptor, gpu));
+        }
+    }
+
+    fn ocean_bind_group_for<'a>(batch: &WorldBatch, authored_oceans: &'a [(crate::ocean::authoring::AuthoredOcean, crate::ocean::OceanGpu)], ocean: &'a Option<crate::ocean::OceanGpu>, inert: &'a wgpu::BindGroup) -> &'a wgpu::BindGroup {
+        if batch.source.water_primary {
+            let centre = std::array::from_fn(|i| (batch.bounds_min[i] + batch.bounds_max[i]) * 0.5);
+            if let Some((_, gpu)) = authored_oceans.iter().find(|(a,_)| batch.source.authored_ocean.map_or_else(|| a.contains_render_point(centre), |id| a.index == id)) {
+                return &gpu.render_bind_group;
+            }
+        }
+        ocean.as_ref().map(|o| &o.render_bind_group).unwrap_or(inert)
+    }
+
+    fn set_ocean_enabled(&mut self, enabled: bool) {
+        if self.ocean_enabled == enabled { return; }
+        self.ocean_enabled = enabled;
+        self.set_authored_oceans(self.authored_ocean_definitions.clone());
+        if enabled {
+            if self.ocean.is_none() {
+                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, self.ocean_settings);
+                ocean.set_enabled(&self.queue, true);
+                self.ocean = Some(ocean);
+            } else if let Some(ocean) = &mut self.ocean {
+                ocean.set_enabled(&self.queue, true);
+            }
+        } else {
+            // Release the large FFT textures/buffers when stock JKA water is selected.
+            self.ocean = None;
+        }
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_gpu_timings(&mut self, enabled: bool) {
+        self.gpu_profiler.set_enabled(enabled);
+        println!(
+            "GPU timestamps: {}",
+            if enabled {
+                if self.gpu_profiler.available() {
+                    "enabled"
+                } else {
+                    "unavailable on this adapter"
+                }
+            } else {
+                "disabled"
+            }
+        );
+    }
+
+    fn set_ghoul2_batch_draws(&mut self, mode: Ghoul2BatchMode) {
+        self.dynamic_model_renderer.set_ghoul2_batch_draws(mode);
+    }
+
+    fn set_clustered_lighting(&mut self, enabled: bool) {
+        self.clustered_lighting_enabled = enabled;
+        if let Some(world) = &mut self.world {
+            // Point/entity lights and emissive area lights share the same local
+            // shadow cache. Changing either source class must force a fresh
+            // selection so disabled lights cannot keep occupying shadow slots.
+            world.local_shadows.selection_position = None;
+        }
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_emissive_area_lights(&mut self, enabled: bool) {
+        self.emissive_area_lights_enabled = enabled;
+        if let Some(world) = &mut self.world {
+            // Force the local-shadow cache to drop/reconsider area emitters.
+            world.local_shadows.selection_position = None;
+        }
+        // Area emitters share the clustered-light transport, but the user-facing
+        // area-light switch is independent from the ordinary dynamic-light
+        // switch. Keep the cluster compute path alive whenever either source
+        // class needs it.
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_irradiance_volume(&mut self, enabled: bool) {
+        self.irradiance_volume_enabled = enabled;
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_voxel_probe_gi(&mut self, enabled: bool) {
+        self.voxel_probe_gi_enabled = enabled;
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_local_light_shadows(&mut self, enabled: bool) {
+        self.local_light_shadows_enabled = enabled;
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+    }
+
+    fn set_pbr_settings(&mut self, enabled: bool, deluxe_mapping: bool, deluxe_specular: f32) {
+        self.pbr_enabled = enabled;
+        self.deluxe_mapping_enabled = deluxe_mapping;
+        self.deluxe_specular = deluxe_specular.clamp(0.0, 1.0);
+        let settings = PbrSettings {
+            values: [
+                u32::from(enabled && PBR_PROFILE_MATERIALS),
+                u32::from(enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+                40,
+                0,
+            ],
+            deluxe: [
+                f32::from(enabled && deluxe_mapping),
+                self.deluxe_specular,
+                0.0,
+                0.0,
+            ],
+        };
+        self.queue.write_buffer(
+            &self.pbr_settings_buffer,
+            0,
+            bytemuck::bytes_of(&settings),
+        );
+        let sun = self.active_sun();
+        self.grass_renderer.update_environment(
+            &self.queue,
+            sun,
+            self.cloud_wind_speed,
+            self.cloud_wind_direction,
+            self.pbr_enabled,
+        );
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+        println!(
+            "PBR profile: {} (companions={} POM={} deluxe={} deluxe_spec={:.2})",
+            if enabled { "ON" } else { "OFF" },
+            u8::from(enabled && PBR_PROFILE_MATERIALS),
+            u8::from(enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+            u8::from(enabled && deluxe_mapping),
+            self.deluxe_specular,
+        );
+    }
+
+    fn inspect_surface(
+        &mut self,
+        camera: &Camera,
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<SurfaceInspectorInfo> {
+        let Some(world) = &self.world else {
+            self.inspector_vertex_range = None;
+            return None;
+        };
+        if width == 0 || height == 0 {
+            self.inspector_vertex_range = None;
+            return None;
+        }
+
+        let uv = Vec2::new(
+            (x / width as f32).clamp(0.0, 1.0),
+            (y / height as f32).clamp(0.0, 1.0),
+        );
+        let ndc = Vec4::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+        let inv_view_proj = camera.view_projection(width, height).inverse();
+        let world_near = inv_view_proj * ndc;
+        if world_near.w.abs() <= 1e-6 {
+            self.inspector_vertex_range = None;
+            return None;
+        }
+        let ray_point = world_near.truncate() / world_near.w;
+        let ray_origin = camera.position;
+        let ray_direction = (ray_point - ray_origin).normalize_or_zero();
+        if ray_direction.length_squared() <= 1e-8 {
+            self.inspector_vertex_range = None;
+            return None;
+        }
+
+        let mut best: Option<(f32, usize, u32, Vec3)> = None;
+        for (batch_index, batch) in world.coarse_batches.iter().enumerate() {
+            if !ray_hits_aabb(
+                ray_origin,
+                ray_direction,
+                Vec3::from_array(batch.bounds_min),
+                Vec3::from_array(batch.bounds_max),
+            ) {
+                continue;
+            }
+            let start = usize::try_from(batch.source.vertices.start).unwrap_or(usize::MAX);
+            let end = usize::try_from(batch.source.vertices.end)
+                .unwrap_or(usize::MAX)
+                .min(world.inspector_vertices.len());
+            if start >= end || end - start < 3 {
+                continue;
+            }
+            for (triangle_index, triangle) in world.inspector_vertices[start..end]
+                .chunks_exact(3)
+                .enumerate()
+            {
+                let a = Vec3::from_array(triangle[0].position);
+                let b = Vec3::from_array(triangle[1].position);
+                let c = Vec3::from_array(triangle[2].position);
+                let Some(distance) = ray_triangle_distance(ray_origin, ray_direction, a, b, c)
+                else {
+                    continue;
+                };
+                let replace = match best {
+                    None => true,
+                    Some((best_distance, best_index, _, _)) => {
+                        distance + 0.001 < best_distance
+                            || ((distance - best_distance).abs() <= 0.001
+                                && batch.source.texture.is_some()
+                                && world.coarse_batches[best_index].source.texture.is_none())
+                    }
+                };
+                if replace {
+                    best = Some((
+                        distance,
+                        batch_index,
+                        batch.source.vertices.start + (triangle_index as u32) * 3,
+                        ray_origin + ray_direction * distance,
+                    ));
+                }
+            }
+        }
+
+        let Some((distance, batch_index, triangle_start, hit)) = best else {
+            self.inspector_vertex_range = None;
+            return None;
+        };
+        let hit_range = triangle_start..triangle_start.saturating_add(3);
+        if self.inspector_vertex_range.as_ref() == Some(&hit_range) {
+            // `trace` is a selection toggle: tracing the already-selected BSP
+            // triangle exits inspection and removes its highlight.
+            self.inspector_vertex_range = None;
+            return None;
+        }
+        self.inspector_vertex_range = Some(hit_range);
+        let batch = &world.coarse_batches[batch_index];
+        let source = &batch.source;
+
+        let triangle_offset = usize::try_from(triangle_start).unwrap_or(usize::MAX);
+        let hit_triangle = triangle_offset
+            .checked_add(3)
+            .filter(|end| *end <= world.inspector_vertices.len())
+            .map(|end| &world.inspector_vertices[triangle_offset..end]);
+        let hit_barycentric = hit_triangle.and_then(|triangle| {
+            barycentric_coordinates(
+                hit,
+                Vec3::from_array(triangle[0].position),
+                Vec3::from_array(triangle[1].position),
+                Vec3::from_array(triangle[2].position),
+            )
+        });
+        let hit_base_uv = hit_triangle
+            .zip(hit_barycentric)
+            .map(|(triangle, weights)| interpolate_uv(triangle, weights, |vertex| vertex.uv));
+        let hit_lightmap_uv = hit_triangle
+            .zip(hit_barycentric)
+            .map(|(triangle, weights)| {
+                interpolate_uv(triangle, weights, |vertex| vertex.lightmap_uv)
+            });
+
+        let texture = source
+            .texture
+            .and_then(|index| world.inspector_textures.get(index));
+        let lightmap = source
+            .lightmap
+            .and_then(|index| world.inspector_lightmaps.get(index));
+        let texture_label = texture.map(|texture| texture.label.as_str());
+        let has_bsp_shader = source.bsp_shader_index != u32::MAX;
+        let debug_entry = if has_bsp_shader {
+            // BSP draws carry the exact material-debug entry resolved from the
+            // BSP shader-table index at map load. Never infer a BSP shader from
+            // its stage texture: many unrelated shaders legitimately reference
+            // the same image (for example terrain_0 -> yavin/ground.jpg).
+            (source.material_debug_index != u32::MAX)
+                .then_some(source.material_debug_index as usize)
+                .and_then(|index| world.material_debug.entries.get(index))
+        } else {
+            // Source .map rendering has no BSP shader-table index, so retain the
+            // legacy best-effort lookup for that developer-only path.
+            texture_label.and_then(|label| {
+                let label_lower = label.to_ascii_lowercase();
+                world.material_debug.entries.iter().find(|entry| {
+                    entry.name.eq_ignore_ascii_case(label)
+                        || entry
+                            .lines
+                            .iter()
+                            .any(|line| line.to_ascii_lowercase().contains(&label_lower))
+                })
+            })
+        };
+        let title = debug_entry
+            .map(|entry| entry.name.clone())
+            .or_else(|| {
+                has_bsp_shader.then(|| format!("BSP SHADER #{}", source.bsp_shader_index))
+            })
+            .or_else(|| texture.map(|texture| texture.label.clone()))
+            .unwrap_or_else(|| format!("WORLD BATCH {batch_index}"));
+
+        let current_cluster = world
+            .visibility
+            .as_ref()
+            .and_then(|vis| vis.cluster_at(scene::jka_position(camera.position.to_array())));
+        let pvs_visible = current_cluster.is_none_or(|cluster| {
+            if source.pvs_signature.is_empty() {
+                return true;
+            }
+            let word = cluster / 64;
+            let bit = cluster % 64;
+            source
+                .pvs_signature
+                .get(word)
+                .is_none_or(|value| *value & (1_u64 << bit) != 0)
+        });
+
+        let vertex_count = source.vertices.end.saturating_sub(source.vertices.start);
+        let mut lines = vec![
+            format!(
+                "BATCH: {batch_index}    TRIANGLES: {}    VERTICES: {vertex_count}",
+                vertex_count / 3
+            ),
+            format!(
+                "DISTANCE: {distance:.2}    HIT: {:.1}, {:.1}, {:.1}",
+                hit.x, hit.y, hit.z
+            ),
+            format!(
+                "CLASS: {:?}    BLEND: {:?}    CULL: {:?}",
+                source.pipeline.class, source.pipeline.blend, source.pipeline.cull
+            ),
+            format!(
+                "DEPTH WRITE: {}    DEPTH EQUAL: {}    POLYGON OFFSET: {}",
+                source.pipeline.depth_write, source.pipeline.depth_equal, source.pipeline.offset
+            ),
+            format!(
+                "TCGEN: {:?}    TCMODS: {}    RGBGEN: {:?}    ALPHAGEN: {:?}",
+                source.tc_gen,
+                source.tc_mods.len(),
+                source.rgb_gen,
+                source.alpha_gen
+            ),
+            format!(
+                "RENDER FLAGS: MODULATE LIGHTMAP: {}    TEXTURE IS LIGHTMAP: {}",
+                source.modulate_lightmap, source.texture_is_lightmap
+            ),
+        ];
+        if has_bsp_shader {
+            let shader_index = source.bsp_shader_index;
+            lines.insert(
+                1,
+                format!(
+                    "BSP SHADER: #{shader_index}    {}",
+                    debug_entry
+                        .map(|entry| entry.name.as_str())
+                        .unwrap_or("<unresolved>")
+                ),
+            );
+        }
+        if let Some(uv) = hit_base_uv {
+            lines.push(format!("BASE UV HIT: {:.5}, {:.5}", uv.x, uv.y));
+        }
+        if let Some(uv) = hit_lightmap_uv {
+            lines.push(format!("LIGHTMAP UV HIT: {:.5}, {:.5}", uv.x, uv.y));
+        }
+        if let Some(triangle) = hit_triangle {
+            let base_edges = uv_edge_lengths(triangle, |vertex| vertex.uv);
+            let lm_edges = uv_edge_lengths(triangle, |vertex| vertex.lightmap_uv);
+            lines.push(format!(
+                "BASE UV EDGE DELTAS: {:.5}, {:.5}, {:.5}",
+                base_edges[0], base_edges[1], base_edges[2]
+            ));
+            lines.push(format!(
+                "LIGHTMAP UV EDGE DELTAS: {:.5}, {:.5}, {:.5}",
+                lm_edges[0], lm_edges[1], lm_edges[2]
+            ));
+        }
+        if let Some(texture) = texture {
+            lines.push(format!(
+                "TEXTURE: {}    {}x{}    MIPS {}    {} {}",
+                texture.label,
+                texture.width,
+                texture.height,
+                texture.mip_level_count,
+                if texture.srgb { "sRGB" } else { "linear" },
+                if texture.clamp { "clamp" } else { "repeat" },
+            ));
+            lines.push(format!(
+                "IMAGE PROVIDER: {}",
+                texture
+                    .source
+                    .as_deref()
+                    .map_or_else(|| "<generated / unknown>".to_owned(), |path| path.display().to_string())
+            ));
+            lines.push(format!(
+                "SOURCE DETAIL: RGB {}..{} / {}..{} / {}..{}    LUMA AVG {:.1} STDDEV {:.1}",
+                texture.sampled_rgb_min[0],
+                texture.sampled_rgb_max[0],
+                texture.sampled_rgb_min[1],
+                texture.sampled_rgb_max[1],
+                texture.sampled_rgb_min[2],
+                texture.sampled_rgb_max[2],
+                texture.sampled_luma_mean,
+                texture.sampled_luma_stddev,
+            ));
+            if let Some(triangle) = hit_triangle {
+                let density = texture_edge_density(triangle, texture.width, texture.height);
+                lines.push(format!(
+                    "BASE TEXELS/WORLD UNIT: {:.3}, {:.3}, {:.3}",
+                    density[0], density[1], density[2]
+                ));
+            }
+        } else if source.texture_is_lightmap {
+            lines.push("TEXTURE: $lightmap".into());
+        } else {
+            lines.push("TEXTURE: <white / shader-generated>".into());
+        }
+        if let Some(lightmap) = lightmap {
+            lines.push(format!(
+                "LIGHTMAP: {}    {}x{}    PAGE {:?}",
+                lightmap.label, lightmap.width, lightmap.height, source.lightmap
+            ));
+            lines.push(format!(
+                "LIGHTMAP PROVIDER: {}",
+                lightmap
+                    .source
+                    .as_deref()
+                    .map_or_else(|| "<embedded / generated>".to_owned(), |path| path.display().to_string())
+            ));
+        } else {
+            lines.push(format!("LIGHTMAP: {:?}", source.lightmap));
+        }
+        lines.push(format!(
+            "PVS CLUSTER: {}    PVS VISIBLE: {}",
+            current_cluster.map_or_else(|| "none".into(), |cluster| cluster.to_string()),
+            if pvs_visible { "YES" } else { "NO" },
+        ));
+        lines.push(format!(
+            "PLANAR: {}    ENV CANDIDATE: {}    REFLECTION PROBE: {:?}",
+            source.planar_reflection, source.planar_environment_candidate, source.reflection_probe,
+        ));
+        lines.push(format!(
+            "BOUNDS MIN: {:.1}, {:.1}, {:.1}",
+            batch.bounds_min[0], batch.bounds_min[1], batch.bounds_min[2]
+        ));
+        lines.push(format!(
+            "BOUNDS MAX: {:.1}, {:.1}, {:.1}",
+            batch.bounds_max[0], batch.bounds_max[1], batch.bounds_max[2]
+        ));
+        if let Some(entry) = debug_entry {
+            if let Some(file) = entry.definition_file.as_deref() {
+                lines.push(format!("SHADER FILE: {file}"));
+            }
+            if let Some(provider) = entry.definition_source.as_deref() {
+                lines.push(format!("SHADER PROVIDER: {}", provider.display()));
+            }
+            lines.push(format!(
+                "SHADER SOURCE: {}{}",
+                entry.source,
+                if entry.mtr_override {
+                    " (MTR OVERRIDE)"
+                } else {
+                    ""
+                }
+            ));
+            for image in &entry.image_sources {
+                lines.push(image.clone());
+            }
+            for detail in entry.lines.iter().take(5) {
+                lines.push(detail.clone());
+            }
+        } else if has_bsp_shader {
+            lines.push("SHADER SOURCE: <no exact BSP material-debug entry>".into());
+        } else {
+            lines.push("SHADER SOURCE: <no direct material-debug match>".into());
+        }
+
+        Some(SurfaceInspectorInfo { title, lines })
+    }
+
+    fn dump_materials(&self, filter: Option<&str>, all: bool) {
+        println!("\n=== JKA MATERIAL DEBUG ===");
+        let Some(world) = &self.world else {
+            println!("No world is loaded.");
+            println!("=== END JKA MATERIAL DEBUG ===\n");
+            return;
+        };
+
+        let debug = &world.material_debug;
+        println!(
+            "library: .shader files={} parsed_defs={} | .mtr files={} parsed_defs={}",
+            debug.shader_files, debug.shader_definitions, debug.mtr_files, debug.mtr_definitions,
+        );
+        println!(
+            "runtime: PBR={} POM={} clustered_lights={} dynamic_lights={} local_shadows={} cascaded_sun={} static_lightgrid={} hdr_lightgrid={} reflection_probes={}",
+            self.pbr_enabled && PBR_PROFILE_MATERIALS,
+            self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
+            self.clustered_lighting_enabled,
+            world.light_count,
+            self.local_light_shadows_enabled,
+            self.cascaded_shadows_enabled,
+            world._static_light_grid.enabled,
+            world._static_light_grid.external_hdr,
+            world.reflection_probes.source_count,
+        );
+        if self.pbr_enabled
+            && PBR_PROFILE_MATERIALS
+            && !world._static_light_grid.enabled
+            && world.reflection_probes.source_count == 0
+            && (!self.clustered_lighting_enabled || world.light_count == 0)
+        {
+            println!(
+                "NOTE: PBR companions are enabled, but no static directional lightgrid, reflection probes, or active clustered lights are available to make normal/roughness/metallic/specular visibly respond."
+            );
+        }
+        if self.pbr_enabled && PBR_PROFILE_MATERIALS && world._static_light_grid.enabled {
+            println!(
+                "NOTE: baked lightmaps are directionally relit from the JKA/Rend2 lightgrid for normal/specular response{}.",
+                if world._static_light_grid.external_hdr {
+                    " (external HDR lightgrid.raw loaded)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if self.pbr_enabled && PBR_PROFILE_MATERIALS && world.reflection_probes.source_count > 0 {
+            println!(
+                "NOTE: Rend2 reflection probes are loaded; roughness/metallic/specular materials sample the nearest assigned cubemap."
+            );
+        }
+        println!(
+            "NOTE: POM is independent of clustered lighting. Emissive companions are also applied directly when PBR is ON."
+        );
+
+        let mut enhanced_batches = 0usize;
+        let mut pbr_eligible_batches = 0usize;
+        let mut pom_eligible_batches = 0usize;
+        let mut probe_assigned_batches = 0usize;
+        for batch in &world.coarse_batches {
+            let source = &batch.source;
+            let enhanced = source.normal_texture.is_some()
+                || source.roughness_texture.is_some()
+                || source.height_texture.is_some()
+                || source.metallic_texture.is_some()
+                || source.specular_texture.is_some()
+                || source.emissive_texture.is_some()
+                || source.roughness_override.is_some()
+                || source.specular_reflectance.is_some();
+            if !enhanced {
+                continue;
+            }
+            enhanced_batches += 1;
+            let eligible = !source.texture_is_lightmap
+                && source.pipeline.class == DrawClass::Opaque
+                && source.pipeline.blend == BlendMode::Opaque
+                && matches!(source.tc_gen, TcGen::Base);
+            if eligible {
+                pbr_eligible_batches += 1;
+                if source.height_texture.is_some() {
+                    pom_eligible_batches += 1;
+                }
+                if source.reflection_probe.is_some() {
+                    probe_assigned_batches += 1;
+                }
+            }
+        }
+        println!(
+            "prepared coarse batches: total={} enhanced={} pbr_eligible={} pom_eligible={} reflection_probe_assigned={}",
+            world.coarse_batches.len(),
+            enhanced_batches,
+            pbr_eligible_batches,
+            pom_eligible_batches,
+            probe_assigned_batches
+        );
+
+        let normalized_filter = filter.map(|value| value.to_ascii_lowercase());
+        println!(
+            "listing: {}{}",
+            if all {
+                "ALL used materials"
+            } else if normalized_filter.is_some() {
+                "matching materials"
+            } else {
+                "enhanced materials only"
+            },
+            normalized_filter
+                .as_deref()
+                .map(|filter| format!(" (filter={filter})"))
+                .unwrap_or_default()
+        );
+
+        let mut shown = 0usize;
+        for entry in &debug.entries {
+            if !all && normalized_filter.is_none() && !entry.enhanced {
+                continue;
+            }
+            if let Some(filter) = normalized_filter.as_deref() {
+                let name_match = entry.name.to_ascii_lowercase().contains(filter);
+                let source_match = entry.source.to_ascii_lowercase().contains(filter);
+                let line_match = entry
+                    .lines
+                    .iter()
+                    .any(|line| line.to_ascii_lowercase().contains(filter));
+                if !name_match && !source_match && !line_match {
+                    continue;
+                }
+            }
+            shown += 1;
+            println!(
+                "\n[MATERIAL] {} | source={}{} | enhanced={}",
+                entry.name,
+                entry.source,
+                if entry.mtr_override {
+                    " [MTR OVERRIDE]"
+                } else {
+                    ""
+                },
+                entry.enhanced,
+            );
+            for line in &entry.lines {
+                println!("  {line}");
+            }
+        }
+        if shown == 0 {
+            println!("No material entries matched this dump.");
+        } else {
+            println!("\nshown materials: {shown}/{}", debug.entries.len());
+        }
+        println!("=== END JKA MATERIAL DEBUG ===\n");
+    }
+
+    fn set_cascaded_shadows(&mut self, mode: DynamicShadowsMode) {
+        self.cascaded_shadow_mode = mode;
+        self.cascaded_shadows_enabled = matches!(
+            mode,
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
+        );
+        self.rebuild_weather_surface_receiver_bind_group();
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+        if !self.cascaded_shadows_enabled {
+            self.write_shadow_uniforms(
+                &[Mat4::IDENTITY; SHADOW_CASCADES],
+                &[0.0; SHADOW_CASCADES],
+                &[0.0; SHADOW_CASCADES],
+                false,
+                Vec3::Z,
+                [0.0; 4],
+                false,
+            );
+        }
+    }
+
+    fn set_planar_reflection_debug(&mut self, mode: PlanarReflectionDebugMode) {
+        if self.planar_reflection_debug_mode == mode {
+            return;
+        }
+        self.planar_reflection_debug_mode = mode;
+        self.rebuild_frame_plan();
+        self.last_planar_debug_selection = None;
+        println!("Planar reflection debug: {}", mode.label());
+    }
+
+    fn set_puddle_debug(&mut self, enabled: bool) {
+        if self.weather.rain.puddle_debug_visualization == enabled {
+            return;
+        }
+        self.weather.rain.puddle_debug_visualization = enabled;
+        self.update_weather_surface_uniform();
+        self.history_valid = false;
+        self.ssr_history_valid = false;
+        self.rebuild_frame_plan();
+    }
+
+    fn set_cull_debug(&mut self, mode: CullDebugMode) {
+        if self.cull_debug_mode == mode {
+            return;
+        }
+        self.cull_debug_mode = mode;
+        if let Some(world) = &mut self.world {
+            // Force the CPU PVS classification to be republished into the
+            // debug-reason buffer when diagnostics are switched on.
+            world.active_selection_key = None;
+        }
+        if mode == CullDebugMode::Off {
+            self.cull_diagnostics_readback.latest = [0; 4];
+            self.cull_diagnostics_readback.current = None;
+            self.cull_diagnostics_readback.encoded = false;
+        }
+        self.rebuild_frame_plan();
+        self.update_gpu_cull_settings();
+    }
+
+    fn write_shadow_uniforms(
+        &self,
+        matrices: &[Mat4; SHADOW_CASCADES],
+        splits: &[f32; SHADOW_CASCADES],
+        texel_sizes: &[f32; SHADOW_CASCADES],
+        enabled: bool,
+        camera_forward: Vec3,
+        camera_pos_time: [f32; 4],
+        bevy_mode: bool,
+    ) {
+        let sun = self.active_sun();
+        let light_direction = Vec3::from_array(sun.direction).normalize_or_zero();
+        let intensity_scale = (sun.intensity / 250.0).max(0.0).sqrt().clamp(0.0, 1.5);
+        let receiver = ShadowReceiverUniform {
+            view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
+            split_depths: *splits,
+            light_direction_enabled: [
+                light_direction.x,
+                light_direction.y,
+                light_direction.z,
+                if enabled { 1.0 } else { 0.0 },
+            ],
+            params: [
+                SHADOW_MAP_SIZE as f32,
+                0.00035,
+                0.30 * intensity_scale,
+                if bevy_mode { 1.0 } else { 0.0 },
+            ],
+            camera_forward: [camera_forward.x, camera_forward.y, camera_forward.z, self.sun_visibility.shader_value()],
+            cascade_texel_sizes: *texel_sizes,
+            bevy_params: [
+                BEVY_CSM_SHADOW_DEPTH_BIAS,
+                BEVY_CSM_SHADOW_NORMAL_BIAS,
+                BEVY_CSM_OVERLAP_PROPORTION,
+                if bevy_mode { SHADOW_CASCADES as f32 } else { LEGACY_SHADOW_CASCADES as f32 },
+            ],
+        };
+        self.queue.write_buffer(
+            &self.shadow_resources.receiver_buffer,
+            0,
+            bytemuck::bytes_of(&receiver),
+        );
+        for (index, matrix) in matrices.iter().enumerate() {
+            let caster = ShadowCasterUniform {
+                view_proj: matrix.to_cols_array_2d(),
+                camera_pos_time,
+            };
+            self.queue.write_buffer(
+                &self.shadow_resources.caster_buffers[index],
+                0,
+                bytemuck::bytes_of(&caster),
+            );
+        }
+    }
+
+    fn write_froxel_uniform(
+        &self,
+        inv_view_proj: Mat4,
+        camera_pos_time: [f32; 4],
+        shadow_matrices: Option<&[Mat4; SHADOW_CASCADES]>,
+    ) {
+        let matrices = shadow_matrices
+            .copied()
+            .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADES]);
+        let sun = self.active_sun();
+        let sun_direction = Vec3::from_array(sun.direction).normalize_or_zero();
+        let (fog_density, fog_color, fog_height_falloff, map_fog_depth) =
+            self.weather.fog.volumetric_density_color();
+        let rain_occlusion = match &self.weather.rain.occlusion {
+            WeatherOcclusionCache::Ready(info) => [
+                info.min_xz[0],
+                info.min_xz[1],
+                info.inv_extent_xz[0],
+                info.inv_extent_xz[1],
+            ],
+            WeatherOcclusionCache::Pending(_)
+            | WeatherOcclusionCache::Building(_)
+            | WeatherOcclusionCache::Unavailable => [0.0; 4],
+        };
+        let wind_angle = self.cloud_wind_direction.to_radians();
+        let wind_speed = self.cloud_wind_speed.max(0.0);
+        let uniform = FroxelUniform {
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            camera_pos_time,
+            sun_direction_enabled: [sun_direction.x, sun_direction.y, sun_direction.z, 1.0],
+            sun_color_intensity: [sun.color[0], sun.color[1], sun.color[2], sun.intensity],
+            // w is zero for manual fog and depthForOpaque for authored MAP
+            // fog. With authored fog, x is a multiplier of the OpenJK EXP2
+            // profile (MAP/0 and explicit 1.0x are identical). With manual fog
+            // x remains the Beer-Lambert base density.
+            fog_params: [fog_density, fog_height_falloff, 768.0, map_fog_depth],
+            fog_color_anisotropy: [fog_color[0], fog_color[1], fog_color[2], 0.35],
+            rain_params: [
+                if self.weather.rain.enabled { 1.0 } else { 0.0 },
+                self.weather.rain.intensity.shader_value(),
+                self.weather.rain.intensity.haze_strength(),
+                0.0,
+            ],
+            rain_occlusion,
+            rain_wind: [
+                wind_angle.cos() * wind_speed,
+                wind_angle.sin() * wind_speed,
+                0.0,
+                0.0,
+            ],
+            shadow_view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
+            split_depths: if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+                bevy_cascade_bounds()
+            } else {
+                [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0]
+            },
+            shadow_params: [
+                SHADOW_MAP_SIZE as f32,
+                0.0006,
+                if self.cascaded_shadows_enabled && shadow_matrices.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy { 1.0 } else { 0.0 },
+            ],
+            grid: [weather::FROXEL_X, weather::FROXEL_Y, weather::FROXEL_Z, self.sun_visibility.shader_value() as u32],
+        };
+        self.queue.write_buffer(
+            &self.weather.fog.resources.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+    }
+
+    fn rebuild_frame_plan(&mut self) {
+        let fog_enabled = self.weather.fog.volumetric_effective();
+        let legacy_fog_enabled = self.weather.fog.legacy_effective();
+        let gamma_enabled = (self.gamma - 1.0).abs() > 0.001;
+        let lut_enabled =
+            self.color_lut_preset != ColorLutPreset::Off && self.color_lut_strength > 0.001;
+        let full_post_effects = self.hdr_enabled
+            || self.tone_mapping_enabled
+            || self.bloom_enabled
+            || self.halation_enabled
+            || self.ssao_enabled
+            || self.fxaa_enabled
+            || self.taa_enabled
+            || self.contact_shadows_enabled
+            || fog_enabled
+            || self.clouds_enabled
+            || self.weather.rain.enabled
+            || self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON
+            || self.ssr_enabled
+            || self.reflection_debug_enabled
+            || self.chromatic_aberration_strength > 0.001
+            || self.film_grain_strength > 0.001
+            || self.motion_blur_strength > 0.001
+            || self.depth_of_field_strength > 0.001;
+        // SMAA is a separate reference-quality resolve after the renderer's
+        // chosen output path. It does not by itself require our post-process
+        // intermediate: with gamma/effects off the world can render directly
+        // into the SMAA color target before SMAA resolves to the surface.
+        let use_post = gamma_enabled || lut_enabled || full_post_effects;
+        let use_hiz = self.gpu_driven_enabled && self.hiz_occlusion_enabled;
+
+        // Render settings are resolved here, on the cold path. The maximum-FPS
+        // frame loop should not rediscover that every advanced feature is OFF
+        // hundreds of times per frame/per draw. This path intentionally matches
+        // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
+        // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
+        let fast_baseline = !self.hdr_enabled
+            && !self.tone_mapping_enabled
+            && !self.bloom_enabled
+            && !self.halation_enabled
+            && !self.ssao_enabled
+            && !self.fxaa_enabled
+            && !self.smaa_enabled
+            && !self.taa_enabled
+            && !self.contact_shadows_enabled
+            && !fog_enabled
+            && !legacy_fog_enabled
+            && !self.clouds_enabled
+            && !self.weather.rain.enabled
+            && !self.ocean_enabled
+            && self.weather.rain.surface_wetness <= weather::RAIN_WETNESS_EPSILON
+            && self.weather.rain.puddle_amount <= weather::RAIN_PUDDLE_EPSILON
+            && !self.ssr_enabled
+            && !self.reflection_debug_enabled
+            && self.chromatic_aberration_strength <= 0.001
+            && !self.vignette_enabled
+            && self.film_grain_strength <= 0.001
+            && self.motion_blur_strength <= 0.001
+            && self.depth_of_field_strength <= 0.001
+            && self.color_lut_preset == ColorLutPreset::Off
+            && !self.gpu_driven_enabled
+            && !self.hiz_occlusion_enabled
+            && !self.clustered_lighting_enabled
+            && !self.emissive_area_lights_enabled
+            && !self.irradiance_volume_enabled
+            && !self.voxel_probe_gi_enabled
+            && !self.local_light_shadows_enabled
+            && !self.pbr_enabled
+            && !self.cascaded_shadows_enabled
+            && self.cull_debug_mode == CullDebugMode::Off
+            && !self.planar_reflection.active
+            && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off;
+        self.frame_plan = FramePlan {
+            world_path: if fast_baseline {
+                WorldRenderPath::FastBaseline
+            } else {
+                WorldRenderPath::Advanced
+            },
+            use_enhanced_world_shader: self.world_shader_variant_key().family()
+                == WorldShaderFamily::Enhanced,
+            use_post,
+            // The tiny post path handles display gamma and/or one trilinear 3-D
+            // LUT sample. If that path is already required it also applies the
+            // vignette, but vignette alone does not force an offscreen scene copy.
+            gamma_only_post: (gamma_enabled || lut_enabled) && !full_post_effects,
+            needs_linear_depth: self.ssao_enabled
+                || self.taa_enabled
+                || self.contact_shadows_enabled
+                || fog_enabled
+                || self.clouds_enabled
+                || self.weather.rain.enabled
+                || self.ssr_enabled
+                || self.reflection_debug_enabled
+                || self.motion_blur_strength > 0.001
+                || self.depth_of_field_strength > 0.001
+                || use_hiz,
+            use_hiz,
+            use_gpu_culling: self.gpu_driven_enabled || self.cull_debug_mode != CullDebugMode::Off,
+            // Area lights use the same clustered lists as entity/point lights,
+            // but remain independently toggleable. The active BSP pipeline is
+            // specialized for the requested source classes when settings change.
+            use_clustered_lighting: self.clustered_lighting_enabled
+                || self.emissive_area_lights_enabled,
+        };
+    }
+
+    fn update_lighting_settings(&self) {
+        let light_count = self.world.as_ref().map_or(0, |world| world.light_count);
+        let shadowed_count = self
+            .world
+            .as_ref()
+            .map_or(0, |world| world.local_shadows.shadowed_light_count);
+        let direct_local_lighting_enabled =
+            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        let settings = LightingSettings {
+            values: [
+                u32::from(direct_local_lighting_enabled && light_count != 0),
+                light_count,
+                self.config.width.max(1),
+                self.config.height.max(1),
+            ],
+            local_shadows: [
+                u32::from(
+                    direct_local_lighting_enabled
+                        && self.local_light_shadows_enabled
+                        && shadowed_count != 0,
+                ),
+                shadowed_count,
+                LOCAL_SHADOW_MAP_SIZE,
+                0,
+            ],
+            feature_flags: [
+                u32::from(self.emissive_area_lights_enabled),
+                u32::from(
+                    self.voxel_probe_gi_enabled
+                        && self
+                            .world
+                            .as_ref()
+                            .is_some_and(|world| world.voxel_probe_gi.enabled),
+                ),
+                // Ordinary entity/point dynamic lights are a separate source
+                // class from extracted emissive/area lights even though both
+                // share the clustered-light backend.
+                u32::from(self.clustered_lighting_enabled),
+                self.reflection_quality.shader_value(),
+            ],
+        };
+        self.queue.write_buffer(
+            &self.lighting_settings_buffer,
+            0,
+            bytemuck::bytes_of(&settings),
+        );
+    }
+
+    fn scene_format(&self) -> wgpu::TextureFormat {
+        if self.hdr_enabled || self.bloom_enabled || self.halation_enabled {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            self.config.format
+        }
+    }
+
+    fn rebuild_world_pipelines(&mut self) {
+        // Render-target compatibility changes (MSAA / scene format) invalidate
+        // every cached render pipeline. Rebuild only the active specialized
+        // variant plus the known-fast baseline; future settings combinations
+        // are created lazily again on demand.
+        let key = self.world_shader_variant_key();
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        let (layout, shader) = match key.family() {
+            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+        };
+        let (pipelines, reflection_pipelines, fast_pipelines) = {
+            let Some(world) = self.world.as_ref() else {
+                return;
+            };
+            let pipelines = create_world_pipelines(
+                &self.device,
+                layout,
+                shader,
+                scene_format,
+                samples,
+                &world.coarse_batches,
+                key.legacy_fog,
+                Some(key),
+            );
+            let reflection_pipelines =
+                if world.planar_reflectors.is_empty() || !key.planar_reflections {
+                    BTreeMap::new()
+                } else {
+                    create_reflection_pipelines(
+                        &self.device,
+                        layout,
+                        shader,
+                        scene_format,
+                        &world.coarse_batches,
+                        key.legacy_fog,
+                        key,
+                    )
+                };
+            let fast_pipelines = create_world_pipelines(
+                &self.device,
+                &self.fast_world_pipeline_layout,
+                &self.fast_world_shader,
+                scene_format,
+                samples,
+                &world.coarse_batches,
+                false,
+                None,
+            );
+            (pipelines, reflection_pipelines, fast_pipelines)
+        };
+
+        if let Some(world) = &mut self.world {
+            world.pipeline_variants.clear();
+            world.pipeline_variants.insert(
+                key,
+                WorldPipelineVariant {
+                    pipelines,
+                    reflection_pipelines,
+                },
+            );
+            world.active_pipeline_variant = key;
+            world.fast_pipelines = fast_pipelines;
+        }
+    }
+
+    /// Queue the scene rebuild instead of running it inline.
+    ///
+    /// Recreating the targets also recompiles the whole world pipeline set, which
+    /// costs hundreds of milliseconds. Several independent settings request it —
+    /// HDR, bloom, SSAO, SSR, depth of field, cloud resolution, MSAA — so a burst
+    /// of changes arriving together (a quality preset sends about forty cvars at
+    /// once) would otherwise pay that cost once per setting. Collapsing them to a
+    /// single rebuild before the next frame turns a multi-second stall into one.
+    fn request_scene_rebuild(&mut self) {
+        self.scene_rebuild_pending = true;
+    }
+
+    fn apply_pending_scene_rebuild(&mut self) {
+        if std::mem::take(&mut self.scene_rebuild_pending) {
+            self.rebuild_scene_targets_and_pipelines();
+        }
+    }
+
+    fn rebuild_scene_targets_and_pipelines(&mut self) {
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        self.targets = create_targets(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            scene_format,
+            samples,
+            self.bloom_enabled || self.halation_enabled,
+            self.depth_of_field_strength > 0.001,
+            self.ssao_enabled,
+            self.ssr_enabled,
+            self.cloud_render_resolution,
+        );
+        self.weather
+            .rain
+            .rebuild_render_pipelines(&self.device, scene_format, samples);
+        self.grass_renderer
+            .rebuild_pipeline(&self.device, scene_format, samples);
+        self.surface_sprite_effect_renderer
+            .rebuild_pipelines(&self.device, scene_format, samples);
+        self.dynamic_model_renderer
+            .rebuild_pipelines(&self.device, scene_format, samples);
+        self.rebuild_planar_reflection_resources();
+        self.taa_post_pipeline = create_taa_post_pipeline(
+            &self.device,
+            &self.post_pipeline_layout,
+            &self.post_shader,
+            self.config.format,
+            scene_format,
+        );
+        self.rebuild_post_bind_group();
+        self.rebuild_rain_haze_mask_bind_group();
+        self.rebuild_gpu_visibility_resources();
+        self.history_valid = false;
+        self.cloud_history_valid = false;
+        self.cloud_history_read_index = 0;
+        self.cloud_temporal_frame_index = 0;
+        self.taa_frame_index = 0;
+        self.history_read_index = 0;
+        self.ssao_history_valid = false;
+        self.ssao_history_read_index = 0;
+        self.ssr_history_valid = false;
+        self.ssr_history_read_index = 0;
+        self.ssr_frame_index = 0;
+        self.update_post_uniform();
+        self.update_lighting_settings();
+        self.rebuild_world_pipelines();
+        self.cull_debug_pipeline = create_cull_debug_pipeline(
+            &self.device,
+            &self.cull_debug_pipeline_layout,
+            &self.cull_debug_shader,
+            scene_format,
+            samples,
+        );
+        self.wireframe_pipeline = self.wireframe_supported.then(|| {
+            create_wireframe_pipeline(
+                &self.device,
+                &self.wireframe_pipeline_layout,
+                &self.wireframe_shader,
+                scene_format,
+                samples,
+            )
+        });
+        self.surface_inspector_pipeline = create_surface_inspector_pipeline(
+            &self.device,
+            &self.wireframe_pipeline_layout,
+            &self.surface_inspector_shader,
+            scene_format,
+            samples,
+        );
+    }
+
+    fn update_post_uniform(&self) {
+        self.write_post_uniform(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            0.0,
+            [0.0; 4],
+            false,
+        );
+    }
+
+    fn write_post_uniform(
+        &self,
+        view_proj: Mat4,
+        inv_view_proj: Mat4,
+        cloud_inv_view_proj: Mat4,
+        cloud_prev_view_proj: Mat4,
+        prev_view_proj: Mat4,
+        motion_prev_view_proj: Mat4,
+        motion_blur_scale: f32,
+        camera_pos_time: [f32; 4],
+        history_valid: bool,
+    ) {
+        let uniform = PostUniform {
+            color: PostColorSettings {
+                gamma: self.gamma,
+                // The floating-point scene format and display tone mapping are
+                // independent. This lane controls ACES only; HDR rendering is
+                // selected separately by scene_format().
+                tone_mapping: if self.tone_mapping_enabled { 1.0 } else { 0.0 },
+                bloom: if self.bloom_enabled { 1.0 } else { 0.0 },
+                ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
+            },
+            aa: PostAaSettings {
+                fxaa: if self.fxaa_enabled { 1.0 } else { 0.0 },
+                viewport_width: self.config.width.max(1) as f32,
+                viewport_height: self.config.height.max(1) as f32,
+                taa: if self.taa_enabled { 1.0 } else { 0.0 },
+            },
+            taa_params: [
+                if self.hdr_enabled { 1.0 } else { 0.0 },
+                if self.reflection_debug_enabled { 1.0 } else { 0.0 },
+                self.reflection_quality.shader_value() as f32,
+                0.0,
+            ],
+            scene: PostSceneSettings {
+                contact_shadows: if self.contact_shadows_enabled {
+                    1.0
+                } else {
+                    0.0
+                },
+                volumetric_fog: if self.weather.fog.volumetric_effective()
+                    || self.weather.rain.enabled
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+                ssr: if self.ssr_enabled { 1.0 } else { 0.0 },
+                history_valid: if history_valid { 1.0 } else { 0.0 },
+            },
+            film: PostFilmSettings {
+                halation: if self.halation_enabled { 1.0 } else { 0.0 },
+                chromatic_aberration: self.chromatic_aberration_strength,
+                vignette: if self.vignette_enabled { 1.0 } else { 0.0 },
+                lut_strength: if self.color_lut_preset != ColorLutPreset::Off {
+                    self.color_lut_strength
+                } else {
+                    0.0
+                },
+            },
+            grain: PostGrainSettings {
+                strength: self.film_grain_strength,
+                grain_size: 1.35,
+                time: self.started.elapsed().as_secs_f32(),
+                exposure: 0.0,
+            },
+            camera_fx: PostCameraFxSettings {
+                motion_blur_scale,
+                depth_of_field: self.depth_of_field_strength,
+                dof_focus_distance: self.dof_focus_distance,
+                dof_quality: self.dof_quality.shader_value(),
+            },
+            clouds: CloudRenderSettings {
+                values: [
+                    if self.clouds_enabled { 1.0 } else { 0.0 },
+                    self.cloud_type.shader_value(),
+                    self.cloud_quality,
+                    self.cloud_coverage,
+                ],
+            },
+            cloud_layer: CloudLayerSettings {
+                values: [
+                    self.cloud_height,
+                    self.cloud_thickness,
+                    self.cloud_wind_speed,
+                    self.cloud_wind_direction.to_radians(),
+                ],
+            },
+            cloud_sun: {
+                let sun = self.active_sun();
+                CloudSunSettings {
+                    direction_intensity: [
+                        sun.direction[0],
+                        sun.direction[1],
+                        sun.direction[2],
+                        sun.intensity,
+                    ],
+                    color_density: [sun.color[0], sun.color[1], sun.color[2], 1.0],
+                }
+            },
+            cloud_shadow: PostCloudShadowSettings {
+                values: [
+                    if self.clouds_enabled && self.cloud_shadows_enabled {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.75,
+                    if self.cloud_temporal_depth_fix { 1.0 } else { 0.0 },
+                    if self.cloud_terrain_interaction { 1.0 } else { 0.0 },
+                ],
+            },
+            cloud_shaping: PostCloudShapingSettings {
+                values: [
+                    self.cloud_shear,
+                    self.cloud_base_variation,
+                    if self.cloud_empty_skip { 1.0 } else { 0.0 },
+                    self.cloud_aerial,
+                ],
+            },
+            cloud_sky_ambient: {
+                // Falls back to the stored default until a map with a skybox is
+                // loaded, so the menu backdrop and fog-only levels still light
+                // clouds sensibly.
+                let sky = self
+                    .world
+                    .as_ref()
+                    .map_or(self.cloud_sky_average, |world| world.sky_average);
+                PostCloudSkyAmbientSettings {
+                    values: [
+                        sky[0],
+                        sky[1],
+                        sky[2],
+                        if self.cloud_sky_ambient_enabled { 1.0 } else { 0.0 },
+                    ],
+                }
+            },
+            cloud_temporal_tuning: PostCloudTemporalTuningSettings {
+                values: [
+                    self.cloud_history_blend,
+                    self.cloud_motion_reject,
+                    if self.cloud_history_depth_reject { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+            },
+            cloud_variation: PostCloudVariationSettings {
+                values: [
+                    self.cloud_thickness_variation,
+                    self.cloud_size,
+                    if self.cloud_wind_variation { 1.0 } else { 0.0 },
+                    if self.cloud_shape_evolution { 1.0 } else { 0.0 },
+                ],
+            },
+            cloud_temporal: PostCloudTemporalSettings {
+                values: [
+                    if self.clouds_enabled && self.cloud_temporal_enabled {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    if self.cloud_history_valid { 1.0 } else { 0.0 },
+                    (self.cloud_temporal_frame_index & 3) as f32,
+                    2.0,
+                ],
+            },
+            rain: [
+                if self.weather.rain.enabled { 1.0 } else { 0.0 },
+                self.weather.rain.intensity.shader_value(),
+                self.weather.rain.intensity.haze_strength(),
+                self.weather.rain.puddle_amount,
+            ],
+            weather_occlusion: match &self.weather.rain.occlusion {
+                WeatherOcclusionCache::Ready(info) => [
+                    info.min_xz[0],
+                    info.min_xz[1],
+                    info.inv_extent_xz[0],
+                    info.inv_extent_xz[1],
+                ],
+                WeatherOcclusionCache::Pending(_) | WeatherOcclusionCache::Building(_) | WeatherOcclusionCache::Unavailable => [0.0; 4],
+            },
+            camera_pos_time,
+            prev_camera_pos_time: if self.cloud_history_valid {
+                [
+                    self.previous_camera_position.x,
+                    self.previous_camera_position.y,
+                    self.previous_camera_position.z,
+                    self.previous_frame_time,
+                ]
+            } else {
+                camera_pos_time
+            },
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            cloud_inv_view_proj: cloud_inv_view_proj.to_cols_array_2d(),
+            cloud_prev_view_proj: cloud_prev_view_proj.to_cols_array_2d(),
+            prev_view_proj: prev_view_proj.to_cols_array_2d(),
+            motion_prev_view_proj: motion_prev_view_proj.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.post_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn write_ssao_temporal_uniform(
+        &self,
+        view_proj: Mat4,
+        inv_view_proj: Mat4,
+        camera_pos_time: [f32; 4],
+    ) {
+        let previous_view_proj = if self.ssao_history_valid {
+            self.previous_view_proj
+        } else {
+            view_proj
+        };
+        let previous_camera = if self.ssao_history_valid {
+            self.previous_camera_position
+        } else {
+            Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2])
+        };
+        let uniform = SsaoTemporalUniform {
+            viewport_history: [
+                self.config.width.max(1) as f32,
+                self.config.height.max(1) as f32,
+                if self.ssao_history_valid { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            camera_pos_time,
+            previous_camera_pos: [previous_camera.x, previous_camera.y, previous_camera.z, 0.0],
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            prev_view_proj: previous_view_proj.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.ssao_temporal_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn write_ssr_temporal_uniform(
+        &self,
+        view_proj: Mat4,
+        inv_view_proj: Mat4,
+        camera_pos_time: [f32; 4],
+    ) {
+        let previous_view_proj = if self.ssr_history_valid {
+            self.previous_view_proj
+        } else {
+            view_proj
+        };
+        let previous_camera = if self.ssr_history_valid {
+            self.previous_camera_position
+        } else {
+            Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2])
+        };
+        let uniform = SsrTemporalUniform {
+            viewport_history: [
+                self.config.width.max(1) as f32,
+                self.config.height.max(1) as f32,
+                if self.ssr_history_valid { 1.0 } else { 0.0 },
+                (self.ssr_frame_index & 0xffff) as f32,
+            ],
+            camera_pos_time,
+            previous_camera_pos: [
+                previous_camera.x,
+                previous_camera.y,
+                previous_camera.z,
+                self.reflection_quality.shader_value() as f32,
+            ],
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            prev_view_proj: previous_view_proj.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.ssr_temporal_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn rebuild_post_bind_group(&mut self) {
+        // The march target is recreated with the other cloud targets whenever
+        // render resolution changes, so its bind group has to follow.
+        self.cloud_resolve_bind_group = create_cloud_resolve_bind_group(
+            &self.device,
+            &self.cloud_resolve_layout,
+            &self.targets.cloud_march_view,
+        );
+        self.auto_exposure_bind_group = create_auto_exposure_bind_group(
+            &self.device,
+            &self.auto_exposure_layout,
+            &self.targets.scene_view,
+            &self.auto_exposure_state_buffer,
+            &self.auto_exposure_settings_buffer,
+        );
+        self.post_bind_groups = std::array::from_fn(|history_index| {
+            std::array::from_fn(|ssao_index| {
+                std::array::from_fn(|ssr_index| {
+                    std::array::from_fn(|cloud_index| {
+                        let ssao_view = self
+                            .targets
+                            .ssao_history
+                            .as_ref()
+                            .map_or(&self.targets.scene_view, |history| {
+                                &history.views[ssao_index]
+                            });
+                        let (ssr_radiance_view, ssr_depth_view) =
+                            self.targets.ssr_history.as_ref().map_or(
+                                (&self.targets.scene_view, &self.targets.linear_depth_view),
+                                |history| {
+                                    (
+                                        &history.radiance_views[ssr_index],
+                                        &history.depth_views[ssr_index],
+                                    )
+                                },
+                            );
+                        let cloud_noise = self
+                            .cloud_noise_resources
+                            .as_ref()
+                            .unwrap_or(&self.cloud_noise_fallback);
+                        create_post_bind_group(
+                            &self.device,
+                            &self.post_layout,
+                            &self.targets.scene_view,
+                            &self.targets.linear_depth_view,
+                            &self.targets.history_views[history_index],
+                            ssao_view,
+                            ssr_radiance_view,
+                            ssr_depth_view,
+                            &self.post_sampler,
+                            &self.post_buffer,
+                            &self.weather.fog.resources.buffer,
+                            self.targets.bloom.as_ref(),
+                            self.targets.dof.as_ref(),
+                            &self.color_lut_view,
+                            &self.color_lut_sampler,
+                            &cloud_noise.detail_view,
+                            &cloud_noise.sampler,
+                            &self.targets.cloud_transfer_views[cloud_index],
+                            self.weather.rain.collision_view(),
+                            &self.targets.rain_haze_mask_view,
+                            &cloud_noise.weather_view,
+                            &self.targets.motion_vector_view,
+                            &self.targets.ao_depth_view,
+                            &self.targets.reflection_mask_view,
+                            &self.auto_exposure_state_buffer,
+                        )
+                    })
+                })
+            })
+        });
+        self.ssao_temporal_bind_groups = create_ssao_temporal_bind_groups(
+            &self.device,
+            &self.ssao_temporal_layout,
+            &self.targets.linear_depth_view,
+            self.targets.ssao_history.as_ref(),
+            &self.post_sampler,
+            &self.ssao_temporal_buffer,
+        );
+        self.ssr_temporal_bind_groups = create_ssr_temporal_bind_groups(
+            &self.device,
+            &self.ssr_temporal_layout,
+            &self.targets.scene_view,
+            &self.targets.linear_depth_view,
+            self.targets.ssr_history.as_ref(),
+            &self.post_sampler,
+            &self.ssr_temporal_buffer,
+            &self.shadow_resources.weather_height_view,
+            &self.shadow_resources.weather_sampler,
+            &self.shadow_resources.weather_surface_buffer,
+            &self.targets.reflection_mask_view,
+        );
+        self.bloom_bind_groups = create_bloom_bind_groups(
+            &self.device,
+            &self.bloom_layout,
+            &self.post_sampler,
+            &self.targets.scene_view,
+            self.targets.bloom.as_ref(),
+        );
+        self.dof_bind_group = create_dof_bind_group(
+            &self.device,
+            &self.dof_layout,
+            &self.targets.scene_view,
+            &self.targets.linear_depth_view,
+            &self.post_sampler,
+            &self.dof_buffer,
+            self.targets.dof.as_ref(),
+        );
+        self.gamma_post_bind_group = create_gamma_post_bind_group(
+            &self.device,
+            &self.gamma_post_layout,
+            &self.targets.scene_view,
+            &self.post_sampler,
+            &self.gamma_post_buffer,
+            &self.color_lut_view,
+            &self.color_lut_sampler,
+        );
+        self.fast_post_bind_group = create_fast_post_bind_group(
+            &self.device,
+            &self.fast_post_layout,
+            &self.targets.scene_view,
+            &self.post_sampler,
+            &self.gamma_post_buffer,
+        );
+    }
+
+    fn rebuild_rain_haze_mask_bind_group(&mut self) {
+        self.weather.rain.rebuild_haze_bind_group(
+            &self.device,
+            &self.post_buffer,
+            &self.targets.linear_depth_view,
+            &self.targets.rain_haze_mask_view,
+        );
+    }
+
+    fn render_fast_baseline(
+        &mut self,
+        camera: &Camera,
+        player_position: Option<Vec3>,
+        area_mask: Option<&[u8; 32]>,
+        dynamic_models: &[DynamicModelSurface],
+    ) -> Result<FrameInfo, RenderError> {
+        let frame_started = Instant::now();
+        let view_proj = camera.view_projection(self.config.width, self.config.height);
+        let uniform = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos_time: [
+                camera.position.x,
+                camera.position.y,
+                camera.position.z,
+                self.started.elapsed().as_secs_f32(),
+            ],
+            clip_plane: [0.0; 4],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), 0, 0],
+            camera_forward: camera.forward().extend(0.0).to_array(),
+            unjittered_view_proj: view_proj.to_cols_array_2d(),
+            previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let mut info = FrameInfo::default();
+        let snow_deform_center = self.surface_deformation.field_center();
+        let mut prepared_grass = None;
+        let mut prepared_surface_sprite_effects = None;
+        if let Some(world) = &mut self.world {
+            update_visibility(world, camera);
+            if self.grass_enabled {
+                let pvs_cluster = world.last_cluster.flatten();
+                if let Some(grass) = world.grass.as_ref() {
+                    prepared_grass = Some(self.grass_renderer.prepare_draw(
+                        &self.device,
+                        &self.queue,
+                        grass,
+                        camera.position,
+                        player_position,
+                        view_proj,
+                        pvs_cluster,
+                        uniform.camera_pos_time[3],
+                        self.grass_precompute_enabled,
+                        self.grass_mid_lod_enabled,
+                        self.grass_front_to_back_enabled,
+                    ));
+                }
+            }
+            if !world.surface_sprite_effects.is_empty() {
+                let pvs_cluster = if matches!(self.pvs_mode, PvsMode::Off) {
+                    None
+                } else {
+                    world.last_cluster.flatten()
+                };
+                prepared_surface_sprite_effects = Some(
+                    self.surface_sprite_effect_renderer.prepare_draw(
+                        &self.device,
+                        &self.queue,
+                        &world.surface_sprite_effects,
+                        camera,
+                        pvs_cluster,
+                        uniform.camera_pos_time[3] * 1000.0,
+                    ),
+                );
+            }
+        }
+        let dynamic_prepare_started = Instant::now();
+        self.dynamic_model_renderer
+            .prepare(&self.device, &self.queue, dynamic_models);
+        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
+            self.dynamic_model_renderer.ghoul2_draw_stats();
+        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
+        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
+        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
+        info.dynamic_model_vertices = dynamic_models
+            .iter()
+            .map(|surface| surface.vertex_count() as u64)
+            .sum();
+        info.dynamic_model_indices = dynamic_models
+            .iter()
+            .map(|surface| surface.index_count() as u64)
+            .sum();
+        info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+
+        let acquire_started = Instant::now();
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => return Err(RenderError::Occluded),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(RenderError::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::Lost),
+            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
+        };
+        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        let frame_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut screenshot_readback = self.prepare_screenshot_readback();
+
+        let encode_started = Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA fast baseline frame encoder"),
+            });
+        let use_gamma_post = (self.gamma - 1.0).abs() > 0.001;
+        let menu_backdrop_active = self.menu_backdrop_requested();
+        let presentation_output = if menu_backdrop_active {
+            &self
+                .menu_backdrop
+                .as_ref()
+                .expect("menu backdrop resources must exist while active")
+                .view
+        } else {
+            &frame_view
+        };
+        let scene_output = if use_gamma_post {
+            &self.targets.scene_view
+        } else {
+            presentation_output
+        };
+
+        if self.grass_enabled {
+            if let (Some(world), Some(prepared)) = (&self.world, prepared_grass.as_ref()) {
+                if let Some(grass) = world.grass.as_ref() {
+                    self.grass_renderer.encode_prepare(
+                        &mut encoder,
+                        grass,
+                        prepared,
+                        &self.shadow_resources.receiver_bind_group,
+                    );
+                }
+            }
+        }
+
+        if let Some(world) = &self.world {
+            let (color_view, resolve_target) = if let Some(msaa_view) = &self.targets.msaa_view {
+                (msaa_view, Some(scene_output))
+            } else {
+                (scene_output, None)
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA world (fast baseline)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            let active = active_batch_selection(world, self.pvs_mode);
+            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            let mut current_pipeline = None;
+            let mut grass_drawn = false;
+            let mut snow_shell_drawn = false;
+            for &batch_index in active.indices {
+                let batch = &active.batches[batch_index];
+                if !batch_area_visible(batch, effective_area_mask) { continue; }
+                if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
+                    if !snow_shell_drawn {
+                        draw_snow_shell_fast(&mut pass, world, view_proj, snow_deform_center, &mut current_pipeline);
+                        pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                        snow_shell_drawn = true;
+                    }
+                    if self.grass_enabled {
+                        if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                            self.gpu_profiler.write_render_pass_timestamp(
+                                &mut pass,
+                                GpuPass::Grass,
+                                false,
+                            );
+                            info.grass = self.grass_renderer.draw(
+                                &mut pass,
+                                &self.camera_bind_group,
+                                &self.shadow_resources.receiver_bind_group,
+                                grass,
+                                prepared,
+                            );
+                            self.gpu_profiler.write_render_pass_timestamp(
+                                &mut pass,
+                                GpuPass::Grass,
+                                true,
+                            );
+                            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            pass.set_index_buffer(
+                                world.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                            current_pipeline = None;
+                        }
+                    }
+                    grass_drawn = true;
+                }
+                if current_pipeline != Some(batch.source.pipeline) {
+                    pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
+                    current_pipeline = Some(batch.source.pipeline);
+                }
+                pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
+            }
+            if !snow_shell_drawn {
+                draw_snow_shell_fast(&mut pass, world, view_proj, snow_deform_center, &mut current_pipeline);
+                pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+            }
+            if !grass_drawn && self.grass_enabled {
+                if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                    self.gpu_profiler.write_render_pass_timestamp(
+                        &mut pass,
+                        GpuPass::Grass,
+                        false,
+                    );
+                    info.grass = self.grass_renderer.draw(
+                        &mut pass,
+                        &self.camera_bind_group,
+                        &self.shadow_resources.receiver_bind_group,
+                        grass,
+                        prepared,
+                    );
+                    self.gpu_profiler.write_render_pass_timestamp(
+                        &mut pass,
+                        GpuPass::Grass,
+                        true,
+                    );
+                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                }
+            }
+            if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                self.surface_sprite_effect_renderer.draw(
+                    &mut pass,
+                    &self.camera_bind_group,
+                    &world.surface_sprite_effects,
+                    prepared,
+                );
+            }
+            if let Some(ocean) = self.ocean.as_ref() {
+                ocean.draw_spray(&mut pass, &self.camera_bind_group);
+            }
+            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass,
+                GpuPass::DynamicModels,
+                false,
+            );
+            self.dynamic_model_renderer
+                .draw(&mut pass, &self.camera_bind_group);
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass,
+                GpuPass::DynamicModels,
+                true,
+            );
+
+            // DynamicModelRenderer::draw() binds its own transient entity vertex/index
+            // buffers. Everything below this point (wireframe, surface inspector, PVS
+            // debug) addresses BSP/world index ranges, so restore the world geometry
+            // bindings unconditionally before any of those debug draws run.
+            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+            if self.wireframe_enabled {
+                if let Some(pipeline) = &self.wireframe_pipeline {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if batch.source.pipeline.class != DrawClass::Sky {
+                            draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
+                        }
+                    }
+                }
+            }
+            if let Some(vertices) = &self.inspector_vertex_range {
+                if let Some(indices) = inspector_index_range(active.batches, vertices) {
+                    pass.set_pipeline(&self.surface_inspector_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.draw_indexed(indices, 0, 0..1);
+                }
+            }
+        } else {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA clear (fast baseline)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        if use_gamma_post {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA gamma post (fast baseline)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: presentation_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.fast_post_pipeline);
+            pass.set_bind_group(0, &self.fast_post_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
+        // frame, so the readout ends up above it rather than beneath.
+        if !menu_backdrop_active && !self.egui_active && self.ui_vertex_count != 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA overlay (fast baseline)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: presentation_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_pipeline);
+            pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
+            pass.draw(0..self.ui_vertex_count, 0..1);
+        }
+
+        if !menu_backdrop_active && !self.egui_active {
+            if let Some(readback) = screenshot_readback.as_mut() {
+                let staging_buffer = &self
+                    .screenshot_readback_buffer
+                    .as_ref()
+                    .expect("screenshot staging buffer must exist after preparation")
+                    .buffer;
+                Self::encode_screenshot_copy(
+                    &mut encoder,
+                    &frame.texture,
+                    staging_buffer,
+                    readback,
+                );
+                readback.inline_copy = true;
+            }
+        }
+        let command_buffer = encoder.finish();
+        info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        let submit_started = Instant::now();
+        let frame_submission = self.queue.submit([command_buffer]);
+        if let Some(readback) = screenshot_readback
+            .as_mut()
+            .filter(|readback| readback.inline_copy)
+        {
+            readback.submission_index = Some(frame_submission.clone());
+        }
+        if menu_backdrop_active {
+            self.submit_menu_backdrop(&frame_view);
+        }
+        self.submit_egui(&frame_view);
+        if menu_backdrop_active || self.egui_active {
+            self.submit_ui_overlay(&frame_view);
+        }
+        if let Some(readback) = screenshot_readback
+            .as_mut()
+            .filter(|readback| !readback.inline_copy)
+        {
+            self.submit_screenshot_copy(&frame.texture, readback);
+        }
+        self.window.pre_present_notify();
+        frame.present();
+        if let Some(readback) = screenshot_readback {
+            self.finish_screenshot_readback(readback);
+        }
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(info)
+    }
+
+    /// Apply this frame's CG_Mover inline-model poses: rewrite each moved
+    /// model's private vertex region and its batches' CPU and GPU cull bounds.
+    /// Models absent from an authoritative list collapse to zero-area
+    /// triangles, so no draw list has to change.
+    fn update_inline_models(&mut self, instances: Option<&[InlineModelInstance]>) {
+        let Some(world) = self.world.as_mut() else { return };
+        let WorldGpu {
+            inline_models,
+            coarse_batches,
+            full_batches,
+            vertex_buffer,
+            cull_records_buffer,
+            ..
+        } = world;
+        let stride = std::mem::size_of::<GpuVertex>() as u64;
+        let record_stride = std::mem::size_of::<GpuCullRecord>() as u64;
+        for model in inline_models.iter_mut() {
+            let target = match instances {
+                None => Some(InlineModelInstance::compiled(model.model)),
+                Some(list) => list.iter().find(|instance| instance.model == model.model).copied(),
+            };
+            if model.uploaded == Some(target) {
+                continue;
+            }
+            model.uploaded = Some(target);
+            let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, target);
+            self.queue.write_buffer(
+                vertex_buffer,
+                u64::from(model.gpu_vertex_start) * stride,
+                bytemuck::cast_slice(&vertices),
+            );
+            let bounds: [f32; 8] = [
+                minimum[0], minimum[1], minimum[2], 0.0,
+                maximum[0], maximum[1], maximum[2], 0.0,
+            ];
+            for (set, indices) in [
+                (&mut *coarse_batches, &model.coarse_batches),
+                (&mut *full_batches, &model.full_batches),
+            ] {
+                for &index in indices {
+                    let Some(batch) = set.get_mut(index) else { continue };
+                    batch.bounds_min = minimum;
+                    batch.bounds_max = maximum;
+                    self.queue.write_buffer(
+                        cull_records_buffer,
+                        u64::from(batch.cull_index) * record_stride,
+                        bytemuck::cast_slice(&bounds),
+                    );
+                }
+            }
+        }
+    }
+
+    fn render(
+        &mut self,
+        camera: &Camera,
+        player_position: Option<Vec3>,
+        area_mask: Option<&[u8; 32]>,
+        dynamic_models: &[DynamicModelSurface],
+        dof_focus_target: f32,
+        motion_reference_camera: &Camera,
+        motion_camera_sample_dt: f32,
+        motion_camera_sample_age: f32,
+    ) -> Result<FrameInfo, RenderError> {
+        if self.size.width == 0 || self.size.height == 0 {
+            return Ok(FrameInfo::default());
+        }
+
+        // Resolved before any pass borrows the renderer mutably.
+        let ocean_clipmap = self.ocean_clipmap_quality();
+        let update_weather_surface = self.weather.rain.enabled
+            || self.weather.rain.surface_wetness > weather::RAIN_WETNESS_EPSILON
+            || self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON;
+        if update_weather_surface {
+            let wetness_time = self.started.elapsed().as_secs_f32();
+            if self.advance_surface_wetness(wetness_time) {
+                self.update_weather_surface_uniform();
+                self.rebuild_frame_plan();
+            }
+        }
+
+        let menu_backdrop_active = self.menu_backdrop_requested();
+        if menu_backdrop_active {
+            self.ensure_menu_backdrop_resources();
+        }
+
+        // Snowflow state advances only when new brushes/window movement/relaxation
+        // require it. This is deliberately before the fast-path early return.
+        self.surface_deformation.prepare_frame(&self.device, &self.queue);
+
+        // Pipeline/render-plan selection happens only when settings change. The
+        // hot frame path can therefore jump directly into the known-fast renderer
+        // without walking every advanced feature branch. GPU timestamp/surface
+        // diagnostics deliberately use the full path so their instrumentation
+        // remains available when explicitly requested.
+        if self.frame_plan.world_path == WorldRenderPath::FastBaseline
+            && !self.gpu_profiler.enabled()
+            && !self.surface_diag_pending
+            && !self.frame_diag_pending
+        {
+            return self.render_fast_baseline(camera, player_position, area_mask, dynamic_models);
+        }
+
+        let frame_started = Instant::now();
+        let frame_time = self.started.elapsed().as_secs_f32();
+        let frame_delta = if self.previous_frame_time > 0.0 {
+            (frame_time - self.previous_frame_time).clamp(0.0, 0.25)
+        } else {
+            0.0
+        };
+        if self.depth_of_field_strength > 0.001 {
+            let target = dof_focus_target.clamp(32.0, 16384.0);
+            if !self.dof_focus_valid || frame_delta <= 0.0 {
+                self.dof_focus_distance = target;
+                self.dof_focus_valid = true;
+            } else {
+                // Smooth autofocus like a physical focus pull instead of snapping
+                // to every tiny collision-depth change under the crosshair.
+                let alpha = 1.0 - (-frame_delta / 0.16).exp();
+                self.dof_focus_distance += (target - self.dof_focus_distance) * alpha;
+            }
+        }
+        if self.depth_of_field_strength > 0.001 {
+            self.queue.write_buffer(
+                &self.dof_buffer,
+                0,
+                bytemuck::bytes_of(&DofUniform {
+                    focus_strength: [
+                        self.dof_focus_distance,
+                        self.depth_of_field_strength,
+                        self.config.width.max(1) as f32,
+                        self.config.height.max(1) as f32,
+                    ],
+                    quality: [self.dof_quality.shader_value(), 0.0, 0.0, 0.0],
+                }),
+            );
+        }
+        self.gpu_profiler.begin_frame(&self.device);
+        if self.cull_debug_mode != CullDebugMode::Off {
+            self.cull_diagnostics_readback.begin_frame(&self.device);
+        }
+        let plan = self.frame_plan;
+        let enhanced_world_shader = plan.use_enhanced_world_shader;
+        let jitter = if self.taa_enabled {
+            temporal_jitter(self.taa_frame_index)
+        } else {
+            [0.0, 0.0]
+        };
+        let view_proj = if self.taa_enabled {
+            camera.view_projection_jittered(self.config.width, self.config.height, jitter)
+        } else {
+            camera.view_projection(self.config.width, self.config.height)
+        };
+        let cloud_view_proj = if self.clouds_enabled {
+            camera.view_projection(self.config.width, self.config.height)
+        } else {
+            Mat4::IDENTITY
+        };
+        let cloud_inv_view_proj = if self.clouds_enabled {
+            cloud_view_proj.inverse()
+        } else {
+            Mat4::IDENTITY
+        };
+        let cloud_prev_view_proj = if self.clouds_enabled && self.cloud_history_valid {
+            self.previous_cloud_view_proj
+        } else {
+            cloud_view_proj
+        };
+        let motion_prev_view_proj =
+            motion_reference_camera.view_projection(self.config.width, self.config.height);
+        let motion_blur_scale =
+            if self.motion_blur_strength > 0.001 && motion_camera_sample_age <= (1.0 / 60.0) {
+                // A conventional 180-degree shutter at 60 Hz is ~1/120 s. Scale
+                // camera-snapshot displacement to that exposure, then decay after
+                // the last camera update so stopping the mouse doesn't leave a smear.
+                let exposure = 1.0 / 120.0;
+                let sample_dt = motion_camera_sample_dt.clamp(1.0 / 10_000.0, 0.05);
+                let fade = (1.0 - motion_camera_sample_age / (1.0 / 60.0)).clamp(0.0, 1.0);
+                (self.motion_blur_strength * exposure / sample_dt * fade).clamp(0.0, 32.0)
+            } else {
+                0.0
+            };
+        self.motion_blur_runtime_scale = motion_blur_scale;
+        let inv_view_proj = if plan.use_post && !plan.gamma_only_post {
+            view_proj.inverse()
+        } else {
+            Mat4::IDENTITY
+        };
+        let camera_pos_time = [
+            camera.position.x,
+            camera.position.y,
+            camera.position.z,
+            frame_time,
+        ];
+        let unjittered_view_proj = camera.view_projection(self.config.width, self.config.height);
+        let previous_unjittered_view_proj = if self.camera_history_valid {
+            self.previous_unjittered_view_proj
+        } else {
+            unjittered_view_proj
+        };
+        let uniform = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos_time,
+            clip_plane: [0.0; 4],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), 0, 0],
+            camera_forward: camera.forward().extend(0.0).to_array(),
+            unjittered_view_proj: unjittered_view_proj.to_cols_array_2d(),
+            previous_unjittered_view_proj: previous_unjittered_view_proj.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        if self.weather.rain.enabled {
+            self.prepare_rain_frame(camera, frame_time);
+        }
+        if update_weather_surface {
+            self.update_weather_surface_uniform();
+        }
+        let previous_view_proj =
+            if !plan.gamma_only_post && plan.use_post && self.camera_history_valid {
+                self.previous_view_proj
+            } else {
+                view_proj
+            };
+        if plan.use_post && !plan.gamma_only_post {
+            self.write_post_uniform(
+                view_proj,
+                inv_view_proj,
+                cloud_inv_view_proj,
+                cloud_prev_view_proj,
+                previous_view_proj,
+                motion_prev_view_proj,
+                motion_blur_scale,
+                camera_pos_time,
+                self.taa_enabled && self.history_valid,
+            );
+        }
+        if self.ssao_enabled {
+            self.write_ssao_temporal_uniform(view_proj, inv_view_proj, camera_pos_time);
+        }
+        if self.ssr_enabled {
+            self.write_ssr_temporal_uniform(view_proj, inv_view_proj, camera_pos_time);
+        }
+
+        let shadow_matrices = if self.cascaded_shadows_enabled {
+            let sun = self.active_sun();
+            let bevy_mode = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy;
+            let (matrices, splits, texel_sizes) = if bevy_mode {
+                bevy_cascade_shadow_matrices(
+                    camera,
+                    self.config.width,
+                    self.config.height,
+                    Vec3::from_array(sun.direction),
+                )
+            } else {
+                let matrices = legacy_cascade_shadow_matrices(
+                    camera,
+                    self.config.width,
+                    self.config.height,
+                    Vec3::from_array(sun.direction),
+                );
+                (
+                    matrices,
+                    [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0],
+                    [0.0; SHADOW_CASCADES],
+                )
+            };
+            self.write_shadow_uniforms(
+                &matrices, &splits, &texel_sizes, true, camera.forward(), camera_pos_time, bevy_mode
+            );
+            Some(matrices)
+        } else {
+            None
+        };
+        if self.weather.fog.volumetric_effective() || self.weather.rain.enabled {
+            self.write_froxel_uniform(inv_view_proj, camera_pos_time, shadow_matrices.as_ref());
+        }
+
+        let mut info = FrameInfo::default();
+        info.gpu_ms = self.gpu_profiler.latest_frame_ms();
+        if self.cull_debug_mode != CullDebugMode::Off {
+            info.cull_visible = self.cull_diagnostics_readback.latest[0];
+            info.cull_frustum_rejected = self.cull_diagnostics_readback.latest[1];
+            info.cull_hiz_rejected = self.cull_diagnostics_readback.latest[2];
+        }
+        let mut active_selection_changed = false;
+        let mut prepared_grass = None;
+        let mut prepared_surface_sprite_effects = None;
+        let snow_deform_center = self.surface_deformation.field_center();
+        if let Some(world) = &mut self.world {
+            update_visibility(world, camera);
+            let active = active_batch_selection(world, self.pvs_mode);
+            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            if self.cull_debug_mode != CullDebugMode::Off {
+                info.cull_pvs_rejected =
+                    u32::try_from(active.batches.len().saturating_sub(active.indices.len()))
+                        .unwrap_or(u32::MAX);
+                info.cull_area_rejected = u32::try_from(
+                    active
+                        .indices
+                        .iter()
+                        .filter(|&&batch_index| {
+                            !batch_area_visible(&active.batches[batch_index], effective_area_mask)
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX);
+            }
+            if self.gpu_driven_enabled || self.cull_debug_mode != CullDebugMode::Off {
+                active_selection_changed = update_active_cull_indices(
+                    &self.queue,
+                    world,
+                    self.pvs_mode,
+                    area_mask,
+                    self.cull_debug_mode != CullDebugMode::Off,
+                );
+            }
+            if self.grass_enabled {
+                let pvs_cluster = world.last_cluster.flatten();
+                if let Some(grass) = world.grass.as_ref() {
+                    prepared_grass = Some(self.grass_renderer.prepare_draw(
+                        &self.device,
+                        &self.queue,
+                        grass,
+                        camera.position,
+                        player_position,
+                        view_proj,
+                        pvs_cluster,
+                        frame_time,
+                        self.grass_precompute_enabled,
+                        self.grass_mid_lod_enabled,
+                        self.grass_front_to_back_enabled,
+                    ));
+                }
+            }
+            if !world.surface_sprite_effects.is_empty() {
+                let pvs_cluster = if matches!(self.pvs_mode, PvsMode::Off) {
+                    None
+                } else {
+                    world.last_cluster.flatten()
+                };
+                prepared_surface_sprite_effects = Some(
+                    self.surface_sprite_effect_renderer.prepare_draw(
+                        &self.device,
+                        &self.queue,
+                        &world.surface_sprite_effects,
+                        camera,
+                        pvs_cluster,
+                        frame_time * 1000.0,
+                    ),
+                );
+            }
+        }
+        if active_selection_changed {
+            self.update_gpu_cull_settings();
+        }
+
+        let planar_views = if self.planar_reflection.active {
+            self.world
+                .as_ref()
+                .map_or([None; PLANAR_REFLECTION_SLOTS], |world| {
+                    select_planar_reflection_views(
+                        world,
+                        camera,
+                        view_proj,
+                        self.pvs_mode,
+                        area_mask,
+                        self.planar_reflection_mode,
+                        self.reflection_quality,
+                        &self.planar_slot_history,
+                    )
+                })
+        } else {
+            [None; PLANAR_REFLECTION_SLOTS]
+        };
+        self.planar_slot_history = planar_views.map(|view| view.map(|view| view.plane));
+
+        if self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off {
+            let selected: Vec<usize> = planar_views
+                .iter()
+                .flatten()
+                .map(|view| view.coarse_batch_index)
+                .collect();
+            if self.last_planar_debug_selection.as_ref() != Some(&selected) {
+                if selected.is_empty() {
+                    println!("[PLANAR DEBUG] no eligible visible reflector selected");
+                } else if let Some(world) = self.world.as_ref() {
+                    println!(
+                        "[PLANAR DEBUG] mode={} active slots={}",
+                        self.planar_reflection_debug_mode.label(),
+                        selected.len()
+                    );
+                    for (slot, view) in planar_views.iter().enumerate() {
+                        let Some(view) = view else { continue };
+                        let reflector = world.planar_reflectors.iter().find(|reflector| {
+                            reflector.coarse_batch_index == view.coarse_batch_index
+                        });
+                        let source = world.coarse_batches.get(view.coarse_batch_index);
+                        if let Some(reflector) = reflector {
+                            println!(
+                                "[PLANAR DEBUG] slot={} selected {:?} batch={} plane=[{:.4}, {:.4}, {:.4}, {:.2}] area={:.1} cluster={:?} tcGen={:?} authored={} env_candidate={} texture={:?} bounds=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]",
+                                slot,
+                                view.kind,
+                                view.coarse_batch_index,
+                                view.plane[0],
+                                view.plane[1],
+                                view.plane[2],
+                                view.plane[3],
+                                reflector.area,
+                                view.cluster,
+                                source.map(|batch| batch.source.tc_gen),
+                                source.is_some_and(|batch| batch.source.planar_reflection),
+                                source.is_some_and(|batch| batch.source.planar_environment_candidate),
+                                source.and_then(|batch| batch.source.texture),
+                                reflector.bounds_min[0],
+                                reflector.bounds_min[1],
+                                reflector.bounds_min[2],
+                                reflector.bounds_max[0],
+                                reflector.bounds_max[1],
+                                reflector.bounds_max[2],
+                            );
+                        }
+                    }
+                }
+                self.last_planar_debug_selection = Some(selected);
+            }
+        } else {
+            self.last_planar_debug_selection = None;
+        }
+
+        if self.planar_reflection.active {
+            let mut planes = [[0.0; 4]; PLANAR_REFLECTION_SLOTS];
+            let mut active_count = 0usize;
+            for (slot, view) in planar_views.iter().enumerate() {
+                if let Some(view) = view {
+                    planes[slot] = view.plane;
+                    active_count += 1;
+                }
+            }
+            let settings = PlanarReflectionUniform {
+                planes,
+                // Portal fragments use their main-frame pixel coordinates to
+                // address the downscaled reflection texture array.
+                viewport: [
+                    self.config.width.max(1) as f32,
+                    self.config.height.max(1) as f32,
+                    active_count as f32,
+                    if self.planar_reflection_mode == PlanarReflectionMode::Environment {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ],
+                debug: [
+                    self.planar_reflection_debug_mode.shader_value(),
+                    if self.reflection_debug_enabled { 1.0 } else { 0.0 },
+                    self.reflection_quality.shader_value() as f32,
+                    0.0,
+                ],
+            };
+            self.queue.write_buffer(
+                &self.planar_reflection.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&settings),
+            );
+            for (slot, view) in planar_views.iter().enumerate() {
+                let Some(view) = view else { continue };
+                let reflected_camera = CameraUniform {
+                    view_proj: view.view_proj.to_cols_array_2d(),
+                    camera_pos_time: [
+                        view.camera_position.x,
+                        view.camera_position.y,
+                        view.camera_position.z,
+                        camera_pos_time[3],
+                    ],
+                    clip_plane: view.plane,
+                    render_flags: [1, u32::from(self.static_bsp_ao_enabled), 0, 0],
+                    camera_forward: view.camera_forward.extend(0.0).to_array(),
+                    unjittered_view_proj: view.view_proj.to_cols_array_2d(),
+                    previous_unjittered_view_proj: view.view_proj.to_cols_array_2d(),
+                };
+                self.queue.write_buffer(
+                    &self.planar_camera_buffers[slot],
+                    0,
+                    bytemuck::bytes_of(&reflected_camera),
+                );
+            }
+        } else if self.reflection_debug_enabled {
+            let settings = PlanarReflectionUniform {
+                planes: [[0.0; 4]; PLANAR_REFLECTION_SLOTS],
+                viewport: [
+                    self.config.width.max(1) as f32,
+                    self.config.height.max(1) as f32,
+                    0.0,
+                    0.0,
+                ],
+                debug: [
+                    self.planar_reflection_debug_mode.shader_value(),
+                    1.0,
+                    self.reflection_quality.shader_value() as f32,
+                    0.0,
+                ],
+            };
+            self.queue.write_buffer(
+                &self.planar_reflection.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&settings),
+            );
+        }
+
+        self.update_local_shadow_selection(camera);
+        self.ensure_local_shadow_cache();
+
+        info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        // One-shot diagnostic for CurrentSurfaceTexture::Validation. Wgpu's
+        // Validation variant means a validation error occurred inside
+        // Surface::get_current_texture(). Capture that exact call in a validation
+        // scope so we can print the real error rather than guessing from the
+        // generic surface status. This path is completely dormant unless
+        // JKA_SURFACE_DIAG=1 is set.
+        let surface_scope = self
+            .surface_diag_pending
+            .then(|| self.device.push_error_scope(wgpu::ErrorFilter::Validation));
+        if self.surface_diag_pending {
+            eprintln!(
+                "[JKA SURFACE DIAG] before acquire: config={}x{} format={:?} present={:?} latency={} usage={:?} alpha={:?} view_formats={:?}",
+                self.config.width,
+                self.config.height,
+                self.config.format,
+                self.config.present_mode,
+                self.config.desired_maximum_frame_latency,
+                self.config.usage,
+                self.config.alpha_mode,
+                self.config.view_formats,
+            );
+        }
+        let acquire_started = Instant::now();
+        let surface_result = self.surface.get_current_texture();
+        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(scope) = surface_scope {
+            let scoped_error = block_on(scope.pop());
+            match scoped_error {
+                Some(error) => {
+                    eprintln!("[JKA SURFACE DIAG] get_current_texture validation: {error}");
+                    eprintln!("[JKA SURFACE DIAG] debug: {error:?}");
+                }
+                None => {
+                    eprintln!("[JKA SURFACE DIAG] get_current_texture scope: no validation error captured");
+                }
+            }
+            eprintln!("[JKA SURFACE DIAG] returned: {surface_result:?}");
+            self.surface_diag_pending = false;
+        }
+        let frame = match surface_result {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => return Err(RenderError::Occluded),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(RenderError::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::Lost),
+            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
+        };
+        let frame_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut screenshot_readback = self.prepare_screenshot_readback();
+
+        // One-shot validation capture for the first diagnostic frame. The first
+        // surface acquisition succeeds, while later acquisitions report
+        // CurrentSurfaceTexture::Validation. That strongly indicates that a
+        // validation error is being generated while recording/submitting the
+        // preceding frame. Keep one scope around the entire first timed frame
+        // so wgpu can report the exact offending API/resource.
+        let frame_validation_scope = self
+            .frame_diag_pending
+            .then(|| self.device.push_error_scope(wgpu::ErrorFilter::Validation));
+        if self.frame_diag_pending {
+            eprintln!(
+                "[JKA FRAME DIAG] begin first diagnostic frame: plan={:?} gpu_profiler={} config={}x{}",
+                plan,
+                self.gpu_profiler.enabled(),
+                self.config.width,
+                self.config.height,
+            );
+        }
+
+        let encode_started = Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA frame encoder"),
+            });
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
+        let ocean_sun = self.active_sun();
+        let ocean_scene_context = self.world.as_ref().map(|world| {
+            (
+                world.sky_average,
+                world.primary_skybox.is_some(),
+                world.ocean_surfaces.clone(),
+            )
+        });
+        if let Some(ocean) = &mut self.ocean {
+            if let Some((sky_average, has_skybox, surfaces)) = ocean_scene_context.as_ref() {
+                ocean.set_environment(
+                    &self.queue,
+                    ocean_sun.direction,
+                    ocean_sun.color,
+                    ocean_sun.intensity,
+                    *sky_average,
+                    *has_skybox,
+                );
+                let fallback: Vec<_> = surfaces.iter().copied().filter(|s| {
+                    let centre = [(s.minimum[0]+s.maximum[0])*0.5,s.plane_height,(s.minimum[1]+s.maximum[1])*0.5];
+                    !self.authored_oceans.iter().any(|(a,_)| a.contains_render_point(centre))
+                }).collect();
+                ocean.set_surfaces(&self.queue, &fallback);
+            }
+            // Re-centre the clipmap before the wave step so the geometry the
+            // frame draws and the field it samples come from the same tick.
+            let coarsest = self
+                .world
+                .as_ref()
+                .map(|world| world.ocean_coarsest_spacing)
+                .unwrap_or(0.0);
+            if coarsest > 0.0 {
+                ocean.set_clipmap_center(&self.queue, camera.position.to_array(), coarsest);
+            }
+            ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+        }
+        for (authored, ocean) in &mut self.authored_oceans {
+            if let Some((sky_average, has_skybox, _)) = ocean_scene_context.as_ref() {
+                ocean.set_environment(&self.queue, ocean_sun.direction, ocean_sun.color,
+                    ocean_sun.intensity, *sky_average, *has_skybox);
+                let selected = [crate::ocean::OceanSurface {plane_height:authored.height,
+                    minimum:[authored.mins[0],-authored.maxs[1]], maximum:[authored.maxs[0],-authored.mins[1]]}];
+                ocean.set_surfaces(&self.queue, &selected);
+            }
+            let coarsest = self.world.as_ref().map(|w| w.ocean_coarsest_spacing).unwrap_or(0.0);
+            ocean.set_clipmap_center(&self.queue, camera.position.to_array(), coarsest);
+            ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+        }
+
+        // Grass preparation has to precede the first sun-shadow cascade because
+        // nearby blades reuse the prepared wind/trample transform as a cheap
+        // one-triangle shadow caster. This is the same compute work the color
+        // pass already needed; it is merely scheduled earlier.
+        if self.grass_enabled {
+            if let (Some(world), Some(prepared)) = (&self.world, prepared_grass.as_ref()) {
+                if let Some(grass) = world.grass.as_ref() {
+                    self.gpu_profiler.write_encoder_timestamp(
+                        &mut encoder,
+                        GpuPass::GrassPrepare,
+                        false,
+                    );
+                    self.grass_renderer.encode_prepare(
+                        &mut encoder,
+                        grass,
+                        prepared,
+                        &self.shadow_resources.receiver_bind_group,
+                    );
+                    self.gpu_profiler.write_encoder_timestamp(
+                        &mut encoder,
+                        GpuPass::GrassPrepare,
+                        true,
+                    );
+                }
+            }
+        }
+
+        if let Some(shadow_matrices) = shadow_matrices.as_ref() {
+            if let Some(world) = &self.world {
+                let bevy_mode = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy;
+                let cascade_count = if bevy_mode { SHADOW_CASCADES } else { LEGACY_SHADOW_CASCADES };
+                for cascade in 0..cascade_count {
+                    if self.sun_visibility != SunVisibilityMode::Legacy {
+                        let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("JKA shader-sun sky admission"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.shadow_resources.sky_layer_views[cascade],
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(if bevy_mode { 0.0 } else { 1.0 }),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        sky_pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_sky_pipeline } else { &self.shadow_resources.sky_pipeline });
+                        sky_pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
+                        sky_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        for batch in &world.coarse_batches {
+                            if batch.source.pipeline.class != DrawClass::Sky {
+                                continue;
+                            }
+                            draw_world_batch(&mut sky_pass, batch, 0..1, None);
+                        }
+                    }
+
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("JKA cascaded sun shadow"),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.shadow_resources.layer_views[cascade],
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(if bevy_mode { 0.0 } else { 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_pipeline } else { &self.shadow_resources.pipeline });
+                    pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
+                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    let mut mask_pipeline_active = false;
+                    for batch in &world.coarse_batches {
+                        if (batch.source.pipeline.blend != BlendMode::Opaque
+                                && self.sun_visibility != SunVisibilityMode::Filtered)
+                            || !aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                shadow_matrices[cascade],
+                            )
+                        {
+                            continue;
+                        }
+                        match batch.source.pipeline.class {
+                            DrawClass::Opaque if batch.source.alpha_cutoff <= 0.0 => {
+                                if mask_pipeline_active {
+                                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_pipeline } else { &self.shadow_resources.pipeline });
+                                    mask_pipeline_active = false;
+                                }
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
+                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                                if !mask_pipeline_active {
+                                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_mask_pipeline } else { &self.shadow_resources.mask_pipeline });
+                                    mask_pipeline_active = true;
+                                }
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
+                            DrawClass::Transparent if self.sun_visibility == SunVisibilityMode::Filtered => {
+                                pass.set_pipeline(if bevy_mode {
+                                    &self.shadow_resources.bevy_translucent_pipeline
+                                } else {
+                                    &self.shadow_resources.translucent_pipeline
+                                });
+                                mask_pipeline_active = true;
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // The source GodotGrass demo enables full grass shadow mapping,
+                    // but explicitly notes its high cost. Only the closest grass
+                    // contributes here, through the existing first sun cascade and
+                    // with the source one-triangle low blade as a depth-only proxy.
+                    if cascade == 0 && self.grass_enabled {
+                        if let (Some(grass), Some(prepared)) =
+                            (world.grass.as_ref(), prepared_grass.as_ref())
+                        {
+                            self.grass_renderer.draw_shadow(
+                                &mut pass,
+                                &self.shadow_resources.caster_bind_groups[cascade],
+                                grass,
+                                prepared,
+                                bevy_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.weather.rain.dispatch_simulation(&mut encoder);
+
+        if plan.needs_linear_depth {
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Depth, false);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA AO depth prepass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.linear_depth_render_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1_000_000.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.motion_vector_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.reflection_mask_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.ao_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.depth_prepass_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            // The reflection-policy attachment records whether this particular
+            // surface actually won a planar slot this frame. Surfaces that were
+            // merely eligible but lost the budget remain free to fall back to SSR.
+            pass.set_bind_group(2, &self.planar_reflection.bind_group, &[]);
+            if let Some(world) = &self.world {
+                let active = active_batch_selection(world, self.pvs_mode);
+                let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                let mut mask_pipeline_active = false;
+                for &batch_index in active.indices {
+                    let batch = &active.batches[batch_index];
+                    if !batch_area_visible(batch, effective_area_mask) { continue; }
+                    match batch.source.pipeline.class {
+                        DrawClass::Opaque => {
+                            if mask_pipeline_active {
+                                pass.set_pipeline(&self.depth_prepass_pipeline);
+                                mask_pipeline_active = false;
+                            }
+                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            draw_world_batch(
+                                &mut pass,
+                                batch,
+                                0..1,
+                                None,
+                            );
+                        }
+                        DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                            if !mask_pipeline_active {
+                                pass.set_pipeline(&self.depth_prepass_mask_pipeline);
+                                mask_pipeline_active = true;
+                            }
+                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            draw_world_batch(
+                                &mut pass,
+                                batch,
+                                0..1,
+                                None,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            drop(pass);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Depth, true);
+        }
+
+        if plan.use_hiz && plan.needs_linear_depth {
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::HiZ, false);
+            for (mip_index, bind_group) in self.hiz_reduce_bind_groups.iter().enumerate() {
+                let destination_mip = u32::try_from(mip_index + 1).unwrap_or(u32::MAX);
+                let width = (self.config.width.max(1) >> destination_mip).max(1);
+                let height = (self.config.height.max(1) >> destination_mip).max(1);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("JKA Hi-Z reduce"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.hiz_reduce_pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::HiZ, true);
+        }
+
+        if plan.use_gpu_culling {
+            if let Some(world) = &self.world {
+                let debug_culling = self.cull_debug_mode != CullDebugMode::Off;
+                if debug_culling {
+                    encoder.clear_buffer(&world.cull_debug_count_buffer, 0, None);
+                }
+                if world.active_cull_count > 0 {
+                    if let Some(cull_bind_group) = &world.cull_bind_group {
+                        if self.gpu_compaction_supported && !world.compact_groups.is_empty() {
+                            encoder.clear_buffer(&world.compact_count_buffer, 0, None);
+                        }
+                        self.gpu_profiler.write_encoder_timestamp(
+                            &mut encoder,
+                            GpuPass::Cull,
+                            false,
+                        );
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("JKA GPU world culling"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&self.gpu_cull_pipeline);
+                            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                            pass.set_bind_group(1, cull_bind_group, &[]);
+                            pass.dispatch_workgroups(world.active_cull_count.div_ceil(64), 1, 1);
+                        }
+                        self.gpu_profiler.write_encoder_timestamp(
+                            &mut encoder,
+                            GpuPass::Cull,
+                            true,
+                        );
+                    }
+                }
+                if debug_culling {
+                    self.cull_diagnostics_readback
+                        .encode_copy(&mut encoder, &world.cull_debug_count_buffer);
+                }
+            }
+        }
+
+        if plan.use_clustered_lighting {
+            if let Some(world) = &self.world {
+                if world.light_count > 0 {
+                    self.gpu_profiler.write_encoder_timestamp(
+                        &mut encoder,
+                        GpuPass::Cluster,
+                        false,
+                    );
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("JKA clustered-light build"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.cluster_compute_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(1, &world.cluster_compute_bind_group, &[]);
+                    pass.dispatch_workgroups(CLUSTER_COUNT.div_ceil(64), 1, 1);
+                    drop(pass);
+                    self.gpu_profiler
+                        .write_encoder_timestamp(&mut encoder, GpuPass::Cluster, true);
+                }
+            }
+        }
+
+        if self.weather.fog.volumetric_effective() || self.weather.rain.enabled {
+            if let Some(world) = &self.world {
+                if let Some(bind_group) = &world.froxel_bind_group {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("JKA froxel volumetric fog build"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.weather.fog.resources.pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.dispatch_workgroups(weather::FROXEL_X.div_ceil(8), weather::FROXEL_Y.div_ceil(8), 1);
+                }
+            }
+        }
+
+        // Render up to four distinct visible planar views at half resolution.
+        // Coplanar surfaces share one texture-array layer. Each reflection pass
+        // still receives the recursion-disabled bind group, so mirrors do not
+        // recursively explode when several reflective planes face each other.
+        if let Some(world) = self.world.as_ref() {
+            let active_pipeline_variant = &world.pipeline_variants[&world.active_pipeline_variant];
+            let planar_binding_test =
+                self.planar_reflection_debug_mode == PlanarReflectionDebugMode::BindingTest;
+            for (slot, reflection_view) in planar_views.iter().enumerate() {
+                let Some(reflection_view) = reflection_view else {
+                    continue;
+                };
+                let indices: &[usize] = if self.pvs_mode == PvsMode::Off {
+                    &world.coarse_all_batches
+                } else if let Some(cluster) = reflection_view.cluster {
+                    world
+                        .coarse_visible_batches_by_cluster
+                        .get(cluster)
+                        .unwrap_or(&world.coarse_all_batches)
+                } else {
+                    &world.coarse_all_batches
+                };
+                let reflection_area_mask = if self.pvs_mode == PvsMode::Off
+                    || reflection_view.cluster.is_none()
+                {
+                    None
+                } else {
+                    area_mask
+                };
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA planar reflection"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.planar_reflection.color_views[slot],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(if planar_binding_test {
+                                wgpu::Color {
+                                    r: 0.0,
+                                    g: 1.0,
+                                    b: 0.12,
+                                    a: 1.0,
+                                }
+                            } else {
+                                self.weather.fog.clear_color()
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.planar_reflection.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &self.planar_camera_bind_groups[slot], &[]);
+                pass.set_bind_group(
+                    2,
+                    if enhanced_world_shader {
+                        &world.lighting_bind_group
+                    } else {
+                        &world.lighting_bind_group_lean
+                    },
+                    &[],
+                );
+                pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                pass.set_bind_group(4, &self.planar_reflection.reflection_pass_bind_group, &[]);
+                if enhanced_world_shader {
+                    let ocean_bind_group = self
+                        .ocean
+                        .as_ref()
+                        .map(|ocean| &ocean.render_bind_group)
+                        .unwrap_or(&self.ocean_inert_bind_group);
+                    pass.set_bind_group(6, ocean_bind_group, &[]);
+                }
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                let mut current_pipeline = None;
+                if !planar_binding_test {
+                    for &batch_index in indices {
+                        let batch = &world.coarse_batches[batch_index];
+                        if !batch_area_visible(batch, reflection_area_mask) { continue; }
+                        if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                        // Omit this reflector's own geometry. Other reflective
+                        // planes render through the recursion-disabled path.
+                        let selected_range = &world.coarse_batches
+                            [reflection_view.coarse_batch_index]
+                            .source
+                            .vertices;
+                        if &batch.source.vertices == selected_range {
+                            continue;
+                        }
+                        if batch.source.pipeline.class != DrawClass::Sky
+                            && !aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                reflection_view.view_proj,
+                            )
+                        {
+                            continue;
+                        }
+                        if current_pipeline != Some(batch.source.pipeline) {
+                            if let Some(pipeline) = active_pipeline_variant
+                                .reflection_pipelines
+                                .get(&batch.source.pipeline)
+                            {
+                                pass.set_pipeline(pipeline);
+                            } else {
+                                continue;
+                            }
+                            current_pipeline = Some(batch.source.pipeline);
+                        }
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
+                        draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                    }
+                }
+            }
+        }
+
+        // SMAA owns a single-sample color target and resolves it to the
+        // swapchain with the reference three-pass SMAA 1x algorithm. Keep it
+        // completely out of the frame when disabled. If no renderer post pass
+        // is needed, the world can render straight into this target and avoid
+        // an otherwise-pointless fullscreen copy.
+        let presentation_output = if menu_backdrop_active {
+            &self
+                .menu_backdrop
+                .as_ref()
+                .expect("menu backdrop resources must exist while active")
+                .view
+        } else {
+            &frame_view
+        };
+        let mut smaa_frame = if self.smaa_enabled {
+            Some(
+                self.smaa_target
+                    .as_mut()
+                    .expect("SMAA target must exist while SMAA is enabled")
+                    .start_frame(&self.device, &self.queue, presentation_output),
+            )
+        } else {
+            None
+        };
+        let final_output: &wgpu::TextureView = match smaa_frame.as_ref() {
+            Some(smaa_frame) => smaa_frame,
+            None => presentation_output,
+        };
+
+        let scene_output = if plan.use_post {
+            &self.targets.scene_view
+        } else {
+            final_output
+        };
+
+        let dynamic_prepare_started = Instant::now();
+        self.dynamic_model_renderer
+            .prepare(&self.device, &self.queue, dynamic_models);
+        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
+            self.dynamic_model_renderer.ghoul2_draw_stats();
+        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
+        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
+        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
+        info.dynamic_model_vertices = dynamic_models
+            .iter()
+            .map(|surface| surface.vertex_count() as u64)
+            .sum();
+        info.dynamic_model_indices = dynamic_models
+            .iter()
+            .map(|surface| surface.index_count() as u64)
+            .sum();
+
+        let mut compact_group_drawn = std::mem::take(&mut self.compact_group_scratch);
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
+        if let Some(world) = &self.world {
+            let active_pipeline_variant = &world.pipeline_variants[&world.active_pipeline_variant];
+            let (color_view, resolve_target) = if let Some(msaa_view) = &self.targets.msaa_view {
+                (msaa_view, Some(scene_output))
+            } else {
+                (scene_output, None)
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA world"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(
+                2,
+                if enhanced_world_shader {
+                    &world.lighting_bind_group
+                } else {
+                    &world.lighting_bind_group_lean
+                },
+                &[],
+            );
+            pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+            pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+            if enhanced_world_shader {
+                let ocean_bind_group = self
+                    .ocean
+                    .as_ref()
+                    .map(|ocean| &ocean.render_bind_group)
+                    .unwrap_or(&self.ocean_inert_bind_group);
+                pass.set_bind_group(6, ocean_bind_group, &[]);
+            }
+            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            let active = active_batch_selection(world, self.pvs_mode);
+            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            let mut current_pipeline = None;
+            let mut grass_drawn = false;
+            let mut snow_shell_drawn = false;
+            let use_compaction = self.gpu_driven_enabled
+                && !self.ocean_enabled
+                && self.gpu_compaction_supported
+                && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                && !world.compact_groups.is_empty();
+            compact_group_drawn.clear();
+            compact_group_drawn.resize(world.compact_groups.len(), false);
+            for &batch_index in active.indices {
+                let batch = &active.batches[batch_index];
+                if !batch_area_visible(batch, effective_area_mask) { continue; }
+                if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
+                    if !snow_shell_drawn {
+                        draw_snow_shell(
+                            &mut pass,
+                            world,
+                            &active_pipeline_variant.pipelines,
+                            view_proj,
+                            snow_deform_center,
+                            &mut current_pipeline,
+                        );
+                        snow_shell_drawn = true;
+                    }
+                    if self.grass_enabled {
+                        if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                            self.gpu_profiler.write_render_pass_timestamp(
+                                &mut pass,
+                                GpuPass::Grass,
+                                false,
+                            );
+                            info.grass = self.grass_renderer.draw(
+                                &mut pass,
+                                &self.camera_bind_group,
+                                &self.shadow_resources.receiver_bind_group,
+                                grass,
+                                prepared,
+                            );
+                            self.gpu_profiler.write_render_pass_timestamp(
+                                &mut pass,
+                                GpuPass::Grass,
+                                true,
+                            );
+                            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            pass.set_index_buffer(
+                                world.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            // Grass owns bind-group slot 2 while its pipeline is active
+                            // (cascaded-shadow receiver). Restore the world pipeline's
+                            // lighting/shadow/reflection bindings before the next BSP draw;
+                            // RenderPass bind groups persist across pipeline switches.
+                            pass.set_bind_group(
+                                2,
+                                if enhanced_world_shader {
+                                    &world.lighting_bind_group
+                                } else {
+                                    &world.lighting_bind_group_lean
+                                },
+                                &[],
+                            );
+                            pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                            pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                            if enhanced_world_shader {
+                                let ocean_bind_group = self
+                                    .ocean
+                                    .as_ref()
+                                    .map(|ocean| &ocean.render_bind_group)
+                                    .unwrap_or(&self.ocean_inert_bind_group);
+                                pass.set_bind_group(6, ocean_bind_group, &[]);
+                            }
+                            current_pipeline = None;
+                        }
+                    }
+                    grass_drawn = true;
+                }
+                if matches!(
+                    self.planar_reflection_debug_mode,
+                    PlanarReflectionDebugMode::Candidates
+                        | PlanarReflectionDebugMode::SelectedPlane
+                        | PlanarReflectionDebugMode::AppliedSample
+                        | PlanarReflectionDebugMode::BindingTest
+                ) {
+                    // In surface-debug modes draw only the stage that can
+                    // actually own the planar source substitution. Do not rely
+                    // on propagated sibling-plane metadata here: AUTO/FULL PVS
+                    // may render a finer sub-batch than the coarse reflector
+                    // selected for the reflected camera.
+                    let planar_stage = batch.source.planar_reflection
+                        || (self.planar_reflection_mode == PlanarReflectionMode::Environment
+                            && matches!(batch.source.tc_gen, TcGen::Environment));
+                    if !planar_stage {
+                        continue;
+                    }
+                }
+                if use_compaction {
+                    if let Some(group_index) = batch.compact_group {
+                        let group_index = group_index as usize;
+                        if !compact_group_drawn[group_index] {
+                            let group = &world.compact_groups[group_index];
+                            let representative = match group.representative_set {
+                                WorldBatchSet::Coarse => {
+                                    &world.coarse_batches[group.representative_index]
+                                }
+                                WorldBatchSet::Full => {
+                                    &world.full_batches[group.representative_index]
+                                }
+                            };
+                            if current_pipeline != Some(representative.source.pipeline) {
+                                pass.set_pipeline(
+                                    &active_pipeline_variant.pipelines
+                                        [&representative.source.pipeline],
+                                );
+                                current_pipeline = Some(representative.source.pipeline);
+                            }
+                            pass.set_bind_group(1, &representative.bind_group, &[]);
+                            pass.multi_draw_indexed_indirect_count(
+                                &world.compact_indirect_buffer,
+                                u64::from(group.output_base)
+                                    * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                &world.compact_count_buffer,
+                                group_index as u64 * std::mem::size_of::<u32>() as u64,
+                                group.max_count,
+                            );
+                            compact_group_drawn[group_index] = true;
+                        }
+                        continue;
+                    }
+                }
+                if current_pipeline != Some(batch.source.pipeline) {
+                    pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
+                    current_pipeline = Some(batch.source.pipeline);
+                }
+                pass.set_bind_group(1, &batch.bind_group, &[]);
+                if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
+                if self.gpu_driven_enabled
+                    && !(self.ocean_enabled && batch.source.water_primary)
+                {
+                    let offset = u64::from(batch.cull_index)
+                        * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+                    pass.draw_indexed_indirect(&world.indirect_buffer, offset);
+                } else {
+                    // Promoted water uses the separately generated dense index
+                    // range, which is not represented by the stock indirect record.
+                    draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                }
+            }
+            if !snow_shell_drawn {
+                draw_snow_shell(
+                    &mut pass,
+                    world,
+                    &active_pipeline_variant.pipelines,
+                    view_proj,
+                    snow_deform_center,
+                    &mut current_pipeline,
+                );
+            }
+            if !grass_drawn && self.grass_enabled {
+                if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                    self.gpu_profiler.write_render_pass_timestamp(
+                        &mut pass,
+                        GpuPass::Grass,
+                        false,
+                    );
+                    info.grass = self.grass_renderer.draw(
+                        &mut pass,
+                        &self.camera_bind_group,
+                        &self.shadow_resources.receiver_bind_group,
+                        grass,
+                        prepared,
+                    );
+                    self.gpu_profiler.write_render_pass_timestamp(
+                        &mut pass,
+                        GpuPass::Grass,
+                        true,
+                    );
+                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    // Keep the parent world pass in a valid state even when grass is
+                    // the final opaque draw. This also protects later debug/wireframe
+                    // draws from inheriting grass's bind-group slot 2.
+                    pass.set_bind_group(
+                        2,
+                        if enhanced_world_shader {
+                            &world.lighting_bind_group
+                        } else {
+                            &world.lighting_bind_group_lean
+                        },
+                        &[],
+                    );
+                    pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                    pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                    if enhanced_world_shader {
+                        let ocean_bind_group = self
+                            .ocean
+                            .as_ref()
+                            .map(|ocean| &ocean.render_bind_group)
+                            .unwrap_or(&self.ocean_inert_bind_group);
+                        pass.set_bind_group(6, ocean_bind_group, &[]);
+                    }
+                }
+            }
+            if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                self.surface_sprite_effect_renderer.draw(
+                    &mut pass,
+                    &self.camera_bind_group,
+                    &world.surface_sprite_effects,
+                    prepared,
+                );
+            }
+            if let Some(ocean) = self.ocean.as_ref() {
+                ocean.draw_spray(&mut pass, &self.camera_bind_group);
+            }
+            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass,
+                GpuPass::DynamicModels,
+                false,
+            );
+            self.dynamic_model_renderer
+                .draw(&mut pass, &self.camera_bind_group);
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass,
+                GpuPass::DynamicModels,
+                true,
+            );
+
+            // DynamicModelRenderer::draw() binds its own transient entity vertex/index
+            // buffers. Everything below this point (wireframe, surface inspector, PVS
+            // debug) addresses BSP/world index ranges, so restore the world geometry
+            // bindings unconditionally before any of those debug draws run.
+            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+            if self.wireframe_enabled {
+                if let Some(pipeline) = &self.wireframe_pipeline {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if batch.source.pipeline.class != DrawClass::Sky {
+                            draw_world_batch(&mut pass, batch, 0..1, None);
+                        }
+                    }
+                }
+            }
+            if let Some(vertices) = &self.inspector_vertex_range {
+                if let Some(indices) = inspector_index_range(active.batches, vertices) {
+                    pass.set_pipeline(&self.surface_inspector_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.draw_indexed(indices, 0, 0..1);
+                }
+            }
+            if self.cull_debug_mode == CullDebugMode::RejectionReasons {
+                pass.set_pipeline(&self.cull_debug_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &world.cull_debug_bind_group, &[]);
+                // Draw the entire PVS representation, not merely its active
+                // subset. The shader discards visible records and colors only
+                // the rejection stage recorded for each batch.
+                for batch in active.batches {
+                    if batch.source.pipeline.class == DrawClass::Sky {
+                        continue;
+                    }
+                    let first_instance = batch.cull_index;
+                    draw_world_batch(
+                        &mut pass,
+                        batch,
+                        first_instance..first_instance.saturating_add(1),
+                        None,
+                    );
+                }
+            }
+            self.weather.rain.render(&mut pass, &self.camera_bind_group);
+        } else {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::World, true);
+        self.compact_group_scratch = compact_group_drawn;
+
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
+        if self.ssao_enabled {
+            if let (Some(history), Some(bind_groups)) =
+                (&self.targets.ssao_history, &self.ssao_temporal_bind_groups)
+            {
+                let history_write_index = 1 - self.ssao_history_read_index;
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA half-resolution temporal SSAO"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &history.views[history_write_index],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.ssao_temporal_pipeline);
+                pass.set_bind_group(0, &bind_groups[self.ssao_history_read_index], &[]);
+                pass.draw(0..3, 0..1);
+                drop(pass);
+                self.ssao_history_read_index = history_write_index;
+            }
+        }
+
+        if self.ssr_enabled {
+            if let (Some(history), Some(bind_groups)) =
+                (&self.targets.ssr_history, &self.ssr_temporal_bind_groups)
+            {
+                let history_write_index = 1 - self.ssr_history_read_index;
+                let color_attachments = [
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &history.radiance_views[history_write_index],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &history.depth_views[history_write_index],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA half-resolution temporal SSR"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.ssr_temporal_pipeline);
+                pass.set_bind_group(0, &bind_groups[self.ssr_history_read_index], &[]);
+                pass.draw(0..3, 0..1);
+                drop(pass);
+                self.ssr_history_read_index = history_write_index;
+            }
+        }
+
+        if self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled {
+            // Inlined rather than called via &self methods: a live borrow of
+            // self.smaa_target (through smaa_frame) is in scope here, and a
+            // method call would reborrow all of *self.
+            let uniform = AutoExposureUniform {
+                params: [1.0, frame_delta.clamp(0.0, 0.25), -2.0, 2.0],
+                // 18% middle gray, with slower opening into darkness than closing
+                // down on a suddenly bright scene. These are intentionally fixed
+                // policy constants for r_autoExposure rather than extra user knobs.
+                adaptation: [0.18, 1.5, 3.0, 0.0],
+            };
+            self.queue.write_buffer(
+                &self.auto_exposure_settings_buffer,
+                0,
+                bytemuck::bytes_of(&uniform),
+            );
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("JKA auto-exposure luminance/adaptation"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.auto_exposure_pipeline);
+            pass.set_bind_group(0, &self.auto_exposure_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        if self.depth_of_field_strength > 0.001 {
+            if let (Some(target), Some(bind_group)) = (&self.targets.dof, &self.dof_bind_group) {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA Gaussian DOF horizontal"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.dof_pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+
+        if self.bloom_enabled || self.halation_enabled {
+            if let (Some(bloom), Some(bind_groups)) = (&self.targets.bloom, &self.bloom_bind_groups)
+            {
+                let labels = [
+                    "JKA bloom half-resolution extract",
+                    "JKA bloom quarter-resolution downsample",
+                    "JKA bloom eighth-resolution downsample",
+                ];
+                for level in 0..3 {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(labels[level]),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &bloom.views[level],
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(if level == 0 {
+                        &self.bloom_extract_pipeline
+                    } else {
+                        &self.bloom_downsample_pipeline
+                    });
+                    pass.set_bind_group(0, &bind_groups[level], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+
+        if self.weather.rain.enabled && plan.use_post && !plan.gamma_only_post {
+            self.weather.rain.dispatch_haze(
+                &mut encoder,
+                self.targets.rain_haze_mask_width,
+                self.targets.rain_haze_mask_height,
+            );
+        }
+
+        if plan.use_post && self.clouds_enabled {
+            // Raymarch visible clouds into an independent transfer buffer. RGB
+            // carries in-scattered cloud light and A carries sky transmittance.
+            // The pass can therefore run below display resolution and be
+            // bilinearly composited over the full-resolution sky later.
+            //
+            // Temporal mode uses a 2x2 interleave: after the first complete
+            // history frame, only one quarter of the cloud-target pixels execute
+            // the expensive raymarch each frame. The other three quarters are
+            // reconstructed by reprojection from the previous ping-pong target.
+            // Always ping-pong because sampling and writing one texture in the
+            // same render pass is invalid in wgpu regardless of shader control
+            // flow.
+            let cloud_write_index = 1 - self.cloud_history_read_index;
+            let post_bind_group = &self.post_bind_groups[self.history_read_index]
+                [self.ssao_history_read_index][self.ssr_history_read_index]
+                [self.cloud_history_read_index];
+            let cloud_clear = wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            };
+
+            // Pass one: march. With the interleave on, only one pixel per block
+            // writes a real sample here.
+            let march_attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &self.targets.cloud_march_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: cloud_clear,
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA volumetric cloud march"),
+                color_attachments: &march_attachments,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.cloud_march_pipeline);
+            pass.set_bind_group(0, post_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+
+            // Pass two: resolve. Reconstructs every pixel from the sparse
+            // lattice, then blends reprojected history clamped into that
+            // lattice's range.
+            let resolve_attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &self.targets.cloud_transfer_views[cloud_write_index],
+                depth_slice: None,
+                resolve_target: None,
+                ops: cloud_clear,
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA volumetric cloud resolve"),
+                color_attachments: &resolve_attachments,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.cloud_resolve_pipeline);
+            pass.set_bind_group(0, post_bind_group, &[]);
+            pass.set_bind_group(1, &self.cloud_resolve_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+
+            self.cloud_history_read_index = cloud_write_index;
+            self.cloud_history_valid = true;
+            if self.cloud_temporal_enabled {
+                self.cloud_temporal_frame_index = (self.cloud_temporal_frame_index + 1) & 3;
+            } else {
+                self.cloud_temporal_frame_index = 0;
+            }
+        }
+
+        if plan.use_post {
+            if self.taa_enabled {
+                // Persist the *resolved* temporal color, not the raw jittered
+                // scene. Ping-pong history avoids sampling and writing the same
+                // texture while keeping TAA inside the existing fullscreen pass.
+                let history_write_index = 1 - self.history_read_index;
+                let color_attachments = [
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: final_output,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.history_views[history_write_index],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA TAA/post-process resolve"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.taa_post_pipeline);
+                pass.set_bind_group(
+                    0,
+                    &self.post_bind_groups[self.history_read_index][self.ssao_history_read_index]
+                        [self.ssr_history_read_index][self.cloud_history_read_index],
+                    &[],
+                );
+                pass.draw(0..3, 0..1);
+                drop(pass);
+                self.history_read_index = history_write_index;
+            } else {
+                let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: final_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA brightness/gamma post-process"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                if plan.gamma_only_post {
+                    pass.set_pipeline(&self.gamma_post_pipeline);
+                    pass.set_bind_group(0, &self.gamma_post_bind_group, &[]);
+                } else {
+                    pass.set_pipeline(&self.post_pipeline);
+                    pass.set_bind_group(
+                        0,
+                        &self.post_bind_groups[self.history_read_index]
+                            [self.ssao_history_read_index][self.ssr_history_read_index]
+                            [self.cloud_history_read_index],
+                        &[],
+                    );
+                }
+                pass.draw(0..3, 0..1);
+            }
+        }
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Post, true);
+
+        if matches!(
+            self.planar_reflection_debug_mode,
+            PlanarReflectionDebugMode::ReflectionTexture | PlanarReflectionDebugMode::BindingTest
+        ) && self.planar_reflection.active
+            && planar_views.iter().any(|view| view.is_some())
+        {
+            let frame_width = self.config.width.max(1) as f32;
+            let frame_height = self.config.height.max(1) as f32;
+            let margin = 16.0_f32.min(frame_width * 0.02);
+            let preview_width = (frame_width * 0.36)
+                .clamp(160.0, 560.0)
+                .min(frame_width - margin * 2.0);
+            let aspect = frame_height / frame_width;
+            let preview_height = (preview_width * aspect).min(frame_height * 0.42);
+            let preview_x = (frame_width - preview_width - margin).max(0.0);
+            let preview_y = margin.max(0.0);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA planar reflection debug texture preview"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: final_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.planar_debug_pipeline);
+            pass.set_bind_group(0, &self.planar_reflection.bind_group, &[]);
+            pass.set_viewport(
+                preview_x,
+                preview_y,
+                preview_width.max(1.0),
+                preview_height.max(1.0),
+                0.0,
+                1.0,
+            );
+            pass.draw(0..3, 0..1);
+        }
+
+        if self.taa_enabled {
+            self.history_valid = true;
+            self.taa_frame_index = self.taa_frame_index.wrapping_add(1);
+        } else {
+            self.history_valid = false;
+            self.taa_frame_index = 0;
+            self.history_read_index = 0;
+        }
+        if self.ssao_enabled {
+            self.ssao_history_valid = true;
+        } else {
+            self.ssao_history_valid = false;
+            self.ssao_history_read_index = 0;
+        }
+        if self.ssr_enabled {
+            self.ssr_history_valid = true;
+            self.ssr_frame_index = self.ssr_frame_index.wrapping_add(1);
+        } else {
+            self.ssr_history_valid = false;
+            self.ssr_history_read_index = 0;
+            self.ssr_frame_index = 0;
+        }
+        self.previous_view_proj = view_proj;
+        self.previous_unjittered_view_proj = unjittered_view_proj;
+        self.previous_cloud_view_proj = cloud_view_proj;
+        self.previous_camera_position = camera.position;
+        self.previous_frame_time = camera_pos_time[3];
+        self.camera_history_valid = true;
+
+        // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
+        // frame, so the readout ends up above it rather than beneath.
+        if !menu_backdrop_active && !self.egui_active && self.ui_vertex_count != 0 {
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Ui, false);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: final_output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ui_pipeline);
+            pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
+            pass.draw(0..self.ui_vertex_count, 0..1);
+            drop(pass);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Ui, true);
+        }
+
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Frame, true);
+        self.gpu_profiler.resolve(&mut encoder);
+        // If the swapchain image is already the final target, fold the readback
+        // copy into the frame command buffer instead of paying another submit.
+        // SMAA and the menu backdrop both submit work after this encoder, so
+        // those paths intentionally do a tiny late copy submit instead.
+        if !self.smaa_enabled && !menu_backdrop_active && !self.egui_active {
+            if let Some(readback) = screenshot_readback.as_mut() {
+                let staging_buffer = &self
+                    .screenshot_readback_buffer
+                    .as_ref()
+                    .expect("screenshot staging buffer must exist after preparation")
+                    .buffer;
+                Self::encode_screenshot_copy(
+                    &mut encoder,
+                    &frame.texture,
+                    staging_buffer,
+                    readback,
+                );
+                readback.inline_copy = true;
+            }
+        }
+        let command_buffer = encoder.finish();
+        let profiler_readback_copy = self.gpu_profiler.encode_readback_copy(&self.device);
+        info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        let submit_started = Instant::now();
+        let frame_submission = if let Some(readback_copy) = profiler_readback_copy {
+            self.queue.submit([command_buffer, readback_copy])
+        } else {
+            self.queue.submit([command_buffer])
+        };
+        if let Some(readback) = screenshot_readback
+            .as_mut()
+            .filter(|readback| readback.inline_copy)
+        {
+            readback.submission_index = Some(frame_submission.clone());
+        }
+        // The SMAA crate records/submits its three reference passes here. Queue
+        // ordering guarantees they consume the color target after the main JKA
+        // command buffer and complete before presentation.
+        if let Some(smaa_frame) = smaa_frame.take() {
+            smaa_frame.resolve();
+        }
+        // Release the SMAA target borrow before re-borrowing `self` below.
+        drop(smaa_frame);
+        if menu_backdrop_active {
+            // SMAA resolves into the lazy backdrop source when enabled, so this
+            // must run after its three-pass resolve and before the UI overlay.
+            self.submit_menu_backdrop(&frame_view);
+        }
+        // The menu is a native-resolution overlay. Keeping it after
+        // SMAA/post-processing makes text crisp and lets screenshots capture
+        // exactly what the player sees.
+        self.submit_egui(&frame_view);
+        if menu_backdrop_active || self.egui_active {
+            self.submit_ui_overlay(&frame_view);
+        }
+        if let Some(readback) = screenshot_readback
+            .as_mut()
+            .filter(|readback| !readback.inline_copy)
+        {
+            self.submit_screenshot_copy(&frame.texture, readback);
+        }
+        self.window.pre_present_notify();
+        frame.present();
+        if let Some(readback) = screenshot_readback {
+            self.finish_screenshot_readback(readback);
+        }
+        // Start readback mapping only after the swapchain image has been
+        // presented. This keeps diagnostic readback bookkeeping out of the
+        // acquire/submit/present critical sequence.
+        self.gpu_profiler.submit();
+        if self.cull_debug_mode != CullDebugMode::Off {
+            self.cull_diagnostics_readback.submit();
+        }
+
+        if let Some(scope) = frame_validation_scope {
+            // Validation is normally generated synchronously during command
+            // recording/finish/submit. Poll once so any queued device-side
+            // validation is also surfaced before the scope is popped.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            match block_on(scope.pop()) {
+                Some(error) => {
+                    eprintln!("[JKA FRAME DIAG] VALIDATION ERROR: {error}");
+                    eprintln!("[JKA FRAME DIAG] debug: {error:?}");
+                }
+                None => {
+                    eprintln!("[JKA FRAME DIAG] first diagnostic frame produced no validation error");
+                }
+            }
+            self.frame_diag_pending = false;
+        }
+
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(info)
+    }
+}
+
+struct IndexedGeometryBuilder<'a> {
+    source: &'a [GpuVertex],
+    vertices: Vec<GpuVertex>,
+    lookup: BTreeMap<[u32; 15], u32>,
+    indices: Vec<u32>,
+    cache: BTreeMap<(u32, u32, u32), std::ops::Range<u32>>,
+    source_to_index: Vec<Option<u32>>,
+}
+
+impl<'a> IndexedGeometryBuilder<'a> {
+    fn new(source: &'a [GpuVertex]) -> Self {
+        Self {
+            source,
+            vertices: Vec::new(),
+            lookup: BTreeMap::new(),
+            indices: Vec::new(),
+            cache: BTreeMap::new(),
+            source_to_index: vec![None; source.len()],
+        }
+    }
+
+    fn intern(&mut self, vertex: GpuVertex) -> u32 {
+        let key = gpu_vertex_key(&vertex);
+        if let Some(&index) = self.lookup.get(&key) {
+            return index;
+        }
+        let index = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
+        self.vertices.push(vertex);
+        self.lookup.insert(key, index);
+        index
+    }
+
+    fn append_indices(&mut self, values: &[u32]) -> std::ops::Range<u32> {
+        let start = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        self.indices.extend_from_slice(values);
+        let end = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        start..end
+    }
+
+    /// Appends the ocean clipmap as its own vertex/index block. Its vertices are
+    /// grid records rather than world positions, so they must not go through
+    /// `intern` and be merged with real BSP geometry.
+    fn append_clipmap(
+        &mut self,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+    ) -> std::ops::Range<u32> {
+        let vertex_base = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
+        self.vertices.extend_from_slice(vertices);
+        let start = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        self.indices
+            .extend(indices.iter().map(|index| vertex_base.saturating_add(*index)));
+        let end = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        start..end
+    }
+
+    fn batch_range(&mut self, batch: &DrawBatch) -> std::ops::Range<u32> {
+        let key = (batch.vertices.start, batch.vertices.end, 0u32);
+        if let Some(range) = self.cache.get(&key) {
+            return range.clone();
+        }
+
+        let start = batch.vertices.start as usize;
+        let end = batch.vertices.end as usize;
+        let slice = self.source[start..end].to_vec();
+        let mut values = Vec::new();
+        {
+            values.reserve(slice.len());
+            for (offset, &vertex) in slice.iter().enumerate() {
+                let index = self.intern(vertex);
+                let source_index = start + offset;
+                if let Some(slot) = self.source_to_index.get_mut(source_index) {
+                    *slot = Some(index);
+                }
+                values.push(index);
+            }
+        }
+        let range = self.append_indices(&values);
+        self.cache.insert(key, range.clone());
+        range
+    }
+}
+
+
+
+fn gpu_vertex_key(vertex: &GpuVertex) -> [u32; 15] {
+    [
+        vertex.position[0].to_bits(),
+        vertex.position[1].to_bits(),
+        vertex.position[2].to_bits(),
+        vertex.uv[0].to_bits(),
+        vertex.uv[1].to_bits(),
+        vertex.lightmap_uv[0].to_bits(),
+        vertex.lightmap_uv[1].to_bits(),
+        vertex.normal[0].to_bits(),
+        vertex.normal[1].to_bits(),
+        vertex.normal[2].to_bits(),
+        vertex.color[0].to_bits(),
+        vertex.color[1].to_bits(),
+        vertex.color[2].to_bits(),
+        vertex.color[3].to_bits(),
+        vertex.alpha_cutoff.to_bits(),
+    ]
+}
+
+fn midpoint_gpu_vertex(a: GpuVertex, b: GpuVertex) -> GpuVertex {
+    let midpoint3 = |a: [f32; 3], b: [f32; 3]| [
+        (a[0] + b[0]) * 0.5,
+        (a[1] + b[1]) * 0.5,
+        (a[2] + b[2]) * 0.5,
+    ];
+    let midpoint2 = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+    let midpoint4 = |a: [f32; 4], b: [f32; 4]| [
+        (a[0] + b[0]) * 0.5,
+        (a[1] + b[1]) * 0.5,
+        (a[2] + b[2]) * 0.5,
+        (a[3] + b[3]) * 0.5,
+    ];
+    let mut normal = Vec3::from_array(midpoint3(a.normal, b.normal)).normalize_or_zero();
+    if normal == Vec3::ZERO {
+        normal = Vec3::from_array(a.normal).normalize_or_zero();
+    }
+    GpuVertex {
+        position: midpoint3(a.position, b.position),
+        uv: midpoint2(a.uv, b.uv),
+        lightmap_uv: midpoint2(a.lightmap_uv, b.lightmap_uv),
+        normal: normal.to_array(),
+        color: midpoint4(a.color, b.color),
+        alpha_cutoff: (a.alpha_cutoff + b.alpha_cutoff) * 0.5,
+    }
+}
+
+fn append_static_snow_triangle(
+    chunks: &mut BTreeMap<(usize, i32, i32), Vec<GpuVertex>>,
+    coarse_batch_index: usize,
+    triangle: [GpuVertex; 3],
+    depth: u32,
+) {
+    let positions = triangle.map(|vertex| Vec3::from_array(vertex.position));
+    let max_edge_sq = (positions[0] - positions[1])
+        .length_squared()
+        .max((positions[1] - positions[2]).length_squared())
+        .max((positions[2] - positions[0]).length_squared());
+    let target_sq = SNOW_SHELL_TESSELLATION * SNOW_SHELL_TESSELLATION;
+    if max_edge_sq <= target_sq || depth >= 12 {
+        let centroid = (positions[0] + positions[1] + positions[2]) / 3.0;
+        let chunk_x = (centroid.x / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+        let chunk_z = (centroid.z / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+        chunks
+            .entry((coarse_batch_index, chunk_x, chunk_z))
+            .or_default()
+            .extend_from_slice(&triangle);
+        return;
+    }
+
+    let ab = midpoint_gpu_vertex(triangle[0], triangle[1]);
+    let bc = midpoint_gpu_vertex(triangle[1], triangle[2]);
+    let ca = midpoint_gpu_vertex(triangle[2], triangle[0]);
+    append_static_snow_triangle(chunks, coarse_batch_index, [triangle[0], ab, ca], depth + 1);
+    append_static_snow_triangle(chunks, coarse_batch_index, [ab, triangle[1], bc], depth + 1);
+    append_static_snow_triangle(chunks, coarse_batch_index, [ca, bc, triangle[2]], depth + 1);
+    append_static_snow_triangle(chunks, coarse_batch_index, [ab, bc, ca], depth + 1);
+}
+
+fn create_snow_shell_gpu(
+    device: &wgpu::Device,
+    vertices: &[GpuVertex],
+    coarse_sources: &[DrawBatch],
+) -> SnowShellGpu {
+    let mut chunks = BTreeMap::<(usize, i32, i32), Vec<GpuVertex>>::new();
+    for (coarse_batch_index, source) in coarse_sources.iter().enumerate() {
+        if u32::from(source.surface_material) != MATERIAL_SNOW || source.pipeline.class == DrawClass::Sky {
+            continue;
+        }
+        let start = usize::try_from(source.vertices.start).unwrap_or(usize::MAX);
+        let end = usize::try_from(source.vertices.end).unwrap_or(usize::MAX).min(vertices.len());
+        if start >= end { continue; }
+        for tri in vertices[start..end].chunks_exact(3) {
+            let triangle = [tri[0], tri[1], tri[2]];
+            let normal = (Vec3::from_array(triangle[0].normal)
+                + Vec3::from_array(triangle[1].normal)
+                + Vec3::from_array(triangle[2].normal))
+                .normalize_or_zero();
+            if normal.y <= 0.35 { continue; }
+            append_static_snow_triangle(&mut chunks, coarse_batch_index, triangle, 0);
+        }
+    }
+
+    let total_vertices = chunks.values().map(Vec::len).sum::<usize>();
+    let mut packed = Vec::<GpuVertex>::with_capacity(total_vertices);
+    let mut draws = Vec::<SnowShellDraw>::with_capacity(chunks.len());
+    for ((coarse_batch_index, _, _), chunk_vertices) in chunks {
+        let start = packed.len();
+        packed.extend_from_slice(&chunk_vertices);
+        let end = packed.len();
+        let mut bounds_min = Vec3::splat(f32::INFINITY);
+        let mut bounds_max = Vec3::splat(f32::NEG_INFINITY);
+        for vertex in &packed[start..end] {
+            let p = Vec3::from_array(vertex.position);
+            bounds_min = bounds_min.min(p);
+            bounds_max = bounds_max.max(p);
+        }
+        // Snowflow source allows +0.34 m of berm; keep conservative JKA-unit padding.
+        bounds_max.y += 16.0;
+        draws.push(SnowShellDraw {
+            coarse_batch_index,
+            vertices: u32::try_from(start).unwrap_or(u32::MAX)..u32::try_from(end).unwrap_or(u32::MAX),
+            bounds_min: bounds_min.to_array(),
+            bounds_max: bounds_max.to_array(),
+        });
+    }
+
+    let bytes = (packed.len() * std::mem::size_of::<GpuVertex>()).max(1) as u64;
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA static Snowflow snow overlay vertices"),
+        contents: if packed.is_empty() { &[0u8][..] } else { bytemuck::cast_slice(&packed) },
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    println!(
+        "Snowflow overlay: {} static chunks, {} vertices ({:.1} MiB), {:.1}u lattice",
+        draws.len(), packed.len(), bytes as f64 / (1024.0 * 1024.0), SNOW_SHELL_TESSELLATION
+    );
+    SnowShellGpu { vertex_buffer, draws }
+}
+
+fn snow_shell_draw_near_center(draw: &SnowShellDraw, center: Vec2) -> bool {
+    let minimum = Vec2::new(draw.bounds_min[0], draw.bounds_min[2]);
+    let maximum = Vec2::new(draw.bounds_max[0], draw.bounds_max[2]);
+    let closest = center.clamp(minimum, maximum);
+    (closest - center).length_squared() <= SNOW_SHELL_DRAW_RADIUS * SNOW_SHELL_DRAW_RADIUS
+}
+
+fn draw_snow_shell_fast<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    world: &'a WorldGpu,
+    view_proj: Mat4,
+    deform_center: Vec2,
+    current_pipeline: &mut Option<PipelineKey>,
+) {
+    if world.snow_shell.draws.is_empty() { return; }
+    pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    for draw in &world.snow_shell.draws {
+        if !snow_shell_draw_near_center(draw, deform_center)
+            || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+        { continue; }
+        let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
+        if *current_pipeline != Some(batch.source.pipeline) {
+            pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
+            *current_pipeline = Some(batch.source.pipeline);
+        }
+        pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+        pass.draw(draw.vertices.clone(), 1..2);
+    }
+    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+    *current_pipeline = None;
+}
+
+fn draw_snow_shell<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    world: &'a WorldGpu,
+    pipelines: &'a BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    view_proj: Mat4,
+    deform_center: Vec2,
+    current_pipeline: &mut Option<PipelineKey>,
+) {
+    if world.snow_shell.draws.is_empty() { return; }
+    pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    for draw in &world.snow_shell.draws {
+        if !snow_shell_draw_near_center(draw, deform_center)
+            || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+        { continue; }
+        let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
+        if *current_pipeline != Some(batch.source.pipeline) {
+            pass.set_pipeline(&pipelines[&batch.source.pipeline]);
+            *current_pipeline = Some(batch.source.pipeline);
+        }
+        pass.set_bind_group(1, &batch.bind_group, &[]);
+        pass.draw(draw.vertices.clone(), 1..2);
+    }
+    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+    *current_pipeline = None;
+}
+
+/// Upper bound on distinct water planes that get their own clipmap. Each one
+/// costs a fixed mesh, so a map with many separate pools keeps the rest on
+/// their authored faces rather than growing the vertex buffer without limit.
+const MAX_OCEAN_SURFACES: usize = crate::ocean::OCEAN_MAX_SURFACES;
+
+/// Plane height and world-space xz footprint of a promoted water face.
+fn water_surface_extent(source: &DrawBatch, vertices: &[GpuVertex]) -> (f32, [f32; 2], [f32; 2]) {
+    let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for vertex in slice {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(vertex.position[axis]);
+            maximum[axis] = maximum[axis].max(vertex.position[axis]);
+        }
+    }
+    (maximum[1], [minimum[0], minimum[2]], [maximum[0], maximum[2]])
+}
+
+fn ocean_surface_key(plane: f32, minimum: [f32; 2], maximum: [f32; 2]) -> [u32; 5] {
+    [
+        plane.to_bits(),
+        minimum[0].to_bits(),
+        minimum[1].to_bits(),
+        maximum[0].to_bits(),
+        maximum[1].to_bits(),
+    ]
+}
+
+/// A `surfaceparm water` brush contributes every face it has, so its underside
+/// and its sides arrive looking exactly like its top. Only the upward-facing
+/// horizontal face is the water surface the FFT ocean should replace.
+fn is_upward_water_face(source: &DrawBatch, vertices: &[GpuVertex]) -> bool {
+    let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
+    let mut lowest = f32::INFINITY;
+    let mut highest = f32::NEG_INFINITY;
+    let mut facing = 0.0f32;
+    for vertex in slice {
+        lowest = lowest.min(vertex.position[1]);
+        highest = highest.max(vertex.position[1]);
+        facing += vertex.normal[1];
+    }
+    lowest.is_finite() && facing > 0.0 && lowest >= highest - 1.0
+}
+
+/// Promoted water draws the shared camera-centred ocean clipmap in place of its
+/// authored brush face. The clipmap is one mesh for the whole world, so the
+/// range comes from the renderer rather than from per-batch state.
+fn draw_world_batch<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    batch: &WorldBatch,
+    instances: std::ops::Range<u32>,
+    ocean_quality: Option<usize>,
+) {
+    let range = match (ocean_quality, batch.ocean_clipmap.as_ref()) {
+        (Some(quality), Some(clipmap)) => &clipmap[quality.min(1)],
+        _ => &batch.indexed_range,
+    };
+    pass.draw_indexed(range.clone(), 0, instances);
+}
+
+fn inspector_index_range(
+    batches: &[WorldBatch],
+    source_vertices: &std::ops::Range<u32>,
+) -> Option<std::ops::Range<u32>> {
+    batches.iter().find_map(|batch| {
+        if source_vertices.start < batch.source.vertices.start
+            || source_vertices.end > batch.source.vertices.end
+        {
+            return None;
+        }
+        let offset = source_vertices.start - batch.source.vertices.start;
+        let start = batch.indexed_range.start.checked_add(offset)?;
+        let count = source_vertices.end - source_vertices.start;
+        Some(start..start.checked_add(count)?)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Linear average colour of a map's skybox faces.
+///
+/// Each face is read from the smallest mip its decode produced, which the mip
+/// chain has already reduced to (very nearly) that face's mean, so this costs a
+/// handful of texel reads rather than a full-resolution scan. Stored bytes are
+/// sRGB-encoded for colour textures, so they are linearised before averaging;
+/// averaging them encoded would bias the result bright.
+fn average_skybox_color(
+    texture_data: &[crate::materials::TextureData],
+    faces: &[usize],
+) -> [f32; 3] {
+    // Matches the reference's overcast daylight sky, used when a map has no
+    // skybox at all (fog-only or fully enclosed levels).
+    const FALLBACK: [f32; 3] = [0.45, 0.55, 0.75];
+    if faces.is_empty() {
+        return FALLBACK;
+    }
+
+    let mut total = [0.0f64; 3];
+    let mut counted = 0u32;
+    for &index in faces {
+        let Some(data) = texture_data.get(index) else {
+            continue;
+        };
+        // Walk the packed mip chain to the start of the smallest level.
+        let mut offset = 0usize;
+        let mut width = data.width.max(1);
+        let mut height = data.height.max(1);
+        for _ in 1..data.mip_level_count.max(1) {
+            offset += (width * height * 4) as usize;
+            width = (width / 2).max(1);
+            height = (height / 2).max(1);
+        }
+        let texels = (width * height) as usize;
+        if texels == 0 || offset + texels * 4 > data.rgba.len() {
+            continue;
+        }
+
+        let mut face = [0.0f64; 3];
+        for texel in 0..texels {
+            for channel in 0..3 {
+                let raw = data.rgba[offset + texel * 4 + channel] as f32 / 255.0;
+                let linear = if data.srgb {
+                    if raw <= 0.04045 {
+                        raw / 12.92
+                    } else {
+                        ((raw + 0.055) / 1.055).powf(2.4)
+                    }
+                } else {
+                    raw
+                };
+                face[channel] += f64::from(linear);
+            }
+        }
+        for channel in 0..3 {
+            total[channel] += face[channel] / texels as f64;
+        }
+        counted += 1;
+    }
+
+    if counted == 0 {
+        return FALLBACK;
+    }
+    let scale = f64::from(counted);
+    [
+        (total[0] / scale) as f32,
+        (total[1] / scale) as f32,
+        (total[2] / scale) as f32,
+    ]
+}
+
+fn build_world(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    surface_layout: &wgpu::BindGroupLayout,
+    fast_surface_layout: &wgpu::BindGroupLayout,
+    pipeline_layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    shader_variant: WorldShaderVariantKey,
+    fast_pipeline_layout: &wgpu::PipelineLayout,
+    fast_shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    legacy_fog: bool,
+    white: &GpuImage,
+    missing: &GpuImage,
+    flat_normal: &GpuImage,
+    repeat_sampler: &wgpu::Sampler,
+    clamp_sampler: &wgpu::Sampler,
+    pbr_repeat_sampler: &wgpu::Sampler,
+    pbr_clamp_sampler: &wgpu::Sampler,
+    lightmap_sampler: &wgpu::Sampler,
+    sky_sampler: &wgpu::Sampler,
+    cluster_compute_layout: &wgpu::BindGroupLayout,
+    lighting_layout: &wgpu::BindGroupLayout,
+    lighting_layout_lean: &wgpu::BindGroupLayout,
+    shadow_caster_layout: &wgpu::BindGroupLayout,
+    cull_debug_layout: &wgpu::BindGroupLayout,
+    lighting_settings_buffer: &wgpu::Buffer,
+    pbr_settings_buffer: &wgpu::Buffer,
+    surface_deformation_buffer: &wgpu::Buffer,
+    deformation_field_views: [&wgpu::TextureView; 2],
+    deformation_field_sampler: &wgpu::Sampler,
+    grass_renderer: &GrassRenderer,
+    surface_sprite_effect_renderer: &SurfaceSpriteEffectRenderer,
+    build_ocean_meshes: bool,
+    compress_pbr_companions: bool,
+    map: PreparedMap,
+) -> (WorldGpu, WorldUploadTimings) {
+    let PreparedMap {
+        vertices,
+        batches: coarse_sources,
+        pvs_batches: full_sources,
+        textures: texture_data,
+        footprint_mark_textures,
+        lightmaps: lightmap_data,
+        deluxemaps: deluxemap_data,
+        static_bsp_ao_cache,
+        visibility,
+        lights: dynamic_lights,
+        sun,
+        static_light_grid,
+        voxel_probe_gi: voxel_probe_gi_data,
+        reflection_probes: reflection_probe_data,
+        grass_patches,
+        surface_sprite_effects: surface_sprite_effect_sources,
+        material_debug,
+        inline_vertices,
+        inline_batches: inline_batch_sources,
+        inline_models: inline_model_sources,
+        ..
+    } = map;
+    let snow_shell = create_snow_shell_gpu(device, &vertices, &coarse_sources);
+    let inspector_vertices = vertices
+        .iter()
+        .map(|vertex| InspectorVertex {
+            position: vertex.position,
+            uv: vertex.uv,
+            lightmap_uv: vertex.lightmap_uv,
+        })
+        .collect::<Vec<_>>();
+    let inspector_textures = texture_data
+        .iter()
+        .map(inspector_texture_meta)
+        .collect::<Vec<_>>();
+    let inspector_lightmaps = lightmap_data
+        .iter()
+        .map(inspector_texture_meta)
+        .collect::<Vec<_>>();
+    let static_ao_lightmap_triangles = collect_static_ao_lightmap_triangles(&vertices, &coarse_sources);
+    let static_ao_vertex_receivers = collect_static_ao_vertex_receivers(vertices.len(), &coarse_sources);
+    let static_ao_render_triangles = collect_static_ao_render_triangles(&vertices, &coarse_sources);
+    let static_ao_lightmap_sizes = lightmap_data
+        .iter()
+        .map(|image| [image.width, image.height])
+        .collect::<Vec<_>>();
+    let static_ao_lightmap_bases = lightmap_data
+        .iter()
+        .map(|image| StaticAoBaseLightmap {
+            label: image.label.clone(),
+            width: image.width,
+            height: image.height,
+            rgba: image.rgba.clone(),
+            clamp: image.clamp,
+            srgb: image.srgb,
+        })
+        .collect::<Vec<_>>();
+    let static_ao_cache_source = static_bsp_ao_cache;
+
+    let mut upload_timings = WorldUploadTimings::default();
+
+    let vertex_started = Instant::now();
+    let mut indexed_builder = IndexedGeometryBuilder::new(&vertices);
+    let coarse_index_ranges = coarse_sources
+        .iter()
+        .map(|source| indexed_builder.batch_range(source))
+        .collect::<Vec<_>>();
+    let full_index_ranges = full_sources
+        .iter()
+        .map(|source| indexed_builder.batch_range(source))
+        .collect::<Vec<_>>();
+    // The FFT ocean replaces every promoted water face with one shared
+    // camera-centred clipmap, so the authored brush footprint no longer has to
+    // be subdivided per map. `build_ocean_meshes` only decides whether the
+    // clipmap is worth uploading at all.
+    // One clipmap per distinct promoted water surface. Each bakes in that
+    // surface's plane height and footprint, so the vertex shader needs nothing
+    // from the material uniform and cannot end up placing the ocean somewhere
+    // the draw call did not intend.
+    let mut ocean_clipmaps = BTreeMap::<[u32; 5], [std::ops::Range<u32>; 2]>::new();
+    let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
+    let mut ocean_coarsest_spacing = 0.0f32;
+    if build_ocean_meshes {
+        for source in coarse_sources.iter().chain(full_sources.iter()) {
+            if !source.water_primary || !is_upward_water_face(source, &vertices) {
+                continue;
+            }
+            let (plane, minimum, maximum) = water_surface_extent(source, &vertices);
+            let key = ocean_surface_key(plane, minimum, maximum);
+            if ocean_clipmaps.contains_key(&key) {
+                continue;
+            }
+            if ocean_clipmaps.len() >= MAX_OCEAN_SURFACES {
+                println!(
+                    "Ocean: more than {MAX_OCEAN_SURFACES} promoted water surfaces; plane {plane:.0} left on its authored face"
+                );
+                continue;
+            }
+            // Both mesh qualities are uploaded so the quality setting stays a
+            // live switch instead of needing a map reload.
+            let low = crate::ocean::build_clipmap(
+                crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS, plane, minimum, maximum);
+            let high = crate::ocean::build_clipmap(
+                crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS, plane, minimum, maximum);
+            ocean_coarsest_spacing = low.coarsest_spacing;
+            upload_timings.ocean_clipmap_vertices += (low.vertices.len() + high.vertices.len()) as u64;
+            upload_timings.ocean_clipmap_tris = (high.indices.len() / 3) as u64;
+            upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
+            upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
+            ocean_clipmaps.insert(key, [
+                indexed_builder.append_clipmap(&low.vertices, &low.indices),
+                indexed_builder.append_clipmap(&high.vertices, &high.indices),
+            ]);
+            ocean_surfaces.push(crate::ocean::OceanSurface {
+                plane_height: plane,
+                minimum,
+                maximum,
+            });
+        }
+    }
+    let _ = ocean_coarsest_spacing;
+    upload_timings.ocean_water_batches = coarse_sources
+        .iter()
+        .chain(full_sources.iter())
+        .filter(|source| source.water_primary && is_upward_water_face(source, &vertices))
+        .count() as u32;
+
+    let static_ao_source_to_gpu = indexed_builder
+        .source_to_index
+        .iter()
+        .map(|index| index.unwrap_or(u32::MAX))
+        .collect::<Vec<_>>();
+    let static_ao_gpu_vertices = indexed_builder.vertices.clone();
+    // Inline models go after the static-AO snapshot (AO re-uploads exactly
+    // that prefix) and bypass vertex interning, so transforming a mover can
+    // never drag a coincident world vertex along with it.
+    let mut inline_index_ranges = vec![0..0; inline_batch_sources.len()];
+    let mut inline_gpu_starts = Vec::with_capacity(inline_model_sources.len());
+    for model in &inline_model_sources {
+        let gpu_start = u32::try_from(indexed_builder.vertices.len()).unwrap_or(u32::MAX);
+        let source = model.vertices.start as usize..model.vertices.end as usize;
+        indexed_builder.vertices.extend_from_slice(&inline_vertices[source]);
+        for batch_index in model.batches.clone() {
+            let batch = &inline_batch_sources[batch_index];
+            let indices = batch
+                .vertices
+                .clone()
+                .map(|vertex| gpu_start + (vertex - model.vertices.start))
+                .collect::<Vec<_>>();
+            inline_index_ranges[batch_index] = indexed_builder.append_indices(&indices);
+        }
+        inline_gpu_starts.push(gpu_start);
+    }
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA indexed static world vertices"),
+        contents: bytemuck::cast_slice(&indexed_builder.vertices),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA static world indices"),
+        contents: bytemuck::cast_slice(&indexed_builder.indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let source_vertex_count = vertices.len();
+    let indexed_vertex_count = indexed_builder.vertices.len();
+    let reused_vertex_count = source_vertex_count.saturating_sub(indexed_vertex_count);
+    println!(
+        "Indexed world geometry: {} triangle-list vertices -> {} unique vertices ({} reused, {:.1}% reduction)",
+        source_vertex_count,
+        indexed_vertex_count,
+        reused_vertex_count,
+        if source_vertex_count == 0 {
+            0.0
+        } else {
+            reused_vertex_count as f64 * 100.0 / source_vertex_count as f64
+        }
+    );
+    upload_timings.vertex_buffer_ms = vertex_started.elapsed().as_secs_f64() * 1000.0;
+    let texture_started = Instant::now();
+    let texture_clamp: Vec<_> = texture_data.iter().map(|data| data.clamp).collect();
+    // Companion maps are only safe to BC-compress when that image is not also
+    // referenced as authored color/emissive/sky data. The optional benchmark
+    // path uses BC3 because it preserves all RGB channels plus alpha (required
+    // by normalHeightMap and rmosMap) without changing shader decoding.
+    const TEX_USE_COMPANION: u8 = 1;
+    const TEX_USE_COLOR: u8 = 2;
+    let mut texture_usage = vec![0u8; texture_data.len()];
+    let mut mark = |index: Option<usize>, usage: u8| {
+        if let Some(index) = index {
+            if let Some(bits) = texture_usage.get_mut(index) {
+                *bits |= usage;
+            }
+        }
+    };
+    let mut skybox_faces: Vec<usize> = Vec::new();
+    for source in coarse_sources.iter().chain(full_sources.iter()) {
+        mark(source.texture, TEX_USE_COLOR);
+        mark(source.emissive_texture, TEX_USE_COLOR);
+        mark(source.normal_texture, TEX_USE_COMPANION);
+        mark(source.roughness_texture, TEX_USE_COMPANION);
+        mark(source.height_texture, TEX_USE_COMPANION);
+        mark(source.metallic_texture, TEX_USE_COMPANION);
+        mark(source.specular_texture, TEX_USE_COMPANION);
+        if let Some(skybox) = source.skybox {
+            for index in skybox {
+                mark(Some(index), TEX_USE_COLOR);
+                skybox_faces.push(index);
+            }
+        }
+    }
+    let primary_skybox = coarse_sources
+        .iter()
+        .chain(full_sources.iter())
+        .find_map(|source| source.skybox);
+    let sky_average = average_skybox_color(&texture_data, &skybox_faces);
+    for index in footprint_mark_textures.into_iter().flatten() {
+        mark(Some(index), TEX_USE_COLOR);
+    }
+    for effect in &surface_sprite_effect_sources {
+        mark(Some(effect.texture), TEX_USE_COLOR);
+    }
+    let mut compressed_count = 0usize;
+    let textures: Vec<_> = texture_data
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
+            let use_bc3 = compress_pbr_companions
+                && !data.srgb
+                && texture_usage.get(index).copied().unwrap_or_default() == TEX_USE_COMPANION;
+            if use_bc3 {
+                compressed_count += 1;
+                upload_texture_bc3(device, queue, data)
+            } else {
+                upload_texture(device, queue, data)
+            }
+        })
+        .collect();
+    if compress_pbr_companions {
+        println!(
+            "PBR companion BC: compressed {compressed_count}/{} uploaded map textures",
+            texture_data.len()
+        );
+    }
+    let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
+        footprint_mark_textures[slot]
+            .and_then(|index| textures.get(index))
+            .unwrap_or(white)
+    });
+    let surface_sprite_effects = surface_sprite_effect_sources
+        .into_iter()
+        .filter_map(|source| {
+            let texture = textures.get(source.texture).unwrap_or(missing);
+            let sampler = if source.clamp { clamp_sampler } else { repeat_sampler };
+            Some(SurfaceSpriteEffectGpu {
+                bind_group: surface_sprite_effect_renderer
+                    .create_texture_bind_group(device, &texture.view, sampler),
+                source,
+            })
+        })
+        .collect::<Vec<_>>();
+    upload_timings.texture_upload_ms = texture_started.elapsed().as_secs_f64() * 1000.0;
+    let lightmap_started = Instant::now();
+    let lightmaps: Vec<_> = lightmap_data
+        .iter()
+        .map(|data| upload_texture(device, queue, data))
+        .collect();
+    let deluxemaps: Vec<_> = if deluxemap_data.is_empty() {
+        let neutral = TextureData {
+            label: "JKA neutral deluxemap fallback".into(),
+            source: None,
+            width: 1,
+            height: 1,
+            rgba: vec![127, 127, 127, 0],
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: true,
+            srgb: false,
+        };
+        vec![upload_texture(device, queue, &neutral)]
+    } else {
+        deluxemap_data
+            .iter()
+            .map(|data| upload_texture(device, queue, data))
+            .collect()
+    };
+    upload_timings.lightmap_upload_ms = lightmap_started.elapsed().as_secs_f64() * 1000.0;
+    let reflection_probe_started = Instant::now();
+    let reflection_probes = upload_reflection_probes(device, queue, &reflection_probe_data);
+    upload_timings.reflection_probe_upload_ms =
+        reflection_probe_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut cull_records = Vec::<GpuCullRecord>::new();
+    let mut initial_indirect = Vec::<DrawIndexedIndirectArgs>::new();
+    let mut upload_batches = |
+        sources: Vec<DrawBatch>,
+        index_ranges: Vec<std::ops::Range<u32>>,
+        source_vertices: &[GpuVertex],
+    | {
+        let mut uploaded = Vec::with_capacity(sources.len());
+        for (mut source, index_range) in sources.into_iter().zip(index_ranges) {
+            let mut water_plane: Option<(f32, [f32; 2], [f32; 2])> = None;
+            if source.water_primary {
+                if is_upward_water_face(&source, source_vertices) {
+                    water_plane = Some(water_surface_extent(&source, source_vertices));
+                } else {
+                    // A water brush contributes its underside and its sides
+                    // too. Those are not the water surface, so they neither
+                    // become ocean nor draw on their own.
+                    source.water_primary = false;
+                }
+            }
+            let ocean_clipmap = water_plane.and_then(|(plane, minimum, maximum)| {
+                ocean_clipmaps.get(&ocean_surface_key(plane, minimum, maximum)).cloned()
+            });
+            let material_uniform = material_uniform(&source);
+            let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("JKA material uniform"),
+                contents: bytemuck::bytes_of(&material_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let fog_buffer = weather::fog::create_surface_fog_buffer(
+                device,
+                source.fog,
+                source.fog_is_global,
+                source.fog_color_override,
+            );
+            let bind_group = create_world_bind_group(
+                device,
+                surface_layout,
+                white,
+                missing,
+                flat_normal,
+                repeat_sampler,
+                clamp_sampler,
+                pbr_repeat_sampler,
+                pbr_clamp_sampler,
+                lightmap_sampler,
+                sky_sampler,
+                &textures,
+                &lightmaps,
+                &deluxemaps,
+                &texture_clamp,
+                primary_skybox,
+                &footprint_marks,
+                &reflection_probes,
+                &source,
+                &material_buffer,
+                &fog_buffer,
+                surface_deformation_buffer,
+                deformation_field_views,
+                deformation_field_sampler,
+            );
+            let fast_bind_group = create_fast_world_bind_group(
+                device,
+                fast_surface_layout,
+                white,
+                missing,
+                repeat_sampler,
+                clamp_sampler,
+                lightmap_sampler,
+                sky_sampler,
+                &textures,
+                &lightmaps,
+                &texture_clamp,
+                primary_skybox,
+                &footprint_marks,
+                &source,
+                &material_buffer,
+                surface_deformation_buffer,
+                deformation_field_views,
+                deformation_field_sampler,
+            );
+            let cull_index = u32::try_from(cull_records.len()).unwrap_or(u32::MAX);
+            let record = make_cull_record(&source, source_vertices, &index_range);
+            initial_indirect.push(DrawIndexedIndirectArgs {
+                index_count: record.draw[0],
+                instance_count: 1,
+                first_index: record.draw[1],
+                base_vertex: 0,
+                first_instance: 0,
+            });
+            let mut bounds_min = [record.minimum[0], record.minimum[1], record.minimum[2]];
+            let mut bounds_max = [record.maximum[0], record.maximum[1], record.maximum[2]];
+            if source.water_primary {
+                // FFT displacement moves the promoted plane vertically beyond its
+                // authored BSP bounds. Keep CPU/frustum visibility conservative so
+                // wave crests do not disappear at the edge of the view.
+                bounds_min[1] -= 256.0;
+                bounds_max[1] += 256.0;
+            }
+            cull_records.push(record);
+            uploaded.push(WorldBatch {
+                indexed_range: index_range,
+                ocean_clipmap,
+                source,
+                bind_group,
+                fast_bind_group,
+                _material_buffer: material_buffer,
+                _fog_buffer: fog_buffer,
+                cull_index,
+                compact_group: None,
+                bounds_min,
+                bounds_max,
+            });
+        }
+        uploaded
+    };
+
+    let batch_started = Instant::now();
+    let mut coarse_batches = upload_batches(coarse_sources, coarse_index_ranges, &vertices);
+    let mut full_batches = if visibility.is_some() {
+        upload_batches(full_sources, full_index_ranges, &vertices)
+    } else {
+        Vec::new()
+    };
+    let planar_reflectors = collect_planar_reflectors(&coarse_batches, &vertices);
+    // Inline models join both batch sets after the static world, so every
+    // static batch index (reflectors, snow, AO) is unchanged. Their empty PVS
+    // signature keeps them in every cluster's list.
+    let inline_coarse_start = coarse_batches.len();
+    coarse_batches.extend(upload_batches(
+        inline_batch_sources.clone(),
+        inline_index_ranges.clone(),
+        &inline_vertices,
+    ));
+    let inline_full_start = full_batches.len();
+    if visibility.is_some() {
+        full_batches.extend(upload_batches(inline_batch_sources, inline_index_ranges, &inline_vertices));
+    }
+    // Inline source ranges index `inline_vertices`, not `vertices`. Move them
+    // past every world range so world-indexed debug paths (surface inspector
+    // picking/highlight) skip them instead of aliasing a world surface.
+    let world_vertex_count = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+    for batch in coarse_batches[inline_coarse_start..]
+        .iter_mut()
+        .chain(full_batches[inline_full_start..].iter_mut())
+    {
+        let range = &mut batch.source.vertices;
+        *range = range.start.saturating_add(world_vertex_count)..range.end.saturating_add(world_vertex_count);
+    }
+    let inline_models = inline_model_sources
+        .iter()
+        .zip(inline_gpu_starts)
+        .map(|(model, gpu_vertex_start)| InlineModelGpu {
+            model: model.model,
+            gpu_vertex_start,
+            base: inline_vertices[model.vertices.start as usize..model.vertices.end as usize].to_vec(),
+            coarse_batches: model.batches.clone().map(|index| inline_coarse_start + index).collect(),
+            full_batches: if visibility.is_some() {
+                model.batches.clone().map(|index| inline_full_start + index).collect()
+            } else {
+                Vec::new()
+            },
+            uploaded: None,
+        })
+        .collect::<Vec<_>>();
+    upload_timings.batch_bind_groups_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+    let compact_groups =
+        build_draw_compaction_groups(&mut cull_records, &mut coarse_batches, &mut full_batches);
+    let compact_draw_capacity = compact_groups
+        .iter()
+        .map(|group| group.max_count)
+        .sum::<u32>();
+    if !compact_groups.is_empty() {
+        println!(
+            "GPU draw compaction: {} compatible material group(s), {} candidate draws",
+            compact_groups.len(),
+            compact_draw_capacity
+        );
+    }
+    let cull_started = Instant::now();
+    let cull_count = u32::try_from(cull_records.len()).unwrap_or(u32::MAX);
+    if cull_records.is_empty() {
+        cull_records.push(GpuCullRecord::zeroed());
+        initial_indirect.push(DrawIndexedIndirectArgs {
+            index_count: 0,
+            instance_count: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        });
+    }
+    let cull_records_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA GPU cull records"),
+        contents: bytemuck::cast_slice(&cull_records),
+        // COPY_DST: inline-model (mover) bounds are rewritten as they move.
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA indirect draw arguments"),
+        contents: bytemuck::cast_slice(&initial_indirect),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST,
+    });
+    let active_cull_indices = vec![0_u32; usize::try_from(cull_count.max(1)).unwrap_or(1)];
+    let active_cull_indices_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA active GPU cull indices"),
+        contents: bytemuck::cast_slice(&active_cull_indices),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let compact_indirect = vec![
+        DrawIndexedIndirectArgs::zeroed();
+        usize::try_from(compact_draw_capacity.max(1)).unwrap_or(1)
+    ];
+    let compact_indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA compacted indirect draw arguments"),
+        contents: bytemuck::cast_slice(&compact_indirect),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+    });
+    let compact_counts = vec![0_u32; compact_groups.len().max(1)];
+    let compact_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA compacted indirect draw counts"),
+        contents: bytemuck::cast_slice(&compact_counts),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST,
+    });
+    let cull_debug_reasons = vec![0_u32; usize::try_from(cull_count.max(1)).unwrap_or(1)];
+    let cull_debug_reason_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA cull rejection reasons"),
+        contents: bytemuck::cast_slice(&cull_debug_reasons),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let cull_debug_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA cull rejection counters"),
+        contents: bytemuck::cast_slice(&[0_u32; 4]),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+    });
+    let cull_debug_bind_group =
+        create_cull_debug_bind_group(device, cull_debug_layout, &cull_debug_reason_buffer);
+    upload_timings.cull_resources_ms = cull_started.elapsed().as_secs_f64() * 1000.0;
+    let lighting_started = Instant::now();
+    if dynamic_lights.len() > MAX_DYNAMIC_LIGHTS {
+        eprintln!(
+            "Dynamic lights: {} source lights found; clustered enhancement uses the first {}",
+            dynamic_lights.len(),
+            MAX_DYNAMIC_LIGHTS
+        );
+    }
+    let dynamic_lights = dynamic_lights
+        .into_iter()
+        .take(MAX_DYNAMIC_LIGHTS)
+        .collect::<Vec<_>>();
+    let light_count = u32::try_from(dynamic_lights.len()).unwrap_or(0);
+    let shadow_slot_by_light = vec![0_u32; dynamic_lights.len()];
+    let gpu_lights = gpu_point_lights(&dynamic_lights, &shadow_slot_by_light);
+    let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA dynamic point lights"),
+        contents: bytemuck::cast_slice(&gpu_lights),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let local_shadows = create_local_shadow_resources(device, shadow_caster_layout);
+    let static_light_grid = upload_static_light_grid(device, queue, static_light_grid.as_ref());
+    let voxel_probe_gi = upload_voxel_probe_gi(device, queue, voxel_probe_gi_data.as_ref());
+    if light_count != 0 {
+        println!(
+            "Local light shadow cache: {} active slot(s), {} cached 512x512 cubemap slot(s); lights selected by camera/PVS relevance",
+            MAX_LOCAL_SHADOW_LIGHTS,
+            LOCAL_SHADOW_CACHE_SLOTS
+        );
+    }
+    let cluster_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA clustered-light lists"),
+        size: u64::from(CLUSTER_COUNT)
+            * u64::from(1 + MAX_CLUSTER_LIGHTS)
+            * std::mem::size_of::<u32>() as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cluster_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA clustered-light compute bind group"),
+        layout: cluster_compute_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA clustered-light render bind group"),
+        layout: lighting_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: pbr_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid.direction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid.lighting_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&static_light_grid.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: static_light_grid.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.point_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.area_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: voxel_probe_gi.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid.irradiance_volume_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: static_light_grid.irradiance_volume_uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let lighting_bind_group_lean = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA clustered-light render bind group (lean baseline)"),
+        layout: lighting_layout_lean,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: pbr_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid.direction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid.lighting_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&static_light_grid.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: static_light_grid.uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    upload_timings.lighting_resources_ms = lighting_started.elapsed().as_secs_f64() * 1000.0;
+
+    let pipeline_started = Instant::now();
+    let pipelines = create_world_pipelines(
+        device,
+        pipeline_layout,
+        shader,
+        surface_format,
+        msaa_samples,
+        &coarse_batches,
+        legacy_fog,
+        Some(shader_variant),
+    );
+    let fast_pipelines = create_world_pipelines(
+        device,
+        fast_pipeline_layout,
+        fast_shader,
+        surface_format,
+        msaa_samples,
+        &coarse_batches,
+        false,
+        None,
+    );
+    let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
+    {
+        BTreeMap::new()
+    } else {
+        create_reflection_pipelines(
+            device,
+            pipeline_layout,
+            shader,
+            surface_format,
+            &coarse_batches,
+            legacy_fog,
+            shader_variant,
+        )
+    };
+    let mut pipeline_variants = BTreeMap::new();
+    pipeline_variants.insert(
+        shader_variant,
+        WorldPipelineVariant {
+            pipelines,
+            reflection_pipelines,
+        },
+    );
+    upload_timings.pipeline_create_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0;
+
+    let visibility_started = Instant::now();
+    let coarse_all_batches: Vec<usize> = (0..coarse_batches.len()).collect();
+    let coarse_visible_batches_by_cluster = visibility
+        .as_ref()
+        .map(|vis| visible_batches_by_cluster(&coarse_batches, vis))
+        .unwrap_or_default();
+    let full_visible_batches_by_cluster = visibility
+        .as_ref()
+        .filter(|_| !full_batches.is_empty())
+        .map(|vis| visible_batches_by_cluster(&full_batches, vis))
+        .unwrap_or_default();
+    let auto_use_full_by_cluster = if full_visible_batches_by_cluster.is_empty() {
+        Vec::new()
+    } else {
+        coarse_visible_batches_by_cluster
+            .iter()
+            .zip(&full_visible_batches_by_cluster)
+            .map(|(coarse, full)| {
+                estimated_batch_cost(&full_batches, full)
+                    < estimated_batch_cost(&coarse_batches, coarse)
+            })
+            .collect()
+    };
+    upload_timings.visibility_tables_ms = visibility_started.elapsed().as_secs_f64() * 1000.0;
+    let grass_started = Instant::now();
+    let grass = grass_renderer.upload_map(device, &grass_patches);
+    upload_timings.grass_upload_ms = grass_started.elapsed().as_secs_f64() * 1000.0;
+
+    let static_ao_source = static_ao_cache_source.map(|cache| StaticAoWorldSource {
+        cache,
+        vertices: Arc::new(vertices),
+        vertex_ao_receivers: Arc::new(static_ao_vertex_receivers),
+        lightmap_triangles: Arc::new(static_ao_lightmap_triangles),
+        render_triangles: Arc::new(static_ao_render_triangles),
+        lightmap_sizes: Arc::new(static_ao_lightmap_sizes),
+        lightmap_bases: Arc::new(static_ao_lightmap_bases),
+    });
+
+    (
+        WorldGpu {
+            sky_average,
+            primary_skybox,
+            ocean_surfaces,
+            inline_models,
+            vertex_buffer,
+            index_buffer,
+            ocean_coarsest_spacing: upload_timings.ocean_coarsest_spacing,
+            cull_records_buffer,
+            indirect_buffer,
+            active_cull_indices_buffer,
+            compact_indirect_buffer,
+            compact_count_buffer,
+            cull_debug_reason_buffer,
+            cull_debug_count_buffer,
+            cull_debug_bind_group,
+            cull_record_count: cull_records.len(),
+            cull_bind_group: None,
+            active_cull_count: 0,
+            active_selection_key: None,
+            compact_groups,
+            light_buffer,
+            _cluster_buffer: cluster_buffer,
+            dynamic_lights,
+            cluster_compute_bind_group,
+            lighting_bind_group,
+            lighting_bind_group_lean,
+            _static_light_grid: static_light_grid,
+            voxel_probe_gi,
+            reflection_probes,
+            froxel_bind_group: None,
+            light_count,
+            local_shadows,
+            sun,
+            grass,
+            surface_sprite_effects,
+            active_pipeline_variant: shader_variant,
+            pipeline_variants,
+            fast_pipelines,
+            planar_reflectors,
+            coarse_batches,
+            full_batches,
+            visibility,
+            coarse_visible_batches_by_cluster,
+            full_visible_batches_by_cluster,
+            auto_use_full_by_cluster,
+            coarse_all_batches,
+            last_cluster: None,
+            textures,
+            footprint_mark_textures,
+            lightmaps,
+            deluxemaps,
+            lightmap_base_data: lightmap_data,
+            static_ao_source,
+            static_ao_source_to_gpu,
+            static_ao_gpu_vertices,
+            static_ao_lightmap_active: false,
+            texture_clamp,
+            material_debug,
+            inspector_vertices,
+            inspector_textures,
+            inspector_lightmaps,
+            snow_shell,
+        },
+        upload_timings,
+    )
+}
+
+/// Pose an inline model's compiled vertices. `None` (not in the snapshot)
+/// collapses every vertex onto one point: zero-area triangles rasterize
+/// nothing, and the returned bounds are that point.
+fn posed_inline_vertices(
+    base: &[GpuVertex],
+    pose: Option<InlineModelInstance>,
+) -> (Vec<GpuVertex>, [f32; 3], [f32; 3]) {
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    let hidden_point = base.first().map_or([0.0; 3], |vertex| vertex.position);
+    let vertices = base
+        .iter()
+        .map(|vertex| {
+            let mut out = *vertex;
+            match pose {
+                Some(pose) => {
+                    out.position = pose.transform_point(vertex.position);
+                    out.normal = pose.transform_normal(vertex.normal);
+                }
+                None => out.position = hidden_point,
+            }
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(out.position[axis]);
+                maximum[axis] = maximum[axis].max(out.position[axis]);
+            }
+            out
+        })
+        .collect::<Vec<_>>();
+    if vertices.is_empty() {
+        return (vertices, [0.0; 3], [0.0; 3]);
+    }
+    (vertices, minimum, maximum)
+}
+
+fn make_cull_record(
+    source: &DrawBatch,
+    vertices: &[GpuVertex],
+    index_range: &std::ops::Range<u32>,
+) -> GpuCullRecord {
+    let start = usize::try_from(source.vertices.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(source.vertices.end)
+        .unwrap_or(usize::MAX)
+        .min(vertices.len());
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    if start < end {
+        for vertex in &vertices[start..end] {
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(vertex.position[axis]);
+                maximum[axis] = maximum[axis].max(vertex.position[axis]);
+            }
+        }
+    } else {
+        minimum = [0.0; 3];
+        maximum = [0.0; 3];
+    }
+    GpuCullRecord {
+        minimum: [minimum[0], minimum[1], minimum[2], 0.0],
+        maximum: [maximum[0], maximum[1], maximum[2], 0.0],
+        draw: [
+            index_range.end.saturating_sub(index_range.start),
+            index_range.start,
+            u32::from(source.pipeline.class == DrawClass::Sky),
+            0,
+        ],
+        compact: [u32::MAX, 0, 0, 0],
+    }
+}
+
+fn same_draw_state(a: &DrawBatch, b: &DrawBatch) -> bool {
+    // Planar-capable surfaces carry a per-surface reflection plane in their
+    // material uniform. Never merge them into a compacted indirect group whose
+    // representative bind group could belong to another plane.
+    if a.planar_reflection
+        || b.planar_reflection
+        || a.planar_environment_candidate
+        || b.planar_environment_candidate
+    {
+        return false;
+    }
+    a.pipeline == b.pipeline
+        && a.texture == b.texture
+        && a.texture_is_lightmap == b.texture_is_lightmap
+        && a.normal_texture == b.normal_texture
+        && a.roughness_texture == b.roughness_texture
+        && a.height_texture == b.height_texture
+        && a.metallic_texture == b.metallic_texture
+        && a.specular_texture == b.specular_texture
+        && a.emissive_texture == b.emissive_texture
+        && a.height_from_alpha == b.height_from_alpha
+        && a.rmo_packed == b.rmo_packed
+        && a.rmo_specular_alpha == b.rmo_specular_alpha
+        && a.normal_scale == b.normal_scale
+        && a.roughness_override == b.roughness_override
+        && a.specular_reflectance == b.specular_reflectance
+        && a.parallax_depth == b.parallax_depth
+        && a.lightmap == b.lightmap
+        && a.modulate_lightmap == b.modulate_lightmap
+        && a.vertex_lit == b.vertex_lit
+        && a.tc_gen == b.tc_gen
+        && a.tc_mods == b.tc_mods
+        && a.rgb_gen == b.rgb_gen
+        && a.alpha_gen == b.alpha_gen
+        && a.color == b.color
+        && a.alpha_cutoff == b.alpha_cutoff
+        && a.fog == b.fog
+        && a.skybox == b.skybox
+}
+
+fn build_draw_compaction_groups(
+    records: &mut [GpuCullRecord],
+    coarse_batches: &mut [WorldBatch],
+    full_batches: &mut [WorldBatch],
+) -> Vec<WorldDrawGroup> {
+    struct CandidateGroup {
+        representative_set: WorldBatchSet,
+        representative_index: usize,
+        members: Vec<(WorldBatchSet, usize)>,
+    }
+
+    let mut candidates = Vec::<CandidateGroup>::new();
+    for set in [WorldBatchSet::Coarse, WorldBatchSet::Full] {
+        let batches: &[WorldBatch] = match set {
+            WorldBatchSet::Coarse => coarse_batches,
+            WorldBatchSet::Full => full_batches,
+        };
+        for (batch_index, batch) in batches.iter().enumerate() {
+            // Transparent surfaces require their authored ordering, and sky
+            // stages are cheap enough to keep on the conservative path. GPU
+            // compaction targets the large opaque/masked world workload.
+            if !matches!(
+                batch.source.pipeline.class,
+                DrawClass::Opaque | DrawClass::Mask
+            ) {
+                continue;
+            }
+            if let Some(group) = candidates.iter_mut().find(|group| {
+                if group.representative_set != set {
+                    return false;
+                }
+                let representative = match group.representative_set {
+                    WorldBatchSet::Coarse => &coarse_batches[group.representative_index],
+                    WorldBatchSet::Full => &full_batches[group.representative_index],
+                };
+                same_draw_state(&representative.source, &batch.source)
+            }) {
+                group.members.push((set, batch_index));
+            } else {
+                candidates.push(CandidateGroup {
+                    representative_set: set,
+                    representative_index: batch_index,
+                    members: vec![(set, batch_index)],
+                });
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut output_base = 0_u32;
+    for candidate in candidates
+        .into_iter()
+        .filter(|group| group.members.len() >= 2)
+    {
+        let group_index = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+        let max_count = u32::try_from(candidate.members.len()).unwrap_or(u32::MAX);
+        for (set, batch_index) in &candidate.members {
+            let batch = match set {
+                WorldBatchSet::Coarse => &mut coarse_batches[*batch_index],
+                WorldBatchSet::Full => &mut full_batches[*batch_index],
+            };
+            batch.compact_group = Some(group_index);
+            if let Some(record) = records.get_mut(batch.cull_index as usize) {
+                record.compact = [group_index, output_base, 1, 0];
+            }
+        }
+        groups.push(WorldDrawGroup {
+            representative_set: candidate.representative_set,
+            representative_index: candidate.representative_index,
+            output_base,
+            max_count,
+        });
+        output_base = output_base.saturating_add(max_count);
+    }
+    groups
+}
+
+fn ray_hits_aabb(origin: Vec3, direction: Vec3, minimum: Vec3, maximum: Vec3) -> bool {
+    let mut t_min = 0.0_f32;
+    let mut t_max = f32::INFINITY;
+    for axis in 0..3 {
+        let o = origin[axis];
+        let d = direction[axis];
+        let min = minimum[axis];
+        let max = maximum[axis];
+        if d.abs() < 1e-8 {
+            if o < min || o > max {
+                return false;
+            }
+            continue;
+        }
+        let inv = 1.0 / d;
+        let mut a = (min - o) * inv;
+        let mut b = (max - o) * inv;
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        t_min = t_min.max(a);
+        t_max = t_max.min(b);
+        if t_max < t_min {
+            return false;
+        }
+    }
+    t_max >= 0.0
+}
+
+fn barycentric_coordinates(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<[f32; 3]> {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = point - a;
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let denominator = d00 * d11 - d01 * d01;
+    if denominator.abs() <= 1e-10 {
+        return None;
+    }
+    let v = (d11 * d20 - d01 * d21) / denominator;
+    let w = (d00 * d21 - d01 * d20) / denominator;
+    let u = 1.0 - v - w;
+    Some([u, v, w])
+}
+
+fn interpolate_uv(
+    triangle: &[InspectorVertex],
+    weights: [f32; 3],
+    uv: impl Fn(&InspectorVertex) -> [f32; 2],
+) -> Vec2 {
+    let a = Vec2::from_array(uv(&triangle[0]));
+    let b = Vec2::from_array(uv(&triangle[1]));
+    let c = Vec2::from_array(uv(&triangle[2]));
+    a * weights[0] + b * weights[1] + c * weights[2]
+}
+
+fn uv_edge_lengths(
+    triangle: &[InspectorVertex],
+    uv: impl Fn(&InspectorVertex) -> [f32; 2],
+) -> [f32; 3] {
+    let a = Vec2::from_array(uv(&triangle[0]));
+    let b = Vec2::from_array(uv(&triangle[1]));
+    let c = Vec2::from_array(uv(&triangle[2]));
+    [(b - a).length(), (c - b).length(), (a - c).length()]
+}
+
+fn texture_edge_density(triangle: &[InspectorVertex], width: u32, height: u32) -> [f32; 3] {
+    let positions = [
+        Vec3::from_array(triangle[0].position),
+        Vec3::from_array(triangle[1].position),
+        Vec3::from_array(triangle[2].position),
+    ];
+    let uvs = [
+        Vec2::from_array(triangle[0].uv),
+        Vec2::from_array(triangle[1].uv),
+        Vec2::from_array(triangle[2].uv),
+    ];
+    let size = Vec2::new(width as f32, height as f32);
+    let pairs = [(0usize, 1usize), (1, 2), (2, 0)];
+    pairs.map(|(a, b)| {
+        let world = (positions[b] - positions[a]).length();
+        if world <= 1e-6 {
+            0.0
+        } else {
+            ((uvs[b] - uvs[a]) * size).length() / world
+        }
+    })
+}
+
+fn ray_triangle_distance(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let edge1 = b - a;
+    let edge2 = c - a;
+    let p = direction.cross(edge2);
+    let determinant = edge1.dot(p);
+    if determinant.abs() < 1e-7 {
+        return None;
+    }
+    let inverse = 1.0 / determinant;
+    let t = origin - a;
+    let u = t.dot(p) * inverse;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = t.cross(edge1);
+    let v = direction.dot(q) * inverse;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let distance = edge2.dot(q) * inverse;
+    (distance > 0.001 && distance.is_finite()).then_some(distance)
+}
+
+fn visible_batches_by_cluster(
+    batches: &[WorldBatch],
+    vis: &jka_assets::bsp::Visibility,
+) -> Vec<Vec<usize>> {
+    let mut by_cluster = vec![Vec::new(); vis.clusters];
+    for (batch_index, batch) in batches.iter().enumerate() {
+        if batch.source.pvs_signature.is_empty() {
+            for list in &mut by_cluster {
+                list.push(batch_index);
+            }
+            continue;
+        }
+        for (cluster, list) in by_cluster.iter_mut().enumerate() {
+            let word = cluster / 64;
+            let bit = cluster % 64;
+            if batch
+                .source
+                .pvs_signature
+                .get(word)
+                .is_none_or(|value| *value & (1_u64 << bit) != 0)
+            {
+                list.push(batch_index);
+            }
+        }
+    }
+    by_cluster
+}
+
+fn estimated_batch_cost(batches: &[WorldBatch], indices: &[usize]) -> u64 {
+    indices.iter().fold(0_u64, |cost, &index| {
+        let batch = &batches[index].source;
+        let vertices = u64::from(batch.vertices.end - batch.vertices.start);
+        cost.saturating_add(vertices + AUTO_DRAW_VERTEX_EQUIVALENT)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_fast_world_bind_group(
+    device: &wgpu::Device,
+    surface_layout: &wgpu::BindGroupLayout,
+    white: &GpuImage,
+    missing: &GpuImage,
+    repeat_sampler: &wgpu::Sampler,
+    clamp_sampler: &wgpu::Sampler,
+    lightmap_sampler: &wgpu::Sampler,
+    sky_sampler: &wgpu::Sampler,
+    textures: &[GpuImage],
+    lightmaps: &[GpuImage],
+    texture_clamp: &[bool],
+    fallback_skybox: Option<[usize; 6]>,
+    footprint_marks: &[&GpuImage; 2],
+    source: &DrawBatch,
+    material_buffer: &wgpu::Buffer,
+    surface_deformation_buffer: &wgpu::Buffer,
+    deformation_field_views: [&wgpu::TextureView; 2],
+    deformation_field_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    let explicit_lightmap = source
+        .lightmap
+        .and_then(|index| lightmaps.get(index))
+        .unwrap_or(white);
+    let (base, base_sampler) = if source.texture_is_lightmap {
+        (explicit_lightmap, lightmap_sampler)
+    } else {
+        let base = source
+            .texture
+            .and_then(|index| textures.get(index))
+            .unwrap_or(missing);
+        let sampler = source
+            .texture
+            .and_then(|index| texture_clamp.get(index))
+            .map(|clamp| {
+                if *clamp {
+                    clamp_sampler
+                } else {
+                    repeat_sampler
+                }
+            })
+            .unwrap_or(clamp_sampler);
+        (base, sampler)
+    };
+    let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        source
+            .skybox
+            .or(fallback_skybox)
+            .and_then(|indices| textures.get(indices[face]))
+            .unwrap_or(missing)
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA fast BSP surface bind group"),
+        layout: surface_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&base.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(base_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&explicit_lightmap.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(lightmap_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: material_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[1].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[2].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[3].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[4].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[5].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::Sampler(sky_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: surface_deformation_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::TextureView(&footprint_marks[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(&footprint_marks[1].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 24,
+                resource: wgpu::BindingResource::Sampler(clamp_sampler),
+            },
+            wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(deformation_field_views[0]) },
+            wgpu::BindGroupEntry { binding: 26, resource: wgpu::BindingResource::TextureView(deformation_field_views[1]) },
+            wgpu::BindGroupEntry { binding: 27, resource: wgpu::BindingResource::Sampler(deformation_field_sampler) },
+        ],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_world_bind_group(
+    device: &wgpu::Device,
+    surface_layout: &wgpu::BindGroupLayout,
+    white: &GpuImage,
+    missing: &GpuImage,
+    flat_normal: &GpuImage,
+    repeat_sampler: &wgpu::Sampler,
+    clamp_sampler: &wgpu::Sampler,
+    pbr_repeat_sampler: &wgpu::Sampler,
+    pbr_clamp_sampler: &wgpu::Sampler,
+    lightmap_sampler: &wgpu::Sampler,
+    sky_sampler: &wgpu::Sampler,
+    textures: &[GpuImage],
+    lightmaps: &[GpuImage],
+    deluxemaps: &[GpuImage],
+    texture_clamp: &[bool],
+    fallback_skybox: Option<[usize; 6]>,
+    footprint_marks: &[&GpuImage; 2],
+    reflection_probes: &ReflectionProbeGpuSet,
+    source: &DrawBatch,
+    material_buffer: &wgpu::Buffer,
+    fog_buffer: &wgpu::Buffer,
+    surface_deformation_buffer: &wgpu::Buffer,
+    deformation_field_views: [&wgpu::TextureView; 2],
+    deformation_field_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    let explicit_lightmap = source
+        .lightmap
+        .and_then(|index| lightmaps.get(index))
+        .unwrap_or(white);
+    let deluxemap = source
+        .lightmap
+        .and_then(|index| deluxemaps.get(index))
+        .unwrap_or_else(|| &deluxemaps[0]);
+    let (base, base_sampler) = if source.texture_is_lightmap {
+        (explicit_lightmap, lightmap_sampler)
+    } else {
+        let base = source
+            .texture
+            .and_then(|index| textures.get(index))
+            .unwrap_or(missing);
+        let sampler = source
+            .texture
+            .and_then(|index| texture_clamp.get(index))
+            .map(|clamp| {
+                if *clamp {
+                    clamp_sampler
+                } else {
+                    repeat_sampler
+                }
+            })
+            .unwrap_or(clamp_sampler);
+        (base, sampler)
+    };
+    let companion_clamp = [
+        source.normal_texture,
+        source.roughness_texture,
+        source.height_texture,
+        source.metallic_texture,
+        source.specular_texture,
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|index| texture_clamp.get(index).copied())
+    .unwrap_or_else(|| {
+        source
+            .texture
+            .and_then(|index| texture_clamp.get(index))
+            .copied()
+            .unwrap_or(true)
+    });
+    let pbr_sampler = if companion_clamp {
+        pbr_clamp_sampler
+    } else {
+        pbr_repeat_sampler
+    };
+    let normal = source
+        .normal_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(flat_normal);
+    let roughness = source
+        .roughness_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(white);
+    let height = source
+        .height_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(white);
+    let metallic = source
+        .metallic_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(white);
+    let specular = source
+        .specular_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(white);
+    let emissive = source
+        .emissive_texture
+        .and_then(|index| textures.get(index))
+        .unwrap_or(white);
+    let reflection_probe = source
+        .reflection_probe
+        .and_then(|index| reflection_probes.probes.get(index))
+        .unwrap_or(&reflection_probes.probes[0]);
+    let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        source
+            .skybox
+            .or(fallback_skybox)
+            .and_then(|indices| textures.get(indices[face]))
+            .unwrap_or(missing)
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("BSP surface bind group"),
+        layout: surface_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&base.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(base_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&explicit_lightmap.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(lightmap_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: material_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[1].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[2].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[3].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[4].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&sky_faces[5].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::Sampler(sky_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(&normal.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(&roughness.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(&height.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: fog_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(&metallic.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&specular.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(&emissive.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(&reflection_probe.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::Sampler(&reflection_probes.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: surface_deformation_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::TextureView(&footprint_marks[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(&footprint_marks[1].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 24,
+                resource: wgpu::BindingResource::Sampler(clamp_sampler),
+            },
+            wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(deformation_field_views[0]) },
+            wgpu::BindGroupEntry { binding: 26, resource: wgpu::BindingResource::TextureView(deformation_field_views[1]) },
+            wgpu::BindGroupEntry { binding: 27, resource: wgpu::BindingResource::Sampler(deformation_field_sampler) },
+            wgpu::BindGroupEntry { binding: 28, resource: wgpu::BindingResource::Sampler(pbr_sampler) },
+            wgpu::BindGroupEntry { binding: 29, resource: wgpu::BindingResource::TextureView(&deluxemap.view) },
+        ],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_world_bind_groups(
+    device: &wgpu::Device,
+    surface_layout: &wgpu::BindGroupLayout,
+    fast_surface_layout: &wgpu::BindGroupLayout,
+    white: &GpuImage,
+    missing: &GpuImage,
+    flat_normal: &GpuImage,
+    repeat_sampler: &wgpu::Sampler,
+    clamp_sampler: &wgpu::Sampler,
+    pbr_repeat_sampler: &wgpu::Sampler,
+    pbr_clamp_sampler: &wgpu::Sampler,
+    lightmap_sampler: &wgpu::Sampler,
+    sky_sampler: &wgpu::Sampler,
+    surface_deformation_buffer: &wgpu::Buffer,
+    deformation_field_views: [&wgpu::TextureView; 2],
+    deformation_field_sampler: &wgpu::Sampler,
+    world: &mut WorldGpu,
+) {
+    let WorldGpu {
+        coarse_batches,
+        full_batches,
+        textures,
+        lightmaps,
+        deluxemaps,
+        texture_clamp,
+        primary_skybox,
+        reflection_probes,
+        footprint_mark_textures,
+        ..
+    } = world;
+    let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
+        footprint_mark_textures[slot]
+            .and_then(|index| textures.get(index))
+            .unwrap_or(white)
+    });
+    for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
+        batch.bind_group = create_world_bind_group(
+            device,
+            surface_layout,
+            white,
+            missing,
+            flat_normal,
+            repeat_sampler,
+            clamp_sampler,
+            pbr_repeat_sampler,
+            pbr_clamp_sampler,
+            lightmap_sampler,
+            sky_sampler,
+            textures,
+            lightmaps,
+            deluxemaps,
+            texture_clamp,
+            *primary_skybox,
+            &footprint_marks,
+            reflection_probes,
+            &batch.source,
+            &batch._material_buffer,
+            &batch._fog_buffer,
+            surface_deformation_buffer,
+            deformation_field_views,
+            deformation_field_sampler,
+        );
+        batch.fast_bind_group = create_fast_world_bind_group(
+            device,
+            fast_surface_layout,
+            white,
+            missing,
+            repeat_sampler,
+            clamp_sampler,
+            lightmap_sampler,
+            sky_sampler,
+            textures,
+            lightmaps,
+            texture_clamp,
+            *primary_skybox,
+            &footprint_marks,
+            &batch.source,
+            &batch._material_buffer,
+            surface_deformation_buffer,
+            deformation_field_views,
+            deformation_field_sampler,
+        );
+    }
+}
+
+fn material_uniform(source: &DrawBatch) -> MaterialUniform {
+    let mut out = MaterialUniform::default();
+    match source.tc_gen {
+        TcGen::Base => out.header[0] = 0,
+        TcGen::Lightmap => out.header[0] = 1,
+        TcGen::Vector(s, t) => {
+            out.header[0] = 2;
+            // tcGen vectors are authored in JKA coordinates. Vertex positions in
+            // the renderer use [x,z,-y], so transform the basis once here.
+            out.vector_s = [s[0], s[2], -s[1], 0.0];
+            out.vector_t = [t[0], t[2], -t[1], 0.0];
+        }
+        TcGen::Environment => out.header[0] = 3,
+    }
+    let count = source.tc_mods.len().min(4);
+    out.header[1] = count as u32;
+    // Keep RGB and alpha generation independent, matching id Tech 3's
+    // separate rgbGen/alphaGen state. Bit 0 remains the legacy "RGB from
+    // vertex color" flag so existing shader paths keep their compact layout.
+    if matches!(source.rgb_gen, RgbGen::Vertex | RgbGen::ExactVertex) {
+        out.header[2] |= 1;
+    } else if matches!(source.rgb_gen, RgbGen::OneMinusVertex) {
+        out.header[2] |= 524288;
+    }
+
+    // In the classic renderer rgbGen vertex leaves vertex alpha in place when
+    // alphaGen is identity (with the normal identity-light scale). exactVertex
+    // does not. Encode that implicit case here so the WGSL need not know the
+    // parser's defaulting rules.
+    let alpha_from_vertex = matches!(source.alpha_gen, AlphaGen::Vertex)
+        || (matches!(source.alpha_gen, AlphaGen::Identity)
+            && matches!(source.rgb_gen, RgbGen::Vertex));
+    if alpha_from_vertex {
+        out.header[2] |= 1048576;
+    } else if matches!(source.alpha_gen, AlphaGen::OneMinusVertex) {
+        out.header[2] |= 2097152;
+    }
+
+    if source.modulate_lightmap {
+        out.header[2] |= 2;
+    }
+    // Dedicated cached-AO receiver bit for q3map LIGHTMAP_BY_VERTEX stages.
+    // Restrict it to the stage that actually consumes BSP vertex RGB so
+    // emissive/additive sibling stages do not get incorrectly darkened.
+    if source.vertex_lit && source.rgb_gen.uses_vertex_color() {
+        out.header[2] |= 131072;
+    }
+    let pbr_eligible = !source.texture_is_lightmap
+        && source.pipeline.class == DrawClass::Opaque
+        && source.pipeline.blend == BlendMode::Opaque
+        && matches!(source.tc_gen, TcGen::Base);
+    if pbr_eligible && source.normal_texture.is_some() {
+        out.header[2] |= 8;
+    }
+    if pbr_eligible && source.roughness_texture.is_some() {
+        out.header[2] |= 16;
+    }
+    if pbr_eligible && source.height_texture.is_some() {
+        out.header[2] |= 32;
+    }
+    if pbr_eligible && source.metallic_texture.is_some() {
+        out.header[2] |= 64;
+    }
+    if pbr_eligible && source.specular_texture.is_some() {
+        out.header[2] |= 128;
+    }
+    if pbr_eligible && source.emissive_texture.is_some() {
+        out.header[2] |= 256;
+    }
+    if pbr_eligible && source.rmo_packed {
+        out.header[2] |= 512;
+    }
+    if pbr_eligible && source.rmo_specular_alpha {
+        out.header[2] |= 262144;
+    }
+    if pbr_eligible && source.height_from_alpha {
+        out.header[2] |= 1024;
+    }
+    if source.water_primary {
+        // Enhanced-water promotion: the authored first stage becomes the single
+        // GodotOceanWaves surface pass while sibling authored stages are skipped.
+        out.header[2] |= 65536;
+    }
+    for (i, modifier) in source.tc_mods.iter().take(4).enumerate() {
+        let a = i * 2;
+        match *modifier {
+            TcMod::Scroll(x, y) => out.mods[a] = [1.0, x, y, 0.0],
+            TcMod::Scale(x, y) => out.mods[a] = [2.0, x, y, 0.0],
+            TcMod::Rotate(degrees) => out.mods[a] = [3.0, degrees, 0.0, 0.0],
+            TcMod::Transform(v) => {
+                out.mods[a] = [4.0, v[0], v[1], v[4]];
+                out.mods[a + 1] = [v[2], v[3], v[5], 0.0];
+            }
+            TcMod::Turb {
+                base,
+                amplitude,
+                phase,
+                frequency,
+            } => {
+                out.mods[a] = [5.0, base, amplitude, phase];
+                out.mods[a + 1] = [frequency, 0.0, 0.0, 0.0];
+            }
+        }
+    }
+    if !source.texture_is_lightmap
+        && source.pipeline.class != DrawClass::Sky
+        && source.pipeline.blend == BlendMode::Opaque
+    {
+        out.header[2] |= 4;
+    }
+    if source.skybox.is_some() {
+        out.header[3] |= 1;
+    }
+    out.header[3] |= u32::from(source.surface_material & 31) << 8;
+    out.color = source.color;
+    out.params[0] = source.alpha_cutoff;
+    out.params[1] = source.parallax_depth;
+    out.pbr_params0 = [
+        source.normal_scale[0],
+        source.normal_scale[1],
+        source.roughness_override.unwrap_or(-1.0),
+        source.reflection_roughness_hint,
+    ];
+    if let Some(reflectance) = source.specular_reflectance {
+        out.pbr_params1 = [reflectance[0], reflectance[1], reflectance[2], 1.0];
+    }
+    let has_pbr_companion = source.normal_texture.is_some()
+        || source.roughness_texture.is_some()
+        || source.metallic_texture.is_some()
+        || source.specular_texture.is_some()
+        || source.roughness_override.is_some()
+        || source.specular_reflectance.is_some();
+    if pbr_eligible && has_pbr_companion && source.reflection_probe.is_some() {
+        out.header[2] |= 2048;
+        out.reflection_probe = source.reflection_probe_position_radius;
+    }
+    if (source.reflection_cache_flags & scene::REFLECTION_CACHE_SSR) != 0 {
+        out.header[2] |= 4194304;
+    }
+    if source.planar_reflection {
+        out.header[2] |= 4096;
+        out.planar_plane = source.planar_plane;
+    } else if source.planar_environment_candidate {
+        out.header[2] |= 8192;
+        // A blended tcGen-environment stage is not a mirror replacement in the
+        // material sense: its legacy environment texture also authored the
+        // strength/tint of the reflection contribution. Preserve that response
+        // when substituting the live planar scene.
+        if source.pipeline.blend != BlendMode::Opaque {
+            out.header[2] |= 32768;
+        }
+        out.planar_plane = source.planar_plane;
+    }
+    let planar_normal = Vec3::new(
+        source.planar_plane[0],
+        source.planar_plane[1],
+        source.planar_plane[2],
+    );
+    if planar_normal.length_squared() > 0.5 {
+        // Debug-only bit. assign_planar_reflection_planes propagates the
+        // resolved plane to sibling stages so diagnostics cannot be hidden by
+        // a later alpha/lightmap pass of the same material.
+        out.header[2] |= 16384;
+        out.planar_plane = source.planar_plane;
+    }
+    out
+}
+
+fn create_world_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    batches: &[WorldBatch],
+    legacy_fog: bool,
+    shader_variant: Option<WorldShaderVariantKey>,
+) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
+    let mut pipelines = BTreeMap::new();
+    for batch in batches {
+        pipelines.entry(batch.source.pipeline).or_insert_with(|| {
+            create_world_pipeline(
+                device,
+                layout,
+                shader,
+                surface_format,
+                batch.source.pipeline,
+                msaa_samples,
+                legacy_fog,
+                shader_variant,
+            )
+        });
+    }
+    pipelines
+}
+
+fn create_reflection_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    batches: &[WorldBatch],
+    legacy_fog: bool,
+    shader_variant: WorldShaderVariantKey,
+) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
+    let mut pipelines = BTreeMap::new();
+    for batch in batches {
+        let original = batch.source.pipeline;
+        pipelines.entry(original).or_insert_with(|| {
+            let mut reflected = original;
+            reflected.cull = match reflected.cull {
+                CullMode::None => CullMode::None,
+                CullMode::Front => CullMode::Back,
+                CullMode::Back => CullMode::Front,
+            };
+            create_world_pipeline(
+                device,
+                layout,
+                shader,
+                surface_format,
+                reflected,
+                1,
+                legacy_fog,
+                Some(shader_variant),
+            )
+        });
+    }
+    pipelines
+}
+
+fn planar_reflector_enabled(mode: PlanarReflectionMode, kind: PlanarReflectorKind) -> bool {
+    match mode {
+        PlanarReflectionMode::Off => false,
+        PlanarReflectionMode::Authored => kind == PlanarReflectorKind::Authored,
+        PlanarReflectionMode::Environment => true,
+    }
+}
+
+fn collect_planar_reflectors(
+    batches: &[WorldBatch],
+    vertices: &[GpuVertex],
+) -> Vec<PlanarReflector> {
+    let mut seen_ranges = std::collections::BTreeSet::new();
+    let mut reflectors = Vec::new();
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let kind = if batch.source.planar_reflection {
+            PlanarReflectorKind::Authored
+        } else if batch.source.planar_environment_candidate {
+            PlanarReflectorKind::Environment
+        } else {
+            continue;
+        };
+        if !seen_ranges.insert((batch.source.vertices.start, batch.source.vertices.end)) {
+            continue;
+        }
+        let normal = Vec3::new(
+            batch.source.planar_plane[0],
+            batch.source.planar_plane[1],
+            batch.source.planar_plane[2],
+        );
+        if normal.length_squared() <= 0.5 {
+            continue;
+        }
+        let start = batch.source.vertices.start as usize;
+        let end = batch.source.vertices.end as usize;
+        let Some(slice) = vertices.get(start..end) else {
+            continue;
+        };
+        let area = slice
+            .chunks_exact(3)
+            .map(|triangle| {
+                let a = Vec3::from_array(triangle[0].position);
+                let b = Vec3::from_array(triangle[1].position);
+                let c = Vec3::from_array(triangle[2].position);
+                0.5 * (b - a).cross(c - a).length()
+            })
+            .sum::<f32>();
+        if !area.is_finite() || area <= 0.01 {
+            continue;
+        }
+        let centre = [
+            (batch.bounds_min[0] + batch.bounds_max[0]) * 0.5,
+            (batch.bounds_min[1] + batch.bounds_max[1]) * 0.5,
+            (batch.bounds_min[2] + batch.bounds_max[2]) * 0.5,
+        ];
+        reflectors.push(PlanarReflector {
+            kind,
+            plane: batch.source.planar_plane,
+            // Authored JKA mirrors use misc_portal_surface exactly. Promoted
+            // environment surfaces have no portal entity, so retain their
+            // surface centre and nudge it to the camera side at selection time.
+            pvs_origin: if kind == PlanarReflectorKind::Authored {
+                batch.source.planar_pvs_origin
+            } else {
+                centre
+            },
+            cull: batch.source.pipeline.cull,
+            bounds_min: batch.bounds_min,
+            bounds_max: batch.bounds_max,
+            area,
+            coarse_batch_index: batch_index,
+        });
+    }
+    reflectors
+}
+
+fn reflect_point_across_plane(point: Vec3, plane: [f32; 4]) -> Vec3 {
+    let normal = Vec3::new(plane[0], plane[1], plane[2]);
+    point - normal * (2.0 * (normal.dot(point) + plane[3]))
+}
+
+fn reflection_matrix(plane: [f32; 4]) -> Mat4 {
+    let normal = Vec3::new(plane[0], plane[1], plane[2]);
+    let nx = normal.x;
+    let ny = normal.y;
+    let nz = normal.z;
+    let d = plane[3];
+    Mat4::from_cols(
+        glam::Vec4::new(1.0 - 2.0 * nx * nx, -2.0 * nx * ny, -2.0 * nx * nz, 0.0),
+        glam::Vec4::new(-2.0 * ny * nx, 1.0 - 2.0 * ny * ny, -2.0 * ny * nz, 0.0),
+        glam::Vec4::new(-2.0 * nz * nx, -2.0 * nz * ny, 1.0 - 2.0 * nz * nz, 0.0),
+        glam::Vec4::new(-2.0 * d * nx, -2.0 * d * ny, -2.0 * d * nz, 1.0),
+    )
+}
+
+fn projected_planar_importance(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    view_proj: Mat4,
+) -> Option<(bool, f32)> {
+    // The planar pool is intentionally small. Rank eligible reflectors by the
+    // amount of the main view they can actually affect, rather than by world
+    // area alone, so the four reflected views go to surfaces the player can see.
+    let mut ndc_min = Vec2::splat(f32::INFINITY);
+    let mut ndc_max = Vec2::splat(f32::NEG_INFINITY);
+    let mut projected = 0u32;
+
+    for x in [bounds_min[0], bounds_max[0]] {
+        for y in [bounds_min[1], bounds_max[1]] {
+            for z in [bounds_min[2], bounds_max[2]] {
+                let clip = view_proj * Vec4::new(x, y, z, 1.0);
+                if !clip.is_finite() || clip.w <= 1e-4 {
+                    continue;
+                }
+                let ndc = clip.truncate().truncate() / clip.w;
+                ndc_min = ndc_min.min(ndc);
+                ndc_max = ndc_max.max(ndc);
+                projected += 1;
+            }
+        }
+    }
+    if projected == 0 {
+        return None;
+    }
+
+    ndc_min = ndc_min.max(Vec2::splat(-1.0));
+    ndc_max = ndc_max.min(Vec2::splat(1.0));
+    let extent = (ndc_max - ndc_min).max(Vec2::ZERO);
+    if extent.x <= 0.0 || extent.y <= 0.0 {
+        return None;
+    }
+
+    // NDC spans two units per axis, so divide by four for a 0..1 viewport
+    // coverage estimate. Prefer a reflector covering the crosshair/centre;
+    // otherwise attenuate candidates toward the screen edge.
+    let coverage = (extent.x * extent.y * 0.25).clamp(0.0, 1.0);
+    let contains_centre =
+        ndc_min.x <= 0.0 && ndc_max.x >= 0.0 && ndc_min.y <= 0.0 && ndc_max.y >= 0.0;
+    let centre = (ndc_min + ndc_max) * 0.5;
+    let centre_weight = 1.0 / (1.0 + centre.length_squared() * 3.0);
+    Some((contains_centre, coverage * centre_weight))
+}
+
+fn planar_planes_equivalent(a: [f32; 4], b: [f32; 4]) -> bool {
+    let a_n = Vec3::new(a[0], a[1], a[2]);
+    let b_n = Vec3::new(b[0], b[1], b[2]);
+    if a_n.length_squared() <= 0.5 || b_n.length_squared() <= 0.5 {
+        return false;
+    }
+    let alignment = a_n.normalize().dot(b_n.normalize());
+    let plane_delta = if alignment >= 0.0 {
+        (a[3] - b[3]).abs()
+    } else {
+        (a[3] + b[3]).abs()
+    };
+    alignment.abs() > 0.999 && plane_delta < 2.0
+}
+
+fn select_planar_reflection_views(
+    world: &WorldGpu,
+    camera: &Camera,
+    main_view_proj: Mat4,
+    pvs_mode: PvsMode,
+    area_mask: Option<&[u8; 32]>,
+    planar_mode: PlanarReflectionMode,
+    reflection_quality: ReflectionQuality,
+    previous_planes: &[Option<[f32; 4]>; PLANAR_REFLECTION_SLOTS],
+) -> [Option<PlanarReflectionView>; PLANAR_REFLECTION_SLOTS] {
+    let planar_budget = reflection_quality.planar_slot_budget().min(PLANAR_REFLECTION_SLOTS);
+    if planar_budget == 0 {
+        return [None; PLANAR_REFLECTION_SLOTS];
+    }
+    let active_coarse = if pvs_mode == PvsMode::Off {
+        &world.coarse_all_batches
+    } else if let Some(cluster) = world.last_cluster.flatten() {
+        world
+            .coarse_visible_batches_by_cluster
+            .get(cluster)
+            .unwrap_or(&world.coarse_all_batches)
+    } else {
+        &world.coarse_all_batches
+    };
+    let effective_area_mask = effective_area_mask(world, pvs_mode, area_mask);
+
+    // priority, crosshair coverage, screen score, representative reflector, oriented plane
+    let mut candidates: Vec<(u8, bool, f32, PlanarReflector, [f32; 4])> = Vec::new();
+    for reflector in &world.planar_reflectors {
+        if !planar_reflector_enabled(planar_mode, reflector.kind)
+            || !active_coarse.contains(&reflector.coarse_batch_index)
+            || world
+                .coarse_batches
+                .get(reflector.coarse_batch_index)
+                .is_some_and(|batch| !batch_area_visible(batch, effective_area_mask))
+            || !aabb_intersects_clip_frustum(
+                reflector.bounds_min,
+                reflector.bounds_max,
+                main_view_proj,
+            )
+        {
+            continue;
+        }
+        let mut plane = reflector.plane;
+        let mut normal = Vec3::new(plane[0], plane[1], plane[2]);
+        let signed_distance = normal.dot(camera.position) + plane[3];
+        if signed_distance.abs() < 0.25
+            || matches!(reflector.cull, CullMode::Back) && signed_distance <= 0.0
+            || matches!(reflector.cull, CullMode::Front) && signed_distance >= 0.0
+        {
+            continue;
+        }
+        if signed_distance < 0.0 {
+            normal = -normal;
+            plane = [-plane[0], -plane[1], -plane[2], -plane[3]];
+        }
+        let Some((contains_centre, screen_importance)) =
+            projected_planar_importance(reflector.bounds_min, reflector.bounds_max, main_view_proj)
+        else {
+            continue;
+        };
+        let minimum_screen_importance = match reflection_quality {
+            ReflectionQuality::High => {
+                if reflector.kind == PlanarReflectorKind::Authored { 0.004 } else { 0.015 }
+            }
+            ReflectionQuality::Ultra => {
+                if reflector.kind == PlanarReflectorKind::Authored { 0.0005 } else { 0.002 }
+            }
+            _ => 1.0,
+        };
+        if screen_importance < minimum_screen_importance {
+            continue;
+        }
+        let distance = (normal.dot(camera.position) + plane[3]).abs();
+        let priority = u8::from(reflector.kind == PlanarReflectorKind::Authored);
+        let roughness_weight = world
+            .coarse_batches
+            .get(reflector.coarse_batch_index)
+            .map_or(1.0, |batch| (1.15 - batch.source.reflection_roughness_hint).clamp(0.15, 1.15));
+        // Realtime importance is deliberately continuous rather than a hard
+        // authored-vs-environment ordering. Authored mirrors get a bias, and a
+        // reflector covering the view centre gets another modest bias, but a
+        // genuinely dominant water/floor reflector can still win the budget.
+        let authored_weight = if reflector.kind == PlanarReflectorKind::Authored {
+            1.75
+        } else {
+            1.0
+        };
+        let centre_weight = if contains_centre { 1.20 } else { 1.0 };
+        let tie_break = reflector.area / (distance * distance + 4096.0);
+        let score = screen_importance * roughness_weight * authored_weight * centre_weight
+            + tie_break * 1e-6;
+        let candidate = (priority, contains_centre, score, *reflector, plane);
+
+        // Coplanar pieces share one reflected camera/texture layer. Keep the
+        // strongest representative for PVS selection, but do not spend another
+        // reflection slot on the same geometric plane.
+        if let Some(existing) = candidates
+            .iter_mut()
+            .find(|existing| planar_planes_equivalent(existing.4, plane))
+        {
+            let candidate_is_better = score > existing.2;
+            if candidate_is_better {
+                *existing = candidate;
+            }
+        } else {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        let a_sticky = previous_planes
+            .iter()
+            .flatten()
+            .any(|plane| planar_planes_equivalent(*plane, a.4));
+        let b_sticky = previous_planes
+            .iter()
+            .flatten()
+            .any(|plane| planar_planes_equivalent(*plane, b.4));
+        let a_score = a.2
+            * if a_sticky {
+                PLANAR_REFLECTION_HYSTERESIS
+            } else {
+                1.0
+            };
+        let b_score = b.2
+            * if b_sticky {
+                PLANAR_REFLECTION_HYSTERESIS
+            } else {
+                1.0
+            };
+        b_score
+            .total_cmp(&a_score)
+            .then_with(|| b.0.cmp(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    candidates.truncate(planar_budget);
+
+    // Preserve the relative order of surviving planes so a plane normally keeps
+    // the same texture-array layer. Compact to the front when one disappears,
+    // then append newly-important planes. This avoids A/B slot thrash while
+    // still allowing genuinely better reflectors to enter the four-view budget.
+    let mut ordered = Vec::with_capacity(candidates.len());
+    let mut used = vec![false; candidates.len()];
+    for previous in previous_planes.iter().flatten() {
+        if let Some((index, candidate)) =
+            candidates.iter().enumerate().find(|(index, candidate)| {
+                !used[*index] && planar_planes_equivalent(*previous, candidate.4)
+            })
+        {
+            used[index] = true;
+            ordered.push(*candidate);
+        }
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !used[index] {
+            ordered.push(*candidate);
+        }
+    }
+
+    let mut views = [None; PLANAR_REFLECTION_SLOTS];
+    for (slot, (_, _, _, reflector, plane)) in ordered.into_iter().enumerate() {
+        let plane_normal = Vec3::new(plane[0], plane[1], plane[2]).normalize_or_zero();
+        let reflected_position = reflect_point_across_plane(camera.position, plane);
+        let reflected_forward = (camera.forward()
+            - 2.0 * plane_normal * camera.forward().dot(plane_normal))
+        .normalize_or_zero();
+        let reflected_view_proj = main_view_proj * reflection_matrix(plane);
+        let pvs_origin = if reflector.kind == PlanarReflectorKind::Authored {
+            Vec3::from_array(reflector.pvs_origin)
+        } else {
+            Vec3::from_array(reflector.pvs_origin) + plane_normal
+        };
+        let cluster = world
+            .visibility
+            .as_ref()
+            .and_then(|vis| vis.cluster_at(scene::jka_position(pvs_origin.to_array())));
+        views[slot] = Some(PlanarReflectionView {
+            kind: reflector.kind,
+            plane,
+            view_proj: reflected_view_proj,
+            camera_position: reflected_position,
+            camera_forward: reflected_forward,
+            cluster,
+            coarse_batch_index: reflector.coarse_batch_index,
+        });
+    }
+    views
+}
+
+fn update_visibility(world: &mut WorldGpu, camera: &Camera) -> Option<usize> {
+    let cluster = world
+        .visibility
+        .as_ref()
+        .and_then(|vis| vis.cluster_at(scene::jka_position(camera.position.to_array())));
+    world.last_cluster = Some(cluster);
+    cluster
+}
+
+struct ActiveBatchSelection<'a> {
+    batches: &'a [WorldBatch],
+    indices: &'a [usize],
+}
+
+fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelection<'_> {
+    let coarse_all = ActiveBatchSelection {
+        batches: &world.coarse_batches,
+        indices: &world.coarse_all_batches,
+    };
+    if mode == PvsMode::Off {
+        return coarse_all;
+    }
+
+    let Some(cluster) = world.last_cluster.flatten() else {
+        // Outside the BSP tree or a source with no compiled visibility: render
+        // conservatively with the lowest-draw-call representation.
+        return coarse_all;
+    };
+    let Some(coarse_visible) = world.coarse_visible_batches_by_cluster.get(cluster) else {
+        return coarse_all;
+    };
+
+    let coarse = ActiveBatchSelection {
+        batches: &world.coarse_batches,
+        indices: coarse_visible,
+    };
+    if mode == PvsMode::Minimal || world.full_batches.is_empty() {
+        return coarse;
+    }
+
+    let Some(full_visible) = world.full_visible_batches_by_cluster.get(cluster) else {
+        return coarse;
+    };
+    let full = ActiveBatchSelection {
+        batches: &world.full_batches,
+        indices: full_visible,
+    };
+    match mode {
+        PvsMode::Full => full,
+        PvsMode::Auto
+            if world
+                .auto_use_full_by_cluster
+                .get(cluster)
+                .copied()
+                .unwrap_or(false) =>
+        {
+            full
+        }
+        PvsMode::Auto => coarse,
+        PvsMode::Off | PvsMode::Minimal => coarse,
+    }
+}
+
+fn effective_area_mask<'a>(
+    world: &WorldGpu,
+    mode: PvsMode,
+    area_mask: Option<&'a [u8; 32]>,
+) -> Option<&'a [u8; 32]> {
+    if mode == PvsMode::Off || world.last_cluster.flatten().is_none() {
+        None
+    } else {
+        area_mask
+    }
+}
+
+fn area_signature_visible(signature: &[u64; 4], area_mask: Option<&[u8; 32]>) -> bool {
+    let Some(area_mask) = area_mask else {
+        return true;
+    };
+    if signature.iter().all(|&word| word == 0) {
+        // Unknown/not-applicable area membership remains conservatively visible.
+        return true;
+    }
+    for (word_index, &membership) in signature.iter().enumerate() {
+        let start = word_index * 8;
+        let closed = u64::from_le_bytes(area_mask[start..start + 8].try_into().unwrap());
+        if membership & !closed != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn batch_area_visible(batch: &WorldBatch, area_mask: Option<&[u8; 32]>) -> bool {
+    area_signature_visible(&batch.source.area_signature, area_mask)
+}
+
+fn update_active_cull_indices(
+    queue: &wgpu::Queue,
+    world: &mut WorldGpu,
+    mode: PvsMode,
+    area_mask: Option<&[u8; 32]>,
+    debug_enabled: bool,
+) -> bool {
+    let cluster_key = if mode == PvsMode::Off {
+        None
+    } else {
+        world.last_cluster.flatten()
+    };
+    let area_mask = effective_area_mask(world, mode, area_mask);
+    let key = (mode, cluster_key, area_mask.copied());
+    if world.active_selection_key == Some(key) {
+        return false;
+    }
+
+    let (indices, debug_reasons) = {
+        let active = active_batch_selection(world, mode);
+        let indices = active
+            .indices
+            .iter()
+            .filter(|&&batch_index| batch_area_visible(&active.batches[batch_index], area_mask))
+            .map(|&batch_index| active.batches[batch_index].cull_index)
+            .collect::<Vec<_>>();
+        let debug_reasons = debug_enabled.then(|| {
+            let mut reasons = vec![0_u32; world.cull_record_count.max(1)];
+            // Anything in the selected representation but absent from the PVS
+            // active list was rejected before GPU frustum/Hi-Z culling.
+            for batch in active.batches {
+                if let Some(reason) = reasons.get_mut(batch.cull_index as usize) {
+                    *reason = 3;
+                }
+            }
+            for &batch_index in active.indices {
+                let cull_index = active.batches[batch_index].cull_index as usize;
+                if let Some(reason) = reasons.get_mut(cull_index) {
+                    *reason = if batch_area_visible(&active.batches[batch_index], area_mask) {
+                        0
+                    } else {
+                        4
+                    };
+                }
+            }
+            reasons
+        });
+        (indices, debug_reasons)
+    };
+    if !indices.is_empty() {
+        queue.write_buffer(
+            &world.active_cull_indices_buffer,
+            0,
+            bytemuck::cast_slice(&indices),
+        );
+    }
+    if let Some(reasons) = debug_reasons {
+        queue.write_buffer(
+            &world.cull_debug_reason_buffer,
+            0,
+            bytemuck::cast_slice(&reasons),
+        );
+    }
+    world.active_cull_count = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+    world.active_selection_key = Some(key);
+    true
+}
+
+fn temporal_jitter(frame_index: u32) -> [f32; 2] {
+    // Bevy main: Halton (2,3) - 0.5, including the zero-jitter reset phase.
+    const BEVY_TAA_HALTON: [[f32; 2]; 8] = [
+        [0.0, 0.0],
+        [0.0, -0.16666666],
+        [-0.25, 0.16666669],
+        [0.25, -0.3888889],
+        [-0.375, -0.055555552],
+        [0.125, 0.2777778],
+        [-0.125, -0.2777778],
+        [0.375, 0.055555582],
+    ];
+    BEVY_TAA_HALTON[(frame_index as usize) % BEVY_TAA_HALTON.len()]
+}
+
+fn supported_msaa(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Vec<u32> {
+    let color = adapter.get_texture_format_features(surface_format).flags;
+    let depth = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    let can_resolve = color.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
+    let mut result = vec![1];
+    if can_resolve {
+        for samples in [2_u32, 4, 8, 16] {
+            if color.sample_count_supported(samples) && depth.sample_count_supported(samples) {
+                result.push(samples);
+            }
+        }
+    }
+    result
+}
+
+/// Frames the swapchain may keep in flight.
+///
+/// On DX12 this is also the FAST-vsync throughput ceiling: wgpu presents Mailbox
+/// as `Present(0)` without `DXGI_PRESENT_ALLOW_TEARING`, and a non-tearing
+/// flip-model present is retired at vblank, so no more than this many frames can
+/// retire per refresh. VSync OFF uses Immediate, which does set the tearing flag
+/// and is not bound this way.
+pub const MAX_FRAME_LATENCY: u32 = 3;
+
+fn no_vsync_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if modes.contains(&wgpu::PresentMode::Immediate) {
+        wgpu::PresentMode::Immediate
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    }
+}
+
+fn present_mode_for_vsync(mode: VsyncMode, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    match mode {
+        VsyncMode::Off => no_vsync_mode(supported),
+        VsyncMode::On => wgpu::PresentMode::Fifo,
+        VsyncMode::Fast => {
+            if supported.contains(&wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::Fifo
+            }
+        }
+        VsyncMode::Adaptive => {
+            if supported.contains(&wgpu::PresentMode::FifoRelaxed) {
+                wgpu::PresentMode::FifoRelaxed
+            } else {
+                wgpu::PresentMode::Fifo
+            }
+        }
+    }
+}
+
+fn create_menu_backdrop_resources(
+    device: &wgpu::Device,
+    sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> MenuBackdropResources {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA lazy menu backdrop source"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("JKA lazy menu backdrop layout"),
+        entries: &[texture_entry(0), sampler_entry(1)],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("JKA lazy menu backdrop pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("JKA lazy menu backdrop shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("menu_backdrop.wgsl").into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA lazy menu backdrop pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA lazy menu backdrop bind group"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    MenuBackdropResources {
+        width,
+        height,
+        _texture: texture,
+        view,
+        bind_group,
+        pipeline,
+    }
+}
+
+fn create_targets(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    color_format: wgpu::TextureFormat,
+    samples: u32,
+    enable_bloom: bool,
+    enable_dof: bool,
+    enable_ssao: bool,
+    enable_ssr: bool,
+    cloud_render_resolution: CloudRenderResolution,
+) -> RenderTargets {
+    let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: samples,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let msaa_texture = (samples > 1).then(|| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA MSAA color"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let msaa_view = msaa_texture
+        .as_ref()
+        .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+    let scene_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA post-process scene color"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: color_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bloom = enable_bloom.then(|| create_bloom_pyramid(device, width, height));
+    let dof = enable_dof.then(|| create_dof_target(device, width, height));
+    let ssao_history = enable_ssao.then(|| create_temporal_ssao_history(device, width, height));
+    let ssr_history = enable_ssr.then(|| create_temporal_ssr_history(device, width, height));
+    let history_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA temporal history ping-pong"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let history_views: [wgpu::TextureView; 2] = std::array::from_fn(|index| {
+        history_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+    });
+    let cloud_scale = cloud_render_resolution.scale().clamp(0.01, 1.0);
+    let cloud_width = ((width.max(1) as f32 * cloud_scale).round() as u32).max(1);
+    let cloud_height = ((height.max(1) as f32 * cloud_scale).round() as u32).max(1);
+    let cloud_transfer_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA volumetric cloud transfer ping-pong"),
+            size: wgpu::Extent3d {
+                width: cloud_width,
+                height: cloud_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let cloud_transfer_views: [wgpu::TextureView; 2] = std::array::from_fn(|index| {
+        cloud_transfer_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+    });
+    let cloud_march_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA volumetric cloud sparse march"),
+        size: wgpu::Extent3d {
+            width: cloud_width,
+            height: cloud_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let cloud_march_view =
+        cloud_march_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let ao_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA AO depth attachment"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let ao_depth_view = ao_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let motion_vector_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA Bevy TAA motion-vector prepass"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let motion_vector_view =
+        motion_vector_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // Reflection policy mask written by the existing depth prepass:
+    // R = SSR eligibility, G = active planar winner, B = roughness hint, A = probe.
+    // Keeping this alongside depth/motion avoids another geometry classification pass.
+    let reflection_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA reflection policy mask"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let reflection_mask_view =
+        reflection_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let max_depth_dimension = width.max(height).max(1);
+    let linear_depth_mip_count = 32 - max_depth_dimension.leading_zeros();
+    let linear_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA linear depth / Hi-Z pyramid"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: linear_depth_mip_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let linear_depth_view =
+        linear_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let linear_depth_render_view = linear_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA linear depth mip 0 render view"),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING),
+        ..Default::default()
+    });
+    let linear_depth_mip_views = (0..linear_depth_mip_count)
+        .map(|mip| {
+            linear_depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA Hi-Z mip view"),
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let (rain_haze_mask_width, rain_haze_mask_height) =
+        weather::rain_haze_mask_dimensions(width.max(1), height.max(1));
+    let rain_haze_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA rain haze exposure mask"),
+        size: wgpu::Extent3d {
+            width: rain_haze_mask_width,
+            height: rain_haze_mask_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let rain_haze_mask_view =
+        rain_haze_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    RenderTargets {
+        _depth_texture: depth_texture,
+        depth_view,
+        _msaa_texture: msaa_texture,
+        msaa_view,
+        _scene_texture: scene_texture,
+        scene_view,
+        bloom,
+        dof,
+        ssao_history,
+        ssr_history,
+        _history_textures: history_textures,
+        history_views,
+        _cloud_transfer_textures: cloud_transfer_textures,
+        cloud_transfer_views,
+        _cloud_march_texture: cloud_march_texture,
+        cloud_march_view,
+        _ao_depth_texture: ao_depth_texture,
+        ao_depth_view,
+        _linear_depth_texture: linear_depth_texture,
+        linear_depth_view,
+        linear_depth_render_view,
+        _motion_vector_texture: motion_vector_texture,
+        motion_vector_view,
+        _reflection_mask_texture: reflection_mask_texture,
+        reflection_mask_view,
+        linear_depth_mip_views,
+        linear_depth_mip_count,
+        _rain_haze_mask_texture: rain_haze_mask_texture,
+        rain_haze_mask_view,
+        rain_haze_mask_width,
+        rain_haze_mask_height,
+    }
+}
+
+fn create_planar_reflection_resources(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color_format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    active: bool,
+) -> PlanarReflectionResources {
+    let width = width.max(1);
+    let height = height.max(1);
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA planar reflection color array"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: PLANAR_REFLECTION_SLOTS as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: color_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let color_array_view = color.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA planar reflection color array view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_array_layer: 0,
+        array_layer_count: Some(PLANAR_REFLECTION_SLOTS as u32),
+        ..Default::default()
+    });
+    let color_views = (0..PLANAR_REFLECTION_SLOTS)
+        .map(|slot| {
+            color.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA planar reflection color layer"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: slot as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let fallback_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA planar reflection fallback array"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: PLANAR_REFLECTION_SLOTS as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: color_format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let fallback_view = fallback_color.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA planar reflection fallback array view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_array_layer: 0,
+        array_layer_count: Some(PLANAR_REFLECTION_SLOTS as u32),
+        ..Default::default()
+    });
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA planar reflection depth"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA planar reflection sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let uniform = PlanarReflectionUniform {
+        planes: [[0.0; 4]; PLANAR_REFLECTION_SLOTS],
+        viewport: [
+            width as f32,
+            height as f32,
+            if active { 1.0 } else { 0.0 },
+            0.0,
+        ],
+        debug: [0.0; 4],
+    };
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA planar reflection uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let reflection_pass_uniform = PlanarReflectionUniform {
+        planes: [[0.0; 4]; PLANAR_REFLECTION_SLOTS],
+        viewport: [width as f32, height as f32, 0.0, 0.0],
+        debug: [0.0; 4],
+    };
+    let reflection_pass_uniform_buffer =
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA planar reflection recursion-disabled uniform"),
+            contents: bytemuck::bytes_of(&reflection_pass_uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA planar reflection bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let reflection_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA planar reflection recursion-safe bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&fallback_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: reflection_pass_uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    PlanarReflectionResources {
+        _color: color,
+        color_views,
+        _color_array_view: color_array_view,
+        _fallback_color: fallback_color,
+        _depth: depth,
+        depth_view,
+        _sampler: sampler,
+        uniform_buffer,
+        _reflection_pass_uniform_buffer: reflection_pass_uniform_buffer,
+        bind_group,
+        reflection_pass_bind_group,
+        _width: width,
+        _height: height,
+        active,
+    }
+}
+
+fn create_temporal_ssao_history(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> TemporalSsaoHistory {
+    // Bevy's SSAO follow-up design calls out half-resolution rendering with a
+    // bilateral upsample. Keep the temporal history at half resolution as well:
+    // it cuts both AO sampling cost and history bandwidth to one quarter.
+    let half_width = width.div_ceil(2).max(1);
+    let half_height = height.div_ceil(2).max(1);
+    let textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA half-resolution temporal SSAO history"),
+            size: wgpu::Extent3d {
+                width: half_width,
+                height: half_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
+    let views = std::array::from_fn(|index| {
+        textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+    });
+    TemporalSsaoHistory {
+        _textures: textures,
+        views,
+    }
+}
+
+fn create_temporal_ssr_history(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> TemporalSsrHistory {
+    let half_width = width.div_ceil(2).max(1);
+    let half_height = height.div_ceil(2).max(1);
+    let radiance_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA half-resolution temporal SSR radiance"),
+            size: wgpu::Extent3d {
+                width: half_width,
+                height: half_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
+    let radiance_views = std::array::from_fn(|index| {
+        radiance_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+    });
+    let depth_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA half-resolution temporal SSR depth"),
+            size: wgpu::Extent3d {
+                width: half_width,
+                height: half_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
+    let depth_views = std::array::from_fn(|index| {
+        depth_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+    });
+    TemporalSsrHistory {
+        _radiance_textures: radiance_textures,
+        radiance_views,
+        _depth_textures: depth_textures,
+        depth_views,
+    }
+}
+
+fn create_bloom_pyramid(device: &wgpu::Device, width: u32, height: u32) -> BloomPyramid {
+    let mut w = width.max(1);
+    let mut h = height.max(1);
+    let sizes: [(u32, u32); 3] = std::array::from_fn(|_| {
+        w = w.div_ceil(2).max(1);
+        h = h.div_ceil(2).max(1);
+        (w, h)
+    });
+    let textures: [wgpu::Texture; 3] = std::array::from_fn(|level| {
+        let (width, height) = sizes[level];
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(match level {
+                0 => "JKA bloom half-resolution",
+                1 => "JKA bloom quarter-resolution",
+                _ => "JKA bloom eighth-resolution",
+            }),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
+    let views: [wgpu::TextureView; 3] =
+        std::array::from_fn(|level| textures[level].create_view(&Default::default()));
+    BloomPyramid {
+        _textures: textures,
+        views,
+    }
+}
+
+fn create_dof_target(device: &wgpu::Device, width: u32, height: u32) -> DofTarget {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA Gaussian DOF horizontal target"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    DofTarget {
+        _texture: texture,
+        view,
+    }
+}
+
+fn create_cloud_noise_sampler(device: &wgpu::Device, label: &str) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(label),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    })
+}
+
+fn create_cloud_fallback_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> CloudNoiseResources {
+    let detail_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("JKA lazy cloud detail fallback 3D texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &[0, 0],
+    );
+    let detail_view = detail_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA lazy cloud detail fallback 3D view"),
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+
+    let weather_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("JKA lazy cloud weather fallback texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let weather_view = weather_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA lazy cloud weather fallback view"),
+        ..Default::default()
+    });
+
+    CloudNoiseResources {
+        _detail_texture: detail_texture,
+        detail_view,
+        _weather_texture: weather_texture,
+        weather_view,
+        sampler: create_cloud_noise_sampler(device, "JKA lazy cloud fallback sampler"),
+    }
+}
+
+fn create_cloud_noise_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> CloudNoiseResources {
+    let weather_data = cloud_noise::bake_weather_map();
+    let weather_size = cloud_noise::WEATHER_SIZE;
+    let weather_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("JKA cloud Perlin-Worley weather map"),
+            size: wgpu::Extent3d {
+                width: weather_size,
+                height: weather_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // The remap contrast channel is negative across its whole range, so
+            // this cannot be a unorm format.
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &weather_data,
+    );
+    let weather_view = weather_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA cloud weather map view"),
+        ..Default::default()
+    });
+
+    let detail_data = cloud_noise::bake_detail_volume();
+    let detail_size = cloud_noise::DETAIL_SIZE;
+    let detail_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("JKA cloud Worley detail volume"),
+            size: wgpu::Extent3d {
+                width: detail_size,
+                height: detail_size,
+                depth_or_array_layers: detail_size,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &detail_data,
+    );
+    let detail_view = detail_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA cloud detail volume view"),
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+
+    CloudNoiseResources {
+        _detail_texture: detail_texture,
+        detail_view,
+        _weather_texture: weather_texture,
+        weather_view,
+        sampler: create_cloud_noise_sampler(device, "JKA cloud repeating noise sampler"),
+    }
+}
+fn create_color_lut_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    preset: ColorLutPreset,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = if preset == ColorLutPreset::Off {
+        2
+    } else {
+        color_lut::LUT_SIZE
+    };
+    let data = if preset == ColorLutPreset::Off {
+        color_lut::identity_rgba8(size)
+    } else {
+        color_lut::bake_rgba8(preset)
+    };
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("JKA color grading 3D LUT"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: size,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            // The OxiMedia presets are display-referred numeric RGB values. Do
+            // not use an sRGB texture here: that would decode the LUT itself.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &data,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA color grading 3D LUT view"),
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_entry_stages(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_2d_array_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn cube_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::Cube,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_3d_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    texture_3d_entry_stages(binding, wgpu::ShaderStages::FRAGMENT)
+}
+
+fn texture_3d_entry_stages(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn unfilterable_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    unfilterable_texture_entry_stages(binding, wgpu::ShaderStages::FRAGMENT)
+}
+
+fn unfilterable_texture_entry_stages(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn depth_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn depth_array_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn depth_cube_array_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::CubeArray,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn comparison_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+        count: None,
+    }
+}
+
+fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn sampler_entry_stages(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn nonfiltering_sampler_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn storage_buffer_entry(
+    binding: u32,
+    read_only: bool,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn create_hiz_reduce_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    targets: &RenderTargets,
+) -> Vec<wgpu::BindGroup> {
+    (1..targets.linear_depth_mip_count)
+        .map(|mip| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JKA Hi-Z reduce bind group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &targets.linear_depth_mip_views[(mip - 1) as usize],
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &targets.linear_depth_mip_views[mip as usize],
+                        ),
+                    },
+                ],
+            })
+        })
+        .collect()
+}
+
+fn create_cull_debug_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    reasons: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA cull debug bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: reasons.as_entire_binding(),
+        }],
+    })
+}
+
+fn create_gpu_cull_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    records: &wgpu::Buffer,
+    indirect: &wgpu::Buffer,
+    hi_z_view: &wgpu::TextureView,
+    settings: &wgpu::Buffer,
+    active_indices: &wgpu::Buffer,
+    compact_indirect: &wgpu::Buffer,
+    compact_counts: &wgpu::Buffer,
+    debug_reasons: &wgpu::Buffer,
+    debug_counts: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA GPU cull bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: records.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: indirect.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(hi_z_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: settings.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: active_indices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: compact_indirect.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: compact_counts.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: debug_reasons.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: debug_counts.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_texture_sampler(
+    device: &wgpu::Device,
+    clamp: bool,
+
+    filter: TextureFilter,
+) -> wgpu::Sampler {
+    let address = if clamp {
+        wgpu::AddressMode::ClampToEdge
+    } else {
+        wgpu::AddressMode::Repeat
+    };
+    let (mag_filter, min_filter, mipmap_filter, lod_max_clamp) = match filter {
+        TextureFilter::Nearest => (
+            wgpu::FilterMode::Nearest,
+            wgpu::FilterMode::Nearest,
+            wgpu::MipmapFilterMode::Nearest,
+            0.0,
+        ),
+        TextureFilter::Bilinear => (
+            wgpu::FilterMode::Linear,
+            wgpu::FilterMode::Linear,
+            wgpu::MipmapFilterMode::Nearest,
+            32.0,
+        ),
+        TextureFilter::Trilinear
+        | TextureFilter::Anisotropic2x
+        | TextureFilter::Anisotropic4x
+        | TextureFilter::Anisotropic8x
+        | TextureFilter::Anisotropic16x => (
+            wgpu::FilterMode::Linear,
+            wgpu::FilterMode::Linear,
+            wgpu::MipmapFilterMode::Linear,
+            32.0,
+        ),
+    };
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(filter.label()),
+        address_mode_u: address,
+        address_mode_v: address,
+        address_mode_w: address,
+        mag_filter,
+        min_filter,
+        mipmap_filter,
+        lod_min_clamp: 0.0,
+        lod_max_clamp,
+        anisotropy_clamp: filter.anisotropy_clamp(),
+        ..Default::default()
+    })
+}
+
+fn upload_reflection_probes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    probes: &[scene::ReflectionProbe],
+) -> ReflectionProbeGpuSet {
+    let mut uploaded = Vec::with_capacity(probes.len().max(1));
+    if probes.is_empty() {
+        let data = [128u8, 128, 128, 255].repeat(6);
+        let texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("JKA fallback reflection cubemap"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 6,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &data,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("JKA fallback reflection cubemap view"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            array_layer_count: Some(6),
+            ..Default::default()
+        });
+        uploaded.push(GpuReflectionProbe {
+            _texture: texture,
+            view,
+        });
+    } else {
+        for probe in probes {
+            let texture = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(&probe.label),
+                    size: wgpu::Extent3d {
+                        width: probe.width,
+                        height: probe.height,
+                        depth_or_array_layers: 6,
+                    },
+                    mip_level_count: probe.mip_level_count,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &probe.rgba,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA Rend2 reflection cubemap view"),
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                array_layer_count: Some(6),
+                ..Default::default()
+            });
+            uploaded.push(GpuReflectionProbe {
+                _texture: texture,
+                view,
+            });
+        }
+    }
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA reflection cubemap sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    ReflectionProbeGpuSet {
+        probes: uploaded,
+        sampler,
+        source_count: probes.len(),
+    }
+}
+
+fn upload_voxel_probe_gi(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid: Option<&scene::VoxelProbeGi>,
+) -> VoxelProbeGiGpu {
+    let fallback = [[0_u8; 4]];
+    let (size, point_data, area_data, uniform) = if let Some(grid) = grid {
+        let size = wgpu::Extent3d {
+            width: grid.bounds[0].max(1),
+            height: grid.bounds[1].max(1),
+            depth_or_array_layers: grid.bounds[2].max(1),
+        };
+        (
+            size,
+            grid.point_rgba.as_slice(),
+            grid.area_rgba.as_slice(),
+            VoxelProbeGiUniform {
+                origin_enabled: [grid.origin[0], grid.origin[1], grid.origin[2], 1.0],
+                inv_cell: [
+                    1.0 / grid.cell_size.max(1e-6),
+                    1.0 / grid.cell_size.max(1e-6),
+                    1.0 / grid.cell_size.max(1e-6),
+                    grid.cell_size,
+                ],
+                bounds_strength: [
+                    grid.bounds[0] as f32,
+                    grid.bounds[1] as f32,
+                    grid.bounds[2] as f32,
+                    0.38,
+                ],
+            },
+        )
+    } else {
+        (
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            fallback.as_slice(),
+            fallback.as_slice(),
+            VoxelProbeGiUniform {
+                origin_enabled: [0.0; 4],
+                inv_cell: [1.0, 1.0, 1.0, 1.0],
+                bounds_strength: [1.0, 1.0, 1.0, 0.0],
+            },
+        )
+    };
+
+    let descriptor = |label: &'static str| wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let point_texture = device.create_texture_with_data(
+        queue,
+        &descriptor("JKA voxel GI point probes"),
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytemuck::cast_slice(point_data),
+    );
+    let area_texture = device.create_texture_with_data(
+        queue,
+        &descriptor("JKA voxel GI emissive probes"),
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytemuck::cast_slice(area_data),
+    );
+    let view_descriptor = wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    };
+    let point_view = point_texture.create_view(&view_descriptor);
+    let area_view = area_texture.create_view(&view_descriptor);
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA voxel/probe GI uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    VoxelProbeGiGpu {
+        enabled: grid.is_some(),
+        _point_texture: point_texture,
+        point_view,
+        _area_texture: area_texture,
+        area_view,
+        uniform_buffer,
+    }
+}
+
+fn upload_static_light_grid(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid: Option<&scene::StaticLightGrid>,
+) -> StaticLightGridGpu {
+    let enabled = grid.is_some();
+    let external_hdr = grid.is_some_and(|grid| grid.external_hdr);
+    let (size, direction_data, lighting_data, uniform, irradiance_size, irradiance_data, irradiance_uniform) = if let Some(grid) = grid {
+        let size = wgpu::Extent3d {
+            width: grid.bounds[0].max(1),
+            height: grid.bounds[1].max(1),
+            depth_or_array_layers: grid.bounds[2].max(1),
+        };
+        let uniform = StaticLightGridUniform {
+            origin_enabled: [grid.origin[0], grid.origin[1], grid.origin[2], 1.0],
+            inv_size: [
+                1.0 / grid.size[0].max(1e-6),
+                1.0 / grid.size[1].max(1e-6),
+                1.0 / grid.size[2].max(1e-6),
+                0.0,
+            ],
+            bounds: [
+                grid.bounds[0] as f32,
+                grid.bounds[1] as f32,
+                grid.bounds[2] as f32,
+                0.0,
+            ],
+        };
+        let irradiance_size = wgpu::Extent3d {
+            width: grid.bounds[0].max(1),
+            height: grid.bounds[1].max(1).saturating_mul(2),
+            depth_or_array_layers: grid.bounds[2].max(1).saturating_mul(3),
+        };
+        // Bevy light probes are unit cubes centered on the origin. Expand the
+        // JKA lightgrid by half a cell around its first/last probes so every BSP
+        // sample lands at the same texel center after Bevy's clamp-to-center
+        // sampling. Renderer coordinates are [JKA X, JKA Z, -JKA Y].
+        let resolution = [
+            grid.bounds[0] as f32,
+            grid.bounds[1] as f32,
+            grid.bounds[2] as f32,
+        ];
+        let full_extent = [
+            grid.size[0].max(1e-6) * resolution[0].max(1.0),
+            grid.size[1].max(1e-6) * resolution[1].max(1.0),
+            grid.size[2].max(1e-6) * resolution[2].max(1.0),
+        ];
+        let center_jka = [
+            grid.origin[0] + grid.size[0] * (resolution[0] - 1.0) * 0.5,
+            grid.origin[1] + grid.size[1] * (resolution[1] - 1.0) * 0.5,
+            grid.origin[2] + grid.size[2] * (resolution[2] - 1.0) * 0.5,
+        ];
+        let inv_extent = [
+            1.0 / full_extent[0],
+            1.0 / full_extent[1],
+            1.0 / full_extent[2],
+        ];
+        let irradiance_uniform = IrradianceVolumeUniform {
+            // Column-major affine matrix, matching WGSL mat4x4 layout.
+            // probe.x = (renderer.x  - JKA_center.x) / JKA_extent.x
+            // probe.y = (-renderer.z - JKA_center.y) / JKA_extent.y
+            // probe.z = (renderer.y  - JKA_center.z) / JKA_extent.z
+            light_from_world: [
+                [inv_extent[0], 0.0, 0.0, 0.0],
+                [0.0, 0.0, inv_extent[2], 0.0],
+                [0.0, -inv_extent[1], 0.0, 0.0],
+                [
+                    -center_jka[0] * inv_extent[0],
+                    -center_jka[1] * inv_extent[1],
+                    -center_jka[2] * inv_extent[2],
+                    1.0,
+                ],
+            ],
+            // Bevy's LightProbe default falloff is zero (sharp probe boundary).
+            // Keeping this as explicit probe metadata makes the runtime path use
+            // the same bounded-volume query/weight machinery as Bevy.
+            falloff_intensity: [0.0, 0.0, 0.0, grid.irradiance_intensity],
+            volume_enabled_pad: [1.0, 0.0, 0.0, 0.0],
+        };
+        (
+            size,
+            grid.direction_rgba.as_slice(),
+            grid.lighting_rgba.as_slice(),
+            uniform,
+            irradiance_size,
+            grid.irradiance_volume_rgba.as_slice(),
+            irradiance_uniform,
+        )
+    } else {
+        (
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            &[128, 255, 128, 0][..],
+            &[255, 255, 255, 0][..],
+            StaticLightGridUniform {
+                origin_enabled: [0.0; 4],
+                inv_size: [1.0, 1.0, 1.0, 0.0],
+                bounds: [1.0, 1.0, 1.0, 0.0],
+            },
+            wgpu::Extent3d { width: 1, height: 2, depth_or_array_layers: 3 },
+            &[0u8; 24][..],
+            IrradianceVolumeUniform {
+                light_from_world: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                falloff_intensity: [0.0, 0.0, 0.0, 1.0],
+                volume_enabled_pad: [0.0; 4],
+            },
+        )
+    };
+
+    let descriptor = |label: &'static str| wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let direction_texture = device.create_texture_with_data(
+        queue,
+        &descriptor("JKA static lightgrid direction"),
+        wgpu::util::TextureDataOrder::LayerMajor,
+        direction_data,
+    );
+    let lighting_texture = device.create_texture_with_data(
+        queue,
+        &descriptor("JKA static lightgrid lighting"),
+        wgpu::util::TextureDataOrder::LayerMajor,
+        lighting_data,
+    );
+    let direction_view = direction_texture.create_view(&Default::default());
+    let lighting_view = lighting_texture.create_view(&Default::default());
+    let irradiance_descriptor = wgpu::TextureDescriptor {
+        label: Some("Bevy irradiance volume ambient-cube atlas"),
+        size: irradiance_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let irradiance_volume_texture = device.create_texture_with_data(
+        queue,
+        &irradiance_descriptor,
+        wgpu::util::TextureDataOrder::LayerMajor,
+        irradiance_data,
+    );
+    let irradiance_volume_view = irradiance_volume_texture.create_view(&Default::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA static lightgrid sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA static lightgrid uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let irradiance_volume_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Bevy irradiance volume uniform"),
+        contents: bytemuck::bytes_of(&irradiance_uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    StaticLightGridGpu {
+        enabled,
+        external_hdr,
+        _direction_texture: direction_texture,
+        direction_view,
+        _lighting_texture: lighting_texture,
+        lighting_view,
+        _irradiance_volume_texture: irradiance_volume_texture,
+        irradiance_volume_view,
+        sampler,
+        uniform_buffer,
+        irradiance_volume_uniform_buffer,
+    }
+}
+
+fn normalize_ui_font(mut data: TextureData) -> TextureData {
+    // JKA charset atlases are coverage textures. Some repacks preserve coverage in
+    // alpha while others flatten it into grayscale; normalize both cases to
+    // white RGB + alpha coverage once at load.
+    let alpha_has_transparency = data.rgba.chunks_exact(4).any(|p| p[3] < 250);
+    for pixel in data.rgba.chunks_exact_mut(4) {
+        let coverage = if alpha_has_transparency {
+            pixel[3]
+        } else {
+            pixel[0].max(pixel[1]).max(pixel[2])
+        };
+        pixel[0] = 255;
+        pixel[1] = 255;
+        pixel[2] = 255;
+        pixel[3] = coverage;
+    }
+    data.srgb = false;
+    data
+}
+
+fn try_load_ui_font_asset(assets: &mut AssetSearchPath, path: &str) -> Option<TextureData> {
+    let stem = path
+        .rsplit_once('.')
+        .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
+        .map(|(stem, _)| stem)
+        .unwrap_or(path);
+    let mut candidates = vec![path.to_owned()];
+    for ext in ["tga", "jpg", "png"] {
+        let candidate = format!("{stem}.{ext}");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    for name in candidates {
+        let asset = match assets.read(&name, 8 * 1024 * 1024) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("UI font {name}: {error}");
+                continue;
+            }
+        };
+        match crate::materials::decode_texture_data(&name, &asset.bytes, true, false) {
+            Ok(data) => {
+                let data = normalize_ui_font(data);
+                println!(
+                    "UI font: {}x{} {} from {}",
+                    data.width,
+                    data.height,
+                    name,
+                    asset.source.display()
+                );
+                return Some(data);
+            }
+            Err(error) => eprintln!("UI font {name}: {error}"),
+        }
+    }
+    None
+}
+
+fn missing_texture_data() -> TextureData {
+    const SIZE: usize = 16;
+    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = (y * SIZE + x) * 4;
+            let border = x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1;
+            let checker = ((x / 4) + (y / 4)) % 2 == 0;
+            let color = if border {
+                [0_u8, 0_u8, 0_u8, 255_u8]
+            } else if checker {
+                [255_u8, 0_u8, 255_u8, 255_u8]
+            } else {
+                [0_u8, 0_u8, 0_u8, 255_u8]
+            };
+            rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    TextureData {
+        label: "missing texture fallback".to_owned(),
+        source: None,
+        width: SIZE as u32,
+        height: SIZE as u32,
+        rgba,
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    }
+}
+
+fn try_load_texture_asset(
+    base: &Path,
+    game: Option<&Path>,
+    path: &str,
+    clamp: bool,
+    mipmaps: bool,
+    srgb: bool,
+    log_prefix: &str,
+) -> Option<TextureData> {
+    let stem = path
+        .rsplit_once('.')
+        .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
+        .map(|(stem, _)| stem)
+        .unwrap_or(path);
+    let mut candidates = vec![path.to_owned()];
+    for ext in ["png", "tga", "jpg"] {
+        let candidate = format!("{stem}.{ext}");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut assets = match AssetSearchPath::open_game(base, game) {
+        Ok(assets) => assets,
+        Err(error) => {
+            eprintln!("{log_prefix} asset search: {error}");
+            return None;
+        }
+    };
+
+    for name in candidates {
+        let asset = match assets.read(&name, 16 * 1024 * 1024) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("{log_prefix} {name}: {error}");
+                continue;
+            }
+        };
+        match crate::materials::decode_texture_data_with_color_space(
+            &name,
+            &asset.bytes,
+            clamp,
+            mipmaps,
+            srgb,
+        ) {
+            Ok(data) => {
+                println!(
+                    "{log_prefix}: {}x{} {} from {}",
+                    data.width,
+                    data.height,
+                    name,
+                    asset.source.display()
+                );
+                return Some(data);
+            }
+            Err(error) => eprintln!("{log_prefix} {name}: {error}"),
+        }
+    }
+    None
+}
+
+fn load_texture_asset_or_missing(
+    base: &Path,
+    game: Option<&Path>,
+    path: &str,
+    clamp: bool,
+    mipmaps: bool,
+    srgb: bool,
+    log_prefix: &str,
+    missing: &TextureData,
+) -> TextureData {
+    try_load_texture_asset(base, game, path, clamp, mipmaps, srgb, log_prefix).unwrap_or_else(|| {
+        eprintln!(
+            "{log_prefix}: missing {path}.png/.tga/.jpg; using shared missing texture placeholder"
+        );
+        missing.clone()
+    })
+}
+
+fn load_ui_font_texture(base: &Path, game: Option<&Path>) -> TextureData {
+    match AssetSearchPath::open_game(base, game) {
+        Ok(mut assets) => {
+            // Jedi Academy's native fixed charset. It is a 16x16 logical grid,
+            // but OpenJK samples only the left half of each horizontal slot
+            // (8x16 glyphs on a 16x16 pitch); ui::glyph_quad mirrors that layout.
+            if let Some(data) = try_load_ui_font_asset(&mut assets, "gfx/2d/charsgrid_med") {
+                return data;
+            }
+        }
+        Err(error) => eprintln!("UI font asset search: {error}"),
+    }
+
+    let (width, height, rgba) = ui::fallback_font_rgba();
+    println!("UI font: using built-in fallback charset");
+    TextureData {
+        label: "JKA UI fallback charset".into(),
+        source: None,
+        width,
+        height,
+        rgba,
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: false,
+    }
+}
+
+fn load_ui_splash_texture(base: &Path, game: Option<&Path>) -> (TextureData, Option<[u32; 2]>) {
+    match AssetSearchPath::open_game(base, game) {
+        Ok(mut assets) => {
+            let path = "menu/splash.jpg";
+            match assets.read(path, 16 * 1024 * 1024) {
+                Ok(Some(asset)) => match crate::materials::decode_texture_data_with_color_space(
+                    path,
+                    &asset.bytes,
+                    true,
+                    false,
+                    true,
+                ) {
+                    Ok(data) => {
+                        let size = [data.width, data.height];
+                        println!(
+                            "UI splash: {}x{} {} from {}",
+                            data.width,
+                            data.height,
+                            path,
+                            asset.source.display()
+                        );
+                        return (data, Some(size));
+                    }
+                    Err(error) => eprintln!("UI splash {path}: {error}"),
+                },
+                Ok(None) => eprintln!("UI splash: {path} not found"),
+                Err(error) => eprintln!("UI splash {path}: {error}"),
+            }
+        }
+        Err(error) => eprintln!("UI splash asset search: {error}"),
+    }
+
+    (
+        TextureData {
+            label: "JKA missing splash".into(),
+            source: None,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: true,
+            srgb: true,
+        },
+        None,
+    )
+}
+
+fn empty_ui_font_texture(label: &str) -> TextureData {
+    TextureData {
+        label: label.into(),
+        source: None,
+        width: 1,
+        height: 1,
+        rgba: vec![255, 255, 255, 0],
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: false,
+    }
+}
+
+fn load_ui_proportional_font(
+    base: &Path,
+    game: Option<&Path>,
+    name: &str,
+) -> (TextureData, Option<ui::ProportionalFont>) {
+    let mut assets = match AssetSearchPath::open_game(base, game) {
+        Ok(assets) => assets,
+        Err(error) => {
+            eprintln!("UI proportional font asset search: {error}");
+            return (empty_ui_font_texture("JKA missing proportional font"), None);
+        }
+    };
+
+    let texture_path = format!("fonts/{name}");
+    let texture = try_load_ui_font_asset(&mut assets, &texture_path)
+        .unwrap_or_else(|| empty_ui_font_texture("JKA missing proportional font"));
+
+    let metrics_path = format!("fonts/{name}.fontdat");
+    let metrics = match assets.read(&metrics_path, 64 * 1024) {
+        Ok(Some(asset)) => match ui::parse_fontdat(&asset.bytes) {
+            Ok(font) => {
+                println!(
+                    "UI proportional font: {} point / {} px, {} from {}",
+                    font.point_size,
+                    font.height,
+                    metrics_path,
+                    asset.source.display()
+                );
+                Some(font)
+            }
+            Err(error) => {
+                eprintln!("UI proportional font {metrics_path}: {error}");
+                None
+            }
+        },
+        Ok(None) => {
+            eprintln!("UI proportional font: {metrics_path} not found");
+            None
+        }
+        Err(error) => {
+            eprintln!("UI proportional font {metrics_path}: {error}");
+            None
+        }
+    };
+
+    (texture, metrics)
+}
+
+fn rgb565(rgb: [u8; 3]) -> u16 {
+    (u16::from(rgb[0] >> 3) << 11) | (u16::from(rgb[1] >> 2) << 5) | u16::from(rgb[2] >> 3)
+}
+
+fn rgb565_expand(value: u16) -> [u8; 3] {
+    let r = ((value >> 11) & 31) as u8;
+    let g = ((value >> 5) & 63) as u8;
+    let b = (value & 31) as u8;
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
+}
+
+fn encode_bc3_block(pixels: &[[u8; 4]; 16], output: &mut Vec<u8>) {
+    // DXT5/BC3 alpha block.
+    let alpha_max = pixels.iter().map(|p| p[3]).max().unwrap_or(255);
+    let alpha_min = pixels.iter().map(|p| p[3]).min().unwrap_or(0);
+    output.push(alpha_max);
+    output.push(alpha_min);
+    let mut alpha_palette = [0u8; 8];
+    alpha_palette[0] = alpha_max;
+    alpha_palette[1] = alpha_min;
+    if alpha_max > alpha_min {
+        for i in 1..=6usize {
+            alpha_palette[i + 1] = (((7 - i) as u16 * u16::from(alpha_max)
+                + i as u16 * u16::from(alpha_min)
+                + 3) / 7) as u8;
+        }
+    } else {
+        for i in 1..=4usize {
+            alpha_palette[i + 1] = (((5 - i) as u16 * u16::from(alpha_max)
+                + i as u16 * u16::from(alpha_min)
+                + 2) / 5) as u8;
+        }
+        alpha_palette[6] = 0;
+        alpha_palette[7] = 255;
+    }
+    let mut alpha_bits = 0u64;
+    for (i, pixel) in pixels.iter().enumerate() {
+        let mut best = 0usize;
+        let mut best_error = u16::MAX;
+        for (candidate, value) in alpha_palette.iter().enumerate() {
+            let error = (i16::from(pixel[3]) - i16::from(*value)).unsigned_abs();
+            if error < best_error {
+                best_error = error;
+                best = candidate;
+            }
+        }
+        alpha_bits |= (best as u64) << (3 * i);
+    }
+    for byte in 0..6 {
+        output.push(((alpha_bits >> (8 * byte)) & 0xff) as u8);
+    }
+
+    // BC3's RGB block always uses the four-colour BC1 interpolation mode.
+    // Companion maps are data, not photographs, so preserve the full per-channel
+    // range rather than choosing endpoints only from luminance extrema.
+    let mut minimum = [255u8; 3];
+    let mut maximum = [0u8; 3];
+    for pixel in pixels {
+        for channel in 0..3 {
+            minimum[channel] = minimum[channel].min(pixel[channel]);
+            maximum[channel] = maximum[channel].max(pixel[channel]);
+        }
+    }
+    let mut color0 = rgb565(maximum);
+    let mut color1 = rgb565(minimum);
+    if color0 < color1 {
+        std::mem::swap(&mut color0, &mut color1);
+    }
+    output.extend_from_slice(&color0.to_le_bytes());
+    output.extend_from_slice(&color1.to_le_bytes());
+    let c0 = rgb565_expand(color0);
+    let c1 = rgb565_expand(color1);
+    let palette = [
+        c0,
+        c1,
+        [
+            ((2 * u16::from(c0[0]) + u16::from(c1[0]) + 1) / 3) as u8,
+            ((2 * u16::from(c0[1]) + u16::from(c1[1]) + 1) / 3) as u8,
+            ((2 * u16::from(c0[2]) + u16::from(c1[2]) + 1) / 3) as u8,
+        ],
+        [
+            ((u16::from(c0[0]) + 2 * u16::from(c1[0]) + 1) / 3) as u8,
+            ((u16::from(c0[1]) + 2 * u16::from(c1[1]) + 1) / 3) as u8,
+            ((u16::from(c0[2]) + 2 * u16::from(c1[2]) + 1) / 3) as u8,
+        ],
+    ];
+    let mut color_bits = 0u32;
+    for (i, pixel) in pixels.iter().enumerate() {
+        let mut best = 0usize;
+        let mut best_error = u32::MAX;
+        for (candidate, color) in palette.iter().enumerate() {
+            let dr = i32::from(pixel[0]) - i32::from(color[0]);
+            let dg = i32::from(pixel[1]) - i32::from(color[1]);
+            let db = i32::from(pixel[2]) - i32::from(color[2]);
+            let error = (dr * dr + dg * dg + db * db) as u32;
+            if error < best_error {
+                best_error = error;
+                best = candidate;
+            }
+        }
+        color_bits |= (best as u32) << (2 * i);
+    }
+    output.extend_from_slice(&color_bits.to_le_bytes());
+}
+
+fn encode_bc3_mip_chain(data: &TextureData) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut source_offset = 0usize;
+    let mut width = data.width.max(1);
+    let mut height = data.height.max(1);
+    for _ in 0..data.mip_level_count.max(1) {
+        let source_len = width as usize * height as usize * 4;
+        let source = &data.rgba[source_offset..source_offset + source_len];
+        for block_y in 0..height.div_ceil(4) {
+            for block_x in 0..width.div_ceil(4) {
+                let mut block = [[0u8; 4]; 16];
+                for py in 0..4u32 {
+                    for px in 0..4u32 {
+                        let x = (block_x * 4 + px).min(width - 1);
+                        let y = (block_y * 4 + py).min(height - 1);
+                        let src = ((y * width + x) * 4) as usize;
+                        let dst = (py * 4 + px) as usize;
+                        block[dst].copy_from_slice(&source[src..src + 4]);
+                    }
+                }
+                encode_bc3_block(&block, &mut encoded);
+            }
+        }
+        source_offset += source_len;
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+    encoded
+}
+
+fn upload_texture_bc3(device: &wgpu::Device, queue: &wgpu::Queue, data: &TextureData) -> GpuImage {
+    let encoded = encode_bc3_mip_chain(data);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some(&format!("{} [BC3 companion]", data.label)),
+            size: wgpu::Extent3d {
+                width: data.width,
+                height: data.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: data.mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bc3RgbaUnorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &encoded,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    GpuImage { _texture: texture, view }
+}
+
+fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, data: &TextureData) -> GpuImage {
+    let format = if data.rgba16f.is_some() {
+        wgpu::TextureFormat::Rgba16Float
+    } else if data.srgb {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    };
+    let bytes: &[u8] = data
+        .rgba16f
+        .as_deref()
+        .map(bytemuck::cast_slice)
+        .unwrap_or(&data.rgba);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some(&data.label),
+            size: wgpu::Extent3d {
+                width: data.width,
+                height: data.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: data.mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytes,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    GpuImage {
+        _texture: texture,
+        view,
+    }
+}
+
+fn gpu_blend_factor(factor: BlendFactor) -> wgpu::BlendFactor {
+    match factor {
+        BlendFactor::Zero => wgpu::BlendFactor::Zero,
+        BlendFactor::One => wgpu::BlendFactor::One,
+        BlendFactor::SrcColor => wgpu::BlendFactor::Src,
+        BlendFactor::OneMinusSrcColor => wgpu::BlendFactor::OneMinusSrc,
+        BlendFactor::SrcAlpha => wgpu::BlendFactor::SrcAlpha,
+        BlendFactor::OneMinusSrcAlpha => wgpu::BlendFactor::OneMinusSrcAlpha,
+        BlendFactor::DstColor => wgpu::BlendFactor::Dst,
+        BlendFactor::OneMinusDstColor => wgpu::BlendFactor::OneMinusDst,
+        BlendFactor::DstAlpha => wgpu::BlendFactor::DstAlpha,
+        BlendFactor::OneMinusDstAlpha => wgpu::BlendFactor::OneMinusDstAlpha,
+        BlendFactor::SrcAlphaSaturate => wgpu::BlendFactor::SrcAlphaSaturated,
+    }
+}
+
+fn create_dynamic_model_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+) -> wgpu::RenderPipeline {
+    let blends = matches!(
+        alpha_mode,
+        DynamicModelAlphaMode::Blend
+            | DynamicModelAlphaMode::MaskBlend
+            | DynamicModelAlphaMode::AdditiveOne
+            | DynamicModelAlphaMode::Additive
+            | DynamicModelAlphaMode::BlendUnlit
+            | DynamicModelAlphaMode::Modulate
+    );
+    let blend = match alpha_mode {
+        DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Blend | DynamicModelAlphaMode::MaskBlend | DynamicModelAlphaMode::BlendUnlit => {
+            Some(wgpu::BlendState::ALPHA_BLENDING)
+        }
+        DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        _ => None,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(match alpha_mode {
+            DynamicModelAlphaMode::Opaque => "JKA dynamic model opaque pipeline",
+            DynamicModelAlphaMode::Mask => "JKA dynamic model alpha-test pipeline",
+            DynamicModelAlphaMode::Blend => "JKA dynamic model blend pipeline",
+            DynamicModelAlphaMode::MaskBlend => "JKA dynamic model alpha-test forced-alpha pipeline",
+            DynamicModelAlphaMode::AdditiveOne => "JKA dynamic model GL_ONE GL_ONE additive unlit pipeline",
+            DynamicModelAlphaMode::Additive => "JKA dynamic model src-alpha additive unlit pipeline",
+            DynamicModelAlphaMode::BlendUnlit => "JKA dynamic model alpha-blend unlit pipeline",
+            DynamicModelAlphaMode::Modulate => "JKA dynamic model modulate unlit pipeline",
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(!blends),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(match alpha_mode {
+                DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::AdditiveOne
+                | DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::Modulate => "fs_unlit",
+                _ => "fs_main",
+            }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_ghoul2_skin_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+) -> wgpu::RenderPipeline {
+    let blends = matches!(
+        alpha_mode,
+        DynamicModelAlphaMode::Blend
+            | DynamicModelAlphaMode::MaskBlend
+            | DynamicModelAlphaMode::AdditiveOne
+            | DynamicModelAlphaMode::Additive
+            | DynamicModelAlphaMode::BlendUnlit
+            | DynamicModelAlphaMode::Modulate
+    );
+    let blend = match alpha_mode {
+        DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Blend
+        | DynamicModelAlphaMode::MaskBlend
+        | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
+        DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        _ => None,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(match alpha_mode {
+            DynamicModelAlphaMode::Opaque => "JKA Ghoul2 GPU skin opaque pipeline",
+            DynamicModelAlphaMode::Mask => "JKA Ghoul2 GPU skin alpha-test pipeline",
+            DynamicModelAlphaMode::Blend => "JKA Ghoul2 GPU skin blend pipeline",
+            DynamicModelAlphaMode::MaskBlend => "JKA Ghoul2 GPU skin alpha-test forced-alpha pipeline",
+            DynamicModelAlphaMode::AdditiveOne => "JKA Ghoul2 GPU skin GL_ONE GL_ONE additive unlit pipeline",
+            DynamicModelAlphaMode::Additive => "JKA Ghoul2 GPU skin src-alpha additive unlit pipeline",
+            DynamicModelAlphaMode::BlendUnlit => "JKA Ghoul2 GPU skin alpha-blend unlit pipeline",
+            DynamicModelAlphaMode::Modulate => "JKA Ghoul2 GPU skin modulate unlit pipeline",
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(!blends),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(match alpha_mode {
+                DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::AdditiveOne
+                | DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::Modulate => "fs_unlit",
+                _ => "fs_main",
+            }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_world_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    key: PipelineKey,
+    msaa_samples: u32,
+    legacy_fog: bool,
+    shader_variant: Option<WorldShaderVariantKey>,
+) -> wgpu::RenderPipeline {
+    let blend = match key.blend {
+        BlendMode::Opaque => None,
+        BlendMode::Custom(src, dst) => {
+            let component = wgpu::BlendComponent {
+                src_factor: gpu_blend_factor(src),
+                dst_factor: gpu_blend_factor(dst),
+                operation: wgpu::BlendOperation::Add,
+            };
+            Some(wgpu::BlendState {
+                color: component,
+                alpha: component,
+            })
+        }
+    };
+    let color_write = wgpu::ColorWrites::ALL;
+    let shader_constants = shader_variant.map(WorldShaderVariantKey::compilation_constants);
+    let fragment_compilation_options = match shader_constants.as_ref() {
+        Some(constants) => wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
+        None => Default::default(),
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA BSP pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: match key.cull {
+                CullMode::None => None,
+                CullMode::Front => Some(wgpu::Face::Front),
+                CullMode::Back => Some(wgpu::Face::Back),
+            },
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(key.depth_write),
+            depth_compare: Some(if key.depth_equal {
+                wgpu::CompareFunction::Equal
+            } else {
+                camera_depth_compare()
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: if key.offset {
+                wgpu::DepthBiasState {
+                    constant: -1,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                }
+            } else {
+                wgpu::DepthBiasState::default()
+            },
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if key.class == DrawClass::Sky {
+                "fs_sky"
+            } else if legacy_fog {
+                "fs_main_legacy_fog"
+            } else {
+                "fs_main"
+            }),
+            compilation_options: fragment_compilation_options,
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend,
+                write_mask: color_write,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_shadow_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    bevy_reverse_z: bool,
+    cull_mode: Option<wgpu::Face>,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA cascaded-shadow caster pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(if bevy_reverse_z {
+                wgpu::CompareFunction::GreaterEqual
+            } else {
+                wgpu::CompareFunction::LessEqual
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: if bevy_reverse_z {
+                wgpu::DepthBiasState::default()
+            } else {
+                wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 }
+            },
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: None,
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_shadow_translucent_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    bevy_reverse_z: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA filtered translucent sun-shadow caster pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_mask"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(if bevy_reverse_z {
+                wgpu::CompareFunction::GreaterEqual
+            } else {
+                wgpu::CompareFunction::LessEqual
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: if bevy_reverse_z {
+                wgpu::DepthBiasState::default()
+            } else {
+                wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 }
+            },
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_translucent_shadow"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_sky_admission_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    bevy_reverse_z: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA shader-sun sky admission pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_sky"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(if bevy_reverse_z {
+                wgpu::CompareFunction::GreaterEqual
+            } else {
+                wgpu::CompareFunction::LessEqual
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: None,
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_shadow_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    bevy_reverse_z: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA alpha-tested shadow caster pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_mask"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            // Alpha-tested foliage/fences are commonly authored two-sided.
+            // Matching their visible silhouette is more important than saving a
+            // small amount of shadow-map raster work here.
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(if bevy_reverse_z {
+                wgpu::CompareFunction::GreaterEqual
+            } else {
+                wgpu::CompareFunction::LessEqual
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: if bevy_reverse_z {
+                wgpu::DepthBiasState::default()
+            } else {
+                wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 }
+            },
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn gpu_point_lights(
+    lights: &[scene::DynamicLight],
+    shadow_slot_by_light: &[u32],
+) -> Vec<GpuPointLight> {
+    let mut gpu_lights = lights
+        .iter()
+        .enumerate()
+        .map(|(index, light)| GpuPointLight {
+            position_radius: [
+                light.position[0],
+                light.position[1],
+                light.position[2],
+                light.radius,
+            ],
+            color_intensity: [
+                light.color[0],
+                light.color[1],
+                light.color[2],
+                light.intensity,
+            ],
+            emitter: [
+                light.emitter_normal[0],
+                light.emitter_normal[1],
+                light.emitter_normal[2],
+                if light.emitter_normal.iter().any(|value| value.abs() > 1e-6) {
+                    if light.emitter_two_sided {
+                        2.0
+                    } else {
+                        1.0
+                    }
+                } else {
+                    0.0
+                },
+            ],
+            shadow: [
+                shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        })
+        .collect::<Vec<_>>();
+    if gpu_lights.is_empty() {
+        gpu_lights.push(GpuPointLight::zeroed());
+    }
+    gpu_lights
+}
+
+fn local_light_is_pvs_relevant(world: &WorldGpu, light: scene::DynamicLight) -> bool {
+    let Some(cluster) = world.last_cluster.flatten() else {
+        return true;
+    };
+
+    if let Some(indices) = world.full_visible_batches_by_cluster.get(cluster) {
+        if !indices.is_empty() {
+            return indices.iter().any(|&batch_index| {
+                let batch = &world.full_batches[batch_index];
+                aabb_intersects_sphere(
+                    batch.bounds_min,
+                    batch.bounds_max,
+                    light.position,
+                    light.radius,
+                )
+            });
+        }
+    }
+
+    world
+        .coarse_visible_batches_by_cluster
+        .get(cluster)
+        .is_none_or(|indices| {
+            indices.iter().any(|&batch_index| {
+                let batch = &world.coarse_batches[batch_index];
+                aabb_intersects_sphere(
+                    batch.bounds_min,
+                    batch.bounds_max,
+                    light.position,
+                    light.radius,
+                )
+            })
+        })
+}
+
+fn local_shadow_importance(
+    light: scene::DynamicLight,
+    camera_position: Vec3,
+    already_active: bool,
+) -> f32 {
+    if !light.intensity.is_finite()
+        || !light.radius.is_finite()
+        || light.intensity <= 0.0
+        || light.radius <= LOCAL_SHADOW_NEAR * 2.0
+    {
+        return 0.0;
+    }
+
+    let distance = Vec3::from_array(light.position)
+        .distance(camera_position)
+        .max(LOCAL_SHADOW_NEAR);
+    let radius = light.radius.max(LOCAL_SHADOW_NEAR);
+    let outside_distance = (distance - radius).max(0.0);
+    let projected_influence = (radius / distance.max(radius * 0.25)).clamp(0.0, 4.0);
+    let proximity = 1.0 / (1.0 + outside_distance / radius);
+    let energy = light.intensity.max(0.0).sqrt();
+    let emitter_normal = Vec3::from_array(light.emitter_normal);
+    let emitter_relevance = if emitter_normal.length_squared() > 1e-6 {
+        let to_camera = (camera_position - Vec3::from_array(light.position)).normalize_or_zero();
+        let facing = emitter_normal.normalize().dot(to_camera);
+        if light.emitter_two_sided {
+            facing.abs()
+        } else {
+            facing.max(0.0)
+        }
+    } else {
+        1.0
+    };
+    let hysteresis = if already_active {
+        LOCAL_SHADOW_HYSTERESIS
+    } else {
+        1.0
+    };
+    energy * projected_influence * projected_influence * proximity * emitter_relevance * hysteresis
+}
+
+fn select_relevant_shadow_lights(
+    world: &WorldGpu,
+    camera: &Camera,
+    include_point_lights: bool,
+    include_area_lights: bool,
+) -> Vec<usize> {
+    let mut candidates = world
+        .dynamic_lights
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, light)| {
+            let is_area = light.emitter_normal.iter().any(|value| value.abs() > 1e-6);
+            if is_area && !include_area_lights {
+                return None;
+            }
+            if !is_area && !include_point_lights {
+                return None;
+            }
+            // A single cubemap sample cannot correctly shadow both hemispheres
+            // of a two-sided area emitter. One-sided q3map emitters are offset
+            // from their source plane and can use the normal local-shadow cache.
+            if light.emitter_two_sided
+                && light.emitter_normal.iter().any(|value| value.abs() > 1e-6)
+            {
+                return None;
+            }
+            if !local_light_is_pvs_relevant(world, light) {
+                return None;
+            }
+            let score = local_shadow_importance(
+                light,
+                camera.position,
+                world.local_shadows.active_light_indices.contains(&index),
+            );
+            (score > 0.0).then_some((index, score))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(a_index, a_score), (b_index, b_score)| {
+        b_score
+            .total_cmp(a_score)
+            .then_with(|| a_index.cmp(b_index))
+    });
+    candidates.truncate(MAX_LOCAL_SHADOW_LIGHTS);
+    candidates.into_iter().map(|(index, _)| index).collect()
+}
+
+fn local_shadow_face_matrices(position: Vec3, radius: f32) -> [Mat4; 6] {
+    let far_plane = radius.max(LOCAL_SHADOW_NEAR + 1.0);
+    let projection = Mat4::perspective_rh(
+        std::f32::consts::FRAC_PI_2,
+        1.0,
+        LOCAL_SHADOW_NEAR,
+        far_plane,
+    );
+    let faces = [
+        (Vec3::X, -Vec3::Y),
+        (-Vec3::X, -Vec3::Y),
+        (Vec3::Y, Vec3::Z),
+        (-Vec3::Y, -Vec3::Z),
+        (Vec3::Z, -Vec3::Y),
+        (-Vec3::Z, -Vec3::Y),
+    ];
+    faces.map(|(direction, up)| projection * Mat4::look_to_rh(position, direction, up))
+}
+
+fn create_local_shadow_resources(
+    device: &wgpu::Device,
+    caster_layout: &wgpu::BindGroupLayout,
+) -> LocalShadowResources {
+    let layer_count = u32::try_from(LOCAL_SHADOW_CACHE_SLOTS * 6).unwrap_or(6);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA local-light shadow cubemap cache"),
+        size: wgpu::Extent3d {
+            width: LOCAL_SHADOW_MAP_SIZE,
+            height: LOCAL_SHADOW_MAP_SIZE,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let cube_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA local-light shadow cache cube-array view"),
+        format: Some(DEPTH_FORMAT),
+        dimension: Some(wgpu::TextureViewDimension::CubeArray),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        base_array_layer: 0,
+        array_layer_count: Some(layer_count),
+        aspect: wgpu::TextureAspect::DepthOnly,
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA local-light shadow comparison sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+
+    let identity = ShadowCasterUniform {
+        view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        camera_pos_time: [0.0; 4],
+    };
+    let mut layer_views = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
+    let mut caster_buffers = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
+    let mut caster_bind_groups = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
+    for layer in 0..LOCAL_SHADOW_CACHE_SLOTS * 6 {
+        layer_views.push(texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("JKA local-light cached shadow face"),
+            format: Some(DEPTH_FORMAT),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: u32::try_from(layer).unwrap_or(0),
+            array_layer_count: Some(1),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        }));
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA local-light cached shadow caster uniform"),
+            contents: bytemuck::bytes_of(&identity),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        caster_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA local-light cached shadow caster bind group"),
+            layout: caster_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        }));
+        caster_buffers.push(buffer);
+    }
+
+    LocalShadowResources {
+        _texture: texture,
+        cube_view,
+        sampler,
+        layer_views,
+        caster_buffers,
+        caster_bind_groups,
+        cache_entries: vec![LocalShadowCacheEntry::default(); LOCAL_SHADOW_CACHE_SLOTS],
+        active_light_indices: Vec::new(),
+        pending_slots: Vec::new(),
+        shadowed_light_count: 0,
+        selection_cluster: None,
+        selection_position: None,
+        selection_serial: 0,
+    }
+}
+
+fn aabb_intersects_sphere(
+    minimum: [f32; 3],
+    maximum: [f32; 3],
+    center: [f32; 3],
+    radius: f32,
+) -> bool {
+    let mut squared_distance = 0.0_f32;
+    for axis in 0..3 {
+        let value = center[axis];
+        let nearest = value.clamp(minimum[axis], maximum[axis]);
+        let delta = value - nearest;
+        squared_distance += delta * delta;
+    }
+    squared_distance <= radius * radius
+}
+
+fn aabb_intersects_clip_frustum(minimum: [f32; 3], maximum: [f32; 3], view_proj: Mat4) -> bool {
+    let corners = [
+        Vec3::new(minimum[0], minimum[1], minimum[2]),
+        Vec3::new(maximum[0], minimum[1], minimum[2]),
+        Vec3::new(minimum[0], maximum[1], minimum[2]),
+        Vec3::new(maximum[0], maximum[1], minimum[2]),
+        Vec3::new(minimum[0], minimum[1], maximum[2]),
+        Vec3::new(maximum[0], minimum[1], maximum[2]),
+        Vec3::new(minimum[0], maximum[1], maximum[2]),
+        Vec3::new(maximum[0], maximum[1], maximum[2]),
+    ];
+    let clip = corners.map(|corner| view_proj * corner.extend(1.0));
+
+    let outside_left = clip.iter().all(|point| point.x < -point.w);
+    let outside_right = clip.iter().all(|point| point.x > point.w);
+    let outside_bottom = clip.iter().all(|point| point.y < -point.w);
+    let outside_top = clip.iter().all(|point| point.y > point.w);
+    // glam's *_rh projection helpers use wgpu/D3D depth convention: z in [0, w].
+    let outside_near = clip.iter().all(|point| point.z < 0.0);
+    let outside_far = clip.iter().all(|point| point.z > point.w);
+
+    !(outside_left || outside_right || outside_bottom || outside_top || outside_near || outside_far)
+}
+
+fn create_shadow_receiver_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    shadow_array_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+    sky_array_view: &wgpu::TextureView,
+    receiver_buffer: &wgpu::Buffer,
+    fog_control_buffer: &wgpu::Buffer,
+    weather_height_view: &wgpu::TextureView,
+    weather_sampler: &wgpu::Sampler,
+    weather_surface_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA cascaded sun/weather receiver bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(shadow_array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: receiver_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: fog_control_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(weather_height_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: weather_surface_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(weather_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(sky_array_view),
+            },
+        ],
+    })
+}
+
+fn create_shadow_resources(
+    device: &wgpu::Device,
+    receiver_layout: &wgpu::BindGroupLayout,
+    caster_layout: &wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    mask_pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    bevy_pipeline: wgpu::RenderPipeline,
+    bevy_mask_pipeline: wgpu::RenderPipeline,
+    bevy_translucent_pipeline: wgpu::RenderPipeline,
+    bevy_sky_pipeline: wgpu::RenderPipeline,
+    fog_control_buffer: &wgpu::Buffer,
+) -> ShadowResources {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA cascaded sun shadow array"),
+        size: wgpu::Extent3d {
+            width: SHADOW_MAP_SIZE,
+            height: SHADOW_MAP_SIZE,
+            depth_or_array_layers: SHADOW_CASCADES as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA cascaded sun shadow array view"),
+        format: Some(DEPTH_FORMAT),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        base_array_layer: 0,
+        array_layer_count: Some(SHADOW_CASCADES as u32),
+        aspect: wgpu::TextureAspect::DepthOnly,
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+    });
+    let layer_views = (0..SHADOW_CASCADES)
+        .map(|cascade| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA cascaded sun shadow layer"),
+                format: Some(DEPTH_FORMAT),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                base_array_layer: cascade as u32,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            })
+        })
+        .collect::<Vec<_>>();
+    let sky_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA cascaded shader-sun sky admission array"),
+        size: wgpu::Extent3d {
+            width: SHADOW_MAP_SIZE,
+            height: SHADOW_MAP_SIZE,
+            depth_or_array_layers: SHADOW_CASCADES as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let sky_array_view = sky_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("JKA cascaded shader-sun sky admission array view"),
+        format: Some(DEPTH_FORMAT),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        base_array_layer: 0,
+        array_layer_count: Some(SHADOW_CASCADES as u32),
+        aspect: wgpu::TextureAspect::DepthOnly,
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+    });
+    let sky_layer_views = (0..SHADOW_CASCADES)
+        .map(|cascade| {
+            sky_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA cascaded shader-sun sky admission layer"),
+                format: Some(DEPTH_FORMAT),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                base_array_layer: cascade as u32,
+                array_layer_count: Some(1),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let legacy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA cascaded sun shadow legacy comparison sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+    let bevy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA Bevy CSM comparison sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        compare: Some(wgpu::CompareFunction::GreaterEqual),
+        ..Default::default()
+    });
+    let weather_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA weather-surface fallback heightfield"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    // Placeholder keeps the binding valid before the lazily built map field.
+    // Once rain is first enabled this view is replaced by a second view of the
+    // exact RGBA32F weather field used by GPU rain/materials (R=rain cover,
+    // G=rendered topography height, B=physical upwardness, A=local basin score).
+    let weather_height_view =
+        weather_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let weather_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("JKA weather-surface gather sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let receiver = ShadowReceiverUniform {
+        view_proj: [Mat4::IDENTITY.to_cols_array_2d(); SHADOW_CASCADES],
+        split_depths: [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0],
+        light_direction_enabled: [
+            FALLBACK_SUN_DIRECTION[0],
+            FALLBACK_SUN_DIRECTION[1],
+            FALLBACK_SUN_DIRECTION[2],
+            0.0,
+        ],
+        params: [SHADOW_MAP_SIZE as f32, 0.00035, 0.30, 0.0],
+        camera_forward: [0.0, 0.0, -1.0, 0.0],
+        cascade_texel_sizes: [0.0; 4],
+        bevy_params: [BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS, BEVY_CSM_OVERLAP_PROPORTION, LEGACY_SHADOW_CASCADES as f32],
+    };
+    let receiver_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA cascaded sun shadow receiver uniform"),
+        contents: bytemuck::bytes_of(&receiver),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let weather_surface_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA weather surface uniform"),
+        contents: bytemuck::bytes_of(&WeatherSurfaceUniform {
+            amount_distance: [0.0, weather::RAIN_WETNESS_FADE_START, weather::RAIN_WETNESS_FADE_END, 1.0],
+            puddle: [0.0; 4],
+            occlusion_uv: [0.0; 4],
+            occlusion_size: [0; 4],
+        }),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let receiver_bind_group = create_shadow_receiver_bind_group(
+        device,
+        receiver_layout,
+        &array_view,
+        &legacy_sampler,
+        &sky_array_view,
+        &receiver_buffer,
+        fog_control_buffer,
+        &weather_height_view,
+        &weather_sampler,
+        &weather_surface_buffer,
+    );
+    /*let receiver_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA cascaded sun shadow receiver bind group"),
+        layout: receiver_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: receiver_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: fog_control_buffer.as_entire_binding(),
+            },
+        ],
+    });*/
+    let mut caster_buffers = Vec::with_capacity(SHADOW_CASCADES);
+    let mut caster_bind_groups = Vec::with_capacity(SHADOW_CASCADES);
+    for _ in 0..SHADOW_CASCADES {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA cascaded sun shadow caster uniform"),
+            contents: bytemuck::bytes_of(&ShadowCasterUniform {
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                camera_pos_time: [0.0; 4],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA cascaded sun shadow caster bind group"),
+            layout: caster_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        caster_buffers.push(buffer);
+        caster_bind_groups.push(bind_group);
+    }
+    ShadowResources {
+        _texture: texture,
+        _array_view: array_view,
+        layer_views,
+        _sky_texture: sky_texture,
+        sky_array_view,
+        sky_layer_views,
+        legacy_sampler,
+        bevy_sampler,
+        _weather_fallback_texture: weather_fallback_texture,
+        weather_height_view,
+        weather_sampler,
+        receiver_buffer,
+        weather_surface_buffer,
+        receiver_bind_group,
+        caster_buffers,
+        caster_bind_groups,
+        pipeline,
+        mask_pipeline,
+        translucent_pipeline,
+        sky_pipeline,
+        bevy_pipeline,
+        bevy_mask_pipeline,
+        bevy_translucent_pipeline,
+        bevy_sky_pipeline,
+    }
+}
+
+fn legacy_cascade_shadow_matrices(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    light_direction: Vec3,
+) -> [Mat4; SHADOW_CASCADES] {
+    let light_direction = light_direction.normalize_or_zero();
+    let reference_up = if light_direction.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = light_direction.cross(reference_up).normalize_or_zero();
+    let light_up = right.cross(light_direction).normalize_or_zero();
+    let mut matrices = [Mat4::IDENTITY; SHADOW_CASCADES];
+    for (cascade, far_distance) in LEGACY_SHADOW_SPLITS.iter().copied().enumerate() {
+        let nominal_near = if cascade == 0 {
+            1.0
+        } else {
+            LEGACY_SHADOW_SPLITS[cascade - 1]
+        };
+        let near_distance = if cascade == 0 {
+            nominal_near
+        } else {
+            (nominal_near - shadow_cascade_blend_width(nominal_near)).max(1.0)
+        };
+        let corners = camera.frustum_corners(width, height, near_distance, far_distance);
+        let centre = corners
+            .iter()
+            .copied()
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / 8.0;
+        let mut radius = corners
+            .iter()
+            .map(|corner| corner.distance(centre))
+            .fold(1.0_f32, f32::max);
+        radius = (radius * 16.0).ceil() / 16.0;
+        let texel_size = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+        let centre_right = centre.dot(right);
+        let centre_up = centre.dot(light_up);
+        let snapped_right = (centre_right / texel_size).round() * texel_size;
+        let snapped_up = (centre_up / texel_size).round() * texel_size;
+        let snapped_centre =
+            centre + right * (snapped_right - centre_right) + light_up * (snapped_up - centre_up);
+        let eye_distance = radius * 4.0;
+        let eye = snapped_centre - light_direction * eye_distance;
+        let view = Mat4::look_at_rh(eye, snapped_centre, reference_up);
+        let projection = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 8.0);
+        matrices[cascade] = projection * view;
+    }
+    matrices
+}
+
+fn bevy_cascade_bounds() -> [f32; SHADOW_CASCADES] {
+    let base = (BEVY_CSM_MAXIMUM_DISTANCE / BEVY_CSM_FIRST_FAR_BOUND)
+        .powf(1.0 / (SHADOW_CASCADES - 1) as f32);
+    std::array::from_fn(|i| BEVY_CSM_FIRST_FAR_BOUND * base.powf(i as f32))
+}
+
+fn bevy_cascade_shadow_matrices(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    light_direction: Vec3,
+) -> ([Mat4; SHADOW_CASCADES], [f32; SHADOW_CASCADES], [f32; SHADOW_CASCADES]) {
+    // Faithful port of Bevy 0.19.1 bevy_light::cascade::{build_directional_light_cascades,
+    // calculate_cascade}, with only the cascade distances scaled to JKA world units.
+    let light_direction = light_direction.normalize_or_zero();
+    let reference_up = if light_direction.dot(Vec3::Y).abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+    // Bevy builds cascades from the light transform's pure rotation. JKA stores
+    // the sun's forward/travel direction directly, so construct the equivalent
+    // zero-translation light view and transpose it to obtain world_from_light.
+    let light_from_world = Mat4::look_to_rh(Vec3::ZERO, light_direction, reference_up);
+    let world_from_light = light_from_world.transpose();
+    let bounds = bevy_cascade_bounds();
+    let overlap_factor = 1.0 - BEVY_CSM_OVERLAP_PROPORTION;
+    let mut matrices = [Mat4::IDENTITY; SHADOW_CASCADES];
+    let mut texel_sizes = [0.0; SHADOW_CASCADES];
+
+    for cascade in 0..SHADOW_CASCADES {
+        let near_bound = if cascade == 0 {
+            BEVY_CSM_MINIMUM_DISTANCE
+        } else {
+            overlap_factor * bounds[cascade - 1]
+        };
+        let far_bound = bounds[cascade];
+        let corners = camera.frustum_corners(width, height, near_bound, far_bound);
+
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for corner_world in corners {
+            let corner_light_view = light_from_world.transform_point3(corner_world);
+            min = min.min(corner_light_view);
+            max = max.max(corner_light_view);
+        }
+
+        let body_diagonal = corners[0].distance_squared(corners[6]);
+        let far_plane_diagonal = corners[4].distance_squared(corners[6]);
+        let cascade_diameter = body_diagonal.max(far_plane_diagonal).sqrt().ceil();
+        let cascade_texel_size = cascade_diameter / SHADOW_MAP_SIZE as f32;
+        let near_plane_center = Vec3::new(
+            (0.5 * (min.x + max.x) / cascade_texel_size).floor() * cascade_texel_size,
+            (0.5 * (min.y + max.y) / cascade_texel_size).floor() * cascade_texel_size,
+            max.z,
+        );
+
+        let world_from_light_transpose = world_from_light.transpose();
+        let cascade_from_world = Mat4::from_cols(
+            world_from_light_transpose.x_axis,
+            world_from_light_transpose.y_axis,
+            world_from_light_transpose.z_axis,
+            (-near_plane_center).extend(1.0),
+        );
+        let r = (max.z - min.z).recip();
+        let clip_from_cascade = Mat4::from_cols(
+            Vec4::new(2.0 / cascade_diameter, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, 2.0 / cascade_diameter, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, r, 0.0),
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+        );
+        matrices[cascade] = clip_from_cascade * cascade_from_world;
+        texel_sizes[cascade] = cascade_texel_size;
+    }
+
+    (matrices, bounds, texel_sizes)
+}
+
+fn shadow_cascade_blend_width(split: f32) -> f32 {
+    (split * SHADOW_CASCADE_BLEND_FRACTION).max(SHADOW_CASCADE_MIN_BLEND)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_world_froxel_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    fog_buffer: &wgpu::Buffer,
+    sun_shadow_array: &wgpu::TextureView,
+    sky_admission_array: &wgpu::TextureView,
+    light_buffer: &wgpu::Buffer,
+    cluster_buffer: &wgpu::Buffer,
+    lighting_settings_buffer: &wgpu::Buffer,
+    local_shadow_cube: &wgpu::TextureView,
+    local_shadow_sampler: &wgpu::Sampler,
+    rain_occlusion_height: &wgpu::TextureView,
+    wind_noise: &wgpu::TextureView,
+    wind_noise_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA world froxel volumetric fog bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: fog_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(sun_shadow_array),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(local_shadow_cube),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(local_shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(rain_occlusion_height),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(wind_noise),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::Sampler(wind_noise_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(sky_admission_array),
+            },
+        ],
+    })
+}
+
+fn create_ssao_temporal_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    linear_depth_view: &wgpu::TextureView,
+    history: Option<&TemporalSsaoHistory>,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+) -> Option<[wgpu::BindGroup; 2]> {
+    let history = history?;
+    Some(std::array::from_fn(|history_index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA temporal SSAO bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(linear_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&history.views[history_index]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }))
+}
+
+fn create_ssr_temporal_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    linear_depth_view: &wgpu::TextureView,
+    history: Option<&TemporalSsrHistory>,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+    weather_height_view: &wgpu::TextureView,
+    weather_sampler: &wgpu::Sampler,
+    weather_surface_buffer: &wgpu::Buffer,
+    reflection_mask_view: &wgpu::TextureView,
+) -> Option<[wgpu::BindGroup; 2]> {
+    let history = history?;
+    Some(std::array::from_fn(|history_index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA temporal SSR bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(linear_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(
+                        &history.radiance_views[history_index],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(
+                        &history.depth_views[history_index],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(weather_height_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(weather_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: weather_surface_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(reflection_mask_view),
+                },
+            ],
+        })
+    }))
+}
+
+fn create_fast_post_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA known-fast gamma post bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_gamma_post_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+    color_lut_view: &wgpu::TextureView,
+    color_lut_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA gamma-only post bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(color_lut_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(color_lut_sampler),
+            },
+        ],
+    })
+}
+
+fn create_auto_exposure_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    state_buffer: &wgpu::Buffer,
+    settings_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA auto-exposure bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: state_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: settings_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_post_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    linear_depth_view: &wgpu::TextureView,
+    history_view: &wgpu::TextureView,
+    ssao_view: &wgpu::TextureView,
+    ssr_radiance_view: &wgpu::TextureView,
+    ssr_depth_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+    froxel_buffer: &wgpu::Buffer,
+    bloom: Option<&BloomPyramid>,
+    dof: Option<&DofTarget>,
+    color_lut_view: &wgpu::TextureView,
+    color_lut_sampler: &wgpu::Sampler,
+    cloud_detail_view: &wgpu::TextureView,
+    cloud_noise_sampler: &wgpu::Sampler,
+    cloud_transfer_view: &wgpu::TextureView,
+    weather_occlusion_view: &wgpu::TextureView,
+    rain_haze_mask_view: &wgpu::TextureView,
+    cloud_weather_view: &wgpu::TextureView,
+    motion_vector_view: &wgpu::TextureView,
+    scene_depth_view: &wgpu::TextureView,
+    reflection_mask_view: &wgpu::TextureView,
+    auto_exposure_state_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let bloom_half = bloom.map_or(scene_view, |pyramid| &pyramid.views[0]);
+    let bloom_quarter = bloom.map_or(scene_view, |pyramid| &pyramid.views[1]);
+    let bloom_eighth = bloom.map_or(scene_view, |pyramid| &pyramid.views[2]);
+    let dof_view = dof.map_or(scene_view, |target| &target.view);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA post-process bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(linear_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(history_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: froxel_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(bloom_half),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(bloom_quarter),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(bloom_eighth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(color_lut_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::Sampler(color_lut_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(ssao_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(ssr_radiance_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(ssr_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(dof_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(cloud_detail_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::Sampler(cloud_noise_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(cloud_transfer_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(weather_occlusion_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(rain_haze_mask_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(cloud_weather_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(motion_vector_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::TextureView(scene_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(reflection_mask_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 24,
+                resource: auto_exposure_state_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_dof_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    linear_depth_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    buffer: &wgpu::Buffer,
+    dof: Option<&DofTarget>,
+) -> Option<wgpu::BindGroup> {
+    dof?;
+    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA Gaussian DOF bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(linear_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffer.as_entire_binding(),
+            },
+        ],
+    }))
+}
+
+fn create_bloom_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    scene_view: &wgpu::TextureView,
+    bloom: Option<&BloomPyramid>,
+) -> Option<[wgpu::BindGroup; 3]> {
+    let bloom = bloom?;
+    let sources = [scene_view, &bloom.views[0], &bloom.views[1]];
+    Some(std::array::from_fn(|level| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA bloom downsample bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(sources[level]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }))
+}
+
+fn create_depth_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA AO depth prepass pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_depth_prepass_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA alpha-tested depth prepass pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_mask"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_planar_debug_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA planar reflection debug preview pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_gamma_post_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA gamma-only post pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_dof_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA Gaussian DOF horizontal pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_horizontal"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_bloom_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    fragment_entry: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA low-resolution bloom pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fragment_entry),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_ssao_temporal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA half-resolution temporal SSAO pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_ssr_temporal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA half-resolution temporal SSR pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_cloud_resolve_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    cloud_march_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA cloud resolve bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(cloud_march_view),
+        }],
+    })
+}
+
+fn create_cloud_pass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    entry_point: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_post_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA post-process pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_taa_post_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    history_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA TAA/post-process pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main_taa"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: history_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_cull_debug_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA cull rejection debug pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        // This is intentionally an x-ray diagnostic: rejected surfaces should
+        // remain visible through the geometry that caused their rejection.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA wireframe overlay pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        // JKA r_showtris 1 is an x-ray diagnostic: its lines are never occluded.
+        // The world render pass still has a Depth32Float attachment, so wgpu
+        // requires this pipeline to declare the same depth format even though
+        // we intentionally ignore depth for the overlay. Compare Always makes
+        // every line pass while disabling writes leaves the existing depth
+        // buffer untouched.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_surface_inspector_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA surface inspector highlight pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_ui_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA UI pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &UI_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    fn mover_vertex(jka: [f32; 3], normal: [f32; 3]) -> GpuVertex {
+        GpuVertex {
+            position: scene::render_position(jka),
+            uv: [0.25, 0.5],
+            lightmap_uv: [0.1, 0.2],
+            normal: scene::render_position(normal),
+            color: [1.0; 4],
+            alpha_cutoff: 0.75,
+        }
+    }
+
+    #[test]
+    fn inline_model_pose_matches_cg_mover_transform_in_jka_space() {
+        let base = [mover_vertex([10.0, 0.0, 0.0], [1.0, 0.0, 0.0]), mover_vertex([0.0, 0.0, 8.0], [0.0, 0.0, 1.0])];
+        // AnglesToAxis(0 90 0): forward +Y, left -X, up +Z.
+        let pose = InlineModelInstance {
+            model: 3,
+            origin: [5.0, 0.0, 2.0],
+            axis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let (posed, minimum, maximum) = posed_inline_vertices(&base, Some(pose));
+        assert_eq!(scene::jka_position(posed[0].position), [5.0, 10.0, 2.0]);
+        assert_eq!(scene::jka_position(posed[0].normal), [0.0, 1.0, 0.0]);
+        assert_eq!(scene::jka_position(posed[1].position), [5.0, 0.0, 10.0]);
+        // Only geometry moves; material/lighting attributes are the compiled ones.
+        assert_eq!((posed[0].uv, posed[0].lightmap_uv, posed[0].alpha_cutoff), ([0.25, 0.5], [0.1, 0.2], 0.75));
+        assert_eq!(minimum, [5.0, 2.0, -10.0]);
+        assert_eq!(maximum, [5.0, 10.0, 0.0]);
+
+        let (compiled, _, _) = posed_inline_vertices(&base, Some(InlineModelInstance::compiled(3)));
+        assert_eq!(compiled[0].position, base[0].position);
+        assert_eq!(compiled[1].normal, base[1].normal);
+    }
+
+    #[test]
+    fn inline_model_absent_from_snapshot_collapses_to_zero_area() {
+        let base = [mover_vertex([1.0, 2.0, 3.0], [0.0, 0.0, 1.0]), mover_vertex([9.0, 2.0, 3.0], [0.0, 0.0, 1.0])];
+        let (hidden, minimum, maximum) = posed_inline_vertices(&base, None);
+        assert!(hidden.iter().all(|vertex| vertex.position == base[0].position));
+        assert_eq!(minimum, maximum);
+    }
+
+    #[test]
+    fn planar_reflection_matrix_reflects_across_authored_plane() {
+        let plane = [1.0, 0.0, 0.0, -5.0];
+        let reflected = reflection_matrix(plane).transform_point3(Vec3::new(7.0, 2.0, -3.0));
+        assert!((reflected - Vec3::new(3.0, 2.0, -3.0)).length() < 1e-5);
+        let on_plane = reflection_matrix(plane).transform_point3(Vec3::new(5.0, 4.0, 9.0));
+        assert!((on_plane - Vec3::new(5.0, 4.0, 9.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn planar_selection_prefers_screen_centre_over_edge() {
+        let centre =
+            projected_planar_importance([-0.25, -0.25, 0.5], [0.25, 0.25, 0.5], Mat4::IDENTITY)
+                .unwrap();
+        let edge =
+            projected_planar_importance([0.70, -0.25, 0.5], [0.95, 0.25, 0.5], Mat4::IDENTITY)
+                .unwrap();
+        assert!(centre.0);
+        assert!(!edge.0);
+        assert!(centre.1 > edge.1);
+    }
+
+    #[test]
+    fn planar_selection_scores_larger_screen_coverage_higher() {
+        let large =
+            projected_planar_importance([-0.60, -0.60, 0.5], [0.60, 0.60, 0.5], Mat4::IDENTITY)
+                .unwrap();
+        let small =
+            projected_planar_importance([-0.10, -0.10, 0.5], [0.10, 0.10, 0.5], Mat4::IDENTITY)
+                .unwrap();
+        assert!(large.0 && small.0);
+        assert!(large.1 > small.1);
+    }
+
+    #[test]
+    fn skybox_average_linearises_and_uses_the_smallest_mip() {
+        use crate::materials::TextureData;
+
+        // 2x2 base plus a 1x1 mip. Only the 1x1 should be read; if the base is
+        // averaged instead the result picks up the black texels.
+        let face = TextureData {
+            label: "sky".to_string(),
+            source: None,
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, // base
+                188, 188, 188, 255, // 1x1 mip
+            ],
+            rgba16f: None,
+            mip_level_count: 2,
+            clamp: true,
+            srgb: true,
+        };
+        let average = super::average_skybox_color(&[face], &[0]);
+        // 188/255 in sRGB linearises to about 0.5.
+        for channel in average {
+            assert!(
+                (channel - 0.5).abs() < 0.02,
+                "expected ~0.5 linear, got {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn skybox_average_falls_back_without_faces() {
+        let average = super::average_skybox_color(&[], &[]);
+        assert_eq!(average, [0.45, 0.55, 0.75]);
+        // An out-of-range face index must not panic or return black.
+        let average = super::average_skybox_color(&[], &[7]);
+        assert_eq!(average, [0.45, 0.55, 0.75]);
+    }
+
+    #[test]
+    fn all_renderer_shaders_validate() {
+        let bsp = format!(
+            "{}\n{}",
+            include_str!("bsp.wgsl"),
+            include_str!("surface_deformation.wgsl")
+        );
+        let bsp_lean = format!(
+            "{}\n{}",
+            include_str!("bsp_lean.wgsl"),
+            include_str!("surface_deformation.wgsl")
+        );
+        let bsp_fast = format!(
+            "{}\n{}",
+            include_str!("bsp_fast.wgsl"),
+            include_str!("surface_deformation.wgsl")
+        );
+        for (name, source) in [
+            ("bsp", bsp.as_str()),
+            ("bsp_lean", bsp_lean.as_str()),
+            ("bsp_fast", bsp_fast.as_str()),
+            ("post", include_str!("post.wgsl")),
+            ("rain_haze_mask", include_str!("rain_haze_mask.wgsl")),
+            ("post_gamma", include_str!("post_gamma.wgsl")),
+            ("depth_prepass", include_str!("depth_prepass.wgsl")),
+            ("gpu_cull", include_str!("gpu_cull.wgsl")),
+            ("cull_debug", include_str!("cull_debug.wgsl")),
+            ("hiz_reduce", include_str!("hiz_reduce.wgsl")),
+            ("cluster_lights", include_str!("cluster_lights.wgsl")),
+            ("froxel_fog", include_str!("froxel_fog.wgsl")),
+            ("ocean_windrow", include_str!("ocean_windrow.wgsl")),
+            ("snowflow_deformation_sim", include_str!("snowflow_deformation_sim.wgsl")),
+        ] {
+            let module = wgpu::naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::CUBE_ARRAY_TEXTURES,
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+        }
+    }
+}

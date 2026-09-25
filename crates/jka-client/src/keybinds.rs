@@ -1,0 +1,376 @@
+use std::{collections::HashMap, fs, path::Path};
+use winit::keyboard::KeyCode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindKey {
+    Keyboard(KeyCode),
+    Mouse(u8),
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ControlAction {
+    pub label: &'static str,
+    pub command: &'static str,
+    /// Heading the Controls page files this action under.
+    pub group: &'static str,
+}
+
+pub const CONTROL_ACTIONS: &[ControlAction] = &[
+    ControlAction { label: "FORWARD", command: "+forward", group: "Movement" },
+    ControlAction { label: "BACKPEDAL", command: "+back", group: "Movement" },
+    ControlAction { label: "STEP LEFT", command: "+moveleft", group: "Movement" },
+    ControlAction { label: "STEP RIGHT", command: "+moveright", group: "Movement" },
+    ControlAction { label: "JUMP", command: "+moveup", group: "Movement" },
+    ControlAction { label: "CROUCH", command: "+movedown", group: "Movement" },
+    ControlAction { label: "WALK", command: "+speed", group: "Movement" },
+    ControlAction { label: "PRIMARY ATTACK", command: "+attack", group: "Combat" },
+    ControlAction { label: "ALT ATTACK", command: "+altattack", group: "Combat" },
+    ControlAction { label: "CHAT", command: "messagemode", group: "Communication" },
+    ControlAction { label: "TEAM CHAT", command: "messagemode2", group: "Communication" },
+    ControlAction { label: "SCORES", command: "+scores", group: "Communication" },
+    ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson", group: "View" },
+    ControlAction { label: "NOCLIP", command: "noclip", group: "Debug" },
+    ControlAction { label: "FORCE SPEED TEST", command: "force_speed", group: "Debug" },
+    ControlAction { label: "FORCE RAGE TEST", command: "force_rage", group: "Debug" },
+    ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Debug" },
+    ControlAction { label: "TRACE", command: "trace", group: "Debug" },
+];
+
+#[derive(Debug, Clone)]
+pub struct Bindings {
+    map: HashMap<BindKey, String>,
+}
+
+impl Default for Bindings {
+    fn default() -> Self {
+        let mut bindings = Self { map: HashMap::new() };
+        for (key, command) in [
+            (BindKey::Keyboard(KeyCode::KeyW), "+forward"),
+            (BindKey::Keyboard(KeyCode::KeyS), "+back"),
+            (BindKey::Keyboard(KeyCode::KeyA), "+moveleft"),
+            (BindKey::Keyboard(KeyCode::KeyD), "+moveright"),
+            (BindKey::Keyboard(KeyCode::Space), "+moveup"),
+            (BindKey::Keyboard(KeyCode::ControlLeft), "+movedown"),
+            (BindKey::Keyboard(KeyCode::ShiftLeft), "+speed"),
+            (BindKey::Mouse(1), "+attack"),
+            (BindKey::Mouse(2), "+altattack"),
+            (BindKey::Keyboard(KeyCode::KeyY), "messagemode"),
+            (BindKey::Keyboard(KeyCode::KeyU), "messagemode2"),
+            (BindKey::Keyboard(KeyCode::Tab), "+scores"),
+            (BindKey::Keyboard(KeyCode::KeyN), "noclip"),
+            (BindKey::Keyboard(KeyCode::F3), "force_speed"),
+            (BindKey::Keyboard(KeyCode::F4), "force_rage"),
+            (BindKey::Keyboard(KeyCode::F5), "puddle_debug"),
+            (BindKey::Keyboard(KeyCode::KeyQ), "trace"),
+        ] {
+            bindings.set(key, command);
+        }
+        bindings
+    }
+}
+
+impl Bindings {
+    pub fn load(primary: &Path, fallback: Option<&Path>) -> Self {
+        if let Ok(text) = fs::read_to_string(primary) {
+            let mut bindings = Self::default();
+            if apply_cfg(&mut bindings, &text) {
+                return bindings;
+            }
+        }
+
+        if let Some(path) = fallback {
+            if let Ok(text) = fs::read_to_string(path) {
+                let mut bindings = Self::default();
+                if apply_cfg(&mut bindings, &text) {
+                    return bindings;
+                }
+            }
+        }
+
+        Self::default()
+    }
+
+    pub fn get(&self, key: BindKey) -> Option<&str> {
+        self.map.get(&key).map(String::as_str)
+    }
+
+    pub fn set(&mut self, key: BindKey, command: impl Into<String>) {
+        let command = command.into();
+        if command.is_empty() {
+            self.map.remove(&key);
+        } else {
+            self.map.insert(key, command);
+        }
+    }
+
+    pub fn unbind(&mut self, key: BindKey) -> bool {
+        self.map.remove(&key).is_some()
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    pub fn unbind_command(&mut self, command: &str) -> usize {
+        let mut changed = 0;
+        for value in self.map.values_mut() {
+            if !binding_contains_command(value, command) {
+                continue;
+            }
+            let kept: Vec<_> = split_binding_commands(value)
+                .filter(|part| {
+                    !part
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|verb| verb.eq_ignore_ascii_case(command))
+                })
+                .map(str::to_owned)
+                .collect();
+            *value = kept.join("; ");
+            changed += 1;
+        }
+        self.map.retain(|_, value| !value.is_empty());
+        changed
+    }
+
+    pub fn keys_for_command(&self, command: &str) -> Vec<BindKey> {
+        let mut keys: Vec<_> = self.map.iter()
+            .filter_map(|(key, value)| binding_contains_command(value, command).then_some(*key))
+            .collect();
+        keys.sort_by_key(|key| key_name(*key));
+        keys
+    }
+
+    pub fn display_for_command(&self, command: &str) -> String {
+        let keys = self.keys_for_command(command);
+        if keys.is_empty() {
+            "UNBOUND".into()
+        } else {
+            keys.into_iter().map(key_name).collect::<Vec<_>>().join(" OR ")
+        }
+    }
+
+    pub fn sorted(&self) -> Vec<(BindKey, String)> {
+        let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value.clone())).collect();
+        entries.sort_by_key(|(key, _)| key_name(*key));
+        entries
+    }
+
+    pub fn write_cfg(&self, out: &mut String) {
+        out.push_str("\n// Key bindings. OpenJK-compatible bind syntax.\nunbindall\n");
+        for (key, command) in self.sorted() {
+            out.push_str("bind ");
+            out.push_str(&key_name(key));
+            out.push_str(" \"");
+            out.push_str(&escape_cfg(&command));
+            out.push_str("\"\n");
+        }
+    }
+}
+
+
+fn apply_cfg(bindings: &mut Bindings, text: &str) -> bool {
+    let mut saw_bindings = false;
+    for raw in text.lines() {
+        let words = split_command_words(raw.trim());
+        if words.is_empty() {
+            continue;
+        }
+        if words[0].eq_ignore_ascii_case("unbindall") {
+            bindings.clear();
+            saw_bindings = true;
+            continue;
+        }
+        if words[0].eq_ignore_ascii_case("bind") && words.len() >= 3 {
+            if let Some(key) = parse_key(&words[1]) {
+                bindings.set(key, words[2..].join(" "));
+                saw_bindings = true;
+            }
+        }
+    }
+    saw_bindings
+}
+
+pub fn binding_contains_command(binding: &str, command: &str) -> bool {
+    binding.split(';').any(|part| {
+        part.trim().split_whitespace().next().is_some_and(|verb| verb.eq_ignore_ascii_case(command))
+    })
+}
+
+pub fn split_binding_commands(binding: &str) -> impl Iterator<Item = &str> {
+    binding.split(';').map(str::trim).filter(|part| !part.is_empty())
+}
+
+pub fn bind_key_for_code(code: KeyCode) -> BindKey {
+    BindKey::Keyboard(match code {
+        KeyCode::ControlRight => KeyCode::ControlLeft,
+        KeyCode::ShiftRight => KeyCode::ShiftLeft,
+        KeyCode::AltRight => KeyCode::AltLeft,
+        _ => code,
+    })
+}
+
+pub fn parse_key(name: &str) -> Option<BindKey> {
+    let upper = name.trim().to_ascii_uppercase();
+    let keyboard = match upper.as_str() {
+        "SPACE" => Some(KeyCode::Space),
+        "TAB" => Some(KeyCode::Tab),
+        "ENTER" | "RETURN" => Some(KeyCode::Enter),
+        "ESCAPE" | "ESC" => Some(KeyCode::Escape),
+        "BACKSPACE" => Some(KeyCode::Backspace),
+        "UPARROW" | "UP" => Some(KeyCode::ArrowUp),
+        "DOWNARROW" | "DOWN" => Some(KeyCode::ArrowDown),
+        "LEFTARROW" | "LEFT" => Some(KeyCode::ArrowLeft),
+        "RIGHTARROW" | "RIGHT" => Some(KeyCode::ArrowRight),
+        "ALT" => Some(KeyCode::AltLeft),
+        "CTRL" | "CONTROL" => Some(KeyCode::ControlLeft),
+        "SHIFT" => Some(KeyCode::ShiftLeft),
+        "INS" | "INSERT" => Some(KeyCode::Insert),
+        "DEL" | "DELETE" => Some(KeyCode::Delete),
+        "PGUP" | "PAGEUP" => Some(KeyCode::PageUp),
+        "PGDN" | "PAGEDOWN" => Some(KeyCode::PageDown),
+        "HOME" => Some(KeyCode::Home),
+        "END" => Some(KeyCode::End),
+        "PAUSE" => Some(KeyCode::Pause),
+        "SEMICOLON" | ";" => Some(KeyCode::Semicolon),
+        "APOSTROPHE" | "'" => Some(KeyCode::Quote),
+        "COMMA" | "," => Some(KeyCode::Comma),
+        "PERIOD" | "." => Some(KeyCode::Period),
+        "SLASH" | "/" => Some(KeyCode::Slash),
+        "BACKSLASH" | "\\" => Some(KeyCode::Backslash),
+        "MINUS" | "-" => Some(KeyCode::Minus),
+        "EQUALS" | "=" => Some(KeyCode::Equal),
+        "LBRACKET" | "[" => Some(KeyCode::BracketLeft),
+        "RBRACKET" | "]" => Some(KeyCode::BracketRight),
+        "F1" => Some(KeyCode::F1), "F2" => Some(KeyCode::F2), "F3" => Some(KeyCode::F3),
+        "F4" => Some(KeyCode::F4), "F5" => Some(KeyCode::F5), "F6" => Some(KeyCode::F6),
+        "F7" => Some(KeyCode::F7), "F8" => Some(KeyCode::F8), "F9" => Some(KeyCode::F9),
+        "F10" => Some(KeyCode::F10), "F11" => Some(KeyCode::F11), "F12" => Some(KeyCode::F12),
+        _ => None,
+    };
+    if let Some(key) = keyboard { return Some(BindKey::Keyboard(key)); }
+    if let Some(number) = upper.strip_prefix("MOUSE").and_then(|v| v.parse::<u8>().ok()) {
+        if (1..=5).contains(&number) { return Some(BindKey::Mouse(number)); }
+    }
+    match upper.as_str() {
+        "MWHEELUP" => return Some(BindKey::WheelUp),
+        "MWHEELDOWN" => return Some(BindKey::WheelDown),
+        _ => {}
+    }
+    if upper.len() == 1 {
+        let byte = upper.as_bytes()[0];
+        if byte.is_ascii_alphabetic() {
+            let code = match byte {
+                b'A' => KeyCode::KeyA, b'B' => KeyCode::KeyB, b'C' => KeyCode::KeyC, b'D' => KeyCode::KeyD,
+                b'E' => KeyCode::KeyE, b'F' => KeyCode::KeyF, b'G' => KeyCode::KeyG, b'H' => KeyCode::KeyH,
+                b'I' => KeyCode::KeyI, b'J' => KeyCode::KeyJ, b'K' => KeyCode::KeyK, b'L' => KeyCode::KeyL,
+                b'M' => KeyCode::KeyM, b'N' => KeyCode::KeyN, b'O' => KeyCode::KeyO, b'P' => KeyCode::KeyP,
+                b'Q' => KeyCode::KeyQ, b'R' => KeyCode::KeyR, b'S' => KeyCode::KeyS, b'T' => KeyCode::KeyT,
+                b'U' => KeyCode::KeyU, b'V' => KeyCode::KeyV, b'W' => KeyCode::KeyW, b'X' => KeyCode::KeyX,
+                b'Y' => KeyCode::KeyY, b'Z' => KeyCode::KeyZ, _ => unreachable!(),
+            };
+            return Some(BindKey::Keyboard(code));
+        }
+        if byte.is_ascii_digit() {
+            let code = match byte {
+                b'0' => KeyCode::Digit0, b'1' => KeyCode::Digit1, b'2' => KeyCode::Digit2, b'3' => KeyCode::Digit3,
+                b'4' => KeyCode::Digit4, b'5' => KeyCode::Digit5, b'6' => KeyCode::Digit6, b'7' => KeyCode::Digit7,
+                b'8' => KeyCode::Digit8, b'9' => KeyCode::Digit9, _ => unreachable!(),
+            };
+            return Some(BindKey::Keyboard(code));
+        }
+    }
+    None
+}
+
+pub fn key_name(key: BindKey) -> String {
+    match key {
+        BindKey::Mouse(n) => format!("MOUSE{n}"),
+        BindKey::WheelUp => "MWHEELUP".into(),
+        BindKey::WheelDown => "MWHEELDOWN".into(),
+        BindKey::Keyboard(code) => match code {
+            KeyCode::Space => "SPACE".into(), KeyCode::Tab => "TAB".into(), KeyCode::Enter => "ENTER".into(),
+            KeyCode::Escape => "ESCAPE".into(), KeyCode::Backspace => "BACKSPACE".into(),
+            KeyCode::ArrowUp => "UPARROW".into(), KeyCode::ArrowDown => "DOWNARROW".into(),
+            KeyCode::ArrowLeft => "LEFTARROW".into(), KeyCode::ArrowRight => "RIGHTARROW".into(),
+            KeyCode::AltLeft | KeyCode::AltRight => "ALT".into(),
+            KeyCode::ControlLeft | KeyCode::ControlRight => "CTRL".into(),
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => "SHIFT".into(),
+            KeyCode::Insert => "INS".into(), KeyCode::Delete => "DEL".into(), KeyCode::PageUp => "PGUP".into(),
+            KeyCode::PageDown => "PGDN".into(), KeyCode::Home => "HOME".into(), KeyCode::End => "END".into(),
+            KeyCode::Pause => "PAUSE".into(), KeyCode::Semicolon => "SEMICOLON".into(), KeyCode::Quote => "APOSTROPHE".into(),
+            KeyCode::Comma => "COMMA".into(), KeyCode::Period => "PERIOD".into(), KeyCode::Slash => "SLASH".into(),
+            KeyCode::Backslash => "BACKSLASH".into(), KeyCode::Minus => "MINUS".into(), KeyCode::Equal => "EQUALS".into(),
+            KeyCode::BracketLeft => "LBRACKET".into(), KeyCode::BracketRight => "RBRACKET".into(),
+            KeyCode::KeyA => "A".into(), KeyCode::KeyB => "B".into(), KeyCode::KeyC => "C".into(), KeyCode::KeyD => "D".into(),
+            KeyCode::KeyE => "E".into(), KeyCode::KeyF => "F".into(), KeyCode::KeyG => "G".into(), KeyCode::KeyH => "H".into(),
+            KeyCode::KeyI => "I".into(), KeyCode::KeyJ => "J".into(), KeyCode::KeyK => "K".into(), KeyCode::KeyL => "L".into(),
+            KeyCode::KeyM => "M".into(), KeyCode::KeyN => "N".into(), KeyCode::KeyO => "O".into(), KeyCode::KeyP => "P".into(),
+            KeyCode::KeyQ => "Q".into(), KeyCode::KeyR => "R".into(), KeyCode::KeyS => "S".into(), KeyCode::KeyT => "T".into(),
+            KeyCode::KeyU => "U".into(), KeyCode::KeyV => "V".into(), KeyCode::KeyW => "W".into(), KeyCode::KeyX => "X".into(),
+            KeyCode::KeyY => "Y".into(), KeyCode::KeyZ => "Z".into(),
+            KeyCode::Digit0 => "0".into(), KeyCode::Digit1 => "1".into(), KeyCode::Digit2 => "2".into(), KeyCode::Digit3 => "3".into(),
+            KeyCode::Digit4 => "4".into(), KeyCode::Digit5 => "5".into(), KeyCode::Digit6 => "6".into(), KeyCode::Digit7 => "7".into(),
+            KeyCode::Digit8 => "8".into(), KeyCode::Digit9 => "9".into(),
+            KeyCode::F1 => "F1".into(), KeyCode::F2 => "F2".into(), KeyCode::F3 => "F3".into(), KeyCode::F4 => "F4".into(),
+            KeyCode::F5 => "F5".into(), KeyCode::F6 => "F6".into(), KeyCode::F7 => "F7".into(), KeyCode::F8 => "F8".into(),
+            KeyCode::F9 => "F9".into(), KeyCode::F10 => "F10".into(), KeyCode::F11 => "F11".into(), KeyCode::F12 => "F12".into(),
+            _ => format!("{code:?}").to_ascii_uppercase(),
+        },
+    }
+}
+
+pub fn split_command_words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut token_started = false;
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        if ch == '\\' && quoted {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+        match ch {
+            '"' => { quoted = !quoted; token_started = true; }
+            c if c.is_whitespace() && !quoted => {
+                if token_started { out.push(std::mem::take(&mut current)); token_started = false; }
+            }
+            _ => { current.push(ch); token_started = true; }
+        }
+    }
+    if escaped { current.push('\\'); }
+    if token_started { out.push(current); }
+    out
+}
+
+fn escape_cfg(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_bind_keeps_multiword_command() {
+        assert_eq!(split_command_words("bind x \"say hello there\""), ["bind", "x", "say hello there"]);
+        assert_eq!(split_command_words("bind x \"\""), ["bind", "x", ""]);
+    }
+
+    #[test]
+    fn default_movement_bindings_exist() {
+        let bindings = Bindings::default();
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyW)), Some("+forward"));
+        assert_eq!(bindings.get(BindKey::Mouse(1)), Some("+attack"));
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "jka-assets"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }

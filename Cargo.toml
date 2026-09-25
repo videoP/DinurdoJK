@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-movement"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+# Ship builds carry no symbol table; source paths are scrubbed via --remap-path-prefix
+# in build.ps1. The .pdb stays beside the exe for local debugging but is not shipped.
+strip = true
+lto = true
+codegen-units = 1

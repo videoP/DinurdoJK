@@ -1,0 +1,2 @@
+# Preserve upstream bytes so the OpenJK source-hash manifest works on Windows.
+crates/jka-movement/vendor/openjk/** -text
