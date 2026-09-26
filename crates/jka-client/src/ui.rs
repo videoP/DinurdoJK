@@ -8,6 +8,7 @@ pub enum OverlayMode {
     Video,
     Game,
     HudEdit,
+    MapEdit,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -43,6 +44,53 @@ pub struct UiScoreboard {
     pub team_scores: [i32; 2],
     pub team_game: bool,
     pub entries: Vec<UiScoreEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DemoKillMarkerUi {
+    /// Normalized 0..1 position on the complete demo timeline.
+    pub fraction: f32,
+    /// TEAM_RED=1 / TEAM_BLUE=2 when known, otherwise neutral.
+    pub attacker_team: i32,
+    pub followed_kill: bool,
+    pub followed_death: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DemoTimelineUi {
+    pub elapsed_ms: f64,
+    pub duration_ms: i32,
+    /// Selected playback speed. When paused this is the resume speed.
+    pub playback_rate: f64,
+    pub paused: bool,
+    /// While dragging, render the thumb/time at this pending seek position.
+    pub scrub_fraction: Option<f32>,
+    pub kill_markers: Vec<DemoKillMarkerUi>,
+    pub camera_label: String,
+    pub outside_authoritative_view: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DemoTimelineLayout {
+    pub play: [f32; 4],
+    pub track: [f32; 4],
+    pub speed: [f32; 4],
+}
+
+pub fn demo_timeline_layout(width: u32, height: u32) -> Option<DemoTimelineLayout> {
+    if width < 420 || height < 120 {
+        return None;
+    }
+    let w = width as f32;
+    let h = height as f32;
+    let panel_y = h - 46.0;
+    let play = [16.0, panel_y + 7.0, 30.0, 26.0];
+    let speed = [w - 82.0, panel_y + 7.0, 66.0, 26.0];
+    // Leave fixed text gutters for current and total time.
+    let track_x = 116.0;
+    let track_w = (w - track_x - 176.0).max(80.0);
+    let track = [track_x, panel_y + 10.0, track_w, 20.0];
+    Some(DemoTimelineLayout { play, track, speed })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -331,7 +379,6 @@ pub const SHELPER_WA: u32 = 1 << 6;
 pub const SHELPER_WD: u32 = 1 << 7;
 pub const SHELPER_A: u32 = 1 << 8;
 pub const SHELPER_D: u32 = 1 << 9;
-pub const SHELPER_REAR: u32 = 1 << 10;
 pub const SHELPER_CENTER: u32 = 1 << 11;
 pub const SHELPER_S: u32 = 1 << 15;
 pub const SHELPER_SA: u32 = 1 << 16;
@@ -666,7 +713,8 @@ impl ColorLutPreset {
 pub enum FogMode {
     #[default]
     Off,
-    Legacy,
+    LegacyDrawFog1,
+    LegacyDrawFog2,
     Volumetric,
 }
 
@@ -684,7 +732,7 @@ impl EntityAmbientLightingMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "OFF",
-            Self::BspLightgridClassic => "BSP LIGHTGRID (CLASSIC) [WIP]",
+            Self::BspLightgridClassic => "BSP LIGHTGRID (CLASSIC)",
             Self::BevyIrradianceVolume => "BEVY IRRADIANCE VOLUME (AMBIENT CUBES)",
         }
     }
@@ -711,15 +759,19 @@ impl EntityAmbientLightingMode {
 pub enum DynamicLightsMode {
     #[default]
     Off,
-    PerVertexLegacy,
+    Legacy,
+    Vertex,
+    ClusteredLite,
     PerPixelForwardPlus,
     RayTracedHardware,
 }
 
 impl DynamicLightsMode {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Off,
-        Self::PerVertexLegacy,
+        Self::Legacy,
+        Self::Vertex,
+        Self::ClusteredLite,
         Self::PerPixelForwardPlus,
         Self::RayTracedHardware,
     ];
@@ -727,7 +779,9 @@ impl DynamicLightsMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "OFF",
-            Self::PerVertexLegacy => "PER-VERTEX (LEGACY) [WIP]",
+            Self::Legacy => "LEGACY",
+            Self::Vertex => "VERTEX",
+            Self::ClusteredLite => "CLUSTERED LITE",
             Self::PerPixelForwardPlus => "PER-PIXEL (FORWARD+)",
             Self::RayTracedHardware => "RAY TRACED (HARDWARE) [WIP]",
         }
@@ -736,7 +790,9 @@ impl DynamicLightsMode {
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::PerVertexLegacy => "per_vertex",
+            Self::Legacy => "legacy",
+            Self::Vertex => "vertex",
+            Self::ClusteredLite => "clustered_lite",
             Self::PerPixelForwardPlus => "forward_plus",
             Self::RayTracedHardware => "ray_traced",
         }
@@ -744,10 +800,12 @@ impl DynamicLightsMode {
 
     pub fn from_config(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "0" => Some(Self::Off),
-            "per_vertex" | "vertex" | "legacy" | "1" => Some(Self::PerVertexLegacy),
-            "forward_plus" | "per_pixel" | "forward+" | "2" => Some(Self::PerPixelForwardPlus),
-            "ray_traced" | "raytraced" | "hardware" | "3" => Some(Self::RayTracedHardware),
+            "off" => Some(Self::Off),
+            "legacy" => Some(Self::Legacy),
+            "vertex" => Some(Self::Vertex),
+            "clustered_lite" => Some(Self::ClusteredLite),
+            "forward_plus" => Some(Self::PerPixelForwardPlus),
+            "ray_traced" => Some(Self::RayTracedHardware),
             _ => None,
         }
     }
@@ -1018,6 +1076,44 @@ impl FootprintMode {
     }
 }
 
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SaberMarkMode {
+    Off,
+    #[default]
+    Legacy,
+    Enhanced,
+}
+
+impl SaberMarkMode {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Legacy, Self::Enhanced];
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Legacy => "legacy",
+            Self::Enhanced => "enhanced",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" => Some(Self::Off),
+            "legacy" | "1" | "openjk" | "classic" | "on" | "true" => Some(Self::Legacy),
+            "enhanced" | "2" | "modern" | "molten" => Some(Self::Enhanced),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Legacy => "Legacy (OpenJK)",
+            Self::Enhanced => "Enhanced molten",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DofQuality {
     Performance,
@@ -1061,7 +1157,6 @@ pub const CLOUD_HEIGHT_MIN: f32 = -8192.0;
 pub const CLOUD_HEIGHT_MAX: f32 = 8192.0;
 pub const CLOUD_THICKNESS_MIN: f32 = 256.0;
 pub const CLOUD_THICKNESS_MAX: f32 = 4096.0;
-pub const CLOUD_WIND_SPEED_MAX: f32 = 640.0;
 pub const VIDEO_ROW_FULLSCREEN: usize = 0;
 pub const VIDEO_ROW_RESOLUTION: usize = 1;
 pub const VIDEO_ROW_VSYNC: usize = 2;
@@ -1123,6 +1218,12 @@ pub const VIDEO_ROW_GHOUL2_LOD_BIAS: usize = 57;
 pub const VIDEO_ROW_GHOUL2_BATCH_DRAWS: usize = 58;
 pub const VIDEO_ROW_GHOUL2_EARLY_CULL: usize = 59;
 pub const VIDEO_ROW_MODERN_SABERS: usize = 60;
+pub const VIDEO_ROW_FX_FPS: usize = 61;
+pub const VIDEO_ROW_WORLD_LIGHTING: usize = 62;
+pub const VIDEO_ROW_VERTEX_LIGHTING: usize = 63;
+pub const VIDEO_ROW_LIGHTMAP_ONLY: usize = 64;
+pub const VIDEO_ROW_MAP_LIGHT_SIMULATION: usize = 65;
+pub const VIDEO_ROW_SABER_MARKS: usize = 66;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -1132,8 +1233,8 @@ pub const ENV_ROW_CLOUD_QUALITY: usize = 4;
 pub const ENV_ROW_CLOUD_COVERAGE: usize = 5;
 pub const ENV_ROW_CLOUD_HEIGHT: usize = 6;
 pub const ENV_ROW_CLOUD_THICKNESS: usize = 7;
-pub const ENV_ROW_CLOUD_WIND_SPEED: usize = 8;
-pub const ENV_ROW_CLOUD_WIND_DIRECTION: usize = 9;
+pub const ENV_ROW_WEATHER_WIND_SPEED: usize = 8;
+pub const ENV_ROW_WEATHER_WIND_DIRECTION: usize = 9;
 pub const ENV_ROW_CLOUD_SHADOWS: usize = 10;
 pub const ENV_ROW_CLOUD_RENDER_RESOLUTION: usize = 11;
 pub const ENV_ROW_CLOUD_TEMPORAL: usize = 12;
@@ -1151,6 +1252,8 @@ pub const ENV_ROW_SUN_PITCH: usize = 23;
 pub const ENV_ROW_SUN_INTENSITY: usize = 24;
 pub const ENV_ROW_SUN_COLOR: usize = 25;
 pub const ENV_ROW_SUN_VISIBILITY: usize = 26;
+pub const ENV_ROW_WEATHER_GUST_STRENGTH: usize = 27;
+pub const ENV_ROW_WEATHER_DIRECTION_VARIATION: usize = 28;
 
 pub const SUN_INTENSITY_MAX: f32 = 4000.0;
 
@@ -1164,19 +1267,30 @@ pub const CLOUD_ROW_MOTION_REJECT: usize = 6;
 pub const CLOUD_ROW_HISTORY_DEPTH_REJECT: usize = 7;
 pub const CLOUD_ROW_THICKNESS_VARIATION: usize = 8;
 pub const CLOUD_ROW_SIZE: usize = 9;
-pub const CLOUD_ROW_WIND_VARIATION: usize = 10;
 pub const CLOUD_ROW_SHAPE_EVOLUTION: usize = 11;
 pub const CLOUD_ROW_TERRAIN_INTERACTION: usize = 12;
 pub const CLOUD_ROW_EMPTY_SKIP: usize = 13;
 
 
 impl FogMode {
-
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Legacy => "legacy",
+            Self::LegacyDrawFog1 => "legacy1",
+            Self::LegacyDrawFog2 => "legacy2",
             Self::Volumetric => "volumetric",
+        }
+    }
+
+    pub fn is_legacy(self) -> bool {
+        matches!(self, Self::LegacyDrawFog1 | Self::LegacyDrawFog2)
+    }
+
+    pub fn drawfog_value(self) -> u8 {
+        match self {
+            Self::LegacyDrawFog1 => 1,
+            Self::LegacyDrawFog2 => 2,
+            _ => 0,
         }
     }
 }
@@ -1392,6 +1506,9 @@ pub struct VideoSettings {
     pub skip_ui: bool,
     pub pvs_mode: PvsMode,
     pub fps_cap: u32,
+    /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
+    /// render-frame-driven behavior; non-zero values are fixed Hz.
+    pub fx_fps: u32,
     pub draw_fps: u8,
     pub developer_tools: bool,
     pub perf_trace: bool,
@@ -1469,9 +1586,9 @@ pub struct VideoSettings {
     pub cloud_coverage: f32,
     pub cloud_height: f32,
     pub cloud_thickness: f32,
-    pub cloud_wind_speed: f32,
-    pub cloud_wind_direction: f32,
     pub cloud_shadows: bool,
+    /// One authoritative atmospheric wind shared by clouds, precipitation, grass, and ocean.
+    pub weather_wind: crate::ocean::OceanWind,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
     pub footprints: FootprintMode,
@@ -1489,7 +1606,6 @@ pub struct VideoSettings {
     pub cloud_temporal_depth_fix: bool,
     pub cloud_shear: f32,
     pub cloud_base_variation: f32,
-    pub cloud_wind_variation: bool,
     pub cloud_shape_evolution: bool,
     pub cloud_terrain_interaction: bool,
     pub cloud_empty_skip: bool,
@@ -1516,9 +1632,20 @@ pub struct VideoSettings {
     pub hiz_occlusion: bool,
     pub entity_ambient_lighting: EntityAmbientLightingMode,
     pub dynamic_lights: DynamicLightsMode,
+    /// Source `.map` only: approximate a compiled lighting pass from authored light entities.
+    pub map_light_simulation: bool,
+    /// Classic world-lighting master. False corresponds to vanilla r_fullbright 1.
+    pub world_lighting: bool,
+    /// Use BSP vertex colors instead of baked lightmaps for world static lighting.
+    pub vertex_lighting: bool,
+    /// Debug view equivalent to vanilla r_lightmap: show baked lighting without diffuse textures.
+    pub lightmap_only: bool,
     /// Optional continuous-ribbon saber presentation. False keeps the OpenJK-style
     /// RT_SABER_GLOW sprite chain + RT_LINE core.
     pub modern_sabers: bool,
+    /// Saber/world contact presentation. Legacy mirrors OpenJK's sparks, burn/glow
+    /// marks and contact sound; Enhanced adds a hotter molten pass and drips.
+    pub saber_marks: SaberMarkMode,
     /// Master switch for the complete Rend2-style PBR material profile.
     pub pbr: bool,
     /// Scope base-color replacements owned by PBR-enhanced MTR materials to
@@ -1530,7 +1657,6 @@ pub struct VideoSettings {
     pub deluxe_mapping: bool,
     /// Scale the specular response produced by directional baked lighting.
     pub deluxe_specular: f32,
-    pub clustered_lighting: bool,
     pub emissive_area_lights: bool,
     pub voxel_probe_gi: bool,
     pub dynamic_shadows: DynamicShadowsMode,
@@ -1555,6 +1681,7 @@ impl Default for VideoSettings {
             skip_ui: false,
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
+            fx_fps: crate::fx::FX_FPS_DEFAULT,
             draw_fps: 1,
             developer_tools: false,
             perf_trace: false,
@@ -1620,9 +1747,13 @@ impl Default for VideoSettings {
             cloud_coverage: 0.6,
             cloud_height: 4600.0,
             cloud_thickness: 1200.0,
-            cloud_wind_speed: 167.0,
-            cloud_wind_direction: 220.0,
             cloud_shadows: true,
+            weather_wind: crate::ocean::OceanWind {
+                speed: 167.0,
+                direction: 220.0,
+                gust: 0.2,
+                shift: 0.0,
+            },
             rain: false,
             rain_intensity: RainIntensity::Rain,
             footprints: FootprintMode::ThreeD,
@@ -1637,7 +1768,6 @@ impl Default for VideoSettings {
             cloud_temporal_depth_fix: true,
             cloud_shear: 0.2,
             cloud_base_variation: 1.0,
-            cloud_wind_variation: false,
             cloud_shape_evolution: false,
             cloud_terrain_interaction: false,
             cloud_empty_skip: false,
@@ -1662,13 +1792,17 @@ impl Default for VideoSettings {
             hiz_occlusion: false,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             dynamic_lights: DynamicLightsMode::Off,
+            map_light_simulation: false,
+            world_lighting: true,
+            vertex_lighting: false,
+            lightmap_only: false,
             modern_sabers: false,
+            saber_marks: SaberMarkMode::Legacy,
             pbr: true,
             allow_asset_overrides: true,
             gen_normal_maps: false,
             deluxe_mapping: true,
             deluxe_specular: 1.0,
-            clustered_lighting: false,
             emissive_area_lights: false,
             voxel_probe_gi: false,
             dynamic_shadows: DynamicShadowsMode::Off,
@@ -1763,6 +1897,10 @@ pub struct MapLoadingBar {
 #[derive(Debug, Clone)]
 pub struct MapLoadingUi {
     pub map_name: String,
+    /// Active fs_game/search directory for this load, if any. The renderer uses
+    /// it to resolve mod-provided levelshots before falling back to the generic
+    /// splash image.
+    pub active_game_dir: Option<String>,
     pub preparation_finished: bool,
     pub bars: Vec<MapLoadingBar>,
 }
@@ -1791,6 +1929,7 @@ pub struct UiSnapshot {
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
+    pub demo_timeline: Option<DemoTimelineUi>,
     pub hud: Option<HudState>,
     pub hud_layout: HudLayout,
     pub crosshair: CrosshairSettings,
@@ -1828,6 +1967,7 @@ impl Default for UiSnapshot {
             center_print: None,
             follow_name: None,
             scoreboard: None,
+            demo_timeline: None,
             hud: None,
             hud_layout: HudLayout::default(),
             crosshair: CrosshairSettings::default(),
@@ -1986,30 +2126,18 @@ pub fn build_vertices(
         }
         return out;
     }
-    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit) {
-        build_crosshair(&mut out, ui.crosshair, width, height);
-        build_strafe_helper(&mut out, ui, width, height);
-        build_movement_keys(&mut out, ui, width, height);
-        build_hud(&mut out, ui, width, height);
-        build_chat_history(&mut out, ui, small_font, width, height);
-        build_center_print(&mut out, ui, small_font, width, height);
+    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit) {
         build_follow_indicator(&mut out, ui, small_font, width, height);
         build_scoreboard(&mut out, ui, width, height);
-    }
-    match ui.video.draw_fps {
-        0 => {}
-        1 => build_fps_simple(&mut out, ui, width, height),
-        _ => build_perf(&mut out, ui, width, height),
     }
     if ui.video.reflection_debug {
         build_reflection_debug_legend(&mut out, ui, width, height);
     }
     match ui.mode {
-        OverlayMode::None => {}
-        OverlayMode::Chat => build_chat_input(&mut out, ui, small_font, width, height),
+        OverlayMode::None | OverlayMode::Chat => {}
         OverlayMode::Console => build_console(&mut out, ui, width, height),
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
-        OverlayMode::Video | OverlayMode::Game | OverlayMode::HudEdit => {}
+        OverlayMode::Video | OverlayMode::Game | OverlayMode::HudEdit | OverlayMode::MapEdit => {}
     }
     if matches!(ui.mode, OverlayMode::None | OverlayMode::Game | OverlayMode::Video) {
         if let Some(info) = &ui.surface_inspector {
@@ -2020,6 +2148,183 @@ pub fn build_vertices(
         build_background_progress(&mut out, progress, width, height);
     }
     out
+}
+
+fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> bool {
+    width != 0
+        && height != 0
+        && !ui.video.skip_ui
+        && ui.loading.is_none()
+        && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit)
+}
+
+/// Stable gameplay HUD geometry. This changes when HUD values/settings change,
+/// not merely because velocity/view input produced another movement sample.
+pub fn build_dynamic_static_vertices(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    width: u32,
+    height: u32,
+) {
+    if !gameplay_hud_visible(ui, width, height) {
+        return;
+    }
+    build_crosshair(out, ui.crosshair, width, height);
+    build_hud(out, ui, width, height);
+}
+
+/// Hot movement-driven HUD geometry. Strafehelper and MovementKeys are the only
+/// legacy-HUD pieces that need to follow every new input/simulation snapshot.
+pub fn build_movement_vertices(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    width: u32,
+    height: u32,
+) {
+    if !gameplay_hud_visible(ui, width, height) {
+        return;
+    }
+    build_strafe_helper(out, ui, width, height);
+    build_movement_keys(out, ui, width, height);
+}
+
+/// Chat history and center-print alpha are periodic presentation changes, not
+/// retained UI changes. Rebuild just this small text batch when their fade moves.
+pub fn build_transient_vertices(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    width: u32,
+    height: u32,
+) {
+    if width == 0 || height == 0 || ui.video.skip_ui || ui.loading.is_some() {
+        return;
+    }
+    let gameplay_overlay = matches!(
+        ui.mode,
+        OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit
+    );
+    if gameplay_overlay {
+        build_chat_history(out, ui, small_font, width, height);
+        build_center_print(out, ui, small_font, width, height);
+        build_demo_timeline(out, ui, width, height);
+    }
+    // FPS/perf is intentionally visible above menus too, matching the old
+    // retained path and submit_ui_overlay ordering.
+    match ui.video.draw_fps {
+        0 => {}
+        1 => build_fps_simple(out, ui, width, height),
+        _ => build_perf(out, ui, width, height),
+    }
+    if ui.mode == OverlayMode::Chat {
+        // The input box is anchored to the oldest visible chat line, so keep
+        // it in the same transient batch as chat history. This lets fades/new
+        // messages reposition it without rebuilding the retained UI.
+        build_chat_input(out, ui, small_font, width, height);
+    }
+}
+
+fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(state) = &ui.demo_timeline else {
+        return;
+    };
+    let Some(layout) = demo_timeline_layout(w, h) else {
+        return;
+    };
+
+    if state.outside_authoritative_view {
+        rect(out, 0.0, 0.0, w as f32, h as f32, [0.55, 0.0, 0.0, 0.20], w, h);
+        text(
+            out,
+            "OUTSIDE RECORDED PVS / PORTAL VISIBILITY",
+            18.0,
+            18.0,
+            1.15,
+            [1.0, 0.72, 0.72, 1.0],
+            w,
+            h,
+        );
+    }
+    let panel_y = h as f32 - 46.0;
+    text(
+        out,
+        &format!("{}   [ / ] POV   F FREE   HOME RECORDED", state.camera_label),
+        16.0,
+        panel_y - 18.0,
+        0.90,
+        [0.78, 0.84, 0.90, 0.95],
+        w,
+        h,
+    );
+    rect(out, 8.0, panel_y, w as f32 - 16.0, 42.0, [0.01, 0.016, 0.024, 0.84], w, h);
+    rect(out, 8.0, panel_y, w as f32 - 16.0, 1.0, [0.24, 0.31, 0.40, 0.95], w, h);
+
+    let paused = state.paused;
+    let [px, py, pw, ph] = layout.play;
+    rect(out, px, py, pw, ph, [0.07, 0.10, 0.14, 0.96], w, h);
+    rect(out, px, py, pw, 1.0, [0.30, 0.40, 0.52, 0.95], w, h);
+    text(
+        out,
+        if paused { ">" } else { "||" },
+        px + if paused { 10.0 } else { 6.5 },
+        py + 6.0,
+        1.35,
+        [0.92, 0.96, 1.0, 1.0],
+        w,
+        h,
+    );
+
+    let duration = state.duration_ms.max(1) as f64;
+    let live_fraction = (state.elapsed_ms / duration).clamp(0.0, 1.0) as f32;
+    let fraction = state.scrub_fraction.unwrap_or(live_fraction).clamp(0.0, 1.0);
+    let preview_ms = if state.scrub_fraction.is_some() {
+        (duration * f64::from(fraction)).round() as i32
+    } else {
+        state.elapsed_ms.round().clamp(0.0, duration) as i32
+    };
+    let current_text = format_demo_time(preview_ms);
+    let total_text = format_demo_time(state.duration_ms);
+    text(out, &current_text, 52.0, panel_y + 13.0, 1.05, [0.82, 0.88, 0.94, 1.0], w, h);
+
+    let [tx, ty, tw, th] = layout.track;
+    let line_y = ty + th * 0.5 - 2.0;
+    rect(out, tx, line_y, tw, 4.0, [0.12, 0.16, 0.21, 1.0], w, h);
+    rect(out, tx, line_y, tw * fraction, 4.0, [0.55, 0.37, 0.88, 1.0], w, h);
+
+    for marker in &state.kill_markers {
+        let mf = marker.fraction.clamp(0.0, 1.0);
+        let involved = marker.followed_kill || marker.followed_death;
+        let tick_h = if involved { 24.0 } else { 14.0 };
+        let tick_w = if involved { 3.0 } else { 1.5 };
+        let color = match marker.attacker_team {
+            1 => [1.0, 0.30, 0.30, 0.98],
+            2 => [0.32, 0.58, 1.0, 0.98],
+            _ => [1.0, 0.84, 0.34, 0.98],
+        };
+        let x = tx + tw * mf - tick_w * 0.5;
+        rect(out, x, ty + th * 0.5 - tick_h * 0.5, tick_w, tick_h, color, w, h);
+        if involved {
+            rect(out, x - 1.0, ty + th * 0.5 - tick_h * 0.5, tick_w + 2.0, 1.0, [1.0, 1.0, 1.0, 0.95], w, h);
+        }
+    }
+
+    let thumb_x = tx + tw * fraction;
+    rect(out, thumb_x - 1.5, ty + 1.0, 3.0, th - 2.0, [0.95, 0.96, 1.0, 1.0], w, h);
+
+    text(out, &total_text, tx + tw + 10.0, panel_y + 13.0, 1.05, [0.62, 0.70, 0.78, 1.0], w, h);
+
+    let [sx, sy, sw, sh] = layout.speed;
+    rect(out, sx, sy, sw, sh, [0.07, 0.10, 0.14, 0.96], w, h);
+    rect(out, sx, sy, sw, 1.0, [0.25, 0.50, 0.35, 0.95], w, h);
+    let speed = format!("{}x", state.playback_rate);
+    text(out, &speed, sx + 8.0, sy + 6.0, 1.15, [0.78, 0.94, 0.84, 1.0], w, h);
+}
+
+fn format_demo_time(ms: i32) -> String {
+    let total_seconds = ms.max(0) / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes}:{seconds:02}")
 }
 
 fn build_center_print(
@@ -3572,7 +3877,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     text(
         out,
         &format!(
-            "G2 {} POSES (MOTION {} / {:.3} MS) / {} BOLTS ({:.3} MS) / {} SURF / {} VERTS   CULL {}/{} LOD [{}/{}/{}/{}]   FX {:.3} + TESS {:.3} MS   DYN REPACK {:.3} MS / {} SURF / {} VERTS",
+            "G2 {} POSES (MOTION {} / {:.3} MS) / {} BOLTS ({:.3} MS) / {} SURF / {} VERTS   CULL {}/{} LOD [{}/{}/{}/{}]   FX {:.3} + TESS {:.3} MS   DYN REPACK {:.3} MS / {} SURF / {} VERTS / {} INDICES",
             p.ghoul2_pose_evals,
             p.ghoul2_motion_pose_evals,
             p.ghoul2_motion_pose_ms,
@@ -3591,6 +3896,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
             p.dynamic_model_prepare_ms,
             p.dynamic_model_surfaces,
             p.dynamic_model_vertices,
+            p.dynamic_model_indices,
         ),
         x + 12.0,
         next_y + 94.0,

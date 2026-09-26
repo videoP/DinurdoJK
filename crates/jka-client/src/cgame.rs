@@ -468,6 +468,13 @@ impl ClientGameState {
         self.configstrings.get(&index).map(Vec::as_slice)
     }
 
+    /// Semantic configstring update used by non-wire sources such as the
+    /// in-process local server. Network/demo paths still arrive through the
+    /// normal `cs` server-command machinery.
+    pub fn set_configstring(&mut self, index: u16, value: Vec<u8>) {
+        self.configstrings.insert(index, value);
+    }
+
     pub fn model_qpath(&self, model_index: i32) -> Option<String> {
         configstring_resource(&self.configstrings, CS_MODELS, 512, model_index)
     }
@@ -880,7 +887,15 @@ impl ClientGameState {
     }
 
     /// OpenJK `CG_AddPacketEntities` frame interpolation + `CG_CalcEntityLerpPositions`.
+    #[cfg(test)]
     pub fn present_entities(&mut self, time: i32) -> Result<Vec<PresentedEntity>, String> {
+        self.present_entities_at(f64::from(time))
+    }
+
+    /// High-resolution presentation variant. Snapshot transitions/events remain
+    /// on integer JKA server time, while visual interpolation may sample between
+    /// integer milliseconds (important when rendering demos at very high FPS).
+    pub fn present_entities_at(&mut self, time_ms: f64) -> Result<Vec<PresentedEntity>, String> {
         let current = self
             .current_snapshot
             .as_ref()
@@ -890,7 +905,8 @@ impl ClientGameState {
 
         self.frame_interpolation = match &next {
             Some(next) if next.server_time != current.server_time => {
-                (time - current.server_time) as f32 / (next.server_time - current.server_time) as f32
+                ((time_ms - f64::from(current.server_time))
+                    / f64::from(next.server_time - current.server_time)) as f32
             }
             _ => 0.0,
         };
@@ -905,7 +921,7 @@ impl ClientGameState {
                 continue;
             }
             let cent = self.entity_mut(state.number)?;
-            calc_entity_lerp_positions(cent, time, frame_interpolation, current.server_time, next.as_ref().map(|s| s.server_time))?;
+            calc_entity_lerp_positions(cent, time_ms, frame_interpolation, current.server_time, next.as_ref().map(|s| s.server_time))?;
             let current_state = cent.current_state.clone().unwrap_or_else(|| state.clone());
             let entity_type = field_i32(&current_state, "eType");
             // As in CG_AddCEntity, event-only entities have already served their transition/event
@@ -928,7 +944,12 @@ impl ClientGameState {
     /// The caller decides whether the local/followed body is rendered (OpenJK
     /// suppresses it in ordinary first person); this method only produces the
     /// player entity state that the shared player presenter consumes.
+    #[cfg(test)]
     pub fn present_followed_player(&self, time: i32) -> Option<PresentedEntity> {
+        self.present_followed_player_at(f64::from(time))
+    }
+
+    pub fn present_followed_player_at(&self, time_ms: f64) -> Option<PresentedEntity> {
         let current = self.current_snapshot.as_ref()?;
         let next = self.next_snapshot.as_ref();
         let discontinuity = next.is_some_and(|next| snapshot_discontinuity(current, next));
@@ -937,8 +958,8 @@ impl ClientGameState {
         } else {
             next.filter(|next| next.server_time > current.server_time)
                 .map(|next| {
-                    (time - current.server_time) as f32
-                        / (next.server_time - current.server_time) as f32
+                    ((time_ms - f64::from(current.server_time))
+                        / f64::from(next.server_time - current.server_time)) as f32
                 })
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0)
@@ -1299,7 +1320,7 @@ fn check_entity_event(
 
 fn calc_entity_lerp_positions(
     cent: &mut CEntity,
-    time: i32,
+    time_ms: f64,
     frame_interpolation: f32,
     current_server_time: i32,
     next_server_time: Option<i32>,
@@ -1353,8 +1374,8 @@ fn calc_entity_lerp_positions(
         return Ok(());
     }
 
-    cent.lerp_origin = evaluate_trajectory(current_pos, time)?;
-    cent.lerp_angles = evaluate_trajectory(current_apos, time)?;
+    cent.lerp_origin = evaluate_trajectory_at(current_pos, time_ms)?;
+    cent.lerp_angles = evaluate_trajectory_at(current_apos, time_ms)?;
     Ok(())
 }
 
@@ -1402,35 +1423,43 @@ fn trajectory(entity: &EntityState, prefix: &str) -> Trajectory {
     }
 }
 
-fn evaluate_trajectory(tr: Trajectory, mut at_time: i32) -> Result<[f32; 3], String> {
+fn evaluate_trajectory(tr: Trajectory, at_time: i32) -> Result<[f32; 3], String> {
+    evaluate_trajectory_at(tr, f64::from(at_time))
+}
+
+fn evaluate_trajectory_at(tr: Trajectory, mut at_time_ms: f64) -> Result<[f32; 3], String> {
     let mut result = tr.base;
+    let tr_time = f64::from(tr.time);
+    let tr_duration = f64::from(tr.duration);
     match tr.kind {
         TR_STATIONARY | TR_INTERPOLATE => {}
         TR_LINEAR => {
-            let delta_time = (at_time - tr.time) as f32 * 0.001;
+            let delta_time = ((at_time_ms - tr_time) * 0.001) as f32;
             vector_ma(&mut result, delta_time, tr.delta);
         }
         TR_SINE => {
             if tr.duration == 0 {
                 return Err("BG_EvaluateTrajectory: TR_SINE with zero duration".to_owned());
             }
-            let delta_time = (at_time - tr.time) as f32 / tr.duration as f32;
+            let delta_time = ((at_time_ms - tr_time) / tr_duration) as f32;
             let phase = (delta_time * std::f32::consts::TAU).sin();
             vector_ma(&mut result, phase, tr.delta);
         }
         TR_LINEAR_STOP => {
-            if at_time > tr.time.saturating_add(tr.duration) {
-                at_time = tr.time.saturating_add(tr.duration);
+            let stop_time = f64::from(tr.time.saturating_add(tr.duration));
+            if at_time_ms > stop_time {
+                at_time_ms = stop_time;
             }
-            let delta_time = ((at_time - tr.time) as f32 * 0.001).max(0.0);
+            let delta_time = (((at_time_ms - tr_time) * 0.001) as f32).max(0.0);
             vector_ma(&mut result, delta_time, tr.delta);
         }
         TR_NONLINEAR_STOP => {
-            if at_time > tr.time.saturating_add(tr.duration) {
-                at_time = tr.time.saturating_add(tr.duration);
+            let stop_time = f64::from(tr.time.saturating_add(tr.duration));
+            if at_time_ms > stop_time {
+                at_time_ms = stop_time;
             }
-            let elapsed = at_time - tr.time;
-            let delta_time = if elapsed > tr.duration || elapsed <= 0 || tr.duration == 0 {
+            let elapsed = at_time_ms - tr_time;
+            let delta_time = if elapsed > tr_duration || elapsed <= 0.0 || tr.duration == 0 {
                 0.0
             } else {
                 let degrees = 90.0 - 90.0 * elapsed as f32 / tr.duration as f32;
@@ -1439,7 +1468,7 @@ fn evaluate_trajectory(tr: Trajectory, mut at_time: i32) -> Result<[f32; 3], Str
             vector_ma(&mut result, delta_time, tr.delta);
         }
         TR_GRAVITY => {
-            let delta_time = (at_time - tr.time) as f32 * 0.001;
+            let delta_time = ((at_time_ms - tr_time) * 0.001) as f32;
             vector_ma(&mut result, delta_time, tr.delta);
             result[2] -= 0.5 * DEFAULT_GRAVITY * delta_time * delta_time;
         }

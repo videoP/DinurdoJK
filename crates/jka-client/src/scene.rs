@@ -8,8 +8,8 @@ use crate::{
     },
     thread_activity::Task,
     weather::fog::{
-        bsp_fog_params, bsp_global_fog_num, bsp_global_fog_params, stage_fog_color_override,
-        FogColorOverride,
+        bsp_fog_params, bsp_global_fog_num, bsp_global_fog_params, material_legacy2_in_stage_safe,
+        stage_fog_color_override, FogColorOverride,
     },
 };
 use bytemuck::{Pod, Zeroable};
@@ -97,6 +97,10 @@ pub struct DrawBatch {
     pub texture: Option<usize>,
     /// True when binding 0 should be the BSP lightmap instead of `texture`.
     pub texture_is_lightmap: bool,
+    /// True when binding 0 should be the engine's neutral white texture.
+    /// Keep this distinct from `texture == None`: the latter means a missing/
+    /// unresolved regular image and must continue to use the missing-texture fallback.
+    pub texture_is_white: bool,
     /// Optional linear-data enhancement maps associated with the material base image.
     pub normal_texture: Option<usize>,
     pub roughness_texture: Option<usize>,
@@ -132,6 +136,12 @@ pub struct DrawBatch {
     pub fog_is_global: bool,
     /// OpenJK fixed-function fog-color override for this individual shader stage.
     pub fog_color_override: FogColorOverride,
+    /// True when this complete authored material can reproduce Legacy 2 global
+    /// GL_EXP2 fog directly in each WGPU stage.
+    pub legacy2_fog_in_stage_safe: bool,
+    /// True when this material has a depth-writing stage, allowing its frontmost
+    /// pixels to receive Legacy 1 global fog in the display-space post pass.
+    pub global_fog_post_eligible: bool,
     /// Authored id Tech 3 portal/mirror surface. `planar_plane` is in renderer
     /// coordinates as xyz normal + plane d (`dot(n, p) + d = 0`).
     pub planar_reflection: bool,
@@ -179,6 +189,19 @@ pub struct SpawnPoint {
     pub yaw: f32,
 }
 
+/// Server-facing representation of a map-authored `fx_runner`. Values remain
+/// in JKA coordinates because the local-server shim publishes them through the
+/// same protocol/CGame boundary as a remote game server.
+#[derive(Debug, Clone)]
+pub struct MapFxRunner {
+    pub effect: String,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    pub delay_ms: i32,
+    pub random_ms: i32,
+    pub spawnflags: i32,
+}
+
 #[derive(Debug, Clone)]
 pub enum MapSource {
     /// A compiled BSP resolved through the JKA virtual asset search path.
@@ -187,6 +210,10 @@ pub enum MapSource {
     Map(String),
     /// Explicit OS path escape hatch for source maps outside GameData search paths.
     MapFile(PathBuf),
+    /// Unsaved source-map editor preview. The path remains the real loose .map
+    /// identity for materials/debugging, while geometry comes from the editor's
+    /// in-memory working text. Never written here.
+    MapEditPreview { path: PathBuf, text: Arc<str> },
 }
 
 impl MapSource {
@@ -212,7 +239,7 @@ impl MapSource {
         };
         match &source {
             Self::Bsp(name) | Self::Map(name) => validate_map_name(name)?,
-            Self::MapFile(_) => unreachable!(),
+            Self::MapFile(_) | Self::MapEditPreview { .. } => unreachable!(),
         }
         Ok(source)
     }
@@ -221,7 +248,7 @@ impl MapSource {
         match self {
             Self::Bsp(name) => format!("{name}.bsp"),
             Self::Map(name) => format!("{name}.map"),
-            Self::MapFile(path) => path.display().to_string(),
+            Self::MapFile(path) | Self::MapEditPreview { path, .. } => path.display().to_string(),
         }
     }
 }
@@ -267,6 +294,19 @@ pub fn verify_map_source_exists(
                 Err(format!("Loose map {} not found", path.display()))
             }
         }
+        MapSource::MapEditPreview { path, text } => {
+            if !path.is_file() {
+                return Err(format!("Loose map {} not found", path.display()));
+            }
+            if text.len() > MAX_MAP_FILE_BYTES {
+                return Err(format!(
+                    "Edited map preview {} exceeds {} MiB limit",
+                    path.display(),
+                    MAX_MAP_FILE_BYTES / (1024 * 1024)
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -277,10 +317,18 @@ pub struct MapFileStats {
     pub world_brushes: usize,
     pub grouped_world_brushes: usize,
     pub rendered_faces: usize,
+    pub utility_faces_skipped: usize,
     pub skipped_entity_brushes: usize,
     pub patches_skipped: usize,
     pub degenerate_faces: usize,
     pub skipped_brushes: usize,
+    pub spatial_chunks: usize,
+    pub geometry_groups: usize,
+    pub draw_batches: usize,
+    pub collision_brushes: usize,
+    pub spatial_batching: bool,
+    pub worker_count: usize,
+    pub reconstruction_ms: f64,
 }
 
 /// One inline BSP model's slice of `PreparedMap::inline_vertices` and
@@ -351,6 +399,11 @@ pub struct MapPrepareOptions {
     /// ordinary opaque geometry; enabling the planar reflection path therefore
     /// requires a map/renderer restart.
     pub planar_reflections: bool,
+    /// Source `.map` only: split ordinary opaque material batches into the
+    /// Radiant-style 1024-unit spatial grid. This is only profitable when the
+    /// renderer can consume those chunks through its GPU-driven indirect path;
+    /// otherwise one global batch per material is cheaper to encode on the CPU.
+    pub source_spatial_batches: bool,
     /// Material-library policy captured at map load. When false, Rend2 `.mtr`
     /// files are not parsed as overrides; ordinary JKA `.shader` / implicit
     /// materials remain authoritative until the next map load / vid_restart.
@@ -375,9 +428,32 @@ impl Default for MapPrepareOptions {
             gen_normal_maps: false,
             float_lightmap: false,
             planar_reflections: true,
+            source_spatial_batches: false,
             pbr_materials: true,
             allow_asset_overrides: true,
             steam_audio: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicLightFalloff {
+    /// Existing runtime/FX light response: smooth quadratic fade to the cutoff radius.
+    Smooth,
+    /// q3map2 spawnflag 1 point-light behavior. The stored radius is the exact
+    /// zero-contribution distance and is used only for clustered culling.
+    Linear,
+    /// q3map2 default point-light behavior. The stored radius is only the
+    /// -fast/falloff-tolerance envelope; it never changes inverse-square falloff.
+    InverseSquare,
+}
+
+impl DynamicLightFalloff {
+    pub fn shader_value(self) -> f32 {
+        match self {
+            Self::Smooth => 0.0,
+            Self::Linear => 1.0,
+            Self::InverseSquare => 2.0,
         }
     }
 }
@@ -388,12 +464,23 @@ pub struct DynamicLight {
     pub color: [f32; 3],
     pub radius: f32,
     pub intensity: f32,
+    pub falloff: DynamicLightFalloff,
+    /// q3map2 lightJunior contributes to the lightgrid, but not directly to surfaces.
+    /// Keeping it in the source list still lets voxel/probe GI consume it.
+    pub surface_lighting: bool,
     /// Zero for ordinary point lights. Non-zero identifies an authored q3map
     /// surface emitter and points out of the emitting face.
     pub emitter_normal: [f32; 3],
     /// q3map surface lights can be authored on two-sided materials. Point
     /// lights ignore this flag.
     pub emitter_two_sided: bool,
+    /// q3map2 point-light surface-angle attenuation. Runtime/FX and area lights
+    /// leave this true; it is only consumed for q3map source-map falloff modes.
+    pub angle_attenuation: bool,
+    /// q3map2 `_anglescale`; zero means the ordinary Lambert curve.
+    pub angle_scale: f32,
+    /// q3map2 `_extradist`, folded into the distance before attenuation.
+    pub extra_distance: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -471,6 +558,144 @@ pub struct StaticLightGrid {
     /// Converts normalized RGBA8 atlas values back to JKA light units / 255.
     pub irradiance_intensity: f32,
     pub external_hdr: bool,
+    classic_entity_grid: ClassicEntityLightGrid,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassicLightGridCell {
+    ambient: [f32; 3],
+    directed: [f32; 3],
+    direction: [f32; 3],
+    valid: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClassicEntityLight {
+    /// OpenJK light units, nominally 0..255 after interpolation/scaling.
+    pub ambient: [f32; 3],
+    /// OpenJK light units, nominally 0..255 before the final vertex clamp.
+    pub directed: [f32; 3],
+    /// Unit incoming-light direction in renderer coordinates [x,z,-y].
+    pub direction: [f32; 3],
+}
+
+/// Compact CPU-only subset retained after the renderer uploads the static
+/// lightgrid textures. This avoids keeping the much larger irradiance atlas in
+/// system memory solely for classic entity lighting.
+#[derive(Debug, Clone)]
+pub struct ClassicEntityLightGrid {
+    origin: [f32; 3],
+    size: [f32; 3],
+    bounds: [u32; 3],
+    external_hdr: bool,
+    cells: Vec<ClassicLightGridCell>,
+}
+
+impl StaticLightGrid {
+    pub fn into_classic_entity_grid(self) -> ClassicEntityLightGrid {
+        self.classic_entity_grid
+    }
+}
+
+impl ClassicEntityLightGrid {
+    /// Match OpenJK's R_SetupEntityLightingGrid: sample the eight neighboring
+    /// BSP probes with trilinear weights, ignore invalid/in-wall probes, and
+    /// renormalize the surviving ambient/directed contribution near walls.
+    /// `lighting_origin` is in JKA coordinates, exactly like refEntity origin.
+    pub fn sample_classic_entity_light(
+        &self,
+        lighting_origin: [f32; 3],
+    ) -> Option<ClassicEntityLight> {
+        if self.cells.is_empty()
+            || self.bounds.into_iter().any(|bound| bound == 0)
+            || self.size.into_iter().any(|size| size.abs() <= f32::EPSILON)
+        {
+            return None;
+        }
+
+        let bounds = self.bounds.map(|bound| bound as i32);
+        let mut base = [0_i32; 3];
+        let mut frac = [0.0_f32; 3];
+        for axis in 0..3 {
+            let grid = (lighting_origin[axis] - self.origin[axis]) / self.size[axis];
+            let floored = grid.floor();
+            base[axis] = (floored as i32).clamp(0, bounds[axis] - 1);
+            frac[axis] = grid - floored;
+        }
+
+        let bx = self.bounds[0] as usize;
+        let by = self.bounds[1] as usize;
+        let steps = [1_usize, bx, bx.saturating_mul(by)];
+        let base_index = base[0] as usize
+            + bx * (base[1] as usize + by * base[2] as usize);
+
+        let mut ambient = [0.0_f32; 3];
+        let mut directed = [0.0_f32; 3];
+        let mut direction = [0.0_f32; 3];
+        let mut total_factor = 0.0_f32;
+
+        for corner in 0..8_usize {
+            let mut factor = 1.0_f32;
+            let mut index = base_index;
+            for axis in 0..3 {
+                if corner & (1 << axis) != 0 {
+                    factor *= frac[axis];
+                    index = index.saturating_add(steps[axis]);
+                } else {
+                    factor *= 1.0 - frac[axis];
+                }
+            }
+
+            let Some(cell) = self.cells.get(index).copied() else {
+                continue;
+            };
+            if !cell.valid {
+                continue;
+            }
+
+            total_factor += factor;
+            for channel in 0..3 {
+                ambient[channel] += factor * cell.ambient[channel];
+                directed[channel] += factor * cell.directed[channel];
+                direction[channel] += factor * cell.direction[channel];
+            }
+        }
+
+        // OpenJK compensates when one or more of the eight probes are invalid
+        // (commonly because the point lies in solid) so entities do not dim as
+        // they approach walls. Direction is normalized separately below.
+        if total_factor > 0.0 && total_factor < 0.99 {
+            let inv = total_factor.recip();
+            ambient = ambient.map(|value| value * inv);
+            directed = directed.map(|value| value * inv);
+        }
+
+        // OpenJK defaults: r_ambientScale=0.6 and r_directedScale=1.0.
+        ambient = ambient.map(|value| value * 0.6);
+
+        // The classic LDR path adds a 32-unit minimum ambient term. Rend2's HDR
+        // lightgrid path skips this while HDR lighting is active.
+        if !self.external_hdr {
+            ambient = ambient.map(|value| value + 32.0);
+            ambient = ambient.map(|value| value.clamp(0.0, 255.0));
+        } else {
+            ambient = ambient.map(|value| value.max(0.0));
+        }
+
+        let length_sq = direction.into_iter().map(|value| value * value).sum::<f32>();
+        if length_sq > 1.0e-12 {
+            let inv_length = length_sq.sqrt().recip();
+            direction = direction.map(|value| value * inv_length);
+        } else {
+            direction = [0.0; 3];
+        }
+
+        Some(ClassicEntityLight {
+            ambient,
+            directed,
+            direction,
+        })
+    }
 }
 
 /// Low-frequency indirect lighting field generated once per map. World geometry
@@ -553,6 +778,15 @@ pub struct GrassPatch {
     pub radius: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SourceMapLighting {
+    /// q3map2 worldspawn `_ambient` / `ambient`, already converted from the
+    /// compiler's 0..255 lightmap domain into normalized RGB.
+    pub ambient: [f32; 3],
+    /// q3map2 worldspawn `_minlight`, in the same normalized RGB domain.
+    pub minlight: [f32; 3],
+}
+
 #[derive(Clone)]
 pub struct PreparedMap {
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
@@ -600,6 +834,8 @@ pub struct PreparedMap {
     pub steam_audio_bake_request: Option<crate::steam_audio::SteamAudioBakeRequest>,
     pub visibility: Option<Visibility>,
     pub lights: Vec<DynamicLight>,
+    /// Global q3map2 source-.map lighting controls. Compiled BSPs keep zeroes.
+    pub source_map_lighting: SourceMapLighting,
     pub sun: Option<DirectionalSun>,
     /// Static directional lighting derived from the JKA RBSP lightgrid.
     pub static_light_grid: Option<StaticLightGrid>,
@@ -619,6 +855,9 @@ pub struct PreparedMap {
     pub global_fog: Option<[f32; 4]>,
     pub warnings: Vec<String>,
     pub spawns: Vec<SpawnPoint>,
+    /// Map-authored `fx_runner`s retained for the local server shim. Remote
+    /// servers provide the equivalent state as CS_EFFECTS + ET_FX snapshots.
+    pub fx_runners: Vec<MapFxRunner>,
     /// Authored worldspawn far-plane / visibility distance in JKA map units.
     /// `None` means the map did not provide a usable distancecull-style key.
     pub distance_cull: Option<f32>,
@@ -1729,6 +1968,34 @@ fn stage_pipeline(material: &SurfaceMaterial, stage: &MaterialStage, first: bool
     }
 }
 
+fn resolved_bsp_surface_fog(
+    bsp: &Bsp,
+    library: &BTreeMap<String, Shader>,
+    material: &SurfaceMaterial,
+    fog_num: i32,
+    global_fog_num: Option<i32>,
+    global_fog: Option<[f32; 4]>,
+) -> ([f32; 4], bool) {
+    let authored = bsp_fog_params(bsp, library, fog_num);
+    if authored[3] > 0.001 {
+        return (authored, global_fog_num == Some(fog_num));
+    }
+
+    // q3map2 normally writes the default/global fog index into every eligible
+    // draw surface. Some legacy/custom BSPs leave fogNum == -1 instead. OpenJK
+    // can inherit the world's global fog for BSP-model surfaces; recover the
+    // same visual intent here for any missing assignment, but never override
+    // q3map_nofog authored by the material. Local brush fog remains strictly
+    // driven by the compiled per-surface fog index.
+    if fog_num < 0 && !material.no_fog {
+        if let Some(global) = global_fog {
+            return (global, true);
+        }
+    }
+
+    (authored, false)
+}
+
 fn stage_batch(
     material: &SurfaceMaterial,
     stage: &MaterialStage,
@@ -1743,10 +2010,10 @@ fn stage_batch(
     fog: [f32; 4],
     fog_is_global: bool,
 ) -> DrawBatch {
-    let (texture, texture_is_lightmap) = match stage.texture {
-        StageTexture::Image(index) => (Some(index), false),
-        StageTexture::Lightmap => (None, true),
-        StageTexture::White => (None, false),
+    let (texture, texture_is_lightmap, texture_is_white) = match stage.texture {
+        StageTexture::Image(index) => (Some(index), false, false),
+        StageTexture::Lightmap => (None, true, false),
+        StageTexture::White => (None, false, true),
     };
     DrawBatch {
         vertices,
@@ -1755,6 +2022,7 @@ fn stage_batch(
         surface_material: material.surface_material,
         texture,
         texture_is_lightmap,
+        texture_is_white,
         normal_texture: stage.enhancements.normal_texture,
         roughness_texture: stage.enhancements.roughness_texture,
         height_texture: stage.enhancements.height_texture,
@@ -1786,6 +2054,12 @@ fn stage_batch(
         fog,
         fog_is_global,
         fog_color_override: stage_fog_color_override(stage, first),
+        legacy2_fog_in_stage_safe: material_legacy2_in_stage_safe(&material.stages),
+        global_fog_post_eligible: material
+            .stages
+            .iter()
+            .enumerate()
+            .any(|(index, candidate)| stage_pipeline(material, candidate, index == 0).depth_write),
         planar_reflection: material.planar_reflection && first,
         water: material.water,
         alpha_shadow: material.alpha_shadow,
@@ -2094,6 +2368,7 @@ fn prepare_static_light_grid(
 
     let mut direction_rgba = Vec::with_capacity(cell_count * 4);
     let mut lighting_rgba = Vec::with_capacity(cell_count * 4);
+    let mut classic_cells = Vec::with_capacity(cell_count);
     // Keep the six ambient-cube irradiances in float until every probe has been
     // seen, then choose one map-wide scale so HDR lightgrid.raw values are not
     // clipped by the RGBA8 volume texture. Face order: +X,-X,+Y,-Y,+Z,-Z.
@@ -2136,6 +2411,59 @@ fn prepare_static_light_grid(
         } else {
             ([0.0; 3], [0.0; 3])
         };
+
+        // Keep a second absolute-light representation for dynamic entities.
+        // OpenJK's entity path consumes every active style slot (styleColors
+        // initialize to white), whereas the scale-free PBR representation above
+        // only needs one representative chroma/direction sample.
+        let classic_valid = sample.is_some_and(|sample| sample.styles[0] != 255);
+        let (classic_ambient, classic_directed) = if classic_valid {
+            if let Some(values) = external_values.as_ref() {
+                // Rend2 loads lightgrid.raw as radiance / PI, then converts back
+                // to the renderer's 0..255 light units during entity sampling.
+                let base = cell * 6;
+                let convert = |value: f32| {
+                    if value.is_finite() {
+                        value.max(0.0) * (255.0 / std::f32::consts::PI)
+                    } else {
+                        0.0
+                    }
+                };
+                (
+                    [convert(values[base]), convert(values[base + 1]), convert(values[base + 2])],
+                    [
+                        convert(values[base + 3]),
+                        convert(values[base + 4]),
+                        convert(values[base + 5]),
+                    ],
+                )
+            } else if let Some(sample) = sample {
+                let mut classic_ambient = [0.0_f32; 3];
+                let mut classic_directed = [0.0_f32; 3];
+                for style_index in 0..sample.styles.len() {
+                    if sample.styles[style_index] == 255 {
+                        break;
+                    }
+                    for channel in 0..3 {
+                        classic_ambient[channel] +=
+                            f32::from(sample.ambient_light[style_index][channel]);
+                        classic_directed[channel] +=
+                            f32::from(sample.direct_light[style_index][channel]);
+                    }
+                }
+                (classic_ambient, classic_directed)
+            } else {
+                ([0.0; 3], [0.0; 3])
+            }
+        } else {
+            ([0.0; 3], [0.0; 3])
+        };
+        classic_cells.push(ClassicLightGridCell {
+            ambient: classic_ambient,
+            directed: classic_directed,
+            direction,
+            valid: classic_valid,
+        });
 
         let axes = [
             [1.0_f32, 0.0, 0.0], [-1.0, 0.0, 0.0],
@@ -2217,7 +2545,7 @@ fn prepare_static_light_grid(
         bx, atlas_height, atlas_depth
     ));
     warnings.push(format!(
-        "{map_name}: static lightgrid {}x{}x{} available for PBR directional baked lighting{}",
+        "{map_name}: static lightgrid {}x{}x{} available for PBR directional baked lighting and classic entity lighting{}",
         grid.bounds[0],
         grid.bounds[1],
         grid.bounds[2],
@@ -2243,6 +2571,17 @@ fn prepare_static_light_grid(
         irradiance_volume_rgba,
         irradiance_intensity,
         external_hdr: external_values.is_some(),
+        classic_entity_grid: ClassicEntityLightGrid {
+            origin: grid.origin,
+            size: grid.size,
+            bounds: [
+                grid.bounds[0] as u32,
+                grid.bounds[1] as u32,
+                grid.bounds[2] as u32,
+            ],
+            external_hdr: external_values.is_some(),
+            cells: classic_cells,
+        },
     }))
 }
 
@@ -2455,7 +2794,10 @@ fn assign_reflection_probes(
         return;
     }
     for batch in batches {
-        if batch.pipeline.class == DrawClass::Sky || batch.texture_is_lightmap {
+        if batch.pipeline.class == DrawClass::Sky
+            || batch.texture_is_lightmap
+            || batch.texture_is_white
+        {
             continue;
         }
         let start = batch.vertices.start as usize;
@@ -2502,7 +2844,10 @@ fn cache_reflection_decisions(batches: &mut [DrawBatch]) {
     for batch in batches {
         batch.reflection_cache_flags = 0;
         batch.reflection_roughness_hint = 1.0;
-        if batch.pipeline.class == DrawClass::Sky || batch.texture_is_lightmap {
+        if batch.pipeline.class == DrawClass::Sky
+            || batch.texture_is_lightmap
+            || batch.texture_is_white
+        {
             continue;
         }
 
@@ -2908,11 +3253,12 @@ fn build_material_debug_entry(
             .sum::<usize>();
         let unsupported = definition.unsupported.len() + stage_unsupported;
         lines.push(format!(
-            "parsed shader: stages={} sky={} nodraw={} translucent={} cull={} unsupported={} (shader={} stage={})",
+            "parsed shader: stages={} sky={} nodraw={} translucent={} nofog={} cull={} unsupported={} (shader={} stage={})",
             definition.stages.len(),
             definition.sky,
             definition.nodraw,
             definition.translucent,
+            definition.no_fog,
             if definition.cull.is_empty() {
                 "default"
             } else {
@@ -3413,8 +3759,13 @@ fn append_surface_light_triangle(
                 color: authored.color,
                 radius,
                 intensity,
+                falloff: DynamicLightFalloff::Smooth,
+                surface_lighting: true,
                 emitter_normal: emitter_normal.to_array(),
                 emitter_two_sided: two_sided,
+                angle_attenuation: true,
+                angle_scale: 0.0,
+                extra_distance: 0.0,
             },
             // Modern mesh-light samplers prioritize emitting triangles by area
             // times luminance. Include q3map's authored strength in that weight.
@@ -3794,8 +4145,17 @@ fn build_voxel_probe_gi(
         let normal = Vec3::from_array(light.emitter_normal).normalize_or_zero();
         let is_area = normal.length_squared() > 1e-6;
         let radius_scale = (light.radius.max(64.0) / 512.0).sqrt().clamp(0.45, 1.75);
+        // Source-map q3map lights store compiler photons/255 in `intensity` so
+        // direct rendering can match baked luxels. Probe-GI authoring historically
+        // expects the engine's ~light/300 scale; convert only those compiler lights
+        // back so enabling source-map preview cannot saturate the GI volume.
+        let gi_intensity = if light.falloff == DynamicLightFalloff::Smooth {
+            light.intensity
+        } else {
+            light.intensity * Q3MAP_LIGHTMAP_BYTE_SCALE / (Q3MAP_POINT_SCALE * 300.0)
+        };
         let energy = Vec3::from_array(light.color).max(Vec3::ZERO)
-            * light.intensity
+            * gi_intensity
             * radius_scale
             * if is_area { 0.65 } else { 0.5 };
         if energy.max_element() <= 1e-5 {
@@ -3920,7 +4280,7 @@ fn prepare_internal(
 ) -> Result<PreparedMap, String> {
     let prepare_started = Instant::now();
     let mut load_timings = MapLoadTimings {
-        worker_count: jobs.map_or(0, MapJobPool::worker_count),
+        worker_count: jobs.map_or(1, MapJobPool::worker_count),
         ..Default::default()
     };
     let asset_name = map_asset_name(name, "bsp")?;
@@ -4474,6 +4834,14 @@ fn prepare_internal(
                 coarse_area_signature[word] |= area_signature[word];
             }
 
+            let (fog, fog_is_global) = resolved_bsp_surface_fog(
+                &bsp,
+                &library,
+                material,
+                key.fog_num,
+                global_fog_num,
+                global_fog,
+            );
             append_material_batches(
                 &mut pvs_batches,
                 material,
@@ -4484,13 +4852,21 @@ fn prepare_internal(
                 key.lightmap,
                 &signature,
                 area_signature,
-                bsp_fog_params(&bsp, &library, key.fog_num),
-                global_fog_num == Some(key.fog_num),
+                fog,
+                fog_is_global,
             );
         }
 
         let coarse_end =
             u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
+        let (fog, fog_is_global) = resolved_bsp_surface_fog(
+            &bsp,
+            &library,
+            material,
+            key.fog_num,
+            global_fog_num,
+            global_fog,
+        );
         append_material_batches(
             &mut batches,
             material,
@@ -4501,8 +4877,8 @@ fn prepare_internal(
             key.lightmap,
             &coarse_signature,
             coarse_area_signature,
-            bsp_fog_params(&bsp, &library, key.fog_num),
-            global_fog_num == Some(key.fog_num),
+            fog,
+            fog_is_global,
         );
     }
 
@@ -4541,6 +4917,14 @@ fn prepare_internal(
                 inline_vertices.extend_from_slice(&group_vertices);
                 let range_end =
                     u32::try_from(inline_vertices.len()).map_err(|_| "inline vertex count exceeds u32")?;
+                let (fog, fog_is_global) = resolved_bsp_surface_fog(
+                    &bsp,
+                    &library,
+                    material,
+                    key.fog_num,
+                    global_fog_num,
+                    global_fog,
+                );
                 append_material_batches(
                     &mut inline_batches,
                     material,
@@ -4551,8 +4935,8 @@ fn prepare_internal(
                     key.lightmap,
                     &[],
                     [0_u64; 4],
-                    bsp_fog_params(&bsp, &library, key.fog_num),
-                    global_fog_num == Some(key.fog_num),
+                    fog,
+                    fog_is_global,
                 );
             }
             // A moving brush cannot be promoted to the ocean clipmap, and
@@ -4737,6 +5121,7 @@ fn prepare_internal(
         position[1] += 9.0;
         spawns.push(SpawnPoint { position, yaw: 0.0 });
     }
+    let fx_runners = bsp_fx_runners(&bsp, &mut warnings);
 
     // Grass generation jobs were launched before the main geometry walk. Resolve and
     // merge them before joining GI so patch-finalization jobs can use the remaining
@@ -4932,6 +5317,7 @@ fn prepare_internal(
         steam_audio_bake_request,
         visibility: bsp.visibility.clone(),
         lights,
+        source_map_lighting: SourceMapLighting::default(),
         sun,
         static_light_grid,
         voxel_probe_gi,
@@ -4941,6 +5327,7 @@ fn prepare_internal(
         global_fog,
         warnings,
         spawns,
+        fx_runners,
         distance_cull,
         triangles,
         lightmap_pages,
@@ -4993,8 +5380,15 @@ fn dynamic_light_from_values(
         color,
         radius,
         intensity,
+        falloff: DynamicLightFalloff::Smooth,
+        // Preserve the existing compiled-BSP enhancement path exactly. Source-map
+        // lightJunior filtering is handled by map_dynamic_light below.
+        surface_lighting: true,
         emitter_normal: [0.0; 3],
         emitter_two_sided: false,
+        angle_attenuation: true,
+        angle_scale: 0.0,
+        extra_distance: 0.0,
     })
 }
 
@@ -5022,7 +5416,7 @@ pub(crate) fn append_authored_ocean_planes(
         b.water = true; b.water_primary = true;
         b.authored_ocean = Some(o.index);
         b.bsp_shader_index = u32::MAX; b.material_debug_index = u32::MAX;
-        b.texture = None; b.texture_is_lightmap = false;
+        b.texture = None; b.texture_is_lightmap = false; b.texture_is_white = false;
         b.lightmap = None; b.modulate_lightmap = false;
         b.tc_mods.clear(); b.color = [1.0;4]; b.alpha_cutoff = 0.0;
         b.pipeline = PipelineKey {class:DrawClass::Transparent,blend:BlendMode::Opaque,cull:CullMode::None,offset:false,depth_write:true,depth_equal:false};
@@ -5030,6 +5424,144 @@ pub(crate) fn append_authored_ocean_planes(
         b.planar_reflection = false; b.planar_environment_candidate = false;
         batches.push(b.clone()); pvs_batches.push(b);
     }
+}
+
+fn bsp_entity_value<'a>(entity: &'a jka_assets::bsp::Entity, key: &[u8]) -> Option<&'a [u8]> {
+    entity
+        .properties
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.as_slice())
+}
+
+fn parse_bsp_entity_triplet(value: &[u8]) -> Option<[f32; 3]> {
+    let text = std::str::from_utf8(value).ok()?;
+    let mut values = text.split_whitespace().map(str::parse::<f32>);
+    let result = [values.next()?.ok()?, values.next()?.ok()?, values.next()?.ok()?];
+    if values.next().is_some() || !result.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    Some(result)
+}
+
+fn parse_bsp_entity_i32(value: Option<&[u8]>, default: i32) -> i32 {
+    value
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_bsp_entity_f32(value: Option<&[u8]>, default: f32) -> f32 {
+    value
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn vector_to_jka_angles(direction: [f32; 3]) -> [f32; 3] {
+    let [x, y, z] = direction;
+    if x == 0.0 && y == 0.0 {
+        return [if z > 0.0 { -90.0 } else { 90.0 }, 0.0, 0.0];
+    }
+    let yaw = y.atan2(x).to_degrees().rem_euclid(360.0);
+    let forward = (x * x + y * y).sqrt();
+    let pitch = z.atan2(forward).to_degrees().rem_euclid(360.0);
+    [-pitch, yaw, 0.0]
+}
+
+fn bsp_entity_angles(entity: &jka_assets::bsp::Entity) -> [f32; 3] {
+    if let Some(angles) = bsp_entity_value(entity, b"angles").and_then(parse_bsp_entity_triplet) {
+        return angles;
+    }
+    if let Some(angle) = bsp_entity_value(entity, b"angle")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+    {
+        // id Tech's ANGLE_UP / ANGLE_DOWN shortcuts.
+        return match angle as i32 {
+            -1 => [-90.0, 0.0, 0.0],
+            -2 => [90.0, 0.0, 0.0],
+            _ => [0.0, angle, 0.0],
+        };
+    }
+    [0.0; 3]
+}
+
+fn bsp_fx_runners(bsp: &Bsp, warnings: &mut Vec<String>) -> Vec<MapFxRunner> {
+    let targets: BTreeMap<String, [f32; 3]> = bsp
+        .entities
+        .iter()
+        .filter_map(|entity| {
+            let name = bsp_entity_value(entity, b"targetname")?;
+            let name = std::str::from_utf8(name).ok()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let origin = bsp_entity_value(entity, b"origin").and_then(parse_bsp_entity_triplet)?;
+            Some((name.to_owned(), origin))
+        })
+        .collect();
+
+    bsp.entities
+        .iter()
+        .filter_map(|entity| {
+            let classname = bsp_entity_value(entity, b"classname")?;
+            if !classname.eq_ignore_ascii_case(b"fx_runner") {
+                return None;
+            }
+
+            let origin = bsp_entity_value(entity, b"origin")
+                .and_then(parse_bsp_entity_triplet)
+                .unwrap_or([0.0; 3]);
+            let Some(effect) = bsp_entity_value(entity, b"fxFile")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                warnings.push(format!(
+                    "fx_runner at {:.1} {:.1} {:.1} has no fxFile; skipped",
+                    origin[0], origin[1], origin[2]
+                ));
+                return None;
+            };
+
+            let mut angles = bsp_entity_angles(entity);
+            if angles == [0.0; 3] {
+                // OpenJK SP_fx_runner defaults an unaimed runner to straight up.
+                angles = [-90.0, 0.0, 0.0];
+            }
+            if let Some(target_name) = bsp_entity_value(entity, b"target")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(target) = targets.get(target_name) {
+                    let direction = std::array::from_fn(|axis| target[axis] - origin[axis]);
+                    let length_sq = direction.iter().map(|value| value * value).sum::<f32>();
+                    if length_sq > f32::EPSILON {
+                        angles = vector_to_jka_angles(direction);
+                    }
+                } else {
+                    warnings.push(format!(
+                        "fx_runner target '{target_name}' not found at {:.1} {:.1} {:.1}; using authored/default angles",
+                        origin[0], origin[1], origin[2]
+                    ));
+                }
+            }
+
+            Some(MapFxRunner {
+                effect: effect.replace('\\', "/"),
+                origin,
+                angles,
+                delay_ms: parse_bsp_entity_i32(bsp_entity_value(entity, b"delay"), 200),
+                random_ms: parse_bsp_entity_f32(bsp_entity_value(entity, b"random"), 0.0) as i32,
+                spawnflags: parse_bsp_entity_i32(bsp_entity_value(entity, b"spawnflags"), 0),
+            })
+        })
+        .collect()
 }
 
 fn bsp_dynamic_lights(bsp: &Bsp) -> Vec<DynamicLight> {
@@ -5051,19 +5583,157 @@ fn bsp_dynamic_lights(bsp: &Bsp) -> Vec<DynamicLight> {
         .collect()
 }
 
-fn map_dynamic_lights(document: &jka_assets::map::MapDocument) -> Vec<DynamicLight> {
-    document
-        .entities
-        .iter()
-        .filter_map(|entity| {
-            dynamic_light_from_values(
-                entity.classname()?,
-                entity.properties.get("origin").map(String::as_str),
-                entity.properties.get("_color").map(String::as_str),
-                entity.properties.get("light").map(String::as_str),
-            )
+fn parse_positive_map_f32(entity: &jka_assets::map::MapEntity, key: &str) -> Option<f32> {
+    entity
+        .properties
+        .get(key)
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn parse_map_f32(entity: &jka_assets::map::MapEntity, key: &str) -> Option<f32> {
+    entity
+        .properties
+        .get(key)
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
+// NetRadiant Custom q3map2 defaults for the Quake3/JKA lighting model. Keep
+// these next to source-map parsing: runtime/FX dlights intentionally retain the
+// engine's existing response and do not use compiler-space photon units.
+const Q3MAP_POINT_SCALE: f32 = 7500.0;
+const Q3MAP_LINEAR_SCALE: f32 = 1.0 / 8000.0;
+const Q3MAP_FALLOFF_TOLERANCE: f32 = 1.0;
+const Q3MAP_LIGHTMAP_BYTE_SCALE: f32 = 255.0;
+
+fn q3map_color_normalize(color: Vec3) -> Vec3 {
+    let max_component = color.max_element();
+    if max_component > 0.0 {
+        color / max_component
+    } else {
+        Vec3::ONE
+    }
+}
+
+fn map_world_lighting(world: &jka_assets::map::MapEntity) -> SourceMapLighting {
+    // NetRadiant Custom LightWorld(): worldspawn `_color` tints both `_ambient`
+    // and `_minlight`. Missing/zero color becomes white. The active JA profile
+    // reports `_color colorspace: linear`, so source-map preview keeps authored
+    // components in that space instead of inventing an sRGB transform here.
+    let color = world
+        .properties
+        .get("_color")
+        .and_then(|value| parse_light_triplet(value))
+        .map(Vec3::from_array)
+        .filter(|value| value.length_squared() > 0.0)
+        .unwrap_or(Vec3::ONE);
+    let ambient = parse_map_f32(world, "_ambient")
+        .or_else(|| parse_map_f32(world, "ambient"))
+        .unwrap_or(0.0);
+    let minlight = parse_map_f32(world, "_minlight").unwrap_or(0.0);
+    SourceMapLighting {
+        ambient: (color * (ambient / Q3MAP_LIGHTMAP_BYTE_SCALE)).to_array(),
+        minlight: (color * (minlight / Q3MAP_LIGHTMAP_BYTE_SCALE)).to_array(),
+    }
+}
+
+fn map_dynamic_light(entity: &jka_assets::map::MapEntity) -> Option<DynamicLight> {
+    let classname = entity.classname()?;
+    if classname != "light" && classname != "lightJunior" {
+        return None;
+    }
+    let origin = parse_light_triplet(entity.properties.get("origin")?)?;
+    let spawnflags = entity
+        .properties
+        .get("spawnflags")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(0);
+
+    // q3map2's ColorNormalize divides by the largest component, not vector
+    // length. Spawnflag 32 (NRC's "unnormalized") keeps the authored values.
+    // The active JA compile profile reports `_color colorspace: linear`, so no
+    // sRGB conversion belongs in this source-map preview path.
+    let color = entity
+        .properties
+        .get("_color")
+        .and_then(|value| parse_light_triplet(value))
+        .map(Vec3::from_array)
+        .map(|color| color.max(Vec3::ZERO))
+        .map(|color| {
+            if spawnflags & 32 != 0 {
+                color
+            } else {
+                q3map_color_normalize(color)
+            }
         })
-        .collect()
+        .unwrap_or(Vec3::ONE)
+        .to_array();
+
+    // q3map2 priority/defaults: `_light`, then `light`, default 300. `scale`
+    // multiplies authored intensity, then ordinary point lights multiply by the
+    // game pointScale (7500 for the JA/Q3 profile) to become compiler photons.
+    let authored = parse_positive_map_f32(entity, "_light")
+        .or_else(|| parse_positive_map_f32(entity, "light"))
+        .unwrap_or(300.0);
+    let scale = parse_map_f32(entity, "scale")
+        .filter(|value| *value != 0.0)
+        .unwrap_or(1.0);
+    let brightness = (authored * scale).max(0.0);
+    let photons = brightness * Q3MAP_POINT_SCALE;
+
+    let linear = spawnflags & 1 != 0;
+    let fade = if linear {
+        parse_map_f32(entity, "fade")
+            .filter(|value| *value != 0.0)
+            .unwrap_or(1.0)
+            .max(1.0e-5)
+    } else {
+        1.0
+    };
+    let angle_scale = parse_map_f32(entity, "_anglescale").unwrap_or(0.0);
+    // In Q3/JKA, linear (spawnflag 1) disables angle attenuation, spawnflag 2
+    // also disables it, while an explicit _anglescale re-enables it.
+    let angle_attenuation = angle_scale != 0.0 || (!linear && spawnflags & 2 == 0);
+    let extra_distance = parse_map_f32(entity, "_extradist").unwrap_or(0.0).abs();
+
+    // q3map2's envelope is a culling optimization. It must not be multiplied
+    // into the light curve. `-fast` drops contributions <= falloffTolerance (1),
+    // so inverse-square point lights become irrelevant at sqrt(photons / 1).
+    // Linear lights naturally reach zero at photons*linearScale/fade. The 16u
+    // minimum mirrors q3map2's hot-spot distance clamp.
+    let radius = if linear {
+        (photons * Q3MAP_LINEAR_SCALE / fade).max(16.0)
+    } else {
+        (photons / Q3MAP_FALLOFF_TOLERANCE).sqrt().max(16.0)
+    };
+
+    // q3map2 accumulates direct-light values in lightmap-byte space. Divide the
+    // photons once here so the shader's resulting diffuse factor is equivalent
+    // to sampling the compiled lightmap as normalized 0..1 RGB.
+    let intensity = photons / Q3MAP_LIGHTMAP_BYTE_SCALE;
+
+    Some(DynamicLight {
+        position: render_position(origin),
+        color,
+        radius,
+        intensity,
+        falloff: if linear {
+            DynamicLightFalloff::Linear
+        } else {
+            DynamicLightFalloff::InverseSquare
+        },
+        surface_lighting: classname != "lightJunior",
+        emitter_normal: [0.0; 3],
+        emitter_two_sided: false,
+        angle_attenuation,
+        angle_scale,
+        extra_distance,
+    })
+}
+
+fn map_dynamic_lights(document: &jka_assets::map::MapDocument) -> Vec<DynamicLight> {
+    document.entities.iter().filter_map(map_dynamic_light).collect()
 }
 
 const BRUSH_INSIDE_EPSILON: f64 = 0.05;
@@ -5091,15 +5761,15 @@ const BRUSH_VERTEX_EPSILON: f64 = 0.05;
 const FALLBACK_TEXTURE_SIZE: f64 = 128.0;
 
 #[derive(Debug)]
-struct ReconstructedFace {
-    face_index: usize,
-    vertices: Vec<DVec3>,
+pub(crate) struct ReconstructedFace {
+    pub(crate) face_index: usize,
+    pub(crate) vertices: Vec<DVec3>,
 }
 
 #[derive(Debug)]
-struct ReconstructedBrush {
+pub(crate) struct ReconstructedBrush {
     vertices: Vec<DVec3>,
-    faces: Vec<ReconstructedFace>,
+    pub(crate) faces: Vec<ReconstructedFace>,
 }
 
 #[derive(Default)]
@@ -5107,15 +5777,51 @@ struct MapGeometry {
     vertices: Vec<GpuVertex>,
 }
 
+const SOURCE_MAP_CHUNK_SIZE: f64 = 1024.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MapChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+fn map_chunk_key(vertices: &[DVec3]) -> MapChunkKey {
+    let center = if vertices.is_empty() {
+        DVec3::ZERO
+    } else {
+        vertices.iter().copied().sum::<DVec3>() / vertices.len() as f64
+    };
+    let coord = |value: f64| (value / SOURCE_MAP_CHUNK_SIZE).floor() as i32;
+    MapChunkKey {
+        x: coord(center.x),
+        y: coord(center.y),
+        z: coord(center.z),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct MapGroupKey {
     material: usize,
+    // Transparent/authored-portal geometry keeps its old per-face submission
+    // isolation. Ordinary opaque geometry stays global unless GPU-driven source
+    // batching was requested; environment-planar groups are spatial regardless
+    // because the old source path isolated every one of those faces anyway.
     transparent_order: usize,
+    chunk: Option<MapChunkKey>,
+    planar_group: Option<PlanarGroupKey>,
 }
 
 struct MapMaterial {
     material: SurfaceMaterial,
     uv_size: [f64; 2],
+}
+
+#[derive(Debug)]
+struct ReconstructedMapBrush {
+    entity_index: usize,
+    brush_index: usize,
+    result: Result<ReconstructedBrush, String>,
 }
 
 fn map_vec(value: [f64; 3]) -> DVec3 {
@@ -5202,7 +5908,7 @@ fn brush_has_unbounded_direction(brush: &MapBrush) -> bool {
     false
 }
 
-fn reconstruct_brush(brush: &MapBrush) -> Result<ReconstructedBrush, String> {
+pub(crate) fn reconstruct_brush(brush: &MapBrush) -> Result<ReconstructedBrush, String> {
     if brush.faces.len() < 4 {
         return Err("fewer than four valid planes".into());
     }
@@ -5262,6 +5968,59 @@ fn reconstruct_brush(brush: &MapBrush) -> Result<ReconstructedBrush, String> {
     }
 
     Ok(ReconstructedBrush { vertices, faces })
+}
+
+fn reconstruct_source_brushes(
+    document: Arc<MapDocument>,
+    static_entity_indices: &[usize],
+    jobs: Option<&MapJobPool>,
+) -> Result<Vec<ReconstructedMapBrush>, String> {
+    let work = static_entity_indices
+        .iter()
+        .flat_map(|&entity_index| {
+            (0..document.entities[entity_index].brushes.len())
+                .map(move |brush_index| (entity_index, brush_index))
+        })
+        .collect::<Vec<_>>();
+
+    if work.len() < 256 || jobs.is_none() {
+        return Ok(work
+            .into_iter()
+            .map(|(entity_index, brush_index)| ReconstructedMapBrush {
+                entity_index,
+                brush_index,
+                result: reconstruct_brush(&document.entities[entity_index].brushes[brush_index]),
+            })
+            .collect());
+    }
+
+    let jobs = jobs.expect("source reconstruction jobs");
+    let job_count = (jobs.worker_count().saturating_mul(2)).clamp(1, work.len());
+    let chunk_size = work.len().div_ceil(job_count);
+    let mut handles = Vec::new();
+    for chunk in work.chunks(chunk_size) {
+        let document = Arc::clone(&document);
+        let chunk = chunk.to_vec();
+        handles.push(jobs.submit(Task::MapPrepare, move || {
+            chunk
+                .into_iter()
+                .map(|(entity_index, brush_index)| ReconstructedMapBrush {
+                    entity_index,
+                    brush_index,
+                    result: reconstruct_brush(&document.entities[entity_index].brushes[brush_index]),
+                })
+                .collect::<Vec<_>>()
+        })?);
+    }
+
+    let mut reconstructed = Vec::with_capacity(work.len());
+    for handle in handles {
+        reconstructed.extend(handle.join()?);
+    }
+    // Worker completion order must not affect transparent ordering, warning order,
+    // or generated vertex ranges. Preserve the original entity/brush order.
+    reconstructed.sort_by_key(|item| (item.entity_index, item.brush_index));
+    Ok(reconstructed)
 }
 
 fn legacy_texture_axes(normal: DVec3) -> (DVec3, DVec3) {
@@ -5396,6 +6155,326 @@ fn is_utility_shader(name: &str) -> bool {
         || leaf.ends_with("_clip")
 }
 
+/// Shader-script metadata is authoritative for utility-only surfaces. A custom
+/// shader does not have to be named `caulk`/`playerclip`/etc, so filename
+/// heuristics alone can accidentally send compiler-only faces to WGPU. Keep
+/// visible nonsolid materials (glass/water/etc.) out of this test.
+fn shader_is_render_utility(shader: &Shader) -> bool {
+    shader.nodraw
+        || shader.player_clip
+        || shader.monster_clip
+        || shader.bot_clip
+        || shader.shot_clip
+        || shader.trigger
+        || shader.fog
+}
+
+const SOURCE_CONTENTS_SOLID: u32 = 0x0000_0001;
+const SOURCE_CONTENTS_LAVA: u32 = 0x0000_0002;
+const SOURCE_CONTENTS_WATER: u32 = 0x0000_0004;
+const SOURCE_CONTENTS_FOG: u32 = 0x0000_0008;
+const SOURCE_CONTENTS_PLAYERCLIP: u32 = 0x0000_0010;
+const SOURCE_CONTENTS_MONSTERCLIP: u32 = 0x0000_0020;
+const SOURCE_CONTENTS_BOTCLIP: u32 = 0x0000_0040;
+const SOURCE_CONTENTS_SHOTCLIP: u32 = 0x0000_0080;
+const SOURCE_CONTENTS_TRIGGER: u32 = 0x0000_0400;
+const SOURCE_CONTENTS_OPAQUE: u32 = 0x0000_8000;
+const SOURCE_SURF_SKY: u32 = 0x0000_2000;
+const SOURCE_SURF_SLICK: u32 = 0x0000_4000;
+const SOURCE_SURF_METALSTEPS: u32 = 0x0000_8000;
+const SOURCE_SURF_NODAMAGE: u32 = 0x0004_0000;
+const SOURCE_SURF_NODRAW: u32 = 0x0020_0000;
+const SOURCE_SURF_NOSTEPS: u32 = 0x0040_0000;
+const SOURCE_SURF_NOMISCENTS: u32 = 0x0100_0000;
+const SOURCE_SURF_BEVELS_MASK: u32 = SOURCE_SURF_SLICK
+    | SOURCE_SURF_METALSTEPS
+    | SOURCE_SURF_NODAMAGE
+    | SOURCE_SURF_NOSTEPS
+    | SOURCE_SURF_NOMISCENTS;
+
+fn source_shader_leaf(name: &str) -> String {
+    let normalized = name.replace('\\', "/").to_ascii_lowercase();
+    normalized.rsplit('/').next().unwrap_or(&normalized).to_string()
+}
+
+fn source_face_collision_flags(face: &MapFace, shader: Option<&Shader>) -> (i32, i32) {
+    let leaf = source_shader_leaf(&face.shader);
+    // q3map2's JA/SOF2 table applies this default before shader surfaceParms.
+    let mut contents = SOURCE_CONTENTS_SOLID | SOURCE_CONTENTS_OPAQUE;
+    let mut surface_flags = 0u32;
+
+    if let Some(shader) = shader {
+        contents &= !shader.collision_contents_clear;
+        contents |= shader.collision_contents_add;
+        surface_flags &= !shader.collision_surface_flags_clear;
+        surface_flags |= shader.collision_surface_flags_add;
+
+        // skyparms can identify a sky shader even when an unusual script omits
+        // `surfaceparm sky`; preserve the gameplay surface bit in that case.
+        if shader.sky { surface_flags |= SOURCE_SURF_SKY; }
+        if shader.slick { surface_flags |= SOURCE_SURF_SLICK; }
+        if shader.nodraw { surface_flags |= SOURCE_SURF_NODRAW; }
+    } else {
+        // Fallback only when no shader script exists. These mirror the normal
+        // JKA tool-texture intent closely enough that loose source maps remain
+        // playable; a loaded shader always wins over filename heuristics.
+        match leaf.as_str() {
+            "clip" | "playerclip" => {
+                contents = SOURCE_CONTENTS_PLAYERCLIP;
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            "monsterclip" => {
+                contents = SOURCE_CONTENTS_MONSTERCLIP;
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            "botclip" => {
+                contents = SOURCE_CONTENTS_BOTCLIP;
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            "weaponclip" | "shotclip" => {
+                contents = SOURCE_CONTENTS_SHOTCLIP;
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            "trigger" => {
+                contents = SOURCE_CONTENTS_TRIGGER;
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            "water" => contents = SOURCE_CONTENTS_WATER | SOURCE_CONTENTS_OPAQUE,
+            "lava" => contents = SOURCE_CONTENTS_LAVA | SOURCE_CONTENTS_OPAQUE,
+            // Raven's SOF2/JKA SLIME bit is also used as projectileclip.
+            "slime" => contents = 0x0002_0000 | SOURCE_CONTENTS_OPAQUE,
+            "fog" => contents = SOURCE_CONTENTS_FOG,
+            "nodraw" => surface_flags |= SOURCE_SURF_NODRAW,
+            _ if leaf.starts_with("caulk") || leaf.starts_with("nodraw") => {
+                surface_flags |= SOURCE_SURF_NODRAW;
+            }
+            _ => {}
+        }
+    }
+
+    // Legacy .map writers may append q3map contents/surfaceFlags/value after
+    // the texture projection. Radiant/q3map writers commonly store compile
+    // modifiers such as CONTENTS_DETAIL there without repeating the material
+    // contents already deduced from the shader. Treating a modifier as the
+    // complete gameplay contents makes ordinary detail floors non-solid. Merge
+    // modifier-only values; replace only when the explicit bits actually name a
+    // gameplay volume/collision class.
+    if let Some(value) = face.trailing.first().copied().filter(|value| value.is_finite()) {
+        let explicit = value.round() as i64 as u32;
+        if explicit != 0 {
+            const EXPLICIT_GAMEPLAY_CLASS: u32 = SOURCE_CONTENTS_SOLID
+                | SOURCE_CONTENTS_LAVA
+                | SOURCE_CONTENTS_WATER
+                | SOURCE_CONTENTS_FOG
+                | SOURCE_CONTENTS_PLAYERCLIP
+                | SOURCE_CONTENTS_MONSTERCLIP
+                | SOURCE_CONTENTS_BOTCLIP
+                | SOURCE_CONTENTS_SHOTCLIP
+                | SOURCE_CONTENTS_TRIGGER
+                | 0x0000_1000 // CONTENTS_TERRAIN
+                | 0x0002_0000; // CONTENTS_SLIME
+            if explicit & EXPLICIT_GAMEPLAY_CLASS == 0 {
+                // Compile modifiers (DETAIL, TRANSLUCENT, etc.) augment the
+                // contents already deduced from the material. This also preserves
+                // an authored surfaceParm nonsolid clear from the shader parser.
+                contents |= explicit;
+            } else {
+                // Actual gameplay content classes are authoritative: playerclip,
+                // liquids, trigger volumes, explicit solid, and so on must not
+                // inherit ordinary SOLID merely because the face has a texture.
+                contents = explicit;
+            }
+        }
+    }
+    if let Some(value) = face.trailing.get(1).copied().filter(|value| value.is_finite()) {
+        let explicit = value.round() as i64 as u32;
+        if explicit != 0 { surface_flags = explicit; }
+    }
+    (contents as i32, surface_flags as i32)
+}
+
+fn push_source_collision_plane(
+    planes: &mut Vec<jka_movement::SourceCollisionPlane>,
+    normal: DVec3,
+    distance: f64,
+    surface_flags: i32,
+) {
+    let length = normal.length();
+    if !length.is_finite() || length < 1e-9 || !distance.is_finite() {
+        return;
+    }
+    let normal = normal / length;
+    let distance = distance / length;
+    let n = [normal.x as f32, normal.y as f32, normal.z as f32];
+    let d = distance as f32;
+    if let Some(existing) = planes.iter_mut().find(|plane| {
+        (plane.normal[0] - n[0]).abs() < 1e-4
+            && (plane.normal[1] - n[1]).abs() < 1e-4
+            && (plane.normal[2] - n[2]).abs() < 1e-4
+            && (plane.distance - d).abs() < 0.05
+    }) {
+        // q3map2 ORs the bevel-relevant surface flags when a generated bevel
+        // resolves to an already-present plane.
+        existing.surface_flags |= surface_flags;
+    } else {
+        planes.push(jka_movement::SourceCollisionPlane { normal: n, distance: d, surface_flags });
+    }
+}
+
+fn source_collision_brush(
+    brush: &MapBrush,
+    reconstructed: &ReconstructedBrush,
+    library: &BTreeMap<String, Shader>,
+) -> Option<jka_movement::SourceCollisionBrush> {
+    if reconstructed.vertices.len() < 4 {
+        return None;
+    }
+    let mut minimum = DVec3::splat(f64::INFINITY);
+    let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+    for &point in &reconstructed.vertices {
+        minimum = minimum.min(point);
+        maximum = maximum.max(point);
+    }
+
+    let mut planes = Vec::new();
+    let mut contents = 0i32;
+    let mut face_surface_flags = Vec::with_capacity(brush.faces.len());
+    for face in &brush.faces {
+        let shader_name = canonical_map_shader(&face.shader, library);
+        let (face_contents, surface_flags) =
+            source_face_collision_flags(face, library.get(&shader_name));
+        contents |= face_contents;
+        face_surface_flags.push(surface_flags);
+        push_source_collision_plane(
+            &mut planes,
+            map_vec(face.plane.normal),
+            face.plane.distance,
+            surface_flags,
+        );
+    }
+    if contents == 0 || planes.len() < 4 {
+        return None;
+    }
+
+    // q3map2 adds axial and edge bevels to collision brushes. Face planes alone
+    // are sufficient for point traces, but a swept player AABB needs these
+    // additional Minkowski planes around slanted brush edges to match CM.
+    const BEVEL_EPSILON: f64 = 0.1;
+    for axis in 0..3 {
+        let axial_flags = |coordinate: f64| -> i32 {
+            reconstructed
+                .faces
+                .iter()
+                .filter(|polygon| {
+                    polygon
+                        .vertices
+                        .iter()
+                        .any(|vertex| (vertex[axis] - coordinate).abs() < BEVEL_EPSILON)
+                })
+                .fold(0u32, |flags, polygon| {
+                    flags
+                        | (face_surface_flags
+                            .get(polygon.face_index)
+                            .copied()
+                            .unwrap_or_default() as u32
+                            & SOURCE_SURF_BEVELS_MASK)
+                }) as i32
+        };
+        let mut positive = DVec3::ZERO;
+        positive[axis] = 1.0;
+        push_source_collision_plane(
+            &mut planes,
+            positive,
+            maximum[axis],
+            axial_flags(maximum[axis]),
+        );
+        push_source_collision_plane(
+            &mut planes,
+            -positive,
+            -minimum[axis],
+            axial_flags(minimum[axis]),
+        );
+    }
+    const MAX_SOURCE_COLLISION_PLANES: usize = 256;
+    'faces: for polygon in &reconstructed.faces {
+        if polygon.vertices.len() < 2 { continue; }
+        for edge_index in 0..polygon.vertices.len() {
+            let a = polygon.vertices[edge_index];
+            let b = polygon.vertices[(edge_index + 1) % polygon.vertices.len()];
+            let edge = b - a;
+            let edge_length = edge.length();
+            if edge_length < 1e-6 { continue; }
+            let edge = edge / edge_length;
+            if edge.x.abs() > 0.9999 || edge.y.abs() > 0.9999 || edge.z.abs() > 0.9999 {
+                continue;
+            }
+            for axis in 0..3 {
+                for sign in [-1.0, 1.0] {
+                    let mut axis_vector = DVec3::ZERO;
+                    axis_vector[axis] = sign;
+                    let candidate = edge.cross(axis_vector);
+                    let length = candidate.length();
+                    if length < 1e-6 { continue; }
+                    let normal = candidate / length;
+                    let distance = normal.dot(a);
+                    let mut has_inside = false;
+                    let valid = reconstructed.vertices.iter().all(|point| {
+                        let delta = normal.dot(*point) - distance;
+                        if delta < -BEVEL_EPSILON { has_inside = true; }
+                        delta <= BEVEL_EPSILON
+                    });
+                    if valid && has_inside {
+                        let bevel_surface_flags = face_surface_flags
+                            .get(polygon.face_index)
+                            .copied()
+                            .unwrap_or_default() as u32
+                            & SOURCE_SURF_BEVELS_MASK;
+                        push_source_collision_plane(
+                            &mut planes,
+                            normal,
+                            distance,
+                            bevel_surface_flags as i32,
+                        );
+                        if planes.len() >= MAX_SOURCE_COLLISION_PLANES { break 'faces; }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(jka_movement::SourceCollisionBrush {
+        planes,
+        mins: [minimum.x as f32, minimum.y as f32, minimum.z as f32],
+        maxs: [maximum.x as f32, maximum.y as f32, maximum.z as f32],
+        contents,
+    })
+}
+
+fn parse_map_triplet(value: Option<&String>) -> Option<[f32; 3]> {
+    let mut values = value?.split_whitespace().map(str::parse::<f32>);
+    let result = [values.next()?.ok()?, values.next()?.ok()?, values.next()?.ok()?];
+    (values.next().is_none() && result.iter().all(|value| value.is_finite())).then_some(result)
+}
+
+fn map_spawn_points(document: &MapDocument) -> Vec<SpawnPoint> {
+    document.entities.iter().filter_map(|entity| {
+        if !matches!(entity.classname(),
+            Some("info_player_deathmatch" | "info_player_start" | "info_player_duel" | "info_player_siegeteam1" | "info_player_siegeteam2"))
+        {
+            return None;
+        }
+        let mut origin = parse_map_triplet(entity.properties.get("origin"))?;
+        // BSP spawn preparation applies the same small floor nudge used by JKA.
+        origin[2] += 9.0;
+        let yaw = entity.properties.get("angle")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .or_else(|| parse_map_triplet(entity.properties.get("angles")).map(|angles| angles[1]))
+            .unwrap_or(0.0);
+        Some(SpawnPoint { position: render_position(origin), yaw: yaw.to_radians() })
+    }).collect()
+}
+
 fn canonical_map_shader(name: &str, library: &BTreeMap<String, Shader>) -> String {
     let raw = name.replace('\\', "/").to_ascii_lowercase();
     if library.contains_key(&raw) || raw.starts_with("textures/") {
@@ -5477,6 +6556,9 @@ pub fn prepare_source(
         MapSource::Bsp(name) => prepare(root, game, name),
         MapSource::Map(name) => prepare_map_asset(root, game, name),
         MapSource::MapFile(path) => prepare_map_file(root, game, path),
+        MapSource::MapEditPreview { path, text } => {
+            prepare_map_edit_preview(root, game, path, text, None, MapPrepareOptions::default())
+        }
     }
 }
 
@@ -5489,10 +6571,11 @@ pub fn prepare_source_with_jobs(
 ) -> Result<PreparedMap, String> {
     match source {
         MapSource::Bsp(name) => prepare_with_jobs_options(root, game, name, jobs, options),
-        // Source .map support is a developer path and currently keeps its existing
-        // deterministic single-loader implementation. BSP is the retail/runtime path.
-        MapSource::Map(name) => prepare_map_asset(root, game, name),
-        MapSource::MapFile(path) => prepare_map_file(root, game, path),
+        MapSource::Map(name) => prepare_map_asset_with_jobs(root, game, name, jobs, options),
+        MapSource::MapFile(path) => prepare_map_file_with_jobs(root, game, path, jobs, options),
+        MapSource::MapEditPreview { path, text } => {
+            prepare_map_edit_preview(root, game, path, text, Some(jobs), options)
+        }
     }
 }
 
@@ -5500,6 +6583,26 @@ pub fn prepare_map_asset(
     root: &Path,
     game: Option<&Path>,
     name: &str,
+) -> Result<PreparedMap, String> {
+    prepare_map_asset_inner(root, game, name, None, MapPrepareOptions::default())
+}
+
+fn prepare_map_asset_with_jobs(
+    root: &Path,
+    game: Option<&Path>,
+    name: &str,
+    jobs: &MapJobPool,
+    options: MapPrepareOptions,
+) -> Result<PreparedMap, String> {
+    prepare_map_asset_inner(root, game, name, Some(jobs), options)
+}
+
+fn prepare_map_asset_inner(
+    root: &Path,
+    game: Option<&Path>,
+    name: &str,
+    jobs: Option<&MapJobPool>,
+    options: MapPrepareOptions,
 ) -> Result<PreparedMap, String> {
     let asset_name = map_asset_name(name, "map")?;
     let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
@@ -5513,13 +6616,33 @@ pub fn prepare_map_asset(
         .map_err(|error| format!("{asset_name} is not UTF-8 text: {error}"))?;
     let document =
         jka_assets::map::parse(text).map_err(|error| format!("{asset_name}: {error}"))?;
-    prepare_map_document_with_assets(&asset.source, document, &mut assets)
+    prepare_map_document_with_assets_options(&asset.source, document, &mut assets, jobs, options)
 }
 
 pub fn prepare_map_file(
     root: &Path,
     game: Option<&Path>,
     path: &Path,
+) -> Result<PreparedMap, String> {
+    prepare_map_file_inner(root, game, path, None, MapPrepareOptions::default())
+}
+
+fn prepare_map_file_with_jobs(
+    root: &Path,
+    game: Option<&Path>,
+    path: &Path,
+    jobs: &MapJobPool,
+    options: MapPrepareOptions,
+) -> Result<PreparedMap, String> {
+    prepare_map_file_inner(root, game, path, Some(jobs), options)
+}
+
+fn prepare_map_file_inner(
+    root: &Path,
+    game: Option<&Path>,
+    path: &Path,
+    jobs: Option<&MapJobPool>,
+    options: MapPrepareOptions,
 ) -> Result<PreparedMap, String> {
     if !path
         .extension()
@@ -5545,7 +6668,38 @@ pub fn prepare_map_file(
         .map_err(|error| format!("Loose map {} is not UTF-8 text: {error}", path.display()))?;
     let document =
         jka_assets::map::parse(text).map_err(|error| format!("{}: {error}", path.display()))?;
-    prepare_map_document(root, game, path, document)
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
+    prepare_map_document_with_assets_options(path, document, &mut assets, jobs, options)
+}
+
+fn prepare_map_edit_preview(
+    root: &Path,
+    game: Option<&Path>,
+    path: &Path,
+    text: &str,
+    jobs: Option<&MapJobPool>,
+    options: MapPrepareOptions,
+) -> Result<PreparedMap, String> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("map"))
+    {
+        return Err(format!(
+            "Edited source-map preview must refer to a .map file: {}",
+            path.display()
+        ));
+    }
+    if text.len() > MAX_MAP_FILE_BYTES {
+        return Err(format!(
+            "Edited map preview {} exceeds {} MiB limit",
+            path.display(),
+            MAX_MAP_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let document = jka_assets::map::parse(text)
+        .map_err(|error| format!("Edited preview {}: {error}", path.display()))?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
+    prepare_map_document_with_assets_options(path, document, &mut assets, jobs, options)
 }
 
 fn prepare_map_document(
@@ -5555,14 +6709,20 @@ fn prepare_map_document(
     document: MapDocument,
 ) -> Result<PreparedMap, String> {
     let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
-    prepare_map_document_with_assets(path, document, &mut assets)
+    prepare_map_document_with_assets_options(
+        path, document, &mut assets, None, MapPrepareOptions::default(),
+    )
 }
 
-fn prepare_map_document_with_assets(
+fn prepare_map_document_with_assets_options(
     path: &Path,
     document: MapDocument,
     assets: &mut AssetSearchPath,
+    jobs: Option<&MapJobPool>,
+    options: MapPrepareOptions,
 ) -> Result<PreparedMap, String> {
+    assets.set_allow_asset_overrides(options.allow_asset_overrides);
+    let document = Arc::new(document);
     let world_indices: Vec<_> = document
         .entities
         .iter()
@@ -5646,105 +6806,149 @@ fn prepare_map_document_with_assets(
     let mut static_entity_indices = Vec::with_capacity(1 + grouped_world_indices.len());
     static_entity_indices.push(world_index);
     static_entity_indices.extend(grouped_world_indices.iter().copied());
-    let (library, library_debug) = materials::shader_library(assets, &mut warnings, true)?;
+    let (library, library_debug) = if let Some(jobs) = jobs {
+        materials::shader_library_with_jobs(assets, &mut warnings, jobs, options.pbr_materials)?
+    } else {
+        materials::shader_library(assets, &mut warnings, options.pbr_materials)?
+    };
     let mut textures = Textures::new();
     let mut material_lookup = BTreeMap::<String, usize>::new();
     let mut map_materials = Vec::<MapMaterial>::new();
     let mut groups = BTreeMap::<MapGroupKey, MapGeometry>::new();
     let mut triangles = 0usize;
     let mut rendered_faces = 0usize;
+    let mut utility_faces_skipped = 0usize;
     let mut skipped_brushes = 0usize;
     let mut bounds = None;
     let mut transparent_order = 0usize;
 
-    for entity_index in static_entity_indices {
+    let reconstruction_started = Instant::now();
+    let reconstructed_brushes = reconstruct_source_brushes(
+        Arc::clone(&document),
+        &static_entity_indices,
+        jobs,
+    )?;
+    let reconstruction_ms = reconstruction_started.elapsed().as_secs_f64() * 1000.0;
+    let mut source_collision_brushes = Vec::new();
+
+    for item in reconstructed_brushes {
+        let entity_index = item.entity_index;
+        let brush_index = item.brush_index;
         let entity = &document.entities[entity_index];
         let entity_kind = if entity_index == world_index {
             "worldspawn"
         } else {
             "func_group"
         };
-        for (brush_index, brush) in entity.brushes.iter().enumerate() {
-            let reconstructed = match reconstruct_brush(brush) {
-                Ok(brush) => brush,
-                Err(error) => {
-                    skipped_brushes += 1;
-                    warnings.push(format!(
-                        "{entity_kind} entity {entity_index} brush {brush_index} (line {}): {error}; brush skipped",
-                        brush.line
-                    ));
-                    continue;
-                }
-            };
-            for &point in &reconstructed.vertices {
-                add_bounds(&mut bounds, point);
+        let brush = &entity.brushes[brush_index];
+        let reconstructed = match item.result {
+            Ok(brush) => brush,
+            Err(error) => {
+                skipped_brushes += 1;
+                warnings.push(format!(
+                    "{entity_kind} entity {entity_index} brush {brush_index} (line {}): {error}; brush skipped",
+                    brush.line
+                ));
+                continue;
+            }
+        };
+        for &point in &reconstructed.vertices {
+            add_bounds(&mut bounds, point);
+        }
+
+        // Gameplay collision is deliberately generated before the render-only
+        // utility-surface filter below. Caulk/nodraw/playerclip must stay in CM
+        // even though they never consume a WGPU draw batch.
+        if let Some(collision_brush) = source_collision_brush(brush, &reconstructed, &library) {
+            source_collision_brushes.push(collision_brush);
+        }
+
+        // Match the conservative Radiant large-map index: one static brush
+        // belongs to the 1024-unit cell containing its centre. A brush may
+        // extend beyond that cell; renderer batch bounds are computed from
+        // the actual vertices, so frustum rejection remains conservative.
+        let brush_chunk = map_chunk_key(&reconstructed.vertices);
+
+        for polygon in reconstructed.faces {
+            let face = &brush.faces[polygon.face_index];
+            if is_utility_shader(&face.shader) {
+                utility_faces_skipped += 1;
+                continue;
             }
 
-            for polygon in reconstructed.faces {
-                let face = &brush.faces[polygon.face_index];
-                if is_utility_shader(&face.shader) {
-                    continue;
-                }
-
-                let shader_name = canonical_map_shader(&face.shader, &library);
-                let material_index = if let Some(&index) = material_lookup.get(&shader_name) {
-                    index
-                } else {
-                    let material = materials::describe(
-                        &shader_name,
-                        0,
-                        library.get(&shader_name),
-                        library_debug.origins.get(&shader_name),
-                        assets,
-                        &mut textures,
-                        false,
-                    );
-                    let uv_size = material_uv_size(&material, &textures);
-                    let index = map_materials.len();
-                    map_materials.push(MapMaterial { material, uv_size });
-                    material_lookup.insert(shader_name, index);
-                    index
-                };
-                let map_material = &map_materials[material_index];
-                if map_material.material.hidden {
-                    continue;
-                }
-
-                let class = class_for(&map_material.material);
-                let has_environment_stage = map_material
-                    .material
-                    .stages
-                    .iter()
-                    .any(|stage| matches!(stage.tc_gen, TcGen::Environment));
-                if class == DrawClass::Transparent
-                    || map_material.material.planar_reflection
-                    || has_environment_stage
-                {
-                    transparent_order += 1;
-                }
-                let key = MapGroupKey {
-                    material: material_index,
-                    transparent_order: if class == DrawClass::Transparent
-                        || map_material.material.planar_reflection
-                        || has_environment_stage
-                    {
-                        transparent_order
-                    } else {
-                        0
-                    },
-                };
-                let group = groups.entry(key).or_default();
-                let face_triangles = push_face_triangles(
-                    &mut group.vertices,
-                    face,
-                    &polygon.vertices,
-                    map_material.uv_size,
+            let shader_name = canonical_map_shader(&face.shader, &library);
+            if library.get(&shader_name).is_some_and(shader_is_render_utility) {
+                utility_faces_skipped += 1;
+                continue;
+            }
+            let material_index = if let Some(&index) = material_lookup.get(&shader_name) {
+                index
+            } else {
+                let material = materials::describe(
+                    &shader_name,
+                    0,
+                    library.get(&shader_name),
+                    library_debug.origins.get(&shader_name),
+                    assets,
+                    &mut textures,
+                    options.gen_normal_maps,
                 );
-                if face_triangles != 0 {
-                    triangles += face_triangles;
-                    rendered_faces += 1;
-                }
+                let uv_size = material_uv_size(&material, &textures);
+                let index = map_materials.len();
+                map_materials.push(MapMaterial { material, uv_size });
+                material_lookup.insert(shader_name, index);
+                index
+            };
+            let map_material = &map_materials[material_index];
+            if map_material.material.hidden {
+                continue;
             }
+
+            // Build this face first so environment-mapped opaque geometry can
+            // use the same coplanar grouping rule as the BSP path. The old
+            // source-map path isolated every tcGen environment face, which can
+            // turn a large map into thousands of WGPU commands.
+            let mut face_vertices = Vec::with_capacity(
+                polygon.vertices.len().saturating_sub(2).saturating_mul(3),
+            );
+            let face_triangles = push_face_triangles(
+                &mut face_vertices,
+                face,
+                &polygon.vertices,
+                map_material.uv_size,
+            );
+            if face_triangles == 0 {
+                continue;
+            }
+
+            let class = class_for(&map_material.material);
+            let has_environment_stage = map_material
+                .material
+                .stages
+                .iter()
+                .any(|stage| matches!(stage.tc_gen, TcGen::Environment));
+            let planar_candidate = options.planar_reflections
+                && class != DrawClass::Transparent
+                && (map_material.material.planar_reflection || has_environment_stage);
+            let planar_group = planar_candidate
+                .then(|| planar_group_key(&face_vertices))
+                .flatten();
+            let preserve_unique_plane = planar_candidate && planar_group.is_none();
+            if class == DrawClass::Transparent || preserve_unique_plane {
+                transparent_order += 1;
+            }
+            let unique_submission = class == DrawClass::Transparent || preserve_unique_plane;
+            let spatial_submission = planar_group.is_some()
+                || (options.source_spatial_batches && !unique_submission);
+            let key = MapGroupKey {
+                material: material_index,
+                transparent_order: if unique_submission { transparent_order } else { 0 },
+                chunk: spatial_submission.then_some(brush_chunk),
+                planar_group,
+            };
+            groups.entry(key).or_default().vertices.extend(face_vertices);
+            triangles += face_triangles;
+            rendered_faces += 1;
         }
     }
 
@@ -5766,6 +6970,14 @@ fn prepare_map_document_with_assets(
     let Some((minimum, maximum)) = bounds else {
         return Err("No bounded static world brushes could be reconstructed".into());
     };
+
+    let spatial_chunks = groups
+        .keys()
+        .filter_map(|key| key.chunk)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let geometry_groups = groups.len();
+    let collision_brush_count = source_collision_brushes.len();
 
     let mut vertices = Vec::new();
     let mut batches = Vec::new();
@@ -5830,6 +7042,50 @@ fn prepare_map_document_with_assets(
                 [0.0; 4],
                 false,
             ));
+        } else if stages.len() >= 2 && can_fold_jka_lightmap_pair(&stages[0], &stages[1]) {
+            // A direct .map has no compiled `$lightmap` texture. Rendering the
+            // authored Q3/JKA `$lightmap` + GL_DST_COLOR/GL_ZERO pair literally
+            // therefore leaves no sensible receiver for the realtime q3map2
+            // preview (and can collapse to white/black depending on fallback
+            // bindings). Treat the diffuse half as the opaque source surface.
+            // With simulation off this is the expected fullbright editor look;
+            // with simulation on the normal opaque receiver is multiplied by the
+            // q3map2-equivalent direct/ambient lighting. Decorative stages after
+            // the canonical pair retain their authored order.
+            let mut diffuse = stages[1].clone();
+            diffuse.blend = None;
+            diffuse.depth_write = true;
+            diffuse.depth_equal = false;
+            batches.push(stage_batch(
+                material,
+                &diffuse,
+                true,
+                false,
+                range.clone(),
+                None,
+                None,
+                None,
+                &[],
+                [0_u64; 4],
+                [0.0; 4],
+                false,
+            ));
+            for stage in stages.iter().skip(2) {
+                batches.push(stage_batch(
+                    material,
+                    stage,
+                    false,
+                    false,
+                    range.clone(),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    [0_u64; 4],
+                    [0.0; 4],
+                    false,
+                ));
+            }
         } else {
             for (stage_index, stage) in stages.iter().enumerate() {
                 batches.push(stage_batch(
@@ -5850,14 +7106,25 @@ fn prepare_map_document_with_assets(
         }
     }
 
-    assign_planar_reflection_planes(&mut batches, &vertices);
-    let authored_portal_batch_count = batches
-        .iter()
-        .filter(|batch| batch.planar_reflection)
-        .count();
     let (portal_anchors, camera_portal_count) = map_portal_surface_anchors(&document);
-    retain_authored_planar_mirrors(&mut batches, &portal_anchors);
+    let authored_portal_batch_count;
+    if options.planar_reflections {
+        assign_planar_reflection_planes(&mut batches, &vertices);
+        authored_portal_batch_count = batches
+            .iter()
+            .filter(|batch| batch.planar_reflection)
+            .count();
+        retain_authored_planar_mirrors(&mut batches, &portal_anchors);
+    } else {
+        authored_portal_batch_count = 0;
+        for batch in &mut batches {
+            batch.planar_reflection = false;
+            batch.planar_environment_candidate = false;
+            batch.planar_plane = [0.0; 4];
+        }
+    }
     cache_reflection_decisions(&mut batches);
+    let draw_batches = batches.len();
     log_reflection_cache(&path.display().to_string(), &batches);
     let planar_mirror_batch_count = batches
         .iter()
@@ -5869,7 +7136,7 @@ fn prepare_map_document_with_assets(
                 .into(),
         );
     }
-    if camera_portal_count != 0 {
+    if options.planar_reflections && camera_portal_count != 0 {
         warnings.push(format!(
             "{camera_portal_count} targeted misc_portal_surface camera portal(s) detected; planar mirror pass leaves camera portals on their authored material"
         ));
@@ -5881,14 +7148,35 @@ fn prepare_map_document_with_assets(
 
     let center = (minimum + maximum) * 0.5;
     let movement = load_movement(assets, &mut warnings);
-    let spawn_jka = DVec3::new(center.x, center.y, maximum.z + 64.0);
-    let spawn = SpawnPoint {
-        position: render_position(spawn_jka.to_array().map(|value| value as f32)),
-        yaw: 0.0,
+    let collision = match jka_movement::CollisionWorld::from_source_brushes(source_collision_brushes) {
+        Ok(world) => Some(world),
+        Err(error) => {
+            warnings.push(format!("Source-map player collision unavailable: {error}"));
+            None
+        }
     };
+    let mut spawns = map_spawn_points(&document);
+    if spawns.is_empty() {
+        let spawn_jka = DVec3::new(center.x, center.y, maximum.z + 64.0);
+        spawns.push(SpawnPoint {
+            position: render_position(spawn_jka.to_array().map(|value| value as f32)),
+            yaw: 0.0,
+        });
+    }
 
     let lights = map_dynamic_lights(&document);
-    let voxel_probe_gi = build_voxel_probe_gi(&vertices, &batches, &lights, sun);
+    let source_map_lighting = map_world_lighting(world);
+    if source_map_lighting.ambient != [0.0; 3] || source_map_lighting.minlight != [0.0; 3] {
+        println!(
+            "Source .map q3map2 baseline: ambient={:.3},{:.3},{:.3} minlight={:.3},{:.3},{:.3}",
+            source_map_lighting.ambient[0], source_map_lighting.ambient[1], source_map_lighting.ambient[2],
+            source_map_lighting.minlight[0], source_map_lighting.minlight[1], source_map_lighting.minlight[2],
+        );
+    }
+    let voxel_probe_gi = options
+        .voxel_probe_gi
+        .then(|| build_voxel_probe_gi(&vertices, &batches, &lights, sun))
+        .flatten();
 
     Ok(PreparedMap {
         authored_oceans: Vec::new(),
@@ -5899,8 +7187,7 @@ fn prepare_map_document_with_assets(
         inline_batches: Vec::new(),
         inline_models: Vec::new(),
         movement,
-        collision: None,
-        // Source .map preview has no compiled RBSP collision surface yet.
+        collision,
         physics_collision: crate::cgame::ragdoll::PhysicsMapMesh::default(),
         weather_occlusion: None,
         textures: textures.images,
@@ -5914,6 +7201,7 @@ fn prepare_map_document_with_assets(
         steam_audio_bake_request: None,
         visibility: None,
         lights,
+        source_map_lighting,
         sun,
         static_light_grid: None,
         voxel_probe_gi,
@@ -5922,24 +7210,37 @@ fn prepare_map_document_with_assets(
         surface_sprite_effects: Vec::new(),
         global_fog: None,
         warnings,
-        spawns: vec![spawn],
+        spawns,
+        fx_runners: Vec::new(),
         distance_cull,
         triangles,
         lightmap_pages: 0,
         source: path.to_path_buf(),
         material_debug,
         bsp_stats: None,
-        load_timings: MapLoadTimings::default(),
+        load_timings: MapLoadTimings {
+            geometry_ms: reconstruction_ms,
+            worker_count: jobs.map_or(1, MapJobPool::worker_count),
+            ..MapLoadTimings::default()
+        },
         map_file_stats: Some(MapFileStats {
             entities: document.stats.entities,
             brushes: document.stats.brushes,
             world_brushes: world.brushes.len(),
             grouped_world_brushes,
             rendered_faces,
+            utility_faces_skipped,
             skipped_entity_brushes,
             patches_skipped: document.stats.patches_skipped,
             degenerate_faces: document.stats.degenerate_faces,
             skipped_brushes,
+            spatial_chunks,
+            geometry_groups,
+            draw_batches,
+            collision_brushes: collision_brush_count,
+            spatial_batching: options.source_spatial_batches,
+            worker_count: jobs.map_or(1, MapJobPool::worker_count),
+            reconstruction_ms,
         }),
     })
 }
@@ -6048,6 +7349,68 @@ mod tests {
         let [lightmap, mut diffuse] = legacy_lightmap_modulate_pair(false);
         diffuse.color = [0.5, 1.0, 1.0];
         assert!(!can_fold_jka_lightmap_pair(&lightmap, &diffuse));
+    }
+
+    #[test]
+    fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
+        let diffuse = MaterialStage {
+            texture: StageTexture::Image(7),
+            enhancements: Default::default(),
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: true,
+            depth_equal: false,
+        };
+        let lightmap = MaterialStage {
+            texture: StageTexture::Lightmap,
+            enhancements: Default::default(),
+            blend: Some(materials::BlendFunc {
+                src: BlendFactor::DstColor,
+                dst: BlendFactor::Zero,
+            }),
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+        };
+        let material = SurfaceMaterial {
+            stages: vec![diffuse, lightmap],
+            explicit: true,
+            ..Default::default()
+        };
+
+        let stages = prepared_stages(&material, true);
+        assert!(matches!(stages[1].texture, StageTexture::White));
+        assert_eq!(stages[1].rgb_gen, RgbGen::ExactVertex);
+
+        let batch = stage_batch(
+            &material,
+            &stages[1],
+            false,
+            true,
+            0..3,
+            Some(226),
+            None,
+            None,
+            &[],
+            [0; 4],
+            [0.0; 4],
+            false,
+        );
+        assert!(batch.texture.is_none());
+        assert!(!batch.texture_is_lightmap);
+        assert!(batch.texture_is_white);
     }
 
     #[test]
@@ -6364,7 +7727,133 @@ mod tests {
         assert_eq!(stats.world_brushes, 1);
         assert_eq!(stats.grouped_world_brushes, 0);
         assert_eq!(stats.rendered_faces, 5);
+        assert_eq!(stats.collision_brushes, 1);
         assert_eq!(prepared.triangles, 10);
+        assert!(prepared.collision.is_some(), "caulk must stay in gameplay collision");
+    }
+
+    #[test]
+    fn shader_metadata_hides_custom_utility_surfaces() {
+        let mut shader = Shader::default();
+        shader.player_clip = true;
+        assert!(shader_is_render_utility(&shader));
+        shader.player_clip = false;
+        shader.nonsolid = true;
+        shader.translucent = true;
+        assert!(!shader_is_render_utility(&shader), "visible glass must not be dropped just because it is nonsolid");
+    }
+
+    #[test]
+    fn implicit_detail_face_keeps_default_solid_contents() {
+        let face = MapFace {
+            plane: MapPlane { normal: [0.0, 0.0, 1.0], distance: 64.0 },
+            shader: "textures/rift/floor1b".into(),
+            projection: TextureProjection::Legacy {
+                shift: [0.0, 0.0],
+                rotate: 0.0,
+                scale: [0.5, 0.5],
+            },
+            // Radiant commonly stores CONTENTS_DETAIL here without repeating
+            // the implicit SOLID default.
+            trailing: vec![0x0800_0000_u32 as f64, 0.0, 0.0],
+            plane_span: [0, 0],
+            line: 1,
+        };
+        let (contents, _) = source_face_collision_flags(&face, None);
+        let contents = contents as u32;
+        assert_ne!(contents & SOURCE_CONTENTS_SOLID, 0);
+        assert_ne!(contents & SOURCE_CONTENTS_OPAQUE, 0);
+        assert_ne!(contents & 0x0800_0000, 0);
+
+        // The same modifier must not erase solidity merely because the texture
+        // has an explicit shader definition.
+        let scripted = Shader::default();
+        let (contents, _) = source_face_collision_flags(&face, Some(&scripted));
+        let contents = contents as u32;
+        assert_ne!(contents & SOURCE_CONTENTS_SOLID, 0);
+        assert_ne!(contents & SOURCE_CONTENTS_OPAQUE, 0);
+        assert_ne!(contents & 0x0800_0000, 0);
+
+        // A real gameplay content class is different: playerclip must remain a
+        // clip volume, not inherit the ordinary SOLID bit from the implicit base.
+        let clip_face = MapFace {
+            shader: "textures/common/playerclip".into(),
+            trailing: vec![SOURCE_CONTENTS_PLAYERCLIP as f64, 0.0, 0.0],
+            ..face
+        };
+        let (contents, _) = source_face_collision_flags(&clip_face, None);
+        let contents = contents as u32;
+        assert_eq!(contents & SOURCE_CONTENTS_SOLID, 0);
+        assert_ne!(contents & SOURCE_CONTENTS_PLAYERCLIP, 0);
+    }
+
+    #[test]
+    fn source_map_world_ambient_and_minlight_match_q3map2_keys() {
+        let mut world = jka_assets::map::MapEntity::default();
+        world.properties.insert("classname".into(), "worldspawn".into());
+        world.properties.insert("_color".into(), "0.5 1 0.25".into());
+        world.properties.insert("_ambient".into(), "51".into());
+        world.properties.insert("_minlight".into(), "25.5".into());
+        let lighting = map_world_lighting(&world);
+        assert_eq!(lighting.ambient, [0.1, 0.2, 0.05]);
+        assert_eq!(lighting.minlight, [0.05, 0.1, 0.025]);
+
+        let mut alias = jka_assets::map::MapEntity::default();
+        alias.properties.insert("ambient".into(), "25.5".into());
+        let lighting = map_world_lighting(&alias);
+        assert_eq!(lighting.ambient, [0.1, 0.1, 0.1]);
+    }
+
+    #[test]
+    fn source_map_light_uses_authored_scale_color_and_linear_flag() {
+        let mut entity = jka_assets::map::MapEntity::default();
+        entity.properties.insert("classname".into(), "light".into());
+        entity.properties.insert("origin".into(), "64 32 16".into());
+        entity.properties.insert("_color".into(), "1 0 0".into());
+        entity.properties.insert("_light".into(), "450".into());
+        entity.properties.insert("scale".into(), "0.5".into());
+        entity.properties.insert("spawnflags".into(), "1".into());
+        entity.properties.insert("fade".into(), "2".into());
+
+        let light = map_dynamic_light(&entity).expect("light entity");
+        assert_eq!(light.color, [1.0, 0.0, 0.0]);
+        assert_eq!(light.falloff, DynamicLightFalloff::Linear);
+        assert!(light.surface_lighting);
+        let photons = 450.0 * 0.5 * Q3MAP_POINT_SCALE;
+        assert!((light.intensity - photons / Q3MAP_LIGHTMAP_BYTE_SCALE).abs() < 1e-3);
+        assert!((light.radius - photons * Q3MAP_LINEAR_SCALE / 2.0).abs() < 1e-3);
+        assert!(!light.angle_attenuation);
+        assert_eq!(light.color, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn source_map_point_light_uses_q3map2_photon_scale_and_fast_envelope() {
+        let mut entity = jka_assets::map::MapEntity::default();
+        entity.properties.insert("classname".into(), "light".into());
+        entity.properties.insert("origin".into(), "-24 128 400".into());
+        entity.properties.insert("light".into(), "300".into());
+
+        let light = map_dynamic_light(&entity).expect("light entity");
+        let photons = 300.0 * Q3MAP_POINT_SCALE;
+        assert_eq!(light.color, [1.0, 1.0, 1.0]);
+        assert_eq!(light.falloff, DynamicLightFalloff::InverseSquare);
+        assert!(light.angle_attenuation);
+        assert_eq!(light.angle_scale, 0.0);
+        assert_eq!(light.extra_distance, 0.0);
+        assert!((light.intensity - photons / Q3MAP_LIGHTMAP_BYTE_SCALE).abs() < 1e-3);
+        assert!((light.radius - photons.sqrt()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn source_map_spawn_yaw_uses_radians() {
+        let source = format!(
+            "{}\n{{\n\"classname\" \"info_player_deathmatch\"\n\"origin\" \"16 32 48\"\n\"angle\" \"90\"\n}}\n",
+            legacy_box_source("test/ceiling")
+        );
+        let document = jka_assets::map::parse(&source).unwrap();
+        let spawns = map_spawn_points(&document);
+        assert_eq!(spawns.len(), 1);
+        assert!((spawns[0].yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
     }
 
     #[test]

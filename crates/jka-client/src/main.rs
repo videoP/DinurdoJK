@@ -17,16 +17,19 @@ mod cloud_noise;
 mod color_lut;
 mod config;
 mod console;
+mod download;
 mod fx;
 mod grass;
 mod keybinds;
 mod lightmap_atlas;
 mod logging;
+mod local_server;
 mod map_jobs;
 mod materials;
 mod net;
 mod ocean;
 mod player;
+mod pure;
 mod renderer;
 mod runtime;
 mod scene;
@@ -202,6 +205,17 @@ fn main() -> std::process::ExitCode {
                         stats.patches_skipped,
                         stats.degenerate_faces,
                         stats.skipped_brushes,
+                    );
+                    println!(
+                        "Source .map runtime prep: {} utility faces dropped, {} spatial chunks, {} geometry groups -> {} WGPU draw batches, spatial batching={}; {} gameplay collision brushes; brush reconstruction {:.2} ms on {} map worker(s)",
+                        stats.utility_faces_skipped,
+                        stats.spatial_chunks,
+                        stats.geometry_groups,
+                        stats.draw_batches,
+                        stats.spatial_batching,
+                        stats.collision_brushes,
+                        stats.reconstruction_ms,
+                        stats.worker_count,
                     );
                 }
                 // Ocean promotion audit: which authored faces become the FFT

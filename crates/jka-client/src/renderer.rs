@@ -15,7 +15,7 @@ use crate::{
     weather::{self, FroxelUniform, WeatherOcclusionCache, WeatherSurfaceUniform, WeatherSystem},
     ui::{
         self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofQuality, FogMode,
-        DynamicShadowsMode, EntityAmbientLightingMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PvsMode, RainIntensity,
+        DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PvsMode, RainIntensity,
         ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex, VsyncMode,
     },
 };
@@ -44,6 +44,11 @@ use winit::{dpi::PhysicalSize, event_loop::EventLoopProxy, window::Window};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
+// Hot gameplay HUD and short-lived chat/center-print geometry are isolated from
+// the retained UI. These buffers are intentionally small; a normal frame uses
+// only a few hundred vertices.
+const UI_DYNAMIC_BUFFER_BYTES: u64 = 512 * 1024;
+const UI_TRANSIENT_BUFFER_BYTES: u64 = 1024 * 1024;
 // AUTO uses a conservative vertex-equivalent cost for an extra draw call. This
 // intentionally biases toward the old coarse batches unless FULL PVS removes a
 // meaningful amount of geometry. The comparison is precomputed per BSP cluster.
@@ -179,6 +184,34 @@ pub enum DynamicModelAlphaMode {
     BlendUnlit,
     /// GL_DST_COLOR GL_ZERO: multiplies what is already drawn (FX filters).
     Modulate,
+    /// GL_DST_COLOR GL_SRC_COLOR: JKA 2x modulation (2 * source * destination).
+    Modulate2x,
+    /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
+    Darken,
+}
+
+const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 10] = [
+    DynamicModelAlphaMode::Opaque,
+    DynamicModelAlphaMode::Mask,
+    DynamicModelAlphaMode::MaskBlend,
+    DynamicModelAlphaMode::Modulate,
+    DynamicModelAlphaMode::Modulate2x,
+    DynamicModelAlphaMode::Darken,
+    DynamicModelAlphaMode::Blend,
+    DynamicModelAlphaMode::BlendUnlit,
+    DynamicModelAlphaMode::AdditiveOne,
+    DynamicModelAlphaMode::Additive,
+];
+
+/// Dynamic surfaces come from two geometry backends: transient CPU meshes
+/// (including FX such as saber blades) and GPU-skinned Ghoul2 meshes. The
+/// depth-writing phase must finish across *both* backends before any blended
+/// surface is submitted. Otherwise a CPU additive effect drawn first can be
+/// overwritten later by an opaque GPU-skinned player even when the effect is
+/// physically in front of the player.
+#[inline]
+fn dynamic_model_writes_depth(alpha_mode: DynamicModelAlphaMode) -> bool {
+    matches!(alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
 }
 
 #[repr(C)]
@@ -241,6 +274,9 @@ pub struct DynamicModelSurface {
     pub entity_num: u16,
     pub vertices: Arc<Vec<DynamicModelVertex>>,
     pub indices: Arc<Vec<u32>>,
+    /// JKA-space point used for classic BSP entity-lighting lookup. Effects and
+    /// other deliberately-unlit transient geometry leave this unset.
+    pub lighting_origin: Option<[f32; 3]>,
     /// Present only for r_ghoul2Skinning gpu. CPU geometry keeps this None.
     pub ghoul2_gpu: Option<Ghoul2GpuSkinning>,
     pub texture: Option<Arc<TextureData>>,
@@ -326,6 +362,14 @@ pub struct ClientFramePerf {
     pub dynamic_indices: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransientLight {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub radius: f32,
+    pub intensity: f32,
+}
+
 #[derive(Clone)]
 pub struct RenderSnapshot {
     pub camera: Camera,
@@ -334,6 +378,10 @@ pub struct RenderSnapshot {
     /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
     pub area_mask: Option<[u8; 32]>,
     pub dynamic_models: Arc<Vec<DynamicModelSurface>>,
+    /// Short-lived RE_AddLightToScene-style sources submitted by CGame/FX.
+    /// These stay separate from map-static lights so moving flashes do not
+    /// churn the cached local-shadow selection.
+    pub transient_lights: Arc<Vec<TransientLight>>,
     /// `None`: no CGame owns the scene (solo/offline), so inline models keep
     /// their compiled pose. `Some`: exactly the movers in the current
     /// snapshot are drawn, as OpenJK only draws bmodels CGame submits.
@@ -341,6 +389,11 @@ pub struct RenderSnapshot {
     pub dof_focus_target: f32,
     pub input_latency: Option<InputLatencySample>,
     pub client_perf: ClientFramePerf,
+    /// Small Copy-only HUD state that changes with simulation/input. This rides
+    /// the existing latest-snapshot mailbox instead of the retained UI command
+    /// queue, so high-rate HUD updates never clone console/menu state.
+    pub hud: Option<ui::HudState>,
+    pub movement_hud: ui::MovementHudState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -376,15 +429,13 @@ pub struct PostEffects {
     pub cloud_coverage: f32,
     pub cloud_height: f32,
     pub cloud_thickness: f32,
-    pub cloud_wind_speed: f32,
-    pub cloud_wind_direction: f32,
+    pub weather_wind: crate::ocean::OceanWind,
     pub cloud_shadows: bool,
     pub cloud_render_resolution: CloudRenderResolution,
     pub cloud_temporal: bool,
     pub cloud_temporal_depth_fix: bool,
     pub cloud_shear: f32,
     pub cloud_base_variation: f32,
-    pub cloud_wind_variation: bool,
     pub cloud_shape_evolution: bool,
     pub cloud_terrain_interaction: bool,
     pub cloud_empty_skip: bool,
@@ -454,9 +505,11 @@ pub enum RenderCommand {
         gpu_driven: bool,
         hiz_occlusion: bool,
     },
-    SetClusteredLighting(bool),
+    SetDynamicLighting(DynamicLightsMode),
+    SetMapLightSimulation(bool),
+    SetClassicWorldLighting { fullbright: bool, vertex_light: bool, lightmap_only: bool },
     SetEmissiveAreaLights(bool),
-    SetIrradianceVolume(bool),
+    SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
     SetLocalLightShadows(bool),
     SetPbrSettings {
@@ -484,7 +537,23 @@ pub enum RenderCommand {
         directory: PathBuf,
     },
     SetUi(UiSnapshot),
+    SetTransientUi {
+        chat_lines: Vec<ui::UiChatLine>,
+        center_print: Option<ui::UiCenterPrint>,
+        demo_timeline: Option<ui::DemoTimelineUi>,
+    },
+    SetUiTelemetry {
+        perf: ui::PerfStats,
+        threads: [ui::ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+    },
     SetEgui(Option<EguiRenderData>),
+    /// Developer Asset Viewer: ignore the loaded BSP and render preview
+    /// submissions over a clean black background behind egui.
+    SetAssetPreviewMode(bool),
+    /// Physical-pixel viewport reserved by egui for the live preview. Keeping
+    /// 3D rendering inside this rectangle prevents models/FX/materials from
+    /// being drawn underneath translucent browser panes.
+    SetAssetPreviewViewport(Option<[u32; 4]>),
     UnloadMap,
     LoadMap {
         request_id: u64,
@@ -671,15 +740,13 @@ fn render_thread_main(
         cloud_coverage: initial_ui.video.cloud_coverage,
         cloud_height: initial_ui.video.cloud_height,
         cloud_thickness: initial_ui.video.cloud_thickness,
-        cloud_wind_speed: initial_ui.video.cloud_wind_speed,
-        cloud_wind_direction: initial_ui.video.cloud_wind_direction,
+        weather_wind: initial_ui.video.weather_wind,
         cloud_shadows: initial_ui.video.cloud_shadows,
         cloud_render_resolution: initial_ui.video.cloud_render_resolution,
         cloud_temporal: initial_ui.video.cloud_temporal,
         cloud_temporal_depth_fix: initial_ui.video.cloud_temporal_depth_fix,
         cloud_shear: initial_ui.video.cloud_shear,
         cloud_base_variation: initial_ui.video.cloud_base_variation,
-        cloud_wind_variation: initial_ui.video.cloud_wind_variation,
         cloud_shape_evolution: initial_ui.video.cloud_shape_evolution,
         cloud_terrain_interaction: initial_ui.video.cloud_terrain_interaction,
         cloud_empty_skip: initial_ui.video.cloud_empty_skip,
@@ -707,17 +774,17 @@ fn render_thread_main(
     renderer.set_grass_precompute(initial_ui.video.grass_precompute);
     renderer.set_grass_mid_lod(initial_ui.video.grass_mid_lod);
     renderer.set_grass_front_to_back(initial_ui.video.grass_front_to_back);
-    renderer.set_ocean_settings(initial_ui.video.ocean_settings);
+    let mut initial_ocean_settings = initial_ui.video.ocean_settings;
+    initial_ocean_settings.wind = initial_ui.video.weather_wind;
+    renderer.set_ocean_settings(initial_ocean_settings);
     renderer.set_ocean_enabled(initial_ui.video.ocean);
     renderer.set_gpu_timings(initial_ui.video.gpu_timings);
     renderer.set_ghoul2_batch_draws(initial_ui.video.ghoul2_batch_draws);
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
-    renderer.set_clustered_lighting(initial_ui.video.clustered_lighting);
+    renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
+    renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
     renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
-    renderer.set_irradiance_volume(matches!(
-        initial_ui.video.entity_ambient_lighting,
-        EntityAmbientLightingMode::BevyIrradianceVolume
-    ));
+    renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
     renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
     renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
     renderer.set_pbr_settings(
@@ -730,6 +797,7 @@ fn render_thread_main(
     renderer.set_planar_reflection_debug(initial_ui.video.planar_reflection_debug);
     let mut perf_trace = initial_ui.video.perf_trace;
     renderer.set_ui(initial_ui);
+    renderer.set_dynamic_hud(snapshot.hud, snapshot.movement_hud);
     println!(
         "[RENDER INIT] ready after applying video state {:.1} ms total",
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
@@ -858,14 +926,20 @@ fn render_thread_main(
                     }) => {
                         renderer.set_gpu_visibility(gpu_driven, hiz_occlusion);
                     }
-                    Ok(RenderCommand::SetClusteredLighting(enabled)) => {
-                        renderer.set_clustered_lighting(enabled);
+                    Ok(RenderCommand::SetDynamicLighting(mode)) => {
+                        renderer.set_dynamic_lighting(mode);
+                    }
+                    Ok(RenderCommand::SetMapLightSimulation(enabled)) => {
+                        renderer.set_map_light_simulation(enabled);
+                    }
+                    Ok(RenderCommand::SetClassicWorldLighting { fullbright, vertex_light, lightmap_only }) => {
+                        renderer.set_classic_world_lighting(fullbright, vertex_light, lightmap_only);
                     }
                     Ok(RenderCommand::SetEmissiveAreaLights(enabled)) => {
                         renderer.set_emissive_area_lights(enabled);
                     }
-                    Ok(RenderCommand::SetIrradianceVolume(enabled)) => {
-                        renderer.set_irradiance_volume(enabled);
+                    Ok(RenderCommand::SetEntityAmbientLighting(mode)) => {
+                        renderer.set_entity_ambient_lighting(mode);
                     }
                     Ok(RenderCommand::SetVoxelProbeGi(enabled)) => {
                         renderer.set_voxel_probe_gi(enabled);
@@ -910,7 +984,22 @@ fn render_thread_main(
                         renderer.request_screenshot(directory)
                     }
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::SetTransientUi { chat_lines, center_print, demo_timeline }) => {
+                        renderer.set_transient_ui(chat_lines, center_print, demo_timeline);
+                    }
+                    Ok(RenderCommand::SetUiTelemetry { perf, threads }) => {
+                        renderer.set_ui_telemetry(perf, threads);
+                    }
                     Ok(RenderCommand::SetEgui(frame)) => renderer.set_egui(frame),
+                    Ok(RenderCommand::SetAssetPreviewMode(enabled)) => {
+                        renderer.asset_preview_mode = enabled;
+                        if !enabled {
+                            renderer.asset_preview_viewport = None;
+                        }
+                    }
+                    Ok(RenderCommand::SetAssetPreviewViewport(viewport)) => {
+                        renderer.asset_preview_viewport = viewport;
+                    }
                     Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
                     Ok(RenderCommand::LoadMap {
                         request_id,
@@ -978,6 +1067,9 @@ fn render_thread_main(
                 }
                 motion_camera_changed_at = now;
             }
+            // HUD input/velocity/health are mailbox state just like the camera:
+            // update only the tiny hot vertex buffer when they actually change.
+            renderer.set_dynamic_hud(next.hud, next.movement_hud);
             snapshot = next;
         }
 
@@ -1006,6 +1098,7 @@ fn render_thread_main(
                 snapshot.player_position,
                 snapshot.area_mask.as_ref(),
                 snapshot.dynamic_models.as_slice(),
+                snapshot.transient_lights.as_slice(),
                 snapshot.dof_focus_target,
                 &motion_reference_camera,
                 motion_camera_sample_dt,
@@ -1075,7 +1168,16 @@ fn render_thread_main(
                 }
             }
             Err(RenderError::Lost | RenderError::Outdated) => renderer.reconfigure(),
-            Err(RenderError::Timeout | RenderError::Occluded) => {}
+            Err(RenderError::Timeout) => {}
+            Err(RenderError::Occluded) => {
+                // An occluded/minimized/hidden surface cannot make forward progress
+                // by spinning at uncapped render speed. In particular, startup used
+                // to hold the HWND hidden until the first successful present, making
+                // this path a self-sustaining busy loop. RendererReady now reveals
+                // deliberately hidden startup/restart windows; this small backoff
+                // also keeps genuinely occluded windows from burning a CPU core.
+                thread::sleep(Duration::from_millis(8));
+            }
             Err(RenderError::Validation) => {
                 let _ = proxy.send_event(UserEvent::RendererError(
                     "GPU surface validation error".into(),
@@ -1166,6 +1268,17 @@ fn render_thread_main(
             let gpu_ms = |pass: GpuPass| {
                 gpu_value(pass).map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"))
             };
+            let dynamic_model_gpu = match (
+                gpu_value(GpuPass::DynamicModels),
+                gpu_value(GpuPass::DynamicModelsTranslucent),
+            ) {
+                (Some(opaque), Some(translucent)) => Some(opaque + translucent),
+                (Some(opaque), None) => Some(opaque),
+                (None, Some(translucent)) => Some(translucent),
+                (None, None) => None,
+            };
+            let dynamic_model_ms = dynamic_model_gpu
+                .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
             let grass_prepare_gpu = gpu_value(GpuPass::GrassPrepare);
             let grass_draw_gpu = gpu_value(GpuPass::Grass);
             let grass_total_gpu = match (grass_prepare_gpu, grass_draw_gpu) {
@@ -1221,10 +1334,11 @@ fn render_thread_main(
                 client.dynamic_indices,
             );
             println!(
-                "[JKA PERF GPU] frame={}ms world={}ms dyn_models={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
+                "[JKA PERF GPU] frame={}ms world={}ms dyn_models={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::World),
-                gpu_ms(GpuPass::DynamicModels),
+                dynamic_model_ms,
+                gpu_ms(GpuPass::OceanOptics),
                 grass_total_ms,
                 gpu_ms(GpuPass::GrassPrepare),
                 gpu_ms(GpuPass::Grass),
@@ -1333,13 +1447,14 @@ fn render_thread_main(
                     },
                 );
             println!(
-                "[JKA PERF STATE] camera=[{:.2},{:.2},{:.2}] yaw={:.5} pitch={:.5} point={} area={} gi={} world_path={} shader={} pipeline_variant={} cached_variants={} planar={} planar_active={} lights_total={} point_sources={} area_sources={}",
+                "[JKA PERF STATE] camera=[{:.2},{:.2},{:.2}] yaw={:.5} pitch={:.5} dlights={} point={} area={} gi={} world_path={} shader={} pipeline_variant={} cached_variants={} planar={} planar_active={} lights_total={} point_sources={} area_sources={} transient_sources={} active_lights={}",
                 snapshot.camera.position.x,
                 snapshot.camera.position.y,
                 snapshot.camera.position.z,
                 snapshot.camera.yaw,
                 snapshot.camera.pitch,
-                u8::from(renderer.clustered_lighting_enabled),
+                renderer.dynamic_lights_mode.config_value(),
+                u8::from(renderer.point_lighting_enabled()),
                 u8::from(renderer.emissive_area_lights_enabled),
                 u8::from(renderer.voxel_probe_gi_enabled),
                 match renderer.frame_plan.world_path {
@@ -1358,6 +1473,8 @@ fn render_thread_main(
                 total_sources,
                 point_sources,
                 area_sources,
+                renderer.transient_lights.len(),
+                renderer.active_light_count(),
             );
             trace_started = Instant::now();
             trace_frames = 0;
@@ -1622,6 +1739,9 @@ struct PostUniform {
     film: PostFilmSettings,
     grain: PostGrainSettings,
     camera_fx: PostCameraFxSettings,
+    // rgb: authored OpenJK global fog color in legacy framebuffer/display space;
+    // w: depthForOpaque. taa_params.w carries the authored strength scale.
+    legacy_fog: [f32; 4],
     clouds: CloudRenderSettings,
     cloud_layer: CloudLayerSettings,
     cloud_sun: CloudSunSettings,
@@ -1731,8 +1851,10 @@ struct GpuPointLight {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LightingSettings {
     values: [u32; 4],        // enabled, light count, viewport width, viewport height
-    local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, reserved
-    feature_flags: [u32; 4], // emissive area lights, voxel/probe GI, point/entity lights, reflection quality
+    local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, transient-light start
+    feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode (0/1/2), reflection quality
+    map_ambient: [f32; 4],   // xyz q3map2 ambient RGB; w reserved
+    map_minlight: [f32; 4],  // source-.map q3map2 minlight RGB, normalized; w reserved
 }
 
 #[repr(C)]
@@ -2341,6 +2463,9 @@ struct Ghoul2GpuDrawUniform {
     origin: [f32; 4],
     color: [f32; 4],
     params: [u32; 4],
+    classic_ambient: [f32; 4],
+    classic_directed: [f32; 4],
+    classic_direction: [f32; 4],
 }
 
 struct Ghoul2GpuMesh {
@@ -2371,6 +2496,39 @@ struct Ghoul2PendingDraw {
     batch_hash: Option<u64>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DynamicEntityLightingUniform {
+    // x: EntityAmbientLightingMode (0=off, 1=BSP lightgrid, 2=irradiance volume).
+    // BSP lightgrid is applied during dynamic-model preparation (CPU vertices)
+    // or in the Ghoul2 vertex shader (GPU skinning); mode 2 retains the legacy
+    // placeholder until dynamic models sample the actual irradiance volume.
+    values: [u32; 4],
+    // Self-applied Legacy fog, see md3.wgsl apply_self_legacy_fog.
+    legacy_fog: EntityLegacyFog,
+}
+
+/// Legacy fog applied in the entity/grass shaders. Zeroed (mode 0) disables it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub(crate) struct EntityLegacyFog {
+    /// Linear RGB, depthForOpaque.
+    pub color_depth: [f32; 4],
+    /// x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    pub params: [f32; 4],
+}
+
+impl DynamicEntityLightingUniform {
+    fn new(mode: EntityAmbientLightingMode, legacy_fog: EntityLegacyFog) -> Self {
+        let value = match mode {
+            EntityAmbientLightingMode::Off => 0,
+            EntityAmbientLightingMode::BspLightgridClassic => 1,
+            EntityAmbientLightingMode::BevyIrradianceVolume => 2,
+        };
+        Self { values: [value, 0, 0, 0], legacy_fog }
+    }
+}
+
 struct DynamicGpuTexture {
     _image: GpuImage,
     bind_group: wgpu::BindGroup,
@@ -2389,6 +2547,11 @@ struct DynamicPreparedDraw {
 /// The renderer still knows nothing about demo/network provenance or JKA state.
 struct DynamicModelRenderer {
     texture_layout: wgpu::BindGroupLayout,
+    entity_lighting_buffer: wgpu::Buffer,
+    entity_ambient_lighting: EntityAmbientLightingMode,
+    entity_legacy_fog: EntityLegacyFog,
+    /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
+    legacy_fog_compiled: bool,
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     opaque_pipeline: wgpu::RenderPipeline,
@@ -2399,6 +2562,8 @@ struct DynamicModelRenderer {
     additive_pipeline: wgpu::RenderPipeline,
     blend_unlit_pipeline: wgpu::RenderPipeline,
     modulate_pipeline: wgpu::RenderPipeline,
+    modulate2x_pipeline: wgpu::RenderPipeline,
+    darken_pipeline: wgpu::RenderPipeline,
     skin_layout: wgpu::BindGroupLayout,
     skin_pipeline_layout: wgpu::PipelineLayout,
     skin_shader: wgpu::ShaderModule,
@@ -2410,6 +2575,14 @@ struct DynamicModelRenderer {
     skin_additive_pipeline: wgpu::RenderPipeline,
     skin_blend_unlit_pipeline: wgpu::RenderPipeline,
     skin_modulate_pipeline: wgpu::RenderPipeline,
+    skin_modulate2x_pipeline: wgpu::RenderPipeline,
+    skin_darken_pipeline: wgpu::RenderPipeline,
+    // Depth-writing entities in the single-sample scene depth prepass. These
+    // target the fixed prepass formats, so they never depend on MSAA/HDR.
+    prepass_pipeline: wgpu::RenderPipeline,
+    prepass_mask_pipeline: wgpu::RenderPipeline,
+    skin_prepass_pipeline: wgpu::RenderPipeline,
+    skin_prepass_mask_pipeline: wgpu::RenderPipeline,
     repeat_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
     fallback_bind_group: wgpu::BindGroup,
@@ -2454,7 +2627,19 @@ impl DynamicModelRenderer {
     ) -> Self {
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA dynamic model texture layout"),
-            entries: &[texture_entry(0), sampler_entry(1)],
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let entity_lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA dynamic model entity lighting uniform"),
+            contents: bytemuck::bytes_of(&DynamicEntityLightingUniform::new(
+                EntityAmbientLightingMode::Off,
+                EntityLegacyFog::default(),
+            )),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JKA dynamic model pipeline layout"),
@@ -2513,6 +2698,10 @@ impl DynamicModelRenderer {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&clamp_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: entity_lighting_buffer.as_entire_binding(),
+                },
             ],
         });
         let vertex_capacity = 4096;
@@ -2558,25 +2747,47 @@ impl DynamicModelRenderer {
             ],
         });
 
-        let opaque_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
-        let mask_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Mask);
-        let blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Blend);
-        let mask_blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
-        let additive_one_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
-        let additive_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Additive);
-        let blend_unlit_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
-        let modulate_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
-        let skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
-        let skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
-        let skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
-        let skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
-        let skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
-        let skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
-        let skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
-        let skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+        let opaque_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Opaque, false);
+        let mask_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Mask, false);
+        let blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Blend, false);
+        let mask_blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, false);
+        let additive_one_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, false);
+        let additive_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Additive, false);
+        let blend_unlit_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, false);
+        let modulate_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate, false);
+        let modulate2x_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, false);
+        let darken_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Darken, false);
+        let skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque, false);
+        let skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask, false);
+        let skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend, false);
+        let skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, false);
+        let skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, false);
+        let skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive, false);
+        let skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, false);
+        let skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate, false);
+        let skin_modulate2x_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, false);
+        let skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken, false);
+        let md3_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+        };
+        let skin_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
+        };
+        let prepass_pipeline = create_entity_prepass_pipeline(device, &pipeline_layout, &shader, md3_vertex_layout.clone(), false, "JKA dynamic model depth prepass pipeline");
+        let prepass_mask_pipeline = create_entity_prepass_pipeline(device, &pipeline_layout, &shader, md3_vertex_layout, true, "JKA dynamic model alpha-test depth prepass pipeline");
+        let skin_prepass_pipeline = create_entity_prepass_pipeline(device, &skin_pipeline_layout, &skin_shader, skin_vertex_layout.clone(), false, "JKA Ghoul2 GPU skin depth prepass pipeline");
+        let skin_prepass_mask_pipeline = create_entity_prepass_pipeline(device, &skin_pipeline_layout, &skin_shader, skin_vertex_layout, true, "JKA Ghoul2 GPU skin alpha-test depth prepass pipeline");
 
         Self {
             texture_layout,
+            entity_lighting_buffer,
+            entity_ambient_lighting: EntityAmbientLightingMode::Off,
+            entity_legacy_fog: EntityLegacyFog::default(),
+            legacy_fog_compiled: false,
             pipeline_layout,
             shader,
             opaque_pipeline,
@@ -2587,6 +2798,8 @@ impl DynamicModelRenderer {
             additive_pipeline,
             blend_unlit_pipeline,
             modulate_pipeline,
+            modulate2x_pipeline,
+            darken_pipeline,
             skin_layout,
             skin_pipeline_layout,
             skin_shader,
@@ -2598,6 +2811,12 @@ impl DynamicModelRenderer {
             skin_additive_pipeline,
             skin_blend_unlit_pipeline,
             skin_modulate_pipeline,
+            skin_modulate2x_pipeline,
+            skin_darken_pipeline,
+            prepass_pipeline,
+            prepass_mask_pipeline,
+            skin_prepass_pipeline,
+            skin_prepass_mask_pipeline,
             repeat_sampler,
             clamp_sampler,
             fallback_bind_group,
@@ -2690,22 +2909,26 @@ impl DynamicModelRenderer {
         surface_format: wgpu::TextureFormat,
         samples: u32,
     ) {
-        self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
-        self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask);
-        self.blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Blend);
-        self.mask_blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
-        self.additive_one_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
-        self.additive_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Additive);
-        self.blend_unlit_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
-        self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
-        self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
-        self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
-        self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
-        self.skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend);
-        self.skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne);
-        self.skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
-        self.skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
-        self.skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
+        self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
+        self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
+        self.blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
+        self.mask_blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, self.legacy_fog_compiled);
+        self.additive_one_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, self.legacy_fog_compiled);
+        self.additive_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Additive, self.legacy_fog_compiled);
+        self.blend_unlit_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, self.legacy_fog_compiled);
+        self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate, self.legacy_fog_compiled);
+        self.modulate2x_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, self.legacy_fog_compiled);
+        self.darken_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Darken, self.legacy_fog_compiled);
+        self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
+        self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
+        self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
+        self.skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, self.legacy_fog_compiled);
+        self.skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, self.legacy_fog_compiled);
+        self.skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive, self.legacy_fog_compiled);
+        self.skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, self.legacy_fog_compiled);
+        self.skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate, self.legacy_fog_compiled);
+        self.skin_modulate2x_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, self.legacy_fog_compiled);
+        self.skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken, self.legacy_fog_compiled);
     }
 
     fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required: u64) {
@@ -2798,6 +3021,7 @@ impl DynamicModelRenderer {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&image.view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.entity_lighting_buffer.as_entire_binding() },
                 ],
             });
             entry.insert(DynamicGpuTexture { _image: image, bind_group });
@@ -2806,11 +3030,51 @@ impl DynamicModelRenderer {
         Some(key)
     }
 
+    fn set_entity_ambient_lighting(
+        &mut self,
+        queue: &wgpu::Queue,
+        mode: EntityAmbientLightingMode,
+    ) {
+        self.entity_ambient_lighting = mode;
+        self.write_entity_lighting(queue);
+    }
+
+    /// Applies FogSystem::legacy_self_fog. Called only when fog settings or the
+    /// map change; pipelines are respecialized only when fog turns on or off.
+    fn set_legacy_fog(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+        fog: EntityLegacyFog,
+    ) {
+        self.entity_legacy_fog = fog;
+        self.write_entity_lighting(queue);
+        let enabled = fog.params[0] > 0.5;
+        if enabled != self.legacy_fog_compiled {
+            self.legacy_fog_compiled = enabled;
+            self.rebuild_pipelines(device, surface_format, samples);
+        }
+    }
+
+    fn write_entity_lighting(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.entity_lighting_buffer,
+            0,
+            bytemuck::bytes_of(&DynamicEntityLightingUniform::new(
+                self.entity_ambient_lighting,
+                self.entity_legacy_fog,
+            )),
+        );
+    }
+
     fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         surfaces: &[DynamicModelSurface],
+        classic_grid: Option<&scene::ClassicEntityLightGrid>,
     ) {
         self.draws.clear();
         self.skin_draws.clear();
@@ -2851,6 +3115,23 @@ impl DynamicModelRenderer {
 
         for surface in surfaces {
             let texture_key = self.ensure_texture(device, queue, surface.texture.as_ref());
+            let classic_light = if self.entity_ambient_lighting
+                == EntityAmbientLightingMode::BspLightgridClassic
+                && !matches!(
+                    surface.alpha_mode,
+                    DynamicModelAlphaMode::AdditiveOne
+                        | DynamicModelAlphaMode::Additive
+                        | DynamicModelAlphaMode::BlendUnlit
+                        | DynamicModelAlphaMode::Modulate
+                )
+            {
+                match (surface.lighting_origin, classic_grid) {
+                    (Some(origin), Some(grid)) => grid.sample_classic_entity_light(origin),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             if let Some(skin) = surface.ghoul2_gpu.as_ref() {
                 if skin.vertices.is_empty() || skin.indices.is_empty() || skin.bones.is_empty() {
                     continue;
@@ -2890,7 +3171,16 @@ impl DynamicModelRenderer {
                     axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
                     origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
                     color: skin.color,
-                    params: [bone_base, 0, 0, 0],
+                    params: [bone_base, u32::from(classic_light.is_some()), 0, 0],
+                    classic_ambient: classic_light
+                        .map(|light| [light.ambient[0], light.ambient[1], light.ambient[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_directed: classic_light
+                        .map(|light| [light.directed[0], light.directed[1], light.directed[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_direction: classic_light
+                        .map(|light| [light.direction[0], light.direction[1], light.direction[2], 0.0])
+                        .unwrap_or([0.0; 4]),
                 };
                 skin_pending.push(Ghoul2PendingDraw {
                     mesh_key,
@@ -2908,7 +3198,23 @@ impl DynamicModelRenderer {
             }
             let base_vertex = vertices.len() as u32;
             let first_index = indices.len() as u32;
-            vertices.extend_from_slice(surface.vertices.as_slice());
+            if let Some(light) = classic_light {
+                for source in surface.vertices.iter() {
+                    let normal = Vec3::from_array(source.normal).normalize_or_zero();
+                    let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
+                    let mut vertex = *source;
+                    for channel in 0..3 {
+                        let illumination =
+                            (light.ambient[channel] + incoming * light.directed[channel])
+                                .clamp(0.0, 255.0)
+                                / 255.0;
+                        vertex.color[channel] *= illumination;
+                    }
+                    vertices.push(vertex);
+                }
+            } else {
+                vertices.extend_from_slice(surface.vertices.as_slice());
+            }
             indices.extend(surface.indices.iter().map(|index| base_vertex.saturating_add(*index)));
             self.draws.push(DynamicPreparedDraw {
                 first_index,
@@ -3040,22 +3346,26 @@ impl DynamicModelRenderer {
         self.scratch_skin_pending = skin_pending;
     }
 
-    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
+    fn draw_phase<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+        depth_writing_phase: bool,
+    ) {
+        // Match the renderer-wide opaque-before-blended contract across both
+        // dynamic geometry backends. The phase split is also used by water:
+        // opaque/masked entities establish depth before the pre-water scene
+        // capture, while saber glow, smoke and every other non-depth-writing FX
+        // draw after the ocean surface/spray so water cannot paint over them.
         if !self.draws.is_empty() {
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_bind_group(0, camera, &[]);
 
-            for alpha_mode in [
-                DynamicModelAlphaMode::Opaque,
-                DynamicModelAlphaMode::Mask,
-                DynamicModelAlphaMode::MaskBlend,
-                DynamicModelAlphaMode::Modulate,
-                DynamicModelAlphaMode::Blend,
-                DynamicModelAlphaMode::BlendUnlit,
-                DynamicModelAlphaMode::AdditiveOne,
-                DynamicModelAlphaMode::Additive,
-            ] {
+            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
+                .into_iter()
+                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+            {
                 let pipeline = match alpha_mode {
                     DynamicModelAlphaMode::Opaque => &self.opaque_pipeline,
                     DynamicModelAlphaMode::Mask => &self.mask_pipeline,
@@ -3065,6 +3375,8 @@ impl DynamicModelRenderer {
                     DynamicModelAlphaMode::Additive => &self.additive_pipeline,
                     DynamicModelAlphaMode::BlendUnlit => &self.blend_unlit_pipeline,
                     DynamicModelAlphaMode::Modulate => &self.modulate_pipeline,
+                    DynamicModelAlphaMode::Modulate2x => &self.modulate2x_pipeline,
+                    DynamicModelAlphaMode::Darken => &self.darken_pipeline,
                 };
                 pass.set_pipeline(pipeline);
                 for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
@@ -3077,16 +3389,10 @@ impl DynamicModelRenderer {
 
         if !self.skin_draws.is_empty() {
             pass.set_bind_group(0, camera, &[]);
-            for alpha_mode in [
-                DynamicModelAlphaMode::Opaque,
-                DynamicModelAlphaMode::Mask,
-                DynamicModelAlphaMode::MaskBlend,
-                DynamicModelAlphaMode::Modulate,
-                DynamicModelAlphaMode::Blend,
-                DynamicModelAlphaMode::BlendUnlit,
-                DynamicModelAlphaMode::AdditiveOne,
-                DynamicModelAlphaMode::Additive,
-            ] {
+            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
+                .into_iter()
+                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+            {
                 let pipeline = match alpha_mode {
                     DynamicModelAlphaMode::Opaque => &self.skin_opaque_pipeline,
                     DynamicModelAlphaMode::Mask => &self.skin_mask_pipeline,
@@ -3096,6 +3402,8 @@ impl DynamicModelRenderer {
                     DynamicModelAlphaMode::Additive => &self.skin_additive_pipeline,
                     DynamicModelAlphaMode::BlendUnlit => &self.skin_blend_unlit_pipeline,
                     DynamicModelAlphaMode::Modulate => &self.skin_modulate_pipeline,
+                    DynamicModelAlphaMode::Modulate2x => &self.skin_modulate2x_pipeline,
+                    DynamicModelAlphaMode::Darken => &self.skin_darken_pipeline,
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(2, &self.skin_bind_group, &[]);
@@ -3114,6 +3422,73 @@ impl DynamicModelRenderer {
             }
         }
     }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
+        for depth_writing_phase in [true, false] {
+            self.draw_phase(pass, camera, depth_writing_phase);
+        }
+    }
+
+    /// Adds depth-writing entities to the scene depth prepass, making linear
+    /// depth the authoritative nearest-opaque depth. Fog and the other post
+    /// consumers then read each entity's own depth instead of the BSP behind it.
+    /// Requires `prepare` to have run for this frame.
+    fn draw_prepass<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
+        let prepass_modes = [
+            (DynamicModelAlphaMode::Opaque, &self.prepass_pipeline, &self.skin_prepass_pipeline),
+            (DynamicModelAlphaMode::Mask, &self.prepass_mask_pipeline, &self.skin_prepass_mask_pipeline),
+        ];
+        if !self.draws.is_empty() {
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_bind_group(0, camera, &[]);
+            for (alpha_mode, pipeline, _) in prepass_modes {
+                let mut bound = false;
+                for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+                    if !bound {
+                        pass.set_pipeline(pipeline);
+                        // Opaque depth never samples the texture; one bind keeps
+                        // the layout satisfied without per-draw state changes.
+                        pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                        bound = true;
+                    }
+                    if alpha_mode == DynamicModelAlphaMode::Mask {
+                        let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                        pass.set_bind_group(1, bind_group, &[]);
+                    }
+                    pass.draw_indexed(draw.first_index..draw.first_index.saturating_add(draw.index_count), 0, 0..1);
+                }
+            }
+        }
+
+        if !self.skin_draws.is_empty() {
+            pass.set_bind_group(0, camera, &[]);
+            for (alpha_mode, _, pipeline) in prepass_modes {
+                let mut bound = false;
+                for draw in self.skin_draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+                    let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };
+                    if !bound {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                        pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                        bound = true;
+                    }
+                    if alpha_mode == DynamicModelAlphaMode::Mask {
+                        let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                        pass.set_bind_group(1, bind_group, &[]);
+                    }
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(
+                        0..mesh.index_count,
+                        0,
+                        draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
+                    );
+                }
+            }
+        }
+    }
+
 }
 
 struct CloudNoiseResources {
@@ -3158,6 +3533,11 @@ struct WorldShaderVariantKey {
     pbr_companion_sampler: bool,
     pbr_vertex_lightgrid: bool,
     point_lights: bool,
+    map_light_simulation: bool,
+    source_map_world: bool,
+    legacy_dlights: bool,
+    vertex_dlights: bool,
+    clustered_lite_dlights: bool,
     area_lights: bool,
     irradiance_volume: bool,
     voxel_gi: bool,
@@ -3177,7 +3557,7 @@ impl WorldShaderVariantKey {
         }
     }
 
-    fn compilation_constants(self) -> [(&'static str, f64); 16] {
+    fn compilation_constants(self) -> [(&'static str, f64); 22] {
         [
             ("ENABLE_PBR", f64::from(u8::from(self.pbr))),
             ("ENABLE_POM", f64::from(u8::from(self.pom))),
@@ -3206,6 +3586,17 @@ impl WorldShaderVariantKey {
                 "ENABLE_POINT_LIGHTS",
                 f64::from(u8::from(self.point_lights)),
             ),
+            (
+                "ENABLE_MAP_LIGHT_SIMULATION",
+                f64::from(u8::from(self.map_light_simulation)),
+            ),
+            (
+                "ENABLE_SOURCE_MAP_WORLD",
+                f64::from(u8::from(self.source_map_world)),
+            ),
+            ("ENABLE_LEGACY_DLIGHTS", f64::from(u8::from(self.legacy_dlights))),
+            ("ENABLE_VERTEX_DLIGHTS", f64::from(u8::from(self.vertex_dlights))),
+            ("ENABLE_CLUSTERED_LITE_DLIGHTS", f64::from(u8::from(self.clustered_lite_dlights))),
             ("ENABLE_AREA_LIGHTS", f64::from(u8::from(self.area_lights))),
             ("ENABLE_IRRADIANCE_VOLUME", f64::from(u8::from(self.irradiance_volume))),
             ("ENABLE_VOXEL_GI", f64::from(u8::from(self.voxel_gi))),
@@ -3222,6 +3613,7 @@ impl WorldShaderVariantKey {
                 f64::from(u8::from(self.planar_reflections)),
             ),
             ("ENABLE_OCEAN", f64::from(u8::from(self.ocean))),
+            ("ENABLE_LEGACY_FOG", f64::from(u8::from(self.legacy_fog))),
         ]
     }
 
@@ -3253,6 +3645,21 @@ impl WorldShaderVariantKey {
         }
         if self.point_lights {
             enabled.push("point");
+        }
+        if self.source_map_world {
+            enabled.push("source-map");
+        }
+        if self.map_light_simulation {
+            enabled.push("map-light-sim");
+        }
+        if self.legacy_dlights {
+            enabled.push("legacy-dlight");
+        }
+        if self.vertex_dlights {
+            enabled.push("vertex-dlight");
+        }
+        if self.clustered_lite_dlights {
+            enabled.push("cluster-lite");
         }
         if self.area_lights {
             enabled.push("area");
@@ -3295,7 +3702,7 @@ struct FramePlan {
     use_clustered_lighting: bool,
 }
 
-const GPU_PASS_COUNT: usize = 11;
+const GPU_PASS_COUNT: usize = 13;
 const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 const GPU_PROFILER_SLOTS: usize = 3;
 const CULL_DIAGNOSTIC_READBACK_SLOTS: usize = 3;
@@ -3318,6 +3725,11 @@ enum GpuPass {
     GrassPrepare = 9,
     // Sub-timing inside World: dynamic MD3/GLM entities, including GPU Ghoul2 skinning.
     DynamicModels = 10,
+    // Sub-timing inside World: scene capture, absorption/caustics, composite.
+    OceanOptics = 11,
+    // Sub-timing inside World: non-depth-writing dynamic FX deferred until after
+    // ocean surface/spray composition so water cannot overpaint sabers/particles.
+    DynamicModelsTranslucent = 12,
 }
 
 impl GpuPass {
@@ -3739,6 +4151,7 @@ impl CullDiagnosticsReadback {
 #[derive(Debug, Clone, Copy)]
 struct InspectorVertex {
     position: [f32; 3],
+    normal: [f32; 3],
     uv: [f32; 2],
     lightmap_uv: [f32; 2],
 }
@@ -3854,7 +4267,13 @@ struct WorldDrawGroup {
 
 struct WorldPipelineVariant {
     pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    // OpenJK r_drawfog 1, and r_drawfog 2 local brush fog, redraw the final
+    // material result with a dedicated SRC_ALPHA/ONE_MINUS_SRC_ALPHA fog pass.
+    // Keyed by the authored material pipeline so the draw loop can switch to
+    // the matching cull/depth state without rebuilding a key at runtime.
+    fog_pass_pipelines: BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
     reflection_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    reflection_fog_pass_pipelines: BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
 }
 
 struct StaticLightGridGpu {
@@ -3895,6 +4314,7 @@ struct ReflectionProbeGpuSet {
 enum PlanarReflectorKind {
     Authored,
     Environment,
+    Ocean,
 }
 
 #[derive(Clone, Copy)]
@@ -3952,6 +4372,10 @@ struct InlineModelGpu {
 }
 
 struct WorldGpu {
+    /// Direct source-.map worlds have no compiled BSP/PVS. They therefore use
+    /// conservative per-batch frustum rejection on their 1024-unit spatial batches.
+    source_map: bool,
+    source_map_lighting: scene::SourceMapLighting,
     /// Linear average of this map's skybox faces. Cloud ambient is tinted with
     /// it so a desert, sunset or night sky does not leave the clouds lit by the
     /// reference's hardcoded blue.
@@ -3985,6 +4409,8 @@ struct WorldGpu {
     lighting_bind_group: wgpu::BindGroup,
     lighting_bind_group_lean: wgpu::BindGroup,
     _static_light_grid: StaticLightGridGpu,
+    /// CPU copy retained only for classic dynamic-entity lightgrid sampling.
+    entity_light_grid: Option<scene::ClassicEntityLightGrid>,
     voxel_probe_gi: VoxelProbeGiGpu,
     reflection_probes: ReflectionProbeGpuSet,
     froxel_bind_group: Option<wgpu::BindGroup>,
@@ -6102,6 +6528,8 @@ struct RenderTargets {
     motion_vector_view: wgpu::TextureView,
     _reflection_mask_texture: wgpu::Texture,
     reflection_mask_view: wgpu::TextureView,
+    _ssr_visibility_texture: Option<wgpu::Texture>,
+    ssr_visibility_view: Option<wgpu::TextureView>,
     linear_depth_mip_views: Vec<wgpu::TextureView>,
     linear_depth_mip_count: u32,
     _rain_haze_mask_texture: wgpu::Texture,
@@ -6111,6 +6539,7 @@ struct RenderTargets {
 }
 
 struct Renderer {
+    base: PathBuf,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -6140,6 +6569,8 @@ struct Renderer {
     grass_renderer: GrassRenderer,
     surface_sprite_effect_renderer: SurfaceSpriteEffectRenderer,
     ocean_layout: wgpu::BindGroupLayout,
+    ocean_optics_layout: wgpu::BindGroupLayout,
+    ocean_optics: crate::ocean::optics::Resources,
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
     ocean: Option<crate::ocean::OceanGpu>,
@@ -6165,15 +6596,24 @@ struct Renderer {
     surface_inspector_pipeline: wgpu::RenderPipeline,
     inspector_vertex_range: Option<std::ops::Range<u32>>,
     ui_pipeline: wgpu::RenderPipeline,
+    ui_texture_layout: wgpu::BindGroupLayout,
     ui_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
     _ui_splash: GpuImage,
     ui_splash_size: Option<[u32; 2]>,
+    ui_loading_image_key: Option<String>,
     ui_small_font_metrics: Option<ui::ProportionalFont>,
     _ui_font_sampler: wgpu::Sampler,
     ui_vertex_buffer: wgpu::Buffer,
     ui_vertex_count: u32,
+    ui_dynamic_vertex_buffer: wgpu::Buffer,
+    ui_dynamic_vertex_count: u32,
+    ui_dynamic_stable_vertex_count: usize,
+    ui_dynamic_vertices: Vec<UiVertex>,
+    ui_transient_vertex_buffer: wgpu::Buffer,
+    ui_transient_vertex_count: u32,
+    ui_transient_vertices: Vec<UiVertex>,
     ui_trace: bool,
     ui_state: UiSnapshot,
     egui_renderer: egui_wgpu::Renderer,
@@ -6181,6 +6621,8 @@ struct Renderer {
     egui_pixels_per_point: f32,
     egui_active: bool,
     egui_pending_free: Vec<egui::TextureId>,
+    asset_preview_mode: bool,
+    asset_preview_viewport: Option<[u32; 4]>,
     // Created only after opening a menu page that requests the live blurred/
     // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
     // compile or allocate this pass.
@@ -6229,15 +6671,13 @@ struct Renderer {
     cloud_coverage: f32,
     cloud_height: f32,
     cloud_thickness: f32,
-    cloud_wind_speed: f32,
-    cloud_wind_direction: f32,
+    weather_wind: crate::ocean::OceanWind,
     cloud_shadows_enabled: bool,
     cloud_render_resolution: CloudRenderResolution,
     cloud_temporal_enabled: bool,
     cloud_temporal_depth_fix: bool,
     cloud_shear: f32,
     cloud_base_variation: f32,
-    cloud_wind_variation: bool,
     cloud_shape_evolution: bool,
     cloud_terrain_interaction: bool,
     cloud_empty_skip: bool,
@@ -6284,7 +6724,13 @@ struct Renderer {
     compact_group_scratch: Vec<bool>,
     gpu_driven_enabled: bool,
     hiz_occlusion_enabled: bool,
+    dynamic_lights_mode: DynamicLightsMode,
     clustered_lighting_enabled: bool,
+    map_light_simulation_enabled: bool,
+    classic_fullbright: bool,
+    classic_vertex_light: bool,
+    classic_lightmap_only: bool,
+    transient_lights: Vec<TransientLight>,
     emissive_area_lights_enabled: bool,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
@@ -6360,6 +6806,9 @@ struct Renderer {
     ssr_temporal_pipeline: wgpu::RenderPipeline,
     ssr_temporal_buffer: wgpu::Buffer,
     ssr_temporal_bind_groups: Option<[wgpu::BindGroup; 2]>,
+    _ssr_visibility_layout: Option<wgpu::BindGroupLayout>,
+    ssr_visibility_pipeline: Option<wgpu::RenderPipeline>,
+    ssr_visibility_bind_group: Option<wgpu::BindGroup>,
     bloom_layout: wgpu::BindGroupLayout,
     bloom_extract_pipeline: wgpu::RenderPipeline,
     bloom_downsample_pipeline: wgpu::RenderPipeline,
@@ -7001,9 +7450,9 @@ impl Renderer {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA clustered-light render layout (lean baseline)"),
                 entries: &[
-                    storage_buffer_entry(0, true, wgpu::ShaderStages::FRAGMENT),
+                    storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                     storage_buffer_entry(1, true, wgpu::ShaderStages::FRAGMENT),
-                    uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                    uniform_entry(2, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                     uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
                     depth_cube_array_texture_entry(4),
                     comparison_sampler_entry(5),
@@ -7016,9 +7465,9 @@ impl Renderer {
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA clustered-light render layout"),
             entries: &[
-                storage_buffer_entry(0, true, wgpu::ShaderStages::FRAGMENT),
+                storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 storage_buffer_entry(1, true, wgpu::ShaderStages::FRAGMENT),
-                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(2, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
                 depth_cube_array_texture_entry(4),
                 comparison_sampler_entry(5),
@@ -7053,15 +7502,8 @@ impl Renderer {
                     depth_array_texture_entry(7),
                 ],
             });
-        // Group 5 is intentionally kept as an empty placeholder so the ocean
-        // bindings can remain group 6 without renumbering every BSP pipeline.
-        // The old per-BSP cloud-shadow receiver path was dead; projected cloud
-        // shadows are resolved in post.wgsl from reconstructed world position.
-        let cloud_shadow_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("JKA unused BSP group 5 placeholder"),
-                entries: &[],
-            });
+        // Group 5 holds an immutable pre-water scene snapshot.
+        let cloud_shadow_layout = crate::ocean::optics::layout(&device);
         let shadow_caster_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA cascaded-shadow caster layout"),
@@ -7166,6 +7608,8 @@ impl Renderer {
                     values: [0, 0, config.width.max(1), config.height.max(1)],
                     local_shadows: [0, 0, LOCAL_SHADOW_MAP_SIZE, 0],
                     feature_flags: [0; 4],
+                    map_ambient: [0.0; 4],
+                    map_minlight: [0.0; 4],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
@@ -7216,9 +7660,11 @@ impl Renderer {
             ),
         });
         let ocean_layout = crate::ocean::OceanGpu::create_render_layout(&device);
+        let ocean_optics = crate::ocean::optics::Resources::new(&device,
+            &cloud_shadow_layout, &ocean_layout, (1, 1, msaa_samples, config.format));
         let ocean_inert_bind_group =
             crate::ocean::OceanGpu::create_inert_render_bind_group(&device, &ocean_layout);
-        let missing_texture_data = missing_texture_data();
+        let missing_texture_data = crate::materials::missing_texture_data();
         let ocean_spray_albedo_data = load_texture_asset_or_missing(
             base,
             game,
@@ -7318,7 +7764,7 @@ impl Renderer {
         let (ui_small_font_data, ui_small_font_metrics) =
             load_ui_proportional_font(base, game, "ocr_a");
         let ui_small_font = upload_texture(&device, &queue, &ui_small_font_data);
-        let (ui_splash_data, ui_splash_size) = load_ui_splash_texture(base, game);
+        let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
         let ui_splash = upload_texture(&device, &queue, &ui_splash_data);
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA UI font sampler"),
@@ -7353,8 +7799,20 @@ impl Renderer {
             ],
         });
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("JKA UI dynamic vertices"),
+            label: Some("JKA retained UI vertices"),
             size: UI_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_dynamic_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA hot HUD vertices"),
+            size: UI_DYNAMIC_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_transient_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA transient UI vertices"),
+            size: UI_TRANSIENT_BUFFER_BYTES,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -7468,6 +7926,7 @@ impl Renderer {
                 depth_texture_entry(22),
                 texture_entry(23),
                 storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
+                unfilterable_texture_entry(25),
             ],
         });
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -7572,6 +8031,9 @@ impl Renderer {
                     uniform_entry(8, wgpu::ShaderStages::FRAGMENT),
                     // Cached per-surface reflection eligibility from the depth prepass.
                     texture_entry(9),
+                    // Resolved final scene depth used to reject a BSP reflection
+                    // when a dynamic entity/ocean surface owns the pixel instead.
+                    unfilterable_texture_entry(10),
                 ],
             });
         let ssr_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -7589,6 +8051,12 @@ impl Renderer {
             &ssr_temporal_pipeline_layout,
             &ssr_temporal_shader,
         );
+        let ssr_visibility_resources =
+            create_ssr_visibility_resources(&device, &targets, msaa_samples);
+        let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
+            ssr_visibility_resources.map_or((None, None, None), |(layout, pipeline, bind_group)| {
+                (Some(layout), Some(pipeline), Some(bind_group))
+            });
 
         // Gamma is common even in otherwise-minimal configurations. Keep a tiny
         // specialized pipeline for the gamma-only case so advanced post features
@@ -7768,6 +8236,7 @@ impl Renderer {
                     dof_focus_distance: 4096.0,
                     dof_quality: DofQuality::Adaptive.shader_value(),
                 },
+                legacy_fog: [0.0; 4],
                 clouds: CloudRenderSettings {
                     values: [0.0, 0.0, 0.55, 0.55],
                 },
@@ -7921,6 +8390,7 @@ impl Renderer {
             &shadow_resources.weather_sampler,
             &shadow_resources.weather_surface_buffer,
             &targets.reflection_mask_view,
+            targets.ssr_visibility_view.as_ref(),
         );
 
         let post_bind_groups = std::array::from_fn(|history_index| {
@@ -7967,6 +8437,10 @@ impl Renderer {
                             &targets.ao_depth_view,
                             &targets.reflection_mask_view,
                             &auto_exposure_state_buffer,
+                            targets
+                                .ssr_visibility_view
+                                .as_ref()
+                                .unwrap_or(&white.view),
                         )
                     })
                 })
@@ -8203,6 +8677,7 @@ impl Renderer {
             .map_err(|error| format!("could not start screenshot worker: {error}"))?;
 
         Ok(Self {
+            base: base.to_path_buf(),
             window,
             surface,
             device,
@@ -8231,6 +8706,8 @@ impl Renderer {
             grass_renderer,
             surface_sprite_effect_renderer,
             ocean_layout,
+            ocean_optics_layout: cloud_shadow_layout,
+            ocean_optics,
             ocean_inert_bind_group,
             ocean_spray_albedo,
             ocean: None,
@@ -8254,15 +8731,24 @@ impl Renderer {
             surface_inspector_pipeline,
             inspector_vertex_range: None,
             ui_pipeline,
+            ui_texture_layout,
             ui_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
             _ui_splash: ui_splash,
             ui_splash_size,
+            ui_loading_image_key: None,
             ui_small_font_metrics,
             _ui_font_sampler: ui_font_sampler,
             ui_vertex_buffer,
             ui_vertex_count: 0,
+            ui_dynamic_vertex_buffer,
+            ui_dynamic_vertex_count: 0,
+            ui_dynamic_stable_vertex_count: 0,
+            ui_dynamic_vertices: Vec::with_capacity(2048),
+            ui_transient_vertex_buffer,
+            ui_transient_vertex_count: 0,
+            ui_transient_vertices: Vec::with_capacity(4096),
             ui_trace: env_flag("JKA_UI_TRACE"),
             ui_state: UiSnapshot::default(),
             egui_renderer,
@@ -8270,6 +8756,8 @@ impl Renderer {
             egui_pixels_per_point: 1.0,
             egui_active: false,
             egui_pending_free: Vec::new(),
+            asset_preview_mode: false,
+            asset_preview_viewport: None,
             menu_backdrop: None,
             world: None,
             dynamic_model_renderer,
@@ -8315,15 +8803,13 @@ impl Renderer {
             cloud_coverage: 0.6,
             cloud_height: 4600.0,
             cloud_thickness: 1200.0,
-            cloud_wind_speed: 167.0,
-            cloud_wind_direction: 220.0,
+            weather_wind: crate::ocean::OceanWind { speed: 167.0, direction: 220.0, gust: 0.2, shift: 0.0 },
             cloud_shadows_enabled: true,
             cloud_render_resolution: CloudRenderResolution::Full,
             cloud_temporal_enabled: true,
             cloud_temporal_depth_fix: true,
             cloud_shear: 0.2,
             cloud_base_variation: 1.0,
-            cloud_wind_variation: false,
             cloud_shape_evolution: false,
             cloud_terrain_interaction: false,
             cloud_empty_skip: false,
@@ -8368,7 +8854,13 @@ impl Renderer {
             compact_group_scratch: Vec::new(),
             gpu_driven_enabled: false,
             hiz_occlusion_enabled: false,
+            dynamic_lights_mode: DynamicLightsMode::Off,
             clustered_lighting_enabled: false,
+            map_light_simulation_enabled: false,
+            classic_fullbright: false,
+            classic_vertex_light: false,
+            classic_lightmap_only: false,
+            transient_lights: Vec::new(),
             emissive_area_lights_enabled: false,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
@@ -8444,6 +8936,9 @@ impl Renderer {
             ssr_temporal_pipeline,
             ssr_temporal_buffer,
             ssr_temporal_bind_groups,
+            _ssr_visibility_layout: ssr_visibility_layout,
+            ssr_visibility_pipeline,
+            ssr_visibility_bind_group,
             bloom_layout,
             bloom_extract_pipeline,
             bloom_downsample_pipeline,
@@ -8679,7 +9174,102 @@ impl Renderer {
 
     fn set_ui(&mut self, ui_state: UiSnapshot) {
         self.ui_state = ui_state;
+        self.sync_ui_loading_background();
         self.rebuild_ui();
+    }
+
+    fn sync_ui_loading_background(&mut self) {
+        let request = self.ui_state.loading.as_ref().and_then(|loading| {
+            let stem = loading_levelshot_stem(&loading.map_name)?;
+            Some((stem, loading.active_game_dir.as_deref().map(Path::new)))
+        });
+        let desired_key = request.as_ref().map(|(stem, game)| {
+            format!(
+                "{}\n{}",
+                game.map(|path| path.display().to_string()).unwrap_or_default(),
+                stem
+            )
+        });
+        if self.ui_loading_image_key == desired_key {
+            return;
+        }
+        let (data, size) = match request {
+            Some((ref stem, game)) => {
+                load_ui_loading_texture(&self.base, game, Some(stem.as_str()))
+            }
+            None => load_ui_loading_texture(&self.base, None, None),
+        };
+        let image = upload_texture(&self.device, &self.queue, &data);
+        self.ui_splash_size = size;
+        self._ui_splash = image;
+        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA UI font bind group"),
+            layout: &self.ui_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_splash.view),
+                },
+            ],
+        });
+        self.ui_loading_image_key = desired_key;
+    }
+
+    fn set_dynamic_hud(&mut self, hud: Option<ui::HudState>, movement_hud: ui::MovementHudState) {
+        let hud_changed = self.ui_state.hud != hud;
+        let movement_changed = self.ui_state.movement_hud != movement_hud;
+        if !hud_changed && !movement_changed {
+            return;
+        }
+        self.ui_state.hud = hud;
+        self.ui_state.movement_hud = movement_hud;
+        if hud_changed {
+            // HUD text/geometry can change size, so rebuild the stable prefix and
+            // then append the current movement tail.
+            self.rebuild_dynamic_ui();
+        } else {
+            // The common path: only velocity/input/view state changed. Preserve
+            // the stable prefix and rewrite the tiny movement tail in place.
+            self.rebuild_movement_ui();
+        }
+    }
+
+    fn set_transient_ui(
+        &mut self,
+        chat_lines: Vec<ui::UiChatLine>,
+        center_print: Option<ui::UiCenterPrint>,
+        demo_timeline: Option<ui::DemoTimelineUi>,
+    ) {
+        self.ui_state.chat_lines = chat_lines;
+        self.ui_state.center_print = center_print;
+        self.ui_state.demo_timeline = demo_timeline;
+        self.rebuild_transient_ui();
+    }
+
+    fn set_ui_telemetry(
+        &mut self,
+        perf: ui::PerfStats,
+        threads: [ui::ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+    ) {
+        self.ui_state.perf = perf;
+        self.ui_state.threads = threads;
+        // Telemetry is part of the small volatile overlay batch. Rebuilding it
+        // never touches retained console/menu/scoreboard geometry.
+        if self.ui_state.video.draw_fps != 0 {
+            self.rebuild_transient_ui();
+        }
     }
 
     fn set_egui(&mut self, frame: Option<EguiRenderData>) {
@@ -8821,11 +9411,43 @@ impl Renderer {
     /// The renderer-drawn overlay (frame rate readout, perf graphs, surface
     /// inspector, background bake progress) as its own submit.
     ///
+    fn draw_ui_batches<'a>(
+        pass: &mut wgpu::RenderPass<'a>,
+        ui_pipeline: &'a wgpu::RenderPipeline,
+        ui_bind_group: &'a wgpu::BindGroup,
+        dynamic_buffer: &'a wgpu::Buffer,
+        dynamic_vertex_count: u32,
+        transient_buffer: &'a wgpu::Buffer,
+        transient_vertex_count: u32,
+        retained_buffer: &'a wgpu::Buffer,
+        retained_vertex_count: u32,
+    ) {
+        pass.set_pipeline(ui_pipeline);
+        pass.set_bind_group(0, ui_bind_group, &[]);
+        // Draw the gameplay HUD, transient chat/center-print and telemetry, then
+        // retained foreground UI such as the scoreboard, console, and inspector.
+        if dynamic_vertex_count != 0 {
+            pass.set_vertex_buffer(0, dynamic_buffer.slice(..));
+            pass.draw(0..dynamic_vertex_count, 0..1);
+        }
+        if transient_vertex_count != 0 {
+            pass.set_vertex_buffer(0, transient_buffer.slice(..));
+            pass.draw(0..transient_vertex_count, 0..1);
+        }
+        if retained_vertex_count != 0 {
+            pass.set_vertex_buffer(0, retained_buffer.slice(..));
+            pass.draw(0..retained_vertex_count, 0..1);
+        }
+    }
+
     /// With a menu open this runs *after* egui so the readout stays on top of
     /// the menu instead of being covered by it: these are status displays the
     /// player is usually watching while changing a setting.
     fn submit_ui_overlay(&self, frame_view: &wgpu::TextureView) {
-        if self.ui_vertex_count == 0 {
+        if self.ui_vertex_count == 0
+            && self.ui_dynamic_vertex_count == 0
+            && self.ui_transient_vertex_count == 0
+        {
             return;
         }
         let mut encoder = self
@@ -8850,43 +9472,40 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.ui_pipeline);
-            pass.set_bind_group(0, &self.ui_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
-            pass.draw(0..self.ui_vertex_count, 0..1);
+            Self::draw_ui_batches(
+                &mut pass,
+                &self.ui_pipeline,
+                &self.ui_bind_group,
+                &self.ui_dynamic_vertex_buffer,
+                self.ui_dynamic_vertex_count,
+                &self.ui_transient_vertex_buffer,
+                self.ui_transient_vertex_count,
+                &self.ui_vertex_buffer,
+                self.ui_vertex_count,
+            );
         }
         self.queue.submit([encoder.finish()]);
     }
 
     fn rebuild_ui(&mut self) {
+        self.rebuild_retained_ui();
+        self.rebuild_dynamic_ui();
+        self.rebuild_transient_ui();
+    }
+
+    fn rebuild_retained_ui(&mut self) {
         let trace_started = self.ui_trace.then(Instant::now);
         if self.ui_state.video.skip_ui {
             self.ui_vertex_count = 0;
-            if let Some(started) = trace_started {
-                println!(
-                    "[JKA UI] rebuild {:.3} ms, skipped by r_skipUi",
-                    started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
             return;
         }
-        let ui_vertices = ui::build_vertices(
+        let mut vertices = ui::build_vertices(
             &self.ui_state,
             self.config.width,
             self.config.height,
             self.ui_small_font_metrics.as_ref(),
             self.ui_splash_size,
         );
-        let mut vertices = Vec::with_capacity(ui_vertices.len() + 768);
-        // Vignette by itself is just translucent black geometry in the existing
-        // overlay path. This avoids allocating/rendering a full-size scene texture
-        // and then sampling every pixel again merely to darken the screen edges.
-        // If gamma/LUT/full post is already active, that existing pass applies the
-        // exact shader vignette instead so we do not add another fullscreen step.
-        if self.vignette_enabled && !self.frame_plan.use_post {
-            append_vignette_vertices(&mut vertices);
-        }
-        vertices.extend(ui_vertices);
         let max_vertices = UI_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
         if vertices.len() > max_vertices {
             vertices.truncate(max_vertices - (max_vertices % 3));
@@ -8898,10 +9517,153 @@ impl Renderer {
         }
         if let Some(started) = trace_started {
             println!(
-                "[JKA UI] rebuild {:.3} ms, {} vertices ({} triangles)",
+                "[JKA UI] retained rebuild {:.3} ms, {} vertices ({} triangles)",
                 started.elapsed().as_secs_f64() * 1000.0,
                 self.ui_vertex_count,
                 self.ui_vertex_count / 3
+            );
+        }
+    }
+
+    fn rebuild_dynamic_ui(&mut self) {
+        let trace_started = self.ui_trace.then(Instant::now);
+        self.ui_dynamic_vertices.clear();
+        self.ui_dynamic_stable_vertex_count = 0;
+        if self.ui_state.video.skip_ui {
+            self.ui_dynamic_vertex_count = 0;
+            return;
+        }
+
+        // Vignette-only mode is a few quads in the same gameplay batch. Keeping
+        // it in the stable prefix preserves the original painter order.
+        if self.vignette_enabled && !self.frame_plan.use_post {
+            append_vignette_vertices(&mut self.ui_dynamic_vertices);
+        }
+        ui::build_dynamic_static_vertices(
+            &mut self.ui_dynamic_vertices,
+            &self.ui_state,
+            self.config.width,
+            self.config.height,
+        );
+        let max_vertices =
+            UI_DYNAMIC_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
+        if self.ui_dynamic_vertices.len() > max_vertices {
+            self.ui_dynamic_vertices
+                .truncate(max_vertices - (max_vertices % 3));
+        }
+        self.ui_dynamic_stable_vertex_count = self.ui_dynamic_vertices.len();
+        ui::build_movement_vertices(
+            &mut self.ui_dynamic_vertices,
+            &self.ui_state,
+            self.config.width,
+            self.config.height,
+        );
+        if self.ui_dynamic_vertices.len() > max_vertices {
+            self.ui_dynamic_vertices
+                .truncate(max_vertices - (max_vertices % 3));
+        }
+        self.ui_dynamic_vertex_count =
+            u32::try_from(self.ui_dynamic_vertices.len()).unwrap_or(u32::MAX);
+        if self.ui_dynamic_vertex_count != 0 {
+            self.queue.write_buffer(
+                &self.ui_dynamic_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.ui_dynamic_vertices),
+            );
+        }
+        if let Some(started) = trace_started {
+            println!(
+                "[JKA UI] gameplay rebuild {:.3} ms, {} stable + {} hot vertices",
+                started.elapsed().as_secs_f64() * 1000.0,
+                self.ui_dynamic_stable_vertex_count,
+                self.ui_dynamic_vertices
+                    .len()
+                    .saturating_sub(self.ui_dynamic_stable_vertex_count)
+            );
+        }
+    }
+
+    fn rebuild_movement_ui(&mut self) {
+        let trace_started = self.ui_trace.then(Instant::now);
+        if self.ui_state.video.skip_ui {
+            self.ui_dynamic_vertex_count = 0;
+            return;
+        }
+        let max_vertices =
+            UI_DYNAMIC_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
+        let stable = self
+            .ui_dynamic_stable_vertex_count
+            .min(self.ui_dynamic_vertices.len())
+            .min(max_vertices);
+        self.ui_dynamic_vertices.truncate(stable);
+        ui::build_movement_vertices(
+            &mut self.ui_dynamic_vertices,
+            &self.ui_state,
+            self.config.width,
+            self.config.height,
+        );
+        if self.ui_dynamic_vertices.len() > max_vertices {
+            self.ui_dynamic_vertices
+                .truncate(max_vertices - (max_vertices % 3));
+        }
+        self.ui_dynamic_vertex_count =
+            u32::try_from(self.ui_dynamic_vertices.len()).unwrap_or(u32::MAX);
+
+        // The stable prefix is already resident on the GPU. Upload only the tail
+        // that changed with this input/simulation snapshot.
+        let tail = &self.ui_dynamic_vertices[stable..];
+        if !tail.is_empty() {
+            let byte_offset = (stable * std::mem::size_of::<UiVertex>()) as u64;
+            self.queue.write_buffer(
+                &self.ui_dynamic_vertex_buffer,
+                byte_offset,
+                bytemuck::cast_slice(tail),
+            );
+        }
+        if let Some(started) = trace_started {
+            println!(
+                "[JKA UI] movement tail {:.3} ms, {} vertices / {} bytes",
+                started.elapsed().as_secs_f64() * 1000.0,
+                tail.len(),
+                tail.len() * std::mem::size_of::<UiVertex>()
+            );
+        }
+    }
+
+    fn rebuild_transient_ui(&mut self) {
+        let trace_started = self.ui_trace.then(Instant::now);
+        self.ui_transient_vertices.clear();
+        if self.ui_state.video.skip_ui {
+            self.ui_transient_vertex_count = 0;
+            return;
+        }
+        ui::build_transient_vertices(
+            &mut self.ui_transient_vertices,
+            &self.ui_state,
+            self.ui_small_font_metrics.as_ref(),
+            self.config.width,
+            self.config.height,
+        );
+        let max_vertices =
+            UI_TRANSIENT_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
+        if self.ui_transient_vertices.len() > max_vertices {
+            self.ui_transient_vertices
+                .truncate(max_vertices - (max_vertices % 3));
+        }
+        self.ui_transient_vertex_count =
+            u32::try_from(self.ui_transient_vertices.len()).unwrap_or(u32::MAX);
+        if self.ui_transient_vertex_count != 0 {
+            self.queue.write_buffer(
+                &self.ui_transient_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.ui_transient_vertices),
+            );
+        }
+        if let Some(started) = trace_started {
+            println!(
+                "[JKA UI] transient rebuild {:.3} ms, {} vertices",
+                started.elapsed().as_secs_f64() * 1000.0,
+                self.ui_transient_vertex_count
             );
         }
     }
@@ -9288,6 +10050,9 @@ impl Renderer {
     }
 
     fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
+        // A new world must not inherit transient RE_AddLightToScene submissions
+        // from the previous map. The next CGame snapshot will repopulate them.
+        self.transient_lights.clear();
         // Start the pure-CPU weather heightfield solve immediately so it overlaps
         // GPU/world upload. First rain enable should normally only upload the
         // already-computed field instead of stalling the render thread.
@@ -9332,7 +10097,8 @@ impl Renderer {
                 )
             }),
         );
-        let initial_shader_variant = self.world_shader_variant_key();
+        let source_map = map.map_file_stats.is_some();
+        let initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
         let (world_pipeline_layout, world_shader) = match initial_shader_variant.family() {
             WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
@@ -9407,13 +10173,18 @@ impl Renderer {
             &self.weather.rain.gpu.wind_noise_sampler,
         ));
         self.world = Some(world);
+        // build_world allocates the fixed-capacity storage with every authored
+        // light so the buffer exists before Renderer owns the WorldGpu. Rewrite
+        // it immediately through the active source-class filter: source .map
+        // simulation excludes lightJunior from direct surface lighting and the
+        // normal Forward+/area toggles must also be correct on the first frame.
+        self.upload_light_buffer();
         self.request_static_ao(false);
         let sun = self.active_sun();
         self.grass_renderer.update_environment(
             &self.queue,
             sun,
-            self.cloud_wind_speed,
-            self.cloud_wind_direction,
+            self.weather_wind,
             self.pbr_enabled,
         );
         // The CPU solve is already running on the weather worker. Rain and the
@@ -9425,6 +10196,7 @@ impl Renderer {
         self.rebuild_weather_surface_receiver_bind_group();
         self.update_weather_surface_uniform();
         self.weather.fog.write_legacy_control(&self.queue);
+        self.sync_self_legacy_fog();
         self.rebuild_planar_reflection_resources();
         self.rebuild_frame_plan();
         // Loading the world may discover authored/environment planar reflectors,
@@ -9435,6 +10207,33 @@ impl Renderer {
         self.update_lighting_settings();
         upload_timings.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
         upload_timings
+    }
+
+    /// Entities and procedural grass are not BSP material stages, so they apply
+    /// Legacy fog in their own shaders (GodotOcean does the same from its
+    /// surface fog in bsp.wgsl). Runs whenever fog settings or map fog change,
+    /// alongside the legacy fog control upload; nothing is checked per frame.
+    fn sync_self_legacy_fog(&mut self) {
+        let fog = self
+            .weather
+            .fog
+            .legacy_self_fog()
+            .map_or_else(EntityLegacyFog::default, |(color_depth, params)| EntityLegacyFog {
+                color_depth,
+                params,
+            });
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        self.dynamic_model_renderer
+            .set_legacy_fog(&self.device, &self.queue, scene_format, samples, fog);
+        self.grass_renderer.set_legacy_fog(
+            &self.device,
+            &self.queue,
+            scene_format,
+            samples,
+            fog.color_depth,
+            fog.params,
+        );
     }
 
     fn unload_map(&mut self) {
@@ -9449,6 +10248,7 @@ impl Renderer {
             .fog
             .install_map(None, std::iter::empty::<([f32; 4], u64)>());
         self.weather.fog.write_legacy_control(&self.queue);
+        self.sync_self_legacy_fog();
 
         self.history_valid = false;
         self.camera_history_valid = false;
@@ -9477,7 +10277,8 @@ impl Renderer {
         let planar_budget = self.reflection_quality.planar_slot_budget().min(PLANAR_REFLECTION_SLOTS);
         let active = planar_budget > 0 && self.world.as_ref().is_some_and(|world| {
             world.planar_reflectors.iter().any(|reflector| {
-                planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
+                (reflector.kind != PlanarReflectorKind::Ocean || self.ocean_enabled)
+                    && planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
             })
         });
         // Promoted tcGen-environment surfaces are intentionally broad/rough
@@ -9515,23 +10316,25 @@ impl Renderer {
         self.planar_slot_history = [None; PLANAR_REFLECTION_SLOTS];
         self.last_planar_debug_selection = None;
         if active {
-            let (authored, environment) = self.world.as_ref().map_or((0, 0), |world| {
+            let (authored, environment, ocean) = self.world.as_ref().map_or((0, 0, 0), |world| {
                 world
                     .planar_reflectors
                     .iter()
-                    .fold((0, 0), |counts, reflector| match reflector.kind {
-                        PlanarReflectorKind::Authored => (counts.0 + 1, counts.1),
-                        PlanarReflectorKind::Environment => (counts.0, counts.1 + 1),
+                    .fold((0, 0, 0), |counts, reflector| match reflector.kind {
+                        PlanarReflectorKind::Authored => (counts.0 + 1, counts.1, counts.2),
+                        PlanarReflectorKind::Environment => (counts.0, counts.1 + 1, counts.2),
+                        PlanarReflectorKind::Ocean => (counts.0, counts.1, counts.2 + 1),
                     })
             });
             println!(
-                "Planar reflections: {}x{} reflected view, {} slots, mode={} (authored={}, planar tcGen environment={})",
+                "Planar reflections: {}x{} reflected view, {} slots, mode={} (authored={}, promoted environment={}, ocean={})",
                 width,
                 height,
                 planar_budget,
                 self.planar_reflection_mode.label(),
                 authored,
-                environment
+                environment,
+                ocean
             );
         }
     }
@@ -9818,8 +10621,7 @@ impl Renderer {
             self.previous_frame_time,
             self.config.width,
             self.config.height,
-            self.cloud_wind_speed,
-            self.cloud_wind_direction,
+            self.weather_wind,
             sun.color,
             sun.intensity,
         );
@@ -9861,14 +10663,12 @@ impl Renderer {
             || (self.cloud_coverage - effects.cloud_coverage).abs() > 0.0001
             || (self.cloud_height - effects.cloud_height).abs() > 0.01
             || (self.cloud_thickness - effects.cloud_thickness).abs() > 0.01
-            || (self.cloud_wind_speed - effects.cloud_wind_speed).abs() > 0.001
-            || (self.cloud_wind_direction - effects.cloud_wind_direction).abs() > 0.001
+            || self.weather_wind != effects.weather_wind
             || cloud_resolution_changed
             || self.cloud_temporal_enabled != effects.cloud_temporal
             || self.cloud_temporal_depth_fix != effects.cloud_temporal_depth_fix
             || (self.cloud_shear - effects.cloud_shear).abs() > 0.0001
             || (self.cloud_base_variation - effects.cloud_base_variation).abs() > 0.0001
-            || self.cloud_wind_variation != effects.cloud_wind_variation
             || self.cloud_shape_evolution != effects.cloud_shape_evolution
             || self.cloud_terrain_interaction != effects.cloud_terrain_interaction
             || self.cloud_empty_skip != effects.cloud_empty_skip
@@ -9960,16 +10760,12 @@ impl Renderer {
         self.cloud_thickness = effects
             .cloud_thickness
             .clamp(ui::CLOUD_THICKNESS_MIN, ui::CLOUD_THICKNESS_MAX);
-        self.cloud_wind_speed = effects
-            .cloud_wind_speed
-            .clamp(0.0, ui::CLOUD_WIND_SPEED_MAX);
-        self.cloud_wind_direction = effects.cloud_wind_direction.rem_euclid(360.0);
+        self.weather_wind = effects.weather_wind.sanitize();
         let sun = self.active_sun();
         self.grass_renderer.update_environment(
             &self.queue,
             sun,
-            self.cloud_wind_speed,
-            self.cloud_wind_direction,
+            self.weather_wind,
             self.pbr_enabled,
         );
         self.cloud_shadows_enabled = effects.cloud_shadows;
@@ -9978,7 +10774,6 @@ impl Renderer {
         self.cloud_temporal_depth_fix = effects.cloud_temporal_depth_fix;
         self.cloud_shear = effects.cloud_shear;
         self.cloud_base_variation = effects.cloud_base_variation;
-        self.cloud_wind_variation = effects.cloud_wind_variation;
         self.cloud_shape_evolution = effects.cloud_shape_evolution;
         self.cloud_terrain_interaction = effects.cloud_terrain_interaction;
         self.cloud_empty_skip = effects.cloud_empty_skip;
@@ -10006,6 +10801,7 @@ impl Renderer {
         let new_legacy_fog_effective = self.weather.fog.legacy_effective();
         let legacy_fog_pipeline_changed = old_legacy_fog_effective != new_legacy_fog_effective;
         self.weather.fog.write_legacy_control(&self.queue);
+        self.sync_self_legacy_fog();
         self.reflection_quality = effects.reflection_quality;
         self.reflection_debug_enabled = effects.reflection_debug;
         self.ssr_enabled = self.reflection_quality.ssr_enabled();
@@ -10178,7 +10974,7 @@ impl Renderer {
 
     fn update_local_shadow_selection(&mut self, camera: &Camera) {
         let direct_local_lighting_enabled =
-            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+            self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
             return;
         }
@@ -10206,7 +11002,7 @@ impl Renderer {
             select_relevant_shadow_lights(
                 world,
                 camera,
-                self.clustered_lighting_enabled,
+                self.static_point_lighting_enabled(),
                 self.emissive_area_lights_enabled,
             )
         };
@@ -10218,7 +11014,6 @@ impl Renderer {
             shadows.selection_serial = shadows.selection_serial.wrapping_add(1).max(1);
             let serial = shadows.selection_serial;
 
-            let mut active_slots = Vec::with_capacity(selected.len());
             for &light_index in &selected {
                 let slot = if let Some(slot) = shadows
                     .cache_entries
@@ -10276,7 +11071,6 @@ impl Renderer {
                     slot
                 };
                 shadows.cache_entries[slot].last_used = serial;
-                active_slots.push((light_index, slot));
             }
 
             shadows.active_light_indices = selected.clone();
@@ -10284,17 +11078,12 @@ impl Renderer {
             shadows.selection_cluster = world.last_cluster;
             shadows.selection_position = Some(camera.position);
 
-            let mut shadow_slot_by_light = vec![0_u32; world.light_count as usize];
-            for (light_index, slot) in active_slots {
-                if light_index < shadow_slot_by_light.len() {
-                    shadow_slot_by_light[light_index] = u32::try_from(slot + 1).unwrap_or(0);
-                }
-            }
-            let gpu_lights = gpu_point_lights(&world.dynamic_lights, &shadow_slot_by_light);
-            self.queue
-                .write_buffer(&world.light_buffer, 0, bytemuck::cast_slice(&gpu_lights));
+            // Upload after this mutable world borrow ends so the transient,
+            // explicitly-unshadowed tail is preserved as well.
             changed = previous_active != selected;
         }
+
+        self.upload_light_buffer();
 
         if changed {
             if let Some(world) = &self.world {
@@ -10310,7 +11099,7 @@ impl Renderer {
 
     fn ensure_local_shadow_cache(&mut self) {
         let direct_local_lighting_enabled =
-            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+            self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
             return;
         }
@@ -10412,9 +11201,49 @@ impl Renderer {
         }
     }
 
+    fn map_light_simulation_active_for(&self, source_map: bool) -> bool {
+        self.map_light_simulation_enabled && source_map
+    }
+
+    fn map_light_simulation_active(&self) -> bool {
+        self.map_light_simulation_active_for(
+            self.world.as_ref().is_some_and(|world| world.source_map),
+        )
+    }
+
+    fn point_lighting_enabled_for(&self, source_map: bool) -> bool {
+        self.clustered_lighting_enabled || self.map_light_simulation_active_for(source_map)
+    }
+
+    fn point_lighting_enabled(&self) -> bool {
+        self.clustered_lighting_enabled || self.map_light_simulation_active()
+    }
+
+    fn static_point_lighting_enabled_for(&self, source_map: bool) -> bool {
+        if source_map {
+            self.map_light_simulation_active_for(true)
+        } else {
+            self.clustered_lighting_enabled
+        }
+    }
+
+    fn static_point_lighting_enabled(&self) -> bool {
+        let source_map = self.world.as_ref().is_some_and(|world| world.source_map);
+        self.static_point_lighting_enabled_for(source_map)
+    }
+
     fn world_shader_variant_key(&self) -> WorldShaderVariantKey {
-        let direct_local_lights =
-            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        let source_map = self.world.as_ref().is_some_and(|world| world.source_map);
+        self.world_shader_variant_key_for_source_map(source_map)
+    }
+
+    fn world_shader_variant_key_for_source_map(&self, source_map: bool) -> WorldShaderVariantKey {
+        let legacy_dlights = self.dynamic_lights_mode == DynamicLightsMode::Legacy;
+        let vertex_dlights = self.dynamic_lights_mode == DynamicLightsMode::Vertex;
+        let clustered_lite_dlights = self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite;
+        let point_lights = self.point_lighting_enabled_for(source_map);
+        let map_light_simulation = self.map_light_simulation_active_for(source_map);
+        let shadowable_local_lights = point_lights || self.emissive_area_lights_enabled;
         WorldShaderVariantKey {
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
             pom: self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
@@ -10424,14 +11253,19 @@ impl Renderer {
             pom_adaptive_steps: self.pbr_enabled && PBR_PROFILE_POM_ADAPTIVE_STEPS,
             pbr_companion_sampler: self.pbr_enabled && PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR,
             pbr_vertex_lightgrid: self.pbr_enabled && PBR_PROFILE_VERTEX_LIGHTGRID,
-            point_lights: self.clustered_lighting_enabled,
+            point_lights,
+            map_light_simulation,
+            source_map_world: source_map,
+            legacy_dlights,
+            vertex_dlights,
+            clustered_lite_dlights,
             area_lights: self.emissive_area_lights_enabled,
             irradiance_volume: self.irradiance_volume_enabled,
             voxel_gi: self.voxel_probe_gi_enabled,
             // A local-shadow shader path is useless without a direct local-light
             // source. Normalize it out of the key so toggling shadows alone does
             // not create a redundant pipeline permutation.
-            local_shadows: self.local_light_shadows_enabled && direct_local_lights,
+            local_shadows: self.local_light_shadows_enabled && shadowable_local_lights,
             cascaded_shadows: self.cascaded_shadows_enabled,
             planar_reflections: self.planar_reflection.active,
             // MAP/DEFAULT is a no-op on maps with no authored fog. FogSystem owns
@@ -10485,7 +11319,7 @@ impl Renderer {
             "Renderer pipeline cache: miss {} -> compiling lazily",
             key.short_label()
         );
-        let (pipelines, reflection_pipelines) = {
+        let (pipelines, fog_pass_pipelines, reflection_pipelines, reflection_fog_pass_pipelines) = {
             let Some(world) = self.world.as_ref() else {
                 return;
             };
@@ -10499,6 +11333,19 @@ impl Renderer {
                 key.legacy_fog,
                 Some(key),
             );
+            let fog_pass_pipelines = if key.legacy_fog {
+                create_legacy_fog_pass_pipelines(
+                    &self.device,
+                    layout,
+                    shader,
+                    scene_format,
+                    samples,
+                    &world.coarse_batches,
+                    Some(key),
+                )
+            } else {
+                BTreeMap::new()
+            };
             let reflection_pipelines =
                 if world.planar_reflectors.is_empty() || !key.planar_reflections {
                     BTreeMap::new()
@@ -10513,7 +11360,25 @@ impl Renderer {
                         key,
                     )
                 };
-            (pipelines, reflection_pipelines)
+            let reflection_fog_pass_pipelines =
+                if key.legacy_fog && !world.planar_reflectors.is_empty() && key.planar_reflections {
+                    create_reflection_fog_pass_pipelines(
+                        &self.device,
+                        layout,
+                        shader,
+                        scene_format,
+                        &world.coarse_batches,
+                        key,
+                    )
+                } else {
+                    BTreeMap::new()
+                };
+            (
+                pipelines,
+                fog_pass_pipelines,
+                reflection_pipelines,
+                reflection_fog_pass_pipelines,
+            )
         };
 
         if let Some(world) = &mut self.world {
@@ -10521,7 +11386,9 @@ impl Renderer {
                 key,
                 WorldPipelineVariant {
                     pipelines,
+                    fog_pass_pipelines,
                     reflection_pipelines,
+                    reflection_fog_pass_pipelines,
                 },
             );
             world.active_pipeline_variant = key;
@@ -10622,7 +11489,10 @@ impl Renderer {
         } else {
             // Release the large FFT textures/buffers when stock JKA water is selected.
             self.ocean = None;
+            self.ocean_optics = crate::ocean::optics::Resources::new(&self.device,
+                &self.ocean_optics_layout, &self.ocean_layout, (1, 1, self.msaa_samples, self.scene_format()));
         }
+        self.rebuild_planar_reflection_resources();
         self.rebuild_frame_plan();
         self.activate_world_pipeline_variant();
     }
@@ -10647,17 +11517,61 @@ impl Renderer {
         self.dynamic_model_renderer.set_ghoul2_batch_draws(mode);
     }
 
-    fn set_clustered_lighting(&mut self, enabled: bool) {
-        self.clustered_lighting_enabled = enabled;
+    fn set_dynamic_lighting(&mut self, mode: DynamicLightsMode) {
+        self.dynamic_lights_mode = mode;
+        // Keep the old boolean as a derived implementation detail for the full
+        // Forward+ path only. Legacy/Vertex/Clustered Lite are separate runtime-light modes.
+        self.clustered_lighting_enabled = matches!(mode, DynamicLightsMode::PerPixelForwardPlus);
         if let Some(world) = &mut self.world {
-            // Point/entity lights and emissive area lights share the same local
-            // shadow cache. Changing either source class must force a fresh
-            // selection so disabled lights cannot keep occupying shadow slots.
             world.local_shadows.selection_position = None;
         }
+        self.upload_light_buffer();
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+    }
+
+    fn classic_world_render_flags(&self) -> u32 {
+        u32::from(self.classic_fullbright)
+            | (u32::from(self.classic_vertex_light) << 1)
+            | (u32::from(self.classic_lightmap_only) << 2)
+    }
+
+    fn set_classic_world_lighting(&mut self, fullbright: bool, vertex_light: bool, lightmap_only: bool) {
+        let vertex_light_changed = self.classic_vertex_light != vertex_light;
+        self.classic_fullbright = fullbright;
+        self.classic_vertex_light = vertex_light;
+        self.classic_lightmap_only = lightmap_only;
+        if vertex_light_changed {
+            // OpenJK clears RE_AddLightToScene dlights while r_vertexLight is on.
+            // Keep that classic interaction for runtime/transient lights without
+            // conflating it with the separate Dynamic Lights > Vertex mode.
+            self.upload_light_buffer();
+            self.update_lighting_settings();
+        }
+    }
+
+    fn set_map_light_simulation(&mut self, enabled: bool) {
+        if self.map_light_simulation_enabled == enabled {
+            return;
+        }
+        self.map_light_simulation_enabled = enabled;
+        if let Some(world) = &mut self.world {
+            world.local_shadows.selection_position = None;
+        }
+        self.upload_light_buffer();
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+        println!(
+            ".map light simulation: {}{}",
+            if enabled { "enabled" } else { "disabled" },
+            if self.world.as_ref().is_some_and(|world| !world.source_map) {
+                " (current world is a compiled BSP; setting is dormant)"
+            } else {
+                ""
+            }
+        );
     }
 
     fn set_emissive_area_lights(&mut self, enabled: bool) {
@@ -10675,8 +11589,13 @@ impl Renderer {
         self.activate_world_pipeline_variant();
     }
 
-    fn set_irradiance_volume(&mut self, enabled: bool) {
-        self.irradiance_volume_enabled = enabled;
+    fn set_entity_ambient_lighting(&mut self, mode: EntityAmbientLightingMode) {
+        self.irradiance_volume_enabled = matches!(
+            mode,
+            EntityAmbientLightingMode::BevyIrradianceVolume
+        );
+        self.dynamic_model_renderer
+            .set_entity_ambient_lighting(&self.queue, mode);
         self.rebuild_frame_plan();
         self.activate_world_pipeline_variant();
     }
@@ -10722,8 +11641,7 @@ impl Renderer {
         self.grass_renderer.update_environment(
             &self.queue,
             sun,
-            self.cloud_wind_speed,
-            self.cloud_wind_direction,
+            self.weather_wind,
             self.pbr_enabled,
         );
         self.rebuild_frame_plan();
@@ -10939,8 +11857,8 @@ impl Renderer {
                 source.alpha_gen
             ),
             format!(
-                "RENDER FLAGS: MODULATE LIGHTMAP: {}    TEXTURE IS LIGHTMAP: {}",
-                source.modulate_lightmap, source.texture_is_lightmap
+                "RENDER FLAGS: MODULATE LIGHTMAP: {}    TEXTURE IS LIGHTMAP: {}    TEXTURE IS WHITE: {}",
+                source.modulate_lightmap, source.texture_is_lightmap, source.texture_is_white
             ),
         ];
         if has_bsp_shader {
@@ -11025,9 +11943,40 @@ impl Renderer {
                     .as_deref()
                     .map_or_else(|| "<embedded / generated>".to_owned(), |path| path.display().to_string())
             ));
+        } else if source.vertex_lit {
+            lines.push("LIGHTMAP: Vertex-lit (LIGHTMAP_BY_VERTEX / -3; no page)".into());
         } else {
             lines.push(format!("LIGHTMAP: {:?}", source.lightmap));
         }
+        let fog_assignment = if source.fog[3] > 0.001 {
+            if source.fog_is_global { "GLOBAL" } else { "LOCAL" }
+        } else {
+            "NONE"
+        };
+        lines.push(format!(
+            "FOG: {}    RGB {:.3},{:.3},{:.3}    DEPTH {:.1}    STAGE OVERRIDE {:?}    L1 POST {}",
+            fog_assignment,
+            source.fog[0],
+            source.fog[1],
+            source.fog[2],
+            source.fog[3],
+            source.fog_color_override,
+            if source.global_fog_post_eligible { "YES" } else { "NO" },
+        ));
+        let drawfog = self.weather.fog.legacy_drawfog_value();
+        let fog_path = match drawfog {
+            1 if source.fog[3] > 0.001
+                && source.fog_is_global
+                && source.global_fog_post_eligible => "GLOBAL DISPLAY-SPACE (SQRT TABLE)",
+            1 if source.fog[3] > 0.001 => "SEPARATE PASS (SQRT TABLE)",
+            2 if source.fog[3] > 0.001 && source.fog_is_global => "GLOBAL EXP2 SEPARATE PASS",
+            2 if source.fog[3] > 0.001 => "LOCAL SEPARATE PASS",
+            _ => "NONE",
+        };
+        lines.push(format!(
+            "FOG MODE: r_drawfog {}    PATH: {}",
+            drawfog, fog_path,
+        ));
         lines.push(format!(
             "PVS CLUSTER: {}    PVS VISIBLE: {}",
             current_cluster.map_or_else(|| "none".into(), |cluster| cluster.to_string()),
@@ -11045,6 +11994,153 @@ impl Renderer {
             "BOUNDS MAX: {:.1}, {:.1}, {:.1}",
             batch.bounds_max[0], batch.bounds_max[1], batch.bounds_max[2]
         ));
+        if world.source_map {
+            let map_receiver = !source.texture_is_lightmap
+                && !source.vertex_lit
+                && source.pipeline.class != DrawClass::Sky
+                && source.pipeline.blend == BlendMode::Opaque;
+            let q3map_lights = world
+                .dynamic_lights
+                .iter()
+                .filter(|light| light.falloff != scene::DynamicLightFalloff::Smooth && light.surface_lighting)
+                .count();
+            lines.push(format!(
+                "MAP LIGHT SIM: toggle={} receiver={} q3map_surface_lights={} ambient={:.3},{:.3},{:.3} minlight={:.3},{:.3},{:.3}",
+                if self.map_light_simulation_enabled { "ON" } else { "OFF" },
+                if map_receiver { "YES" } else { "NO" },
+                q3map_lights,
+                world.source_map_lighting.ambient[0],
+                world.source_map_lighting.ambient[1],
+                world.source_map_lighting.ambient[2],
+                world.source_map_lighting.minlight[0],
+                world.source_map_lighting.minlight[1],
+                world.source_map_lighting.minlight[2],
+            ));
+        }
+        // Dynamic-light diagnostics live in the surface inspector rather than a
+        // continuously running GPU/CPU counter. Pressing Trace/Q therefore gives
+        // exact per-triangle numbers with effectively zero cost during normal play.
+        if matches!(
+            self.dynamic_lights_mode,
+            DynamicLightsMode::Legacy | DynamicLightsMode::Vertex | DynamicLightsMode::ClusteredLite
+        ) {
+            let shader_key = self.world_shader_variant_key();
+            let family = match shader_key.family() {
+                WorldShaderFamily::Enhanced => "enhanced",
+                WorldShaderFamily::Lean => "lean",
+            };
+            let dlight_eligible = !source.texture_is_lightmap
+                && source.pipeline.class != DrawClass::Sky
+                && source.pipeline.blend == BlendMode::Opaque;
+            lines.push(format!(
+                "DLIGHT DEBUG: mode={} family={} variant={} runtime={} transient={} active={} surface_eligible={}",
+                self.dynamic_lights_mode.config_value(),
+                family,
+                shader_key.short_label(),
+                if self.runtime_transient_lights_enabled() { "YES" } else { "NO" },
+                self.transient_lights.len(),
+                self.active_transient_light_count(),
+                if dlight_eligible { "YES" } else { "NO" },
+            ));
+            lines.push(format!(
+                "DLIGHT PIPELINE FLAGS: legacy={} vertex={} clustered_lite={} classic_r_vertexLight={}",
+                u8::from(shader_key.legacy_dlights),
+                u8::from(shader_key.vertex_dlights),
+                u8::from(shader_key.clustered_lite_dlights),
+                u8::from(self.classic_vertex_light),
+            ));
+
+            let primary_light = self
+                .transient_lights
+                .iter()
+                .take(32)
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = (Vec3::from_array(a.position) - hit).length() / a.radius.max(1.0);
+                    let db = (Vec3::from_array(b.position) - hit).length() / b.radius.max(1.0);
+                    da.total_cmp(&db)
+                });
+            if let Some((light_index, light)) = primary_light {
+                let light_position = Vec3::from_array(light.position);
+                let hit_distance = (light_position - hit).length();
+                lines.push(format!(
+                    "DLIGHT #{light_index}: POS {:.1},{:.1},{:.1} R={:.2} HIT_DIST={:.2} ({:.3}R) RGB={:.3},{:.3},{:.3} I={:.3}",
+                    light.position[0], light.position[1], light.position[2],
+                    light.radius, hit_distance, hit_distance / light.radius.max(1.0),
+                    light.color[0], light.color[1], light.color[2], light.intensity,
+                ));
+
+                if let Some(triangle) = hit_triangle {
+                    match self.dynamic_lights_mode {
+                        DynamicLightsMode::Vertex => {
+                            let samples = [
+                                vertex_dlight_cpu(
+                                    Vec3::from_array(triangle[0].position),
+                                    Vec3::from_array(triangle[0].normal),
+                                    &self.transient_lights,
+                                ),
+                                vertex_dlight_cpu(
+                                    Vec3::from_array(triangle[1].position),
+                                    Vec3::from_array(triangle[1].normal),
+                                    &self.transient_lights,
+                                ),
+                                vertex_dlight_cpu(
+                                    Vec3::from_array(triangle[2].position),
+                                    Vec3::from_array(triangle[2].normal),
+                                    &self.transient_lights,
+                                ),
+                            ];
+                            let weights = hit_barycentric.unwrap_or([1.0 / 3.0; 3]);
+                            let interpolated = samples[0] * weights[0]
+                                + samples[1] * weights[1]
+                                + samples[2] * weights[2];
+                            let vertex_distances = [
+                                (Vec3::from_array(triangle[0].position) - light_position).length()
+                                    / light.radius.max(1.0),
+                                (Vec3::from_array(triangle[1].position) - light_position).length()
+                                    / light.radius.max(1.0),
+                                (Vec3::from_array(triangle[2].position) - light_position).length()
+                                    / light.radius.max(1.0),
+                            ];
+                            lines.push(format!(
+                                "VERTEX DLIGHT: vertex_dist_R={:.3},{:.3},{:.3} sample_len={:.5},{:.5},{:.5} interp_len={:.5}",
+                                vertex_distances[0], vertex_distances[1], vertex_distances[2],
+                                samples[0].length(), samples[1].length(), samples[2].length(),
+                                interpolated.length(),
+                            ));
+                            lines.push(format!(
+                                "VERTEX INTERP RGB: {:.5},{:.5},{:.5} bary={:.3},{:.3},{:.3}",
+                                interpolated.x, interpolated.y, interpolated.z,
+                                weights[0], weights[1], weights[2],
+                            ));
+                        }
+                        DynamicLightsMode::Legacy => {
+                            if let Some(diag) = legacy_dlight_diagnostic(triangle, hit, light) {
+                                let predicted = Vec3::from_array(light.color)
+                                    * light.intensity.max(0.0)
+                                    * diag.plane_modulate
+                                    * diag.blob
+                                    * 0.225;
+                                lines.push(format!(
+                                    "LEGACY DLIGHT: smooth radial cubic plane_dist={:.3} proj_R={:.3} radial_sq={:.4} plane_mod={:.4}",
+                                    diag.plane_distance, diag.projected_radius, diag.radial_sq, diag.plane_modulate,
+                                ));
+                                lines.push(format!(
+                                    "LEGACY RESPONSE: blob={:.5} gain=0.225 predicted_len={:.5}",
+                                    diag.blob, predicted.length(),
+                                ));
+                            }
+                        }
+                        DynamicLightsMode::ClusteredLite => {
+                            lines.push("CLUSTERED LITE: transient light transport is active; use the same hit/light line above as the source sanity check.".into());
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                lines.push("DLIGHT DEBUG: no transient/runtime lights are currently submitted.".into());
+            }
+        }
         if let Some(entry) = debug_entry {
             if let Some(file) = entry.definition_file.as_deref() {
                 lines.push(format!("SHADER FILE: {file}"));
@@ -11093,7 +12189,7 @@ impl Renderer {
             "runtime: PBR={} POM={} clustered_lights={} dynamic_lights={} local_shadows={} cascaded_sun={} static_lightgrid={} hdr_lightgrid={} reflection_probes={}",
             self.pbr_enabled && PBR_PROFILE_MATERIALS,
             self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
-            self.clustered_lighting_enabled,
+            self.point_lighting_enabled(),
             world.light_count,
             self.local_light_shadows_enabled,
             self.cascaded_shadows_enabled,
@@ -11105,7 +12201,7 @@ impl Renderer {
             && PBR_PROFILE_MATERIALS
             && !world._static_light_grid.enabled
             && world.reflection_probes.source_count == 0
-            && (!self.clustered_lighting_enabled || world.light_count == 0)
+            && (!self.point_lighting_enabled() || world.light_count == 0)
         {
             println!(
                 "NOTE: PBR companions are enabled, but no static directional lightgrid, reflection probes, or active clustered lights are available to make normal/roughness/metallic/specular visibly respond."
@@ -11149,6 +12245,7 @@ impl Renderer {
             }
             enhanced_batches += 1;
             let eligible = !source.texture_is_lightmap
+                && !source.texture_is_white
                 && source.pipeline.class == DrawClass::Opaque
                 && source.pipeline.blend == BlendMode::Opaque
                 && matches!(source.tc_gen, TcGen::Base);
@@ -11368,8 +12465,8 @@ impl Renderer {
             | WeatherOcclusionCache::Building(_)
             | WeatherOcclusionCache::Unavailable => [0.0; 4],
         };
-        let wind_angle = self.cloud_wind_direction.to_radians();
-        let wind_speed = self.cloud_wind_speed.max(0.0);
+        let weather_wind = self.weather_wind.sanitize();
+        let weather_wind_angle = weather_wind.direction.to_radians();
         let uniform = FroxelUniform {
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             camera_pos_time,
@@ -11389,8 +12486,8 @@ impl Renderer {
             ],
             rain_occlusion,
             rain_wind: [
-                wind_angle.cos() * wind_speed,
-                wind_angle.sin() * wind_speed,
+                weather_wind_angle.cos() * weather_wind.speed,
+                weather_wind_angle.sin() * weather_wind.speed,
                 0.0,
                 0.0,
             ],
@@ -11422,10 +12519,11 @@ impl Renderer {
     fn rebuild_frame_plan(&mut self) {
         let fog_enabled = self.weather.fog.volumetric_effective();
         let legacy_fog_enabled = self.weather.fog.legacy_effective();
+        let legacy1_global_post = self.weather.fog.legacy1_global_post_active();
         let gamma_enabled = (self.gamma - 1.0).abs() > 0.001;
         let lut_enabled =
             self.color_lut_preset != ColorLutPreset::Off && self.color_lut_strength > 0.001;
-        let full_post_effects = self.hdr_enabled
+        let full_post_effects = self.ocean_enabled || self.hdr_enabled
             || self.tone_mapping_enabled
             || self.bloom_enabled
             || self.halation_enabled
@@ -11434,6 +12532,7 @@ impl Renderer {
             || self.taa_enabled
             || self.contact_shadows_enabled
             || fog_enabled
+            || legacy1_global_post
             || self.clouds_enabled
             || self.weather.rain.enabled
             || self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON
@@ -11481,7 +12580,11 @@ impl Renderer {
             && self.color_lut_preset == ColorLutPreset::Off
             && !self.gpu_driven_enabled
             && !self.hiz_occlusion_enabled
-            && !self.clustered_lighting_enabled
+            && !self.point_lighting_enabled()
+            && !matches!(
+                self.dynamic_lights_mode,
+                DynamicLightsMode::Legacy | DynamicLightsMode::Vertex | DynamicLightsMode::ClusteredLite
+            )
             && !self.emissive_area_lights_enabled
             && !self.irradiance_volume_enabled
             && !self.voxel_probe_gi_enabled
@@ -11508,6 +12611,7 @@ impl Renderer {
                 || self.taa_enabled
                 || self.contact_shadows_enabled
                 || fog_enabled
+                || legacy1_global_post
                 || self.clouds_enabled
                 || self.weather.rain.enabled
                 || self.ssr_enabled
@@ -11520,19 +12624,216 @@ impl Renderer {
             // Area lights use the same clustered lists as entity/point lights,
             // but remain independently toggleable. The active BSP pipeline is
             // specialized for the requested source classes when settings change.
-            use_clustered_lighting: self.clustered_lighting_enabled
+            use_clustered_lighting: self.point_lighting_enabled()
+                || self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite
                 || self.emissive_area_lights_enabled,
         };
     }
 
+    fn clustered_lite_dlights_enabled(&self) -> bool {
+        self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite
+    }
+
+    fn runtime_transient_lights_enabled(&self) -> bool {
+        !self.classic_vertex_light
+            && matches!(
+                self.dynamic_lights_mode,
+                DynamicLightsMode::Legacy
+                    | DynamicLightsMode::Vertex
+                    | DynamicLightsMode::ClusteredLite
+                    | DynamicLightsMode::PerPixelForwardPlus
+            )
+    }
+
+    fn active_static_light_count(&self) -> usize {
+        let Some(world) = self.world.as_ref() else {
+            return 0;
+        };
+        world
+            .dynamic_lights
+            .iter()
+            .filter(|light| {
+                let is_area = light
+                    .emitter_normal
+                    .iter()
+                    .any(|component| component.abs() > 1.0e-6);
+                if is_area {
+                    self.emissive_area_lights_enabled && light.surface_lighting
+                } else {
+                    self.static_point_lighting_enabled() && light.surface_lighting
+                }
+            })
+            .take(MAX_DYNAMIC_LIGHTS)
+            .count()
+    }
+
+    fn active_transient_light_count(&self) -> usize {
+        if !self.runtime_transient_lights_enabled() {
+            return 0;
+        }
+        self.transient_lights
+            .len()
+            .min(MAX_DYNAMIC_LIGHTS.saturating_sub(self.active_static_light_count()))
+    }
+
+    fn active_light_count(&self) -> u32 {
+        u32::try_from(self.active_static_light_count() + self.active_transient_light_count())
+            .unwrap_or(0)
+    }
+
+    fn set_transient_lights(&mut self, lights: &[TransientLight]) {
+        if self.transient_lights == lights {
+            return;
+        }
+        self.transient_lights.clear();
+        self.transient_lights.extend_from_slice(lights);
+        self.upload_light_buffer();
+        self.update_lighting_settings();
+    }
+
+    fn upload_light_buffer(&self) {
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+
+        let mut shadow_slot_by_light = vec![0_u32; world.dynamic_lights.len()];
+        if self.local_light_shadows_enabled {
+            for (slot, entry) in world.local_shadows.cache_entries.iter().enumerate() {
+                let Some(light_index) = entry.light_index else {
+                    continue;
+                };
+                if world.local_shadows.active_light_indices.contains(&light_index)
+                    && light_index < shadow_slot_by_light.len()
+                {
+                    shadow_slot_by_light[light_index] = u32::try_from(slot + 1).unwrap_or(0);
+                }
+            }
+        }
+
+        // Keep only the static source classes required by the selected mode.
+        // Legacy/Vertex/Clustered Lite intentionally exclude map point lights; they are
+        // for runtime-authored RE_AddLightToScene/FX sources. Area lights remain independently gated.
+        let mut gpu_lights = Vec::with_capacity(MAX_DYNAMIC_LIGHTS);
+        for (index, light) in world.dynamic_lights.iter().enumerate() {
+            let is_area = light
+                .emitter_normal
+                .iter()
+                .any(|component| component.abs() > 1.0e-6);
+            if !light.surface_lighting
+                || (is_area && !self.emissive_area_lights_enabled)
+                || (!is_area && !self.static_point_lighting_enabled())
+            {
+                continue;
+            }
+            gpu_lights.push(GpuPointLight {
+                position_radius: [
+                    light.position[0],
+                    light.position[1],
+                    light.position[2],
+                    light.radius,
+                ],
+                color_intensity: [
+                    light.color[0],
+                    light.color[1],
+                    light.color[2],
+                    light.intensity,
+                ],
+                emitter: [
+                    light.emitter_normal[0],
+                    light.emitter_normal[1],
+                    light.emitter_normal[2],
+                    if is_area {
+                        if light.emitter_two_sided { 2.0 } else { 1.0 }
+                    } else if light.falloff.shader_value() > 0.5 {
+                        // Negative emitter.w is reserved for source-map q3map point
+                        // metadata and remains a non-area light to all existing paths:
+                        // -1 no angle attenuation, -2 normal Lambert, <-2 _anglescale.
+                        if !light.angle_attenuation {
+                            -1.0
+                        } else if light.angle_scale != 0.0 {
+                            -(2.0 + light.angle_scale.abs())
+                        } else {
+                            -2.0
+                        }
+                    } else {
+                        0.0
+                    },
+                ],
+                shadow: [
+                    shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
+                    light.falloff.shader_value(),
+                    light.extra_distance,
+                    0.0,
+                ],
+            });
+            if gpu_lights.len() == MAX_DYNAMIC_LIGHTS {
+                break;
+            }
+        }
+
+        let remaining = MAX_DYNAMIC_LIGHTS.saturating_sub(gpu_lights.len());
+        if self.runtime_transient_lights_enabled() {
+            // RenderSnapshot::transient_lights currently comes directly from
+            // authored FX `Light {}` primitives. Full Forward+ intentionally
+            // gives those runtime FX lights 2x source intensity; static map and
+            // emissive-area lights above keep their authored intensity.
+            let transient_intensity_scale = if self.dynamic_lights_mode
+                == DynamicLightsMode::PerPixelForwardPlus
+            {
+                2.0
+            } else {
+                1.0
+            };
+            gpu_lights.extend(
+                self.transient_lights
+                    .iter()
+                    .take(remaining)
+                    .map(|light| GpuPointLight {
+                        position_radius: [
+                            light.position[0],
+                            light.position[1],
+                            light.position[2],
+                            light.radius.max(0.0),
+                        ],
+                        color_intensity: [
+                            light.color[0],
+                            light.color[1],
+                            light.color[2],
+                            light.intensity.max(0.0) * transient_intensity_scale,
+                        ],
+                        emitter: [0.0; 4],
+                        // shadow.w marks transient/runtime lights for the lightweight
+                        // runtime modes. They never enter the local cubemap cache.
+                        shadow: [0.0, 0.0, 0.0, 1.0],
+                    }),
+            );
+        }
+        if gpu_lights.is_empty() {
+            gpu_lights.push(GpuPointLight::zeroed());
+        }
+        self.queue
+            .write_buffer(&world.light_buffer, 0, bytemuck::cast_slice(&gpu_lights));
+    }
+
     fn update_lighting_settings(&self) {
-        let light_count = self.world.as_ref().map_or(0, |world| world.light_count);
+        let light_count = self.active_light_count();
+        let transient_start = u32::try_from(self.active_static_light_count()).unwrap_or(0);
         let shadowed_count = self
             .world
             .as_ref()
             .map_or(0, |world| world.local_shadows.shadowed_light_count);
-        let direct_local_lighting_enabled =
-            self.clustered_lighting_enabled || self.emissive_area_lights_enabled;
+        let direct_local_lighting_enabled = self.point_lighting_enabled()
+            || matches!(
+                self.dynamic_lights_mode,
+                DynamicLightsMode::Legacy | DynamicLightsMode::Vertex | DynamicLightsMode::ClusteredLite
+            )
+            || self.emissive_area_lights_enabled;
+        let source_map_world = self.world.as_ref().is_some_and(|world| world.source_map);
+        let source_map_lighting = self
+            .world
+            .as_ref()
+            .filter(|world| world.source_map)
+            .map_or(scene::SourceMapLighting::default(), |world| world.source_map_lighting);
         let settings = LightingSettings {
             values: [
                 u32::from(direct_local_lighting_enabled && light_count != 0),
@@ -11548,7 +12849,7 @@ impl Renderer {
                 ),
                 shadowed_count,
                 LOCAL_SHADOW_MAP_SIZE,
-                0,
+                transient_start,
             ],
             feature_flags: [
                 u32::from(self.emissive_area_lights_enabled),
@@ -11559,18 +12860,40 @@ impl Renderer {
                             .as_ref()
                             .is_some_and(|world| world.voxel_probe_gi.enabled),
                 ),
-                // Ordinary entity/point dynamic lights are a separate source
-                // class from extracted emissive/area lights even though both
-                // share the clustered-light backend.
-                u32::from(self.clustered_lighting_enabled),
+                // Used by cluster/froxel consumers: full Forward+ or Clustered Lite
+                // has valid runtime point-light lists.
+                if self.point_lighting_enabled() {
+                    1
+                } else if self.clustered_lite_dlights_enabled() {
+                    2
+                } else {
+                    0
+                },
                 self.reflection_quality.shader_value(),
             ],
+            map_ambient: [
+                source_map_lighting.ambient[0],
+                source_map_lighting.ambient[1],
+                source_map_lighting.ambient[2],
+                0.0,
+            ],
+            map_minlight: [
+                source_map_lighting.minlight[0],
+                source_map_lighting.minlight[1],
+                source_map_lighting.minlight[2],
+                0.0,
+            ],
         };
-        self.queue.write_buffer(
-            &self.lighting_settings_buffer,
-            0,
-            bytemuck::bytes_of(&settings),
-        );
+        let settings_bytes = bytemuck::bytes_of(&settings);
+        // BSP/multiplayer keeps the original 48-byte common lighting upload.
+        // q3map2 ambient/minlight live only in lazy source-map shader variants.
+        let upload_bytes = if source_map_world {
+            settings_bytes
+        } else {
+            &settings_bytes[..48]
+        };
+        self.queue
+            .write_buffer(&self.lighting_settings_buffer, 0, upload_bytes);
     }
 
     fn scene_format(&self) -> wgpu::TextureFormat {
@@ -11593,7 +12916,13 @@ impl Renderer {
             WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
         };
-        let (pipelines, reflection_pipelines, fast_pipelines) = {
+        let (
+            pipelines,
+            fog_pass_pipelines,
+            reflection_pipelines,
+            reflection_fog_pass_pipelines,
+            fast_pipelines,
+        ) = {
             let Some(world) = self.world.as_ref() else {
                 return;
             };
@@ -11607,6 +12936,19 @@ impl Renderer {
                 key.legacy_fog,
                 Some(key),
             );
+            let fog_pass_pipelines = if key.legacy_fog {
+                create_legacy_fog_pass_pipelines(
+                    &self.device,
+                    layout,
+                    shader,
+                    scene_format,
+                    samples,
+                    &world.coarse_batches,
+                    Some(key),
+                )
+            } else {
+                BTreeMap::new()
+            };
             let reflection_pipelines =
                 if world.planar_reflectors.is_empty() || !key.planar_reflections {
                     BTreeMap::new()
@@ -11621,6 +12963,19 @@ impl Renderer {
                         key,
                     )
                 };
+            let reflection_fog_pass_pipelines =
+                if key.legacy_fog && !world.planar_reflectors.is_empty() && key.planar_reflections {
+                    create_reflection_fog_pass_pipelines(
+                        &self.device,
+                        layout,
+                        shader,
+                        scene_format,
+                        &world.coarse_batches,
+                        key,
+                    )
+                } else {
+                    BTreeMap::new()
+                };
             let fast_pipelines = create_world_pipelines(
                 &self.device,
                 &self.fast_world_pipeline_layout,
@@ -11631,7 +12986,13 @@ impl Renderer {
                 false,
                 None,
             );
-            (pipelines, reflection_pipelines, fast_pipelines)
+            (
+                pipelines,
+                fog_pass_pipelines,
+                reflection_pipelines,
+                reflection_fog_pass_pipelines,
+                fast_pipelines,
+            )
         };
 
         if let Some(world) = &mut self.world {
@@ -11640,7 +13001,9 @@ impl Renderer {
                 key,
                 WorldPipelineVariant {
                     pipelines,
+                    fog_pass_pipelines,
                     reflection_pipelines,
+                    reflection_fog_pass_pipelines,
                 },
             );
             world.active_pipeline_variant = key;
@@ -11681,6 +13044,15 @@ impl Renderer {
             self.ssr_enabled,
             self.cloud_render_resolution,
         );
+        let ssr_visibility_resources =
+            create_ssr_visibility_resources(&self.device, &self.targets, samples);
+        let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
+            ssr_visibility_resources.map_or((None, None, None), |(layout, pipeline, bind_group)| {
+                (Some(layout), Some(pipeline), Some(bind_group))
+            });
+        self._ssr_visibility_layout = ssr_visibility_layout;
+        self.ssr_visibility_pipeline = ssr_visibility_pipeline;
+        self.ssr_visibility_bind_group = ssr_visibility_bind_group;
         self.weather
             .rain
             .rebuild_render_pipelines(&self.device, scene_format, samples);
@@ -11690,6 +13062,24 @@ impl Renderer {
             .rebuild_pipelines(&self.device, scene_format, samples);
         self.dynamic_model_renderer
             .rebuild_pipelines(&self.device, scene_format, samples);
+        if let Some(ocean) = &mut self.ocean {
+            ocean.rebuild_spray_pipeline(
+                &self.device,
+                &self.camera_layout,
+                &self.ocean_layout,
+                scene_format,
+                samples,
+            );
+        }
+        for (_, ocean) in &mut self.authored_oceans {
+            ocean.rebuild_spray_pipeline(
+                &self.device,
+                &self.camera_layout,
+                &self.ocean_layout,
+                scene_format,
+                samples,
+            );
+        }
         self.rebuild_planar_reflection_resources();
         self.taa_post_pipeline = create_taa_post_pipeline(
             &self.device,
@@ -11766,6 +13156,11 @@ impl Renderer {
         camera_pos_time: [f32; 4],
         history_valid: bool,
     ) {
+        let legacy1_global_fog = self.weather.fog.legacy1_global_post_params();
+        let (legacy_fog, legacy_fog_scale) = legacy1_global_fog.map_or(
+            ([0.0; 4], 0.0),
+            |(color, depth, scale)| ([color[0], color[1], color[2], depth], scale),
+        );
         let uniform = PostUniform {
             color: PostColorSettings {
                 gamma: self.gamma,
@@ -11786,7 +13181,7 @@ impl Renderer {
                 if self.hdr_enabled { 1.0 } else { 0.0 },
                 if self.reflection_debug_enabled { 1.0 } else { 0.0 },
                 self.reflection_quality.shader_value() as f32,
-                0.0,
+                legacy_fog_scale,
             ],
             scene: PostSceneSettings {
                 contact_shadows: if self.contact_shadows_enabled {
@@ -11826,6 +13221,7 @@ impl Renderer {
                 dof_focus_distance: self.dof_focus_distance,
                 dof_quality: self.dof_quality.shader_value(),
             },
+            legacy_fog,
             clouds: CloudRenderSettings {
                 values: [
                     if self.clouds_enabled { 1.0 } else { 0.0 },
@@ -11838,8 +13234,8 @@ impl Renderer {
                 values: [
                     self.cloud_height,
                     self.cloud_thickness,
-                    self.cloud_wind_speed,
-                    self.cloud_wind_direction.to_radians(),
+                    self.weather_wind.speed,
+                    self.weather_wind.direction.to_radians(),
                 ],
             },
             cloud_sun: {
@@ -11896,15 +13292,15 @@ impl Renderer {
                     self.cloud_history_blend,
                     self.cloud_motion_reject,
                     if self.cloud_history_depth_reject { 1.0 } else { 0.0 },
-                    0.0,
+                    if self.cloud_shape_evolution { 1.0 } else { 0.0 },
                 ],
             },
             cloud_variation: PostCloudVariationSettings {
                 values: [
                     self.cloud_thickness_variation,
                     self.cloud_size,
-                    if self.cloud_wind_variation { 1.0 } else { 0.0 },
-                    if self.cloud_shape_evolution { 1.0 } else { 0.0 },
+                    self.weather_wind.gust,
+                    self.weather_wind.shift.to_radians(),
                 ],
             },
             cloud_temporal: PostCloudTemporalSettings {
@@ -12093,6 +13489,10 @@ impl Renderer {
                             &self.targets.ao_depth_view,
                             &self.targets.reflection_mask_view,
                             &self.auto_exposure_state_buffer,
+                            self.targets
+                                .ssr_visibility_view
+                                .as_ref()
+                                .unwrap_or(&self.white.view),
                         )
                     })
                 })
@@ -12118,6 +13518,7 @@ impl Renderer {
             &self.shadow_resources.weather_sampler,
             &self.shadow_resources.weather_surface_buffer,
             &self.targets.reflection_mask_view,
+            self.targets.ssr_visibility_view.as_ref(),
         );
         self.bloom_bind_groups = create_bloom_bind_groups(
             &self.device,
@@ -12162,6 +13563,118 @@ impl Renderer {
         );
     }
 
+    fn render_asset_preview(
+        &mut self,
+        camera: &Camera,
+        dynamic_models: &[DynamicModelSurface],
+    ) -> Result<FrameInfo, RenderError> {
+        let frame_started = Instant::now();
+        let full_width = self.config.width.max(1);
+        let full_height = self.config.height.max(1);
+        let draw_preview = self.asset_preview_viewport.is_some();
+        let mut viewport = self.asset_preview_viewport.unwrap_or([0, 0, 1, 1]);
+        viewport[0] = viewport[0].min(full_width.saturating_sub(1));
+        viewport[1] = viewport[1].min(full_height.saturating_sub(1));
+        viewport[2] = viewport[2].min(full_width.saturating_sub(viewport[0])).max(1);
+        viewport[3] = viewport[3].min(full_height.saturating_sub(viewport[1])).max(1);
+        let view_proj = camera.view_projection(viewport[2], viewport[3]);
+        let uniform = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos_time: [camera.position.x, camera.position.y, camera.position.z, self.started.elapsed().as_secs_f32()],
+            clip_plane: [0.0; 4],
+            render_flags: [0, 0, 0, 0],
+            camera_forward: camera.forward().extend(0.0).to_array(),
+            unjittered_view_proj: view_proj.to_cols_array_2d(),
+            previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
+        };
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let mut info = FrameInfo::default();
+        let prepare_started = Instant::now();
+        self.dynamic_model_renderer
+            .prepare(&self.device, &self.queue, dynamic_models, None);
+        info.dynamic_model_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) = self.dynamic_model_renderer.ghoul2_draw_stats();
+        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
+        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
+        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
+        info.dynamic_model_vertices = dynamic_models.iter().map(|surface| surface.vertex_count() as u64).sum();
+        info.dynamic_model_indices = dynamic_models.iter().map(|surface| surface.index_count() as u64).sum();
+        info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+
+        let acquire_started = Instant::now();
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => return Err(RenderError::Occluded),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(RenderError::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::Lost),
+            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
+        };
+        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let encode_started = Instant::now();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("JKA asset viewer encoder"),
+        });
+        let (color_view, resolve_target) = if let Some(msaa_view) = &self.targets.msaa_view {
+            (msaa_view, Some(&frame_view))
+        } else {
+            (&frame_view, None)
+        };
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA asset viewer model preview"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if draw_preview {
+                pass.set_viewport(
+                    viewport[0] as f32,
+                    viewport[1] as f32,
+                    viewport[2] as f32,
+                    viewport[3] as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(viewport[0], viewport[1], viewport[2], viewport[3]);
+                self.dynamic_model_renderer.draw(&mut pass, &self.camera_bind_group);
+            }
+        }
+        info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        let submit_started = Instant::now();
+        self.queue.submit([encoder.finish()]);
+        self.submit_egui(&frame_view);
+        if self.egui_active {
+            self.submit_ui_overlay(&frame_view);
+        }
+        self.window.pre_present_notify();
+        frame.present();
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(info)
+    }
+
     fn render_fast_baseline(
         &mut self,
         camera: &Camera,
@@ -12180,7 +13693,7 @@ impl Renderer {
                 self.started.elapsed().as_secs_f32(),
             ],
             clip_plane: [0.0; 4],
-            render_flags: [0, u32::from(self.static_bsp_ao_enabled), 0, 0],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
             camera_forward: camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
@@ -12231,8 +13744,12 @@ impl Renderer {
             }
         }
         let dynamic_prepare_started = Instant::now();
+        let entity_light_grid = self
+            .world
+            .as_ref()
+            .and_then(|world| world.entity_light_grid.as_ref());
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models);
+            .prepare(&self.device, &self.queue, dynamic_models, entity_light_grid);
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();
@@ -12341,7 +13858,13 @@ impl Renderer {
             for &batch_index in active.indices {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
-                if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                if self.ocean_enabled && batch.source.water { continue; }
+                if world.source_map
+                    && batch.source.pipeline.class != DrawClass::Sky
+                    && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                {
+                    continue;
+                }
                 if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
                     if !snow_shell_drawn {
                         draw_snow_shell_fast(&mut pass, world, view_proj, snow_deform_center, &mut current_pipeline);
@@ -12451,7 +13974,10 @@ impl Renderer {
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
-                        if batch.source.pipeline.class != DrawClass::Sky {
+                        if batch.source.pipeline.class != DrawClass::Sky
+                            && (!world.source_map
+                                || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                        {
                             draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
                         }
                     }
@@ -12507,7 +14033,12 @@ impl Renderer {
 
         // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
         // frame, so the readout ends up above it rather than beneath.
-        if !menu_backdrop_active && !self.egui_active && self.ui_vertex_count != 0 {
+        if !menu_backdrop_active
+            && !self.egui_active
+            && (self.ui_vertex_count != 0
+                || self.ui_dynamic_vertex_count != 0
+                || self.ui_transient_vertex_count != 0)
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA overlay (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -12524,10 +14055,17 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.ui_pipeline);
-            pass.set_bind_group(0, &self.ui_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
-            pass.draw(0..self.ui_vertex_count, 0..1);
+            Self::draw_ui_batches(
+                &mut pass,
+                &self.ui_pipeline,
+                &self.ui_bind_group,
+                &self.ui_dynamic_vertex_buffer,
+                self.ui_dynamic_vertex_count,
+                &self.ui_transient_vertex_buffer,
+                self.ui_transient_vertex_count,
+                &self.ui_vertex_buffer,
+                self.ui_vertex_count,
+            );
         }
 
         if !menu_backdrop_active && !self.egui_active {
@@ -12638,6 +14176,7 @@ impl Renderer {
         player_position: Option<Vec3>,
         area_mask: Option<&[u8; 32]>,
         dynamic_models: &[DynamicModelSurface],
+        transient_lights: &[TransientLight],
         dof_focus_target: f32,
         motion_reference_camera: &Camera,
         motion_camera_sample_dt: f32,
@@ -12645,6 +14184,10 @@ impl Renderer {
     ) -> Result<FrameInfo, RenderError> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameInfo::default());
+        }
+
+        if self.asset_preview_mode {
+            return self.render_asset_preview(camera, dynamic_models);
         }
 
         // Resolved before any pass borrows the renderer mutably.
@@ -12664,6 +14207,10 @@ impl Renderer {
         if menu_backdrop_active {
             self.ensure_menu_backdrop_resources();
         }
+
+        // CGame/FX submits RE_AddLightToScene-style lights at simulation rate.
+        // Keep them in a transient tail of the clustered-light buffer.
+        self.set_transient_lights(transient_lights);
 
         // Snowflow state advances only when new brushes/window movement/relaxation
         // require it. This is deliberately before the fast-path early return.
@@ -12732,6 +14279,44 @@ impl Renderer {
         } else {
             camera.view_projection(self.config.width, self.config.height)
         };
+        let mut optical_volumes = None;
+        if self.ocean_enabled && self.world.as_ref().is_some_and(|w| !w.ocean_surfaces.is_empty()) {
+            let key = (self.config.width.max(1), self.config.height.max(1), self.msaa_samples, self.scene_format());
+            if self.ocean_optics.key != key {
+                self.ocean_optics = crate::ocean::optics::Resources::new(&self.device,
+                    &self.ocean_optics_layout, &self.ocean_layout, key);
+            }
+            let optical = self.ocean_settings.optics;
+            let fog = crate::ocean::optics::linear_color(optical.fog_color);
+            let mut uniform = crate::ocean::optics::Uniform {
+                inverse_view_projection: view_proj.inverse().to_cols_array_2d(),
+                eye: camera.position.extend(1.0).to_array(),
+                forward: camera.forward().extend(0.0).to_array(),
+                fog: [fog[0], fog[1], fog[2], optical.absorption_distance()],
+                params: [optical.absorption_distance() * optical.depth_darkening, optical.refraction, optical.caustics, 0.0],
+                minimum: [[0.0;4];8], maximum: [[0.0;4];8],
+            };
+            let mut count = 0;
+            for a in &self.authored_ocean_definitions {
+                if count == 8 { break; }
+                uniform.minimum[count] = [a.mins[0], a.mins[2], -a.maxs[1], 0.0];
+                uniform.maximum[count] = [a.maxs[0], a.height, -a.mins[1], 0.0];
+                count += 1;
+            }
+            if let Some(world) = &self.world {
+                for s in &world.ocean_surfaces {
+                    if count == 8 { break; }
+                    let centre = [(s.minimum[0]+s.maximum[0])*0.5,s.plane_height,(s.minimum[1]+s.maximum[1])*0.5];
+                    if self.authored_ocean_definitions.iter().any(|a| a.contains_render_point(centre)) { continue; }
+                    uniform.minimum[count] = [s.minimum[0], -65536.0, s.minimum[1], 0.0];
+                    uniform.maximum[count] = [s.maximum[0], s.plane_height, s.maximum[1], 0.0];
+                    count += 1;
+                }
+            }
+            uniform.params[3] = count as f32;
+            self.queue.write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&uniform));
+            optical_volumes = Some(uniform);
+        }
         let cloud_view_proj = if self.clouds_enabled {
             camera.view_projection(self.config.width, self.config.height)
         } else {
@@ -12783,7 +14368,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos_time,
             clip_plane: [0.0; 4],
-            render_flags: [0, u32::from(self.static_bsp_ao_enabled), 0, 0],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
             camera_forward: camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: unjittered_view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: previous_unjittered_view_proj.to_cols_array_2d(),
@@ -12947,6 +14532,7 @@ impl Renderer {
                         area_mask,
                         self.planar_reflection_mode,
                         self.reflection_quality,
+                        self.ocean_enabled,
                         &self.planar_slot_history,
                     )
                 })
@@ -13054,7 +14640,7 @@ impl Renderer {
                         camera_pos_time[3],
                     ],
                     clip_plane: view.plane,
-                    render_flags: [1, u32::from(self.static_bsp_ao_enabled), 0, 0],
+                    render_flags: [1, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
                     camera_forward: view.camera_forward.extend(0.0).to_array(),
                     unjittered_view_proj: view.view_proj.to_cols_array_2d(),
                     previous_unjittered_view_proj: view.view_proj.to_cols_array_2d(),
@@ -13365,6 +14951,30 @@ impl Renderer {
 
         self.weather.rain.dispatch_simulation(&mut encoder);
 
+        // Entities must be uploaded before the depth prepass, which now carries
+        // them so linear depth is the single authoritative nearest-opaque depth.
+        let dynamic_prepare_started = Instant::now();
+        let entity_light_grid = self
+            .world
+            .as_ref()
+            .and_then(|world| world.entity_light_grid.as_ref());
+        self.dynamic_model_renderer
+            .prepare(&self.device, &self.queue, dynamic_models, entity_light_grid);
+        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
+            self.dynamic_model_renderer.ghoul2_draw_stats();
+        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
+        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
+        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
+        info.dynamic_model_vertices = dynamic_models
+            .iter()
+            .map(|surface| surface.vertex_count() as u64)
+            .sum();
+        info.dynamic_model_indices = dynamic_models
+            .iter()
+            .map(|surface| surface.index_count() as u64)
+            .sum();
+
         if plan.needs_linear_depth {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Depth, false);
@@ -13431,6 +15041,13 @@ impl Renderer {
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
                     if !batch_area_visible(batch, effective_area_mask) { continue; }
+                    if self.ocean_enabled && batch.source.water { continue; }
+                    if world.source_map
+                        && batch.source.pipeline.class != DrawClass::Sky
+                        && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    {
+                        continue;
+                    }
                     match batch.source.pipeline.class {
                         DrawClass::Opaque => {
                             if mask_pipeline_active {
@@ -13462,6 +15079,11 @@ impl Renderer {
                     }
                 }
             }
+            // Players, vehicles and other depth-writing entities. Without them
+            // every post consumer saw the BSP behind an entity, which washed
+            // third-person players in background fog.
+            self.dynamic_model_renderer
+                .draw_prepass(&mut pass, &self.camera_bind_group);
             drop(pass);
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Depth, true);
@@ -13529,7 +15151,7 @@ impl Renderer {
 
         if plan.use_clustered_lighting {
             if let Some(world) = &self.world {
-                if world.light_count > 0 {
+                if self.active_light_count() > 0 {
                     self.gpu_profiler.write_encoder_timestamp(
                         &mut encoder,
                         GpuPass::Cluster,
@@ -13643,16 +15265,17 @@ impl Renderer {
                         .as_ref()
                         .map(|ocean| &ocean.render_bind_group)
                         .unwrap_or(&self.ocean_inert_bind_group);
+                    pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                     pass.set_bind_group(6, ocean_bind_group, &[]);
                 }
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 let mut current_pipeline = None;
                 if !planar_binding_test {
-                    for &batch_index in indices {
+                    for (reflection_pos, &batch_index) in indices.iter().enumerate() {
                         let batch = &world.coarse_batches[batch_index];
                         if !batch_area_visible(batch, reflection_area_mask) { continue; }
-                        if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                        if self.ocean_enabled && batch.source.water { continue; }
                         // Omit this reflector's own geometry. Other reflective
                         // planes render through the recursion-disabled path.
                         let selected_range = &world.coarse_batches
@@ -13685,6 +15308,50 @@ impl Renderer {
                         pass.set_bind_group(1, &batch.bind_group, &[]);
                         if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
                         draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+
+                        let next_is_same_surface = indices.get(reflection_pos + 1).is_some_and(|&next_index| {
+                            same_world_surface(batch, &world.coarse_batches[next_index])
+                        });
+                        let surface_writes_depth = indices[..=reflection_pos]
+                            .iter()
+                            .rev()
+                            .map(|&index| &world.coarse_batches[index])
+                            .take_while(|sibling| same_world_surface(batch, sibling))
+                            .any(|sibling| sibling.source.pipeline.depth_write);
+                        let needs_fog_pass = !next_is_same_surface
+                            && batch.source.pipeline.class != DrawClass::Sky
+                            // GodotOcean fogs itself (bsp.wgsl apply_ocean_legacy_fog).
+                            && !(self.ocean_enabled && batch.ocean_clipmap.is_some())
+                            && self.weather.fog.legacy_uses_separate_pass(
+                                batch.source.fog_is_global,
+                                batch.source.legacy2_fog_in_stage_safe,
+                                batch.source.global_fog_post_eligible,
+                            )
+                            && (batch.source.fog[3] > 0.001
+                                || self.weather.fog.legacy_drawfog_value() == 1);
+                        if needs_fog_pass {
+                            if let Some(fog_pipeline) = active_pipeline_variant
+                                .reflection_fog_pass_pipelines
+                                .get(&(batch.source.pipeline, surface_writes_depth))
+                            {
+                                pass.set_pipeline(fog_pipeline);
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if enhanced_world_shader {
+                                    pass.set_bind_group(
+                                        6,
+                                        Self::ocean_bind_group_for(
+                                            batch,
+                                            &self.authored_oceans,
+                                            &self.ocean,
+                                            &self.ocean_inert_bind_group,
+                                        ),
+                                        &[],
+                                    );
+                                }
+                                draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                                current_pipeline = None;
+                            }
+                        }
                     }
                 }
             }
@@ -13724,24 +15391,6 @@ impl Renderer {
         } else {
             final_output
         };
-
-        let dynamic_prepare_started = Instant::now();
-        self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models);
-        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
-        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
-            self.dynamic_model_renderer.ghoul2_draw_stats();
-        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
-        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
-        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
-        info.dynamic_model_vertices = dynamic_models
-            .iter()
-            .map(|surface| surface.vertex_count() as u64)
-            .sum();
-        info.dynamic_model_indices = dynamic_models
-            .iter()
-            .map(|surface| surface.index_count() as u64)
-            .sum();
 
         let mut compact_group_drawn = std::mem::take(&mut self.compact_group_scratch);
         self.gpu_profiler
@@ -13794,6 +15443,7 @@ impl Renderer {
                     .as_ref()
                     .map(|ocean| &ocean.render_bind_group)
                     .unwrap_or(&self.ocean_inert_bind_group);
+                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                 pass.set_bind_group(6, ocean_bind_group, &[]);
             }
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
@@ -13803,17 +15453,52 @@ impl Renderer {
             let mut current_pipeline = None;
             let mut grass_drawn = false;
             let mut snow_shell_drawn = false;
+            // A separate OpenJK-style fog redraw must occur after the final
+            // material stage of each surface. GPU compaction can merge/reorder
+            // those stages, so keep it only when this frame needs no fog pass.
+            let separate_legacy_fog_pass = match self.weather.fog.legacy_drawfog_value() {
+                1 => active.indices.iter().any(|&batch_index| {
+                    let batch = &active.batches[batch_index];
+                    batch.source.fog[3] > 0.001
+                        && (!batch.source.fog_is_global
+                            || !batch.source.global_fog_post_eligible)
+                }),
+                2 => active.indices.iter().any(|&batch_index| {
+                    let batch = &active.batches[batch_index];
+                    batch.source.fog[3] > 0.001
+                }),
+                _ => false,
+            };
             let use_compaction = self.gpu_driven_enabled
                 && !self.ocean_enabled
                 && self.gpu_compaction_supported
                 && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                && !separate_legacy_fog_pass
                 && !world.compact_groups.is_empty();
             compact_group_drawn.clear();
             compact_group_drawn.resize(world.compact_groups.len(), false);
-            for &batch_index in active.indices {
+            for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
-                if self.ocean_enabled && batch.source.water && !batch.source.water_primary { continue; }
+                if self.ocean_enabled && batch.source.water { continue; }
+                // When GPU-driven culling is disabled, reject source-map batches
+                // with useful local bounds before recording WGPU state/draw commands.
+                // Global material batches simply intersect and retain the old cheap path.
+                if world.source_map
+                    && !self.gpu_driven_enabled
+                    && batch.source.pipeline.class != DrawClass::Sky
+                    && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                {
+                    continue;
+                }
+                if let Some(volumes) = &optical_volumes {
+                    let optical = self.ocean_settings.optics;
+                    let wave_margin = self.authored_ocean_definitions.iter().map(|a| a.waves.amplitude)
+                        .fold(self.ocean_settings.authored.amplitude, f32::max) * 4.0;
+                    if batch.source.pipeline.class != DrawClass::Sky
+                        && crate::ocean::optics::cull_submerged(camera.position.to_array(), batch.bounds_min, batch.bounds_max,
+                            volumes, optical.absorption_distance() * optical.underwater_cull, wave_margin) { continue; }
+                }
                 if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
                     if !snow_shell_drawn {
                         draw_snow_shell(
@@ -13871,6 +15556,7 @@ impl Renderer {
                                     .as_ref()
                                     .map(|ocean| &ocean.render_bind_group)
                                     .unwrap_or(&self.ocean_inert_bind_group);
+                                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                                 pass.set_bind_group(6, ocean_bind_group, &[]);
                             }
                             current_pipeline = None;
@@ -13948,6 +15634,67 @@ impl Renderer {
                     // range, which is not represented by the stock indirect record.
                     draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
                 }
+
+                // OpenJK r_drawfog 1 redraws fog after all material stages.
+                // r_drawfog 2 does the same only for local brush fog. Batches for
+                // a multi-stage shader share the exact vertex range, so emit the
+                // pass only after the last sibling stage instead of fogging each
+                // stage independently.
+                let next_is_same_surface = active.indices.get(active_pos + 1).is_some_and(|&next_index| {
+                    same_world_surface(batch, &active.batches[next_index])
+                });
+                let surface_writes_depth = active.indices[..=active_pos]
+                    .iter()
+                    .rev()
+                    .map(|&index| &active.batches[index])
+                    .take_while(|sibling| same_world_surface(batch, sibling))
+                    .any(|sibling| sibling.source.pipeline.depth_write);
+                let needs_fog_pass = !next_is_same_surface
+                    && batch.source.pipeline.class != DrawClass::Sky
+                    // The displaced GodotOcean cannot pass this depth-EQUAL
+                    // redraw; it fogs itself (bsp.wgsl apply_ocean_legacy_fog).
+                    && !(self.ocean_enabled && batch.ocean_clipmap.is_some())
+                    && self.weather.fog.legacy_uses_separate_pass(
+                        batch.source.fog_is_global,
+                        batch.source.legacy2_fog_in_stage_safe,
+                        batch.source.global_fog_post_eligible,
+                    )
+                    && (batch.source.fog[3] > 0.001
+                        || self.weather.fog.legacy_drawfog_value() == 1);
+                if needs_fog_pass {
+                    if let Some(fog_pipeline) = active_pipeline_variant
+                        .fog_pass_pipelines
+                        .get(&(batch.source.pipeline, surface_writes_depth))
+                    {
+                        pass.set_pipeline(fog_pipeline);
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        if enhanced_world_shader {
+                            pass.set_bind_group(
+                                6,
+                                Self::ocean_bind_group_for(
+                                    batch,
+                                    &self.authored_oceans,
+                                    &self.ocean,
+                                    &self.ocean_inert_bind_group,
+                                ),
+                                &[],
+                            );
+                        }
+                        if self.gpu_driven_enabled
+                            && !(self.ocean_enabled && batch.source.water_primary)
+                        {
+                            let offset = u64::from(batch.cull_index)
+                                * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+                            pass.draw_indexed_indirect(&world.indirect_buffer, offset);
+                        } else {
+                            draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                        }
+                        // The next authored stage uses a different pipeline object
+                        // even when its PipelineKey matches this batch. Force the
+                        // normal pipeline to be rebound after the fog pass.
+                        current_pipeline = None;
+                    }
+                }
             }
             if !snow_shell_drawn {
                 draw_snow_shell(
@@ -14000,6 +15747,7 @@ impl Renderer {
                             .as_ref()
                             .map(|ocean| &ocean.render_bind_group)
                             .unwrap_or(&self.ocean_inert_bind_group);
+                        pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                         pass.set_bind_group(6, ocean_bind_group, &[]);
                     }
                 }
@@ -14012,24 +15760,104 @@ impl Renderer {
                     prepared,
                 );
             }
-            if let Some(ocean) = self.ocean.as_ref() {
-                ocean.draw_spray(&mut pass, &self.camera_bind_group);
-            }
-            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+            let split_dynamic_for_ocean = optical_volumes.is_some();
             self.gpu_profiler.write_render_pass_timestamp(
                 &mut pass,
                 GpuPass::DynamicModels,
                 false,
             );
-            self.dynamic_model_renderer
-                .draw(&mut pass, &self.camera_bind_group);
+            if split_dynamic_for_ocean {
+                // Only depth-writing entities belong in the pre-water scene.
+                // Additive/alpha FX (especially saber core + glow) must be
+                // composited after the ocean surface and spray, otherwise the
+                // opaque water pass overwrites them because they do not write
+                // depth themselves.
+                self.dynamic_model_renderer
+                    .draw_phase(&mut pass, &self.camera_bind_group, true);
+            } else {
+                self.dynamic_model_renderer
+                    .draw(&mut pass, &self.camera_bind_group);
+            }
             self.gpu_profiler.write_render_pass_timestamp(
                 &mut pass,
                 GpuPass::DynamicModels,
                 true,
             );
 
-            // DynamicModelRenderer::draw() binds its own transient entity vertex/index
+            if optical_volumes.is_some() {
+                drop(pass);
+                self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::OceanOptics, false);
+                let optical_ocean = self.authored_oceans.iter()
+                    .find(|(a, _)| camera.position.x >= a.mins[0] && camera.position.x <= a.maxs[0]
+                        && -camera.position.z >= a.mins[1] && -camera.position.z <= a.maxs[1])
+                    .map(|(_, gpu)| &gpu.render_bind_group)
+                    .or_else(|| self.ocean.as_ref().map(|gpu| &gpu.render_bind_group))
+                    .unwrap_or(&self.ocean_inert_bind_group);
+                // Pair each MSAA color sample with the matching depth sample in
+                // the underwater optics capture. Sampling the resolved color with
+                // a nearest-depth resolve produces a one-pixel halo at silhouettes.
+                self.ocean_optics.capture(&self.device, &mut encoder, color_view,
+                    &self.targets.depth_view, optical_ocean);
+                let submerged = optical_volumes.as_ref().is_some_and(|v| {
+                    (0..v.params[3] as usize).any(|i| (0..3).all(|axis| camera.position[axis] >= v.minimum[i][axis]
+                        && camera.position[axis] <= v.maximum[i][axis]))
+                });
+                if submerged { self.ocean_optics.composite(&mut encoder, color_view, resolve_target); }
+                self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::OceanOptics, true);
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA ocean surface and diagnostics"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view, depth_slice: None, resolve_target,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None,
+                    }), ..Default::default()
+                });
+                pass.set_pipeline(&active_pipeline_variant.pipelines[&ocean_pipeline_key()]);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(2, &world.lighting_bind_group, &[]);
+                pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                for &batch_index in active.indices {
+                    let batch = &active.batches[batch_index];
+                    if batch.ocean_clipmap.is_none() || !batch_area_visible(batch, effective_area_mask) { continue; }
+                    if world.source_map
+                        && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    {
+                        continue;
+                    }
+                    pass.set_bind_group(1, &batch.bind_group, &[]);
+                    pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                    draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                }
+            }
+
+            if let Some(ocean) = self.ocean.as_ref() {
+                ocean.draw_spray(&mut pass, &self.camera_bind_group);
+            }
+            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+
+            if split_dynamic_for_ocean {
+                self.gpu_profiler.write_render_pass_timestamp(
+                    &mut pass,
+                    GpuPass::DynamicModelsTranslucent,
+                    false,
+                );
+                self.dynamic_model_renderer
+                    .draw_phase(&mut pass, &self.camera_bind_group, false);
+                self.gpu_profiler.write_render_pass_timestamp(
+                    &mut pass,
+                    GpuPass::DynamicModelsTranslucent,
+                    true,
+                );
+            }
+
+            // DynamicModelRenderer binds its own transient entity vertex/index
             // buffers. Everything below this point (wireframe, surface inspector, PVS
             // debug) addresses BSP/world index ranges, so restore the world geometry
             // bindings unconditionally before any of those debug draws run.
@@ -14042,7 +15870,10 @@ impl Renderer {
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
-                        if batch.source.pipeline.class != DrawClass::Sky {
+                        if batch.source.pipeline.class != DrawClass::Sky
+                            && (!world.source_map
+                                || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                        {
                             draw_world_batch(&mut pass, batch, 0..1, None);
                         }
                     }
@@ -14100,6 +15931,45 @@ impl Renderer {
 
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
+
+        // Fog does not need this: entities are in the linear-depth prepass, so
+        // it already is the authoritative opaque scene depth. Only SSR still
+        // uses the resolve, to reject reflections under non-prepass geometry
+        // (grass, promoted ocean) drawn over a reflective BSP surface.
+        let needs_resolved_scene_depth = self.ssr_enabled || self.reflection_debug_enabled;
+        if needs_resolved_scene_depth {
+            // Resolve the final opaque device depth after players, vehicles and
+            // promoted ocean have rendered. SSR compares its reconstructed
+            // world-space distance with the linear-depth prepass.
+            if let (Some(view), Some(pipeline), Some(bind_group)) = (
+                self.targets.ssr_visibility_view.as_ref(),
+                self.ssr_visibility_pipeline.as_ref(),
+                self.ssr_visibility_bind_group.as_ref(),
+            ) {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA resolved final scene depth"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                if self.world.is_some() {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+
         if self.ssao_enabled {
             if let (Some(history), Some(bind_groups)) =
                 (&self.targets.ssao_history, &self.ssao_temporal_bind_groups)
@@ -14505,7 +16375,12 @@ impl Renderer {
 
         // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
         // frame, so the readout ends up above it rather than beneath.
-        if !menu_backdrop_active && !self.egui_active && self.ui_vertex_count != 0 {
+        if !menu_backdrop_active
+            && !self.egui_active
+            && (self.ui_vertex_count != 0
+                || self.ui_dynamic_vertex_count != 0
+                || self.ui_transient_vertex_count != 0)
+        {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, false);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -14524,10 +16399,17 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.ui_pipeline);
-            pass.set_bind_group(0, &self.ui_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
-            pass.draw(0..self.ui_vertex_count, 0..1);
+            Self::draw_ui_batches(
+                &mut pass,
+                &self.ui_pipeline,
+                &self.ui_bind_group,
+                &self.ui_dynamic_vertex_buffer,
+                self.ui_dynamic_vertex_count,
+                &self.ui_transient_vertex_buffer,
+                self.ui_transient_vertex_count,
+                &self.ui_vertex_buffer,
+                self.ui_vertex_count,
+            );
             drop(pass);
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, true);
@@ -15106,6 +16988,7 @@ fn build_world(
     compress_pbr_companions: bool,
     map: PreparedMap,
 ) -> (WorldGpu, WorldUploadTimings) {
+    let source_map = map.map_file_stats.is_some();
     let PreparedMap {
         vertices,
         batches: coarse_sources,
@@ -15117,6 +17000,7 @@ fn build_world(
         static_bsp_ao_cache,
         visibility,
         lights: dynamic_lights,
+        source_map_lighting,
         sun,
         static_light_grid,
         voxel_probe_gi: voxel_probe_gi_data,
@@ -15134,6 +17018,7 @@ fn build_world(
         .iter()
         .map(|vertex| InspectorVertex {
             position: vertex.position,
+            normal: vertex.normal,
             uv: vertex.uv,
             lightmap_uv: vertex.lightmap_uv,
         })
@@ -15421,6 +17306,9 @@ fn build_world(
             let ocean_clipmap = water_plane.and_then(|(plane, minimum, maximum)| {
                 ocean_clipmaps.get(&ocean_surface_key(plane, minimum, maximum)).cloned()
             });
+            if let Some((plane, _, _)) = water_plane {
+                source.planar_plane = [0.0, 1.0, 0.0, -plane];
+            }
             let material_uniform = material_uniform(&source);
             let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("JKA material uniform"),
@@ -15432,6 +17320,8 @@ fn build_world(
                 source.fog,
                 source.fog_is_global,
                 source.fog_color_override,
+                source.legacy2_fog_in_stage_safe,
+                source.global_fog_post_eligible,
             );
             let bind_group = create_world_bind_group(
                 device,
@@ -15655,14 +17545,18 @@ fn build_world(
         .collect::<Vec<_>>();
     let light_count = u32::try_from(dynamic_lights.len()).unwrap_or(0);
     let shadow_slot_by_light = vec![0_u32; dynamic_lights.len()];
-    let gpu_lights = gpu_point_lights(&dynamic_lights, &shadow_slot_by_light);
+    // Static map lights occupy the prefix; transient CGame/FX lights use the
+    // remaining slots at runtime without reallocating this storage buffer.
+    let mut gpu_lights = gpu_point_lights(&dynamic_lights, &shadow_slot_by_light);
+    gpu_lights.resize(MAX_DYNAMIC_LIGHTS, GpuPointLight::zeroed());
     let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA dynamic point lights"),
         contents: bytemuck::cast_slice(&gpu_lights),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let local_shadows = create_local_shadow_resources(device, shadow_caster_layout);
-    let static_light_grid = upload_static_light_grid(device, queue, static_light_grid.as_ref());
+    let static_light_grid_gpu = upload_static_light_grid(device, queue, static_light_grid.as_ref());
+    let entity_light_grid = static_light_grid.map(scene::StaticLightGrid::into_classic_entity_grid);
     let voxel_probe_gi = upload_voxel_probe_gi(device, queue, voxel_probe_gi_data.as_ref());
     if light_count != 0 {
         println!(
@@ -15727,19 +17621,19 @@ fn build_world(
             },
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid.direction_view),
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid.lighting_view),
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
             },
             wgpu::BindGroupEntry {
                 binding: 8,
-                resource: wgpu::BindingResource::Sampler(&static_light_grid.sampler),
+                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 9,
-                resource: static_light_grid.uniform_buffer.as_entire_binding(),
+                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 10,
@@ -15755,11 +17649,11 @@ fn build_world(
             },
             wgpu::BindGroupEntry {
                 binding: 13,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid.irradiance_volume_view),
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.irradiance_volume_view),
             },
             wgpu::BindGroupEntry {
                 binding: 14,
-                resource: static_light_grid.irradiance_volume_uniform_buffer.as_entire_binding(),
+                resource: static_light_grid_gpu.irradiance_volume_uniform_buffer.as_entire_binding(),
             },
         ],
     });
@@ -15794,19 +17688,19 @@ fn build_world(
             },
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid.direction_view),
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid.lighting_view),
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
             },
             wgpu::BindGroupEntry {
                 binding: 8,
-                resource: wgpu::BindingResource::Sampler(&static_light_grid.sampler),
+                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 9,
-                resource: static_light_grid.uniform_buffer.as_entire_binding(),
+                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
             },
         ],
     });
@@ -15823,6 +17717,19 @@ fn build_world(
         legacy_fog,
         Some(shader_variant),
     );
+    let fog_pass_pipelines = if legacy_fog {
+        create_legacy_fog_pass_pipelines(
+            device,
+            pipeline_layout,
+            shader,
+            surface_format,
+            msaa_samples,
+            &coarse_batches,
+            Some(shader_variant),
+        )
+    } else {
+        BTreeMap::new()
+    };
     let fast_pipelines = create_world_pipelines(
         device,
         fast_pipeline_layout,
@@ -15847,12 +17754,27 @@ fn build_world(
             shader_variant,
         )
     };
+    let reflection_fog_pass_pipelines =
+        if legacy_fog && !planar_reflectors.is_empty() && shader_variant.planar_reflections {
+            create_reflection_fog_pass_pipelines(
+                device,
+                pipeline_layout,
+                shader,
+                surface_format,
+                &coarse_batches,
+                shader_variant,
+            )
+        } else {
+            BTreeMap::new()
+        };
     let mut pipeline_variants = BTreeMap::new();
     pipeline_variants.insert(
         shader_variant,
         WorldPipelineVariant {
             pipelines,
+            fog_pass_pipelines,
             reflection_pipelines,
+            reflection_fog_pass_pipelines,
         },
     );
     upload_timings.pipeline_create_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0;
@@ -15897,6 +17819,8 @@ fn build_world(
 
     (
         WorldGpu {
+            source_map,
+            source_map_lighting,
             sky_average,
             primary_skybox,
             ocean_surfaces,
@@ -15923,7 +17847,8 @@ fn build_world(
             cluster_compute_bind_group,
             lighting_bind_group,
             lighting_bind_group_lean,
-            _static_light_grid: static_light_grid,
+            _static_light_grid: static_light_grid_gpu,
+            entity_light_grid,
             voxel_probe_gi,
             reflection_probes,
             froxel_bind_group: None,
@@ -16047,6 +17972,7 @@ fn same_draw_state(a: &DrawBatch, b: &DrawBatch) -> bool {
     a.pipeline == b.pipeline
         && a.texture == b.texture
         && a.texture_is_lightmap == b.texture_is_lightmap
+        && a.texture_is_white == b.texture_is_white
         && a.normal_texture == b.normal_texture
         && a.roughness_texture == b.roughness_texture
         && a.height_texture == b.height_texture
@@ -16070,6 +17996,10 @@ fn same_draw_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         && a.color == b.color
         && a.alpha_cutoff == b.alpha_cutoff
         && a.fog == b.fog
+        && a.fog_is_global == b.fog_is_global
+        && a.fog_color_override == b.fog_color_override
+        && a.legacy2_fog_in_stage_safe == b.legacy2_fog_in_stage_safe
+        && a.global_fog_post_eligible == b.global_fog_post_eligible
         && a.skybox == b.skybox
 }
 
@@ -16196,6 +18126,107 @@ fn barycentric_coordinates(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<[f3
     let w = (d00 * d21 - d01 * d20) / denominator;
     let u = 1.0 - v - w;
     Some([u, v, w])
+}
+
+fn vertex_dlight_cpu(
+    position: Vec3,
+    normal: Vec3,
+    lights: &[TransientLight],
+) -> Vec3 {
+    let normal = normal.normalize_or_zero();
+    let mut result = Vec3::ZERO;
+    for light in lights.iter().take(32) {
+        let light_position = Vec3::from_array(light.position);
+        let delta = light_position - position;
+        let distance_to_light = delta.length();
+        let radius = light.radius.max(1.0);
+        if distance_to_light <= 0.0001 {
+            continue;
+        }
+        let normalized_distance = distance_to_light / radius;
+        if normalized_distance >= 4.0 {
+            continue;
+        }
+        let core_falloff = (1.0 - normalized_distance).max(0.0);
+        let support_falloff = (1.0 - normalized_distance / 4.0).max(0.0);
+        let attenuation = (core_falloff * core_falloff)
+            .max(support_falloff * support_falloff * 0.40);
+        let light_direction = delta / distance_to_light;
+        let ndotl = normal.dot(light_direction).max(0.0);
+        let facing = 0.35 + 0.65 * ndotl;
+        result += Vec3::from_array(light.color)
+            * light.intensity.max(0.0)
+            * attenuation
+            * facing
+            * 0.70;
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegacyDlightDiagnostic {
+    plane_distance: f32,
+    projected_radius: f32,
+    radial_sq: f32,
+    blob: f32,
+    plane_modulate: f32,
+}
+
+/// CPU mirror of the Legacy shader path for the surface inspector.
+fn legacy_dlight_diagnostic(
+    triangle: &[InspectorVertex],
+    hit: Vec3,
+    light: &TransientLight,
+) -> Option<LegacyDlightDiagnostic> {
+    if triangle.len() != 3 {
+        return None;
+    }
+    let a = Vec3::from_array(triangle[0].position);
+    let b = Vec3::from_array(triangle[1].position);
+    let c = Vec3::from_array(triangle[2].position);
+    let mut plane_normal = (b - a).cross(c - a).normalize_or_zero();
+    if plane_normal.length_squared() <= 1.0e-10 {
+        return None;
+    }
+    let authored_normal = (Vec3::from_array(triangle[0].normal)
+        + Vec3::from_array(triangle[1].normal)
+        + Vec3::from_array(triangle[2].normal))
+        .normalize_or_zero();
+    if authored_normal.length_squared() > 1.0e-8 && plane_normal.dot(authored_normal) < 0.0 {
+        plane_normal = -plane_normal;
+    }
+
+    let radius = light.radius.max(1.0);
+    let radius_sq = radius * radius;
+    let delta = Vec3::from_array(light.position) - hit;
+    let plane_distance = plane_normal.dot(delta);
+    if plane_distance <= 0.0 || plane_distance >= radius {
+        return Some(LegacyDlightDiagnostic {
+            plane_distance,
+            projected_radius: 0.0,
+            radial_sq: f32::INFINITY,
+            blob: 0.0,
+            plane_modulate: 0.0,
+        });
+    }
+
+    let projected_radius_sq = (radius_sq - plane_distance * plane_distance).max(1.0e-4);
+    let planar_distance_sq = (delta.length_squared() - plane_distance * plane_distance).max(0.0);
+    let radial_sq = planar_distance_sq / projected_radius_sq;
+    let blob = if radial_sq < 1.0 {
+        let x = 1.0 - radial_sq;
+        x * x * (3.0 - 2.0 * x)
+    } else {
+        0.0
+    };
+    let plane_modulate = (1.0 - (plane_distance * plane_distance) / radius_sq).max(0.0);
+    Some(LegacyDlightDiagnostic {
+        plane_distance,
+        projected_radius: projected_radius_sq.sqrt(),
+        radial_sq,
+        blob,
+        plane_modulate,
+    })
 }
 
 fn interpolate_uv(
@@ -16328,6 +18359,8 @@ fn create_fast_world_bind_group(
         .unwrap_or(white);
     let (base, base_sampler) = if source.texture_is_lightmap {
         (explicit_lightmap, lightmap_sampler)
+    } else if source.texture_is_white {
+        (white, clamp_sampler)
     } else {
         let base = source
             .texture
@@ -16465,6 +18498,8 @@ fn create_world_bind_group(
         .unwrap_or_else(|| &deluxemaps[0]);
     let (base, base_sampler) = if source.texture_is_lightmap {
         (explicit_lightmap, lightmap_sampler)
+    } else if source.texture_is_white {
+        (white, clamp_sampler)
     } else {
         let base = source
             .texture
@@ -16780,6 +18815,21 @@ fn material_uniform(source: &DrawBatch) -> MaterialUniform {
     if source.modulate_lightmap {
         out.header[2] |= 2;
     }
+    if source.texture_is_lightmap {
+        out.header[2] |= 8388608;
+    }
+    if source.lightmap.is_some() {
+        out.header[2] |= 16777216;
+    }
+    if matches!(source.pipeline.blend, BlendMode::Opaque) {
+        out.header[2] |= 33554432;
+    }
+    // Depth prepass packs this into the reflection-policy attachment so the
+    // final Legacy 1 display-space fog affects exactly the BSP surfaces that
+    // participate in the compiled/recovered global fog (q3map_nofog stays out).
+    if source.fog_is_global && source.fog[3] > 0.001 && source.global_fog_post_eligible {
+        out.header[2] |= 67108864;
+    }
     // Dedicated cached-AO receiver bit for q3map LIGHTMAP_BY_VERTEX stages.
     // Restrict it to the stage that actually consumes BSP vertex RGB so
     // emissive/additive sibling stages do not get incorrectly darkened.
@@ -16787,6 +18837,7 @@ fn material_uniform(source: &DrawBatch) -> MaterialUniform {
         out.header[2] |= 131072;
     }
     let pbr_eligible = !source.texture_is_lightmap
+        && !source.texture_is_white
         && source.pipeline.class == DrawClass::Opaque
         && source.pipeline.blend == BlendMode::Opaque
         && matches!(source.tc_gen, TcGen::Base);
@@ -16928,11 +18979,84 @@ fn create_world_pipelines(
                 batch.source.pipeline,
                 msaa_samples,
                 legacy_fog,
+                false,
                 shader_variant,
             )
         });
     }
+    if shader_variant.is_some_and(|key| key.ocean) {
+        pipelines.insert(ocean_pipeline_key(), create_world_pipeline(device, layout, shader,
+            surface_format, ocean_pipeline_key(), msaa_samples, false, false, shader_variant));
+    }
     pipelines
+}
+
+fn legacy_fog_pass_pipeline_key(source: PipelineKey, depth_equal: bool) -> PipelineKey {
+    PipelineKey {
+        class: source.class,
+        blend: BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
+        cull: source.cull,
+        offset: source.offset,
+        depth_write: false,
+        // OpenJK chooses FP_EQUAL for shaders whose material wrote depth and
+        // ordinary depth testing for genuinely translucent/no-depth shaders.
+        depth_equal,
+    }
+}
+
+fn same_world_surface(a: &WorldBatch, b: &WorldBatch) -> bool {
+    a.source.vertices == b.source.vertices
+        && a.source.bsp_shader_index == b.source.bsp_shader_index
+}
+
+fn create_legacy_fog_pass_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    batches: &[WorldBatch],
+    shader_variant: Option<WorldShaderVariantKey>,
+) -> BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline> {
+    let mut pipelines = BTreeMap::new();
+    let mut start = 0usize;
+    while start < batches.len() {
+        let mut end = start + 1;
+        while end < batches.len() && same_world_surface(&batches[start], &batches[end]) {
+            end += 1;
+        }
+        let surface_writes_depth = batches[start..end]
+            .iter()
+            .any(|batch| batch.source.pipeline.depth_write);
+        for batch in &batches[start..end] {
+            let original = batch.source.pipeline;
+            if original.class == DrawClass::Sky {
+                continue;
+            }
+            pipelines
+                .entry((original, surface_writes_depth))
+                .or_insert_with(|| {
+                    create_world_pipeline(
+                        device,
+                        layout,
+                        shader,
+                        surface_format,
+                        legacy_fog_pass_pipeline_key(original, surface_writes_depth),
+                        msaa_samples,
+                        true,
+                        true,
+                        shader_variant,
+                    )
+                });
+        }
+        start = end;
+    }
+    pipelines
+}
+
+fn ocean_pipeline_key() -> PipelineKey {
+    PipelineKey { class: DrawClass::Transparent, blend: BlendMode::Opaque,
+        cull: CullMode::None, offset: false, depth_write: true, depth_equal: false }
 }
 
 fn create_reflection_pipelines(
@@ -16962,6 +19086,7 @@ fn create_reflection_pipelines(
                 reflected,
                 1,
                 legacy_fog,
+                false,
                 Some(shader_variant),
             )
         });
@@ -16969,10 +19094,61 @@ fn create_reflection_pipelines(
     pipelines
 }
 
+fn create_reflection_fog_pass_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    batches: &[WorldBatch],
+    shader_variant: WorldShaderVariantKey,
+) -> BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline> {
+    let mut pipelines = BTreeMap::new();
+    let mut start = 0usize;
+    while start < batches.len() {
+        let mut end = start + 1;
+        while end < batches.len() && same_world_surface(&batches[start], &batches[end]) {
+            end += 1;
+        }
+        let surface_writes_depth = batches[start..end]
+            .iter()
+            .any(|batch| batch.source.pipeline.depth_write);
+        for batch in &batches[start..end] {
+            let original = batch.source.pipeline;
+            if original.class == DrawClass::Sky {
+                continue;
+            }
+            pipelines
+                .entry((original, surface_writes_depth))
+                .or_insert_with(|| {
+                    let mut reflected =
+                        legacy_fog_pass_pipeline_key(original, surface_writes_depth);
+                    reflected.cull = match reflected.cull {
+                        CullMode::None => CullMode::None,
+                        CullMode::Front => CullMode::Back,
+                        CullMode::Back => CullMode::Front,
+                    };
+                    create_world_pipeline(
+                        device,
+                        layout,
+                        shader,
+                        surface_format,
+                        reflected,
+                        1,
+                        true,
+                        true,
+                        Some(shader_variant),
+                    )
+                });
+        }
+        start = end;
+    }
+    pipelines
+}
+
 fn planar_reflector_enabled(mode: PlanarReflectionMode, kind: PlanarReflectorKind) -> bool {
     match mode {
         PlanarReflectionMode::Off => false,
-        PlanarReflectionMode::Authored => kind == PlanarReflectorKind::Authored,
+        PlanarReflectionMode::Authored => kind != PlanarReflectorKind::Environment,
         PlanarReflectionMode::Environment => true,
     }
 }
@@ -16984,7 +19160,9 @@ fn collect_planar_reflectors(
     let mut seen_ranges = std::collections::BTreeSet::new();
     let mut reflectors = Vec::new();
     for (batch_index, batch) in batches.iter().enumerate() {
-        let kind = if batch.source.planar_reflection {
+        let kind = if batch.ocean_clipmap.is_some() {
+            PlanarReflectorKind::Ocean
+        } else if batch.source.planar_reflection {
             PlanarReflectorKind::Authored
         } else if batch.source.planar_environment_candidate {
             PlanarReflectorKind::Environment
@@ -17035,7 +19213,7 @@ fn collect_planar_reflectors(
             } else {
                 centre
             },
-            cull: batch.source.pipeline.cull,
+            cull: if kind == PlanarReflectorKind::Ocean { CullMode::None } else { batch.source.pipeline.cull },
             bounds_min: batch.bounds_min,
             bounds_max: batch.bounds_max,
             area,
@@ -17064,33 +19242,231 @@ fn reflection_matrix(plane: [f32; 4]) -> Mat4 {
     )
 }
 
-fn projected_planar_importance(
+fn push_unique_planar_point(
+    points: &mut [Vec3; 6],
+    point_count: &mut usize,
+    point: Vec3,
+    epsilon_squared: f32,
+) {
+    if !point.is_finite()
+        || points[..*point_count]
+            .iter()
+            .any(|existing| existing.distance_squared(point) <= epsilon_squared)
+        || *point_count >= points.len()
+    {
+        return;
+    }
+    points[*point_count] = point;
+    *point_count += 1;
+}
+
+fn planar_aabb_intersection_polygon(
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
-    view_proj: Mat4,
-) -> Option<(bool, f32)> {
-    // The planar pool is intentionally small. Rank eligible reflectors by the
-    // amount of the main view they can actually affect, rather than by world
-    // area alone, so the four reflected views go to surfaces the player can see.
-    let mut ndc_min = Vec2::splat(f32::INFINITY);
-    let mut ndc_max = Vec2::splat(f32::NEG_INFINITY);
-    let mut projected = 0u32;
+    plane: [f32; 4],
+) -> Option<([Vec3; 6], usize)> {
+    let normal = Vec3::new(plane[0], plane[1], plane[2]);
+    if !normal.is_finite() || normal.length_squared() <= 1e-8 {
+        return None;
+    }
 
-    for x in [bounds_min[0], bounds_max[0]] {
-        for y in [bounds_min[1], bounds_max[1]] {
-            for z in [bounds_min[2], bounds_max[2]] {
-                let clip = view_proj * Vec4::new(x, y, z, 1.0);
-                if !clip.is_finite() || clip.w <= 1e-4 {
-                    continue;
-                }
-                let ndc = clip.truncate().truncate() / clip.w;
-                ndc_min = ndc_min.min(ndc);
-                ndc_max = ndc_max.max(ndc);
-                projected += 1;
+    let corners = [
+        Vec3::new(bounds_min[0], bounds_min[1], bounds_min[2]),
+        Vec3::new(bounds_max[0], bounds_min[1], bounds_min[2]),
+        Vec3::new(bounds_min[0], bounds_max[1], bounds_min[2]),
+        Vec3::new(bounds_max[0], bounds_max[1], bounds_min[2]),
+        Vec3::new(bounds_min[0], bounds_min[1], bounds_max[2]),
+        Vec3::new(bounds_max[0], bounds_min[1], bounds_max[2]),
+        Vec3::new(bounds_min[0], bounds_max[1], bounds_max[2]),
+        Vec3::new(bounds_max[0], bounds_max[1], bounds_max[2]),
+    ];
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (2, 3),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+    ];
+
+    let plane_distance = |point: Vec3| normal.dot(point) + plane[3];
+    let distance_epsilon = normal.length().max(1.0) * 1e-4;
+    let point_epsilon_squared = 1e-4_f32;
+    let mut points = [Vec3::ZERO; 6];
+    let mut point_count = 0usize;
+
+    for (a_index, b_index) in EDGES {
+        let a = corners[a_index];
+        let b = corners[b_index];
+        let a_distance = plane_distance(a);
+        let b_distance = plane_distance(b);
+        let a_on_plane = a_distance.abs() <= distance_epsilon;
+        let b_on_plane = b_distance.abs() <= distance_epsilon;
+
+        if a_on_plane {
+            push_unique_planar_point(
+                &mut points,
+                &mut point_count,
+                a,
+                point_epsilon_squared,
+            );
+        }
+        if b_on_plane {
+            push_unique_planar_point(
+                &mut points,
+                &mut point_count,
+                b,
+                point_epsilon_squared,
+            );
+        }
+        if !a_on_plane && !b_on_plane && (a_distance < 0.0) != (b_distance < 0.0) {
+            let denominator = a_distance - b_distance;
+            if denominator.abs() > f32::EPSILON {
+                let t = (a_distance / denominator).clamp(0.0, 1.0);
+                push_unique_planar_point(
+                    &mut points,
+                    &mut point_count,
+                    a.lerp(b, t),
+                    point_epsilon_squared,
+                );
             }
         }
     }
-    if projected == 0 {
+
+    if point_count < 3 {
+        return None;
+    }
+
+    // The edge intersections are not emitted in winding order. Sort them around
+    // the plane centroid so homogeneous Sutherland-Hodgman clipping below sees
+    // the actual convex planar polygon rather than a self-intersecting loop.
+    let centroid = points[..point_count].iter().copied().sum::<Vec3>() / point_count as f32;
+    let unit_normal = normal.normalize();
+    let helper_axis = if unit_normal.x.abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let tangent = unit_normal.cross(helper_axis).normalize_or_zero();
+    let bitangent = unit_normal.cross(tangent).normalize_or_zero();
+    if tangent.length_squared() <= 0.5 || bitangent.length_squared() <= 0.5 {
+        return None;
+    }
+    points[..point_count].sort_unstable_by(|a, b| {
+        let a_delta = *a - centroid;
+        let b_delta = *b - centroid;
+        let a_angle = a_delta.dot(bitangent).atan2(a_delta.dot(tangent));
+        let b_angle = b_delta.dot(bitangent).atan2(b_delta.dot(tangent));
+        a_angle.total_cmp(&b_angle)
+    });
+    Some((points, point_count))
+}
+
+fn planar_clip_distance(point: Vec4, plane_index: usize) -> f32 {
+    match plane_index {
+        // Keep a small positive w before the perspective divide. This plane is
+        // intentionally first so polygons that straddle the eye are clipped
+        // rather than losing whichever distant AABB corners happen to be behind.
+        0 => point.w - 1e-4,
+        1 => point.x + point.w,
+        2 => point.w - point.x,
+        3 => point.y + point.w,
+        4 => point.w - point.y,
+        // glam's *_rh projection helpers use wgpu/D3D z in [0, w], including
+        // our reversed-Z camera projection.
+        5 => point.z,
+        6 => point.w - point.z,
+        _ => unreachable!(),
+    }
+}
+
+fn clip_planar_polygon_to_viewport(
+    world_points: [Vec3; 6],
+    world_point_count: usize,
+    view_proj: Mat4,
+) -> Option<([Vec4; 16], usize)> {
+    // A convex N-gon can gain at most one vertex per clipping plane. A plane/AABB
+    // intersection starts with at most six vertices, so 16 is comfortably above
+    // the 13 vertices possible after the seven homogeneous clip planes.
+    let mut current = [Vec4::ZERO; 16];
+    let mut current_count = world_point_count.min(6);
+    for (index, point) in world_points[..current_count].iter().enumerate() {
+        current[index] = view_proj * point.extend(1.0);
+    }
+
+    for plane_index in 0..7 {
+        if current_count < 3 {
+            return None;
+        }
+        let mut next = [Vec4::ZERO; 16];
+        let mut next_count = 0usize;
+        let mut previous = current[current_count - 1];
+        let mut previous_distance = planar_clip_distance(previous, plane_index);
+        let mut previous_inside = previous_distance >= 0.0;
+
+        for current_point in current[..current_count].iter().copied() {
+            let current_distance = planar_clip_distance(current_point, plane_index);
+            let current_inside = current_distance >= 0.0;
+            if current_inside != previous_inside {
+                let denominator = previous_distance - current_distance;
+                if denominator.abs() > f32::EPSILON && next_count < next.len() {
+                    let t = (previous_distance / denominator).clamp(0.0, 1.0);
+                    next[next_count] = previous.lerp(current_point, t);
+                    next_count += 1;
+                }
+            }
+            if current_inside && next_count < next.len() {
+                next[next_count] = current_point;
+                next_count += 1;
+            }
+            previous = current_point;
+            previous_distance = current_distance;
+            previous_inside = current_inside;
+        }
+
+        current = next;
+        current_count = next_count;
+    }
+
+    (current_count >= 3).then_some((current, current_count))
+}
+
+fn projected_planar_importance(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    plane: [f32; 4],
+    view_proj: Mat4,
+) -> Option<(bool, f32)> {
+    // AABB-corner projection is not sufficient for large floors/lakes: when the
+    // camera is over the middle of the plane, every distant corner can be behind
+    // the eye or off-screen even though the reflector fills the viewport. Build
+    // the bounded plane polygon, clip it against the homogeneous view frustum,
+    // then rank the portion that is actually visible.
+    let (world_points, world_point_count) =
+        planar_aabb_intersection_polygon(bounds_min, bounds_max, plane)?;
+    let (visible_points, visible_point_count) =
+        clip_planar_polygon_to_viewport(world_points, world_point_count, view_proj)?;
+
+    let mut ndc_min = Vec2::splat(f32::INFINITY);
+    let mut ndc_max = Vec2::splat(f32::NEG_INFINITY);
+    for clip in visible_points[..visible_point_count].iter().copied() {
+        if !clip.is_finite() || clip.w <= 1e-4 {
+            continue;
+        }
+        let ndc = clip.truncate().truncate() / clip.w;
+        if !ndc.is_finite() {
+            continue;
+        }
+        ndc_min = ndc_min.min(ndc);
+        ndc_max = ndc_max.max(ndc);
+    }
+    if !ndc_min.is_finite() || !ndc_max.is_finite() {
         return None;
     }
 
@@ -17135,6 +19511,7 @@ fn select_planar_reflection_views(
     area_mask: Option<&[u8; 32]>,
     planar_mode: PlanarReflectionMode,
     reflection_quality: ReflectionQuality,
+    ocean_enabled: bool,
     previous_planes: &[Option<[f32; 4]>; PLANAR_REFLECTION_SLOTS],
 ) -> [Option<PlanarReflectionView>; PLANAR_REFLECTION_SLOTS] {
     let planar_budget = reflection_quality.planar_slot_budget().min(PLANAR_REFLECTION_SLOTS);
@@ -17156,7 +19533,8 @@ fn select_planar_reflection_views(
     // priority, crosshair coverage, screen score, representative reflector, oriented plane
     let mut candidates: Vec<(u8, bool, f32, PlanarReflector, [f32; 4])> = Vec::new();
     for reflector in &world.planar_reflectors {
-        if !planar_reflector_enabled(planar_mode, reflector.kind)
+        if (reflector.kind == PlanarReflectorKind::Ocean && !ocean_enabled)
+            || !planar_reflector_enabled(planar_mode, reflector.kind)
             || !active_coarse.contains(&reflector.coarse_batch_index)
             || world
                 .coarse_batches
@@ -17184,7 +19562,12 @@ fn select_planar_reflection_views(
             plane = [-plane[0], -plane[1], -plane[2], -plane[3]];
         }
         let Some((contains_centre, screen_importance)) =
-            projected_planar_importance(reflector.bounds_min, reflector.bounds_max, main_view_proj)
+            projected_planar_importance(
+                reflector.bounds_min,
+                reflector.bounds_max,
+                plane,
+                main_view_proj,
+            )
         else {
             continue;
         };
@@ -17201,15 +19584,25 @@ fn select_planar_reflection_views(
             continue;
         }
         let distance = (normal.dot(camera.position) + plane[3]).abs();
-        let priority = u8::from(reflector.kind == PlanarReflectorKind::Authored);
+        // Explicit reflection owners must not lose the small planar budget to
+        // opportunistic tcGen-environment promotion. In particular, a promoted
+        // ocean is a real reflection consumer; if a generic environment plane
+        // steals the only slot, ocean_environment() abruptly falls back to the
+        // map sky as the camera moves. Keep JKA-authored mirrors highest, oceans
+        // next, and generic environment candidates last.
+        let priority = match reflector.kind {
+            PlanarReflectorKind::Authored => 2,
+            PlanarReflectorKind::Ocean => 1,
+            PlanarReflectorKind::Environment => 0,
+        };
         let roughness_weight = world
             .coarse_batches
             .get(reflector.coarse_batch_index)
             .map_or(1.0, |batch| (1.15 - batch.source.reflection_roughness_hint).clamp(0.15, 1.15));
-        // Realtime importance is deliberately continuous rather than a hard
-        // authored-vs-environment ordering. Authored mirrors get a bias, and a
-        // reflector covering the view centre gets another modest bias, but a
-        // genuinely dominant water/floor reflector can still win the budget.
+        // Screen importance ranks reflectors *within* the semantic priority
+        // tier. This keeps selection responsive between multiple oceans/mirrors
+        // without allowing generic tcGen-environment candidates to make an
+        // explicit ocean's reflection source flicker between planar and sky.
         let authored_weight = if reflector.kind == PlanarReflectorKind::Authored {
             1.75
         } else {
@@ -17258,9 +19651,8 @@ fn select_planar_reflection_views(
             } else {
                 1.0
             };
-        b_score
-            .total_cmp(&a_score)
-            .then_with(|| b.0.cmp(&a.0))
+        b.0.cmp(&a.0)
+            .then_with(|| b_score.total_cmp(&a_score))
             .then_with(|| b.1.cmp(&a.1))
     });
     candidates.truncate(planar_budget);
@@ -17657,7 +20049,7 @@ fn create_targets(
         sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -17673,7 +20065,8 @@ fn create_targets(
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: color_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
     });
@@ -17806,6 +20199,30 @@ fn create_targets(
     });
     let reflection_mask_view =
         reflection_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // Full-resolution resolved final scene depth used only by SSR. The linear-depth
+    // prepass carries BSP and depth-writing entities; this one-channel float target
+    // additionally captures main-pass-only depth writers (grass, promoted ocean) so
+    // SSR can reject reflections under them. Fog reads linear depth directly.
+    let ssr_visibility_texture = Some(
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA resolved final scene depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    );
+    let ssr_visibility_view = ssr_visibility_texture
+        .as_ref()
+        .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
     let max_depth_dimension = width.max(height).max(1);
     let linear_depth_mip_count = 32 - max_depth_dimension.leading_zeros();
     let linear_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -17887,6 +20304,8 @@ fn create_targets(
         motion_vector_view,
         _reflection_mask_texture: reflection_mask_texture,
         reflection_mask_view,
+        _ssr_visibility_texture: ssr_visibility_texture,
+        ssr_visibility_view,
         linear_depth_mip_views,
         linear_depth_mip_count,
         _rain_haze_mask_texture: rain_haze_mask_texture,
@@ -19180,37 +21599,6 @@ fn try_load_ui_font_asset(assets: &mut AssetSearchPath, path: &str) -> Option<Te
     None
 }
 
-fn missing_texture_data() -> TextureData {
-    const SIZE: usize = 16;
-    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let index = (y * SIZE + x) * 4;
-            let border = x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1;
-            let checker = ((x / 4) + (y / 4)) % 2 == 0;
-            let color = if border {
-                [0_u8, 0_u8, 0_u8, 255_u8]
-            } else if checker {
-                [255_u8, 0_u8, 255_u8, 255_u8]
-            } else {
-                [0_u8, 0_u8, 0_u8, 255_u8]
-            };
-            rgba[index..index + 4].copy_from_slice(&color);
-        }
-    }
-    TextureData {
-        label: "missing texture fallback".to_owned(),
-        source: None,
-        width: SIZE as u32,
-        height: SIZE as u32,
-        rgba,
-        rgba16f: None,
-        mip_level_count: 1,
-        clamp: true,
-        srgb: true,
-    }
-}
-
 fn try_load_texture_asset(
     base: &Path,
     game: Option<&Path>,
@@ -19319,36 +21707,49 @@ fn load_ui_font_texture(base: &Path, game: Option<&Path>) -> TextureData {
     }
 }
 
-fn load_ui_splash_texture(base: &Path, game: Option<&Path>) -> (TextureData, Option<[u32; 2]>) {
-    match AssetSearchPath::open_game(base, game) {
-        Ok(mut assets) => {
-            let path = "menu/splash.jpg";
-            match assets.read(path, 16 * 1024 * 1024) {
-                Ok(Some(asset)) => match crate::materials::decode_texture_data_with_color_space(
-                    path,
-                    &asset.bytes,
-                    true,
-                    false,
-                    true,
-                ) {
-                    Ok(data) => {
-                        let size = [data.width, data.height];
-                        println!(
-                            "UI splash: {}x{} {} from {}",
-                            data.width,
-                            data.height,
-                            path,
-                            asset.source.display()
-                        );
-                        return (data, Some(size));
-                    }
-                    Err(error) => eprintln!("UI splash {path}: {error}"),
-                },
-                Ok(None) => eprintln!("UI splash: {path} not found"),
-                Err(error) => eprintln!("UI splash {path}: {error}"),
-            }
+fn loading_levelshot_stem(map_name: &str) -> Option<String> {
+    let trimmed = map_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Keep map subdirectories intact (e.g. mp/ffa3 -> levelshots/mp/ffa3).
+    // Only remove the map-source extension; Path::file_stem would incorrectly
+    // collapse mp/ffa3.bsp to just ffa3.
+    let lower = trimmed.to_ascii_lowercase();
+    let qpath = if lower.ends_with(".bsp") || lower.ends_with(".map") {
+        &trimmed[..trimmed.len().saturating_sub(4)]
+    } else {
+        trimmed
+    };
+    Some(qpath.replace('\\', "/"))
+}
+
+fn load_ui_loading_texture(
+    base: &Path,
+    game: Option<&Path>,
+    levelshot_map_name: Option<&str>,
+) -> (TextureData, Option<[u32; 2]>) {
+    if let Some(map_name) = levelshot_map_name {
+        // Use the renderer's normal VFS/image resolver. Passing an extensionless
+        // qpath intentionally gives levelshots the same format fallback rules as
+        // every other generic texture load instead of maintaining a private list.
+        let path = format!("levelshots/{map_name}");
+        if let Some(data) = try_load_texture_asset(
+            base, game, &path, true, false, true, "UI levelshot",
+        ) {
+            let size = [data.width, data.height];
+            return (data, Some(size));
         }
-        Err(error) => eprintln!("UI splash asset search: {error}"),
+        eprintln!(
+            "UI levelshot: no image resolved for {path}; falling back to menu/splash"
+        );
+    }
+
+    if let Some(data) = try_load_texture_asset(
+        base, game, "menu/splash", true, false, true, "UI splash",
+    ) {
+        let size = [data.width, data.height];
+        return (data, Some(size));
     }
 
     (
@@ -19655,16 +22056,8 @@ fn create_dynamic_model_pipeline(
     surface_format: wgpu::TextureFormat,
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
 ) -> wgpu::RenderPipeline {
-    let blends = matches!(
-        alpha_mode,
-        DynamicModelAlphaMode::Blend
-            | DynamicModelAlphaMode::MaskBlend
-            | DynamicModelAlphaMode::AdditiveOne
-            | DynamicModelAlphaMode::Additive
-            | DynamicModelAlphaMode::BlendUnlit
-            | DynamicModelAlphaMode::Modulate
-    );
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -19701,6 +22094,28 @@ fn create_dynamic_model_pipeline(
             },
             alpha: wgpu::BlendComponent::OVER,
         }),
+        DynamicModelAlphaMode::Modulate2x => Some(wgpu::BlendState {
+            // Exact GL_DST_COLOR GL_SRC_COLOR fixed-function equation:
+            // src * dst + dst * src = 2 * src * dst.
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::DstAlpha,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Darken => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
         _ => None,
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -19713,6 +22128,8 @@ fn create_dynamic_model_pipeline(
             DynamicModelAlphaMode::Additive => "JKA dynamic model src-alpha additive unlit pipeline",
             DynamicModelAlphaMode::BlendUnlit => "JKA dynamic model alpha-blend unlit pipeline",
             DynamicModelAlphaMode::Modulate => "JKA dynamic model modulate unlit pipeline",
+            DynamicModelAlphaMode::Modulate2x => "JKA dynamic model GL_DST_COLOR GL_SRC_COLOR pipeline",
+            DynamicModelAlphaMode::Darken => "JKA dynamic model darken unlit pipeline",
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
@@ -19736,7 +22153,7 @@ fn create_dynamic_model_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(!blends),
+            depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
@@ -19749,13 +22166,20 @@ fn create_dynamic_model_pipeline(
             module: shader,
             entry_point: Some(match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
+                // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
                 DynamicModelAlphaMode::AdditiveOne
-                | DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::Modulate => "fs_unlit_fog_black",
+                DynamicModelAlphaMode::Additive
                 | DynamicModelAlphaMode::BlendUnlit
-                | DynamicModelAlphaMode::Modulate => "fs_unlit",
+                | DynamicModelAlphaMode::Modulate2x
+                | DynamicModelAlphaMode::Darken => "fs_unlit",
                 _ => "fs_main",
             }),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend,
@@ -19774,16 +22198,8 @@ fn create_ghoul2_skin_pipeline(
     surface_format: wgpu::TextureFormat,
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
 ) -> wgpu::RenderPipeline {
-    let blends = matches!(
-        alpha_mode,
-        DynamicModelAlphaMode::Blend
-            | DynamicModelAlphaMode::MaskBlend
-            | DynamicModelAlphaMode::AdditiveOne
-            | DynamicModelAlphaMode::Additive
-            | DynamicModelAlphaMode::BlendUnlit
-            | DynamicModelAlphaMode::Modulate
-    );
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -19820,6 +22236,28 @@ fn create_ghoul2_skin_pipeline(
             },
             alpha: wgpu::BlendComponent::OVER,
         }),
+        DynamicModelAlphaMode::Modulate2x => Some(wgpu::BlendState {
+            // Exact GL_DST_COLOR GL_SRC_COLOR fixed-function equation:
+            // src * dst + dst * src = 2 * src * dst.
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::DstAlpha,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Darken => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
         _ => None,
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -19832,6 +22270,8 @@ fn create_ghoul2_skin_pipeline(
             DynamicModelAlphaMode::Additive => "JKA Ghoul2 GPU skin src-alpha additive unlit pipeline",
             DynamicModelAlphaMode::BlendUnlit => "JKA Ghoul2 GPU skin alpha-blend unlit pipeline",
             DynamicModelAlphaMode::Modulate => "JKA Ghoul2 GPU skin modulate unlit pipeline",
+            DynamicModelAlphaMode::Modulate2x => "JKA Ghoul2 GPU skin GL_DST_COLOR GL_SRC_COLOR pipeline",
+            DynamicModelAlphaMode::Darken => "JKA Ghoul2 GPU skin darken unlit pipeline",
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
@@ -19855,7 +22295,7 @@ fn create_ghoul2_skin_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(!blends),
+            depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
@@ -19868,13 +22308,20 @@ fn create_ghoul2_skin_pipeline(
             module: shader,
             entry_point: Some(match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
+                // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
                 DynamicModelAlphaMode::AdditiveOne
-                | DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::Modulate => "fs_unlit_fog_black",
+                DynamicModelAlphaMode::Additive
                 | DynamicModelAlphaMode::BlendUnlit
-                | DynamicModelAlphaMode::Modulate => "fs_unlit",
+                | DynamicModelAlphaMode::Modulate2x
+                | DynamicModelAlphaMode::Darken => "fs_unlit",
                 _ => "fs_main",
             }),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend,
@@ -19894,6 +22341,7 @@ fn create_world_pipeline(
     key: PipelineKey,
     msaa_samples: u32,
     legacy_fog: bool,
+    fog_pass: bool,
     shader_variant: Option<WorldShaderVariantKey>,
 ) -> wgpu::RenderPipeline {
     let blend = match key.blend {
@@ -19912,6 +22360,19 @@ fn create_world_pipeline(
     };
     let color_write = wgpu::ColorWrites::ALL;
     let shader_constants = shader_variant.map(WorldShaderVariantKey::compilation_constants);
+    // WGSL overrides are module-level, but wgpu specialization is supplied per
+    // entry point/stage. Several world variants (notably Dynamic Lights > Vertex,
+    // PBR_VERTEX_LIGHTGRID and ocean vertex work) consume these overrides in
+    // vs_main, so specializing only fs_main silently leaves the vertex stage at
+    // each override's WGSL default. Feed the exact same immutable constant set
+    // to both stages.
+    let vertex_compilation_options = match shader_constants.as_ref() {
+        Some(constants) => wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
+        None => Default::default(),
+    };
     let fragment_compilation_options = match shader_constants.as_ref() {
         Some(constants) => wgpu::PipelineCompilationOptions {
             constants,
@@ -19920,12 +22381,12 @@ fn create_world_pipeline(
         None => Default::default(),
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("JKA BSP pipeline"),
+        label: Some(if fog_pass { "JKA BSP legacy fog-pass pipeline" } else { "JKA BSP pipeline" }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
+            compilation_options: vertex_compilation_options,
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
@@ -19970,7 +22431,9 @@ fn create_world_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if key.class == DrawClass::Sky {
+            entry_point: Some(if fog_pass {
+                "fs_legacy_fog_pass"
+            } else if key.class == DrawClass::Sky {
                 "fs_sky"
             } else if legacy_fog {
                 "fs_main_legacy_fog"
@@ -20217,14 +22680,22 @@ fn gpu_point_lights(
                     } else {
                         1.0
                     }
+                } else if light.falloff.shader_value() > 0.5 {
+                    if !light.angle_attenuation {
+                        -1.0
+                    } else if light.angle_scale != 0.0 {
+                        -(2.0 + light.angle_scale.abs())
+                    } else {
+                        -2.0
+                    }
                 } else {
                     0.0
                 },
             ],
             shadow: [
                 shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
-                0.0,
-                0.0,
+                light.falloff.shader_value(),
+                light.extra_distance,
                 0.0,
             ],
         })
@@ -20323,6 +22794,9 @@ fn select_relevant_shadow_lights(
         .copied()
         .enumerate()
         .filter_map(|(index, light)| {
+            if !light.surface_lighting {
+                return None;
+            }
             let is_area = light.emitter_normal.iter().any(|value| value.abs() > 1e-6);
             if is_area && !include_area_lights {
                 return None;
@@ -21072,8 +23546,10 @@ fn create_ssr_temporal_bind_groups(
     weather_sampler: &wgpu::Sampler,
     weather_surface_buffer: &wgpu::Buffer,
     reflection_mask_view: &wgpu::TextureView,
+    ssr_visibility_view: Option<&wgpu::TextureView>,
 ) -> Option<[wgpu::BindGroup; 2]> {
     let history = history?;
+    let ssr_visibility_view = ssr_visibility_view?;
     Some(std::array::from_fn(|history_index| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA temporal SSR bind group"),
@@ -21122,6 +23598,10 @@ fn create_ssr_temporal_bind_groups(
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(reflection_mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(ssr_visibility_view),
                 },
             ],
         })
@@ -21245,6 +23725,7 @@ fn create_post_bind_group(
     scene_depth_view: &wgpu::TextureView,
     reflection_mask_view: &wgpu::TextureView,
     auto_exposure_state_buffer: &wgpu::Buffer,
+    ssr_visibility_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let bloom_half = bloom.map_or(scene_view, |pyramid| &pyramid.views[0]);
     let bloom_quarter = bloom.map_or(scene_view, |pyramid| &pyramid.views[1]);
@@ -21353,6 +23834,10 @@ fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 24,
                 resource: auto_exposure_state_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 25,
+                resource: wgpu::BindingResource::TextureView(ssr_visibility_view),
             },
         ],
     })
@@ -21535,6 +24020,67 @@ fn create_depth_prepass_mask_pipeline(
     })
 }
 
+fn create_entity_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vertex_layout: wgpu::VertexBufferLayout<'_>,
+    alpha_test: bool,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_prepass"),
+            compilation_options: Default::default(),
+            buffers: &[vertex_layout],
+        },
+        // Same winding/culling as the entity colour pipelines.
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if alpha_test { "fs_prepass_mask" } else { "fs_prepass" }),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                // Entities have no per-bone history; keep TAA's existing
+                // motion for these pixels rather than inventing camera-only motion.
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_planar_debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -21696,6 +24242,83 @@ fn create_ssao_temporal_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_ssr_visibility_resources(
+    device: &wgpu::Device,
+    targets: &RenderTargets,
+    msaa_samples: u32,
+) -> Option<(wgpu::BindGroupLayout, wgpu::RenderPipeline, wgpu::BindGroup)> {
+    targets.ssr_visibility_view.as_ref()?;
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("JKA SSR frontmost visibility layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: msaa_samples > 1,
+                },
+                count: None,
+            },
+            depth_texture_entry(1),
+        ],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("JKA SSR frontmost visibility shader"),
+        source: wgpu::ShaderSource::Wgsl(if msaa_samples > 1 {
+            include_str!("ssr_visibility_msaa.wgsl").into()
+        } else {
+            include_str!("ssr_visibility.wgsl").into()
+        }),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("JKA SSR frontmost visibility pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA SSR frontmost visibility pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA SSR frontmost visibility bind group"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&targets.ao_depth_view),
+            },
+        ],
+    });
+    Some((layout, pipeline, bind_group))
 }
 
 fn create_ssr_temporal_pipeline(
@@ -22127,10 +24750,20 @@ mod shader_tests {
     #[test]
     fn planar_selection_prefers_screen_centre_over_edge() {
         let centre =
-            projected_planar_importance([-0.25, -0.25, 0.5], [0.25, 0.25, 0.5], Mat4::IDENTITY)
+            projected_planar_importance(
+                [-0.25, -0.25, 0.5],
+                [0.25, 0.25, 0.5],
+                [0.0, 0.0, 1.0, -0.5],
+                Mat4::IDENTITY,
+            )
                 .unwrap();
         let edge =
-            projected_planar_importance([0.70, -0.25, 0.5], [0.95, 0.25, 0.5], Mat4::IDENTITY)
+            projected_planar_importance(
+                [0.70, -0.25, 0.5],
+                [0.95, 0.25, 0.5],
+                [0.0, 0.0, 1.0, -0.5],
+                Mat4::IDENTITY,
+            )
                 .unwrap();
         assert!(centre.0);
         assert!(!edge.0);
@@ -22140,13 +24773,39 @@ mod shader_tests {
     #[test]
     fn planar_selection_scores_larger_screen_coverage_higher() {
         let large =
-            projected_planar_importance([-0.60, -0.60, 0.5], [0.60, 0.60, 0.5], Mat4::IDENTITY)
+            projected_planar_importance(
+                [-0.60, -0.60, 0.5],
+                [0.60, 0.60, 0.5],
+                [0.0, 0.0, 1.0, -0.5],
+                Mat4::IDENTITY,
+            )
                 .unwrap();
         let small =
-            projected_planar_importance([-0.10, -0.10, 0.5], [0.10, 0.10, 0.5], Mat4::IDENTITY)
+            projected_planar_importance(
+                [-0.10, -0.10, 0.5],
+                [0.10, 0.10, 0.5],
+                [0.0, 0.0, 1.0, -0.5],
+                Mat4::IDENTITY,
+            )
                 .unwrap();
         assert!(large.0 && small.0);
         assert!(large.1 > small.1);
+    }
+
+    #[test]
+    fn planar_selection_keeps_large_plane_visible_when_camera_is_over_its_middle() {
+        let view_proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 1000.0);
+        let importance = projected_planar_importance(
+            [-100.0, -1.0, -100.0],
+            [100.0, -1.0, 100.0],
+            [0.0, 1.0, 0.0, 1.0],
+            view_proj,
+        )
+        .expect("large plane crossing the camera footprint should remain visible");
+        assert!(
+            importance.1 > 0.1,
+            "unexpectedly tiny screen importance: {importance:?}"
+        );
     }
 
     #[test]
@@ -22189,6 +24848,31 @@ mod shader_tests {
     }
 
     #[test]
+    fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry() {
+        // Saber glow/core are transient CPU additive surfaces while the default
+        // player path is GPU Ghoul2. The player must establish depth first so
+        // the blade is occluded only where it is actually behind the body.
+        assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::Opaque));
+        assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::Mask));
+        assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::AdditiveOne));
+        assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Additive));
+        assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Modulate2x));
+        assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Darken));
+
+        let phases: Vec<_> = [true, false]
+            .into_iter()
+            .flat_map(|depth_phase| {
+                DYNAMIC_MODEL_ALPHA_ORDER
+                    .into_iter()
+                    .filter(move |mode| dynamic_model_writes_depth(*mode) == depth_phase)
+            })
+            .collect();
+        let opaque = phases.iter().position(|mode| *mode == DynamicModelAlphaMode::Opaque).unwrap();
+        let saber = phases.iter().position(|mode| *mode == DynamicModelAlphaMode::AdditiveOne).unwrap();
+        assert!(opaque < saber);
+    }
+
+    #[test]
     fn all_renderer_shaders_validate() {
         let bsp = format!(
             "{}\n{}",
@@ -22213,19 +24897,28 @@ mod shader_tests {
             ("rain_haze_mask", include_str!("rain_haze_mask.wgsl")),
             ("post_gamma", include_str!("post_gamma.wgsl")),
             ("depth_prepass", include_str!("depth_prepass.wgsl")),
+            ("ssr_temporal", include_str!("ssr_temporal.wgsl")),
+            ("ssr_visibility", include_str!("ssr_visibility.wgsl")),
+            ("ssr_visibility_msaa", include_str!("ssr_visibility_msaa.wgsl")),
             ("gpu_cull", include_str!("gpu_cull.wgsl")),
             ("cull_debug", include_str!("cull_debug.wgsl")),
             ("hiz_reduce", include_str!("hiz_reduce.wgsl")),
             ("cluster_lights", include_str!("cluster_lights.wgsl")),
             ("froxel_fog", include_str!("froxel_fog.wgsl")),
             ("ocean_windrow", include_str!("ocean_windrow.wgsl")),
+            ("md3", include_str!("md3.wgsl")),
+            ("ghoul2_skin", include_str!("ghoul2_skin.wgsl")),
+            ("grass", include_str!("grass.wgsl")),
+            ("grass_prepared", include_str!("grass_prepared.wgsl")),
             ("snowflow_deformation_sim", include_str!("snowflow_deformation_sim.wgsl")),
         ] {
             let module = wgpu::naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
             wgpu::naga::valid::Validator::new(
                 wgpu::naga::valid::ValidationFlags::all(),
-                wgpu::naga::valid::Capabilities::CUBE_ARRAY_TEXTURES,
+                // grass_prepared unpacks f16 pairs with unpack2x16float.
+                wgpu::naga::valid::Capabilities::CUBE_ARRAY_TEXTURES
+                    | wgpu::naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
             )
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));

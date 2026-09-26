@@ -229,6 +229,7 @@ fn live_connect(target: &str, seconds: u64, commands: &[String]) -> Result<(), B
                     }
                 }
                 SessionEvent::DemoMessage { .. } => {}
+                SessionEvent::Download(block) => println!("[{:>6}ms] download block {} ({} bytes)", now(), block.block, block.data.len()),
                 SessionEvent::MapChange => println!("[{:>6}ms] svc_mapchange", now()),
                 SessionEvent::Disconnected(reason) => {
                     println!("[{:>6}ms] DISCONNECTED: {reason}", now());

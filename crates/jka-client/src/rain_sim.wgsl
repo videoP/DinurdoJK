@@ -7,7 +7,8 @@ struct RainParticle {
 struct RainSimUniform {
     camera_dt: vec4<f32>,      // camera xyz, dt seconds
     spawn: vec4<f32>,          // horizontal radius, below camera, above camera, base fall speed
-    wind_time: vec4<f32>,      // cloud wind X/Z JKA/s, absolute time, splash duration
+    wind_time: vec4<f32>,      // instantaneous weather wind X/Z JKA/s, absolute time, splash duration
+    weather: vec4<f32>,        // base weather wind X/Z JKA/s, remaining lanes reserved
     collision_uv: vec4<f32>,   // min render X/Z, inverse map width/depth
     counts: vec4<u32>,         // active particles, heightfield width/height, splash subset
 };
@@ -27,7 +28,7 @@ const TAU: f32 = 6.28318530717958647692;
 const GOLDEN_ANGLE: f32 = 2.39996322972865332;
 const JKA_TO_GODOT_METERS: f32 = 1.0 / 64.0;
 const RAIN_GROUP_SIZE: u32 = 128u;
-const RAIN_CLOUD_WIND_INHERITANCE: f32 = 1.00;
+const RAIN_WEATHER_WIND_INHERITANCE: f32 = 1.00;
 
 fn hash_u32(x0: u32) -> u32 {
     var x = x0;
@@ -68,16 +69,20 @@ fn rain_group_center(group_index: u32) -> vec2<f32> {
     return sim.camera_dt.xz + vec2<f32>(cos(angle), sin(angle)) * radius;
 }
 
+fn weather_wind_offset_jka(time: f32) -> vec2<f32> {
+    return sim.weather.xy * time;
+}
+
 fn godot_grass_wind(world_xz: vec2<f32>) -> vec2<f32> {
-    // Volumetric-cloud wind is the prevailing atmospheric flow. The shared
-    // GodotGrass field is advected by that full velocity, while rain responds to
-    // the full air speed. One sample still feeds the whole 128-drop group.
-    let cloud_wind_jka = sim.wind_time.xy;
-    let cloud_speed_jka = length(cloud_wind_jka);
-    let prevailing_dir = cloud_wind_jka / max(cloud_speed_jka, 0.0001);
+    // Shared Weather wind is the prevailing atmospheric flow. The GodotGrass
+    // field adds broad local variance and follows the stable base transport path;
+    // instantaneous gust/veer still drive the mean rain slant through wind_time.xy.
+    let weather_wind_jka = sim.wind_time.xy;
+    let weather_speed_jka = length(weather_wind_jka);
+    let prevailing_dir = weather_wind_jka / max(weather_speed_jka, 0.0001);
     let root_m = world_xz * JKA_TO_GODOT_METERS;
     let advected_root = root_m
-        - cloud_wind_jka * JKA_TO_GODOT_METERS * sim.wind_time.z;
+        - weather_wind_offset_jka(sim.wind_time.z) * JKA_TO_GODOT_METERS;
 
     let direction_noise = textureSampleLevel(
         wind_noise,
@@ -101,9 +106,9 @@ fn godot_grass_wind(world_xz: vec2<f32>) -> vec2<f32> {
     var strength = mix(0.25, 1.0, strength_noise);
     strength = strength * strength;
 
-    // Global cloud wind supplies the mean slant. Perlin only adds broad +/-30 degrees
+    // Shared Weather wind supplies the mean slant. Perlin only adds broad +/-30 degrees
     // direction variance and a subtle gust-strength variation around that mean.
-    let inherited_speed = cloud_speed_jka * RAIN_CLOUD_WIND_INHERITANCE;
+    let inherited_speed = weather_speed_jka * RAIN_WEATHER_WIND_INHERITANCE;
     let lateral_speed = inherited_speed * mix(0.75, 1.25, strength);
     return local_dir * lateral_speed;
 }

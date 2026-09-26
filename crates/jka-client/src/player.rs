@@ -4,8 +4,8 @@ use crate::{
     surface_deformation::{LocalFootContactShim, SurfaceDeformationStamp},
 };
 use jka_movement::{
-    angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PmoveContext, TraceQuery,
-    TraceResult, TraceWorld, UserCmd, BUTTON_ALT_ATTACK, BUTTON_ATTACK, BUTTON_WALKING,
+    angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PmoveContext,
+    SaberMovementInfo, TraceQuery, TraceResult, TraceWorld, UserCmd, BUTTON_WALKING,
     ENTITY_NONE, MAX_TICK_MSEC, MIN_TICK_MSEC, TICK_MSEC,
 };
 use std::{collections::HashSet, time::Duration};
@@ -140,11 +140,19 @@ pub struct LocalPlayer {
     previous_command_time: i32,
     current_command_time: i32,
     pending_power: Option<MovementPower>,
+    // CL_CreateCmd can run on a render frame where no fixed Pmove tick is due
+    // (especially at the very high render rates this client supports). Keep
+    // one-shot button/generic-command input alive until at least one Pmove
+    // step consumes it, matching idTech's "wasPressed" behavior instead of
+    // dropping a click between physics ticks.
+    pending_cmd_buttons: i32,
+    pending_generic_command: u8,
     // JKA cl_idrive 1 semantics: when opposite directions are both held,
     // the direction pressed most recently wins. Only one signed winner per
     // axis is needed, so this costs three bytes and needs no timestamp.
     move_priority: [i8; 3],
     noclip: bool,
+    saber_movement: [SaberMovementInfo; 2],
     mouse_input: MouseInputSettings,
     deformation_shim: LocalFootContactShim,
 }
@@ -155,11 +163,17 @@ impl LocalPlayer {
         spawn: SpawnPoint,
     ) -> Result<Self, String> {
         let can_join = movement.is_some() && world.is_some();
-        let spectator = PlayerState::spawn(
+        let mut spectator = PlayerState::spawn(
             jka_position(spawn.position),
             spawn.yaw.to_degrees(),
             JoinMode::Spectator,
         )?;
+        let saber_movement = [
+            SaberMovementInfo::equipped_default(),
+            SaberMovementInfo::default(),
+        ];
+        spectator.set_saber_movement_info(0, saber_movement[0])?;
+        spectator.set_saber_movement_info(1, saber_movement[1])?;
         let spectator_view = spectator.view();
         let eye = spectator_view.eye_origin();
         Ok(Self {
@@ -179,14 +193,46 @@ impl LocalPlayer {
             previous_command_time: spectator_view.command_time,
             current_command_time: spectator_view.command_time,
             pending_power: None,
+            pending_cmd_buttons: 0,
+            pending_generic_command: 0,
             move_priority: [0; 3],
             noclip: false,
+            saber_movement,
             mouse_input: MouseInputSettings::default(),
             deformation_shim: LocalFootContactShim::new(spectator_view.origin),
         })
     }
+    fn apply_saber_movement_to_state(
+        state: &mut PlayerState,
+        sabers: [SaberMovementInfo; 2],
+    ) -> Result<(), String> {
+        state.set_saber_movement_info(0, sabers[0])?;
+        state.set_saber_movement_info(1, sabers[1])?;
+        Ok(())
+    }
+
+    pub fn set_saber_movement_info(
+        &mut self,
+        sabers: [SaberMovementInfo; 2],
+    ) -> Result<(), String> {
+        Self::apply_saber_movement_to_state(&mut self.spectator, sabers)?;
+        if let Some(player) = &mut self.player {
+            Self::apply_saber_movement_to_state(player, sabers)?;
+        }
+        self.saber_movement = sabers;
+        Ok(())
+    }
+
     pub fn can_join(&self) -> bool {
         self.can_join
+    }
+
+    /// Swap the static gameplay collision used by local Pmove without
+    /// recreating the player/server state. Source-map edit previews build a
+    /// fresh CollisionWorld, and keeping the existing LocalPlayer alive avoids
+    /// resetting position, command time, saber state, or one-shot input.
+    pub fn replace_collision_world(&mut self, world: CollisionWorld) {
+        self.world.0 = Some(world);
     }
     pub fn set_noclip(&mut self, enabled: bool) -> Result<bool, String> {
         if self.mode != JoinMode::Player {
@@ -212,6 +258,12 @@ impl LocalPlayer {
     pub fn entity_view(&self) -> jka_movement::PlayerEntityView {
         self.state().entity_view()
     }
+    /// Authoritative local playerState in the same wire schema consumed by
+    /// protocol snapshots. The local-server shim owns the conversion into the
+    /// decoded protocol type so the player/Pmove layer stays protocol-agnostic.
+    pub(crate) fn network_state(&self) -> jka_movement::NetworkPlayerState {
+        self.state().network()
+    }
     pub fn set_physics_tick_msec(&mut self, tick_msec: u32) -> Result<(), String> {
         let tick_msec = i32::try_from(tick_msec).map_err(|_| "Invalid physics tick")?;
         if !(MIN_TICK_MSEC..=MAX_TICK_MSEC).contains(&tick_msec) {
@@ -233,7 +285,7 @@ impl LocalPlayer {
     }
     pub fn join(&mut self, mode: JoinMode, spawn: SpawnPoint) -> Result<(), String> {
         if mode == JoinMode::Player && !self.can_join {
-            return Err("JOIN GAME REQUIRES A COMPILED BSP AND HUMANOID ANIMATIONS".into());
+            return Err("JOIN GAME REQUIRES MAP COLLISION AND HUMANOID ANIMATIONS".into());
         }
         if mode != self.mode {
             if self.noclip {
@@ -243,14 +295,18 @@ impl LocalPlayer {
                 self.noclip = false;
             }
             if mode == JoinMode::Player && self.player.is_none() {
-                self.player = Some(PlayerState::spawn(
+                let mut player = PlayerState::spawn(
                     jka_position(spawn.position),
                     spawn.yaw.to_degrees(),
                     mode,
-                )?);
+                )?;
+                Self::apply_saber_movement_to_state(&mut player, self.saber_movement)?;
+                self.player = Some(player);
             } else if mode == JoinMode::Spectator {
                 let view = self.state().view();
-                self.spectator = PlayerState::spawn(view.origin, view.view_angles[1], mode)?;
+                let mut spectator = PlayerState::spawn(view.origin, view.view_angles[1], mode)?;
+                Self::apply_saber_movement_to_state(&mut spectator, self.saber_movement)?;
+                self.spectator = spectator;
             }
             self.mode = mode;
         }
@@ -263,6 +319,7 @@ impl LocalPlayer {
             spawn.yaw.to_degrees(),
             self.mode,
         )?;
+        Self::apply_saber_movement_to_state(&mut state, self.saber_movement)?;
         if self.mode == JoinMode::Player && self.noclip {
             state.set_noclip(true);
         }
@@ -295,6 +352,8 @@ impl LocalPlayer {
         self.previous_origin = self.current_origin;
         self.previous_command_time = self.current_command_time;
         self.pending_power = None;
+        self.pending_cmd_buttons = 0;
+        self.pending_generic_command = 0;
     }
     pub fn request_power(&mut self, power: MovementPower) {
         self.pending_power = Some(power);
@@ -334,12 +393,19 @@ impl LocalPlayer {
         elapsed: Duration,
         keys: &HashSet<KeyCode>,
         mouse: (f64, f64),
-        noclip_primary: bool,
-        noclip_alt: bool,
+        client_cmd: UserCmd,
     ) -> Result<(), String> {
         self.apply_mouse_look_timed(mouse, elapsed);
+        // Preserve tapped +commands until a fixed Pmove step actually runs.
+        // Held buttons are present in client_cmd again on later frames; ORing
+        // here is specifically what protects short taps at >physics-rate FPS.
+        self.pending_cmd_buttons |= client_cmd.buttons;
+        if client_cmd.generic_command != 0 {
+            self.pending_generic_command = client_cmd.generic_command;
+        }
         self.accumulated += elapsed.min(Duration::from_millis(250));
         let tick = Duration::from_millis(self.tick_msec as u64);
+        let mut first_step = true;
         while self.accumulated >= tick {
             self.accumulated -= tick;
             let move_priority = self.move_priority;
@@ -351,17 +417,33 @@ impl LocalPlayer {
             let magnitude = if walk { 64 } else { 127 };
             let crouch =
                 keys.contains(&KeyCode::ControlLeft) || keys.contains(&KeyCode::ControlRight);
-            let mut buttons = if walk { BUTTON_WALKING } else { 0 };
-            if self.noclip && noclip_primary {
-                buttons |= BUTTON_ATTACK;
-            }
-            if self.noclip && noclip_alt {
-                buttons |= BUTTON_ALT_ATTACK;
+            // Reuse the same CL_CreateCmd button/select/generic-command payload
+            // as remote play. Local movement keeps its idrive axis winner and
+            // local subframe angle path, but action semantics must not diverge.
+            let mut buttons = client_cmd.buttons;
+            let generic_command = if first_step {
+                buttons |= self.pending_cmd_buttons;
+                if self.pending_generic_command != 0 {
+                    self.pending_generic_command
+                } else {
+                    client_cmd.generic_command
+                }
+            } else {
+                0
+            };
+            if walk {
+                buttons |= BUTTON_WALKING;
+            } else {
+                buttons &= !BUTTON_WALKING;
             }
             let cmd = UserCmd {
                 server_time: state.view().command_time + self.tick_msec,
                 angles: self.input_angles.map(angle_to_short),
                 buttons,
+                weapon: client_cmd.weapon,
+                force_selection: client_cmd.force_selection,
+                inventory_selection: client_cmd.inventory_selection,
+                generic_command,
                 forward_move: idrive_axis(
                     keys.contains(&KeyCode::KeyW),
                     keys.contains(&KeyCode::KeyS),
@@ -396,6 +478,11 @@ impl LocalPlayer {
             self.current_eye = view.eye_origin();
             self.current_origin = view.origin;
             self.current_command_time = view.command_time;
+            if first_step {
+                self.pending_cmd_buttons = 0;
+                self.pending_generic_command = 0;
+                first_step = false;
+            }
             if self.mode == JoinMode::Player && !self.noclip {
                 self.deformation_shim.observe_pmove(view, &mut self.world);
             }
@@ -561,8 +648,7 @@ mod tests {
                         Duration::from_nanos(end - start),
                         &keys,
                         (0.0, 0.0),
-                        false,
-                        false,
+                        UserCmd::default(),
                     )
                     .unwrap();
             }
@@ -611,7 +697,7 @@ mod tests {
         let keys = HashSet::from([KeyCode::KeyW]);
         for _ in 0..100 {
             player
-                .update(Duration::from_millis(7), &keys, (0.0, 0.0), false, false)
+                .update(Duration::from_millis(7), &keys, (0.0, 0.0), UserCmd::default())
                 .unwrap();
         }
         assert_eq!(player.state().view().command_time, 700);
@@ -625,8 +711,7 @@ mod tests {
                 Duration::from_millis(200),
                 &HashSet::from([KeyCode::KeyW]),
                 (0.0, 0.0),
-                false,
-                false,
+                UserCmd::default(),
             )
             .unwrap();
         let saved = player.state().view();
@@ -638,14 +723,99 @@ mod tests {
                 Duration::from_millis(200),
                 &HashSet::from([KeyCode::Space]),
                 (0.0, 0.0),
-                false,
-                false,
+                UserCmd::default(),
             )
             .unwrap();
         assert!(player.state().view().origin[2] > saved.origin[2]);
         player.join(JoinMode::Player, spawn).unwrap();
         assert_eq!(saved, player.state().view());
     }
+    #[test]
+    fn tapped_attack_survives_until_the_next_fixed_pmove_tick() {
+        let (mut player, _) = local();
+        let before = player.entity_view().saber_move;
+        let attack = UserCmd {
+            buttons: jka_movement::BUTTON_ATTACK,
+            ..UserCmd::default()
+        };
+
+        // At very high render FPS this frame is shorter than the 8 ms physics
+        // tick, so CL_CreateCmd input must not be consumed and forgotten.
+        player
+            .update(Duration::from_millis(1), &HashSet::new(), (0.0, 0.0), attack)
+            .unwrap();
+        assert_eq!(player.entity_view().saber_move, before);
+
+        player
+            .update(
+                Duration::from_millis(7),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd::default(),
+            )
+            .unwrap();
+        assert_ne!(player.entity_view().saber_move, before);
+    }
+
+    #[test]
+    fn local_saber_attack_cycle_runs_through_server_side_generic_command_path() {
+        // protocol-26 playerStateFields slot 23 is fd.saberAnimLevel.
+        const SABER_ANIM_LEVEL_FIELD: usize = 23;
+        let (mut player, _) = local();
+        assert_eq!(player.network_state().fields[SABER_ANIM_LEVEL_FIELD], 2); // SS_MEDIUM
+
+        player
+            .update(
+                Duration::from_millis(8),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd {
+                    generic_command: jka_movement::GENCMD_SABERATTACKCYCLE,
+                    ..UserCmd::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(player.network_state().fields[SABER_ANIM_LEVEL_FIELD], 3); // SS_STRONG
+
+        // OpenJK debounces repeats of the same generic command for 300 ms.
+        player
+            .update(
+                Duration::from_millis(8),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd {
+                    generic_command: jka_movement::GENCMD_SABERATTACKCYCLE,
+                    ..UserCmd::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(player.network_state().fields[SABER_ANIM_LEVEL_FIELD], 3);
+
+        // Once the debounce expires, strong wraps to fast at offense level 3.
+        for _ in 0..38 {
+            player
+                .update(
+                    Duration::from_millis(8),
+                    &HashSet::new(),
+                    (0.0, 0.0),
+                    UserCmd::default(),
+                )
+                .unwrap();
+        }
+        player
+            .update(
+                Duration::from_millis(8),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd {
+                    generic_command: jka_movement::GENCMD_SABERATTACKCYCLE,
+                    ..UserCmd::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(player.network_state().fields[SABER_ANIM_LEVEL_FIELD], 1); // SS_FAST
+    }
+
     #[test]
     fn noclip_toggles_native_pmove_type() {
         let (mut player, _) = local();
@@ -668,8 +838,11 @@ mod tests {
                     Duration::from_millis(8),
                     &HashSet::from([KeyCode::KeyW]),
                     (0.0, 0.0),
-                    primary,
-                    alt,
+                    UserCmd {
+                        buttons: (if primary { jka_movement::BUTTON_ATTACK } else { 0 })
+                            | (if alt { jka_movement::BUTTON_ALT_ATTACK } else { 0 }),
+                        ..UserCmd::default()
+                    },
                 )
                 .unwrap();
             glam::Vec3::from_array(player.view().velocity).length()
@@ -697,8 +870,7 @@ mod tests {
                 Duration::from_millis(200),
                 &HashSet::from([KeyCode::KeyW]),
                 (0.0, 0.0),
-                false,
-                false,
+                UserCmd::default(),
             )
             .unwrap();
         assert!(player.state().view().origin[0] > 0.0);

@@ -1,0 +1,46 @@
+diff a/crates/jka-client/src/fx/draw.rs b/crates/jka-client/src/fx/draw.rs	(rejected hunks)
+@@ -52,6 +52,8 @@ pub enum FxBlend {
+     Alpha,
+     /// GL_DST_COLOR GL_ZERO / GL_ZERO GL_SRC_COLOR.
+     Modulate,
++    /// GL_ZERO GL_ONE_MINUS_SRC_COLOR: classic dark decal/burn compositing.
++    Darken,
+     /// No blendFunc.
+     Opaque,
+ }
+@@ -63,6 +65,7 @@ impl FxBlend {
+             ["add"] | ["gl_one", "gl_one"] => Self::Add,
+             ["gl_src_alpha", "gl_one"] => Self::AddAlpha,
+             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
++            ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
+             [] => Self::Opaque,
+             _ => Self::Alpha,
+         }
+@@ -81,6 +84,7 @@ impl FxBlend {
+             Self::Add => DynamicModelAlphaMode::AdditiveOne,
+             Self::AddAlpha => DynamicModelAlphaMode::Additive,
+             Self::Modulate => DynamicModelAlphaMode::Modulate,
++            Self::Darken => DynamicModelAlphaMode::Darken,
+             Self::Alpha | Self::Opaque => DynamicModelAlphaMode::BlendUnlit,
+         }
+     }
+@@ -105,7 +109,7 @@ impl FxMaterial {
+         let rgb = if self.rgb_vertex { [0, 1, 2].map(|i| f32::from(rgba[i]) / 255.0) } else { self.rgb_const };
+         let alpha = match self.blend {
+             // Additive-one ignores alpha; the pipeline multiplies by it.
+-            FxBlend::Add | FxBlend::Modulate => 1.0,
++            FxBlend::Add | FxBlend::Modulate | FxBlend::Darken => 1.0,
+             _ if self.alpha_vertex => f32::from(rgba[3]) / 255.0,
+             _ => self.alpha_const,
+         };
+@@ -327,6 +331,10 @@ mod tests {
+         assert_eq!(FxBlend::from_blend_func("GL_SRC_ALPHA GL_ONE"), FxBlend::AddAlpha);
+         assert_eq!(FxBlend::from_blend_func("blend"), FxBlend::Alpha);
+         assert_eq!(FxBlend::from_blend_func("gl_dst_color gl_zero"), FxBlend::Modulate);
++        assert_eq!(
++            FxBlend::from_blend_func("gl_zero gl_one_minus_src_color"),
++            FxBlend::Darken
++        );
+         assert_eq!(FxBlend::from_blend_func(""), FxBlend::Opaque);
+     }
+ 

@@ -10,6 +10,7 @@
 //! loading screen, which are in-world surfaces rather than menu chrome.
 
 use super::egui_theme as theme;
+use super::map_editor::MapEditTool;
 use super::*;
 
 const TOP_ITEMS: [&str; 7] = [
@@ -24,6 +25,7 @@ const TOP_SETUP: usize = 4;
 const SETUP_TAB_VIDEO: usize = 1;
 const SETUP_TAB_INPUT: usize = 2;
 const SETUP_TAB_AUDIO: usize = 3;
+const SETUP_TAB_NETWORK: usize = 4;
 const SETUP_TAB_INTERFACE: usize = 5;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
@@ -59,7 +61,6 @@ pub(super) enum VideoSection {
     BakedAo,
     Physics,
     Sun,
-    Fog,
     Clouds,
     Weather,
     Surface,
@@ -81,9 +82,8 @@ impl VideoSection {
         (Self::BakedAo, "Baked AO"),
         (Self::Physics, "Physics"),
     ];
-    const ENVIRONMENT: [(Self, &'static str); 6] = [
+    const ENVIRONMENT: [(Self, &'static str); 5] = [
         (Self::Sun, "Sun"),
-        (Self::Fog, "Fog"),
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),
@@ -108,15 +108,25 @@ impl App {
         self.egui_repaint_requested = true;
         self.egui_renderer_active = false;
         self.egui_apply_video_requested = false;
+        self.map_edit_toolbar_rect = None;
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = None;
     }
 
     /// egui owns every menu overlay, not just the Video page.
     pub(super) fn egui_menu_active(&self) -> bool {
-        matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::HudEdit)
+        let blocking_download_ui = self.missing_map_prompt.is_some()
+            || self.demo_missing_map_prompt.is_some()
+            || self.live_download.is_some()
+            || self.live_join_ui.is_some();
+        let asset_viewer_behind_console = self.front_end
+            && self.frontend_page == FrontendPage::AssetViewer
+            && self.overlay == OverlayMode::Console;
+        (blocking_download_ui
+            || asset_viewer_behind_console
+            || matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::HudEdit | OverlayMode::MapEdit))
             && self.video_confirmation.is_none()
-            && self.loading.is_none()
+            && (blocking_download_ui || self.loading.is_none())
             && !self.video.skip_ui
             && self.window.is_some()
             && self.render.is_some()
@@ -137,6 +147,11 @@ impl App {
     /// logical key, so those events are handed back to the legacy handlers.
     pub(super) fn route_egui_window_event(&mut self, event: &WindowEvent) -> bool {
         let confirmation = self.egui_confirmation_active();
+        // Asset Viewer remains rendered behind the legacy console, but the
+        // console must retain all keyboard/mouse input while it is open.
+        if !confirmation && self.overlay == OverlayMode::Console {
+            return false;
+        }
         if !confirmation && !self.egui_menu_active() {
             return false;
         }
@@ -174,14 +189,65 @@ impl App {
         let response = state.on_window_event(window, event);
         self.egui_repaint_requested |= response.repaint;
 
+        // `egui_winit::Response::consumed` is not a reliable hit-test for every
+        // pointer-button event. In Map Edit that used to let a toolbar press
+        // fall through and start the 3D brush picker underneath (the giveaway
+        // was clicking SAVE and seeing "No brush under cursor"). Own presses
+        // inside the toolbar explicitly; releases may still reach the raw path
+        // so a viewport drag ending over the toolbar can finish cleanly.
+        if self.overlay == OverlayMode::MapEdit
+            && matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                }
+            )
+        {
+            let pixels_per_point = self.egui_ctx.pixels_per_point().max(0.001);
+            let pointer = egui::pos2(
+                self.cursor_position.0 as f32 / pixels_per_point,
+                self.cursor_position.1 as f32 / pixels_per_point,
+            );
+            if self
+                .map_edit_toolbar_rect
+                .is_some_and(|rect| rect.expand(2.0).contains(pointer))
+            {
+                return true;
+            }
+        }
+
+        if self.overlay == OverlayMode::MapEdit
+            && matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    button: MouseButton::Left,
+                    ..
+                }
+            )
+            && self.map_editor.as_ref().is_some_and(MapEditor::is_dragging)
+        {
+            // A drag that began in the viewport still belongs to the editor if
+            // the cursor happens to cross the toolbar before LMB is released.
+            return false;
+        }
+
         if let WindowEvent::KeyboardInput { event, .. } = event {
             let PhysicalKey::Code(code) = event.physical_key else {
                 return true;
             };
-            if matches!(
-                code,
-                KeyCode::PrintScreen | KeyCode::Backquote | KeyCode::Escape
-            ) {
+            if code == KeyCode::Escape
+                && (self.missing_map_prompt.is_some()
+                    || self.demo_missing_map_prompt.is_some()
+                    || self.live_download.is_some()
+                    || self.live_join_ui.is_some())
+            {
+                // The missing-map/download flow is modal. Do not let the
+                // ordinary in-game Escape handler obscure it.
+                return true;
+            }
+            if matches!(code, KeyCode::PrintScreen | KeyCode::Backquote | KeyCode::Escape) {
                 return false;
             }
             // Everything else belongs to egui while a menu is open.
@@ -264,11 +330,314 @@ impl App {
         self.egui_last_frame = Instant::now();
     }
 
+    fn egui_missing_map_dialog(&mut self, root: &mut egui::Ui) {
+        let Some(prompt) = self.missing_map_prompt.clone() else { return };
+        let can_auto = self.network.allow_http_downloads || self.network.allow_legacy_downloads;
+        #[derive(Clone, Copy)]
+        enum Choice { Abort, Connect, Download }
+        let mut choice = None;
+        egui::Area::new(egui::Id::new("missing_map_prompt"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.set_width(560.0);
+                        theme::page_title(ui, "MAP NOT FOUND", "The server uses a map that is not installed locally.");
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT));
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM));
+                        ui.add_space(16.0);
+                        ui.label("Choose how to continue:");
+                        ui.add_space(10.0);
+                        if theme::primary_button(ui, "AUTO-DOWNLOAD & CONNECT").clicked() {
+                            if can_auto { choice = Some(Choice::Download); }
+                        }
+                        if !can_auto {
+                            ui.label(egui::RichText::new("Autodownload is disabled in Setup > Network.").color(theme::WARNING));
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if theme::ghost_button(ui, "CONNECT ANYWAY").clicked() {
+                                choice = Some(Choice::Connect);
+                            }
+                            ui.add_space(8.0);
+                            if theme::ghost_button(ui, "ABORT").clicked() {
+                                choice = Some(Choice::Abort);
+                            }
+                        });
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new(
+                            "HTTP is preferred when advertised by the server; legacy JKA download is the fallback when enabled."
+                        ).small().color(theme::TEXT_DIM));
+                    });
+            });
+        match choice {
+            Some(Choice::Abort) => self.choose_missing_map_abort(),
+            Some(Choice::Connect) => self.choose_missing_map_connect_anyway(),
+            Some(Choice::Download) => self.choose_missing_map_autodownload(),
+            None => {}
+        }
+    }
+
+    fn egui_demo_missing_map_dialog(&mut self, root: &mut egui::Ui) {
+        let Some(prompt) = self.demo_missing_map_prompt.clone() else { return };
+        #[derive(Clone, Copy)]
+        enum Choice { Continue, Exit }
+        let mut choice = None;
+        egui::Area::new(egui::Id::new("demo_missing_map_prompt"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.set_width(560.0);
+                        theme::page_title(
+                            ui,
+                            "DEMO MAP NOT FOUND",
+                            "This demo was recorded on a map that is not installed locally.",
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT));
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM));
+                        ui.add_space(16.0);
+                        ui.label(egui::RichText::new(
+                            "You can still play the recorded snapshots, but world geometry and map-dependent effects may be missing."
+                        ).color(theme::TEXT));
+                        ui.add_space(12.0);
+                        if theme::primary_button(ui, "CONTINUE ANYWAY").clicked() {
+                            choice = Some(Choice::Continue);
+                        }
+                        ui.add_space(8.0);
+                        if theme::ghost_button(ui, "EXIT").clicked() {
+                            choice = Some(Choice::Exit);
+                        }
+                    });
+            });
+        match choice {
+            Some(Choice::Continue) => self.choose_demo_missing_map_continue(),
+            Some(Choice::Exit) => self.choose_demo_missing_map_exit(),
+            None => {}
+        }
+    }
+
+    fn egui_live_join_pipeline(&mut self, root: &mut egui::Ui) {
+        let Some(join) = self.live_join_ui.clone() else { return };
+
+        // Own the whole frame for the duration of an autodownload-assisted join.
+        // The renderer may still have the frontend scene or the normal map-load
+        // splash underneath us; an opaque backdrop prevents either from flashing
+        // between connection, download, filesystem refresh and map preparation.
+        root.painter().rect_filled(root.max_rect(), 0.0, egui::Color32::BLACK);
+
+        let (phase, detail, overall, secondary, package_line) =
+            if let Some(download) = self.live_download.as_ref() {
+                let count = download.files.len().max(1);
+                let current_fraction = download
+                    .total
+                    .filter(|total| *total > 0)
+                    .map(|total| (download.received as f32 / total as f32).clamp(0.0, 1.0));
+                let package_fraction = ((download.index as f32 + current_fraction.unwrap_or(0.0))
+                    / count as f32)
+                    .clamp(0.0, 1.0);
+                let package_line = download.current().map(|spec| {
+                    format!(
+                        "PACKAGE {} / {}  ·  {}",
+                        (download.index + 1).min(download.files.len()),
+                        download.files.len(),
+                        spec.remote_name
+                    )
+                });
+                let transfer_text = if let Some(total) = download.total {
+                    format!(
+                        "{:.1} / {:.1} MiB",
+                        download.received as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0
+                    )
+                } else {
+                    format!("{:.1} MiB", download.received as f64 / 1_048_576.0)
+                };
+                (
+                    "DOWNLOADING CONTENT",
+                    download.status.clone(),
+                    0.10 + 0.55 * package_fraction,
+                    Some((current_fraction.unwrap_or(0.0), transfer_text, current_fraction.is_none())),
+                    package_line,
+                )
+            } else if let Some(loading) = self.loading.as_ref() {
+                let fraction = loading.progress_fraction();
+                let (phase, detail) = if loading.preparation_finished {
+                    (
+                        "ENTERING GAME",
+                        "Map preparation is complete; uploading the world to the renderer...".to_owned(),
+                    )
+                } else {
+                    (
+                        "LOADING MAP",
+                        "Preparing BSP, collision, shaders and map assets...".to_owned(),
+                    )
+                };
+                (
+                    phase,
+                    detail,
+                    0.75 + 0.23 * fraction,
+                    Some((fraction, format!("Preparing {}", loading.name), false)),
+                    None,
+                )
+            } else {
+                match join.phase {
+                    LiveJoinUiPhase::CheckingContent => (
+                        "CHECKING CONTENT",
+                        join.detail.clone(),
+                        0.08,
+                        None,
+                        None,
+                    ),
+                    LiveJoinUiPhase::Synchronizing => (
+                        "SYNCHRONIZING",
+                        join.detail.clone(),
+                        0.70,
+                        None,
+                        None,
+                    ),
+                }
+            };
+
+        egui::Area::new(egui::Id::new("live_join_pipeline"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::same(28))
+                    .show(ui, |ui| {
+                        ui.set_width(620.0);
+                        theme::page_title(ui, "JOINING SERVER", &format!("Preparing {}", join.map_name));
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new(phase).size(21.0).strong().color(theme::TEXT));
+                        ui.label(egui::RichText::new(detail).color(theme::TEXT_DIM));
+                        ui.add_space(16.0);
+
+                        let overall_text = format!("Overall  {:.0}%", overall.clamp(0.0, 0.99) * 100.0);
+                        ui.add(egui::ProgressBar::new(overall.clamp(0.0, 0.99)).text(overall_text));
+
+                        if let Some(line) = package_line {
+                            ui.add_space(14.0);
+                            ui.label(egui::RichText::new(line).strong().color(theme::TEXT));
+                        } else {
+                            ui.add_space(14.0);
+                        }
+                        if let Some((fraction, text, animate)) = secondary {
+                            let mut bar = egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).text(text);
+                            if animate {
+                                bar = bar.animate(true);
+                            }
+                            ui.add(bar);
+                        } else {
+                            ui.add(egui::ProgressBar::new(0.0).animate(true).text("Working..."));
+                        }
+
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            for (index, label) in ["CONTENT", "SYNC", "MAP", "ENTER"].iter().enumerate() {
+                                if index > 0 {
+                                    ui.label(egui::RichText::new("  ›  ").color(theme::TEXT_DIM));
+                                }
+                                let active = match phase {
+                                    "CHECKING CONTENT" | "DOWNLOADING CONTENT" => index == 0,
+                                    "SYNCHRONIZING" => index == 1,
+                                    "LOADING MAP" => index == 2,
+                                    "ENTERING GAME" => index == 3,
+                                    _ => false,
+                                };
+                                let text = egui::RichText::new(*label).small();
+                                ui.label(if active {
+                                    text.strong().color(theme::TEXT)
+                                } else {
+                                    text.color(theme::TEXT_DIM)
+                                });
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn egui_download_dialog(&mut self, root: &mut egui::Ui) {
+        let Some(state) = self.live_download.as_ref() else { return };
+        let map_name = state.map_name.clone();
+        let status = state.status.clone();
+        let file_name = state.current().map(|spec| {
+            format!("{} · {}", spec.referenced_name, spec.remote_name)
+        }).unwrap_or_default();
+        let file_index = (state.index + 1).min(state.files.len());
+        let file_count = state.files.len();
+        let received = state.received;
+        let total = state.total;
+        let fraction = total.filter(|total| *total > 0).map(|total| (received as f32 / total as f32).clamp(0.0, 1.0));
+        egui::Area::new(egui::Id::new("map_autodownload_progress"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.set_width(560.0);
+                        theme::page_title(ui, "DOWNLOADING MAP", &format!("Preparing {map_name} before joining."));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(format!("Package {file_index} / {file_count}")).strong());
+                        ui.label(&file_name);
+                        ui.label(egui::RichText::new(status).small().color(theme::TEXT_DIM));
+                        ui.add_space(8.0);
+                        let text = if let Some(total) = total {
+                            format!("{:.1} / {:.1} MiB", received as f64 / 1_048_576.0, total as f64 / 1_048_576.0)
+                        } else {
+                            format!("{:.1} MiB", received as f64 / 1_048_576.0)
+                        };
+                        let mut bar = egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(text).show_percentage();
+                        if fraction.is_none() { bar = bar.animate(true); }
+                        ui.add(bar);
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Downloaded PK3s are installed as dl_*.pk3 and the client requests a fresh gamestate before loading the world.").small().color(theme::TEXT_DIM));
+                    });
+            });
+    }
+
     // ------------------------------------------------------------- chrome --
 
     fn build_egui_menu(&mut self, ui: &mut egui::Ui) {
+        if self.missing_map_prompt.is_some() {
+            self.egui_missing_map_dialog(ui);
+            return;
+        }
+        if self.demo_missing_map_prompt.is_some() {
+            self.egui_demo_missing_map_dialog(ui);
+            return;
+        }
+        if self.live_join_ui.is_some() {
+            self.egui_live_join_pipeline(ui);
+            return;
+        }
+        if self.live_download.is_some() {
+            self.egui_download_dialog(ui);
+            return;
+        }
         if self.overlay == OverlayMode::HudEdit {
             self.egui_hud_editor(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::MapEdit {
+            self.egui_map_editor(ui);
             return;
         }
         if self.front_end {
@@ -312,7 +681,7 @@ impl App {
             while x <= full.right() {
                 painter.line_segment(
                     [egui::pos2(x, full.top()), egui::pos2(x, full.bottom())],
-                    egui::Stroke::new(1.0, if column % 4 == 0 { major } else { line }),
+                    egui::Stroke::new(1.0_f32, if column % 4 == 0 { major } else { line }),
                 );
                 x += spacing;
                 column += 1;
@@ -322,7 +691,7 @@ impl App {
             while y <= full.bottom() {
                 painter.line_segment(
                     [egui::pos2(full.left(), y), egui::pos2(full.right(), y)],
-                    egui::Stroke::new(1.0, if row % 4 == 0 { major } else { line }),
+                    egui::Stroke::new(1.0_f32, if row % 4 == 0 { major } else { line }),
                 );
                 y += spacing;
                 row += 1;
@@ -388,7 +757,7 @@ impl App {
             painter.rect_stroke(
                 rect.expand(3.0),
                 egui::CornerRadius::ZERO,
-                egui::Stroke::new(if selected { 2.0 } else { 1.0 }, outline),
+                egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, outline),
                 egui::StrokeKind::Outside,
             );
             painter.text(
@@ -447,7 +816,7 @@ impl App {
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236))
-                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -539,6 +908,191 @@ impl App {
         }
     }
 
+    fn egui_map_editor(&mut self, root: &mut egui::Ui) {
+        self.map_edit_toolbar_rect = None;
+        let Some(window) = self.window.as_ref() else { return };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 { return; }
+
+        let pixels_per_point = root.ctx().pixels_per_point().max(0.001);
+        let viewport_points = egui::vec2(
+            size.width as f32 / pixels_per_point,
+            size.height as f32 / pixels_per_point,
+        );
+        let view_proj = self.camera.view_projection(size.width, size.height);
+        let project = |point_jka: [f64; 3]| -> Option<egui::Pos2> {
+            let render = scene::render_position(point_jka.map(|v| v as f32));
+            let clip = view_proj * glam::Vec3::from_array(render).extend(1.0);
+            if clip.w <= 0.001 { return None; }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.z < -0.1 || ndc.z > 1.1 { return None; }
+            Some(egui::pos2(
+                (ndc.x * 0.5 + 0.5) * viewport_points.x,
+                (1.0 - (ndc.y * 0.5 + 0.5)) * viewport_points.y,
+            ))
+        };
+
+        if let Some(editor) = self.map_editor.as_ref() {
+            let painter = root.painter().clone();
+            let changed = editor.changed_geometries();
+            let selected = editor.selected_geometry();
+            let selected_face = editor.selected.map(|selection| selection.face);
+
+            for geometry in changed {
+                for face in geometry.faces {
+                    if face.vertices.len() < 2 { continue; }
+                    for edge in 0..face.vertices.len() {
+                        let a = face.vertices[edge];
+                        let b = face.vertices[(edge + 1) % face.vertices.len()];
+                        if let (Some(a), Some(b)) = (project(a), project(b)) {
+                            painter.line_segment(
+                                [a, b],
+                                egui::Stroke::new(0.75_f32, egui::Color32::from_rgba_unmultiplied(255, 166, 64, 90)),
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(geometry) = selected {
+                for face in geometry.faces {
+                    if face.vertices.len() < 2 { continue; }
+                    let selected_face_line = selected_face == Some(face.face_index);
+                    for edge in 0..face.vertices.len() {
+                        let a = face.vertices[edge];
+                        let b = face.vertices[(edge + 1) % face.vertices.len()];
+                        if let (Some(a), Some(b)) = (project(a), project(b)) {
+                            painter.line_segment(
+                                [a, b],
+                                egui::Stroke::new(
+                                    if selected_face_line { 1.75_f32 } else { 1.0_f32 },
+                                    if selected_face_line {
+                                        egui::Color32::from_rgba_unmultiplied(255, 214, 92, 210)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 220, 255, 150)
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut save_requested = false;
+        let mut revert_requested = false;
+        let mut close_requested = false;
+        let mut snapshot_refresh_requested = false;
+        let toolbar = egui::Area::new(egui::Id::new("jka_map_edit_toolbar"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+            .order(egui::Order::Foreground)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(8, 13, 20, 242))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        let Some(editor) = self.map_editor.as_mut() else {
+                            ui.horizontal(|ui| {
+                                theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT);
+                                ui.label(egui::RichText::new("This source map is not a writable loose .map file.").color(theme::WARNING));
+                                if ui.button("DONE").clicked() { close_requested = true; }
+                            });
+                            return;
+                        };
+
+                        ui.horizontal(|ui| {
+                            theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT);
+                            ui.separator();
+                            if ui.selectable_label(editor.tool == MapEditTool::MoveBrush, "BRUSH MOVE").clicked() {
+                                editor.cancel_drag();
+                                snapshot_refresh_requested = true;
+                                editor.tool = MapEditTool::MoveBrush;
+                                editor.status = "Brush Move: click a brush and drag in the camera plane.".into();
+                            }
+                            if ui.selectable_label(editor.tool == MapEditTool::MoveFace, "FACE RESIZE").clicked() {
+                                editor.cancel_drag();
+                                snapshot_refresh_requested = true;
+                                editor.tool = MapEditTool::MoveFace;
+                                editor.status = "Face Resize: click a face and drag along its normal.".into();
+                            }
+                            ui.separator();
+                            ui.label("Grid");
+                            ui.add(egui::DragValue::new(&mut editor.grid).range(0.125..=256.0).speed(1.0));
+                            ui.separator();
+                            let pending = editor.pending_changes;
+                            ui.label(egui::RichText::new(format!("{pending} pending change{}", if pending == 1 { "" } else { "s" }))
+                                .color(if pending == 0 { theme::TEXT_DIM } else { theme::WARNING }));
+                            if ui.add_enabled(pending != 0, egui::Button::new("SAVE")).clicked() {
+                                save_requested = true;
+                            }
+                            if ui.add_enabled(pending != 0, egui::Button::new("REVERT")).clicked() {
+                                revert_requested = true;
+                            }
+                            if ui.button("DONE").clicked() { close_requested = true; }
+                        });
+                        ui.horizontal(|ui| {
+                            let selection = editor.selected.map_or_else(
+                                || "No brush selected".to_owned(),
+                                |selection| format!(
+                                    "entity {} / brush {} / face {}  {}",
+                                    selection.entity,
+                                    selection.brush,
+                                    selection.face,
+                                    editor.selected_shader().unwrap_or("<no shader>")
+                                ),
+                            );
+                            theme::label(ui, theme::plain(
+                                &format!("{}  —  {}  —  LMB selects/drags. ESC exits edit mode without discarding pending edits.", selection, editor.status),
+                                10.5,
+                                theme::TEXT_FAINT,
+                            ));
+                        });
+                    });
+            });
+        self.map_edit_toolbar_rect = Some(toolbar.response.rect);
+        if snapshot_refresh_requested {
+            self.publish_snapshot();
+        }
+
+        if revert_requested {
+            if let Some(editor) = self.map_editor.as_mut() {
+                editor.revert_all();
+            }
+            self.queue_map_edit_preview();
+            self.publish_snapshot();
+            self.egui_repaint_requested = true;
+        }
+        if save_requested {
+            let result = self.map_editor.as_mut().map(|editor| {
+                editor.save()?;
+                Ok::<_, String>(editor.source_path.clone())
+            });
+            match result {
+                Some(Ok(path)) => {
+                    self.console_status = format!("MAP EDIT SAVED: {}", path.display());
+                    self.push_console_line(format!("^2{}", self.console_status));
+                    // Save may happen while a live textured drag preview is still
+                    // building. Queue the newest reparsed document instead of
+                    // superseding it with another full rebuild immediately.
+                    self.queue_map_edit_preview();
+                    self.publish_snapshot();
+                }
+                Some(Err(error)) => {
+                    self.console_status = format!("MAP EDIT SAVE FAILED: {error}");
+                    self.push_console_line(format!("^1{}", self.console_status));
+                    if let Some(editor) = self.map_editor.as_mut() { editor.status = error; }
+                }
+                None => {}
+            }
+            self.egui_repaint_requested = true;
+        }
+        if close_requested {
+            if let Some(editor) = self.map_editor.as_mut() { editor.cancel_drag(); }
+            self.set_overlay(OverlayMode::None);
+            self.publish_snapshot();
+        }
+    }
+
     fn build_egui_frontend_menu(&mut self, ui: &mut egui::Ui) {
         self.egui_frontend_scene_fade(ui);
         self.egui_frontend_header(ui);
@@ -557,6 +1111,9 @@ impl App {
     /// than the renderer's no-world clear color. Once the cinematic is ready,
     /// the scrim eases away and the BSP appears to brighten from 0 -> 1.
     fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
+        if self.frontend_page == FrontendPage::AssetViewer {
+            return;
+        }
         let brightness = self.frontend_cinematic.map_or(0.0, |cinematic| {
             let t = cinematic.started.elapsed().as_secs_f32() / FRONTEND_SCENE_FADE_IN_SECS;
             let t = t.clamp(0.0, 1.0);
@@ -598,6 +1155,9 @@ impl App {
                             FrontendPage::SoloGame => "SOLO GAME",
                             FrontendPage::PlayDemo => "PLAY DEMO",
                             FrontendPage::Controls => "CONTROLS",
+                            FrontendPage::DeveloperTools => "DEVELOPER TOOLS",
+                            FrontendPage::AssetViewer => "ASSET VIEWER",
+                            FrontendPage::MapViewer => "MAP VIEWER",
                         }
                     };
                     theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
@@ -639,6 +1199,8 @@ impl App {
                         FrontendPage::Play => "ESC returns to the main menu.",
                         FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => "ESC returns to Play.",
                         FrontendPage::Controls => "ESC returns to the main menu.",
+                        FrontendPage::DeveloperTools => "ESC returns to the main menu.",
+                        FrontendPage::AssetViewer | FrontendPage::MapViewer => "ESC returns to Developer Tools.",
                     };
                     theme::label(ui, theme::plain(hint, 11.5, theme::TEXT_FAINT));
                 });
@@ -658,6 +1220,8 @@ impl App {
                     FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo
                 ) {
                     1120.0
+                } else if matches!(self.frontend_page, FrontendPage::AssetViewer | FrontendPage::MapViewer) {
+                    ui.available_width()
                 } else {
                     CONTENT_MAX_W
                 };
@@ -675,7 +1239,11 @@ impl App {
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
                         egui::Frame::new()
-                            .fill(theme::PANEL_FILL)
+                            .fill(if self.frontend_page == FrontendPage::AssetViewer {
+                                egui::Color32::TRANSPARENT
+                            } else {
+                                theme::PANEL_FILL
+                            })
                             .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
                             .inner_margin(egui::Margin::symmetric(GUTTER as i8, 18))
                             .show(ui, |ui| {
@@ -696,6 +1264,9 @@ impl App {
             FrontendPage::SoloGame => self.egui_solo_game_page(ui),
             FrontendPage::PlayDemo => self.egui_play_demo_page(ui),
             FrontendPage::Controls => self.egui_controls_page(ui),
+            FrontendPage::DeveloperTools => self.egui_developer_tools_page(ui),
+            FrontendPage::AssetViewer => self.egui_asset_viewer_page(ui),
+            FrontendPage::MapViewer => self.egui_map_viewer_page(ui),
         }
     }
 
@@ -716,6 +1287,11 @@ impl App {
         if menu_action(ui, "Settings", "Use the same Setup pages available in game.", true) {
             self.setup_selected = SETUP_TAB_VIDEO;
             self.set_overlay(OverlayMode::Video);
+            return;
+        }
+        if menu_action(ui, "Developer Tools", "Browse and inspect game assets and source maps.", true) {
+            self.frontend_page = FrontendPage::DeveloperTools;
+            self.egui_repaint_requested = true;
             return;
         }
         if menu_action(ui, "Quit", "Exit DinurdoJK and return to the desktop.", true) {
@@ -740,6 +1316,796 @@ impl App {
             self.frontend_page = FrontendPage::PlayDemo;
             self.egui_repaint_requested = true;
             return;
+        }
+    }
+
+    fn egui_developer_tools_page(&mut self, ui: &mut egui::Ui) {
+        theme::page_title(ui, "DEVELOPER TOOLS", "Inspect the active JKA virtual filesystem without leaving the client.");
+        theme::section(ui, "TOOLS", "");
+        if menu_action(
+            ui,
+            "Asset Viewer",
+            "Browse MD3, GLM, EFX and .shader files in a grid with search, folder filtering and A-Z navigation.",
+            true,
+        ) {
+            self.frontend_page = FrontendPage::AssetViewer;
+            self.render_command(RenderCommand::SetAssetPreviewMode(true));
+            self.render_command(RenderCommand::SetAssetPreviewViewport(None));
+            self.asset_preview_viewport_key = None;
+            self.clear_asset_preview_runtime();
+            self.egui_repaint_requested = true;
+            return;
+        }
+        if menu_action(
+            ui,
+            "Map Viewer",
+            "Browse source maps (*.map) from loose files and mounted PK3s, then launch them directly.",
+            true,
+        ) {
+            self.frontend_page = FrontendPage::MapViewer;
+            self.egui_repaint_requested = true;
+        }
+    }
+
+    fn ensure_asset_viewer_catalog(&mut self) {
+        if self.asset_viewer_catalog_loaded {
+            return;
+        }
+        self.asset_viewer_catalog_loaded = true;
+        self.asset_viewer_entries.clear();
+        self.asset_viewer_catalog_error = None;
+        match frontend::scan_asset_viewer_assets(&self.base, self.game.as_deref()) {
+            Ok(entries) => self.asset_viewer_entries = entries,
+            Err(error) => {
+                eprintln!("Could not build Asset Viewer catalog: {error}");
+                self.asset_viewer_catalog_error = Some(error);
+            }
+        }
+    }
+
+    fn ensure_asset_viewer_detail(&mut self) {
+        let Some(selected_id) = self.asset_viewer_selected.clone() else {
+            self.asset_viewer_detail_path = None;
+            self.asset_viewer_detail = None;
+            self.asset_viewer_shader_name = None;
+            self.clear_asset_preview_runtime();
+            return;
+        };
+        if self.asset_viewer_detail_path.as_deref() == Some(selected_id.as_str()) {
+            self.update_asset_preview_content();
+            return;
+        }
+        let Some(entry) = self
+            .asset_viewer_entries
+            .iter()
+            .find(|entry| entry.id == selected_id)
+            .cloned()
+        else {
+            self.asset_viewer_detail_path = None;
+            self.asset_viewer_detail = None;
+            self.asset_viewer_shader_name = None;
+            self.clear_asset_preview_runtime();
+            return;
+        };
+        self.asset_viewer_detail_path = Some(selected_id);
+        let selected_shader = entry.shader_name.clone();
+        let detail = frontend::inspect_asset(&self.base, self.game.as_deref(), &entry);
+        self.asset_viewer_shader_name = selected_shader.or_else(|| {
+            detail
+                .as_ref()
+                .ok()
+                .and_then(|detail| detail.shader_names.first().cloned())
+        });
+        self.asset_viewer_detail = Some(detail);
+        self.clear_asset_preview_runtime();
+        self.update_asset_preview_content();
+    }
+
+    fn egui_asset_viewer_page(&mut self, ui: &mut egui::Ui) {
+        self.ensure_asset_viewer_catalog();
+        if let Some(error) = &self.asset_viewer_catalog_error {
+            theme::banner(ui, &format!("Asset scan failed: {error}"), theme::WARNING);
+            return;
+        }
+        let mut shader_files = self
+            .asset_viewer_entries
+            .iter()
+            .filter(|entry| entry.kind == AssetKind::Shader)
+            .map(|entry| entry.qpath.clone())
+            .collect::<Vec<_>>();
+        shader_files.sort();
+        shader_files.dedup();
+
+        egui::Frame::new()
+            .fill(theme::RAIL_FILL)
+            .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::glow_label(ui, "ASSET VIEWER", 16.0, theme::TEXT);
+                    ui.add_space(14.0);
+                    theme::label(ui, theme::plain("Type", 11.0, theme::TEXT_FAINT));
+                    egui::ComboBox::from_id_salt("asset_viewer_type")
+                        .selected_text(self.asset_viewer_filter.label())
+                        .width(118.0)
+                        .show_ui(ui, |ui| {
+                            for filter in [
+                                AssetFilter::All,
+                                AssetFilter::Models,
+                                AssetFilter::Md3,
+                                AssetFilter::Glm,
+                                AssetFilter::Efx,
+                                AssetFilter::Shader,
+                            ] {
+                                ui.selectable_value(&mut self.asset_viewer_filter, filter, filter.label());
+                            }
+                        });
+                    ui.add_space(8.0);
+                    theme::label(ui, theme::plain("Search", 11.0, theme::TEXT_FAINT));
+                    ui.add_sized(
+                        [210.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.asset_viewer_search).hint_text("name or path"),
+                    );
+                    ui.add_space(8.0);
+                    theme::label(ui, theme::plain("Folder", 11.0, theme::TEXT_FAINT));
+                    ui.add_sized(
+                        [180.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.asset_viewer_folder).hint_text("e.g. models/players"),
+                    );
+                    if self.asset_viewer_filter == AssetFilter::Shader {
+                        ui.add_space(8.0);
+                        theme::label(ui, theme::plain("Shader file", 11.0, theme::TEXT_FAINT));
+                        let selected_file = if self.asset_viewer_shader_file.is_empty() {
+                            "All files".to_owned()
+                        } else {
+                            self.asset_viewer_shader_file
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(self.asset_viewer_shader_file.as_str())
+                                .to_owned()
+                        };
+                        egui::ComboBox::from_id_salt("asset_viewer_shader_file")
+                            .selected_text(selected_file)
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.asset_viewer_shader_file,
+                                    String::new(),
+                                    "All files",
+                                );
+                                for qpath in &shader_files {
+                                    let label = qpath.rsplit('/').next().unwrap_or(qpath);
+                                    ui.selectable_value(
+                                        &mut self.asset_viewer_shader_file,
+                                        qpath.clone(),
+                                        label,
+                                    )
+                                    .on_hover_text(qpath);
+                                }
+                            });
+                    }
+                    if theme::ghost_button(ui, "CLEAR").clicked() {
+                        self.asset_viewer_filter = AssetFilter::All;
+                        self.asset_viewer_search.clear();
+                        self.asset_viewer_folder.clear();
+                        self.asset_viewer_shader_file.clear();
+                        self.asset_viewer_letter = None;
+                        self.asset_viewer_jump_letter = Some('A');
+                    }
+                });
+            });
+
+        ui.add_space(8.0);
+        let search = self.asset_viewer_search.trim().to_ascii_lowercase();
+        let folder = self.asset_viewer_folder.trim().replace('\\', "/").to_ascii_lowercase();
+        let shader_file = self.asset_viewer_shader_file.as_str();
+        let filtered = self
+            .asset_viewer_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| self.asset_viewer_filter.matches(entry.kind))
+            .filter(|(_, entry)| {
+                search.is_empty()
+                    || entry.qpath.to_ascii_lowercase().contains(&search)
+                    || entry.leaf.to_ascii_lowercase().contains(&search)
+                    || entry.display_name.to_ascii_lowercase().contains(&search)
+                    || entry
+                        .shader_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains(&search))
+            })
+            .filter(|(_, entry)| folder.is_empty() || entry.folder.to_ascii_lowercase().contains(&folder))
+            .filter(|(_, entry)| {
+                self.asset_viewer_filter != AssetFilter::Shader
+                    || shader_file.is_empty()
+                    || entry.qpath == shader_file
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        if self.asset_viewer_selected.as_ref().is_some_and(|selected| {
+            !filtered
+                .iter()
+                .any(|&index| self.asset_viewer_entries[index].id == *selected)
+        }) {
+            self.asset_viewer_selected = None;
+            self.asset_viewer_detail_path = None;
+            self.asset_viewer_shader_name = None;
+            self.clear_asset_preview_runtime();
+        }
+        self.ensure_asset_viewer_detail();
+
+        let body_height = ui.available_height().max(260.0);
+        let total_width = ui.available_width().max(1.0);
+        let gap = 8.0_f32;
+        // Give the selected asset more room than V3 while keeping enough grid
+        // width for several compact name cards.
+        let right_width = if total_width >= 900.0 {
+            (total_width * 0.40).clamp(440.0, 760.0)
+        } else {
+            (total_width * 0.42).max(280.0)
+        };
+        let left_width = (total_width - right_width - gap).max(280.0);
+        let alphabet_width = 22.0_f32;
+        let jump_letter = self.asset_viewer_jump_letter.take();
+        let jump_target = jump_letter.and_then(|letter| {
+            filtered
+                .iter()
+                .copied()
+                .find(|&index| asset_entry_letter(&self.asset_viewer_entries[index]) == Some(letter))
+        });
+        let mut center_letter = None;
+        let mut center_letter_distance = f32::MAX;
+        let mut selection_changed = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::RAIL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(8, 8))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (left_width - 16.0).max(1.0),
+                                (body_height - 16.0).max(1.0),
+                            ));
+                            theme::section(
+                                ui,
+                                "ASSETS",
+                                &format!("{} shown / {} total", filtered.len(), self.asset_viewer_entries.len()),
+                            );
+                            ui.add_space(4.0);
+
+                            let browser_height = ui.available_height().max(1.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+
+                                // A-Z lives inside the grid's left edge. It is a
+                                // thin navigator, not its own panel.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(alphabet_width, browser_height),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        let letter_height = (browser_height / 26.0).max(1.0);
+                                        for byte in b'A'..=b'Z' {
+                                            let ch = byte as char;
+                                            let active = self.asset_viewer_letter == Some(ch);
+                                            let (rect, response) = ui.allocate_exact_size(
+                                                egui::vec2(alphabet_width, letter_height),
+                                                egui::Sense::click(),
+                                            );
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                ch.to_string(),
+                                                egui::FontId::monospace(if active { 11.0 } else { 9.5 }),
+                                                if active {
+                                                    theme::ACCENT
+                                                } else if response.hovered() {
+                                                    theme::TEXT_DIM
+                                                } else {
+                                                    theme::TEXT_FAINT
+                                                },
+                                            );
+                                            if active {
+                                                ui.painter().rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        egui::pos2(rect.left(), rect.center().y - 7.0),
+                                                        egui::vec2(2.0, 14.0),
+                                                    ),
+                                                    egui::CornerRadius::ZERO,
+                                                    theme::ACCENT,
+                                                );
+                                            }
+                                            if response.clicked() {
+                                                self.asset_viewer_letter = Some(ch);
+                                                self.asset_viewer_jump_letter = Some(ch);
+                                                self.egui_repaint_requested = true;
+                                            }
+                                        }
+                                    },
+                                );
+
+                                let grid_width = ui.available_width().max(1.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(grid_width, browser_height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("asset_viewer_grid")
+                                            .auto_shrink([false, false])
+                                            .max_height(browser_height)
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(grid_width);
+                                                let available = ui.available_width().max(1.0);
+                                                let card_gap = 6.0_f32;
+                                                let desired_card = 150.0_f32;
+                                                let columns = (((available + card_gap)
+                                                    / (desired_card + card_gap))
+                                                    .floor() as usize)
+                                                    .max(1);
+                                                let card_width = ((available
+                                                    - card_gap * (columns.saturating_sub(1) as f32))
+                                                    / columns as f32)
+                                                    .max(105.0);
+                                                let card_height = 38.0_f32;
+                                                let clip = ui.clip_rect();
+                                                let clip_center = clip.center();
+
+                                                for row in filtered.chunks(columns) {
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = card_gap;
+                                                        for &index in row {
+                                                            let entry = self.asset_viewer_entries[index].clone();
+                                                            let selected = self.asset_viewer_selected.as_deref()
+                                                                == Some(entry.id.as_str());
+                                                            let (rect, response) = ui.allocate_exact_size(
+                                                                egui::vec2(card_width, card_height),
+                                                                egui::Sense::click(),
+                                                            );
+                                                            let fill = if selected {
+                                                                theme::CONTROL_SELECTED
+                                                            } else if response.hovered() {
+                                                                theme::CONTROL
+                                                            } else {
+                                                                theme::PANEL_FILL
+                                                            };
+                                                            let card_painter =
+                                                                ui.painter().with_clip_rect(rect.shrink(1.0));
+                                                            card_painter.rect_filled(
+                                                                rect,
+                                                                egui::CornerRadius::same(2),
+                                                                fill,
+                                                            );
+                                                            card_painter.rect_stroke(
+                                                                rect,
+                                                                egui::CornerRadius::same(2),
+                                                                egui::Stroke::new(
+                                                                    1.0_f32,
+                                                                    if selected { theme::ACCENT } else { theme::LINE },
+                                                                ),
+                                                                egui::StrokeKind::Inside,
+                                                            );
+                                                            card_painter.text(
+                                                                rect.left_center() + egui::vec2(8.0, -2.0),
+                                                                egui::Align2::LEFT_CENTER,
+                                                                &entry.display_name,
+                                                                egui::FontId::monospace(10.5),
+                                                                theme::TEXT,
+                                                            );
+                                                            card_painter.text(
+                                                                rect.right_bottom() + egui::vec2(-6.0, -4.0),
+                                                                egui::Align2::RIGHT_BOTTOM,
+                                                                entry.kind.label(),
+                                                                egui::FontId::monospace(7.5),
+                                                                if selected { theme::ACCENT } else { theme::TEXT_FAINT },
+                                                            );
+
+                                                            let hover = entry.shader_name.as_ref().map_or_else(
+                                                                || entry.qpath.clone(),
+                                                                |shader| format!("{shader}\n{}", entry.qpath),
+                                                            );
+                                                            let response = response.on_hover_text(hover);
+
+                                                            // Track the asset nearest the physical center
+                                                            // of the visible grid, not the first visible row.
+                                                            if rect.intersects(clip) {
+                                                                if let Some(letter) = asset_entry_letter(&entry) {
+                                                                    let delta = rect.center() - clip_center;
+                                                                    let distance = delta.x * delta.x + delta.y * delta.y;
+                                                                    if distance < center_letter_distance {
+                                                                        center_letter_distance = distance;
+                                                                        center_letter = Some(letter);
+                                                                    }
+                                                                }
+                                                            }
+                                                            if jump_target == Some(index) {
+                                                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                                            }
+                                                            if response.clicked() && !selected {
+                                                                self.asset_viewer_selected = Some(entry.id.clone());
+                                                                self.asset_viewer_detail_path = None;
+                                                                self.asset_viewer_shader_name = None;
+                                                                self.clear_asset_preview_runtime();
+                                                                selection_changed = true;
+                                                                self.egui_repaint_requested = true;
+                                                            }
+                                                        }
+                                                    });
+                                                    ui.add_space(card_gap);
+                                                }
+                                            });
+                                    },
+                                );
+                            });
+                        });
+                },
+            );
+
+            if jump_target.is_none() {
+                if let Some(letter) = center_letter {
+                    self.asset_viewer_letter = Some(letter);
+                }
+            } else if let Some(letter) = jump_letter {
+                self.asset_viewer_letter = Some(letter);
+            }
+
+            if selection_changed {
+                self.ensure_asset_viewer_detail();
+            }
+
+            ui.add_space(gap);
+            let detail_snapshot = self
+                .asset_viewer_detail
+                .as_ref()
+                .and_then(|detail| detail.as_ref().ok())
+                .cloned();
+            let detail_error = self
+                .asset_viewer_detail
+                .as_ref()
+                .and_then(|detail| detail.as_ref().err())
+                .cloned();
+
+            ui.vertical(|ui| {
+                ui.set_width(right_width);
+                ui.set_height(body_height);
+                let preview_height = (body_height * 0.62).clamp(260.0, 650.0);
+                let (preview_rect, preview_response) = ui.allocate_exact_size(
+                    egui::vec2(right_width, preview_height),
+                    egui::Sense::click_and_drag(),
+                );
+                // Deliberately no filled egui panel here: the WGPU preview is
+                // rendered only inside this physical viewport, so it is never
+                // darkened by translucent menu chrome.
+                ui.painter().rect_stroke(
+                    preview_rect,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(1.0_f32, theme::LINE),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    preview_rect.left_top() + egui::vec2(10.0, 9.0),
+                    egui::Align2::LEFT_TOP,
+                    match detail_snapshot.as_ref().map(|detail| detail.kind) {
+                        Some(AssetKind::Md3) | Some(AssetKind::Glm) => "MODEL PREVIEW",
+                        Some(AssetKind::Efx) => "EFX PREVIEW · LOOPING",
+                        Some(AssetKind::Shader) => "SHADER PREVIEW",
+                        None => "PREVIEW",
+                    },
+                    egui::FontId::proportional(10.5),
+                    theme::TEXT_FAINT,
+                );
+                self.set_asset_preview_viewport(preview_rect.shrink(1.0), ui.ctx().pixels_per_point());
+
+                let mut preview_changed = false;
+                if detail_snapshot.as_ref().is_some_and(|detail| detail.kind.is_model()) && preview_response.dragged() {
+                    let delta = ui.input(|input| input.pointer.delta());
+                    if delta.x.abs() > f32::EPSILON {
+                        self.asset_viewer_model_yaw =
+                            (self.asset_viewer_model_yaw + delta.x * 0.45).rem_euclid(360.0);
+                        preview_changed = true;
+                    }
+                }
+                if preview_response.hovered() {
+                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                    if scroll.abs() > f32::EPSILON {
+                        self.asset_viewer_model_zoom =
+                            (self.asset_viewer_model_zoom * (-scroll * 0.0015).exp()).clamp(0.35, 5.0);
+                        preview_changed = true;
+                    }
+                }
+                if preview_changed {
+                    self.asset_preview_model_key = None;
+                    self.asset_preview_shader_key = None;
+                    self.asset_preview_fx = None;
+                    self.update_asset_preview_content();
+                    self.egui_repaint_requested = true;
+                }
+
+                ui.add_space(8.0);
+                let metadata_height = (body_height - preview_height - 8.0).max(100.0);
+                egui::Frame::new()
+                    .fill(theme::RAIL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::symmetric(10, 9))
+                    .show(ui, |ui| {
+                        ui.set_width((right_width - 20.0).max(1.0));
+                        ui.set_height((metadata_height - 18.0).max(1.0));
+                        egui::ScrollArea::vertical()
+                            .id_salt("asset_viewer_metadata")
+                            .auto_shrink([false, false])
+                            .max_height((metadata_height - 18.0).max(1.0))
+                            .show(ui, |ui| {
+                                match detail_snapshot.as_ref() {
+                                    Some(detail) => {
+                                        let detail_title = if detail.kind == AssetKind::Shader {
+                                            self.asset_viewer_shader_name
+                                                .as_deref()
+                                                .unwrap_or(detail.qpath.as_str())
+                                        } else {
+                                            detail.qpath.as_str()
+                                        };
+                                        theme::glow_label(ui, detail_title, 13.0, theme::TEXT);
+                                        if detail.kind == AssetKind::Shader {
+                                            theme::label(
+                                                ui,
+                                                theme::plain(&format!("File: {}", detail.qpath), 9.5, theme::TEXT_FAINT),
+                                            );
+                                        }
+                                        ui.add_space(4.0);
+                                        theme::label(
+                                            ui,
+                                            theme::plain(
+                                                &format!("{}  •  {}", detail.kind.label(), asset_size_label(detail.size_bytes)),
+                                                10.5,
+                                                theme::TEXT_DIM,
+                                            ),
+                                        );
+                                        theme::label(
+                                            ui,
+                                            theme::plain(&format!("Source: {}", detail.source), 9.5, theme::TEXT_FAINT),
+                                        );
+                                        ui.add_space(8.0);
+                                        for (name, value) in &detail.stats {
+                                            ui.horizontal(|ui| {
+                                                theme::label(ui, theme::plain(name, 10.5, theme::TEXT_FAINT));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    theme::label(ui, theme::plain(value, 10.5, theme::TEXT));
+                                                });
+                                            });
+                                        }
+
+                                        if detail.kind.is_model() {
+                                            ui.add_space(7.0);
+                                            ui.horizontal(|ui| {
+                                                theme::label(ui, theme::plain("Yaw", 10.5, theme::TEXT_FAINT));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut self.asset_viewer_model_yaw, 0.0..=360.0).show_value(false))
+                                                    .changed()
+                                                {
+                                                    self.asset_preview_model_key = None;
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                theme::label(ui, theme::plain("Zoom", 10.5, theme::TEXT_FAINT));
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(&mut self.asset_viewer_model_zoom, 0.35..=5.0)
+                                                            .logarithmic(true)
+                                                            .show_value(false),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    self.asset_preview_model_key = None;
+                                                }
+                                            });
+                                            self.update_asset_preview_content();
+                                        } else {
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                theme::label(ui, theme::plain("Zoom", 10.5, theme::TEXT_FAINT));
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(&mut self.asset_viewer_model_zoom, 0.35..=5.0)
+                                                            .logarithmic(true)
+                                                            .show_value(false),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    self.asset_preview_shader_key = None;
+                                                    self.asset_preview_fx = None;
+                                                    self.update_asset_preview_content();
+                                                }
+                                            });
+                                        }
+
+                                        ui.add_space(8.0);
+                                        theme::section(
+                                            ui,
+                                            match detail.kind {
+                                                AssetKind::Shader => "STAGES",
+                                                kind if kind.is_model() => "SURFACES",
+                                                _ => "PRIMITIVES",
+                                            },
+                                            &format!("{}", detail.items.len()),
+                                        );
+                                        for item in &detail.items {
+                                            ui.label(
+                                                egui::RichText::new(item)
+                                                    .monospace()
+                                                    .size(9.5)
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+
+
+                                        if let Some(text) = &detail.raw_text {
+                                            ui.add_space(8.0);
+                                            ui.collapsing("SOURCE", |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(text)
+                                                        .monospace()
+                                                        .size(9.0)
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                            });
+                                        }
+                                    }
+                                    None if detail_error.is_some() => {
+                                        theme::banner(
+                                            ui,
+                                            detail_error.as_deref().unwrap_or("Asset inspection failed"),
+                                            theme::WARNING,
+                                        );
+                                    }
+                                    None => {
+                                        theme::label(ui, theme::plain("No asset selected.", 11.5, theme::TEXT_FAINT));
+                                    }
+                                }
+                            });
+                    });
+            });
+        });
+
+        // EFX needs to advance every frontend frame even when no UI control is
+        // moving; model/shader paths cheaply return when their cache key matches.
+        self.update_asset_preview_content();
+    }
+
+    fn ensure_source_map_catalog(&mut self) {
+        if self.source_map_catalog_loaded {
+            return;
+        }
+        self.source_map_catalog_loaded = true;
+        self.source_maps.clear();
+        self.source_map_catalog_error = None;
+        match frontend::scan_source_maps(&self.base, self.game.as_deref()) {
+            Ok(maps) => self.source_maps = maps,
+            Err(error) => {
+                eprintln!("Could not build Map Viewer catalog: {error}");
+                self.source_map_catalog_error = Some(error);
+            }
+        }
+        self.source_map_selected = self.source_map_selected.min(self.source_maps.len().saturating_sub(1));
+        self.source_map_levelshot_texture = None;
+        self.source_map_levelshot_texture_map = None;
+    }
+
+    fn ensure_source_map_levelshot_texture(&mut self, ctx: &egui::Context) {
+        let Some(entry) = self.source_maps.get(self.source_map_selected) else {
+            self.source_map_levelshot_texture = None;
+            self.source_map_levelshot_texture_map = None;
+            return;
+        };
+        let map_name = entry.map_name.clone();
+        if self.source_map_levelshot_texture_map.as_deref() == Some(map_name.as_str()) {
+            return;
+        }
+        self.source_map_levelshot_texture = None;
+        self.source_map_levelshot_texture_map = Some(map_name.clone());
+        let Some(bytes) = self.source_maps.get(self.source_map_selected).and_then(|entry| entry.levelshot.as_ref()) else {
+            return;
+        };
+        match image::load_from_memory_with_format(&bytes.bytes, bytes.format) {
+            Ok(image) => {
+                let rgba = image.into_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.source_map_levelshot_texture = Some(ctx.load_texture(
+                    format!("source-levelshot:{map_name}"),
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            Err(error) => eprintln!("Source map levelshot {map_name} decode failed: {error}"),
+        }
+    }
+
+    fn egui_map_viewer_page(&mut self, ui: &mut egui::Ui) {
+        theme::page_title(ui, "MAP VIEWER", "Source .map files discovered from the active VFS; launch uses the existing direct .map path.");
+        self.ensure_source_map_catalog();
+        if let Some(error) = &self.source_map_catalog_error {
+            theme::banner(ui, &format!("Source map scan failed: {error}"), theme::WARNING);
+            return;
+        }
+        if self.source_maps.is_empty() {
+            theme::banner(ui, "No maps/*.map assets were found.", theme::WARNING);
+            return;
+        }
+        self.source_map_selected = self.source_map_selected.min(self.source_maps.len() - 1);
+        self.ensure_source_map_levelshot_texture(ui.ctx());
+        let mut selected = self.source_map_selected;
+        let selected_name = self.source_maps[selected].map_name.clone();
+        let browser_height = ui.available_height().max(1.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(390.0, browser_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    theme::section(ui, "SOURCE MAPS", &format!("{} found", self.source_maps.len()));
+                    egui::ScrollArea::vertical()
+                        .id_salt("jka_source_map_list")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height().max(1.0))
+                        .show(ui, |ui| {
+                            for (index, entry) in self.source_maps.iter().enumerate() {
+                                if rail_item(ui, &entry.map_name, index == selected).clicked() {
+                                    selected = index;
+                                }
+                            }
+                        });
+                },
+            );
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(14.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), browser_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    theme::section(ui, "SELECTED SOURCE MAP", "");
+                    theme::glow_label(ui, &format!("maps/{selected_name}.map"), 18.0, theme::TEXT);
+                    ui.add_space(10.0);
+                    let preview_w = ui.available_width().max(1.0);
+                    let preview_box = egui::vec2(preview_w, 360.0);
+                    if let Some(texture) = &self.source_map_levelshot_texture {
+                        let source = texture.size_vec2();
+                        let scale = (preview_box.x / source.x.max(1.0)).min(preview_box.y / source.y.max(1.0));
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
+                    } else {
+                        let placeholder = egui::vec2(preview_w, (preview_w * 0.5).min(360.0));
+                        let (rect, _) = ui.allocate_exact_size(placeholder, egui::Sense::hover());
+                        ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL);
+                        ui.painter().rect_stroke(rect, egui::CornerRadius::ZERO, egui::Stroke::new(1.0_f32, theme::LINE), egui::StrokeKind::Inside);
+                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "NO LEVELSHOT", egui::FontId::proportional(13.0), theme::TEXT_DISABLED);
+                    }
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "LOAD SOURCE MAP").clicked() {
+                            self.source_map_edit_on_load = false;
+                            self.render_command(RenderCommand::SetAssetPreviewMode(false));
+                            self.request_map(scene::MapSource::Map(selected_name.clone()));
+                        }
+                        if theme::ghost_button(ui, "EDIT SOURCE MAP").clicked() {
+                            self.source_map_edit_on_load = true;
+                            self.render_command(RenderCommand::SetAssetPreviewMode(false));
+                            self.request_map(scene::MapSource::Map(selected_name.clone()));
+                        }
+                    });
+                },
+            );
+        });
+        if selected != self.source_map_selected {
+            self.source_map_selected = selected;
+            self.source_map_levelshot_texture = None;
+            self.source_map_levelshot_texture_map = None;
+            self.egui_repaint_requested = true;
         }
     }
 
@@ -1474,6 +2840,51 @@ impl App {
         }
     }
 
+    fn poll_demo_metadata_jobs(&mut self) {
+        while let Ok(done) = self.demo_metadata_rx.try_recv() {
+            if done.generation != self.demo_metadata_generation {
+                continue;
+            }
+            self.demo_metadata_inflight.remove(&done.demo_name);
+            match done.result {
+                Ok(metadata) => {
+                    self.demo_metadata_errors.remove(&done.demo_name);
+                    self.demo_metadata_cache.insert(done.demo_name, metadata);
+                }
+                Err(error) => {
+                    self.demo_metadata_errors.insert(done.demo_name, error);
+                }
+            }
+            self.egui_repaint_requested = true;
+        }
+    }
+
+    fn ensure_demo_metadata(&mut self, demo_name: &str) {
+        self.poll_demo_metadata_jobs();
+        if self.demo_metadata_cache.contains_key(demo_name)
+            || self.demo_metadata_errors.contains_key(demo_name)
+            || self.demo_metadata_inflight.contains(demo_name)
+        {
+            return;
+        }
+
+        let demo_name = demo_name.to_owned();
+        self.demo_metadata_inflight.insert(demo_name.clone());
+        let base = self.base.clone();
+        let game = self.game.clone();
+        let tx = self.demo_metadata_tx.clone();
+        let generation = self.demo_metadata_generation;
+        let worker_demo_name = demo_name.clone();
+        let thread_name = format!("demo-meta:{}", demo_name.chars().take(24).collect::<String>());
+        if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+            let result = frontend::index_demo_metadata(&base, game.as_deref(), &worker_demo_name);
+            let _ = tx.send(DemoMetadataResult { generation, demo_name: worker_demo_name, result });
+        }) {
+            self.demo_metadata_inflight.remove(&demo_name);
+            self.demo_metadata_errors.insert(demo_name, format!("metadata worker: {error}"));
+        }
+    }
+
     fn ensure_demo_catalog(&mut self) {
         if self.demo_catalog_loaded {
             return;
@@ -1492,6 +2903,273 @@ impl App {
         self.demo_selected = self
             .demo_selected
             .min(self.demo_entries.len().saturating_sub(1));
+    }
+
+    fn format_demo_time(ms: i32) -> String {
+        let total_seconds = ms.max(0) / 1000;
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        let seconds = total_seconds % 60;
+        if hours > 0 {
+            format!("{hours}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{minutes}:{seconds:02}")
+        }
+    }
+
+    fn demo_gametype_name(gametype: i32) -> &'static str {
+        match gametype {
+            0 => "FFA",
+            1 => "Holocron",
+            2 => "Jedi Master",
+            3 => "Duel",
+            4 => "Power Duel",
+            5 => "Single Player",
+            6 => "Team FFA",
+            7 => "Siege",
+            8 => "CTF",
+            9 => "CTY",
+            _ => "Unknown",
+        }
+    }
+
+    fn demo_team_summary(teams: &[i32]) -> String {
+        teams
+            .iter()
+            .map(|team| match team {
+                1 => "red",
+                2 => "blue",
+                3 => "spectator",
+                _ => "free",
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn render_demo_metadata(
+        ui: &mut egui::Ui,
+        metadata: &DemoMetadata,
+        console_filter: &mut DemoConsoleFilter,
+        launch_seek_ms: &mut Option<i32>,
+    ) {
+        let size_mb = metadata.size_bytes as f64 / (1024.0 * 1024.0);
+        let source = Path::new(&metadata.source)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&metadata.source);
+        let pov = match (&metadata.recorded_player_name, metadata.recorded_client_num) {
+            (Some(name), Some(client)) => format!("{name}  (client {client})"),
+            (Some(name), None) => name.clone(),
+            (None, Some(client)) => format!("client {client}"),
+            (None, None) => "unknown".to_owned(),
+        };
+
+        egui::Grid::new("demo_metadata_summary")
+            .num_columns(4)
+            .spacing(egui::vec2(16.0, 4.0))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("DURATION").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(Self::format_demo_time(metadata.duration_ms));
+                ui.label(egui::RichText::new("SIZE").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(format!("{size_mb:.1} MB"));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("MOD").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(&metadata.fs_game);
+                ui.label(egui::RichText::new("PROTOCOL").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(metadata.protocol.to_string());
+                ui.end_row();
+
+                ui.label(egui::RichText::new("GAME TYPE").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(Self::demo_gametype_name(metadata.gametype));
+                ui.label(egui::RichText::new("SERVER").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(metadata.server_name.as_deref().unwrap_or("unknown"));
+                ui.end_row();
+
+                ui.label(egui::RichText::new("SNAPSHOTS").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(format!("{}  ({:.1}/s)", metadata.snapshot_count, metadata.average_snapshot_rate));
+                ui.label(egui::RichText::new("KILLS").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(metadata.kill_count.to_string());
+                ui.end_row();
+
+                ui.label(egui::RichText::new("RECORDED POV").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(pov);
+                ui.label(egui::RichText::new("SOURCE").color(theme::TEXT_DISABLED).size(11.0));
+                ui.label(source);
+                ui.end_row();
+            });
+
+        ui.add_space(12.0);
+        theme::section(ui, "MAPS", &format!("{} used", metadata.maps.len()));
+        for map in &metadata.maps {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&map.map_name).color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.monospace(Self::format_demo_time(map.duration_ms));
+                });
+            });
+        }
+
+        ui.add_space(10.0);
+        theme::section(ui, "PLAYERS", &format!("{} identities · roster presence", metadata.players.len()));
+        egui::ScrollArea::vertical()
+            .id_salt("demo_metadata_players")
+            .max_height(150.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for player in &metadata.players {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(&player.name).color(theme::TEXT));
+                            let teams = Self::demo_team_summary(&player.teams);
+                            let detail = if player.model.is_empty() {
+                                teams
+                            } else if teams.is_empty() {
+                                player.model.clone()
+                            } else {
+                                format!("{} · {}", player.model, teams)
+                            };
+                            ui.label(egui::RichText::new(detail).color(theme::TEXT_DISABLED).size(10.0));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(Self::format_demo_time(player.duration_ms));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}–{}",
+                                    Self::format_demo_time(player.first_seen_ms),
+                                    Self::format_demo_time(player.last_seen_ms)
+                                ))
+                                .color(theme::TEXT_DISABLED)
+                                .size(10.0),
+                            );
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+
+        ui.add_space(10.0);
+        theme::section(ui, "ROUNDS", &format!("{} detected", metadata.rounds.len()));
+        for round in &metadata.rounds {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(format!("ROUND {}", round.index)).color(theme::ACCENT));
+                ui.monospace(format!(
+                    "{} +{}",
+                    Self::format_demo_time(round.start_ms),
+                    Self::format_demo_time(round.duration_ms)
+                ));
+                ui.label(format!("{} kills · {} players", round.kills, round.players));
+                if let Some([red, blue]) = round.team_scores.filter(|score| score[0] != 0 || score[1] != 0) {
+                    ui.label(format!("red {red} – blue {blue}"));
+                } else if let Some((name, score)) = &round.leader {
+                    ui.label(format!("leader {name} {score}"));
+                }
+                if metadata.maps.len() > 1 {
+                    ui.label(egui::RichText::new(&round.map_name).color(theme::TEXT_DISABLED));
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        theme::section(ui, "DUELS", &format!("{} detected", metadata.duels.len()));
+        if metadata.duels.is_empty() {
+            ui.label(egui::RichText::new("No duel rounds visible in this recording.").color(theme::TEXT_DISABLED));
+        } else {
+            let mut records = BTreeMap::<String, [usize; 3]>::new(); // W / L / unknown-draw
+            for duel in &metadata.duels {
+                for player in &duel.players {
+                    let record = records.entry(player.clone()).or_default();
+                    match duel.winner.as_deref() {
+                        Some(winner) if winner == player => record[0] += 1,
+                        Some(_) => record[1] += 1,
+                        None => record[2] += 1,
+                    }
+                }
+            }
+            if !records.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("OVERVIEW").color(theme::TEXT_DISABLED).size(10.0));
+                    for (player, [wins, losses, unknown]) in records {
+                        let suffix = if unknown == 0 {
+                            format!("{wins}-{losses}")
+                        } else {
+                            format!("{wins}-{losses} (+{unknown} unresolved)")
+                        };
+                        ui.label(format!("{player} {suffix}"));
+                    }
+                });
+            }
+            for duel in &metadata.duels {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("DUEL {}", duel.index)).color(theme::ACCENT));
+                    ui.label(egui::RichText::new(duel.kind.label()).color(theme::TEXT_DISABLED).size(10.0));
+                    ui.monospace(format!(
+                        "{} +{}",
+                        Self::format_demo_time(duel.start_ms),
+                        Self::format_demo_time(duel.duration_ms)
+                    ));
+                    if !duel.players.is_empty() {
+                        ui.label(duel.players.join(" vs "));
+                    }
+                    if let Some(winner) = &duel.winner {
+                        ui.label(format!("winner {winner}"));
+                    }
+                    if !duel.scores.is_empty() {
+                        let scores = duel.scores.iter()
+                            .map(|(name, score)| format!("{name} {score}"))
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        ui.label(egui::RichText::new(scores).color(theme::TEXT_DISABLED).size(10.0));
+                    }
+                });
+            }
+            if metadata.duels.iter().any(|duel| matches!(duel.kind, frontend::DemoDuelKind::PrivatePov)) {
+                ui.label(egui::RichText::new("PRIVATE (POV) duels are limited to duels exposed by the recorded player's playerState.")
+                    .color(theme::TEXT_DISABLED).size(10.0));
+            }
+        }
+
+        ui.add_space(10.0);
+        theme::section(ui, "CONSOLE", &format!("{} messages", metadata.console.len()));
+        ui.horizontal(|ui| {
+            for (label, filter) in [
+                ("ALL", DemoConsoleFilter::All),
+                ("PRINT", DemoConsoleFilter::Print),
+                ("CHAT", DemoConsoleFilter::Chat),
+                ("CENTER", DemoConsoleFilter::CenterPrint),
+                ("EVENTS", DemoConsoleFilter::Event),
+            ] {
+                if ui.selectable_label(*console_filter == filter, label).clicked() {
+                    *console_filter = filter;
+                }
+            }
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("demo_metadata_console")
+            .max_height(190.0)
+            .stick_to_bottom(false)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for entry in metadata.console.iter().filter(|entry| (*console_filter).matches(&entry.kind)) {
+                    let row = ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(Self::format_demo_time(entry.elapsed_ms))
+                                .color(theme::TEXT_DISABLED)
+                                .monospace(),
+                        );
+                        ui.label(
+                            egui::RichText::new(entry.kind.label())
+                                .color(theme::ACCENT)
+                                .size(10.0),
+                        );
+                        ui.label(&entry.text);
+                    });
+                    if row.response.double_clicked() {
+                        *launch_seek_ms = Some(entry.elapsed_ms);
+                    }
+                    row.response.on_hover_text("Double-click to play this demo from here");
+                }
+            });
     }
 
     fn egui_play_demo_page(&mut self, ui: &mut egui::Ui) {
@@ -1515,8 +3193,10 @@ impl App {
         self.demo_selected = self.demo_selected.min(self.demo_entries.len() - 1);
         let mut selected = self.demo_selected;
         let selected_name = self.demo_entries[selected].demo_name.clone();
+        self.ensure_demo_metadata(&selected_name);
 
         let browser_height = ui.available_height().max(1.0);
+        let mut console_seek_request = None;
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(330.0, browser_height),
@@ -1551,31 +3231,41 @@ impl App {
                     theme::glow_label(ui, &selected_name, 18.0, theme::TEXT);
                     ui.add_space(10.0);
 
-                    let placeholder_height = (ui.available_height() - 56.0)
-                        .clamp(180.0, 360.0);
-                    let placeholder_size = egui::vec2(
-                        ui.available_width().max(1.0),
-                        placeholder_height,
-                    );
-                    let (rect, _) = ui.allocate_exact_size(placeholder_size, egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        theme::CONTROL,
-                    );
-                    ui.painter().rect_stroke(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0_f32, theme::LINE),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "[PLACEHOLDER]",
-                        egui::FontId::proportional(16.0),
-                        theme::TEXT_DISABLED,
-                    );
+                    let inspector_height = (ui.available_height() - 56.0).max(180.0);
+                    egui::Frame::new()
+                        .fill(theme::CONTROL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_min_height(inspector_height);
+                            if let Some(metadata) = self.demo_metadata_cache.get(&selected_name) {
+                                let mut filter = self.demo_console_filter;
+                                egui::ScrollArea::vertical()
+                                    .id_salt("demo_metadata_inspector")
+                                    .max_height(inspector_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        Self::render_demo_metadata(
+                                            ui,
+                                            metadata,
+                                            &mut filter,
+                                            &mut console_seek_request,
+                                        );
+                                    });
+                                self.demo_console_filter = filter;
+                            } else if let Some(error) = self.demo_metadata_errors.get(&selected_name) {
+                                theme::banner(ui, &format!("Metadata scan failed: {error}"), theme::WARNING);
+                            } else {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space((inspector_height * 0.35).max(20.0));
+                                    ui.spinner();
+                                    ui.label(
+                                        egui::RichText::new("INDEXING SELECTED DEMO…")
+                                            .color(theme::TEXT_DISABLED),
+                                    );
+                                });
+                            }
+                        });
 
                     ui.add_space(14.0);
                     if theme::primary_button(ui, "PLAY DEMO").clicked() {
@@ -1588,6 +3278,9 @@ impl App {
         if selected != self.demo_selected {
             self.demo_selected = selected;
             self.egui_repaint_requested = true;
+        }
+        if let Some(elapsed_ms) = console_seek_request {
+            self.play_selected_demo_at(elapsed_ms);
         }
     }
 
@@ -1823,16 +3516,7 @@ impl App {
                 SETUP_TAB_VIDEO => self.egui_video_page(ui),
                 SETUP_TAB_INPUT => self.egui_input_page(ui),
                 SETUP_TAB_AUDIO => self.egui_audio_page(ui),
-                4 => placeholder(
-                    ui,
-                    "NETWORK",
-                    "Connection, download and snapshot options.",
-                    &[
-                        "Rate and snapshot frequency",
-                        "Automatic downloads",
-                        "Packet duplication and lag compensation",
-                    ],
-                ),
+                SETUP_TAB_NETWORK => self.egui_network_page(ui),
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
                 _ => unreachable!("setup tab index is bounded by SETUP_TABS"),
             }
@@ -1872,11 +3556,20 @@ impl App {
     // -------------------------------------------------------------- pages --
 
     fn egui_resume_page(&mut self, ui: &mut egui::Ui) {
+        if self.map_editor.is_some() {
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "EDIT SOURCE MAP").clicked() {
+                    self.set_overlay(OverlayMode::MapEdit);
+                }
+                theme::label(ui, theme::plain("Loose .map brush editing is available for this world.", 10.5, theme::TEXT_FAINT));
+            });
+            ui.add_space(12.0);
+        }
         let demo_rate = self
             .game_session
             .as_ref()
             .and_then(GameSession::playback_rate);
-        let mode = match self.local_player.as_ref().map(|player| player.mode) {
+        let mode = match self.local_server.as_ref().map(|server| server.mode()) {
             Some(JoinMode::Player) => "Playing",
             _ => "Spectating",
         };
@@ -1902,9 +3595,9 @@ impl App {
 
         let can_join = self.live_connected()
             || self
-                .local_player
+                .local_server
                 .as_ref()
-                .is_some_and(LocalPlayer::can_join);
+                .is_some_and(|server| server.can_join());
 
         theme::section(ui, "SESSION", "");
         let return_label = if demo_rate.is_some() { "Return to demo" } else { "Return to game" };
@@ -1974,11 +3667,13 @@ impl App {
         let Some(spawn) = self.spawns.get(self.spawn_index).copied() else {
             return;
         };
-        let Some(player) = &mut self.local_player else {
-            return;
+        let result = match self.local_server.as_mut() {
+            Some(server) => server.join(mode, spawn),
+            None => return,
         };
-        match player.join(mode, spawn) {
+        match result {
             Ok(()) => {
+                self.push_local_snapshot(true);
                 self.third_person_camera.reset();
                 self.update_solo_player_view_and_presentation();
                 self.set_overlay(OverlayMode::None);
@@ -2118,10 +3813,53 @@ impl App {
         );
     }
 
+    fn egui_network_page(&mut self, ui: &mut egui::Ui) {
+        theme::page_title(ui, "NETWORK", "Connection, packet pacing and map/package autodownload policy.");
+
+        theme::section(
+            ui,
+            "AUTOMATIC DOWNLOADS",
+            "When a server's map is missing, DinurdoJK asks before downloading. HTTP takes priority when the server advertises it; legacy JKA download is the fallback.",
+        );
+        theme::row(
+            ui,
+            "HTTP downloads",
+            "cl_allowHttpDownload. Allow PK3 downloads from TaystJK-compatible mvhttp/mvhttpurl endpoints. Preferred over legacy UDP when available.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.network.allow_http_downloads) {
+                    let _ = self.set_console_cvar("cl_allowHttpDownload", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Legacy server downloads",
+            "cl_allowDownload. Allow the stock Jedi Academy svc_download / nextdl transport. Used when HTTP is unavailable or an HTTP transfer fails.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.network.allow_legacy_downloads) {
+                    let _ = self.set_console_cvar("cl_allowDownload", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
+        theme::section(ui, "PACKET SETTINGS", "Existing JKA-compatible client networking controls.");
+        theme::row(ui, "Rate", "rate. Maximum bytes per second requested from the server.", theme::Reset::None, |ui| {
+            ui.label(format!("{} B/s", self.network.rate));
+        });
+        theme::row(ui, "Snapshots", "snaps. Snapshot frequency requested from the server.", theme::Reset::None, |ui| {
+            ui.label(format!("{} Hz", self.network.snaps));
+        });
+        theme::row(ui, "Max packets", "cl_maxpackets. Maximum client packets per second.", theme::Reset::None, |ui| {
+            ui.label(format!("{} Hz", self.network.max_packets));
+        });
+    }
+
     fn egui_audio_page(&mut self, ui: &mut egui::Ui) {
         theme::page_title(ui, "AUDIO", "OpenJK mixer levels, Steam Audio spatial acoustics and native output diagnostics.");
 
-        theme::section(ui, "MIX", "Changes are live and archived to jka-rust.cfg.");
+        theme::section(ui, "MIX", "Changes are live and archived to DinurdoJK.cfg.");
         macro_rules! audio_slider {
             ($label:literal, $tip:literal, $field:ident, $cvar:literal) => {
                 theme::row(ui, $label, $tip, theme::Reset::None, |ui| {
@@ -2179,6 +3917,31 @@ impl App {
             |ui| {
                 if let Some(enabled) = theme::switch(ui, self.audio.steam_audio) {
                     let _ = self.set_console_cvar("s_steamAudio", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Binaural HRTF",
+            "s_steamAudioBinaural. Uses Steam Audio HRTF rendering for positional sounds. This is a live setting and does not require a map reload.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_binaural) {
+                    let _ = self.set_console_cvar("s_steamAudioBinaural", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Environmental Acoustics",
+            "s_steamAudioEnvironmental. Live Steam Audio direct-path acoustics for positional world sounds: wall occlusion plus frequency-dependent material transmission. Simulation runs on a dedicated worker at a bounded rate; the audio callback only applies the latest result. No map reload or rebake is required once the map's Steam Audio scene is ready.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_environmental) {
+                    let _ = self.set_console_cvar(
+                        "s_steamAudioEnvironmental",
+                        if enabled { "1" } else { "0" },
+                    );
                 }
             },
         );
@@ -2283,21 +4046,51 @@ impl App {
             );
             theme::row(
                 ui,
-                "Steam Audio DSP",
-                "Audible HRTF/direct occlusion/transmission/reflection/path processing. This is intentionally reported separately from the feature gate and bake so 'On' never implies that Steam Audio is already changing the mix.",
+                "Direct environmental DSP",
+                "Live Steam Audio raycast occlusion and material transmission. Scene queries run on a dedicated worker at up to 30 Hz; the fixed-block audio DSP applies the latest coefficients.",
                 theme::Reset::None,
                 |ui| {
-                    theme::hint(
-                        ui,
-                        if info.steam_audio_dsp_active {
-                            "Active"
-                        } else if info.steam_audio_bake_ready {
-                            "Pending · baked environment ready; legacy mixer still audible"
-                        } else {
-                            "Pending · legacy mixer currently audible"
-                        },
-                        if info.steam_audio_dsp_active { theme::TEXT } else { theme::TEXT_DIM },
-                    );
+                    let (state, color) = if !info.steam_audio_enabled {
+                        ("Disabled by Steam Audio master gate".to_owned(), theme::TEXT_FAINT)
+                    } else if !info.steam_audio_environmental_enabled {
+                        ("Off · direct sound unchanged".to_owned(), theme::TEXT_DIM)
+                    } else if let Some(error) = &info.steam_audio_environmental_error {
+                        (format!("Unavailable · {error}"), theme::WARNING)
+                    } else if info.steam_audio_environmental_active {
+                        (format!("Active · {} sources · {} updates · last {:.2} ms", info.steam_audio_environment_voice_count, info.steam_audio_environment_updates, info.steam_audio_environment_last_ms), theme::TEXT)
+                    } else if info.steam_audio_scene_triangles > 0 {
+                        ("Initializing direct simulator…".to_owned(), theme::TEXT_DIM)
+                    } else {
+                        ("Waiting for map acoustic scene".to_owned(), theme::TEXT_DIM)
+                    };
+                    theme::hint(ui, &state, color);
+                },
+            );
+            theme::row(
+                ui,
+                "Baked reflections / pathing DSP",
+                "Probe-baked reflections, reverb, and pathing are reported separately from live direct occlusion and transmission.",
+                theme::Reset::None,
+                |ui| {
+                    theme::hint(ui, if info.steam_audio_bake_ready { "Pending · baked probe data ready" } else { "Pending · waiting for acoustic bake" }, theme::TEXT_DIM);
+                },
+            );
+            theme::row(
+                ui,
+                "Binaural HRTF",
+                "Live Steam Audio headphone positioning for positional sound sources.",
+                theme::Reset::None,
+                |ui| {
+                    let state = if let Some(error) = &info.steam_audio_hrtf_error {
+                        format!("Unavailable · {error}")
+                    } else if info.steam_audio_binaural_active {
+                        format!("Active · {} positional voices", info.steam_audio_hrtf_voice_count)
+                    } else if info.steam_audio_binaural_enabled {
+                        "Requested · waiting for Steam Audio master gate".to_owned()
+                    } else {
+                        "Disabled".to_owned()
+                    };
+                    theme::hint(ui, &state, if info.steam_audio_binaural_active { theme::TEXT } else { theme::TEXT_DIM });
                 },
             );
         } else {
@@ -2460,6 +4253,30 @@ fn rail_group(ui: &mut egui::Ui, title: &str) {
         theme::LINE,
     );
     ui.add_space(4.0);
+}
+
+fn asset_size_label(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as usize)
+    }
+}
+
+fn asset_entry_letter(entry: &AssetEntry) -> Option<char> {
+    entry
+        .display_name
+        .chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .and_then(|c| {
+            let c = c.to_ascii_uppercase();
+            c.is_ascii_alphabetic().then_some(c)
+        })
 }
 
 fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {

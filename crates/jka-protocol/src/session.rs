@@ -18,7 +18,7 @@ use crate::{
         self, ClientMoves, ClientPacket, Netchan, UserCmd, MAX_PACKET_USERCMDS,
         MAX_RELIABLE_COMMANDS, MAX_STRING_CHARS,
     },
-    server::{Decoder, Event, ServerCommand, Snapshot},
+    server::{Decoder, DownloadBlock, Event, ServerCommand, Snapshot},
 };
 
 pub const RETRANSMIT_TIMEOUT: i32 = 3000;
@@ -66,6 +66,7 @@ pub enum SessionEvent {
     /// `full_snapshot` is true when this same message established a non-delta snapshot.
     DemoMessage { sequence: i32, payload: Vec<u8>, full_snapshot: bool },
     MapChange,
+    Download(DownloadBlock),
     Disconnected(String),
 }
 
@@ -86,6 +87,10 @@ pub struct ClientSession {
     /// Independent echo token for the public `getinfo` query.
     info_challenge: String,
     server_info_seen: bool,
+    /// Hold the challenge->connect transition until the owner has inspected
+    /// infoResponse (mapname/autodownload preflight).
+    connect_preflight_paused: bool,
+    preflight_wait_started: Option<i32>,
     connect_time: i32,
     connect_packet_count: i32,
     netchan: Option<Netchan>,
@@ -134,6 +139,16 @@ impl ClientSession {
     /// CL_Connect_f for a remote server. `client_challenge` is the random
     /// value OpenJK derives from rand()/Com_Milliseconds; `qport` is net_qport.
     pub fn connect(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32) -> Self {
+        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, false)
+    }
+
+    /// Same handshake, but pause before sending the gameplay `connect` packet
+    /// so the owner can inspect the speculative infoResponse first.
+    pub fn connect_preflight(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32) -> Self {
+        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, true)
+    }
+
+    fn connect_inner(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32, pause_preflight: bool) -> Self {
         let info_challenge = format!("{:08x}", client_challenge as u32);
         let mut session = Self {
             server,
@@ -143,6 +158,8 @@ impl ClientSession {
             challenge: client_challenge,
             info_challenge,
             server_info_seen: false,
+            connect_preflight_paused: pause_preflight,
+            preflight_wait_started: None,
             connect_time: -99999,
             connect_packet_count: 0,
             netchan: None,
@@ -196,6 +213,25 @@ impl ClientSession {
     pub fn reliable_sequence(&self) -> i32 { self.reliable_sequence }
     pub fn sv_pure(&self) -> bool { self.sv_pure }
     pub fn dropped_packets(&self) -> i32 { self.netchan.as_ref().map_or(0, |chan| chan.dropped) }
+    pub fn connect_preflight_paused(&self) -> bool { self.connect_preflight_paused }
+
+    pub fn resume_connect(&mut self, realtime: i32) {
+        if !self.connect_preflight_paused {
+            return;
+        }
+        self.connect_preflight_paused = false;
+        self.preflight_wait_started = None;
+        self.connect_time = -99999;
+        self.check_for_resend(realtime);
+    }
+
+    /// Flush a newly queued reliable command immediately. Downloads use this
+    /// for `download`, `nextdl`, `stopdl` and `donedl` acknowledgements.
+    pub fn write_packet_now(&mut self, realtime: i32) {
+        if self.state >= ConnectionState::Connected {
+            self.write_packet(realtime);
+        }
+    }
 
     /// cl.cmds[number & CMD_MASK] if it is still in the backup window.
     pub fn command(&self, number: i32) -> Option<UserCmd> {
@@ -253,6 +289,9 @@ impl ClientSession {
                 }
             }
             ConnectionState::Challenging => {
+                if self.connect_preflight_paused {
+                    return;
+                }
                 let mut info = self.userinfo.clone();
                 for (key, value) in [
                     ("protocol", crate::PROTOCOL_VERSION.to_string()),
@@ -272,6 +311,15 @@ impl ClientSession {
 
     /// Per-frame housekeeping: CL_CheckForResend and CL_CheckTimeout.
     pub fn frame(&mut self, realtime: i32, timeout_ms: i32) {
+        // Some legacy/proxied servers do not answer getinfo. Do not make them
+        // unjoinable: after a short preflight window, continue the normal JKA
+        // handshake. If infoResponse did arrive, the UI owns the decision and
+        // this timer deliberately does not bypass the missing-map prompt.
+        if self.connect_preflight_paused && !self.server_info_seen
+            && self.preflight_wait_started.is_some_and(|started| realtime - started >= 1500)
+        {
+            self.resume_connect(realtime);
+        }
         self.check_for_resend(realtime);
         if self.state >= ConnectionState::Connected && realtime - self.last_packet_time > timeout_ms {
             self.drop_connection("Server connection timed out.".into());
@@ -347,6 +395,9 @@ impl ClientSession {
                 // A proxy may hand the connection to another address.
                 self.server = from;
                 self.set_state(ConnectionState::Challenging);
+                if self.connect_preflight_paused && !self.server_info_seen {
+                    self.preflight_wait_started = Some(realtime);
+                }
                 self.check_for_resend(realtime);
             }
             b"connectresponse" => {
@@ -408,7 +459,7 @@ impl ClientSession {
                 }
                 Event::SetGame(_) => {}
                 Event::MapChange => self.events.push_back(SessionEvent::MapChange),
-                Event::Download => {}
+                Event::Download(block) => self.events.push_back(SessionEvent::Download(block)),
             }
             if self.state == ConnectionState::Disconnected {
                 return;
@@ -767,6 +818,17 @@ mod tests {
         session.send_commands(3300, 30);
         assert!(session.take_outgoing().is_empty());
         session.send_commands(4200, 30);
+        assert_eq!(session.take_outgoing().len(), 1);
+    }
+
+    #[test]
+    fn preflight_pauses_connect_packet_until_resumed() {
+        let mut session = ClientSession::connect_preflight(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        let _ = session.take_outgoing();
+        session.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345 777", 10);
+        assert_eq!(session.state(), ConnectionState::Challenging);
+        assert!(session.take_outgoing().is_empty());
+        session.resume_connect(20);
         assert_eq!(session.take_outgoing().len(), 1);
     }
 

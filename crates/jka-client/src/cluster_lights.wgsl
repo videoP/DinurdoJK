@@ -26,7 +26,9 @@ struct ClusterRecord {
 struct LightingSettings {
     values: vec4<u32>, // enabled, light count, viewport width, viewport height
     local_shadows: vec4<u32>, // enabled, shadowed count, cubemap size, reserved
-    feature_flags: vec4<u32>, // emissive area lights, voxel/probe GI, reserved, reserved
+    feature_flags: vec4<u32>, // area lights, voxel/probe GI, point cluster mode: 0 off / 1 full / 2 transient-only, reserved
+    map_ambient: vec4<f32>, // source-.map q3map2 ambient RGB; unused by compute/fog consumers
+    map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; unused by compute/fog consumers
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -117,8 +119,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var count = 0u;
     for (var light_index = 0u; light_index < light_count; light_index += 1u) {
         let light = lights[light_index];
-        if (settings.feature_flags.x == 0u && light.emitter.w > 0.5) {
-            continue;
+        let is_area = light.emitter.w > 0.5;
+        if (is_area) {
+            if (settings.feature_flags.x == 0u) {
+                continue;
+            }
+        } else {
+            let point_mode = settings.feature_flags.z;
+            if (point_mode == 0u) {
+                continue;
+            }
+            // Fast/clustered-lite keeps only runtime-authored transient lights.
+            if (point_mode == 2u && light.shadow.w < 0.5) {
+                continue;
+            }
         }
         let radius = light.position_radius.w;
         let distance_to_light = distance(camera.camera_pos_time.xyz, light.position_radius.xyz);

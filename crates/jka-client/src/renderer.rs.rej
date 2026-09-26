@@ -1,0 +1,173 @@
+diff a/crates/jka-client/src/renderer.rs b/crates/jka-client/src/renderer.rs	(rejected hunks)
+@@ -184,13 +184,16 @@ pub enum DynamicModelAlphaMode {
+     BlendUnlit,
+     /// GL_DST_COLOR GL_ZERO: multiplies what is already drawn (FX filters).
+     Modulate,
++    /// GL_ZERO GL_ONE_MINUS_SRC_COLOR: dark decals such as rivet/burn marks.
++    Darken,
+ }
+ 
+-const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 8] = [
++const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 9] = [
+     DynamicModelAlphaMode::Opaque,
+     DynamicModelAlphaMode::Mask,
+     DynamicModelAlphaMode::MaskBlend,
+     DynamicModelAlphaMode::Modulate,
++    DynamicModelAlphaMode::Darken,
+     DynamicModelAlphaMode::Blend,
+     DynamicModelAlphaMode::BlendUnlit,
+     DynamicModelAlphaMode::AdditiveOne,
+@@ -2532,6 +2535,7 @@ struct DynamicModelRenderer {
+     additive_pipeline: wgpu::RenderPipeline,
+     blend_unlit_pipeline: wgpu::RenderPipeline,
+     modulate_pipeline: wgpu::RenderPipeline,
++    darken_pipeline: wgpu::RenderPipeline,
+     skin_layout: wgpu::BindGroupLayout,
+     skin_pipeline_layout: wgpu::PipelineLayout,
+     skin_shader: wgpu::ShaderModule,
+@@ -2543,6 +2547,7 @@ struct DynamicModelRenderer {
+     skin_additive_pipeline: wgpu::RenderPipeline,
+     skin_blend_unlit_pipeline: wgpu::RenderPipeline,
+     skin_modulate_pipeline: wgpu::RenderPipeline,
++    skin_darken_pipeline: wgpu::RenderPipeline,
+     repeat_sampler: wgpu::Sampler,
+     clamp_sampler: wgpu::Sampler,
+     fallback_bind_group: wgpu::BindGroup,
+@@ -2714,6 +2719,7 @@ impl DynamicModelRenderer {
+         let additive_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+         let blend_unlit_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+         let modulate_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
++        let darken_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Darken);
+         let skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+         let skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+         let skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+@@ -2722,6 +2728,7 @@ impl DynamicModelRenderer {
+         let skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+         let skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+         let skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
++        let skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken);
+ 
+         Self {
+             texture_layout,
+@@ -2736,6 +2743,7 @@ impl DynamicModelRenderer {
+             additive_pipeline,
+             blend_unlit_pipeline,
+             modulate_pipeline,
++            darken_pipeline,
+             skin_layout,
+             skin_pipeline_layout,
+             skin_shader,
+@@ -2747,6 +2755,7 @@ impl DynamicModelRenderer {
+             skin_additive_pipeline,
+             skin_blend_unlit_pipeline,
+             skin_modulate_pipeline,
++            skin_darken_pipeline,
+             repeat_sampler,
+             clamp_sampler,
+             fallback_bind_group,
+@@ -2847,6 +2856,7 @@ impl DynamicModelRenderer {
+         self.additive_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+         self.blend_unlit_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+         self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
++        self.darken_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Darken);
+         self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque);
+         self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask);
+         self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend);
+@@ -2855,6 +2865,7 @@ impl DynamicModelRenderer {
+         self.skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive);
+         self.skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit);
+         self.skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate);
++        self.skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken);
+     }
+ 
+     fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required: u64) {
+@@ -3231,6 +3242,7 @@ impl DynamicModelRenderer {
+                     DynamicModelAlphaMode::Additive => &self.additive_pipeline,
+                     DynamicModelAlphaMode::BlendUnlit => &self.blend_unlit_pipeline,
+                     DynamicModelAlphaMode::Modulate => &self.modulate_pipeline,
++                    DynamicModelAlphaMode::Darken => &self.darken_pipeline,
+                 };
+                 pass.set_pipeline(pipeline);
+                 for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+@@ -3256,6 +3268,7 @@ impl DynamicModelRenderer {
+                     DynamicModelAlphaMode::Additive => &self.skin_additive_pipeline,
+                     DynamicModelAlphaMode::BlendUnlit => &self.skin_blend_unlit_pipeline,
+                     DynamicModelAlphaMode::Modulate => &self.skin_modulate_pipeline,
++                    DynamicModelAlphaMode::Darken => &self.skin_darken_pipeline,
+                 };
+                 pass.set_pipeline(pipeline);
+                 pass.set_bind_group(2, &self.skin_bind_group, &[]);
+@@ -21483,6 +21496,14 @@ fn create_dynamic_model_pipeline(
+             },
+             alpha: wgpu::BlendComponent::OVER,
+         }),
++        DynamicModelAlphaMode::Darken => Some(wgpu::BlendState {
++            color: wgpu::BlendComponent {
++                src_factor: wgpu::BlendFactor::Zero,
++                dst_factor: wgpu::BlendFactor::OneMinusSrc,
++                operation: wgpu::BlendOperation::Add,
++            },
++            alpha: wgpu::BlendComponent::OVER,
++        }),
+         _ => None,
+     };
+     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+@@ -21495,6 +21516,7 @@ fn create_dynamic_model_pipeline(
+             DynamicModelAlphaMode::Additive => "JKA dynamic model src-alpha additive unlit pipeline",
+             DynamicModelAlphaMode::BlendUnlit => "JKA dynamic model alpha-blend unlit pipeline",
+             DynamicModelAlphaMode::Modulate => "JKA dynamic model modulate unlit pipeline",
++            DynamicModelAlphaMode::Darken => "JKA dynamic model darken unlit pipeline",
+         }),
+         layout: Some(layout),
+         vertex: wgpu::VertexState {
+@@ -21534,7 +21556,8 @@ fn create_dynamic_model_pipeline(
+                 DynamicModelAlphaMode::AdditiveOne
+                 | DynamicModelAlphaMode::Additive
+                 | DynamicModelAlphaMode::BlendUnlit
+-                | DynamicModelAlphaMode::Modulate => "fs_unlit",
++                | DynamicModelAlphaMode::Modulate
++                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                 _ => "fs_main",
+             }),
+             compilation_options: Default::default(),
+@@ -21593,6 +21616,14 @@ fn create_ghoul2_skin_pipeline(
+             },
+             alpha: wgpu::BlendComponent::OVER,
+         }),
++        DynamicModelAlphaMode::Darken => Some(wgpu::BlendState {
++            color: wgpu::BlendComponent {
++                src_factor: wgpu::BlendFactor::Zero,
++                dst_factor: wgpu::BlendFactor::OneMinusSrc,
++                operation: wgpu::BlendOperation::Add,
++            },
++            alpha: wgpu::BlendComponent::OVER,
++        }),
+         _ => None,
+     };
+     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+@@ -21605,6 +21636,7 @@ fn create_ghoul2_skin_pipeline(
+             DynamicModelAlphaMode::Additive => "JKA Ghoul2 GPU skin src-alpha additive unlit pipeline",
+             DynamicModelAlphaMode::BlendUnlit => "JKA Ghoul2 GPU skin alpha-blend unlit pipeline",
+             DynamicModelAlphaMode::Modulate => "JKA Ghoul2 GPU skin modulate unlit pipeline",
++            DynamicModelAlphaMode::Darken => "JKA Ghoul2 GPU skin darken unlit pipeline",
+         }),
+         layout: Some(layout),
+         vertex: wgpu::VertexState {
+@@ -21644,7 +21676,8 @@ fn create_ghoul2_skin_pipeline(
+                 DynamicModelAlphaMode::AdditiveOne
+                 | DynamicModelAlphaMode::Additive
+                 | DynamicModelAlphaMode::BlendUnlit
+-                | DynamicModelAlphaMode::Modulate => "fs_unlit",
++                | DynamicModelAlphaMode::Modulate
++                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                 _ => "fs_main",
+             }),
+             compilation_options: Default::default(),
+@@ -24118,6 +24151,7 @@ mod shader_tests {
+         assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::Mask));
+         assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::AdditiveOne));
+         assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Additive));
++        assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Darken));
+ 
+         let phases: Vec<_> = [true, false]
+             .into_iter()

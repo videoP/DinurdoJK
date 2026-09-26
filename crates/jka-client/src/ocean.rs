@@ -16,6 +16,7 @@ use wgpu::util::DeviceExt;
 
 const G: f32 = 9.81;
 pub mod authoring;
+pub mod optics;
 pub use authoring::{OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
@@ -158,6 +159,7 @@ impl CascadeSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OceanSettings {
+    pub optics: optics::Settings,
     pub bounds: Option<OceanSurface>,
     pub authored: OceanAuthoring,
     pub wind: OceanWind,
@@ -176,6 +178,7 @@ pub struct OceanSettings {
 impl Default for OceanSettings {
     fn default() -> Self {
         Self {
+            optics: optics::Settings::default(),
             bounds: None,
             authored: OceanAuthoring::default(),
             wind: OceanWind::default(),
@@ -202,6 +205,7 @@ impl Default for OceanSettings {
 
 impl OceanSettings {
     pub fn sanitize(mut self) -> Self {
+        self.optics = self.optics.sanitize();
         self.authored = self.authored.sanitize();
         self.wind = self.wind.sanitize();
         self.map_size = match self.map_size {
@@ -349,6 +353,66 @@ fn jonswap_alpha(wind_speed: f32, fetch_m: f32) -> f32 {
 }
 fn jonswap_peak(wind_speed: f32, fetch_m: f32) -> f32 {
     22.0 * (G*G/(wind_speed*fetch_m)).powf(1.0/3.0)
+}
+
+fn create_spray_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+    render_layout: &wgpu::BindGroupLayout,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    let spray_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("GodotOceanWaves sea spray port"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("ocean_spray.wgsl").into()),
+    });
+    let spray_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Ocean sea spray pipeline layout"),
+        bind_group_layouts: &[Some(camera_layout), Some(render_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Ocean sea spray pipeline"),
+        layout: Some(&spray_layout),
+        vertex: wgpu::VertexState {
+            module: &spray_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &spray_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 impl OceanGpu {
@@ -574,54 +638,13 @@ impl OceanGpu {
             ],
         });
 
-        let spray_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GodotOceanWaves sea spray port"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("ocean_spray.wgsl").into()),
-        });
-        let spray_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Ocean sea spray pipeline layout"),
-            bind_group_layouts: &[Some(camera_layout), Some(render_layout)],
-            immediate_size: 0,
-        });
-        let spray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Ocean sea spray pipeline"),
-            layout: Some(&spray_layout),
-            vertex: wgpu::VertexState {
-                module: &spray_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
-            fragment: Some(wgpu::FragmentState {
-                module: &spray_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let spray_pipeline = create_spray_pipeline(
+            device,
+            camera_layout,
+            render_layout,
+            surface_format,
+            samples,
+        );
 
         let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,remaining:0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,spray_pipeline,render_buffer,render_bind_group };
         ocean.upload_params(queue,0.0);
@@ -781,6 +804,26 @@ impl OceanGpu {
             &self.params_buffer,
             0,
             std::mem::size_of_val(&gpu) as u64,
+        );
+    }
+
+    /// Rebuild only the render pipeline that depends on the scene target
+    /// format/sample count. The FFT simulation and its persistent foam state do
+    /// not need to be recreated when HDR or MSAA changes.
+    pub fn rebuild_spray_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        render_layout: &wgpu::BindGroupLayout,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+    ) {
+        self.spray_pipeline = create_spray_pipeline(
+            device,
+            camera_layout,
+            render_layout,
+            surface_format,
+            samples,
         );
     }
 

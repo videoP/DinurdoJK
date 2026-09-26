@@ -110,6 +110,15 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadBlock {
+    pub block: u16,
+    /// Present on block zero. A negative size is a server-side download error.
+    pub file_size: Option<i32>,
+    pub error: Option<Vec<u8>>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Nop,
     Gamestate {
@@ -128,7 +137,7 @@ pub enum Event {
     },
     SetGame(Vec<u8>),
     MapChange,
-    Download,
+    Download(DownloadBlock),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,9 +237,27 @@ impl Decoder {
                 }
                 SVC_MAPCHANGE => events.push(Event::MapChange),
                 SVC_DOWNLOAD => {
-                    // Downloads are legal server messages, but demo playback has no useful
-                    // filesystem transfer semantics. Fail before guessing the variable body.
-                    return Err(Error { bit: opcode_bit, kind: ErrorKind::Unsupported("svc_download") });
+                    let block = reader.read_short()? as u16;
+                    let file_size = if block == 0 { Some(reader.read_long()?) } else { None };
+                    if file_size.is_some_and(|size| size < 0) {
+                        events.push(Event::Download(DownloadBlock {
+                            block,
+                            file_size,
+                            error: Some(reader.read_string(1024)?),
+                            data: Vec::new(),
+                        }));
+                        continue;
+                    }
+                    let size = reader.read_short()?;
+                    if size < 0 || size as usize > crate::netchan::MAX_MSGLEN {
+                        return Err(reader.error(ErrorKind::Limit("download block")));
+                    }
+                    events.push(Event::Download(DownloadBlock {
+                        block,
+                        file_size,
+                        error: None,
+                        data: reader.read_data(size as usize)?,
+                    }));
                 }
                 SVC_BAD | SVC_CONFIGSTRING | SVC_BASELINE => {
                     return Err(Error { bit: opcode_bit, kind: ErrorKind::InvalidValue("server service opcode outside gamestate") });
@@ -466,6 +493,23 @@ mod tests {
     fn info_string_lookup_is_case_insensitive() {
         assert_eq!(info_value(b"\\foo\\x\\MapName\\mp/duel1", b"mapname"), Some(b"mp/duel1".as_slice()));
     }
+    #[test]
+    fn download_service_decodes_initial_block() {
+        use crate::message::MessageWriter;
+        let mut writer = MessageWriter::new(1024).unwrap();
+        writer.write_bits(7, 32).unwrap(); // reliable acknowledge
+        writer.write_bits(SVC_DOWNLOAD as i32, 8).unwrap();
+        writer.write_bits(0, 16).unwrap();
+        writer.write_bits(3, 32).unwrap();
+        writer.write_bits(3, 16).unwrap();
+        for byte in b"pk3" { writer.write_bits(*byte as i32, 8).unwrap(); }
+        writer.write_bits(SVC_EOF as i32, 8).unwrap();
+        let mut decoder = Decoder::new();
+        let result = decoder.parse_packet(1, writer.as_bytes()).unwrap();
+        assert!(result.events.iter().any(|event| matches!(event, Event::Download(block)
+            if block.block == 0 && block.file_size == Some(3) && block.data == b"pk3")));
+    }
+
 
     #[test]
     fn optimized_pilot_playerstate_uses_pilot_schema_order() {

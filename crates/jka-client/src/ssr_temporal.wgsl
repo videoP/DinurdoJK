@@ -34,6 +34,7 @@ struct WeatherSurfaceSettings {
 @group(0) @binding(7) var weather_occlusion_sampler: sampler;
 @group(0) @binding(8) var<uniform> weather_surface: WeatherSurfaceSettings;
 @group(0) @binding(9) var reflection_policy_texture: texture_2d<f32>;
+@group(0) @binding(10) var ssr_visibility_texture: texture_2d<f32>;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -101,6 +102,45 @@ fn reflection_policy_at_uv(uv: vec2<f32>) -> vec4<f32> {
         i32(clamp(uv.y, 0.0, 0.999999) * dims_f.y)
     );
     return textureLoad(reflection_policy_texture, clamp(pixel, vec2<i32>(0), max_pixel), 0);
+}
+
+fn ssr_frontmost_at_uv(uv: vec2<f32>) -> bool {
+    let bsp_depth = depth_at_uv(uv);
+    if (!valid_depth(bsp_depth)) {
+        return false;
+    }
+
+    let dims = textureDimensions(ssr_visibility_texture);
+    let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
+    let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let pixel = clamp(
+        vec2<i32>(
+            i32(clamp(uv.x, 0.0, 0.999999) * dims_f.x),
+            i32(clamp(uv.y, 0.0, 0.999999) * dims_f.y)
+        ),
+        vec2<i32>(0),
+        max_pixel
+    );
+    let device_depth = textureLoad(ssr_visibility_texture, pixel, 0).x;
+    if (device_depth <= 0.0) {
+        return false;
+    }
+
+    let pixel_uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / dims_f;
+    let ndc = vec4<f32>(
+        pixel_uv.x * 2.0 - 1.0,
+        1.0 - pixel_uv.y * 2.0,
+        device_depth,
+        1.0
+    );
+    var world = settings.inv_view_proj * ndc;
+    if (abs(world.w) <= 1.0e-6) {
+        return false;
+    }
+    world = world / world.w;
+    let scene_depth = distance(world.xyz, settings.camera_pos_time.xyz);
+    let tolerance = max(2.0, bsp_depth * 0.002);
+    return scene_depth + tolerance >= bsp_depth;
 }
 
 fn history_depth_at_uv(uv: vec2<f32>) -> f32 {
@@ -585,8 +625,17 @@ fn temporal_ssr(uv: vec2<f32>, centre_depth: f32, current: SsrSample) -> SsrSamp
 
 @fragment
 fn fs_main(input: VertexOut) -> SsrFragmentOut {
-    let centre_depth = depth_at_uv(input.uv);
     var out: SsrFragmentOut;
+    // The policy/linear-depth buffers describe BSP geometry.  If the final
+    // opaque scene has a closer depth owner at this pixel (player, vehicle,
+    // ocean, grass/snow shell, etc.), erase SSR history here rather than merely
+    // returning a current-frame miss that temporal accumulation could revive.
+    if (!ssr_frontmost_at_uv(input.uv)) {
+        out.radiance = vec4<f32>(0.0);
+        out.depth = 0.0;
+        return out;
+    }
+    let centre_depth = depth_at_uv(input.uv);
     if (!valid_depth(centre_depth)) {
         out.radiance = vec4<f32>(0.0);
         out.depth = 0.0;

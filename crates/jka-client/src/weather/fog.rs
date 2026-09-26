@@ -28,6 +28,51 @@ pub enum FogColorOverride {
     White,
 }
 
+pub(crate) fn material_legacy2_in_stage_safe(stages: &[MaterialStage]) -> bool {
+    // Vanilla OpenGL can apply GL_EXP2 fog after every fixed-function stage.
+    // Our authored stages are separate WGPU pipelines, and destination-dependent
+    // blend equations cannot always reproduce that result in a linear/HDR target.
+    // Keep simple materials on the cheap in-stage path; complex ones get one
+    // post-material geometry pass using the same Legacy 2 EXP2 curve.
+    if stages.len() <= 1 {
+        return true;
+    }
+
+    let first_is_blended = stages.first().is_some_and(|stage| stage.blend.is_some());
+    for (index, stage) in stages.iter().enumerate() {
+        let Some(blend) = stage.blend else {
+            continue;
+        };
+        if matches!(
+            blend.src,
+            BlendFactor::DstColor
+                | BlendFactor::OneMinusDstColor
+                | BlendFactor::DstAlpha
+                | BlendFactor::OneMinusDstAlpha
+        ) || matches!(blend.dst, BlendFactor::DstAlpha | BlendFactor::OneMinusDstAlpha)
+        {
+            return false;
+        }
+
+        if index > 0
+            && matches!(
+                blend,
+                BlendFunc {
+                    src: BlendFactor::SrcAlpha,
+                    dst: BlendFactor::OneMinusSrcAlpha,
+                } | BlendFunc {
+                    src: BlendFactor::One,
+                    dst: BlendFactor::OneMinusSrcAlpha,
+                }
+            )
+            && !first_is_blended
+        {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn stage_fog_color_override(
     stage: &MaterialStage,
     first: bool,
@@ -211,7 +256,9 @@ pub(crate) struct FroxelUniform {
 struct SurfaceFogUniform {
     color_depth: [f32; 4],
     // x: this surface uses the BSP global fog; y: OpenJK stage fog-color
-    // override (0 none, 1 black, 2 white).
+    // override (0 none, 1 black, 2 white); z: Legacy 2 can use the normal
+    // per-stage EXP2 path; w: this surface can be identified by the depth/policy
+    // buffer for display-space Legacy 1 global fog.
     flags: [f32; 4],
 }
 
@@ -296,7 +343,82 @@ impl FogSystem {
     }
 
     pub(crate) fn legacy_effective(&self) -> bool {
-        self.mode == FogMode::Legacy && (self.strength > 0.001 || self.map_fog.is_some())
+        self.mode.is_legacy() && (self.strength > 0.001 || self.map_fog.is_some())
+    }
+
+    pub(crate) fn legacy_drawfog_value(&self) -> u8 {
+        if self.legacy_effective() {
+            self.mode.drawfog_value()
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn legacy_uses_separate_pass(
+        &self,
+        fog_is_global: bool,
+        _legacy2_in_stage_safe: bool,
+        global_post_eligible: bool,
+    ) -> bool {
+        match self.legacy_drawfog_value() {
+            // Opaque/depth-writing global Legacy 1 fog is composited in the final
+            // display-space pass to match OpenJK's gamma/LDR framebuffer blend.
+            // Transparent-only global surfaces cannot be represented by that
+            // frontmost depth mask, so keep their geometry fog pass.
+            1 => !fog_is_global || !global_post_eligible,
+            // Legacy 2 remains GL_EXP2, but all authored BSP fog now uses the
+            // same post-material geometry pass. Keeping a second in-stage path
+            // caused material-dependent fog strength differences.
+            2 => self.map_fog.is_some(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn legacy1_global_post_params(&self) -> Option<([f32; 3], f32, f32)> {
+        if self.mode != FogMode::LegacyDrawFog1 || !self.legacy_effective() {
+            return None;
+        }
+        let fog = self.global_fog?;
+        Some((
+            fog.color,
+            fog.depth_for_opaque,
+            authored_fog_strength_scale(self.strength),
+        ))
+    }
+
+    /// Legacy fog for geometry that is not a BSP material stage (entities,
+    /// procedural grass) and therefore must fog itself in its own shader, as
+    /// (linear RGB + depthForOpaque, [mode, scale, 0, 0]) with mode 1 = authored
+    /// global EXP2, 2 = manual. Mirrors bsp.wgsl legacy_fog_color_amount so this
+    /// geometry and BSP at the same depth match.
+    ///
+    /// Legacy 1 with authored fog returns None: its global fog is composited in
+    /// post from the depth prepass (entities are in it; grass takes its ground's).
+    pub(crate) fn legacy_self_fog(&self) -> Option<([f32; 4], [f32; 4])> {
+        let drawfog = self.legacy_drawfog_value();
+        if drawfog == 0 {
+            return None;
+        }
+        if self.map_fog.is_some() {
+            if drawfog != 2 {
+                return None;
+            }
+            // OpenJK r_drawfog 2 only uses GL fog for the world's global fog.
+            // Maps with only local fog brushes leave this geometry unfogged.
+            let fog = self.global_fog?;
+            let color = legacy_authored_fog_color(fog.color);
+            return Some((
+                [color[0], color[1], color[2], fog.depth_for_opaque],
+                [1.0, authored_fog_strength_scale(self.strength), 0.0, 0.0],
+            ));
+        }
+        // No authored fog: the strength slider is the manual Legacy fog, the
+        // same neutral colour and 1024-unit curve BSP uses in both Legacy modes.
+        Some(([0.55, 0.62, 0.70, 1024.0], [2.0, self.strength, 0.0, 0.0]))
+    }
+
+    pub(crate) fn legacy1_global_post_active(&self) -> bool {
+        self.legacy1_global_post_params().is_some()
     }
 
     pub(crate) fn volumetric_effective(&self) -> bool {
@@ -316,7 +438,7 @@ impl FogSystem {
                 // density. MAP (the zero sentinel) and an explicit 1.0x must
                 // produce exactly the same curve and color.
                 authored_fog_strength_scale(self.strength),
-                map_fog.color,
+                legacy_authored_fog_color(map_fog.color),
                 // Authored MAP fog follows the JKA EXP2 extinction curve in
                 // the froxel integrator, without our stylized height fog.
                 0.0,
@@ -340,7 +462,7 @@ impl FogSystem {
                 if self.legacy_effective() { 1.0 } else { 0.0 },
                 self.strength,
                 if self.map_fog.is_some() { 1.0 } else { 0.0 },
-                0.0,
+                f32::from(self.legacy_drawfog_value()),
             ],
         };
         queue.write_buffer(
@@ -352,10 +474,18 @@ impl FogSystem {
 
     pub(crate) fn clear_color(&self) -> wgpu::Color {
         if let Some(fog) = self.global_fog {
+            let color = if self.mode.is_legacy() || self.mode == FogMode::Volumetric {
+                // BSP fog colors are authored in the legacy display-space
+                // convention. Volumetric MAP fog lives in the linear/HDR
+                // renderer, so it needs the same decode as the legacy paths.
+                legacy_authored_fog_color(fog.color)
+            } else {
+                fog.color
+            };
             return wgpu::Color {
-                r: f64::from(fog.color[0]),
-                g: f64::from(fog.color[1]),
-                b: f64::from(fog.color[2]),
+                r: f64::from(color[0]),
+                g: f64::from(color[1]),
+                b: f64::from(color[2]),
                 a: 1.0,
             };
         }
@@ -373,6 +503,8 @@ pub(crate) fn create_surface_fog_buffer(
     color_depth: [f32; 4],
     is_global: bool,
     color_override: FogColorOverride,
+    legacy2_in_stage_safe: bool,
+    global_post_eligible: bool,
 ) -> wgpu::Buffer {
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA surface fog uniform"),
@@ -388,12 +520,29 @@ pub(crate) fn create_surface_fog_buffer(
                     FogColorOverride::Black => 1.0,
                     FogColorOverride::White => 2.0,
                 },
-                0.0,
-                0.0,
+                if legacy2_in_stage_safe { 1.0 } else { 0.0 },
+                if global_post_eligible { 1.0 } else { 0.0 },
             ],
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     })
+}
+
+fn legacy_srgb_channel_to_linear(value: f32) -> f32 {
+    let c = value.clamp(0.0, 1.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn legacy_authored_fog_color(color: [f32; 3]) -> [f32; 3] {
+    [
+        legacy_srgb_channel_to_linear(color[0]),
+        legacy_srgb_channel_to_linear(color[1]),
+        legacy_srgb_channel_to_linear(color[2]),
+    ]
 }
 
 fn map_fog_summary(values: [f32; 4]) -> Option<MapFogSummary> {

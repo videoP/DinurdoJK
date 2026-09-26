@@ -541,11 +541,10 @@ impl App {
                 "SUN",
                 "Runtime q3 shader-sun direction, intensity and chromaticity.",
             ),
-            VideoSection::Fog => ("FOG", "Map fog and volumetric atmospheric scattering."),
-            VideoSection::Clouds => ("CLOUDS", "Volumetric cloud deck and global wind source."),
+            VideoSection::Clouds => ("CLOUDS", "Volumetric cloud deck and shaping controls."),
             VideoSection::Weather => (
                 "WEATHER",
-                "Precipitation intensity and surface atmosphere.",
+                "Shared world wind, fog, precipitation and atmospheric effects.",
             ),
             VideoSection::Surface => (
                 "SURFACE INTERACTION",
@@ -572,7 +571,6 @@ impl App {
                 VideoSection::BakedAo => self.egui_baked_ao(ui),
                 VideoSection::Physics => self.egui_physics(ui),
                 VideoSection::Sun => self.egui_sun(ui),
-                VideoSection::Fog => self.egui_fog(ui),
                 VideoSection::Clouds => self.egui_clouds(ui),
                 VideoSection::Weather => self.egui_weather(ui),
                 VideoSection::Surface => self.egui_surface(ui),
@@ -935,7 +933,7 @@ impl App {
             (
                 EntityAmbientLightingMode::BspLightgridClassic,
                 "BSP lightgrid",
-                "Samples direction and ambient light from the map's .bsp lightgrid. WIP — currently behaves as Off.",
+                "OpenJK-style entity lighting from the map's BSP lightgrid: trilinear ambient + directed light and direction, sampled at the entity origin.",
             ),
             (
                 EntityAmbientLightingMode::BevyIrradianceVolume,
@@ -1013,26 +1011,60 @@ impl App {
             },
         );
 
-        const LIGHT_OPTIONS: [(DynamicLightsMode, &str, &str); 4] = [
+        self.egui_toggle_row(
+            ui,
+            "World lighting",
+            "Use baked world lighting. Off is vanilla r_fullbright 1: lightmap contribution is replaced by white while textures remain visible.",
+            ui::VIDEO_ROW_WORLD_LIGHTING,
+            self.video.world_lighting,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Vertex lighting",
+            "Classic r_vertexLight world lighting: use BSP vertex colors instead of sampling baked lightmaps. As in JKA, this suppresses runtime dlights; Dynamic Lights > Vertex is a separate dlight mode, not this setting.",
+            ui::VIDEO_ROW_VERTEX_LIGHTING,
+            self.video.vertex_lighting,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Lightmap only",
+            "Classic r_lightmap debug view: show the baked lightmap/vertex-light contribution without the diffuse texture where available.",
+            ui::VIDEO_ROW_LIGHTMAP_ONLY,
+            self.video.lightmap_only,
+        );
+
+        const LIGHT_OPTIONS: [(DynamicLightsMode, &str, &str); 6] = [
             (
                 DynamicLightsMode::Off,
                 "Off",
-                "Moving objects, blasters and lightsabers emit no real-time light into the world.",
+                "Runtime-authored dynamic lights are disabled.",
             ),
             (
-                DynamicLightsMode::PerVertexLegacy,
-                "Per-vertex",
-                "Attenuation evaluated at geometry vertices; cheap, but blocky on large walls. WIP — currently behaves as Off.",
+                DynamicLightsMode::Legacy,
+                "Legacy",
+                "Low-cost JKA-style authored dynamic lights with a smooth radial falloff and no shadow pass.",
+            ),
+            (
+                DynamicLightsMode::Vertex,
+                "Vertex",
+                "Cheapest authored dynamic-light path: evaluate runtime lights at BSP vertices and interpolate them. This is separate from static r_vertexLight.",
+            ),
+            (
+                DynamicLightsMode::ClusteredLite,
+                "Clustered lite",
+                "Transient authored lights only through GPU cluster lists, using the cheap Lambert model and no local-light shadows.",
             ),
             (
                 DynamicLightsMode::PerPixelForwardPlus,
-                "Per-pixel (Forward+)",
-                "Screen-space tile/cluster binning evaluates hundreds of point lights per pixel with smooth falloff.",
+                "Forward+",
+                "Full clustered per-pixel local lighting, including the modern map-light path.",
             ),
             (
                 DynamicLightsMode::RayTracedHardware,
                 "Ray traced",
-                "Hardware ray queries resolve exact light visibility and falloff. WIP — currently behaves as Off.",
+                "Hardware ray-traced local lighting. WIP — currently behaves as Off.",
             ),
         ];
         if let Some(target) = mode_row(
@@ -1051,6 +1083,51 @@ impl App {
 
         self.egui_toggle_row(
             ui,
+            ".map light simulation",
+            "Source .map preview only. Approximates a compiled light stage from authored light/lightJunior entities, including color, strength and q3map-style falloff. It uses the modern clustered renderer and leaves compiled BSP lighting unchanged.",
+            ui::VIDEO_ROW_MAP_LIGHT_SIMULATION,
+            self.video.map_light_simulation,
+        );
+
+        theme::row(
+            ui,
+            "FX FPS",
+            "Fixed sampling rate for continuous projectile/trail EFX. This removes the stock JKA \
+             render-FPS dependency without changing authored EFX count/life/delay values. Drag to \
+             the far-right Legacy JKA endpoint to restore one PlayEffect call per presentation frame. \
+             0 in cg_fxFPS also selects Legacy JKA.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_FPS),
+            |ui| {
+                const LEGACY_SLIDER_VALUE: f32 = crate::fx::FX_FPS_MAX as f32 + 1.0;
+                let mut slider_value = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+                    LEGACY_SLIDER_VALUE
+                } else {
+                    self.video.fx_fps.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX) as f32
+                };
+                let readout = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+                    "Legacy JKA".to_owned()
+                } else {
+                    format!("{} Hz", self.video.fx_fps)
+                };
+                if theme::slider(
+                    ui,
+                    &mut slider_value,
+                    crate::fx::FX_FPS_MIN as f32..=LEGACY_SLIDER_VALUE,
+                    &readout,
+                ) {
+                    let value = if slider_value >= LEGACY_SLIDER_VALUE {
+                        crate::fx::FX_FPS_LEGACY_JKA
+                    } else {
+                        (slider_value.round() as u32)
+                            .clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
+                    };
+                    let _ = self.set_console_cvar("cg_fxFPS", &value.to_string());
+                }
+            },
+        );
+
+        self.egui_toggle_row(
+            ui,
             "Modern saber rendering",
             "Uses a continuous view-facing glow ribbon with the stock saber shaders instead of \
              OpenJK's chain of glow sprites. The authored line/glow textures and exact additive \
@@ -1058,6 +1135,31 @@ impl App {
             ui::VIDEO_ROW_MODERN_SABERS,
             self.video.modern_sabers,
         );
+
+        const SABER_MARK_OPTIONS: [(ui::SaberMarkMode, &str); 3] = [
+            (ui::SaberMarkMode::Off, "Off"),
+            (ui::SaberMarkMode::Legacy, "Legacy"),
+            (ui::SaberMarkMode::Enhanced, "Enhanced"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Saber marks",
+            "Saber/world contact presentation. Legacy follows OpenJK: contact is evaluated once per \
+             presentation frame, the stock burn/glow mark lasts 10 seconds, and saberhitwall audio \
+             uses the original 100 ms debounce. Enhanced is a separate smooth molten-surface effect: \
+             movement lays a spatially sampled curved melt path, while holding the blade in one place \
+             accumulates heat, widens/raises the molten lips, makes the material sag under gravity, \
+             and grows smooth sludge/drips before cooling to a dark scar. cg_fxFPS does not control \
+             saber/world marks. This is presentation-only.",
+            theme::Reset::Video(ui::VIDEO_ROW_SABER_MARKS),
+            self.video.saber_marks,
+            &SABER_MARK_OPTIONS,
+        ) {
+            let current = index_of(&SABER_MARK_OPTIONS, self.video.saber_marks, 1);
+            let next = index_of(&SABER_MARK_OPTIONS, target, current);
+            self.video_selected = ui::VIDEO_ROW_SABER_MARKS;
+            self.change_video_setting(next as i32 - current as i32);
+        }
 
         self.egui_toggle_row(
             ui,
@@ -1748,17 +1850,19 @@ impl App {
     }
 
     fn egui_fog(&mut self, ui: &mut egui::Ui) {
-        const FOG: [(FogMode, &str); 3] = [
+        const FOG: [(FogMode, &str); 4] = [
             (FogMode::Off, "Off"),
-            (FogMode::Legacy, "Legacy"),
+            (FogMode::LegacyDrawFog1, "Legacy 1"),
+            (FogMode::LegacyDrawFog2, "Legacy 2"),
             (FogMode::Volumetric, "Volumetric"),
         ];
         if let Some(target) = segmented_row(
             ui,
             "Fog mode",
-            "Legacy is the stock per-surface distance fog the map authored. \
-             Volumetric marches a froxel grid instead, so fog receives light and \
-             shows god rays.",
+            "Legacy 1 mirrors OpenJK r_drawfog 1: redraw fog after all material stages. \
+             Legacy 2 mirrors the JKA/OpenJK default r_drawfog 2: global fog is applied \
+             during material stages while local brush fog uses a redraw. Volumetric \
+             marches a froxel grid instead, so fog receives light and shows god rays.",
             theme::Reset::Environment(ui::ENV_ROW_FOG_MODE),
             self.video.fog_mode,
             &FOG,
@@ -1880,33 +1984,6 @@ impl App {
                     &readout,
                 ) {
                     self.set_cloud_thickness(value);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Wind speed",
-            "Global wind source. Drives cloud drift, and also rain slant and \
-             grass motion.",
-            theme::Reset::Environment(ui::ENV_ROW_CLOUD_WIND_SPEED),
-            |ui| {
-                let mut value = self.video.cloud_wind_speed;
-                let readout = format!("{value:.0} u/s");
-                if theme::slider(ui, &mut value, 0.0..=ui::CLOUD_WIND_SPEED_MAX, &readout) {
-                    self.set_cloud_wind_speed(value);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Wind direction",
-            "Compass heading the wind blows toward, in degrees.",
-            theme::Reset::Environment(ui::ENV_ROW_CLOUD_WIND_DIRECTION),
-            |ui| {
-                let mut value = self.video.cloud_wind_direction;
-                let readout = format!("{value:.0}°");
-                if theme::slider(ui, &mut value, 0.0..=360.0, &readout) {
-                    self.set_cloud_wind_direction(value);
                 }
             },
         );
@@ -2037,18 +2114,6 @@ impl App {
         );
         theme::row(
             ui,
-            "Wind variation",
-            "Adds smooth low-frequency variation to cloud speed and bearing \
-             instead of a perfectly straight conveyor-belt drift.",
-            theme::Reset::CloudTuning(ui::CLOUD_ROW_WIND_VARIATION),
-            |ui| {
-                if theme::switch(ui, self.video.cloud_wind_variation).is_some() {
-                    self.apply_cloud_tuning(ui::CLOUD_ROW_WIND_VARIATION, true, None);
-                }
-            },
-        );
-        theme::row(
-            ui,
             "Shape evolution",
             "Lets the high-frequency erosion field drift through the macro weather \
              field so cloud edges and billows slowly reform.",
@@ -2151,11 +2216,89 @@ impl App {
     }
 
     fn egui_weather(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "WIND",
+            "One authoritative atmospheric wind shared by clouds, rain, grass, ocean chop, spray and foam streaks.",
+        );
+        let wind = self.video.weather_wind;
+        theme::row(
+            ui,
+            "Wind speed",
+            "Base atmospheric wind speed in JKA map units per second.",
+            theme::Reset::Environment(ui::ENV_ROW_WEATHER_WIND_SPEED),
+            |ui| {
+                let mut value = wind.speed;
+                let readout = format!("{value:.0} u/s");
+                if theme::slider(ui, &mut value, 0.0..=8192.0, &readout) {
+                    self.set_weather_wind_speed(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Wind direction",
+            "Compass heading the wind blows toward, in degrees.",
+            theme::Reset::Environment(ui::ENV_ROW_WEATHER_WIND_DIRECTION),
+            |ui| {
+                let mut value = wind.direction.rem_euclid(360.0);
+                let readout = format!("{value:.0}°");
+                if theme::slider(ui, &mut value, 0.0..=360.0, &readout) {
+                    self.set_weather_wind_direction(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Gust strength",
+            "Amount of continuous speed variation applied to the shared weather wind.",
+            theme::Reset::Environment(ui::ENV_ROW_WEATHER_GUST_STRENGTH),
+            |ui| {
+                let mut value = wind.gust;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_weather_gust_strength(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Direction variation",
+            "Maximum continuous angular wandering of the shared weather wind.",
+            theme::Reset::Environment(ui::ENV_ROW_WEATHER_DIRECTION_VARIATION),
+            |ui| {
+                let mut value = wind.shift;
+                let readout = format!("{value:.0}°");
+                if theme::slider(ui, &mut value, 0.0..=180.0, &readout) {
+                    self.set_weather_direction_variation(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Mapper export",
+            "Copy the shared weather wind as map entity keys.",
+            theme::Reset::None,
+            |ui| {
+                if theme::ghost_button(ui, "COPY WIND KEYS").clicked() {
+                    let w = self.video.weather_wind;
+                    ui.ctx().copy_text(format!(
+                        "\"windSpeed\" \"{}\"\n\"windAngle\" \"{}\"\n\"windGust\" \"{}\"\n\"windShift\" \"{}\"\n",
+                        w.speed, w.direction, w.gust, w.shift
+                    ));
+                }
+            },
+        );
+
+        theme::section(ui, "FOG", "Map fog and volumetric atmospheric scattering.");
+        self.egui_fog(ui);
+
+        theme::section(ui, "PRECIPITATION", "Rainfall, wetness and precipitation haze.");
         self.egui_environment_toggle(
             ui,
             "Rain",
             "Simulated rainfall with splashes, wetness on surfaces and haze. \
-             Follows the cloud wind direction.",
+             Follows the shared weather wind.",
             ui::ENV_ROW_RAIN,
             self.video.rain,
         );
@@ -2234,13 +2377,23 @@ impl App {
 
         if !self.authored_oceans.is_empty() {
             let old = self.authored_ocean_selected;
-            egui::ComboBox::from_id_salt("authored_ocean_selector")
-                .selected_text(format!("Ocean {}", self.authored_oceans[old].index))
-                .show_ui(ui, |ui| {
-                    for (index, ocean) in self.authored_oceans.iter().enumerate() {
-                        ui.selectable_value(&mut self.authored_ocean_selected, index, format!("Ocean {} · weather {}", ocean.index, ocean.weather));
-                    }
-                });
+            let mut selected = old;
+            theme::row(
+                ui,
+                "Authored ocean",
+                "Select which server/map-authored ocean volume is shown in the local tuning controls.",
+                theme::Reset::None,
+                |ui| {
+                    egui::ComboBox::from_id_salt("authored_ocean_selector")
+                        .selected_text(format!("Ocean {}", self.authored_oceans[selected].index))
+                        .show_ui(ui, |ui| {
+                            for (index, ocean) in self.authored_oceans.iter().enumerate() {
+                                ui.selectable_value(&mut selected, index, format!("Ocean {} · weather {}", ocean.index, ocean.weather));
+                            }
+                        });
+                },
+            );
+            self.authored_ocean_selected = selected;
             if old != self.authored_ocean_selected {
                 self.authored_ocean_preview = false;
                 self.publish_authored_oceans();
@@ -2248,66 +2401,85 @@ impl App {
             if !self.authored_ocean_preview {
                 let ocean = &self.authored_oceans[self.authored_ocean_selected];
                 self.video.ocean_settings.authored = ocean.waves;
-                self.video.ocean_settings.wind = ocean.wind;
             }
-            if ui.checkbox(&mut self.authored_ocean_preview, "Local preview override").changed() {
+
+            let mut preview = self.authored_ocean_preview;
+            let mut preview_changed = false;
+            theme::row(
+                ui,
+                "Local preview override",
+                "Temporarily edit map-authored swell locally without changing the server values.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(value) = theme::switch(ui, preview) {
+                        preview = value;
+                        preview_changed = true;
+                    }
+                },
+            );
+            if preview_changed {
+                self.authored_ocean_preview = preview;
                 self.publish_authored_oceans();
             }
-            if ui.button("Restore server settings").clicked() {
-                self.authored_ocean_preview = false;
-                self.publish_authored_oceans();
-                let ocean = &self.authored_oceans[self.authored_ocean_selected];
-                self.video.ocean_settings.authored = ocean.waves;
-                self.video.ocean_settings.wind = ocean.wind;
-            }
+            theme::row(
+                ui,
+                "Server ocean values",
+                "Discard the local preview and restore the selected server/map-authored values.",
+                theme::Reset::None,
+                |ui| {
+                    if theme::ghost_button(ui, "RESTORE SERVER VALUES").clicked() {
+                        self.authored_ocean_preview = false;
+                        self.publish_authored_oceans();
+                        let ocean = &self.authored_oceans[self.authored_ocean_selected];
+                        self.video.ocean_settings.authored = ocean.waves;
+                    }
+                },
+            );
         }
         let mut settings = self.video.ocean_settings;
         let mut changed = false;
 
-        theme::section(ui, "SIMULATION", "");
-        ui.label("Ocean distances and speeds use map units (40 units = 1 metre).");
+        theme::section(
+            ui,
+            "SIMULATION",
+            "Map-facing swell controls. Distances and speeds use JKA map units (40 units = 1 metre).",
+        );
         ui.add_enabled_ui(self.authored_oceans.is_empty() || self.authored_ocean_preview, |ui| {
-        let a = &mut settings.authored;
-        for (label, value, range) in [
-            ("Swell amplitude", &mut a.amplitude, 0.0..=16384.0),
-            ("Swell wavelength", &mut a.wavelength, 64.0..=32768.0),
-            ("Swell travel direction", &mut a.direction, -180.0..=180.0),
-            ("Primary wave speed", &mut a.speed, -4096.0..=4096.0),
-            ("Base choppiness", &mut a.steepness, 0.0..=1.0),
-            ("Cross-sea / FFT blend", &mut a.slosh, 0.0..=1.0),
-            ("Wind chop", &mut a.wind_chop, 0.0..=4.0),
-            ("Foam amount", &mut a.foam, 0.0..=4.0),
-            ("Foam lifetime (seconds)", &mut a.foam_lifetime, 0.1..=30.0),
-            ("Spray amount", &mut a.spray, 0.0..=4.0),
-        ] {
-            changed |= ui.add(egui::Slider::new(value, range).text(label)).changed();
-        }
-        ui.horizontal(|ui| {
-            ui.label("Wave seed");
-            changed |= ui.add(egui::DragValue::new(&mut a.seed)).changed();
-        });
-        ui.label("Weather wind — independent of swell size and direction");
-        let w = &mut settings.wind;
-        for (label, value, range) in [
-            ("Wind speed", &mut w.speed, 0.0..=8192.0),
-            ("Wind travel direction", &mut w.direction, -180.0..=180.0),
-            ("Gust strength", &mut w.gust, 0.0..=1.0),
-            ("Direction variation", &mut w.shift, 0.0..=180.0),
-        ] {
-            changed |= ui.add(egui::Slider::new(value, range).text(label)).changed();
-        }
+            let a = &mut settings.authored;
+            ocean_slider(ui, "Swell amplitude", "Height scale of the authored long swell, in map units.", theme::Reset::None, &mut a.amplitude, 0.0..=5000.0, &mut changed);
+            ocean_slider(ui, "Swell wavelength", "Distance between authored swell crests, in map units.", theme::Reset::None, &mut a.wavelength, 64.0..=32768.0, &mut changed);
+            ocean_slider(ui, "Swell travel direction", "Heading of the authored swell in degrees.", theme::Reset::None, &mut a.direction, -180.0..=180.0, &mut changed);
+            ocean_slider(ui, "Primary wave speed", "Travel speed of the authored swell in map units per second.", theme::Reset::None, &mut a.speed, -4096.0..=4096.0, &mut changed);
+            ocean_slider(ui, "Base choppiness", "Horizontal steepness of the authored swell.", theme::Reset::None, &mut a.steepness, 0.0..=1.0, &mut changed);
+            ocean_slider(ui, "Cross-sea / FFT blend", "How strongly the first two FFT cascades roughen and cross the authored swell.", theme::Reset::None, &mut a.slosh, 0.0..=1.0, &mut changed);
+            ocean_slider(ui, "Wind chop", "Scales the weather-driven fine chop cascade.", theme::Reset::None, &mut a.wind_chop, 0.0..=4.0, &mut changed);
+            ocean_slider(ui, "Foam amount", "Global multiplier for crest foam generation.", theme::Reset::None, &mut a.foam, 0.0..=4.0, &mut changed);
+            ocean_slider(ui, "Foam lifetime", "How long accumulated crest foam persists before decaying.", theme::Reset::None, &mut a.foam_lifetime, 0.1..=30.0, &mut changed);
+            ocean_slider(ui, "Spray amount", "Global multiplier for crest-triggered sea spray particles.", theme::Reset::None, &mut a.spray, 0.0..=4.0, &mut changed);
+            theme::row(
+                ui,
+                "Wave seed",
+                "Random seed used to generate the repeatable FFT spectrum phases.",
+                theme::Reset::None,
+                |ui| {
+                    changed |= ui.add(egui::DragValue::new(&mut a.seed).speed(1.0)).changed();
+                },
+            );
 
         });
-        ui.horizontal(|ui| {
-            if ui.button("Copy ocean entity keys").clicked() {
-                let a = settings.authored;
-                ui.ctx().copy_text(format!("\"amplitude\" \"{}\"\n\"wavelength\" \"{}\"\n\"speed\" \"{}\"\n\"waveAngle\" \"{}\"\n\"steepness\" \"{}\"\n\"slosh\" \"{}\"\n\"waveSeed\" \"{}\"\n\"waveModel\" \"1\"\n\"windChop\" \"{}\"\n\"foamAmount\" \"{}\"\n\"foamLifetime\" \"{}\"\n\"sprayAmount\" \"{}\"\n",a.amplitude,a.wavelength,a.speed,a.direction,a.steepness,a.slosh,a.seed,a.wind_chop,a.foam,a.foam_lifetime,a.spray));
-            }
-            if ui.button("Copy weather wind keys").clicked() {
-                let w = settings.wind;
-                ui.ctx().copy_text(format!("\"windSpeed\" \"{}\"\n\"windAngle\" \"{}\"\n\"windGust\" \"{}\"\n\"windShift\" \"{}\"\n",w.speed,w.direction,w.gust,w.shift));
-            }
-        });
+
+        theme::row(
+            ui,
+            "Mapper export",
+            "Copy the current values as map entity keys.",
+            theme::Reset::None,
+            |ui| {
+                if theme::ghost_button(ui, "COPY OCEAN KEYS").clicked() {
+                    let a = settings.authored;
+                    ui.ctx().copy_text(format!("\"amplitude\" \"{}\"\n\"wavelength\" \"{}\"\n\"speed\" \"{}\"\n\"waveAngle\" \"{}\"\n\"steepness\" \"{}\"\n\"slosh\" \"{}\"\n\"waveSeed\" \"{}\"\n\"waveModel\" \"1\"\n\"windChop\" \"{}\"\n\"foamAmount\" \"{}\"\n\"foamLifetime\" \"{}\"\n\"sprayAmount\" \"{}\"\n",a.amplitude,a.wavelength,a.speed,a.direction,a.steepness,a.slosh,a.seed,a.wind_chop,a.foam,a.foam_lifetime,a.spray));
+                }
+            },
+        );
         const MAP_SIZES: [(u32, &str); 4] =
             [(128, "128"), (256, "256"), (512, "512"), (1024, "1024")];
         if let Some(target) = quality_table_row(
@@ -2428,28 +2600,54 @@ impl App {
             &mut changed,
         );
 
+        theme::section(ui, "WATER OPTICS", "");
+        color_row(ui, "Fog color", "Scattered underwater light; converted to linear color.",
+            theme::Reset::Ocean(9), &mut settings.optics.fog_color, &mut changed);
+        ocean_slider(ui, "Fog distance", "Base absorption distance in game units.", theme::Reset::Ocean(10), &mut settings.optics.fog_distance, 1.0..=4000.0, &mut changed);
+        ocean_slider(ui, "Transparency", "Multiplies the absorption distance above and below water.", theme::Reset::Ocean(11), &mut settings.optics.transparency, 0.1..=16.0, &mut changed);
+        ocean_slider(ui, "Depth darkening", "Sunlight penetration multiplier; larger values stay bright deeper.", theme::Reset::Ocean(12), &mut settings.optics.depth_darkening, 0.01..=8.0, &mut changed);
+        ocean_slider(ui, "Refraction", "Wave distortion of objects viewed through water. Zero disables distortion.", theme::Reset::Ocean(13), &mut settings.optics.refraction, 0.0..=0.15, &mut changed);
+        ocean_slider(ui, "Caustics", "Experimental wave-curvature sunlight focusing. Not shadow-aware yet; zero disables.", theme::Reset::Ocean(14), &mut settings.optics.caustics, 0.0..=4.0, &mut changed);
+        ocean_slider(ui, "Underwater cull", "Absorption-distance multiple for fully submerged distant world geometry. Zero disables.", theme::Reset::Ocean(15), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
+
+        theme::section(
+            ui,
+            "ADVANCED SPECTRUM",
+            "Three layered FFT spectra reduce tiling. These controls use the native GodotOceanWaves units: metres, m/s and km.",
+        );
         for cascade_index in 0..crate::ocean::OCEAN_CASCADES {
-            egui::CollapsingHeader::new(format!("Advanced spectrum — cascade {}", cascade_index + 1))
+            let (role, detail) = match cascade_index {
+                0 => ("BROAD SWELL", "Largest repeating wave field; carries most large-scale displacement and foam."),
+                1 => ("MID-SCALE CROSS SEA", "Secondary wave field layered over the swell to break up repetition and add crossing chop."),
+                _ => ("FINE WIND CHOP", "Small-scale weather-driven detail; mainly normals/foam with only a small displacement contribution."),
+            };
+            let title = format!("CASCADE {}  ·  {role}", cascade_index + 1);
+            egui::CollapsingHeader::new(theme::plain(&title, 13.0, theme::TEXT))
                 .id_salt(("ocean_cascade", cascade_index))
                 .default_open(false)
                 .show(ui, |ui| {
+                    theme::banner(ui, detail, theme::TEXT_DIM);
                     let cascade = &mut settings.cascades[cascade_index];
-                    ocean_slider(ui, "Tile length X", "Horizontal world size this cascade's wave tile covers.", theme::Reset::OceanCascade(cascade_index as u8, 0), &mut cascade.tile_length[0], 1.0..=2000.0, &mut changed);
-                    ocean_slider(ui, "Tile length Y", "Depth-axis world size this cascade's wave tile covers.", theme::Reset::OceanCascade(cascade_index as u8, 1), &mut cascade.tile_length[1], 1.0..=2000.0, &mut changed);
-                    ocean_slider(ui, "Displacement", "How far the surface is pushed vertically by this cascade.", theme::Reset::OceanCascade(cascade_index as u8, 2), &mut cascade.displacement_scale, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Normal scale", "How strongly this cascade contributes to the surface normals.", theme::Reset::OceanCascade(cascade_index as u8, 3), &mut cascade.normal_scale, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Tile length X", "Repeat size of this FFT cascade along X, in metres. Larger values carry broader waves and repeat less often.", theme::Reset::OceanCascade(cascade_index as u8, 0), &mut cascade.tile_length[0], 1.0..=2000.0, &mut changed);
+                    ocean_slider(ui, "Tile length Y", "Repeat size of this FFT cascade along Y, in metres. Keeping X/Y different can make repetition less obvious.", theme::Reset::OceanCascade(cascade_index as u8, 1), &mut cascade.tile_length[1], 1.0..=2000.0, &mut changed);
+                    ocean_slider(ui, "Displacement scale", "Multiplier for this cascade's geometric displacement. Reduce it on higher-frequency cascades to avoid over-busy silhouettes.", theme::Reset::OceanCascade(cascade_index as u8, 2), &mut cascade.displacement_scale, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Normal scale", "Multiplier for this cascade's shading normals. It can add small-scale sparkle/chop without adding the same amount of geometry displacement.", theme::Reset::OceanCascade(cascade_index as u8, 3), &mut cascade.normal_scale, 0.0..=2.0, &mut changed);
                     if cascade_index < 2 {
-                    ocean_slider(ui, "Spectrum reference speed", "Fixed spectrum shape parameter; atmospheric wind is authored above.", theme::Reset::OceanCascade(cascade_index as u8, 4), &mut cascade.wind_speed, 0.0001..=60.0, &mut changed);
-                    ocean_slider(ui, "Spectrum angle offset", "Directional offset from the authored swell heading, in degrees.", theme::Reset::OceanCascade(cascade_index as u8, 5), &mut cascade.wind_direction, -360.0..=360.0, &mut changed);
+                        ocean_slider(ui, "Spectrum wind speed", "Reference wind speed for this TMA/JONSWAP spectrum, in m/s. It changes spectrum energy and peak frequency; it is separate from live weather wind.", theme::Reset::OceanCascade(cascade_index as u8, 4), &mut cascade.wind_speed, 0.0001..=60.0, &mut changed);
+                        ocean_slider(ui, "Spectrum angle offset", "Directional offset from the authored swell heading, in degrees. This lets the cascades cross rather than stack in exactly one direction.", theme::Reset::OceanCascade(cascade_index as u8, 5), &mut cascade.wind_direction, -360.0..=360.0, &mut changed);
                     } else {
-                        ui.label("This cascade follows the weather wind speed and direction.");
+                        theme::banner(
+                            ui,
+                            "This cascade follows the weather wind speed and direction.",
+                            theme::TEXT_FAINT,
+                        );
                     }
-                    ocean_slider(ui, "Fetch length", "Distance the wind has blown over open water. Longer fetch means longer swells.", theme::Reset::OceanCascade(cascade_index as u8, 6), &mut cascade.fetch_length, 0.1..=1000.0, &mut changed);
-                    ocean_slider(ui, "Directional concentration", "Concentrates spectrum energy near its heading; independent swell amplitude is authored above.", theme::Reset::OceanCascade(cascade_index as u8, 7), &mut cascade.swell, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Spread", "How far off the wind heading wave energy spreads.", theme::Reset::OceanCascade(cascade_index as u8, 8), &mut cascade.spread, 0.0..=1.0, &mut changed);
-                    ocean_slider(ui, "Detail", "Weight of the high-frequency tail of the spectrum.", theme::Reset::OceanCascade(cascade_index as u8, 9), &mut cascade.detail, 0.0..=1.0, &mut changed);
-                    ocean_slider(ui, "Foam threshold", "Higher values produce foam at less-compressed crests.", theme::Reset::OceanCascade(cascade_index as u8, 10), &mut cascade.whitecap, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Foam amount", "How much foam accumulates, and how slowly it fades.", theme::Reset::OceanCascade(cascade_index as u8, 11), &mut cascade.foam_amount, 0.0..=10.0, &mut changed);
+                    ocean_slider(ui, "Fetch length", "Distance from shoreline / wind fetch, in kilometres. Longer fetch shifts the TMA/JONSWAP sea state toward more developed waves.", theme::Reset::OceanCascade(cascade_index as u8, 6), &mut cascade.fetch_length, 0.1..=1000.0, &mut changed);
+                    ocean_slider(ui, "Directional concentration", "GodotOceanWaves calls this swell. Higher values elongate/concentrate wave energy around the preferred heading; it is not your authored swell height.", theme::Reset::OceanCascade(cascade_index as u8, 7), &mut cascade.swell, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Spread", "Mix between strongly directional and flatter/isotropic wave energy. Higher values allow more energy away from the preferred heading.", theme::Reset::OceanCascade(cascade_index as u8, 8), &mut cascade.spread, 0.0..=1.0, &mut changed);
+                    ocean_slider(ui, "Detail", "Small-wave suppression control. Lower values attenuate high-frequency waves; 1 keeps the full high-frequency tail.", theme::Reset::OceanCascade(cascade_index as u8, 9), &mut cascade.detail, 0.0..=1.0, &mut changed);
+                    ocean_slider(ui, "Whitecap threshold", "Controls how steep/compressed a crest must be before foam accumulates. Higher values make whitecaps trigger more readily in this implementation.", theme::Reset::OceanCascade(cascade_index as u8, 10), &mut cascade.whitecap, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Foam amount", "Per-cascade foam growth multiplier. Lifetime/decay is controlled by the main Foam lifetime setting above.", theme::Reset::OceanCascade(cascade_index as u8, 11), &mut cascade.foam_amount, 0.0..=10.0, &mut changed);
                     if cascade.displacement_scale <= 0.001 {
                         theme::banner(
                             ui,
@@ -3052,17 +3250,45 @@ impl App {
                 self.sync_pbr();
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_WORLD_LIGHTING => {
+                self.video.world_lighting = defaults.world_lighting;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_VERTEX_LIGHTING => {
+                self.video.vertex_lighting = defaults.vertex_lighting;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_LIGHTMAP_ONLY => {
+                self.video.lightmap_only = defaults.lightmap_only;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_DYNAMIC_LIGHTS => {
                 self.video.dynamic_lights = defaults.dynamic_lights;
-                self.video.clustered_lighting = matches!(
-                    self.video.dynamic_lights,
-                    DynamicLightsMode::PerPixelForwardPlus
-                );
-                self.sync_clustered_lighting();
+                self.sync_dynamic_lighting();
                 self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
+                self.video.map_light_simulation = defaults.map_light_simulation;
+                self.sync_map_light_simulation();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_FX_FPS => {
+                self.video.fx_fps = defaults.fx_fps;
+                self.mark_config_dirty();
+                self.console_status = format!("FX FPS: {} HZ", self.video.fx_fps);
             }
             ui::VIDEO_ROW_MODERN_SABERS => {
                 self.video.modern_sabers = defaults.modern_sabers;
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_SABER_MARKS => {
+                self.video.saber_marks = defaults.saber_marks;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_saber_marks(self.video.saber_marks);
+                }
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS => {
@@ -3328,9 +3554,15 @@ impl App {
             ui::ENV_ROW_CLOUD_COVERAGE => self.set_cloud_coverage(defaults.cloud_coverage),
             ui::ENV_ROW_CLOUD_HEIGHT => self.set_cloud_height(defaults.cloud_height),
             ui::ENV_ROW_CLOUD_THICKNESS => self.set_cloud_thickness(defaults.cloud_thickness),
-            ui::ENV_ROW_CLOUD_WIND_SPEED => self.set_cloud_wind_speed(defaults.cloud_wind_speed),
-            ui::ENV_ROW_CLOUD_WIND_DIRECTION => {
-                self.set_cloud_wind_direction(defaults.cloud_wind_direction)
+            ui::ENV_ROW_WEATHER_WIND_SPEED => self.set_weather_wind_speed(defaults.weather_wind.speed),
+            ui::ENV_ROW_WEATHER_WIND_DIRECTION => {
+                self.set_weather_wind_direction(defaults.weather_wind.direction)
+            }
+            ui::ENV_ROW_WEATHER_GUST_STRENGTH => {
+                self.set_weather_gust_strength(defaults.weather_wind.gust)
+            }
+            ui::ENV_ROW_WEATHER_DIRECTION_VARIATION => {
+                self.set_weather_direction_variation(defaults.weather_wind.shift)
             }
             ui::ENV_ROW_CLOUD_SHADOWS => {
                 self.video.cloud_shadows = defaults.cloud_shadows;
@@ -3395,11 +3627,6 @@ impl App {
                     self.apply_cloud_tuning(row, true, None);
                 }
             }
-            ui::CLOUD_ROW_WIND_VARIATION => {
-                if self.video.cloud_wind_variation != defaults.cloud_wind_variation {
-                    self.apply_cloud_tuning(row, true, None);
-                }
-            }
             ui::CLOUD_ROW_SHAPE_EVOLUTION => {
                 if self.video.cloud_shape_evolution != defaults.cloud_shape_evolution {
                     self.apply_cloud_tuning(row, true, None);
@@ -3456,6 +3683,13 @@ impl App {
             OCEAN_FOAM_COLOR => settings.foam_color = defaults.foam_color,
             OCEAN_SEA_SPRAY => settings.sea_spray = defaults.sea_spray,
             OCEAN_WIND_FOAM => settings.wind_foam_streaks = defaults.wind_foam_streaks,
+            9 => settings.optics.fog_color = defaults.optics.fog_color,
+            10 => settings.optics.fog_distance = defaults.optics.fog_distance,
+            11 => settings.optics.transparency = defaults.optics.transparency,
+            12 => settings.optics.depth_darkening = defaults.optics.depth_darkening,
+            13 => settings.optics.refraction = defaults.optics.refraction,
+            14 => settings.optics.caustics = defaults.optics.caustics,
+            15 => settings.optics.underwater_cull = defaults.optics.underwater_cull,
             _ => return,
         }
         self.commit_ocean_settings();

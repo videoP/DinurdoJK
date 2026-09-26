@@ -66,7 +66,7 @@ impl Default for ThirdPersonSettings {
 pub struct ThirdPersonCameraState {
     current_target: [f32; 3],
     current_location: [f32; 3],
-    last_frame: i32,
+    last_frame: f64,
     last_yaw: f32,
     stiff_factor: f32,
     initialized: bool,
@@ -77,7 +77,7 @@ impl Default for ThirdPersonCameraState {
         Self {
             current_target: [0.0; 3],
             current_location: [0.0; 3],
-            last_frame: 0,
+            last_frame: 0.0,
             last_yaw: 0.0,
             stiff_factor: 0.0,
             initialized: false,
@@ -101,7 +101,9 @@ pub struct ThirdPersonViewInput {
     pub health: i32,
     pub dead_yaw: f32,
     pub client_num: i32,
-    pub time: i32,
+    /// Presentation clock in milliseconds. Live/OpenJK callers may pass whole
+    /// milliseconds; demo/spectator rendering may pass fractional values.
+    pub time: f64,
     pub teleported: bool,
 }
 
@@ -327,7 +329,7 @@ pub fn offset_third_person_view<W: TraceWorld>(
         focus_angles[0] += settings.pitch_offset;
     }
 
-    if !state.initialized || state.last_frame == 0 || state.last_frame > input.time {
+    if !state.initialized || state.last_frame == 0.0 || state.last_frame > input.time {
         reset_third_person_damp(world, settings, state, input, &mut focus_angles);
     } else {
         focus_angles[0] = focus_angles[0].clamp(-80.0, 80.0);
@@ -337,7 +339,7 @@ pub fn offset_third_person_view<W: TraceWorld>(
             delta_yaw = (delta_yaw - 360.0).abs();
         }
         let delta_time = input.time - state.last_frame;
-        if delta_time > 0 {
+        if delta_time > 0.0 {
             state.stiff_factor = delta_yaw / delta_time as f32;
             if state.stiff_factor < 1.0 {
                 state.stiff_factor = 0.0;
@@ -393,6 +395,7 @@ pub struct Camera {
     far: f32,
 }
 impl Camera {
+    #[cfg(test)]
     pub fn new(position: [f32; 3], yaw: f32) -> Self {
         Self::new_with_fov(position, yaw, DEFAULT_CG_FOV)
     }

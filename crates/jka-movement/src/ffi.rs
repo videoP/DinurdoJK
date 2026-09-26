@@ -45,8 +45,15 @@ unsafe extern "C" {
     pub fn jka_player_jump_level(player: *mut c_void, level: i32);
     pub fn jka_player_knockback(player: *mut c_void, velocity: *const f32, duration: i32);
     pub fn jka_player_set_noclip(player: *mut c_void, enabled: i32);
+    pub fn jka_player_set_saber_movement_info(
+        player: *mut c_void,
+        saber_num: i32,
+        info: *const SaberMovementInfo,
+    ) -> i32;
     pub fn jka_player_offline_force_tick(player: *mut c_void, time: i32, requested_power: i32);
     pub fn jka_animation_name(index: i32) -> *const c_char;
+    pub fn jka_saber_move_trail_length(move_: i32) -> i32;
+    pub fn jka_super_break_win_anim(anim: i32) -> i32;
     pub fn jka_item_count() -> i32;
     // Pure q_math.c helpers (no host state; no lock needed).
     pub fn ByteToDir(b: i32, dir: *mut f32);
@@ -162,6 +169,7 @@ fn rust_bridge_layout_and_constants_match_original_headers() {
         size_of::<PlayerAngleState>() as i32,
         size_of::<BoneAngleCommand>() as i32,
         size_of::<PlayerAngleResult>() as i32,
+        size_of::<SaberMovementInfo>() as i32,
     ];
     for (i, expected) in values.into_iter().enumerate() {
         assert_eq!(

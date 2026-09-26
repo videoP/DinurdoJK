@@ -3,7 +3,7 @@
 //! storage stays native, including animation, Force, weapon and event state.
 mod collision;
 mod ffi;
-pub use collision::{CollisionWorld, EntityClip};
+pub use collision::{CollisionWorld, EntityClip, SourceCollisionBrush, SourceCollisionPlane};
 use std::{
     ffi::{c_void, CStr},
     ptr::NonNull,
@@ -78,6 +78,17 @@ pub fn animation_name(index: i32) -> Option<&'static str> {
     }
 }
 
+/// Exact `saberMoveData[move].trailLength` from the vendored OpenJK tables.
+/// The renderer uses this instead of maintaining a second Rust copy.
+pub fn saber_move_trail_length(move_: i32) -> i32 {
+    unsafe { ffi::jka_saber_move_trail_length(move_) }.max(0)
+}
+
+/// Exact OpenJK `BG_SuperBreakWinAnim` classification.
+pub fn super_break_win_anim(anim: i32) -> bool {
+    unsafe { ffi::jka_super_break_win_anim(anim) != 0 }
+}
+
 /// `bg_numItems`.
 pub fn bg_item_count() -> i32 {
     // SAFETY: reads an immutable C global.
@@ -89,6 +100,8 @@ pub const ENTITY_NONE: i32 = 1023;
 pub const BUTTON_ATTACK: i32 = 1;
 pub const BUTTON_WALKING: i32 = 16;
 pub const BUTTON_ALT_ATTACK: i32 = 128;
+/// OpenJK `GENCMD_SABERATTACKCYCLE` (`genCmds_t` in q_shared.h).
+pub const GENCMD_SABERATTACKCYCLE: u8 = 26;
 pub const WP_SABER: u8 = 3;
 pub const TICK_MSEC: i32 = 8;
 pub const MIN_TICK_MSEC: i32 = 1;
@@ -98,6 +111,48 @@ pub const PMF_ROLLING: i32 = 4;
 pub const PMF_STUCK_TO_WALL: i32 = 16384;
 pub const PM_NOCLIP: i32 = 3;
 pub const PM_SPECTATOR: i32 = 4;
+
+/// Gameplay subset of OpenJK `saberInfo_t` consumed by shared BG/Pmove.
+///
+/// The renderer still owns hilt/blade presentation. This compact projection is
+/// installed only while the native movement host runs, so local play receives
+/// the same stance, movement-scale and saber restriction data as multiplayer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SaberMovementInfo {
+    pub present: i32,
+    pub num_blades: i32,
+    pub styles_learned: i32,
+    pub styles_forbidden: i32,
+    pub saber_flags: i32,
+    pub move_speed_scale: f32,
+    pub anim_speed_scale: f32,
+    pub ready_anim: i32,
+    pub draw_anim: i32,
+    pub putaway_anim: i32,
+}
+impl Default for SaberMovementInfo {
+    fn default() -> Self {
+        Self {
+            present: 0,
+            num_blades: 1,
+            styles_learned: 0,
+            styles_forbidden: 0,
+            saber_flags: 0,
+            move_speed_scale: 1.0,
+            anim_speed_scale: 1.0,
+            ready_anim: -1,
+            draw_anim: -1,
+            putaway_anim: -1,
+        }
+    }
+}
+impl SaberMovementInfo {
+    /// Stock `WP_SaberSetDefaults` gameplay state for an equipped saber.
+    pub fn equipped_default() -> Self {
+        Self { present: 1, ..Self::default() }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JoinMode {
@@ -435,6 +490,14 @@ impl PlayerView {
                 .into_owned()
         }
     }
+    pub fn torso_animation_name(&self) -> String {
+        let _guard = ffi::NativeGuard::new();
+        unsafe {
+            CStr::from_ptr(ffi::jka_animation_name(self.torso_anim))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
     pub fn eye_origin(&self) -> [f32; 3] {
         let mut p = self.origin;
         p[2] += self.view_height as f32;
@@ -560,6 +623,33 @@ impl PlayerState {
     pub fn set_noclip(&mut self, enabled: bool) {
         let _guard = ffi::NativeGuard::new();
         unsafe { ffi::jka_player_set_noclip(self.raw.as_ptr(), i32::from(enabled)) };
+    }
+    /// Install one of the two saber definitions visible to stock BG/Pmove.
+    /// This is state owned by the authoritative player host, not renderer data.
+    pub fn set_saber_movement_info(
+        &mut self,
+        saber_num: usize,
+        info: SaberMovementInfo,
+    ) -> Result<(), String> {
+        if saber_num >= 2
+            || !info.move_speed_scale.is_finite()
+            || !info.anim_speed_scale.is_finite()
+            || !(1..=8).contains(&info.num_blades)
+        {
+            return Err("Invalid saber movement metadata".into());
+        }
+        let _guard = ffi::NativeGuard::new();
+        let ok = unsafe {
+            ffi::jka_player_set_saber_movement_info(
+                self.raw.as_ptr(),
+                saber_num as i32,
+                &info,
+            )
+        };
+        if ok == 0 {
+            return Err("Native saber movement metadata rejected".into());
+        }
+        Ok(())
     }
     /// Server-owned resource updates for the offline session, separate from prediction.
     pub fn offline_force_tick(

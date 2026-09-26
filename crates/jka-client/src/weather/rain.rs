@@ -94,7 +94,14 @@ pub(crate) struct WeatherSurfaceUniform {
 struct RainParticle { position_state: [f32; 4], velocity_age: [f32; 4], misc: [f32; 4] }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct RainSimUniform { camera_dt: [f32; 4], spawn: [f32; 4], wind_time: [f32; 4], collision_uv: [f32; 4], counts: [u32; 4] }
+struct RainSimUniform {
+    camera_dt: [f32; 4],
+    spawn: [f32; 4],
+    wind_time: [f32; 4],
+    weather: [f32; 4],
+    collision_uv: [f32; 4],
+    counts: [u32; 4],
+}
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RainRenderUniform { appearance: [f32; 4], splash: [f32; 4], color: [f32; 4] }
@@ -431,8 +438,7 @@ impl RainSystem {
         previous_frame_time: f32,
         viewport_width: u32,
         viewport_height: u32,
-        cloud_wind_speed: f32,
-        cloud_wind_direction: f32,
+        weather_wind: crate::ocean::OceanWind,
         sun_color: [f32; 3],
         sun_intensity: f32,
     ) {
@@ -456,12 +462,21 @@ impl RainSystem {
         let sim = RainSimUniform {
             camera_dt: [camera.position.x, camera.position.y, camera.position.z, dt],
             spawn: [spawn_radius, below, above, fall_speed],
-            // Cloud wind is the global prevailing flow; rain_sim.wgsl samples
-            // the shared GodotGrass field only as coarse gust/direction variance.
+            // Resolve the same authored weather gust/veer function used by ocean.
+            // rain_sim.wgsl still adds only local spatial turbulence on top.
             wind_time: {
-                let speed = cloud_wind_speed.max(0.0);
-                let angle = cloud_wind_direction.to_radians();
-                [angle.cos() * speed, angle.sin() * speed, frame_time, splash_time]
+                let wind = weather_wind.at(frame_time);
+                [wind[0], wind[1], frame_time, splash_time]
+            },
+            weather: {
+                let weather = weather_wind.sanitize();
+                let angle = weather.direction.to_radians();
+                [
+                    angle.cos() * weather.speed,
+                    angle.sin() * weather.speed,
+                    0.0,
+                    0.0,
+                ]
             },
             collision_uv,
             counts: [
@@ -1209,6 +1224,7 @@ fn create_rain_gpu_resources(
             camera_dt: [0.0, 0.0, 0.0, 1.0 / 120.0],
             spawn: [1_075.0, 350.0, 1_175.0, 1_650.0],
             wind_time: [0.0, 0.0, 0.0, 0.26],
+            weather: [0.0, 0.0, 0.0, 0.0],
             collision_uv: [0.0; 4],
             counts: [14_000, 0, 0, 3_500],
         }),

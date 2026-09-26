@@ -73,7 +73,6 @@ pub struct SteamAudioBakeData {
     /// Audio successfully after loading/baking. This is deliberately stronger
     /// than merely checking that the cache files exist.
     pub runtime_validated: bool,
-    pub cache_directory: PathBuf,
 }
 
 impl SteamAudioBakeData {
@@ -154,57 +153,13 @@ pub fn load_or_bake(
     let threads = num_threads.clamp(1, 8) as u32;
     let started = Instant::now();
     let context = Context::default();
-    let mut scene = Scene::<DefaultRayTracer>::try_new(&context)
-        .map_err(|error| format!("could not create Steam Audio scene: {error}"))?;
-
+    let scene = build_scene_from_acoustic_mesh(&context, mesh)?;
     let vertices = mesh
         .vertices
         .iter()
         .copied()
         .map(jka_to_steam_point)
         .collect::<Vec<_>>();
-    if vertices.is_empty() || mesh.triangles.is_empty() {
-        return Err("acoustic mesh is empty".into());
-    }
-
-    let triangles = mesh
-        .triangles
-        .iter()
-        .map(|triangle| {
-            let a = i32::try_from(triangle[0]).map_err(|_| "acoustic vertex index overflow")?;
-            let b = i32::try_from(triangle[1]).map_err(|_| "acoustic vertex index overflow")?;
-            let c = i32::try_from(triangle[2]).map_err(|_| "acoustic vertex index overflow")?;
-            Ok(Triangle::new(a, b, c))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    if mesh.materials.len() != mesh.triangles.len() {
-        return Err(format!(
-            "acoustic mesh material/triangle mismatch: {} materials for {} triangles",
-            mesh.materials.len(),
-            mesh.triangles.len()
-        ));
-    }
-
-    let materials = steam_material_table();
-    let material_indices = mesh
-        .materials
-        .iter()
-        .map(|&material| usize::from(material.min(31)))
-        .collect::<Vec<_>>();
-    let static_mesh = StaticMesh::try_new(
-        &scene,
-        &StaticMeshSettings {
-            vertices: &vertices,
-            triangles: &triangles,
-            material_indices: &material_indices,
-            materials: &materials,
-        },
-    )
-    .map_err(|error| format!("could not create Steam Audio static mesh: {error}"))?;
-    scene.add_static_mesh(static_mesh);
-    scene.commit();
-
     let (min, max) = point_bounds(&vertices)?;
     let transform = probe_volume_transform(min, max);
     let mut probe_array = ProbeArray::try_new(&context)
@@ -319,7 +274,6 @@ pub fn load_or_bake(
         pathing_data_bytes,
         cache_hit: false,
         runtime_validated: false,
-        cache_directory: cache.directory.clone(),
     };
     let validation = validate_serialized_bake(&data)
         .map_err(|error| format!("fresh Steam Audio bake failed runtime validation: {error}"))?;
@@ -438,7 +392,64 @@ fn bake_progress_callback(
     })
 }
 
-fn jka_to_steam_point(position: [f32; 3]) -> Point {
+/// Builds the runtime Steam Audio scene directly from the already-prepared BSP
+/// acoustic mesh. Direct occlusion/transmission can use this immediately; it
+/// does not need to wait for the slower reflections/pathing probe bake to finish.
+pub(crate) fn build_scene_from_acoustic_mesh(
+    context: &Context,
+    mesh: &AcousticMesh,
+) -> Result<Scene<DefaultRayTracer>, String> {
+    if mesh.vertices.is_empty() || mesh.triangles.is_empty() {
+        return Err("acoustic mesh is empty".into());
+    }
+    if mesh.materials.len() != mesh.triangles.len() {
+        return Err(format!(
+            "acoustic mesh material/triangle mismatch: {} materials for {} triangles",
+            mesh.materials.len(),
+            mesh.triangles.len()
+        ));
+    }
+
+    let mut scene = Scene::<DefaultRayTracer>::try_new(context)
+        .map_err(|error| format!("could not create Steam Audio scene: {error}"))?;
+    let vertices = mesh
+        .vertices
+        .iter()
+        .copied()
+        .map(jka_to_steam_point)
+        .collect::<Vec<_>>();
+    let triangles = mesh
+        .triangles
+        .iter()
+        .map(|triangle| {
+            let a = i32::try_from(triangle[0]).map_err(|_| "acoustic vertex index overflow")?;
+            let b = i32::try_from(triangle[1]).map_err(|_| "acoustic vertex index overflow")?;
+            let c = i32::try_from(triangle[2]).map_err(|_| "acoustic vertex index overflow")?;
+            Ok(Triangle::new(a, b, c))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let materials = steam_material_table();
+    let material_indices = mesh
+        .materials
+        .iter()
+        .map(|&material| usize::from(material.min(31)))
+        .collect::<Vec<_>>();
+    let static_mesh = StaticMesh::try_new(
+        &scene,
+        &StaticMeshSettings {
+            vertices: &vertices,
+            triangles: &triangles,
+            material_indices: &material_indices,
+            materials: &materials,
+        },
+    )
+    .map_err(|error| format!("could not create Steam Audio static mesh: {error}"))?;
+    scene.add_static_mesh(static_mesh);
+    scene.commit();
+    Ok(scene)
+}
+
+pub(crate) fn jka_to_steam_point(position: [f32; 3]) -> Point {
     // Same handedness-preserving basis used by the renderer: JKA +Z becomes
     // Steam Audio +Y, and JKA +Y becomes Steam Audio -Z.
     Point::new(
@@ -596,7 +607,6 @@ fn load_cache(cache: &SteamAudioBakeCacheInfo) -> Result<Option<SteamAudioBakeDa
         pathing_data_bytes,
         cache_hit: true,
         runtime_validated: false,
-        cache_directory: cache.directory.clone(),
     }))
 }
 

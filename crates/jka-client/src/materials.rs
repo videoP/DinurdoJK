@@ -162,6 +162,9 @@ pub struct SurfaceMaterial {
     pub alpha_shadow: bool,
     /// q3map2 `surfaceparm lightfilter`.
     pub light_filter: bool,
+    /// q3map2 `q3map_nofog`: compiler metadata saying this material must not
+    /// participate in local/global BSP fog.
+    pub no_fog: bool,
     pub sky: bool,
     pub skybox: Option<[usize; 6]>,
     pub hidden: bool,
@@ -196,6 +199,7 @@ impl Default for SurfaceMaterial {
             water: false,
             alpha_shadow: false,
             light_filter: false,
+            no_fog: false,
             sky: false,
             skybox: None,
             hidden: false,
@@ -227,6 +231,40 @@ pub struct TextureData {
     pub clamp: bool,
     /// Color textures use sRGB sampling; data maps stay linear.
     pub srgb: bool,
+}
+
+/// Shared missing-material placeholder used by renderer paths that resolve a
+/// real shader/image qpath. Missing assets must remain visibly broken instead
+/// of silently turning into the white fallback used for intentional $whiteimage.
+pub fn missing_texture_data() -> TextureData {
+    const SIZE: usize = 16;
+    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = (y * SIZE + x) * 4;
+            let border = x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1;
+            let checker = ((x / 4) + (y / 4)) % 2 == 0;
+            let color = if border {
+                [0_u8, 0_u8, 0_u8, 255_u8]
+            } else if checker {
+                [255_u8, 0_u8, 255_u8, 255_u8]
+            } else {
+                [0_u8, 0_u8, 0_u8, 255_u8]
+            };
+            rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    TextureData {
+        label: "missing texture fallback".to_owned(),
+        source: None,
+        width: SIZE as u32,
+        height: SIZE as u32,
+        rgba,
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1862,6 +1900,7 @@ pub fn describe(
         water: definition.water,
         alpha_shadow: definition.alpha_shadow,
         light_filter: definition.light_filter,
+        no_fog: definition.no_fog,
         sky,
         skybox,
         explicit,

@@ -20,7 +20,7 @@ struct FroxelSettings {
     fog_color_anisotropy: vec4<f32>,
     rain_params: vec4<f32>,
     rain_occlusion: vec4<f32>,
-    rain_wind: vec4<f32>,
+    rain_wind: vec4<f32>, // base weather wind X/Z JKA/s, remaining lanes reserved
     shadow_view_proj: array<mat4x4<f32>, 4>,
     split_depths: vec4<f32>,
     shadow_params: vec4<f32>,
@@ -43,6 +43,8 @@ struct LightingSettings {
     values: vec4<u32>, // enabled, light count, viewport width, viewport height
     local_shadows: vec4<u32>, // enabled, shadowed count, cubemap size, reserved
     feature_flags: vec4<u32>, // area lights, voxel/probe GI, reserved, reserved
+    map_ambient: vec4<f32>, // source-.map q3map2 ambient RGB; unused by compute/fog consumers
+    map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; unused by compute/fog consumers
 };
 
 @group(0) @binding(0) var<uniform> settings: FroxelSettings;
@@ -175,6 +177,21 @@ fn local_shadow_visibility(light: PointLight, world: vec3<f32>) -> f32 {
     );
 }
 
+fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
+    let radius = max(light.position_radius.w, 1.0);
+    let edge = max(1.0 - distance_to_light / radius, 0.0);
+    if (light.shadow.y > 1.5) {
+        let safe_distance = max(distance_to_light, 16.0);
+        let reference_distance = max(radius * 0.25, 24.0);
+        return min((reference_distance * reference_distance) / (safe_distance * safe_distance), 1.0)
+            * edge;
+    }
+    if (light.shadow.y > 0.5) {
+        return edge;
+    }
+    return edge * edge;
+}
+
 fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
     if (light.emitter.w < 0.5) {
         return 1.0;
@@ -217,14 +234,16 @@ fn rain_exposure(world: vec3<f32>) -> f32 {
     return 1.0 - shelter;
 }
 
+fn weather_wind_offset_jka(time: f32) -> vec2<f32> {
+    return settings.rain_wind.xy * time;
+}
+
 fn rain_gust_strength(world: vec3<f32>) -> f32 {
-    // The canonical GodotGrass noise field is advected by the full atmospheric
-    // cloud wind. Rain/fog density does not need its own wind simulation: the
-    // moving broad field is enough to make mist thicken/thin with gusts.
-    let cloud_wind_jka = settings.rain_wind.xy;
+    // The canonical GodotGrass noise field follows the stable base Weather
+    // transport path; gust/veer affect rain motion without making noise jump.
     let root_m = world.xz * JKA_TO_GODOT_METERS;
     let advected_root = root_m
-        - cloud_wind_jka * JKA_TO_GODOT_METERS * settings.camera_pos_time.w;
+        - weather_wind_offset_jka(settings.camera_pos_time.w) * JKA_TO_GODOT_METERS;
     let strength_noise = textureSampleLevel(
         wind_noise,
         wind_noise_sampler,
@@ -298,7 +317,8 @@ fn local_light_scattering(
     fog_color: vec3<f32>,
     g: f32,
 ) -> vec3<f32> {
-    if (lighting_settings.values.x == 0u || lighting_settings.values.y == 0u) {
+    if (lighting_settings.values.x == 0u || lighting_settings.values.y == 0u
+        || (lighting_settings.feature_flags.x == 0u && lighting_settings.feature_flags.z == 0u)) {
         return vec3<f32>(0.0);
     }
     let cluster = cluster_for_froxel(gid, camera_depth);
@@ -310,6 +330,11 @@ fn local_light_scattering(
             continue;
         }
         let light = dynamic_lights[light_index];
+        if (light.shadow.y > 0.5) {
+            // Source-map q3map lights represent baked surface irradiance. Their
+            // compiler-space photon units must not leak into modern volumetric fog.
+            continue;
+        }
         let to_light = light.position_radius.xyz - world;
         let distance_to_light = length(to_light);
         let radius = max(light.position_radius.w, 1.0);
@@ -317,8 +342,7 @@ fn local_light_scattering(
             continue;
         }
         let direction_to_light = to_light / distance_to_light;
-        let falloff = max(1.0 - distance_to_light / radius, 0.0);
-        let attenuation = falloff * falloff;
+        let attenuation = local_light_attenuation(light, distance_to_light);
         let emission_visibility = emitter_visibility(light, direction_to_light);
         let phase = phase_henyey_greenstein(dot(view_ray, direction_to_light), g);
         let visibility = local_shadow_visibility(light, world);
@@ -423,7 +447,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (extinction > 1.0e-7) {
             medium_color = (fog_color * fog_extinction + rain_color * rain_extinction) / extinction;
         }
-        let ambient_scatter = medium_color * 0.28;
+        // Manual volumetric fog keeps the stylized low ambient term. Authored
+        // MAP fog, however, should converge toward the mapper's fog color just
+        // like legacy JKA fog does. Treat the decoded MAP color as the baseline
+        // in-scattering target, then layer directional/local illumination on top.
+        let ambient_scale = select(0.28, 1.0, authored_depth > 0.001);
+        let ambient_scatter = medium_color * ambient_scale;
         let sun_scatter = medium_color * sun_color * phase * direct_visibility * (0.42 * sun_intensity);
         let local_scatter = local_light_scattering(gid, world, midpoint_depth, ray, medium_color, g);
         let source = ambient_scatter + sun_scatter + local_scatter;

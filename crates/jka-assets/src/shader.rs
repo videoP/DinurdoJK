@@ -162,8 +162,34 @@ pub struct Shader {
     pub alpha_shadow: bool,
     /// q3map2 light-filter metadata for transmissive lighting materials.
     pub light_filter: bool,
+    /// q3map2 compile-time exclusion from fog volumes/global fog. The BSP
+    /// normally bakes this into dsurface.fogNum; retaining the directive lets
+    /// the runtime safely repair malformed/legacy global-fog assignments.
+    pub no_fog: bool,
     /// Authored `surfaceparm water`; retained separately from generic translucency.
     pub water: bool,
+    /// q3map gameplay/content metadata needed when previewing an uncompiled .map.
+    /// These are deliberately separate from visible translucency: `trans` alone
+    /// does not make a brush non-solid.
+    pub nonsolid: bool,
+    pub player_clip: bool,
+    pub monster_clip: bool,
+    pub bot_clip: bool,
+    pub shot_clip: bool,
+    pub trigger: bool,
+    pub lava: bool,
+    pub slime: bool,
+    pub fog: bool,
+    pub ladder: bool,
+    pub slick: bool,
+    /// q3map2/Jedi Academy content/surfaceparm deltas used by direct `.map`
+    /// collision. A source face begins with JA's default SOLID|OPAQUE and these
+    /// masks reproduce the compiler's surfaceParm table without relying on the
+    /// shader name.
+    pub collision_contents_add: u32,
+    pub collision_contents_clear: u32,
+    pub collision_surface_flags_add: u32,
+    pub collision_surface_flags_clear: u32,
     pub polygon_offset: bool,
     pub fogparms: Option<FogParameters>,
     /// q3map/q3map2 authored area-emitter intensity. Zero means this shader
@@ -200,6 +226,134 @@ pub struct Sun {
     pub deviance: f32,
     /// q3map_sunExt jitter sample count. Zero for legacy sun directives.
     pub samples: u32,
+}
+
+// Jedi Academy inherits the SOF2/RBSP q3map2 surfaceParm table. Keep the
+// compiler semantics here because a custom shader name can carry gameplay
+// contents which cannot be recovered from filename heuristics alone.
+fn apply_ja_collision_surfaceparm(shader: &mut Shader, parm: &str) {
+    const SOLID: u32 = 0x0000_0001;
+    const LAVA: u32 = 0x0000_0002;
+    const WATER: u32 = 0x0000_0004;
+    const FOG: u32 = 0x0000_0008;
+    const PLAYERCLIP: u32 = 0x0000_0010;
+    const MONSTERCLIP: u32 = 0x0000_0020;
+    const BOTCLIP: u32 = 0x0000_0040;
+    const SHOTCLIP: u32 = 0x0000_0080;
+    const TRIGGER: u32 = 0x0000_0400;
+    const NODROP: u32 = 0x0000_0800;
+    const TERRAIN: u32 = 0x0000_1000;
+    const LADDER: u32 = 0x0000_2000;
+    const ABSEIL: u32 = 0x0000_4000;
+    const OPAQUE: u32 = 0x0000_8000;
+    const OUTSIDE: u32 = 0x0001_0000;
+    const SLIME: u32 = 0x0002_0000;
+    const DETAIL: u32 = 0x0800_0000;
+    const INSIDE: u32 = 0x1000_0000;
+    const TRANSLUCENT: u32 = 0x8000_0000;
+
+    const SURF_SKY: u32 = 0x0000_2000;
+    const SURF_SLICK: u32 = 0x0000_4000;
+    const SURF_METALSTEPS: u32 = 0x0000_8000;
+    const SURF_FORCEFIELD: u32 = 0x0001_0000;
+    const SURF_NODAMAGE: u32 = 0x0004_0000;
+    const SURF_NOIMPACT: u32 = 0x0008_0000;
+    const SURF_NOMARKS: u32 = 0x0010_0000;
+    const SURF_NODRAW: u32 = 0x0020_0000;
+    const SURF_NOSTEPS: u32 = 0x0040_0000;
+    const SURF_NODLIGHT: u32 = 0x0080_0000;
+    const SURF_NOMISCENTS: u32 = 0x0100_0000;
+    const SURF_FORCESIGHT: u32 = 0x0200_0000;
+
+    let mut add_contents = 0u32;
+    let mut clear_contents = 0u32;
+    let mut add_surface = 0u32;
+    let clear_surface = 0u32;
+    match parm {
+        "origin" => clear_contents |= SOLID,
+        "areaportal" => {
+            add_contents |= TRANSLUCENT;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "trans" => add_contents |= TRANSLUCENT,
+        "detail" => add_contents |= DETAIL,
+        "nodraw" => add_surface |= SURF_NODRAW,
+        "nonsolid" => clear_contents |= SOLID,
+        "nonopaque" => clear_contents |= OPAQUE,
+        "trigger" => {
+            add_contents |= TRIGGER;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "water" => {
+            add_contents |= WATER;
+            clear_contents |= SOLID;
+        }
+        "slime" => {
+            add_contents |= SLIME;
+            clear_contents |= SOLID;
+        }
+        "lava" => {
+            add_contents |= LAVA;
+            clear_contents |= SOLID;
+        }
+        "shotclip" | "weaponclip" => {
+            add_contents |= SHOTCLIP;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "playerclip" => {
+            add_contents |= PLAYERCLIP;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "monsterclip" => {
+            add_contents |= MONSTERCLIP;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "botclip" => {
+            add_contents |= BOTCLIP;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "nodrop" => {
+            add_contents |= NODROP;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "terrain" => {
+            add_contents |= TERRAIN;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "ladder" => {
+            add_contents |= LADDER;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "abseil" => {
+            add_contents |= ABSEIL;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "outside" => {
+            add_contents |= OUTSIDE;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "fog" => {
+            add_contents |= FOG;
+            clear_contents |= SOLID | OPAQUE;
+        }
+        "inside" => add_contents |= INSIDE,
+        "sky" => add_surface |= SURF_SKY,
+        "slick" => add_surface |= SURF_SLICK,
+        "metalsteps" => add_surface |= SURF_METALSTEPS,
+        "forcefield" => add_surface |= SURF_FORCEFIELD,
+        "nodamage" => add_surface |= SURF_NODAMAGE,
+        "noimpact" => add_surface |= SURF_NOIMPACT,
+        "nomarks" => add_surface |= SURF_NOMARKS,
+        "nosteps" => add_surface |= SURF_NOSTEPS,
+        "nodlight" => add_surface |= SURF_NODLIGHT,
+        "nomiscents" => add_surface |= SURF_NOMISCENTS,
+        "forcesight" => add_surface |= SURF_FORCESIGHT,
+        _ => {}
+    }
+    shader.collision_contents_add |= add_contents;
+    shader.collision_contents_clear |= clear_contents;
+    shader.collision_surface_flags_add |= add_surface;
+    shader.collision_surface_flags_clear |= clear_surface;
 }
 
 impl Shader {
@@ -673,22 +827,43 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                     "portal" => shader.portal = true,
                     "sun" | "q3map_sun" => shader.suns.push(parse_sun(args, false)?),
                     "sunext" | "q3map_sunext" => shader.suns.push(parse_sun(args, true)?),
-                    "surfaceparm" => match first.as_str() {
+                    "surfaceparm" => {
+                        apply_ja_collision_surfaceparm(&mut shader, first.as_str());
+                        match first.as_str() {
                         "sky" => shader.sky = true,
                         "nodraw" => shader.nodraw = true,
+                        "nonsolid" => shader.nonsolid = true,
+                        "playerclip" => { shader.player_clip = true; shader.nonsolid = true; },
+                        "monsterclip" => { shader.monster_clip = true; shader.nonsolid = true; },
+                        "botclip" => { shader.bot_clip = true; shader.nonsolid = true; },
+                        "shotclip" | "weaponclip" => { shader.shot_clip = true; shader.nonsolid = true; },
+                        "trigger" => { shader.trigger = true; shader.nonsolid = true; },
                         "water" => {
                             shader.translucent = true;
                             shader.water = true;
+                            shader.nonsolid = true;
                         }
-                        "trans" | "nonopaque" | "lava" | "slime" => {
-                            shader.translucent = true
+                        "lava" => {
+                            shader.translucent = true;
+                            shader.lava = true;
+                            shader.nonsolid = true;
                         }
+                        "slime" => {
+                            shader.translucent = true;
+                            shader.slime = true;
+                            shader.nonsolid = true;
+                        }
+                        "fog" => { shader.fog = true; shader.nonsolid = true; },
+                        "ladder" => shader.ladder = true,
+                        "slick" => shader.slick = true,
+                        "trans" | "nonopaque" => shader.translucent = true,
                         "alphashadow" => shader.alpha_shadow = true,
                         "lightfilter" => {
                             shader.light_filter = true;
                             shader.translucent = true;
                         }
                         _ => (),
+                        }
                     },
                     "skyparms" => {
                         shader.sky = true;
@@ -722,6 +897,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             .and_then(|value| value.parse::<f32>().ok())
                             .filter(|value| value.is_finite() && *value > 0.0);
                     }
+                    "q3map_nofog" => shader.no_fog = true,
                     "sort" => {
                         // The `portal` keyword is only shorthand for `sort portal`
                         // in the original renderer. Accept both authoring styles
@@ -829,6 +1005,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_q3map_nofog_metadata() {
+        let shaders = parse(
+            "textures/test/nofog\n{\n q3map_nofog\n { map textures/test/base }\n}\n",
+        )
+        .unwrap();
+        assert!(shaders["textures/test/nofog"].no_fog);
+    }
+
+    #[test]
     fn parses_q3map_surface_light_metadata() {
         let shaders = parse(
             "textures/test/lamp {\n\
@@ -846,6 +1031,33 @@ mod tests {
             Some("textures/test/lamp_glow.tga")
         );
         assert_eq!(shader.light_subdivide, Some(96.0));
+    }
+
+    #[test]
+    fn parses_jka_collision_surfaceparm_masks() {
+        let shaders = parse(
+            "textures/test/playerclip_custom {\n\
+             surfaceparm playerclip\n\
+             surfaceparm inside\n\
+             surfaceparm slick\n\
+             surfaceparm metalsteps\n\
+             surfaceparm forcesight\n\
+             }\n\
+             textures/test/water_custom {\n\
+             surfaceparm water\n\
+             surfaceparm nonopaque\n\
+             }\n",
+        )
+        .unwrap();
+
+        let clip = &shaders["textures/test/playerclip_custom"];
+        assert_eq!(clip.collision_contents_add & 0x1000_0010, 0x1000_0010);
+        assert_eq!(clip.collision_contents_clear & 0x0000_8001, 0x0000_8001);
+        assert_eq!(clip.collision_surface_flags_add & 0x0200_c000, 0x0200_c000);
+
+        let water = &shaders["textures/test/water_custom"];
+        assert_eq!(water.collision_contents_add & 0x0000_0004, 0x0000_0004);
+        assert_eq!(water.collision_contents_clear & 0x0000_8001, 0x0000_8001);
     }
 
     #[test]

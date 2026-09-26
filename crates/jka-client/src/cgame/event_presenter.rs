@@ -204,6 +204,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         entity_num: flash.entity_num,
         vertices: Arc::new(vertices),
         indices: Arc::new(indices),
+        lighting_origin: None,
         ghoul2_gpu: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Additive,

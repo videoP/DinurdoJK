@@ -6,6 +6,7 @@ struct PostSettings {
     film: vec4<f32>, // halation, chromatic aberration, vignette, LUT strength
     grain: vec4<f32>, // strength, size, time, exposure
     camera_fx: vec4<f32>, // motion shutter scale, DOF strength, focus distance, DOF quality
+    legacy_fog: vec4<f32>, // authored display-space RGB, depthForOpaque; taa_params.w = scale/enabled
     clouds: vec4<f32>, // enabled, type, quality, coverage
     cloud_layer: vec4<f32>, // base height, thickness, wind speed, wind direction radians
     cloud_sun_direction: vec4<f32>, // xyz light travel direction, w intensity
@@ -13,8 +14,8 @@ struct PostSettings {
     cloud_shadow: vec4<f32>, // enabled, projected shadow strength, temporal depth-gate fix, terrain interaction
     cloud_shaping: vec4<f32>, // wind shear, base height variation, empty-space skip gate, aerial perspective
     cloud_sky_ambient: vec4<f32>, // rgb average of the map skybox, w blend amount
-    cloud_temporal_tuning: vec4<f32>, // history blend, motion reject, depth reject, reserved
-    cloud_variation: vec4<f32>, // thickness variation, cloud size, wind variation gate, shape evolution gate
+    cloud_temporal_tuning: vec4<f32>, // history blend, motion reject, depth reject, shape evolution gate
+    cloud_variation: vec4<f32>, // thickness variation, cloud size, weather gust, direction variation radians
     cloud_temporal: vec4<f32>, // enabled, history valid, active 2x2 pattern, grid size
     rain: vec4<f32>, // enabled, intensity, distant haze strength, puddle accumulation
     rain_occlusion: vec4<f32>, // min render X/Z, inverse heightfield extent X/Z
@@ -59,6 +60,7 @@ struct AutoExposureState {
     reserved: f32,
 };
 @group(0) @binding(24) var<storage, read> auto_exposure_state: AutoExposureState;
+@group(0) @binding(25) var ssr_visibility_texture: texture_2d<f32>;
 // Sparse march output, read only by fs_cloud_resolve. It lives in its own bind
 // group because the march pipeline renders into this texture and so must not
 // have it bound; per-entry-point reachability keeps group 1 out of that
@@ -279,6 +281,112 @@ fn cloud_world_ray(uv: vec2<f32>) -> vec3<f32> {
 
 fn world_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return settings.camera_pos_time.xyz + world_ray(uv) * depth;
+}
+
+fn srgb_to_linear_channel(c: f32) -> f32 {
+    let value = clamp(c, 0.0, 1.0);
+    return select(
+        pow((value + 0.055) / 1.055, 2.4),
+        value / 12.92,
+        value <= 0.04045
+    );
+}
+
+fn linear_to_srgb_channel(c: f32) -> f32 {
+    let value = max(c, 0.0);
+    return select(
+        1.055 * pow(value, 1.0 / 2.4) - 0.055,
+        12.92 * value,
+        value <= 0.0031308
+    );
+}
+
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_to_linear_channel(color.r),
+        srgb_to_linear_channel(color.g),
+        srgb_to_linear_channel(color.b)
+    );
+}
+
+fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        linear_to_srgb_channel(color.r),
+        linear_to_srgb_channel(color.g),
+        linear_to_srgb_channel(color.b)
+    );
+}
+
+fn openjk_fog_texel_alpha(texel_x: f32) -> f32 {
+    let x = clamp(texel_x, 0.0, 255.0);
+    let table_index = floor(clamp(x / 32.0, 0.0, 1.0) * 255.0);
+    let table_value = sqrt(table_index / 255.0);
+    return floor(table_value * 255.0) / 255.0;
+}
+
+fn openjk_global_fog_alpha(forward_normalized: f32) -> f32 {
+    // Matches the filtered 256x32 *fog texture used by RB_FogPass. For the
+    // global row, OpenJK's +1/512 S bias cancels the texture half-texel.
+    let texel = max(forward_normalized, 0.0) * 32.0;
+    let x0 = floor(texel);
+    let frac_x = fract(texel);
+    return mix(
+        openjk_fog_texel_alpha(x0),
+        openjk_fog_texel_alpha(x0 + 1.0),
+        frac_x
+    );
+}
+
+fn policy_bits(pixel: vec2<i32>) -> u32 {
+    let dims = textureDimensions(reflection_policy_texture);
+    let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let policy = textureLoad(
+        reflection_policy_texture,
+        clamp(pixel, vec2<i32>(0), maximum),
+        0
+    );
+    return u32(round(clamp(policy.a, 0.0, 1.0) * 3.0));
+}
+
+fn ssr_receiver_at_pixel(pixel: vec2<i32>) -> bool {
+    let dims = textureDimensions(reflection_policy_texture);
+    let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    return textureLoad(reflection_policy_texture, clamp(pixel, vec2<i32>(0), maximum), 0).r >= 0.5;
+}
+
+fn apply_legacy1_global_fog(
+    color: vec3<f32>,
+    uv: vec2<f32>,
+    pixel: vec2<i32>,
+    radial_depth: f32
+) -> vec3<f32> {
+    let scale = settings.taa_params.w;
+    let depth_for_opaque = settings.legacy_fog.w;
+    if (scale <= 0.0 || depth_for_opaque <= 0.001 || !valid_depth(radial_depth)) {
+        return color;
+    }
+    // Bit 1 says the frontmost opaque surface participates in global fog. The
+    // prepass writes it for fogged BSP surfaces (not q3map_nofog/sky) and for
+    // every depth-writing entity, which OpenJK assigns the world's global fog.
+    // radial_depth already is that surface's own depth, entity or BSP.
+    if ((policy_bits(pixel) & 2u) == 0u) {
+        return color;
+    }
+
+    let ray = world_ray(uv);
+    let camera_forward = world_ray(vec2<f32>(0.5));
+    let forward_distance = radial_depth * max(dot(ray, camera_forward), 0.0);
+    let amount = openjk_global_fog_alpha(
+        (forward_distance / depth_for_opaque) * scale
+    );
+
+    // OpenJK's RB_FogPass blended into the legacy gamma-encoded LDR
+    // framebuffer. WGPU sRGB attachments blend in linear space, which made
+    // the same alpha look much denser in dark interiors. Emulate that old
+    // framebuffer blend explicitly, then return to linear for the sRGB target.
+    let encoded_scene = linear_to_srgb(color);
+    let encoded_fog = clamp(settings.legacy_fog.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    return srgb_to_linear(mix(encoded_scene, encoded_fog, amount));
 }
 
 fn camera_motion_blur(uv: vec2<f32>, color: vec3<f32>, depth: f32) -> vec3<f32> {
@@ -906,6 +1014,51 @@ fn finalize_puddle_film(color: vec3<f32>, world: vec3<f32>, puddle: f32) -> vec3
     return mix(color, clear_wet, film_strength);
 }
 
+fn resolved_scene_radial_depth(pixel: vec2<i32>) -> f32 {
+    let dims = textureDimensions(ssr_visibility_texture);
+    let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let clamped_pixel = clamp(pixel, vec2<i32>(0), maximum);
+    let device_depth = textureLoad(ssr_visibility_texture, clamped_pixel, 0).x;
+    if (device_depth <= 0.0) {
+        return 1.0e30;
+    }
+
+    let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
+    let uv = (vec2<f32>(clamped_pixel) + vec2<f32>(0.5)) / dims_f;
+    let ndc = vec4<f32>(
+        uv.x * 2.0 - 1.0,
+        1.0 - uv.y * 2.0,
+        device_depth,
+        1.0
+    );
+    var world = settings.inv_view_proj * ndc;
+    if (abs(world.w) <= 1.0e-6) {
+        return 1.0e30;
+    }
+    world = world / world.w;
+    return distance(world.xyz, settings.camera_pos_time.xyz);
+}
+
+fn bsp_frontmost_at_pixel(pixel: vec2<i32>) -> bool {
+    let bsp_depth = depth_at_pixel(pixel);
+    if (!valid_depth(bsp_depth)) {
+        return false;
+    }
+    let scene_depth = resolved_scene_radial_depth(pixel);
+    if (!valid_depth(scene_depth)) {
+        return false;
+    }
+
+    // The old gate compared two reverse-Z samples with an absolute 1e-7
+    // epsilon. That was unstable across camera jitter, MSAA coverage and target
+    // recreation (alt-tab/resize), sometimes rejecting the entire fog post pass.
+    // Compare in world-space distance instead. A later dynamic owner is normally
+    // tens/hundreds of units closer; this small tolerance only absorbs raster
+    // and polygon-offset differences for the same BSP surface.
+    let tolerance = max(2.0, bsp_depth * 0.002);
+    return scene_depth + tolerance >= bsp_depth;
+}
+
 struct SsrBilateralTap {
     value: vec4<f32>,
     weight: f32,
@@ -942,6 +1095,14 @@ fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, pud
     if (settings.scene.z <= 0.5 || !valid_depth(centre_depth)) {
         return color;
     }
+    // Gate again at full display resolution. The SSR history is half-res and
+    // bilinear upsampling can otherwise pull a neighboring BSP reflection over
+    // a player/ocean silhouette even when the half-res source texel was cleared.
+    // Entities write SSR-ineligible policy in the prepass; the frontmost test
+    // still covers non-prepass geometry such as grass and promoted ocean.
+    if (!ssr_receiver_at_pixel(pixel) || !bsp_frontmost_at_pixel(pixel)) {
+        return color;
+    }
 
     let full_viewport = max(settings.aa.yz, vec2<f32>(1.0));
     let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / full_viewport;
@@ -975,7 +1136,7 @@ fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, pud
 }
 
 fn reflection_debug_color(pixel: vec2<i32>, centre_depth: f32, _base: vec3<f32>) -> vec3<f32> {
-    if (!valid_depth(centre_depth)) {
+    if (!valid_depth(centre_depth) || !bsp_frontmost_at_pixel(pixel)) {
         return vec3<f32>(0.0);
     }
 
@@ -1022,7 +1183,8 @@ fn reflection_debug_color(pixel: vec2<i32>, centre_depth: f32, _base: vec3<f32>)
     }
 
     // A valid local cubemap/probe is the stable fallback after a failed SSR ray.
-    if (quality >= 1u && policy.a >= 0.5) {
+    let packed_policy_bits = u32(round(clamp(policy.a, 0.0, 1.0) * 3.0));
+    if (quality >= 1u && (packed_policy_bits & 1u) != 0u) {
         return vec3<f32>(0.06, 0.20, 1.0);
     }
     if (quality >= 2u && policy.r >= 0.5) {
@@ -1211,35 +1373,42 @@ fn cloud_detail(world: vec3<f32>, tile: f32) -> f32 {
     ).r;
 }
 
-fn cloud_wind_direction() -> vec3<f32> {
+fn cloud_base_wind_direction() -> vec3<f32> {
     let wind_angle = settings.cloud_layer.w;
     return vec3<f32>(cos(wind_angle), 0.0, sin(wind_angle));
 }
 
-// Integrated low-frequency wind displacement. The varying term is expressed as
-// velocity components whose integrals are analytic, rather than rotating
-// (speed*time) directly. That keeps the cloud field continuous forever instead
-// of producing an ever-growing sideways jump as the bearing changes.
-fn cloud_wind_offset_at(time: f32) -> vec3<f32> {
-    let dir = cloud_wind_direction();
-    let speed = max(settings.cloud_layer.z, 0.0);
-    if (settings.cloud_variation.z <= 0.5) {
-        return dir * speed * time;
-    }
+fn cloud_wind_direction_at(time: f32) -> vec3<f32> {
+    let shift_wave = sin(time * 0.13) * 0.7 + sin(time * 0.047 + 2.4) * 0.3;
+    let wind_angle = settings.cloud_layer.w + settings.cloud_variation.w * shift_wave;
+    return vec3<f32>(cos(wind_angle), 0.0, sin(wind_angle));
+}
 
+fn cloud_wind_speed_at(time: f32) -> f32 {
+    let gust_wave = sin(time * 0.83) * 0.65 + sin(time * 1.71 + 1.9) * 0.35;
+    return max(settings.cloud_layer.z, 0.0)
+        * max(0.0, 1.0 + settings.cloud_variation.z * gust_wave);
+}
+
+// Continuous cloud advection driven by the shared weather gust/veer controls.
+// Speed variation is integrated exactly. Angular wandering uses a bounded
+// first-order lateral integral so changing direction does not multiply by the
+// entire elapsed runtime and make the cloud field jump.
+fn cloud_wind_offset_at(time: f32) -> vec3<f32> {
+    let dir = cloud_base_wind_direction();
     let perp = vec3<f32>(-dir.z, 0.0, dir.x);
-    // These are deliberately slow enough to read as changing weather rather
-    // than turbulence, but fast/strong enough that an A/B toggle is observable
-    // during an ordinary test run. Instantaneous speed varies about +/-12%; the
-    // perpendicular component bends the bearing by roughly +/-8 degrees.
-    let speed_omega = 6.28318530718 / 41.0;
-    let veer_omega = 6.28318530718 / 67.0;
-    let speed_phase = 0.65;
-    let veer_phase = 1.35;
-    let along_integral = time
-        + 0.12 * (cos(speed_phase) - cos(speed_omega * time + speed_phase)) / speed_omega;
-    let side_integral = 0.14
-        * (cos(veer_phase) - cos(veer_omega * time + veer_phase)) / veer_omega;
+    let speed = max(settings.cloud_layer.z, 0.0);
+    let gust = clamp(settings.cloud_variation.z, 0.0, 1.0);
+    let shift = clamp(settings.cloud_variation.w, 0.0, 3.14159265359);
+
+    let gust_integral =
+        0.65 * (1.0 - cos(time * 0.83)) / 0.83
+        + 0.35 * (cos(1.9) - cos(time * 1.71 + 1.9)) / 1.71;
+    let shift_integral =
+        0.7 * (1.0 - cos(time * 0.13)) / 0.13
+        + 0.3 * (cos(2.4) - cos(time * 0.047 + 2.4)) / 0.047;
+    let along_integral = time + gust * gust_integral;
+    let side_integral = min(shift, 1.2) * shift_integral;
     return speed * (dir * along_integral + perp * side_integral);
 }
 
@@ -1248,7 +1417,7 @@ fn cloud_wind_offset_at(time: f32) -> vec3<f32> {
 // curtains: the weather map is a 2D field sampled from world.xz, so at every
 // altitude the silhouette is identical unless the lookup itself moves.
 fn cloud_advected_noise_position(world: vec3<f32>, h: f32, thickness: f32) -> vec3<f32> {
-    let wind_dir = cloud_wind_direction();
+    let wind_dir = cloud_wind_direction_at(settings.camera_pos_time.w);
     let wind_offset = cloud_wind_offset_at(settings.camera_pos_time.w);
     let shear = settings.cloud_shaping.x * CLOUD_SHEAR_SCALE * thickness * (h - 0.5);
     return world - wind_offset + wind_dir * shear;
@@ -1258,17 +1427,17 @@ fn cloud_advected_noise_position(world: vec3<f32>, h: f32, thickness: f32) -> ve
 // weather field. This slowly changes billows and edges without changing the
 // identity or path of the large cloud masses and costs no extra texture fetch.
 fn cloud_evolved_detail_position(p: vec3<f32>, tile: f32) -> vec3<f32> {
-    if (settings.cloud_variation.w <= 0.5) {
+    if (settings.cloud_temporal_tuning.w <= 0.5) {
         return p;
     }
     let t = settings.camera_pos_time.w;
-    let dir = cloud_wind_direction();
+    let dir = cloud_wind_direction_at(t);
     let perp = vec3<f32>(-dir.z, 0.0, dir.x);
     // The macro weather field keeps the same path and identity; only the Worley
     // erosion volume slips through it. A small along-wind difference plus the
     // larger cross-wind slip prevents the erosion from looking like a second
     // conveyor belt pasted over the first one.
-    let speed = max(settings.cloud_layer.z, 24.0);
+    let speed = max(cloud_wind_speed_at(t), 24.0);
     let slow_slip = (perp * 0.075 + dir * 0.022) * (speed * t);
     let billow = vec3<f32>(
         sin(t * 0.052) + 0.35 * sin(t * 0.019 + 1.1),
@@ -2271,10 +2440,16 @@ fn render_clouds(background: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     return background * clamp(transfer.a, 0.0, 1.0) + max(transfer.rgb, vec3<f32>(0.0));
 }
 
-fn apply_volumetric_fog(color: vec3<f32>, uv: vec2<f32>, depth: f32) -> vec3<f32> {
+fn apply_volumetric_fog(
+    color: vec3<f32>,
+    uv: vec2<f32>,
+    depth: f32
+) -> vec3<f32> {
     if (settings.scene.y <= 0.5 || !valid_depth(depth)) {
         return color;
     }
+    // linear_depth includes depth-writing entities, so a player integrates fog
+    // only up to itself rather than through to the BSP behind it.
     let volume = sample_integrated_fog(uv, min(depth, FROXEL_FAR));
     let transmittance = clamp(volume.a, 0.0, 1.0);
     return color * transmittance + max(volume.rgb, vec3<f32>(0.0));
@@ -2406,6 +2581,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         color = aces_fitted(color);
     }
 
+    color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = purple_fringe_color(input.uv, color);
     color = apply_color_lut(color);
@@ -2498,6 +2674,7 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
         color = aces_fitted(color);
     }
 
+    color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = purple_fringe_color(input.uv, color);
     color = apply_color_lut(color);

@@ -75,8 +75,28 @@ typedef struct jka_player_angle_result_s {
     jka_bone_angle_command commands[JKA_MAX_BONE_ANGLE_COMMANDS];
 } jka_player_angle_result;
 
+/* Per-saber gameplay metadata consumed by stock BG/Pmove. Rendering keeps
+ * using the Rust asset/presentation path; this exists so the local authority
+ * presents the same saberInfo_t state that a real OpenJK server/cgame owns. */
+typedef struct jka_saber_movement_info_s {
+    int32_t present;
+    int32_t num_blades;
+    int32_t styles_learned;
+    int32_t styles_forbidden;
+    int32_t saber_flags;
+    float move_speed_scale;
+    float anim_speed_scale;
+    int32_t ready_anim;
+    int32_t draw_anim;
+    int32_t putaway_anim;
+} jka_saber_movement_info;
+
 /* Server-provided Pmove configuration for CG_PredictPlayerState. */
 typedef struct jka_predict_settings_s {
     int32_t pmove_fixed, pmove_msec, pmove_float, gametype;
     int32_t debug_melee, step_slide_fix, no_spec_move, tracemask, no_footsteps;
 } jka_predict_settings;
+
+/* Read-only OpenJK presentation queries used by the Rust CGame renderer. */
+int jka_saber_move_trail_length(int move);
+int jka_super_break_win_anim(int anim);

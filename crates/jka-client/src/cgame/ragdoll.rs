@@ -252,6 +252,15 @@ impl RagdollWorld {
         self.config.debug
     }
 
+    /// Drop only dynamic ragdoll state; keep the map collider and configuration.
+    pub fn reset_dynamic_for_seek(&mut self) {
+        self.clear_instances();
+        self.previous_body_poses.clear();
+        self.force_grip_recoveries.clear();
+        self.last_time = None;
+        self.accumulator = 0.0;
+    }
+
     pub fn set_config(&mut self, config: RagdollConfig) {
         let was_enabled = self.config.enabled;
         let debug_was = self.config.debug;

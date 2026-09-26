@@ -38,6 +38,8 @@ struct LightingSettings {
     values: vec4<u32>, // enabled, light count, viewport width, viewport height
     local_shadows: vec4<u32>, // enabled, shadowed count, cubemap size, reserved
     feature_flags: vec4<u32>, // emissive area lights, voxel/probe GI, point/entity lights, reflection quality
+    map_ambient: vec4<f32>, // xyz q3map2 ambient RGB; w reserved
+    map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; unused by compute/fog consumers
 };
 struct PbrSettings {
     // x: PBR companions enabled, y: parallax enabled, z: height scale * 1000.
@@ -65,10 +67,10 @@ struct ShadowSettings {
 };
 struct SurfaceFogSettings {
     color_depth: vec4<f32>,
-    flags: vec4<f32>, // global surface, color override, reserved, reserved
+    flags: vec4<f32>, // global, color override, Legacy2 in-stage safe, Legacy1 post eligible
 };
 struct LegacyFogControl {
-    values: vec4<f32>, // enabled, strength/scale, map has authored fog, reserved
+    values: vec4<f32>, // enabled, strength/scale, map has authored fog, r_drawfog mode
 };
 struct WeatherSurfaceSettings {
     amount_distance: vec4<f32>,
@@ -83,12 +85,24 @@ const CLUSTER_NEAR: f32 = 1.0;
 const CLUSTER_FAR: f32 = 65536.0;
 const LOCAL_SHADOW_NEAR: f32 = 4.0;
 
+const CLASSIC_FULLBRIGHT: u32 = 1u;
+const CLASSIC_VERTEX_LIGHT: u32 = 2u;
+const CLASSIC_LIGHTMAP_ONLY: u32 = 4u;
+const MATERIAL_EXPLICIT_LIGHTMAP: u32 = 8388608u;
+const MATERIAL_HAS_LIGHTMAP: u32 = 16777216u;
+const MATERIAL_OPAQUE_STAGE: u32 = 33554432u;
+
 // Pipeline-specialized feature switches. These are WebGPU/WGSL override
 // constants, not runtime uniforms: the renderer supplies them when a pipeline
 // variant is created, allowing the driver to dead-strip disabled systems.
 override ENABLE_PBR: bool = false;
 override ENABLE_POM: bool = false;
 override ENABLE_POINT_LIGHTS: bool = false;
+override ENABLE_MAP_LIGHT_SIMULATION: bool = false;
+override ENABLE_SOURCE_MAP_WORLD: bool = false;
+override ENABLE_LEGACY_DLIGHTS: bool = false;
+override ENABLE_VERTEX_DLIGHTS: bool = false;
+override ENABLE_CLUSTERED_LITE_DLIGHTS: bool = false;
 override ENABLE_AREA_LIGHTS: bool = false;
 override ENABLE_VOXEL_GI: bool = false;
 override ENABLE_IRRADIANCE_VOLUME: bool = false;
@@ -105,6 +119,8 @@ override POM_ADAPTIVE_STEPS: bool = false;
 override PBR_COMPANION_SAMPLER: bool = false;
 override PBR_VERTEX_LIGHTGRID: bool = false;
 override ENABLE_OCEAN: bool = false;
+// Legacy fog pipeline variant (WorldShaderVariantKey::legacy_fog).
+override ENABLE_LEGACY_FOG: bool = false;
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
@@ -173,6 +189,7 @@ struct VertexOut {
     @location(7) shell_coverage: f32,
     @location(8) pbr_lightgrid_direction: vec4<f32>,
     @location(9) pbr_lightgrid_lighting: vec4<f32>,
+    @location(10) vertex_dlight: vec3<f32>,
 };
 
 fn generated_uv(input: VertexIn) -> vec2<f32> {
@@ -263,6 +280,99 @@ fn sample_vertex_static_lightgrid(world_position: vec3<f32>) -> VertexLightgridS
     return result;
 }
 
+fn q3map_effective_distance(light: PointLight, distance_to_light: f32) -> f32 {
+    let extra_distance = max(light.shadow.z, 0.0);
+    return max(16.0, sqrt(distance_to_light * distance_to_light + extra_distance * extra_distance));
+}
+
+fn q3map_surface_angle(light: PointLight, ndotl: f32) -> f32 {
+    if (light.shadow.y <= 0.5) {
+        return ndotl;
+    }
+    // Source-map q3map point metadata is packed into negative emitter.w:
+    // -1 = no angle attenuation, -2 = ordinary Lambert, <-2 = _anglescale.
+    if (light.emitter.w > -1.5) {
+        return 1.0;
+    }
+    var angle = ndotl;
+    if (light.emitter.w < -2.0001) {
+        let angle_scale = max(-light.emitter.w - 2.0, 1.0e-5);
+        angle = min(angle / angle_scale, 1.0);
+    }
+    return max(angle, 0.0);
+}
+
+fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
+    // Runtime/FX lights keep the engine's existing smooth finite-radius response.
+    // Source-map q3map lights use q3map_light_scalar() instead.
+    let radius = max(light.position_radius.w, 1.0);
+    let edge = max(1.0 - distance_to_light / radius, 0.0);
+    return edge * edge;
+}
+
+fn q3map_light_scalar(light: PointLight, distance_to_light: f32, surface_angle: f32) -> f32 {
+    // color_intensity.a stores q3map photons / 255, so this returns exactly the
+    // normalized lightmap-space scalar before authored light color is applied.
+    let intensity = light.color_intensity.a;
+    let distance = q3map_effective_distance(light, distance_to_light);
+    if (light.shadow.y > 1.5) {
+        // Quake3/JKA default: photons / distance^2 * angle. The radius is only
+        // the q3map envelope used by clustering/culling and never softens falloff.
+        return max(intensity * surface_angle / (distance * distance), 0.0);
+    }
+    if (light.shadow.y > 0.5) {
+        // q3map2 linear: max(0, angle*photons*linearScale - distance*fade).
+        // scene.rs stores radius = photons*linearScale/fade, so fade can be
+        // eliminated algebraically. Unlike a normal edge fade, the distance term
+        // is NOT multiplied by angle; this also keeps _anglescale behavior exact.
+        let radius = max(light.position_radius.w, 1.0);
+        return intensity * (1.0 / 8000.0) * max(surface_angle - distance / radius, 0.0);
+    }
+    return 0.0;
+}
+
+fn q3map_fast_contribution_visible(light_scalar: f32) -> bool {
+    // The reference compile uses -fast. q3map2 rejects scalar contributions <=
+    // falloffTolerance (default 1) before light color is applied. The scalar here
+    // is normalized from q3map's 0..255 lightmap accumulation domain.
+    return light_scalar > (1.0 / 255.0);
+}
+
+fn local_light_surface_scale(light: PointLight) -> f32 {
+    if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
+        return 1.0;
+    }
+    if (ENABLE_CLUSTERED_LITE_DLIGHTS && light.shadow.w >= 0.5) {
+        return 1.70;
+    }
+    return 0.35;
+}
+
+fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -> vec3<f32> {
+    if (!ENABLE_VERTEX_DLIGHTS || camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
+        return vec3<f32>(0.0);
+    }
+    let start = min(lighting_settings.local_shadows.w, lighting_settings.values.y);
+    let end = min(lighting_settings.values.y, start + 32u);
+    let normal = normalize(world_normal);
+    var result = vec3<f32>(0.0);
+    for (var i = start; i < end; i += 1u) {
+        let light = dynamic_lights[i];
+        if (light.shadow.w < 0.5) { continue; }
+        let delta = light.position_radius.xyz - world_position;
+        let distance_to_light = length(delta);
+        let radius = max(light.position_radius.w, 1.0);
+        if (distance_to_light <= 0.0001 || distance_to_light >= radius) { continue; }
+        let light_direction = delta / distance_to_light;
+        let ndotl = max(dot(normal, light_direction), 0.0);
+        if (ndotl <= 0.0) { continue; }
+        let falloff = max(1.0 - distance_to_light / radius, 0.0);
+        result += light.color_intensity.rgb * light.color_intensity.a
+            * (falloff * falloff) * ndotl * 0.70;
+    }
+    return result;
+}
+
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
     var output: VertexOut;
     let allow_shell = camera.render_flags.x == 0u;
@@ -283,6 +393,7 @@ fn sample_vertex_static_lightgrid(world_position: vec3<f32>) -> VertexLightgridS
     output.world_normal = surface_deformation_vertex_normal(
         input.position, input.normal, material.header.w, instance_index, allow_shell
     );
+    output.vertex_dlight = transient_vertex_dlight(world_position, output.world_normal);
     output.shell_kind = select(0u, 1u, instance_index != 0u);
     output.shell_coverage = deformation.w;
     let vertex_lightgrid = sample_vertex_static_lightgrid(world_position);
@@ -650,7 +761,20 @@ fn direct_light_source_enabled(light: PointLight) -> bool {
     if (is_area_light) {
         return ENABLE_AREA_LIGHTS;
     }
-    return ENABLE_POINT_LIGHTS;
+    if (ENABLE_POINT_LIGHTS) {
+        // Source-map lights use Forward+ even when runtime dlights use Legacy/Vertex.
+        // Keep transient lights exclusively on those cheaper paths to avoid doubling.
+        if (ENABLE_MAP_LIGHT_SIMULATION
+            && (ENABLE_LEGACY_DLIGHTS || ENABLE_VERTEX_DLIGHTS)
+            && light.shadow.w >= 0.5) {
+            return false;
+        }
+        return true;
+    }
+    if (ENABLE_CLUSTERED_LITE_DLIGHTS) {
+        return light.shadow.w >= 0.5;
+    }
+    return false;
 }
 
 fn weather_material_gloss_response() -> f32 {
@@ -667,6 +791,55 @@ fn weather_material_gloss_response() -> f32 {
 }
 
 struct LegacyDynamicLighting { diffuse_factor: vec3<f32>, wet_specular: vec3<f32>, };
+
+fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
+    var result: LegacyDynamicLighting;
+    result.diffuse_factor = vec3<f32>(0.0);
+    result.wet_specular = vec3<f32>(0.0);
+    if (!ENABLE_LEGACY_DLIGHTS || camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
+        return result;
+    }
+
+    // JKA-style triangle-plane response with a smooth radial blob. This keeps
+    // authored runtime lights cheap and stable without the old 16x16 lookup or
+    // an extra redraw pass.
+    let dp_x = dpdx(input.world_position);
+    let dp_y = dpdy(input.world_position);
+    let plane_cross = cross(dp_x, dp_y);
+    let plane_len_sq = dot(plane_cross, plane_cross);
+    if (plane_len_sq < 1.0e-10) { return result; }
+    var plane_normal = plane_cross * inverseSqrt(plane_len_sq);
+    if (dot(plane_normal, input.world_normal) < 0.0) {
+        plane_normal = -plane_normal;
+    }
+
+    let start = min(lighting_settings.local_shadows.w, lighting_settings.values.y);
+    let end = min(lighting_settings.values.y, start + 32u);
+    for (var i = start; i < end; i += 1u) {
+        let light = dynamic_lights[i];
+        if (light.shadow.w < 0.5) { continue; }
+
+        let radius = max(light.position_radius.w, 1.0);
+        let radius_sq = radius * radius;
+        let delta = light.position_radius.xyz - input.world_position;
+        let plane_distance = dot(plane_normal, delta);
+        if (plane_distance <= 0.0 || plane_distance >= radius) { continue; }
+
+        let projected_radius_sq = max(radius_sq - plane_distance * plane_distance, 1.0e-4);
+        let planar_distance_sq = max(dot(delta, delta) - plane_distance * plane_distance, 0.0);
+        let radial_sq = planar_distance_sq / projected_radius_sq;
+        if (radial_sq >= 1.0) { continue; }
+        let x = 1.0 - radial_sq;
+        let blob = x * x * (3.0 - 2.0 * x);
+        let plane_modulate = max(1.0 - (plane_distance * plane_distance) / radius_sq, 0.0);
+        result.diffuse_factor += light.color_intensity.rgb
+            * light.color_intensity.a
+            * plane_modulate
+            * blob
+            * 0.225;
+    }
+    return result;
+}
 
 struct WeatherSurfaceResponse {
     wetness: f32,
@@ -904,7 +1077,7 @@ fn clustered_dynamic_light_legacy(input: VertexOut, wetness: f32, puddle: f32) -
     var result: LegacyDynamicLighting;
     result.diffuse_factor = vec3<f32>(0.0);
     result.wet_specular = vec3<f32>(0.0);
-    if (camera.render_flags.x != 0u || !(ENABLE_POINT_LIGHTS || ENABLE_AREA_LIGHTS) || lighting_settings.values.y == 0u) {
+    if (camera.render_flags.x != 0u || !(ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS) || lighting_settings.values.y == 0u) {
         return result;
     }
     let cluster = cluster_for_fragment(input);
@@ -924,16 +1097,29 @@ fn clustered_dynamic_light_legacy(input: VertexOut, wetness: f32, puddle: f32) -
         }
         let light_direction = delta / distance_to_light;
         let ndotl = max(dot(normal, light_direction), 0.0);
-        let falloff = max(1.0 - distance_to_light / radius, 0.0);
-        let attenuation = falloff * falloff;
         let emission_visibility = emitter_visibility(light, light_direction);
         let shadow_visibility = local_light_shadow_visibility(light, input.world_position, normal);
-        let energy = light.color_intensity.rgb
-            * light.color_intensity.a
-            * attenuation
-            * emission_visibility
-            * shadow_visibility;
-        result.diffuse_factor += energy * ndotl * 0.35;
+        var energy = vec3<f32>(0.0);
+        if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
+            let surface_angle = q3map_surface_angle(light, ndotl);
+            let light_scalar = q3map_light_scalar(light, distance_to_light, surface_angle);
+            if (!q3map_fast_contribution_visible(light_scalar)) {
+                continue;
+            }
+            energy = light.color_intensity.rgb
+                * light_scalar
+                * emission_visibility
+                * shadow_visibility;
+            result.diffuse_factor += energy;
+        } else {
+            let attenuation = local_light_attenuation(light, distance_to_light);
+            energy = light.color_intensity.rgb
+                * light.color_intensity.a
+                * attenuation
+                * emission_visibility
+                * shadow_visibility;
+            result.diffuse_factor += energy * ndotl * local_light_surface_scale(light);
+        }
         if ((wetness > 0.001 || puddle > 0.001) && ndotl > 0.0) {
             let half_vector = normalize(light_direction + view_direction);
             let spec_amount = max(pow(clamp(wetness, 0.0, 1.0), 1.35), puddle * 0.92);
@@ -1299,7 +1485,7 @@ fn clustered_dynamic_light_pbr(
     shared_frame: mat3x3<f32>,
     shared_surface: PbrSurface,
 ) -> vec3<f32> {
-    if (camera.render_flags.x != 0u || !(ENABLE_POINT_LIGHTS || ENABLE_AREA_LIGHTS) || lighting_settings.values.y == 0u) {
+    if (camera.render_flags.x != 0u || !(ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS) || lighting_settings.values.y == 0u) {
         return vec3<f32>(0.0);
     }
     let cluster = cluster_for_fragment(input);
@@ -1322,19 +1508,33 @@ fn clustered_dynamic_light_pbr(
         let l = delta / distance_to_light;
         let h = normalize(v + l);
         let ndotl = max(dot(n, l), 0.0);
+        let emission_visibility = emitter_visibility(light, l);
+        let shadow_visibility = local_light_shadow_visibility(light, input.world_position, n);
+        if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
+            let surface_angle = q3map_surface_angle(light, ndotl);
+            let light_scalar = q3map_light_scalar(light, distance_to_light, surface_angle);
+            if (!q3map_fast_contribution_visible(light_scalar)) {
+                continue;
+            }
+            // A compiled lightmap is diffuse irradiance modulation, not a runtime
+            // microfacet light. Keep source-map q3map lights out of the PBR BRDF.
+            let radiance = light.color_intensity.rgb
+                * light_scalar
+                * emission_visibility
+                * shadow_visibility;
+            illumination += albedo * radiance;
+            continue;
+        }
         if (ndotl <= 0.0) {
             continue;
         }
-        let falloff = max(1.0 - distance_to_light / radius, 0.0);
-        let attenuation = falloff * falloff;
-        let emission_visibility = emitter_visibility(light, l);
-        let shadow_visibility = local_light_shadow_visibility(light, input.world_position, n);
+        let attenuation = local_light_attenuation(light, distance_to_light);
         let radiance = light.color_intensity.rgb
             * light.color_intensity.a
             * attenuation
             * emission_visibility
             * shadow_visibility
-            * 0.35;
+            * local_light_surface_scale(light);
         let ndf = distribution_ggx(specular_n, h, surface.roughness);
         let g = geometry_smith(specular_n, v, l, surface.roughness);
         let f = fresnel_schlick(max(dot(h, v), 0.0), surface.f0);
@@ -1348,11 +1548,65 @@ fn clustered_dynamic_light_pbr(
     return illumination;
 }
 
+fn legacy_srgb_channel_to_linear(value: f32) -> f32 {
+    let c = clamp(value, 0.0, 1.0);
+    return select(c / 12.92, pow((c + 0.055) / 1.055, 2.4), c > 0.04045);
+}
+
+fn legacy_authored_fog_color(color: vec3<f32>) -> vec3<f32> {
+    // BSP fog parms are authored as the same display-space RGB values OpenJK
+    // sent to its legacy framebuffer. DinurdoJK shades in linear space, so
+    // convert the authored tint before blending; using it as linear makes the
+    // fog visibly brighter/stronger than the original renderer.
+    return vec3<f32>(
+        legacy_srgb_channel_to_linear(color.r),
+        legacy_srgb_channel_to_linear(color.g),
+        legacy_srgb_channel_to_linear(color.b)
+    );
+}
+
+fn openjk_fog_texel_alpha(texel_x: f32) -> f32 {
+    // Exact global-row contents of OpenJK's 256x32 *fog texture:
+    // R_FogFactor((x + 0.5)/256, 31.5/32) subtracts 1/512, multiplies S by
+    // 8, indexes the 256-entry sqrt fog table, then stores 255*d in an 8-bit
+    // alpha channel (C byte conversion truncates).
+    let x = clamp(texel_x, 0.0, 255.0);
+    let table_index = floor(clamp(x / 32.0, 0.0, 1.0) * 255.0);
+    let table_value = sqrt(table_index / 255.0);
+    return floor(table_value * 255.0) / 255.0;
+}
+
+fn openjk_global_fog_alpha(forward_normalized: f32) -> f32 {
+    // OpenJK generates S = forward/(depth*8) + 1/512 and linearly samples a
+    // 256-wide fog texture. Mapping normalized UV to texel space subtracts
+    // 0.5, exactly cancelling that +1/512 half-texel bias.
+    let texel = max(forward_normalized, 0.0) * 32.0;
+    let x0 = floor(texel);
+    let frac_x = fract(texel);
+    let a0 = openjk_fog_texel_alpha(x0);
+    let a1 = openjk_fog_texel_alpha(x0 + 1.0);
+    return mix(a0, a1, frac_x);
+}
+
 fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let has_map_fog = surface_fog.color_depth.a > 0.0;
     let has_override = legacy_fog.values.y > 0.001;
     let map_has_authored_fog = legacy_fog.values.z > 0.5;
+    let drawfog_mode = legacy_fog.values.w;
     if (legacy_fog.values.x < 0.5) {
+        return color;
+    }
+    // OpenJK r_drawfog 1 never folds fog into material stages: every fogged
+    // surface is redrawn by the explicit fog pass after its material stages.
+    if (drawfog_mode < 1.5) {
+        return color;
+    }
+    // Legacy 2 is emitted as one post-material EXP2 geometry pass for all
+    // authored BSP fog in DinurdoJK. Mixing an in-stage path with a fallback
+    // path produced visibly different fog strengths between materials even at
+    // the same depth. The separate pass preserves one equation/order for every
+    // fogged BSP surface while still leaving dynamic entities untouched.
+    if (drawfog_mode >= 1.5 && map_has_authored_fog && has_map_fog) {
         return color;
     }
     // If this map has authored fog, the strength control scales that authored
@@ -1368,11 +1622,12 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     // fallback so the Legacy mode remains useful as a manual fog control.
     var fog_color = select(
         vec3<f32>(0.55, 0.62, 0.70),
-        surface_fog.color_depth.rgb,
+        legacy_authored_fog_color(surface_fog.color_depth.rgb),
         has_map_fog
     );
-    // OpenJK changes the GL fog color for some multipass blend modes so fog
-    // remains neutral under the stage's blend equation.
+    // r_drawfog 2 mirrors OpenJK's hardware-fog stage handling: blend stages
+    // use a neutral fog color so applying fog per material stage preserves the
+    // fixed-function blend equation.
     if (surface_fog.flags.y > 1.5) {
         fog_color = vec3<f32>(1.0);
     } else if (surface_fog.flags.y > 0.5) {
@@ -1381,20 +1636,15 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let authored_depth = select(1024.0, surface_fog.color_depth.a, has_map_fog);
     let radial_distance = distance(camera.camera_pos_time.xyz, world_position);
     let radial_normalized = radial_distance / max(authored_depth, 0.001);
-    // OpenJK's compiled global fog is GL_EXP2 in the ordinary non-ranged-fog
-    // path. It uses eye-forward depth and chooses a density that leaves 1/255
-    // transmittance at depthForOpaque. Preserve the existing local-brush/manual
-    // curves; this exact path is only for the BSP global fog.
     let camera_forward = normalize(camera.camera_forward.xyz);
     let forward_distance = max(
         dot(world_position - camera.camera_pos_time.xyz, camera_forward),
         0.0
     );
     let forward_normalized = forward_distance / max(authored_depth, 0.001);
-    // MAP is the unmodified authored curve. Once the slider is moved on a
-    // fogged map, it becomes a true multiplier of that same curve: 1.0x is
-    // therefore exactly identical to MAP and keeps the authored fog color.
     let authored_scale = select(1.0, legacy_fog.values.y, has_override);
+    // OpenJK's r_drawfog 2 global fog uses GL_EXP2 and chooses density so the
+    // transmittance is 1/255 at depthForOpaque.
     let global_map_amount = 1.0 - exp(
         -5.5412635 * authored_scale * forward_normalized * forward_normalized
     );
@@ -1413,6 +1663,81 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
         has_map_fog
     );
     return vec4<f32>(mix(color.rgb, fog_color, amount), color.a);
+}
+
+fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
+    let has_map_fog = surface_fog.color_depth.a > 0.0;
+    let has_override = legacy_fog.values.y > 0.001;
+    let map_has_authored_fog = legacy_fog.values.z > 0.5;
+    let drawfog_mode = legacy_fog.values.w;
+    if (legacy_fog.values.x < 0.5 || drawfog_mode < 0.5) {
+        return vec4<f32>(0.0);
+    }
+    if (map_has_authored_fog && !has_map_fog) {
+        return vec4<f32>(0.0);
+    }
+    if (!map_has_authored_fog && !has_override) {
+        return vec4<f32>(0.0);
+    }
+    // Legacy 1 global opaque/depth-writing geometry is fogged later in
+    // display-space to match OpenJK's old gamma/LDR framebuffer blend. Local
+    // fog and transparent-only global geometry still use this pass. Legacy 2
+    // routes every authored fogged BSP surface through this geometry pass so
+    // all materials share the same EXP2 equation and ordering.
+    let legacy1_geometry = drawfog_mode < 1.5
+        && (surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5);
+    let legacy2_geometry = drawfog_mode >= 1.5
+        && map_has_authored_fog
+        && has_map_fog;
+    let separate_pass = legacy1_geometry || legacy2_geometry;
+    if (!separate_pass) {
+        return vec4<f32>(0.0);
+    }
+
+    let fog_color = select(
+        vec3<f32>(0.55, 0.62, 0.70),
+        legacy_authored_fog_color(surface_fog.color_depth.rgb),
+        has_map_fog
+    );
+    let authored_depth = select(1024.0, surface_fog.color_depth.a, has_map_fog);
+    let radial_distance = distance(camera.camera_pos_time.xyz, world_position);
+    let radial_normalized = radial_distance / max(authored_depth, 0.001);
+    let camera_forward = normalize(camera.camera_forward.xyz);
+    let forward_distance = max(
+        dot(world_position - camera.camera_pos_time.xyz, camera_forward),
+        0.0
+    );
+    let forward_normalized = forward_distance / max(authored_depth, 0.001);
+    let authored_scale = select(1.0, legacy_fog.values.y, has_override);
+
+    var amount = 0.0;
+    if (has_map_fog) {
+        if (surface_fog.flags.x > 0.5) {
+            if (drawfog_mode >= 1.5) {
+                // Legacy 2 always uses the OpenJK/JKA GL_EXP2 curve. Because
+                // every authored BSP surface reaches this same pass, material
+                // complexity can no longer change the apparent fog strength.
+                let scaled = forward_normalized * authored_scale;
+                amount = clamp(1.0 - exp(-5.5412635 * scaled * scaled), 0.0, 1.0);
+            } else {
+                // Match RB_FogPass' filtered *fog texture, including its sqrt
+                // table and 8-bit alpha quantization.
+                amount = openjk_global_fog_alpha(forward_normalized * authored_scale);
+            }
+        } else {
+            // The current BSP fog uniform does not yet carry the local brush
+            // clipping plane, so retain this renderer's established local-fog
+            // distance curve while moving it to OpenJK's correct separate pass.
+            amount = clamp(radial_normalized * authored_scale, 0.0, 1.0);
+        }
+    } else {
+        amount = clamp(
+            1.0 - exp(-radial_normalized * legacy_fog.values.y * 0.26),
+            0.0,
+            1.0
+        );
+    }
+    return vec4<f32>(fog_color, amount);
 }
 
 fn material_matches_planar_plane(selected_plane: vec4<f32>) -> bool {
@@ -1515,6 +1840,14 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         && dot(camera.clip_plane.xyz, input.world_position) + camera.clip_plane.w < 0.0) {
         discard;
     }
+    let classic_flags = camera.render_flags.z;
+    let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
+    let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
+    let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    let explicit_lightmap_stage = (material.header.z & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
+    let has_lightmap = (material.header.z & MATERIAL_HAS_LIGHTMAP) != 0u;
+    let opaque_stage = (material.header.z & MATERIAL_OPAQUE_STAGE) != 0u;
+
     var stage_color = material.color;
     if ((material.header.z & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
@@ -1570,13 +1903,14 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 
     let has_pbr_brdf_map = (material.header.z & (8u | 16u | 64u | 128u)) != 0u;
     let static_pbr_path = has_pbr_brdf_map
+        && classic_flags == 0u
         && (material.header.z & 2u) != 0u
         && input.lightmap_uv.x >= 0.0;
     let reflection_pbr_path = (material.header.z & 2048u) != 0u;
     let gi_pbr_path = ENABLE_VOXEL_GI && (material.header.z & 4u) != 0u;
     let dynamic_pbr_path = has_pbr_brdf_map
         && (material.header.z & 4u) != 0u
-        && (ENABLE_POINT_LIGHTS || ENABLE_AREA_LIGHTS);
+        && (ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS);
     let needs_pbr_surface = ENABLE_PBR
         && (static_pbr_path || reflection_pbr_path || gi_pbr_path || dynamic_pbr_path);
 
@@ -1630,6 +1964,31 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         return vec4<f32>(0.95, 0.05, 0.75, 1.0);
     }
 
+    // Classic id Tech 3 world-lighting controls. Keep them runtime flags so
+    // development toggles do not create shader/pipeline permutations.
+    if (explicit_lightmap_stage) {
+        if (classic_fullbright || (classic_vertex_light && classic_lightmap_only)) {
+            source_sample = vec4<f32>(1.0);
+        } else if (classic_vertex_light) {
+            source_sample = vec4<f32>(input.color.rgb, source_sample.a);
+        }
+    }
+
+    // r_lightmap on an explicit multi-pass material effectively leaves the
+    // opaque base as white, lets the lightmap/filter pass supply the visible
+    // image, and suppresses later decorative passes. The compact implicit
+    // base*lightmap path is handled below without needing a second pass.
+    if (classic_lightmap_only && has_lightmap
+        && !explicit_lightmap_stage
+        && (material.header.z & 2u) == 0u) {
+        if (opaque_stage) {
+            source_sample = vec4<f32>(1.0);
+            stage_color = vec4<f32>(1.0);
+        } else {
+            discard;
+        }
+    }
+
     var base = source_sample * stage_color;
     if (material.params.x > 0.0 && base.a < material.params.x) {
         discard;
@@ -1652,6 +2011,18 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         base = vec4<f32>(mix(dry_color, wet_color, wetness), base.a);
     }
     let albedo = base.rgb;
+    let source_map_unbaked_receiver = ENABLE_SOURCE_MAP_WORLD
+        && (material.header.z & 4u) != 0u
+        && input.lightmap_uv.x < 0.0
+        && (material.header.z & 131072u) == 0u;
+    if (ENABLE_MAP_LIGHT_SIMULATION
+        && (material.header.z & 4u) != 0u
+        && input.lightmap_uv.x < 0.0
+        && (material.header.z & 131072u) == 0u) {
+        // q3map2 LightingAtSample starts style 0 at worldspawn `_ambient`
+        // (tinted by worldspawn `_color`) before direct lights are accumulated.
+        base = vec4<f32>(albedo * lighting_settings.map_ambient.rgb, base.a);
+    }
     var shared_pbr = default_pbr_surface(input, albedo, weather);
     if (PBR_SHARED_MATERIAL_EVAL && needs_pbr_surface) {
         shared_pbr = evaluate_pbr_surface(input, albedo, surface_uv, weather, shared_frame);
@@ -1661,16 +2032,41 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // base-texture Ã— lightmap path. Explicit JKA shader scripts render their
     // `$lightmap` as its own ordered blend stage instead.
     if ((material.header.z & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
-        let lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
-        base = vec4<f32>(base.rgb * lightmap_color, base.a);
-        if (ENABLE_PBR && has_pbr_brdf_map) {
+        var lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+        if (classic_fullbright) {
+            // Vanilla r_fullbright keeps the diffuse texture but replaces the
+            // baked lightmap contribution with white.
+            lightmap_color = vec3<f32>(1.0);
+        } else if (classic_vertex_light) {
+            // r_vertexLight substitutes the BSP vertex color for baked lightmap
+            // sampling. r_lightmap + r_vertexLight is the vanilla white debug case.
+            lightmap_color = select(input.color.rgb, vec3<f32>(1.0), classic_lightmap_only);
+        }
+        if (classic_lightmap_only) {
+            // r_lightmap removes the diffuse texture so the lighting data itself
+            // is visible (the familiar white-walls/lightmap debug presentation).
+            base = vec4<f32>(lightmap_color, base.a);
+        } else {
+            base = vec4<f32>(base.rgb * lightmap_color, base.a);
+        }
+        if (ENABLE_PBR && has_pbr_brdf_map && classic_flags == 0u) {
             let baked = static_baked_pbr(input, albedo, surface_uv, lightmap_color, weather, shared_frame, shared_pbr);
             base = vec4<f32>(base.rgb * baked.diffuse_factor + baked.specular, base.a);
         }
     }
-    // Cached static BSP AO only modulates the baked-light contribution.
-    // It is intentionally not applied to later dynamic/point/area light additions.
-    if (camera.render_flags.y != 0u && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
+
+    // LIGHTMAP_BY_VERTEX surfaces have no lightmap texture to expose. Preserve
+    // their compiled vertex lighting for r_lightmap; vanilla r_vertexLight +
+    // r_lightmap deliberately resolves to white instead.
+    if (classic_lightmap_only && (material.header.z & 131072u) != 0u && !has_lightmap) {
+        base = vec4<f32>(select(input.color.rgb, vec3<f32>(1.0), classic_vertex_light), base.a);
+    }
+
+    // Cached static BSP AO only modulates the normal baked-light contribution.
+    // Classic debug/compatibility modes should show their source lighting rather
+    // than a second modern AO modulation.
+    if (camera.render_flags.y != 0u && classic_flags == 0u
+        && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
@@ -1683,12 +2079,36 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);
         let shadow_strength = shadow_settings.params.z * sun_facing * (1.0 - shadow_visibility);
         base = vec4<f32>(base.rgb * (1.0 - shadow_strength), base.a);
-        if (ENABLE_PBR && has_pbr_brdf_map) {
+        if (ENABLE_VERTEX_DLIGHTS) {
+            base = vec4<f32>(base.rgb + albedo * input.vertex_dlight, base.a);
+        }
+        if (ENABLE_LEGACY_DLIGHTS) {
+            let projected_lighting = legacy_dynamic_light(input);
+            base = vec4<f32>(base.rgb + albedo * projected_lighting.diffuse_factor, base.a);
+        }
+        if (ENABLE_CLUSTERED_LITE_DLIGHTS) {
+            let clustered_lite = clustered_dynamic_light_legacy(input, wetness, puddle);
+            base = vec4<f32>(base.rgb + albedo * clustered_lite.diffuse_factor + clustered_lite.wet_specular, base.a);
+        } else if (ENABLE_PBR && has_pbr_brdf_map) {
             base = vec4<f32>(base.rgb + clustered_dynamic_light_pbr(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
         } else {
             let legacy_lighting = clustered_dynamic_light_legacy(input, wetness, puddle);
             base = vec4<f32>(base.rgb + albedo * legacy_lighting.diffuse_factor + legacy_lighting.wet_specular, base.a);
         }
+    }
+    if (ENABLE_MAP_LIGHT_SIMULATION
+        && (material.header.z & 4u) != 0u
+        && input.lightmap_uv.x < 0.0
+        && (material.header.z & 131072u) == 0u) {
+        base = vec4<f32>(max(base.rgb, albedo * lighting_settings.map_minlight.rgb), base.a);
+    }
+    if (source_map_unbaked_receiver && !ENABLE_MAP_LIGHT_SIMULATION) {
+        // OFF is an editor-style global-light/fullbright source-map preview.
+        // Enforce the diffuse texture as a neutral 1.0 light floor *after* the
+        // normal lighting/shadow paths, so missing baked lightmaps, AO, CSM or
+        // other optional lighting features cannot turn raw .map surfaces black.
+        // Dynamic/emissive effects may still brighten the surface above this.
+        base = vec4<f32>(max(base.rgb, albedo), base.a);
     }
     if (wetness > 0.001 || puddle > 0.001) {
         base = vec4<f32>(base.rgb + weather_surface_coat(input, wetness, puddle), base.a);
@@ -1728,6 +2148,16 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         discard;
     }
     return apply_legacy_fog(shade_surface(input), input.world_position);
+}
+
+@fragment fn fs_legacy_fog_pass(input: VertexOut) -> @location(0) vec4<f32> {
+    if (surface_deformation_should_discard(
+        input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
+        camera.render_flags.x == 0u
+    )) {
+        discard;
+    }
+    return legacy_separate_fog(input.world_position);
 }
 
 fn sky_uv(s: f32, t: f32) -> vec2<f32> {

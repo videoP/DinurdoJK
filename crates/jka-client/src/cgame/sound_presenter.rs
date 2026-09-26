@@ -34,12 +34,12 @@ pub struct SoundPresenter {
 }
 
 impl SoundPresenter {
-    pub fn new(mut assets: AssetSearchPath, steam_audio_enabled: bool) -> Self {
+    pub fn new(mut assets: AssetSearchPath, steam_audio_enabled: bool, steam_audio_binaural_enabled: bool, steam_audio_environmental_enabled: bool) -> Self {
         let saber_definitions = load_saber_definitions(&mut assets).unwrap_or_else(|error| {
             eprintln!("AUDIO SABER DEFINITIONS UNAVAILABLE (default hum only): {error}");
             SaberDefinitions::default()
         });
-        let backend = match AudioBackend::open(steam_audio_enabled) {
+        let backend = match AudioBackend::open(steam_audio_enabled, steam_audio_binaural_enabled, steam_audio_environmental_enabled) {
             Ok(backend) => {
                 let info = backend.info();
                 println!(
@@ -73,11 +73,12 @@ impl SoundPresenter {
         game: &ClientGameState,
         siege_classes: &[SiegeClassVisual],
         entities: &[PresentedEntity],
+        followed_entity: Option<&PresentedEntity>,
         listener_entity: u16,
     ) {
         if self.backend.is_none() { return; }
         let mut requests = Vec::new();
-        for entity in entities {
+        for entity in audio_entities(entities, followed_entity) {
             if let Some(request) = entity_loop(entity, game, &self.inline_model_midpoints) {
                 requests.push(request);
             }
@@ -121,9 +122,18 @@ impl SoundPresenter {
         }
     }
 
-    pub fn frame(&mut self, listener: Listener, entities: &[PresentedEntity]) {
+    pub fn frame(
+        &mut self,
+        listener: Listener,
+        entities: &[PresentedEntity],
+        followed_entity: Option<&PresentedEntity>,
+    ) {
         if let Some(backend) = &mut self.backend {
-            backend.frame(listener, entities.iter().map(|entity| (entity.number, entity.origin)));
+            backend.frame(
+                listener,
+                audio_entities(entities, followed_entity)
+                    .map(|entity| (entity.number, entity.origin)),
+            );
         }
     }
     pub fn set_rate(&mut self, rate: f32) { if let Some(b) = &mut self.backend { b.set_rate(rate); } }
@@ -136,6 +146,18 @@ impl SoundPresenter {
     pub fn set_steam_audio_enabled(&mut self, enabled: bool) {
         if let Some(backend) = &mut self.backend {
             backend.set_steam_audio_enabled(enabled);
+        }
+    }
+
+    pub fn set_steam_audio_binaural_enabled(&mut self, enabled: bool) {
+        if let Some(backend) = &mut self.backend {
+            backend.set_steam_audio_binaural_enabled(enabled);
+        }
+    }
+
+    pub fn set_steam_audio_environmental_enabled(&mut self, enabled: bool) {
+        if let Some(backend) = &mut self.backend {
+            backend.set_steam_audio_environmental_enabled(enabled);
         }
     }
     pub fn set_steam_audio_map(
@@ -504,6 +526,18 @@ fn event_variant(event: &PresentationEvent, count: usize) -> usize {
     mixed as usize % count
 }
 
+
+fn audio_entities<'a>(
+    entities: &'a [PresentedEntity],
+    followed_entity: Option<&'a PresentedEntity>,
+) -> impl Iterator<Item = &'a PresentedEntity> {
+    let followed_number = followed_entity.map(|entity| entity.number);
+    entities
+        .iter()
+        .filter(move |entity| Some(entity.number) != followed_number)
+        .chain(followed_entity.into_iter())
+}
+
 /// OpenJK CG_EntityEffects "add loop sound". Brush models sit at their
 /// inline-model midpoint offset by the mover's lerpOrigin; ET_SPEAKER takes
 /// the ordinary S_AddLoopingSound path in MP (S_AddRealLoopingSound is
@@ -602,6 +636,23 @@ mod tests {
             server_time: 1_000,
             state,
         }
+    }
+
+    #[test]
+    fn followed_player_is_present_in_audio_entity_stream_once() {
+        let make = |number| PresentedEntity {
+            number,
+            entity_type: ET_PLAYER,
+            origin: [number as f32, 0.0, 0.0],
+            angles: [0.0; 3],
+            state: EntityState { number, fields: [0; ENTITY_FIELDS.len()] },
+        };
+        let packet_entities = vec![make(7), make(0)];
+        let followed = make(0);
+        let numbers: Vec<_> = audio_entities(&packet_entities, Some(&followed))
+            .map(|entity| entity.number)
+            .collect();
+        assert_eq!(numbers, vec![7, 0]);
     }
 
     #[test]

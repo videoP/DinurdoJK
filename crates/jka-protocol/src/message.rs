@@ -177,6 +177,18 @@ impl<'a> MessageReader<'a> {
         self.read_scalar(32)
     }
 
+    /// Read an exact raw byte count without applying C-string semantics.
+    pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, Error> {
+        if len > MAX_MESSAGE_BYTES {
+            return Err(self.error(ErrorKind::Limit("data bytes")));
+        }
+        let mut value = Vec::with_capacity(len);
+        for _ in 0..len {
+            value.push(self.read_byte()?);
+        }
+        Ok(value)
+    }
+
     /// `limit` includes the NUL terminator. Preserve wire bytes; display and
     /// command sanitization are responsibilities of higher layers.
     pub fn read_string(&mut self, limit: usize) -> Result<Vec<u8>, Error> {

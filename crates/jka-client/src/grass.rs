@@ -31,9 +31,9 @@ use wgpu::util::DeviceExt;
 const GODOT_WORLD_SCALE: f32 = 1.0 / 64.0;
 const SOURCE_REFERENCE_SPRITE_HEIGHT: f32 = 36.0;
 const SOURCE_CLUMPING_FACTOR: f32 = 0.5;
-const GRASS_CLOUD_WIND_INHERITANCE: f32 = 0.20;
-const DEFAULT_CLOUD_WIND_SPEED: f32 = 120.0;
-const DEFAULT_CLOUD_WIND_DIRECTION: f32 = 20.0;
+const GRASS_WEATHER_WIND_INHERITANCE: f32 = 0.20;
+const DEFAULT_WEATHER_WIND_SPEED: f32 = 120.0;
+const DEFAULT_WEATHER_WIND_DIRECTION: f32 = 20.0;
 const SOURCE_MAP_RADIUS_METERS: f32 = 200.0;
 const SOURCE_LOD0_METERS: f32 = 12.0;
 const SOURCE_LOD1_METERS: f32 = 40.0;
@@ -80,11 +80,18 @@ struct GrassGlobals {
     base_color: [f32; 4],
     tip_color: [f32; 4],
     sss_color: [f32; 4],
-    /// x=JKA->Godot meters, y=clumping_factor, z=cloud/world direction radians, w=reference JKA height.
+    /// x=JKA->Godot meters, y=clumping_factor, z=weather/world direction radians, w=reference JKA height.
     params: [f32; 4],
     /// xy=unit prevailing X/Z direction, z=full atmospheric m/s, w=grass response m/s.
     weather_wind: [f32; 4],
+    /// Self-applied Legacy fog (FogSystem::legacy_self_fog): linear RGB, depthForOpaque.
+    /// Owned by `set_legacy_fog`; environment updates never write these fields.
+    legacy_fog_color_depth: [f32; 4],
+    /// x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    legacy_fog_params: [f32; 4],
 }
+
+const GRASS_LEGACY_FOG_OFFSET: usize = std::mem::offset_of!(GrassGlobals, legacy_fog_color_depth);
 
 struct GrassPatchGpu {
     chunk: u32,
@@ -207,6 +214,8 @@ pub struct GrassRenderer {
     _blade_detail: wgpu::Texture,
     _noise_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
+    /// Whether the render pipelines were built with ENABLE_LEGACY_FOG.
+    legacy_fog_compiled: bool,
     bind_group: wgpu::BindGroup,
 }
 
@@ -451,8 +460,12 @@ impl GrassRenderer {
 
         let globals = globals_for_environment(
             None,
-            DEFAULT_CLOUD_WIND_SPEED,
-            DEFAULT_CLOUD_WIND_DIRECTION,
+            crate::ocean::OceanWind {
+                speed: DEFAULT_WEATHER_WIND_SPEED,
+                direction: DEFAULT_WEATHER_WIND_DIRECTION,
+                gust: 0.2,
+                shift: 0.0,
+            },
             true,
         );
         let globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -492,6 +505,7 @@ impl GrassRenderer {
             &shader,
             surface_format,
             msaa_samples,
+            false,
         );
         let prepared_pipeline = create_prepared_pipeline(
             device,
@@ -499,6 +513,7 @@ impl GrassRenderer {
             &prepared_shader,
             surface_format,
             msaa_samples,
+            false,
         );
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GodotGrass near shadow WGSL"),
@@ -553,6 +568,7 @@ impl GrassRenderer {
             _blade_detail: blade_detail,
             _noise_sampler: noise_sampler,
             globals_buffer,
+            legacy_fog_compiled: false,
             bind_group,
         }
     }
@@ -576,6 +592,7 @@ impl GrassRenderer {
             &self.shader,
             surface_format,
             msaa_samples,
+            self.legacy_fog_compiled,
         );
         self.prepared_pipeline = create_prepared_pipeline(
             device,
@@ -583,6 +600,7 @@ impl GrassRenderer {
             &self.prepared_shader,
             surface_format,
             msaa_samples,
+            self.legacy_fog_compiled,
         );
     }
 
@@ -590,20 +608,38 @@ impl GrassRenderer {
         &self,
         queue: &wgpu::Queue,
         sun: DirectionalSun,
-        cloud_wind_speed: f32,
-        cloud_wind_direction: f32,
+        weather_wind: crate::ocean::OceanWind,
         realtime_sun_lighting: bool,
     ) {
+        let globals = globals_for_environment(Some(sun), weather_wind, realtime_sun_lighting);
         queue.write_buffer(
             &self.globals_buffer,
             0,
-            bytemuck::bytes_of(&globals_for_environment(
-                Some(sun),
-                cloud_wind_speed,
-                cloud_wind_direction,
-                realtime_sun_lighting,
-            )),
+            &bytemuck::bytes_of(&globals)[..GRASS_LEGACY_FOG_OFFSET],
         );
+    }
+
+    /// Applies FogSystem::legacy_self_fog. Called only when fog settings or the
+    /// map change; pipelines are respecialized only when fog turns on or off.
+    pub fn set_legacy_fog(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+        color_depth: [f32; 4],
+        params: [f32; 4],
+    ) {
+        queue.write_buffer(
+            &self.globals_buffer,
+            GRASS_LEGACY_FOG_OFFSET as wgpu::BufferAddress,
+            bytemuck::cast_slice(&[color_depth, params]),
+        );
+        let enabled = params[0] > 0.5;
+        if enabled != self.legacy_fog_compiled {
+            self.legacy_fog_compiled = enabled;
+            self.rebuild_pipeline(device, surface_format, msaa_samples);
+        }
     }
 
     pub fn upload_map(&self, device: &wgpu::Device, patches: &[GrassPatch]) -> Option<GrassMapGpu> {
@@ -1770,8 +1806,7 @@ fn alpha_blend_u8(background: u8, foreground: u8, alpha: u8) -> u8 {
 
 fn globals_for_environment(
     sun: Option<DirectionalSun>,
-    cloud_wind_speed: f32,
-    cloud_wind_direction: f32,
+    weather_wind: crate::ocean::OceanWind,
     realtime_sun_lighting: bool,
 ) -> GrassGlobals {
     let sun = sun.unwrap_or(DirectionalSun {
@@ -1780,8 +1815,9 @@ fn globals_for_environment(
         intensity: 250.0,
     });
     let toward_sun = -Vec3::from_array(sun.direction).normalize_or_zero();
-    let wind_angle = cloud_wind_direction.to_radians();
-    let atmospheric_speed = cloud_wind_speed.max(0.0) * GODOT_WORLD_SCALE;
+    let weather_wind = weather_wind.sanitize();
+    let wind_angle = weather_wind.direction.to_radians();
+    let atmospheric_speed = weather_wind.speed.max(0.0) * GODOT_WORLD_SCALE;
     GrassGlobals {
         sun_direction_strength: [
             toward_sun.x,
@@ -1804,12 +1840,16 @@ fn globals_for_environment(
             wind_angle,
             SOURCE_REFERENCE_SPRITE_HEIGHT,
         ],
+        // x = base atmospheric speed (Godot metres/s), y = gust strength,
+        // z = maximum direction variation in radians, w = inherited blade speed.
         weather_wind: [
-            wind_angle.cos(),
-            wind_angle.sin(),
             atmospheric_speed,
-            atmospheric_speed * GRASS_CLOUD_WIND_INHERITANCE,
+            weather_wind.gust,
+            weather_wind.shift.to_radians(),
+            atmospheric_speed * GRASS_WEATHER_WIND_INHERITANCE,
         ],
+        legacy_fog_color_depth: [0.0; 4],
+        legacy_fog_params: [0.0; 4],
     }
 }
 
@@ -1964,6 +2004,7 @@ fn create_prepared_pipeline(
     shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
+    legacy_fog: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("GodotGrass GPU-prepared per-blade pipeline"),
@@ -2001,7 +2042,10 @@ fn create_prepared_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: None,
@@ -2019,6 +2063,7 @@ fn create_pipeline(
     shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
+    legacy_fog: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("GodotGrass per-blade pipeline"),
@@ -2063,7 +2108,10 @@ fn create_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: None,

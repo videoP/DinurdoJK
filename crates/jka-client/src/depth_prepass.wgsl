@@ -43,16 +43,14 @@ struct VertexIn {
 
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) camera_distance: f32,
-    @location(1) world_position: vec3<f32>,
+    @location(0) world_position: vec3<f32>,
 };
 
 struct MaskVertexOut {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) camera_distance: f32,
-    @location(1) uv: vec2<f32>,
-    @location(2) alpha_multiplier: f32,
-    @location(3) world_position: vec3<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) alpha_multiplier: f32,
+    @location(2) world_position: vec3<f32>,
 };
 
 fn generated_uv(input: VertexIn) -> vec2<f32> {
@@ -113,7 +111,6 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
-    out.camera_distance = distance(input.position, camera.camera_pos_time.xyz);
     out.world_position = input.position;
     return out;
 }
@@ -122,7 +119,6 @@ fn vs_main(input: VertexIn) -> VertexOut {
 fn vs_mask(input: VertexIn) -> MaskVertexOut {
     var out: MaskVertexOut;
     out.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
-    out.camera_distance = distance(input.position, camera.camera_pos_time.xyz);
     out.uv = generated_uv(input);
     out.world_position = input.position;
     out.alpha_multiplier = material.color.a;
@@ -186,12 +182,18 @@ fn active_planar_for_surface(world_position: vec3<f32>) -> bool {
 fn reflection_policy(world_position: vec3<f32>) -> vec4<f32> {
     let ssr_eligible = select(0.0, 1.0, (material.header.z & 4194304u) != 0u);
     let active_planar = select(0.0, 1.0, active_planar_for_surface(world_position));
-    let probe_available = select(0.0, 1.0, (material.header.z & 2048u) != 0u);
+    // Alpha is an Rgba8Unorm channel. Pack two exact bits into its four
+    // representable thirds: bit 0 = reflection probe, bit 1 = BSP global fog.
+    // This avoids allocating another full-resolution policy target merely to
+    // reproduce OpenJK's legacy framebuffer-space global fog pass.
+    let probe_bit = select(0u, 1u, (material.header.z & 2048u) != 0u);
+    let global_fog_bit = select(0u, 2u, (material.header.z & 67108864u) != 0u);
+    let packed_policy = f32(probe_bit | global_fog_bit) / 3.0;
     return vec4<f32>(
         ssr_eligible,
         active_planar,
         clamp(material.pbr_params0.w, 0.0, 1.0),
-        probe_available
+        packed_policy
     );
 }
 
@@ -205,10 +207,18 @@ fn bevy_motion_vector(world_position: vec3<f32>) -> vec2<f32> {
     return (current_clip - previous_clip) * vec2<f32>(0.5, -0.5);
 }
 
+// Radial distance is not affine across a triangle, so interpolating a
+// per-vertex distance overestimates it inside large polygons (a floor triangle
+// under a third-person camera could read several times too far). World
+// position is affine and interpolates exactly; take the distance per fragment.
+fn radial_depth(world_position: vec3<f32>) -> f32 {
+    return distance(world_position, camera.camera_pos_time.xyz);
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> FragmentOut {
     var out: FragmentOut;
-    out.linear_depth = input.camera_distance;
+    out.linear_depth = radial_depth(input.world_position);
     out.motion_vector = bevy_motion_vector(input.world_position);
     out.reflection_policy = reflection_policy(input.world_position);
     return out;
@@ -221,7 +231,7 @@ fn fs_mask(input: MaskVertexOut) -> FragmentOut {
         discard;
     }
     var out: FragmentOut;
-    out.linear_depth = input.camera_distance;
+    out.linear_depth = radial_depth(input.world_position);
     out.motion_vector = bevy_motion_vector(input.world_position);
     out.reflection_policy = reflection_policy(input.world_position);
     return out;

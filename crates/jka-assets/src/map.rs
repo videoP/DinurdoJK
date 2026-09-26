@@ -50,6 +50,12 @@ pub struct MapFace {
     /// as numeric source data because writers are not perfectly consistent about
     /// whether they are present or integral.
     pub trailing: Vec<f64>,
+    /// Byte range in the original source text occupied by only the face plane
+    /// declaration: three point tuples for legacy/Valve/brushDef, or the
+    /// `( nx ny nz d )` tuple for brushDef3. This lets editor save-back replace
+    /// geometry without touching texture projection, flags, comments, or line
+    /// formatting, even when a face declaration spans multiple lines.
+    pub plane_span: [usize; 2],
     pub line: usize,
 }
 
@@ -388,23 +394,29 @@ fn parse_brush(tokenizer: &mut Tokenizer<'_>, stats: &mut MapStats) -> Result<Ma
             properties.insert(key.to_ascii_lowercase(), value);
             continue;
         }
+        // Commit trivia before recording source coordinates. `peek()` above
+        // deliberately restores tokenizer state, so without this the line and
+        // byte offset can still point at the previous face's trailing newline.
+        tokenizer.skip_trivia()?;
         let face_line = tokenizer.line;
+        let plane_start = tokenizer.index;
 
-        let (plane, primitive_matrix) = if style == BrushStyle::BrushDef3 {
-            (
-                read_brush_def3_plane(tokenizer)?,
-                Some(read_texture_matrix(tokenizer)?),
-            )
+        let (plane, primitive_matrix, plane_end) = if style == BrushStyle::BrushDef3 {
+            let plane = read_brush_def3_plane(tokenizer)?;
+            let plane_end = tokenizer.index;
+            let matrix = Some(read_texture_matrix(tokenizer)?);
+            (plane, matrix, plane_end)
         } else {
             let p0 = read_point(tokenizer)?;
             let p1 = read_point(tokenizer)?;
             let p2 = read_point(tokenizer)?;
+            let plane_end = tokenizer.index;
             let matrix = if style == BrushStyle::BrushDef {
                 Some(read_texture_matrix(tokenizer)?)
             } else {
                 None
             };
-            (plane_from_points(p0, p1, p2), matrix)
+            (plane_from_points(p0, p1, p2), matrix, plane_end)
         };
 
         let shader =
@@ -462,6 +474,7 @@ fn parse_brush(tokenizer: &mut Tokenizer<'_>, stats: &mut MapStats) -> Result<Ma
                 shader,
                 projection,
                 trailing,
+                plane_span: [plane_start, plane_end],
                 line: face_line,
             });
         } else {

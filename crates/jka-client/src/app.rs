@@ -1,11 +1,16 @@
 mod egui_menu;
 mod egui_settings;
 mod frontend;
+mod map_editor;
 mod egui_theme;
 mod quality;
 
 use egui_menu::VideoSection;
-use frontend::{DemoEntry, FrontendPage, SoloMapEntry};
+use map_editor::MapEditor;
+use frontend::{
+    build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, DemoConsoleKind, DemoEntry,
+    DemoIndex, DemoMetadata, FrontendPage, SoloMapEntry,
+};
 
 use crate::{
     camera::{offset_third_person_view, Camera, ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewInput},
@@ -21,10 +26,11 @@ use crate::{
     },
     config,
     keybinds::{self, BindKey, Bindings},
-    player::{LocalPlayer, LocalPresentationSettings, MouseInputSettings},
+    local_server::LocalServer,
+    player::{LocalPresentationSettings, MouseInputSettings},
     renderer::{
         ClientFramePerf, DynamicModelSurface, EguiRenderData, InputLatencySample, PostEffects,
-        RenderCommand, RenderSnapshot, RenderThread,
+        RenderCommand, RenderSnapshot, RenderThread, TransientLight,
     },
     runtime::{SurfaceInspectorInfo, UserEvent},
     scene::{self, SpawnPoint},
@@ -36,7 +42,7 @@ use crate::{
         Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudLayout, HudState, MapLoadingBar, MapLoadingUi, OverlayMode, PerfStats,
         PlanarReflectionDebugMode, PvsMode, RainIntensity, ReflectionQuality, RendererBackend,
         SunVisibilityMode, TextureFilter, ThreadPerfStats, UiChatLine, UiScoreEntry, UiScoreboard, UiSnapshot,
-        VideoSettings, VsyncMode,
+        DemoKillMarkerUi, DemoTimelineUi, VideoSettings, VsyncMode,
     },
 };
 use std::{
@@ -68,12 +74,17 @@ const FALLBACK_RESOLUTIONS: [[u32; 2]; 5] = [
     [3840, 2160],
 ];
 const VIDEO_CONFIRM_TIMEOUT_SECS: u64 = 15;
+const DEMO_SCRUB_PREVIEW_INTERVAL: Duration = Duration::from_micros(41_667); // 24 Hz
 
 /// The frontend is a real rendered world, not a 2D levelshot. Keep the map
 /// fixed for now so menu art direction is deterministic; later this can become
 /// a cvar or an authored list of menu scenes without changing the load path.
 const FRONTEND_BACKGROUND_MAP: &str = "mp/duel3";
-const FRONTEND_CAMERA_EYE_HEIGHT: f32 = 26.0;
+const FRONTEND_CAMERA_EYE_HEIGHT: f32 = 18.0;
+const FRONTEND_FOREGROUND_MODEL: &str = "jedi_hm/head_a1|torso_d1|lower_a1";
+const FRONTEND_FOREGROUND_MODEL_DISTANCE: f32 = 52.0;
+const FRONTEND_FOREGROUND_MODEL_SIDE_OFFSET: f32 = 46.0;
+const FRONTEND_FOREGROUND_MODEL_HEAD_HEIGHT: f32 = 44.0;
 
 use jka_movement::{CollisionWorld, JoinMode};
 use jka_protocol::{
@@ -325,16 +336,18 @@ struct MapLoadingBarState {
 struct MapLoadingState {
     request_id: u64,
     name: String,
+    active_game_dir: Option<String>,
     preparation_finished: bool,
     bars: [MapLoadingBarState; 8],
 }
 
 impl MapLoadingState {
-    fn new(request_id: u64, name: String) -> Self {
+    fn new(request_id: u64, name: String, active_game: Option<&Path>) -> Self {
         use crate::thread_activity::Task;
         Self {
             request_id,
             name,
+            active_game_dir: active_game.map(|path| path.display().to_string()),
             preparation_finished: false,
             bars: [
                 MapLoadingBarState {
@@ -442,10 +455,29 @@ impl MapLoadingState {
         }
     }
 
+    fn progress_fraction(&self) -> f32 {
+        let mut sum = 0.0f32;
+        let mut count = 0u32;
+        for bar in &self.bars {
+            if bar.skipped || bar.total == 0 {
+                continue;
+            }
+            sum += (bar.completed as f32 / bar.total as f32).clamp(0.0, 1.0);
+            count += 1;
+        }
+        let prep = if count == 0 { 0.0 } else { sum / count as f32 };
+        if self.preparation_finished {
+            prep.max(0.92).min(0.98)
+        } else {
+            (prep * 0.9).clamp(0.0, 0.9)
+        }
+    }
+
     fn ui(&self) -> MapLoadingUi {
         use crate::thread_activity::Task;
         MapLoadingUi {
             map_name: self.name.clone(),
+            active_game_dir: self.active_game_dir.clone(),
             preparation_finished: self.preparation_finished,
             bars: self
                 .bars
@@ -495,11 +527,14 @@ fn prepared_map_has_ocean_surface(map: &scene::PreparedMap) -> bool {
 struct ChatRecord {
     text: String,
     created: Instant,
+    /// Demo timeline position when this line was authored. Live sessions use wall time.
+    demo_elapsed_ms: Option<f64>,
 }
 
 struct CenterPrintRecord {
     text: String,
     created: Instant,
+    demo_elapsed_ms: Option<f64>,
 }
 
 struct DemoRecording {
@@ -526,8 +561,12 @@ enum SessionPhase {
 #[derive(Debug, Clone, Copy)]
 struct DemoCameraSample {
     server_time: i32,
-    /// Actor origin in native JKA coordinates. OpenJK third-person starts here.
+    /// High-resolution visual sample time. Protocol/event ownership still uses
+    /// `server_time`; camera damping can use this without 1 ms quantization.
+    presentation_time_ms: f64,
+    /// Native JKA origin for BSP cluster/area visibility tests.
     native_origin: [f32; 3],
+    /// Actor origin in native JKA coordinates. OpenJK third-person starts here.
     eye_position: [f32; 3],
     player_position: [f32; 3],
     view_angles: [f32; 3],
@@ -542,6 +581,56 @@ struct DemoCameraSample {
 enum DemoAdvance {
     Running,
     Completed,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DemoTimelineHit {
+    PlayPause,
+    Track(f32),
+    Speed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoViewMode {
+    Authoritative,
+    Follow(i32),
+    Free,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemoFakeView {
+    client_num: i32,
+    eye_position: [f32; 3],
+    view_angles: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoConsoleFilter {
+    All,
+    Print,
+    Chat,
+    CenterPrint,
+    Event,
+}
+
+impl DemoConsoleFilter {
+    fn matches(self, kind: &DemoConsoleKind) -> bool {
+        matches!(self, Self::All)
+            || matches!(
+                (self, *kind),
+                (Self::Print, DemoConsoleKind::Print)
+                    | (Self::Chat, DemoConsoleKind::Chat)
+                    | (Self::CenterPrint, DemoConsoleKind::CenterPrint)
+                    | (Self::Event, DemoConsoleKind::Event)
+            )
+    }
+}
+
+#[derive(Debug)]
+struct DemoMetadataResult {
+    generation: u64,
+    demo_name: String,
+    result: Result<DemoMetadata, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -572,19 +661,29 @@ impl DemoTimeline {
         }
     }
 
-    fn target_time(self, now: Instant) -> i32 {
+    /// Continuous presentation time. Keep the demo clock at sub-millisecond
+    /// precision even though JKA protocol/snapshot times are integer ms. This
+    /// avoids quantizing multiple high-FPS render frames onto the same sample.
+    fn target_time_ms(self, now: Instant) -> f64 {
         let elapsed_ms = now.saturating_duration_since(self.wall_anchor).as_secs_f64() * 1000.0;
         let value = self.demo_anchor_ms + elapsed_ms * self.rate;
-        value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)).round() as i32
+        value.clamp(f64::from(i32::MIN), f64::from(i32::MAX))
     }
 
     fn set_rate(&mut self, now: Instant, rate: f64) {
-        self.demo_anchor_ms = f64::from(self.target_time(now));
+        // Preserve the exact fractional position when pausing or changing rate;
+        // otherwise every control change can inject a <= 1 ms presentation hop.
+        self.demo_anchor_ms = self.target_time_ms(now);
         self.wall_anchor = now;
         self.rate = rate;
         if rate > 0.0 {
             self.resume_rate = rate;
         }
+    }
+
+    fn seek(&mut self, now: Instant, demo_time_ms: f64) {
+        self.demo_anchor_ms = demo_time_ms.clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+        self.wall_anchor = now;
     }
 
     fn toggle_pause(&mut self, now: Instant) {
@@ -615,10 +714,15 @@ struct GameSession {
     /// network pump) instead of the demo reader, and their clock comes from
     /// CL_SetCGameTime rather than the demo timeline.
     live: bool,
+    /// In-process `/map`/`/devmap` source. It uses the same streamed snapshot
+    /// queue as networking, but has no netchan or client-side predictor.
+    local: bool,
     live_snapshots: VecDeque<ProtocolSnapshot>,
     qpath: String,
     source: String,
-    reader: DemoReader<Cursor<Vec<u8>>>,
+    reader: DemoReader<Cursor<Arc<[u8]>>>,
+    demo_bytes: Arc<[u8]>,
+    demo_index: Option<DemoIndex>,
     decoder: ServerMessageDecoder,
     messages: usize,
     snapshots: usize,
@@ -630,10 +734,20 @@ struct GameSession {
     first_server_time: Option<i32>,
     timeline: Option<DemoTimeline>,
     eof: bool,
+    seeking_demo: bool,
+    /// Presentation-only audio gate used while interactively scrubbing a demo.
+    /// Keep the backend alive/cached, but do not feed it transient replay audio.
+    suppress_audio: bool,
+    /// Remote ET_PLAYER to animate but not submit while faking its first-person POV.
+    demo_hidden_view_client: Option<i32>,
     player_position: Option<glam::Vec3>,
     client_game: ClientGameState,
     siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
     presented_entities: Vec<PresentedEntity>,
+    /// The predicted/followed player is intentionally absent from
+    /// `presented_entities`; keep the synthesized entity for this frame so
+    /// spatial audio can follow it through the final-camera respatialization.
+    audio_followed_entity: Option<PresentedEntity>,
     player_presenter: PlayerPresenter,
     entity_presenter: EntityPresenter,
     event_presenter: EventPresenter,
@@ -642,6 +756,8 @@ struct GameSession {
     weapon_fx: crate::cgame::weapon_fx::WeaponFx,
     /// This frame's FX primitives, tessellated once the final camera is known.
     fx_draws: Vec<crate::fx::system::FxDraw>,
+    /// RE_AddLightToScene-style FX lights in renderer coordinates.
+    fx_lights: Arc<Vec<TransientLight>>,
     fx_surfaces: Arc<Vec<DynamicModelSurface>>,
     dynamic_models: Arc<Vec<DynamicModelSurface>>,
     client_perf: ClientFramePerf,
@@ -735,6 +851,7 @@ fn probe_demo_fs_game(bytes: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+
 impl GameSession {
     fn new(
         qpath: String,
@@ -745,12 +862,27 @@ impl GameSession {
         entity_presenter: EntityPresenter,
         weapon_fx: crate::cgame::weapon_fx::WeaponFx,
     ) -> Self {
+        let demo_bytes: Arc<[u8]> = Arc::from(bytes);
+        let demo_index = if demo_bytes.is_empty() {
+            None
+        } else {
+            match build_demo_index(&demo_bytes) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    eprintln!("DEMO INDEX WARNING: {error}");
+                    None
+                }
+            }
+        };
         Self {
             live: false,
+            local: false,
             live_snapshots: VecDeque::new(),
             qpath,
             source,
-            reader: DemoReader::new(Cursor::new(bytes)),
+            reader: DemoReader::new(Cursor::new(demo_bytes.clone())),
+            demo_bytes,
+            demo_index,
             decoder: ServerMessageDecoder::new(),
             messages: 0,
             snapshots: 0,
@@ -762,16 +894,21 @@ impl GameSession {
             first_server_time: None,
             timeline: None,
             eof: false,
+            seeking_demo: false,
+            suppress_audio: false,
+            demo_hidden_view_client: None,
             player_position: None,
             client_game: ClientGameState::new(),
             siege_classes,
             presented_entities: Vec::new(),
+            audio_followed_entity: None,
             player_presenter,
             entity_presenter,
             event_presenter: EventPresenter::default(),
             sound_presenter: None,
             weapon_fx,
             fx_draws: Vec::new(),
+            fx_lights: Arc::new(Vec::new()),
             fx_surfaces: Arc::new(Vec::new()),
             dynamic_models: Arc::new(Vec::new()),
             client_perf: ClientFramePerf::default(),
@@ -876,10 +1013,12 @@ impl GameSession {
             Ok(Some(record)) => record,
             Ok(None) => {
                 self.eof = true;
-                println!(
-                    "DEMO EOF: {} messages, {} valid snapshots",
-                    self.messages, self.snapshots
-                );
+                if !self.seeking_demo {
+                    println!(
+                        "DEMO EOF: {} messages, {} valid snapshots",
+                        self.messages, self.snapshots
+                    );
+                }
                 return Ok(None);
             }
             Err(error) => {
@@ -913,18 +1052,20 @@ impl GameSession {
                     client_number,
                     checksum_feed,
                 } => {
-                    println!(
-                        "DEMO svc_gamestate: sequence={} serverCommandSequence={} configstrings={} baselines={} clientNum={} checksumFeed=0x{:08x}",
-                        sequence,
-                        server_command_sequence,
-                        configstrings,
-                        baselines,
-                        client_number,
-                        checksum_feed
-                    );
+                    if !self.seeking_demo {
+                        println!(
+                            "DEMO svc_gamestate: sequence={} serverCommandSequence={} configstrings={} baselines={} clientNum={} checksumFeed=0x{:08x}",
+                            sequence,
+                            server_command_sequence,
+                            configstrings,
+                            baselines,
+                            client_number,
+                            checksum_feed
+                        );
+                    }
                     if let Some(map) = self.decoder.map_name() {
                         if self.map_name.as_deref() != Some(map.as_str()) {
-                            println!("DEMO map: {map}");
+                            if !self.seeking_demo { println!("DEMO map: {map}"); }
                         }
                         self.map_name = Some(map);
                     }
@@ -937,11 +1078,13 @@ impl GameSession {
                 }
                 ServerMessageEvent::ServerCommand(command) => {
                     self.client_game.queue_server_command(command.clone());
-                    println!(
-                        "DEMO svc_serverCommand #{}: {}",
-                        command.sequence,
-                        String::from_utf8_lossy(&command.text)
-                    );
+                    if !self.seeking_demo {
+                        println!(
+                            "DEMO svc_serverCommand #{}: {}",
+                            command.sequence,
+                            String::from_utf8_lossy(&command.text)
+                        );
+                    }
                 }
                 ServerMessageEvent::Snapshot {
                     server_time,
@@ -950,7 +1093,7 @@ impl GameSession {
                     entities,
                 } => {
                     self.snapshots += 1;
-                    if self.snapshots == 1 || self.snapshots % 60 == 0 {
+                    if !self.seeking_demo && (self.snapshots == 1 || self.snapshots % 60 == 0) {
                         println!(
                             "DEMO svc_snapshot: serverTime={} message={} delta={} entities={} decodedSnapshots={}",
                             server_time,
@@ -963,10 +1106,12 @@ impl GameSession {
                     decoded_snapshot = self.decoder.latest_snapshot().cloned();
                 }
                 ServerMessageEvent::SetGame(game) => {
-                    println!("DEMO svc_setgame: {}", String::from_utf8_lossy(game));
+                    if !self.seeking_demo {
+                        println!("DEMO svc_setgame: {}", String::from_utf8_lossy(game));
+                    }
                 }
-                ServerMessageEvent::MapChange => println!("DEMO svc_mapchange"),
-                ServerMessageEvent::Download => println!("DEMO svc_download"),
+                ServerMessageEvent::MapChange => { if !self.seeking_demo { println!("DEMO svc_mapchange"); } }
+                ServerMessageEvent::Download(_) => { if !self.seeking_demo { println!("DEMO svc_download"); } }
             }
         }
 
@@ -986,6 +1131,25 @@ impl GameSession {
         Ok(())
     }
 
+    /// Change the UI playback speed without changing pause state. The play/pause
+    /// control owns whether time advances; the speed control owns resume speed.
+    fn set_playback_speed(&mut self, now: Instant, speed: f64) -> Result<(), String> {
+        if !speed.is_finite() || speed <= 0.0 || speed > 100.0 {
+            return Err("DEMO SPEED MUST BE GREATER THAN 0 AND AT MOST 100".into());
+        }
+        let timeline = self
+            .timeline
+            .as_mut()
+            .ok_or_else(|| "DEMO PLAYBACK CLOCK WAS NOT INITIALIZED".to_owned())?;
+        if timeline.rate == 0.0 {
+            timeline.resume_rate = speed;
+        } else {
+            timeline.set_rate(now, speed);
+            if let Some(sound) = &mut self.sound_presenter { sound.set_rate(speed as f32); }
+        }
+        Ok(())
+    }
+
     fn toggle_pause(&mut self, now: Instant) -> Result<f64, String> {
         let timeline = self
             .timeline
@@ -998,6 +1162,176 @@ impl GameSession {
 
     fn playback_rate(&self) -> Option<f64> {
         self.timeline.map(|timeline| timeline.rate)
+    }
+
+    fn set_audio_suppressed(&mut self, suppressed: bool) {
+        if self.suppress_audio == suppressed {
+            return;
+        }
+        self.suppress_audio = suppressed;
+        // Stop anything already queued/looping at the boundary. On resume the
+        // destination frame rebuilds valid loops and future one-shots normally.
+        if let Some(sound) = &mut self.sound_presenter {
+            sound.clear();
+        }
+    }
+
+    fn demo_duration_ms(&self) -> Option<i32> {
+        self.demo_index.as_ref().map(DemoIndex::duration_ms)
+    }
+
+    fn demo_elapsed_ms(&self, now: Instant) -> Option<f64> {
+        let first = f64::from(self.demo_index.as_ref()?.first_active_server_time?);
+        let current = self.timeline?.target_time_ms(now);
+        Some((current - first).clamp(0.0, f64::from(self.demo_duration_ms()?.max(0))))
+    }
+
+    fn demo_followed_client(&self) -> Option<i32> {
+        self.current_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"))
+    }
+
+    fn demo_visible_players(&self) -> Vec<(i32, String)> {
+        let authoritative = self.demo_followed_client();
+        let mut out = Vec::<(i32, String)>::new();
+        for client in authoritative.into_iter().chain(
+            self.presented_entities.iter()
+                .filter(|entity| entity.entity_type == ET_PLAYER)
+                .map(|entity| i32::from(entity.number))
+        ) {
+            if out.iter().any(|(existing, _)| *existing == client) {
+                continue;
+            }
+            let name = usize::try_from(client).ok()
+                .and_then(|client| self.client_game.client_info(client, &self.siege_classes))
+                .map(|info| info.name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("CLIENT {client}"));
+            out.push((client, name));
+        }
+        out.sort_by_key(|(client, _)| *client);
+        out
+    }
+
+    fn demo_fake_view(&self, client_num: i32) -> Option<DemoFakeView> {
+        let entity = self.presented_entities.iter().find(|entity| {
+            entity.entity_type == ET_PLAYER && i32::from(entity.number) == client_num
+        })?;
+        // Remote demos do not carry another client's playerState/viewheight, so this
+        // is intentionally a presentation approximation. Standing eye height is the
+        // JKA player-view default; authoritative POV keeps the exact playerState path.
+        let mut eye = entity.origin;
+        eye[2] += 26.0;
+        Some(DemoFakeView {
+            client_num,
+            eye_position: scene::render_position(eye),
+            view_angles: entity.angles,
+        })
+    }
+
+    fn demo_area_mask(&self) -> Option<[u8; 32]> {
+        self.current_snapshot.as_ref().map(|snapshot| snapshot.area_mask)
+    }
+
+    fn reset_demo_stream_for_seek(&mut self) {
+        self.reader = DemoReader::new(Cursor::new(self.demo_bytes.clone()));
+        self.decoder = ServerMessageDecoder::new();
+        self.messages = 0;
+        self.snapshots = 0;
+        self.phase = SessionPhase::WaitingForMap;
+        self.map_name = None;
+        self.pending_snapshot = None;
+        self.current_snapshot = None;
+        self.next_snapshot = None;
+        self.first_server_time = None;
+        self.timeline = None;
+        self.eof = false;
+        self.player_position = None;
+        self.client_game = ClientGameState::new();
+        self.presented_entities.clear();
+        self.event_presenter.clear();
+        if let Some(sound) = &mut self.sound_presenter {
+            sound.clear();
+        }
+        self.weapon_fx.reset_for_seek(0);
+        self.player_presenter.reset_for_seek();
+        self.fx_draws.clear();
+        self.fx_lights = Arc::new(Vec::new());
+        self.fx_surfaces = Arc::new(Vec::new());
+        self.dynamic_models = Arc::new(Vec::new());
+        self.inline_models = Arc::new(Vec::new());
+        self.clear_event_stats();
+    }
+
+    fn seek_demo(&mut self, now: Instant, elapsed_ms: i32) -> Result<DemoCameraSample, String> {
+        if self.live {
+            return Err("DEMO SEEK IS NOT AVAILABLE FOR LIVE SESSIONS".into());
+        }
+        self.seeking_demo = true;
+        let result = self.seek_demo_inner(now, elapsed_ms);
+        self.seeking_demo = false;
+        result
+    }
+
+    fn seek_demo_inner(&mut self, now: Instant, elapsed_ms: i32) -> Result<DemoCameraSample, String> {
+        let (first, duration) = {
+            let index = self
+                .demo_index
+                .as_ref()
+                .ok_or_else(|| "DEMO TIMELINE INDEX IS UNAVAILABLE".to_owned())?;
+            let first = index
+                .first_active_server_time
+                .ok_or_else(|| "DEMO TIMELINE HAS NO ACTIVE START".to_owned())?;
+            (first, index.duration_ms())
+        };
+        let elapsed_ms = elapsed_ms.clamp(0, duration);
+        let target = first.saturating_add(elapsed_ms);
+        let (rate, resume_rate) = self
+            .timeline
+            .map(|timeline| (timeline.rate, timeline.resume_rate))
+            .unwrap_or((1.0, 1.0));
+
+        self.reset_demo_stream_for_seek();
+        let _map = self.read_until_map()?;
+        let _ = self.begin_after_map_load(now)?;
+
+        while self
+            .next_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| target >= snapshot.server_time)
+        {
+            self.client_game.transition_snapshot(target)?;
+            self.current_snapshot = self.next_snapshot.take();
+            self.next_snapshot = self.read_next_snapshot()?;
+            self.client_game.set_next_snapshot(self.next_snapshot.as_ref())?;
+        }
+
+        // Seeking reconstructs authoritative CGame state, but transient effects
+        // from the replay-to-target pass must not burst onto the destination frame.
+        let _ = self.client_game.drain_presentation_events();
+        let _ = self.client_game.drain_event_check_traces();
+        // Replayed server commands are historical at the seek destination. The App
+        // reconstructs chat/centerprint explicitly from the indexed demo timeline.
+        let _ = self.client_game.drain_notices();
+        self.event_presenter.clear();
+        if let Some(sound) = &mut self.sound_presenter {
+            sound.clear();
+            sound.set_rate(rate as f32);
+        }
+        self.weapon_fx.reset_for_seek(target);
+        self.weapon_fx.begin_frame(target);
+        self.presented_entities = self.client_game.present_entities_at(f64::from(target))?;
+        let sample = self
+            .sample_at(f64::from(target), target, true)
+            .ok_or_else(|| "DEMO SEEK TARGET HAS NO CAMERA PLAYERSTATE".to_owned())?;
+        self.player_position = Some(glam::Vec3::from_array(sample.player_position));
+        if let Some(timeline) = &mut self.timeline {
+            timeline.seek(now, f64::from(target));
+            timeline.rate = rate;
+            timeline.resume_rate = resume_rate;
+        }
+        Ok(sample)
     }
 
     fn read_until_map(&mut self) -> Result<String, String> {
@@ -1062,7 +1396,11 @@ impl GameSession {
         self.client_game.set_next_snapshot(self.next_snapshot.as_ref())?;
         self.timeline = Some(DemoTimeline::new(self.first_server_time.unwrap(), now));
         self.phase = SessionPhase::Playing;
-        self.sample_at(self.first_server_time.unwrap(), false)
+        self.sample_at(
+            f64::from(self.first_server_time.unwrap()),
+            self.first_server_time.unwrap(),
+            false,
+        )
             .ok_or_else(|| "DEMO FIRST SNAPSHOT HAS NO CAMERA PLAYERSTATE".to_owned())
     }
 
@@ -1102,16 +1440,19 @@ impl GameSession {
         if self.phase != SessionPhase::Playing {
             return Err("DEMO PLAYBACK ADVANCED BEFORE MAP LOAD".to_owned());
         }
-        let target_server_time = self
+        let presentation_time_ms = self
             .timeline
             .ok_or_else(|| "DEMO PLAYBACK CLOCK WAS NOT INITIALIZED".to_owned())?
-            .target_time(now);
-        self.advance_to(
+            .target_time_ms(now);
+        let target_server_time = presentation_time_ms.floor() as i32;
+        self.advance_to_with_prediction(
             target_server_time,
+            presentation_time_ms,
             third_person,
             first_person_lightsaber,
             debug_events,
             ghoul2_view,
+            None,
         )
     }
 
@@ -1125,6 +1466,7 @@ impl GameSession {
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.advance_to_with_prediction(
             target_server_time,
+            f64::from(target_server_time),
             third_person,
             first_person_lightsaber,
             debug_events,
@@ -1138,6 +1480,7 @@ impl GameSession {
     fn advance_to_with_prediction(
         &mut self,
         target_server_time: i32,
+        presentation_time_ms: f64,
         third_person: ThirdPersonSettings,
         first_person_lightsaber: bool,
         debug_events: u8,
@@ -1156,6 +1499,11 @@ impl GameSession {
         // Live cl.serverTime can trail the newest snapshot right after the
         // first one or a time reset; CG_ProcessSnapshots simply holds there.
         let target_server_time = if self.live { target_server_time.max(current_time) } else { target_server_time };
+        let presentation_time_ms = if self.live {
+            presentation_time_ms.max(f64::from(current_time))
+        } else {
+            presentation_time_ms
+        };
         if target_server_time < current_time {
             return Err(format!(
                 "DEMO REVERSE/SEEK REQUIRES CHECKPOINT RESTORE: target {target_server_time} < current snapshot {current_time}"
@@ -1188,6 +1536,19 @@ impl GameSession {
         {
             if let (Some(current), Some(next)) = (&self.current_snapshot, &self.next_snapshot) {
                 camera_teleported |= snapshot_discontinuity(current, next);
+                if self.local {
+                    // The local shim is already authoritative Pmove, so there is
+                    // no separate CG_PredictPlayerState call to drive
+                    // CG_TransitionPlayerState. Consume each committed
+                    // playerState transition here instead. This is where Pmove
+                    // predictable events (footsteps, jump/roll and saber
+                    // attacks) enter the shared CGame event/audio path.
+                    self.client_game.transition_predicted_player_state(
+                        &next.player_state,
+                        &current.player_state,
+                        next.server_time,
+                    )?;
+                }
             }
             self.client_game.transition_snapshot(target_server_time)?;
             self.current_snapshot = self.next_snapshot.take();
@@ -1198,7 +1559,7 @@ impl GameSession {
         // FX_AdjustTime: effects spawned by this frame's events and entities
         // start at cg.time.
         self.weapon_fx.begin_frame(target_server_time);
-        self.presented_entities = self.client_game.present_entities(target_server_time)?;
+        self.presented_entities = self.client_game.present_entities_at(presentation_time_ms)?;
         let predicted = match (predict, self.current_snapshot.as_ref()) {
             (Some(predict), Some(current)) => predict(current, self.next_snapshot.as_ref(), &self.presented_entities)?,
             _ => None,
@@ -1219,10 +1580,21 @@ impl GameSession {
                 camera_teleported,
                 prediction.error,
             ),
-            None => self.sample_at(target_server_time, camera_teleported),
+            None => self.sample_at(presentation_time_ms, target_server_time, camera_teleported),
         }
         .ok_or_else(|| "DEMO CURRENT SNAPSHOT HAS NO CAMERA PLAYERSTATE".to_owned())?;
         self.client_perf.snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+
+        // CG_AddEntities adds cg.predictedPlayerEntity separately from packet
+        // entities. Audio has the same ownership rule: the local/followed
+        // player's loops and entity position must still exist even though
+        // present_entities() intentionally skips that packet entity.
+        let followed_entity = match &predicted {
+            Some(prediction) => crate::cgame::presented_player_state_entity(&prediction.display),
+            None => self.client_game.present_followed_player_at(presentation_time_ms),
+        };
+        self.audio_followed_entity.clone_from(&followed_entity);
+
         // Presentation needs a renderer view before App::apply_demo_camera runs.
         // First person can use this frame's exact sampled eye immediately. Third
         // person needs collision/orbit state owned by App, so it uses the previous
@@ -1242,19 +1614,28 @@ impl GameSession {
             ghoul2_view
         };
         let audio_started = Instant::now();
-        if let Some(sound) = &mut self.sound_presenter {
-            sound.update_loops(
-                &self.client_game,
-                &self.siege_classes,
-                &self.presented_entities,
-                sample.client_num as u16,
-            );
-            let yaw = sample.view_angles[1].to_radians();
-            sound.frame(crate::audio::Listener {
-                entity: sample.client_num as u16,
-                origin: scene::jka_position(sample.eye_position),
-                left: [-yaw.sin(), yaw.cos(), 0.0],
-            }, &self.presented_entities);
+        if !self.suppress_audio {
+            if let Some(sound) = &mut self.sound_presenter {
+                sound.update_loops(
+                    &self.client_game,
+                    &self.siege_classes,
+                    &self.presented_entities,
+                    followed_entity.as_ref(),
+                    sample.client_num as u16,
+                );
+                let yaw = sample.view_angles[1].to_radians();
+                sound.frame(
+                    crate::audio::Listener {
+                        entity: sample.client_num as u16,
+                        origin: scene::jka_position(sample.eye_position),
+                        ahead: [yaw.cos(), yaw.sin(), 0.0],
+                        up: [0.0, 0.0, 1.0],
+                        left: [-yaw.sin(), yaw.cos(), 0.0],
+                    },
+                    &self.presented_entities,
+                    followed_entity.as_ref(),
+                );
+            }
         }
         self.client_perf.audio_ms += audio_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1286,8 +1667,12 @@ impl GameSession {
         for event in self.client_game.drain_presentation_events() {
             let fx_dispatch = self.weapon_fx.entity_event(&event, &self.client_game);
             let sound_dispatch_started = Instant::now();
-            let sound_dispatch = self.sound_presenter.as_mut()
-                .and_then(|sound| sound.dispatch(&event, &self.client_game, &self.siege_classes, target_server_time));
+            let sound_dispatch = if self.suppress_audio {
+                None
+            } else {
+                self.sound_presenter.as_mut()
+                    .and_then(|sound| sound.dispatch(&event, &self.client_game, &self.siege_classes, target_server_time))
+            };
             self.client_perf.audio_ms += sound_dispatch_started.elapsed().as_secs_f64() * 1000.0;
             let dispatch = sound_dispatch
                 .or(fx_dispatch)
@@ -1362,7 +1747,7 @@ impl GameSession {
         // CG_AddEntities adds cg.predictedPlayerEntity for the local player.
         let followed_entity = match &predicted {
             Some(prediction) => crate::cgame::presented_player_state_entity(&prediction.display),
-            None => self.client_game.present_followed_player(target_server_time),
+            None => self.client_game.present_followed_player_at(presentation_time_ms),
         };
         let followed_entity_num = followed_entity.as_ref().map(|entity| entity.number);
         // forceGripCripple is one of the few exact victim-side grip signals in
@@ -1423,6 +1808,7 @@ impl GameSession {
             &self.siege_classes,
             target_server_time,
             followed_entity_num,
+            self.demo_hidden_view_client.and_then(|client| u16::try_from(client).ok()),
             ghoul2_view,
         ));
         self.client_perf.player_present_ms = player_present_started.elapsed().as_secs_f64() * 1000.0;
@@ -1489,9 +1875,32 @@ impl GameSession {
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
         let fx_frame = self.weapon_fx.end_frame();
         self.fx_draws = fx_frame.draws;
-        if let Some(sound) = &mut self.sound_presenter {
-            for fx_sound in &fx_frame.sounds {
-                sound.play_fx_sound(&fx_sound.qpath, fx_sound.origin);
+        self.fx_lights = Arc::new(
+            fx_frame
+                .lights
+                .iter()
+                .filter(|light| {
+                    light.radius.is_finite()
+                        && light.radius > 0.0
+                        && light.origin.iter().all(|value| value.is_finite())
+                        && light.rgb.iter().all(|value| value.is_finite())
+                })
+                .map(|light| TransientLight {
+                    position: scene::render_position(light.origin),
+                    color: light.rgb.map(|value| value.max(0.0)),
+                    radius: light.radius,
+                    // OpenJK's FX primitive passes RGB plus radius to
+                    // RE_AddLightToScene; the renderer's point-light intensity
+                    // scale of 1.0 is the matching neutral source strength.
+                    intensity: 1.0,
+                })
+                .collect(),
+        );
+        if !self.suppress_audio {
+            if let Some(sound) = &mut self.sound_presenter {
+                for fx_sound in &fx_frame.sounds {
+                    sound.play_fx_sound(&fx_sound.qpath, fx_sound.origin);
+                }
             }
         }
         self.client_perf.fx_ms = fx_started.elapsed().as_secs_f64() * 1000.0;
@@ -1536,7 +1945,12 @@ impl GameSession {
         ))
     }
 
-    fn sample_at(&self, server_time: i32, teleported: bool) -> Option<DemoCameraSample> {
+    fn sample_at(
+        &self,
+        presentation_time_ms: f64,
+        server_time: i32,
+        teleported: bool,
+    ) -> Option<DemoCameraSample> {
         let current = self.current_snapshot.as_ref()?;
         let next = self.next_snapshot.as_ref();
         // Match CG_SetNextSnap's demo interpolation guards: abrupt teleports,
@@ -1549,8 +1963,8 @@ impl GameSession {
         } else {
             next.filter(|next| next.server_time > current.server_time)
                 .map(|next| {
-                    (server_time - current.server_time) as f32
-                        / (next.server_time - current.server_time) as f32
+                    ((presentation_time_ms - f64::from(current.server_time))
+                        / f64::from(next.server_time - current.server_time)) as f32
                 })
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0)
@@ -1589,6 +2003,7 @@ impl GameSession {
         eye[2] += viewheight;
         Some(DemoCameraSample {
             server_time,
+            presentation_time_ms,
             native_origin: origin,
             eye_position: scene::render_position(eye),
             player_position: scene::render_position(origin),
@@ -1618,6 +2033,7 @@ fn sample_player_state(
     eye[2] += view_height as f32;
     Some(DemoCameraSample {
         server_time,
+        presentation_time_ms: f64::from(server_time),
         native_origin: view_origin,
         eye_position: scene::render_position(eye),
         player_position: scene::render_position(origin),
@@ -1651,6 +2067,70 @@ fn lerp_angle_degrees(a: f32, b: f32, alpha: f32) -> f32 {
     a + delta * alpha
 }
 
+#[derive(Clone)]
+struct MissingMapPrompt {
+    map_name: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveJoinUiPhase {
+    CheckingContent,
+    Synchronizing,
+}
+
+#[derive(Clone)]
+struct LiveJoinUiState {
+    map_name: String,
+    phase: LiveJoinUiPhase,
+    detail: String,
+}
+
+enum LiveDownloadTransfer {
+    Idle,
+    Http {
+        rx: Receiver<crate::download::HttpEvent>,
+    },
+    Legacy {
+        file: File,
+        temp_path: PathBuf,
+        expected_block: u16,
+        received: u64,
+        total: Option<u64>,
+    },
+}
+
+struct LiveDownloadState {
+    map_name: String,
+    files: Vec<crate::download::DownloadSpec>,
+    index: usize,
+    http_base: Option<String>,
+    server_allows_legacy: bool,
+    transfer: LiveDownloadTransfer,
+    received: u64,
+    total: Option<u64>,
+    status: String,
+}
+
+impl LiveDownloadState {
+    fn current(&self) -> Option<&crate::download::DownloadSpec> {
+        self.files.get(self.index)
+    }
+}
+
+/// Dedicated, silent FX scheduler used only by Developer Tools. Keeping this
+/// separate from CGame's weapon/map FX means previewing an .efx file can never
+/// perturb a live/demo effect timeline.
+struct AssetPreviewFxState {
+    qpath: String,
+    zoom_key: i32,
+    system: crate::fx::system::FxSystem,
+    effect_id: crate::fx::system::EffectId,
+    started: Instant,
+    next_play_ms: i32,
+    cycle_ms: i32,
+}
+
 pub struct App {
     base: PathBuf,
     /// Command-line/local game directory. Session fs_game is restored to this on disconnect.
@@ -1666,16 +2146,74 @@ pub struct App {
     solo_catalog_error: Option<String>,
     solo_levelshot_texture: Option<egui::TextureHandle>,
     solo_levelshot_texture_map: Option<String>,
+    source_maps: Vec<SoloMapEntry>,
+    source_map_selected: usize,
+    source_map_catalog_loaded: bool,
+    source_map_catalog_error: Option<String>,
+    source_map_levelshot_texture: Option<egui::TextureHandle>,
+    source_map_levelshot_texture_map: Option<String>,
+    asset_viewer_entries: Vec<AssetEntry>,
+    asset_viewer_catalog_loaded: bool,
+    asset_viewer_catalog_error: Option<String>,
+    asset_viewer_selected: Option<String>,
+    asset_viewer_filter: AssetFilter,
+    asset_viewer_search: String,
+    asset_viewer_folder: String,
+    /// Optional physical .shader file filter. Shader rows themselves represent
+    /// individual definitions inside these files. Empty means all files.
+    asset_viewer_shader_file: String,
+    /// Letter of the asset nearest the visual center of the scrolling grid.
+    /// This is navigation state, not a filter.
+    asset_viewer_letter: Option<char>,
+    asset_viewer_jump_letter: Option<char>,
+    asset_viewer_detail_path: Option<String>,
+    asset_viewer_detail: Option<Result<AssetDetail, String>>,
+    asset_viewer_shader_name: Option<String>,
+    asset_viewer_model_yaw: f32,
+    asset_viewer_model_zoom: f32,
+    asset_preview_player_presenter: Option<PlayerPresenter>,
+    asset_preview_entity_presenter: Option<EntityPresenter>,
+    asset_preview_model_key: Option<(String, i32, i32)>,
+    asset_preview_shader_key: Option<(String, String, i32)>,
+    asset_preview_fx: Option<AssetPreviewFxState>,
+    asset_preview_viewport_key: Option<[u32; 4]>,
     demo_entries: Vec<DemoEntry>,
     demo_selected: usize,
     demo_catalog_loaded: bool,
     demo_catalog_error: Option<String>,
+    demo_metadata_cache: BTreeMap<String, DemoMetadata>,
+    demo_metadata_errors: BTreeMap<String, String>,
+    demo_metadata_generation: u64,
+    demo_metadata_inflight: HashSet<String>,
+    demo_metadata_tx: Sender<DemoMetadataResult>,
+    demo_metadata_rx: Receiver<DemoMetadataResult>,
+    demo_console_filter: DemoConsoleFilter,
+    demo_launch_seek_ms: Option<i32>,
+    demo_view_mode: DemoViewMode,
+    demo_view_outside_authoritative: bool,
     server_browser_tx: Sender<BrowserCommand>,
     server_browser_rx: Receiver<BrowserEvent>,
     server_browser: BrowserUiState,
     game_session: Option<GameSession>,
     /// True while live CGame/networking are active without a locally loaded BSP.
     live_without_world: bool,
+    /// True while demo playback is active without the demo's locally loaded BSP.
+    demo_without_world: bool,
+    /// Blocking pre-connect choice shown when infoResponse names a BSP that is not installed.
+    missing_map_prompt: Option<MissingMapPrompt>,
+    /// Blocking demo-playback choice shown when the recorded BSP is not installed.
+    demo_missing_map_prompt: Option<MissingMapPrompt>,
+    /// One-connection authorization from the prompt's "Connect anyway" action.
+    live_missing_map_authorized: bool,
+    /// One-connection request to resolve missing referenced PK3s before map init.
+    live_auto_download_requested: bool,
+    /// HTTP download root learned from TaystJK-compatible mvhttp/mvhttpurl infoResponse fields.
+    live_http_base: Option<String>,
+    live_download: Option<LiveDownloadState>,
+    /// Full-screen visual continuity for an autodownload-assisted join. This
+    /// deliberately outlives the transfer itself so the main menu and the
+    /// ordinary map splash cannot flash between download/gamestate/map phases.
+    live_join_ui: Option<LiveJoinUiState>,
     /// Live server connection (OpenJK clc/cls networking).
     net: Option<crate::net::NetClient>,
     /// Presenter/material prep kicked off at connect time and consumed when the
@@ -1729,8 +2267,9 @@ pub struct App {
     render: Option<RenderThread>,
     startup_first_frame_seen: bool,
     camera: Camera,
-    local_player: Option<LocalPlayer>,
+    local_server: Option<LocalServer>,
     map_collision: Option<CollisionWorld>,
+    map_visibility: Option<jka_assets::bsp::Visibility>,
     steam_audio_acoustic_mesh: Option<Arc<jka_assets::bsp::AcousticMesh>>,
     steam_audio_bake: Option<Arc<crate::steam_audio::SteamAudioBakeData>>,
     steam_audio_bake_progress: Option<f32>,
@@ -1739,6 +2278,7 @@ pub struct App {
     map_physics_collision: PhysicsMapMesh,
     third_person: ThirdPersonSettings,
     first_person_lightsaber: bool,
+    saber_trail: i32,
     cg_debug_events: u8,
     crosshair: ui::CrosshairSettings,
     movement_keys_hud: ui::MovementKeysSettings,
@@ -1773,6 +2313,12 @@ pub struct App {
     pending_mouse_input: Option<(u64, Instant)>,
     last_simulated_mouse_input: Option<InputLatencySample>,
     cursor_position: (f64, f64),
+    demo_scrub_dragging: bool,
+    demo_scrub_fraction: Option<f32>,
+    demo_scrub_resume_rate: f64,
+    demo_scrub_last_seek: Option<Instant>,
+    demo_scrub_last_applied_fraction: Option<f32>,
+    last_demo_timeline_refresh: Instant,
     previous_tick: Instant,
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
@@ -1809,7 +2355,6 @@ pub struct App {
     chat_input: String,
     chat_lines: VecDeque<ChatRecord>,
     last_chat_refresh: Instant,
-    last_hud_state: Option<HudState>,
     video_selected: usize,
     /// Which section of Setup -> Video the left rail is showing.
     video_section: VideoSection,
@@ -1850,6 +2395,22 @@ pub struct App {
     spawns: Vec<SpawnPoint>,
     spawn_index: usize,
     map_name: String,
+    /// Lightweight source-.map brush editor state. Present only for loose writable .map sources.
+    map_editor: Option<MapEditor>,
+    /// Set by Developer Tools -> Map Viewer when EDIT SOURCE MAP launches a map.
+    source_map_edit_on_load: bool,
+    /// Background rebuild of the editor's unsaved working document. This is a
+    /// render-only refresh: it never replaces the editor state or writes disk.
+    map_edit_preview_request_id: Option<u64>,
+    /// A snapped editor gesture changed again while a textured preview rebuild
+    /// was already in flight. Keep only one expensive full source-map rebuild
+    /// active at a time; when it lands, immediately request the newest working
+    /// document instead of queuing stale mouse positions.
+    map_edit_preview_dirty: bool,
+    /// Last painted toolbar bounds in egui points. Raw 3D editor input must not
+    /// leak through these controls (egui-winit does not mark every pointer
+    /// button event consumed just because it lands on a foreground Area).
+    map_edit_toolbar_rect: Option<egui::Rect>,
     triangles: usize,
     /// Authored worldspawn distanceCull, or JKA's default when absent.
     map_distance_cull: f32,
@@ -1899,7 +2460,7 @@ impl App {
         let loader_tx = spawn_map_loader(base.clone(), proxy.clone())?;
         let log_rx = crate::logging::subscribe();
         let settings_dir = jka_assets::pk3::active_game_directory(&base, game.as_deref());
-        let config_path = settings_dir.join("jka-rust.cfg");
+        let config_path = settings_dir.join("DinurdoJK.cfg");
         let legacy_config = settings_dir.join("jampconfig.cfg");
         let mut video = config::load_video_settings(&config_path, Some(&legacy_config));
         let audio = config::load_audio_settings(&config_path, Some(&legacy_config));
@@ -1936,14 +2497,21 @@ impl App {
         let config_dirty = !config_path.is_file() || aa_normalized;
         let fresh_install = !config_path.is_file();
         let initial_label = initial_source.label();
+        let initial_loading = launch_map.then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
         let front_end = !launch_map;
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
         let server_browser = BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
+        let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
         let mut app = Self {
             base,
             startup_game: game.clone(),
             game,
             map_name: initial_label.clone(),
+            map_editor: None,
+            source_map_edit_on_load: false,
+            map_edit_preview_request_id: None,
+            map_edit_preview_dirty: false,
+            map_edit_toolbar_rect: None,
             initial_source,
             front_end,
             frontend_page: FrontendPage::Main,
@@ -1953,15 +2521,60 @@ impl App {
             solo_catalog_error: None,
             solo_levelshot_texture: None,
             solo_levelshot_texture_map: None,
+            source_maps: Vec::new(),
+            source_map_selected: 0,
+            source_map_catalog_loaded: false,
+            source_map_catalog_error: None,
+            source_map_levelshot_texture: None,
+            source_map_levelshot_texture_map: None,
+            asset_viewer_entries: Vec::new(),
+            asset_viewer_catalog_loaded: false,
+            asset_viewer_catalog_error: None,
+            asset_viewer_selected: None,
+            asset_viewer_filter: AssetFilter::All,
+            asset_viewer_search: String::new(),
+            asset_viewer_folder: String::new(),
+            asset_viewer_shader_file: String::new(),
+            asset_viewer_letter: None,
+            asset_viewer_jump_letter: None,
+            asset_viewer_detail_path: None,
+            asset_viewer_detail: None,
+            asset_viewer_shader_name: None,
+            asset_viewer_model_yaw: 180.0,
+            asset_viewer_model_zoom: 1.0,
+            asset_preview_player_presenter: None,
+            asset_preview_entity_presenter: None,
+            asset_preview_model_key: None,
+            asset_preview_shader_key: None,
+            asset_preview_fx: None,
+            asset_preview_viewport_key: None,
             demo_entries: Vec::new(),
             demo_selected: 0,
             demo_catalog_loaded: false,
             demo_catalog_error: None,
+            demo_metadata_cache: BTreeMap::new(),
+            demo_metadata_errors: BTreeMap::new(),
+            demo_metadata_generation: 0,
+            demo_metadata_inflight: HashSet::new(),
+            demo_metadata_tx,
+            demo_metadata_rx,
+            demo_console_filter: DemoConsoleFilter::All,
+            demo_launch_seek_ms: None,
+            demo_view_mode: DemoViewMode::Authoritative,
+            demo_view_outside_authoritative: false,
             server_browser_tx,
             server_browser_rx,
             server_browser,
             game_session: None,
             live_without_world: false,
+            demo_without_world: false,
+            missing_map_prompt: None,
+            demo_missing_map_prompt: None,
+            live_missing_map_authorized: false,
+            live_auto_download_requested: false,
+            live_http_base: None,
+            live_download: None,
+            live_join_ui: None,
             net: None,
             live_cgame_prep_rx: None,
             live_cgame_prepared: None,
@@ -1996,8 +2609,9 @@ impl App {
             render: None,
             startup_first_frame_seen: false,
             camera: Camera::new_with_fov([0.0, 0.0, 0.0], 0.0, presentation.fov),
-            local_player: None,
+            local_server: None,
             map_collision: None,
+            map_visibility: None,
             steam_audio_acoustic_mesh: None,
             steam_audio_bake: None,
             steam_audio_bake_progress: None,
@@ -2005,6 +2619,7 @@ impl App {
             map_physics_collision: PhysicsMapMesh::default(),
             third_person: presentation.third_person,
             first_person_lightsaber: presentation.first_person_lightsaber,
+            saber_trail: presentation.saber_trail,
             cg_debug_events: 0,
             crosshair: presentation.crosshair,
             movement_keys_hud: presentation.movement_keys,
@@ -2039,6 +2654,12 @@ impl App {
             pending_mouse_input: None,
             last_simulated_mouse_input: None,
             cursor_position: (0.0, 0.0),
+            demo_scrub_dragging: false,
+            demo_scrub_fraction: None,
+            demo_scrub_resume_rate: 1.0,
+            demo_scrub_last_seek: None,
+            demo_scrub_last_applied_fraction: None,
+            last_demo_timeline_refresh: Instant::now(),
             previous_tick: Instant::now(),
             overlay: OverlayMode::Game,
             overlay_before_console: OverlayMode::Game,
@@ -2068,7 +2689,6 @@ impl App {
             chat_input: String::new(),
             chat_lines: VecDeque::with_capacity(16),
             last_chat_refresh: Instant::now(),
-            last_hud_state: None,
             video_selected: 0,
             video_section: VideoSection::Display,
             environment_selected: 0,
@@ -2108,12 +2728,13 @@ impl App {
                 gen_normal_maps: video.gen_normal_maps,
                 float_lightmap: video.float_lightmap && video.hdr,
                 planar_reflections: video.reflection_quality.planar_slot_budget() > 0,
+                source_spatial_batches: video.gpu_driven,
                 pbr_materials: video.pbr,
                 allow_asset_overrides: video.allow_asset_overrides,
                 steam_audio: audio.steam_audio,
             },
             prepared_map_cache: None,
-            loading: launch_map.then(|| MapLoadingState::new(0, initial_label)),
+            loading: initial_loading,
             static_ao_progress: None,
             preserve_game_state_on_next_map_upload: false,
             renderer_restart_started: None,
@@ -2214,6 +2835,160 @@ impl App {
         Ok(app)
     }
 
+    fn current_demo_elapsed_ms(&self, now: Instant) -> Option<f64> {
+        self.game_session
+            .as_ref()
+            .filter(|session| !session.live)
+            .and_then(|session| session.demo_elapsed_ms(now))
+    }
+
+    fn transient_ui_snapshot(&self) -> (Vec<UiChatLine>, Option<ui::UiCenterPrint>) {
+        let now = Instant::now();
+        let demo_now = self.current_demo_elapsed_ms(now);
+        let chat_lines = self
+            .chat_lines
+            .iter()
+            .filter_map(|line| {
+                let age_ms = match (demo_now, line.demo_elapsed_ms) {
+                    (Some(now_ms), Some(created_ms)) => (now_ms - created_ms).max(0.0),
+                    _ => now.saturating_duration_since(line.created).as_secs_f64() * 1000.0,
+                };
+                // Stock MP cg_chatBox defaults to 10000 ms. Demo messages age
+                // against demo time, so pause/scrub is deterministic and cannot flicker.
+                if age_ms >= 10_000.0 {
+                    return None;
+                }
+                let alpha = if age_ms <= 9_000.0 {
+                    1.0
+                } else {
+                    1.0 - ((age_ms - 9_000.0) / 1_000.0) as f32
+                };
+                Some(UiChatLine {
+                    text: line.text.clone(),
+                    alpha: alpha.clamp(0.0, 1.0),
+                })
+            })
+            .collect();
+
+        let center_print = self.center_print.as_ref().and_then(|print| {
+            const CENTER_TIME: Duration = Duration::from_secs(3);
+            const FADE_TIME: Duration = Duration::from_millis(200);
+            let age = match (demo_now, print.demo_elapsed_ms) {
+                (Some(now_ms), Some(created_ms)) => Duration::from_secs_f64(((now_ms - created_ms).max(0.0)) / 1000.0),
+                _ => now.saturating_duration_since(print.created),
+            };
+            if age >= CENTER_TIME {
+                return None;
+            }
+            let remaining = CENTER_TIME.saturating_sub(age);
+            let alpha = if remaining < FADE_TIME {
+                remaining.as_secs_f32() / FADE_TIME.as_secs_f32()
+            } else {
+                1.0
+            };
+            Some(ui::UiCenterPrint { text: print.text.clone(), alpha })
+        });
+
+        (chat_lines, center_print)
+    }
+
+    fn restore_demo_transients(&mut self, elapsed_ms: i32, now: Instant) {
+        let notices = self
+            .game_session
+            .as_ref()
+            .and_then(|session| session.demo_index.as_ref())
+            .map(|index| index.transient_notices.clone())
+            .unwrap_or_default();
+        self.chat_lines.clear();
+        self.center_print = None;
+        self.last_center_print.clear();
+
+        let chat_start = elapsed_ms.saturating_sub(10_000);
+        for entry in notices.iter().filter(|entry| {
+            entry.kind == DemoConsoleKind::Chat
+                && entry.elapsed_ms >= chat_start
+                && entry.elapsed_ms <= elapsed_ms
+        }).rev().take(16).collect::<Vec<_>>().into_iter().rev() {
+            self.chat_lines.push_back(ChatRecord {
+                text: entry.text.clone(),
+                created: now,
+                demo_elapsed_ms: Some(f64::from(entry.elapsed_ms)),
+            });
+        }
+        if let Some(entry) = notices.iter().rev().find(|entry| {
+            entry.kind == DemoConsoleKind::CenterPrint
+                && entry.elapsed_ms <= elapsed_ms
+                && elapsed_ms.saturating_sub(entry.elapsed_ms) < 3_000
+        }) {
+            let rendered = self.translate_server_text(entry.text.as_bytes());
+            self.center_print = Some(CenterPrintRecord {
+                text: rendered,
+                created: now,
+                demo_elapsed_ms: Some(f64::from(entry.elapsed_ms)),
+            });
+        }
+        self.last_chat_refresh = now;
+        self.last_center_refresh = now;
+    }
+
+    fn demo_timeline_ui(&self, now: Instant) -> Option<DemoTimelineUi> {
+        let session = self
+            .game_session
+            .as_ref()
+            .filter(|session| !session.live && session.phase == SessionPhase::Playing)?;
+        let index = session.demo_index.as_ref()?;
+        let first = index.first_active_server_time?;
+        let duration_ms = index.duration_ms();
+        if duration_ms <= 0 {
+            return None;
+        }
+        let authoritative = session.demo_followed_client().unwrap_or(-1);
+        let followed = match self.demo_view_mode {
+            DemoViewMode::Follow(client) => client,
+            _ => authoritative,
+        };
+        let duration = duration_ms as f32;
+        let kill_markers = index
+            .kill_markers
+            .iter()
+            .map(|marker| DemoKillMarkerUi {
+                fraction: (marker.server_time.saturating_sub(first) as f32 / duration).clamp(0.0, 1.0),
+                attacker_team: marker.attacker_team,
+                followed_kill: marker.attacker == followed && marker.target != followed,
+                followed_death: marker.target == followed,
+            })
+            .collect();
+        let (paused, playback_rate) = session
+            .timeline
+            .map(|timeline| {
+                let paused = timeline.rate == 0.0;
+                let speed = if paused { timeline.resume_rate } else { timeline.rate };
+                (paused, speed)
+            })
+            .unwrap_or((true, 1.0));
+        let camera_label = match self.demo_view_mode {
+            DemoViewMode::Authoritative => session.demo_visible_players().into_iter()
+                .find(|(client, _)| *client == authoritative)
+                .map(|(_, name)| format!("RECORDED: {name}"))
+                .unwrap_or_else(|| "RECORDED POV".to_owned()),
+            DemoViewMode::Follow(client) => session.demo_visible_players().into_iter()
+                .find(|(candidate, _)| *candidate == client)
+                .map(|(_, name)| format!("FAKE POV: {name}"))
+                .unwrap_or_else(|| format!("FAKE POV: CLIENT {client}")),
+            DemoViewMode::Free => "FREE VIEW".to_owned(),
+        };
+        Some(DemoTimelineUi {
+            elapsed_ms: session.demo_elapsed_ms(now).unwrap_or(0.0),
+            duration_ms,
+            playback_rate,
+            paused,
+            scrub_fraction: self.demo_scrub_fraction,
+            kill_markers,
+            camera_label,
+            outside_authoritative_view: self.demo_view_outside_authoritative,
+        })
+    }
+
     fn ui_snapshot(&self) -> UiSnapshot {
         // Keep the retained UI snapshot bounded even after a very long console session.
         // Full-screen 4K needs far fewer than 384 atlas-text rows, so this leaves
@@ -2285,45 +3060,7 @@ impl App {
                 )
             });
 
-        let now = Instant::now();
-        let chat_lines = self
-            .chat_lines
-            .iter()
-            .filter_map(|line| {
-                let age = now.saturating_duration_since(line.created);
-                // Stock MP cg_chatBox defaults to 10000 ms. Preserve this
-                // client's requested 1-second tail fade inside that lifetime.
-                if age >= Duration::from_secs(10) {
-                    return None;
-                }
-                let alpha = if age <= Duration::from_secs(9) {
-                    1.0
-                } else {
-                    1.0 - (age.as_secs_f32() - 9.0)
-                };
-                Some(UiChatLine {
-                    text: line.text.clone(),
-                    alpha: alpha.clamp(0.0, 1.0),
-                })
-            })
-            .collect();
-
-        let center_print = self.center_print.as_ref().and_then(|print| {
-            const CENTER_TIME: Duration = Duration::from_secs(3);
-            const FADE_TIME: Duration = Duration::from_millis(200);
-            let age = now.saturating_duration_since(print.created);
-            if age >= CENTER_TIME {
-                return None;
-            }
-            let remaining = CENTER_TIME.saturating_sub(age);
-            let alpha = if remaining < FADE_TIME {
-                remaining.as_secs_f32() / FADE_TIME.as_secs_f32()
-            } else {
-                1.0
-            };
-            Some(ui::UiCenterPrint { text: print.text.clone(), alpha })
-        });
-
+        let (chat_lines, center_print) = self.transient_ui_snapshot();
         let hud = self.current_hud_state();
         let follow_name = self.current_follow_name();
 
@@ -2349,6 +3086,7 @@ impl App {
             center_print,
             follow_name,
             scoreboard: self.scores_showing.then(|| self.scoreboard.clone()).flatten(),
+            demo_timeline: self.demo_timeline_ui(Instant::now()),
             hud,
             hud_layout: self.hud_layout,
             crosshair: self.crosshair,
@@ -2388,6 +3126,18 @@ impl App {
                 }
             })
             .unwrap_or_else(|| Arc::clone(&self.solo_dynamic_models));
+        let dynamic_models = if self.overlay == OverlayMode::MapEdit {
+            if let Some(preview) = self.map_editor.as_ref().and_then(MapEditor::preview_surface) {
+                let mut merged = Vec::with_capacity(dynamic_models.len() + 1);
+                merged.extend(dynamic_models.iter().cloned());
+                merged.push(preview);
+                Arc::new(merged)
+            } else {
+                Arc::clone(&dynamic_models)
+            }
+        } else {
+            dynamic_models
+        };
         // Only a running demo's CGame owns mover state; before its first
         // snapshot (and in solo) inline models keep their compiled pose.
         let inline_models = self
@@ -2396,15 +3146,23 @@ impl App {
             .filter(|playback| playback.current_snapshot.is_some())
             .map(|playback| Arc::clone(&playback.inline_models));
         RenderSnapshot {
-            camera: self.camera,
+            camera: if self.front_end && self.frontend_page == FrontendPage::AssetViewer {
+                self.asset_preview_camera()
+            } else {
+                self.camera
+            },
             player_position: demo_player_position
-                .or_else(|| self.local_player.as_ref().map(LocalPlayer::world_position)),
+                .or_else(|| self.local_server.as_ref().map(LocalServer::world_position)),
             area_mask: self
                 .game_session
                 .as_ref()
                 .and_then(|playback| playback.current_snapshot.as_ref())
                 .map(|snapshot| snapshot.area_mask),
             dynamic_models,
+            transient_lights: self
+                .game_session
+                .as_ref()
+                .map_or_else(|| Arc::new(Vec::new()), |playback| Arc::clone(&playback.fx_lights)),
             inline_models,
             dof_focus_target: self.dof_focus_target,
             input_latency: self.last_simulated_mouse_input,
@@ -2412,6 +3170,8 @@ impl App {
                 .game_session
                 .as_ref()
                 .map_or_else(ClientFramePerf::default, |playback| playback.client_perf),
+            hud: self.current_hud_state(),
+            movement_hud: self.current_movement_hud_state(),
         }
     }
 
@@ -2425,9 +3185,229 @@ impl App {
         self.render_command(RenderCommand::SetUi(self.ui_snapshot()));
     }
 
+    fn publish_transient_ui(&self) {
+        let (chat_lines, center_print) = self.transient_ui_snapshot();
+        let demo_timeline = self.demo_timeline_ui(Instant::now());
+        self.render_command(RenderCommand::SetTransientUi { chat_lines, center_print, demo_timeline });
+    }
+
+    fn publish_telemetry_ui(&self) {
+        self.render_command(RenderCommand::SetUiTelemetry {
+            perf: self.perf,
+            threads: self.threads,
+        });
+    }
+
     fn render_command(&self, command: RenderCommand) {
         if let Some(render) = &self.render {
             render.command(command);
+        }
+    }
+
+    fn demo_playback_active(&self) -> bool {
+        self.game_session.as_ref().is_some_and(|session| {
+            !session.live && session.phase == SessionPhase::Playing && session.demo_index.is_some()
+        })
+    }
+
+    fn demo_timeline_hit(&self, x: f64, y: f64) -> Option<DemoTimelineHit> {
+        if !self.demo_playback_active() || self.overlay != OverlayMode::None {
+            return None;
+        }
+        let size = self.window.as_ref()?.inner_size();
+        let layout = ui::demo_timeline_layout(size.width, size.height)?;
+        let point = [x as f32, y as f32];
+        let inside = |rect: [f32; 4]| {
+            point[0] >= rect[0]
+                && point[0] <= rect[0] + rect[2]
+                && point[1] >= rect[1]
+                && point[1] <= rect[1] + rect[3]
+        };
+        if inside(layout.play) {
+            return Some(DemoTimelineHit::PlayPause);
+        }
+        if inside(layout.speed) {
+            return Some(DemoTimelineHit::Speed);
+        }
+        if inside(layout.track) {
+            let fraction = ((point[0] - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0);
+            return Some(DemoTimelineHit::Track(fraction));
+        }
+        None
+    }
+
+    fn toggle_demo_pause_ui(&mut self) {
+        let status = self.game_session.as_mut().and_then(|session| {
+            (!session.live).then(|| session.toggle_pause(Instant::now())).and_then(Result::ok)
+        });
+        if let Some(rate) = status {
+            self.console_status = if rate == 0.0 {
+                "DEMO PAUSED".into()
+            } else {
+                format!("DEMO PLAYING AT {rate}X")
+            };
+            self.publish_transient_ui();
+        }
+    }
+
+    fn cycle_demo_speed_ui(&mut self) {
+        const RATES: [f64; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+        let Some(session) = self.game_session.as_mut().filter(|session| !session.live) else { return; };
+        let current = session.timeline.map(|timeline| {
+            if timeline.rate > 0.0 { timeline.rate } else { timeline.resume_rate }
+        }).unwrap_or(1.0);
+        let next = RATES
+            .iter()
+            .copied()
+            .find(|rate| *rate > current + 0.001)
+            .unwrap_or(RATES[0]);
+        if session.set_playback_speed(Instant::now(), next).is_ok() {
+            self.console_status = format!("DEMO SPEED: {next}X");
+            self.publish_transient_ui();
+        }
+    }
+
+    fn lower_demo_speed_ui(&mut self) {
+        const RATES: [f64; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+        let Some(session) = self.game_session.as_mut().filter(|session| !session.live) else { return; };
+        let current = session.timeline.map(|timeline| {
+            if timeline.rate > 0.0 { timeline.rate } else { timeline.resume_rate }
+        }).unwrap_or(1.0);
+        let next = RATES
+            .iter()
+            .copied()
+            .rev()
+            .find(|rate| *rate < current - 0.001)
+            .unwrap_or(*RATES.last().unwrap());
+        if session.set_playback_speed(Instant::now(), next).is_ok() {
+            self.console_status = format!("DEMO SPEED: {next}X");
+            self.publish_transient_ui();
+        }
+    }
+
+    fn seek_demo_scrub_fraction(&mut self, fraction: f32, now: Instant) -> Result<(), String> {
+        let (sample, elapsed) = {
+            let session = self
+                .game_session
+                .as_mut()
+                .filter(|session| !session.live)
+                .ok_or_else(|| "NO DEMO SESSION".to_owned())?;
+            let duration = session
+                .demo_duration_ms()
+                .ok_or_else(|| "DEMO TIMELINE IS NOT READY".to_owned())?;
+            let elapsed = (duration as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+            (session.seek_demo(now, elapsed)?, elapsed)
+        };
+        self.restore_demo_transients(elapsed, now);
+        self.third_person_camera = ThirdPersonCameraState::default();
+        self.apply_demo_view(sample, Duration::ZERO);
+        self.previous_tick = now;
+        Ok(())
+    }
+
+    fn begin_demo_scrub(&mut self, fraction: f32) {
+        let Some(session) = self.game_session.as_mut().filter(|session| !session.live) else { return; };
+        self.demo_scrub_resume_rate = session.playback_rate().unwrap_or(0.0);
+        let now = Instant::now();
+        session.set_audio_suppressed(true);
+        let _ = session.set_playback_rate(now, 0.0);
+        self.demo_scrub_dragging = true;
+        let fraction = fraction.clamp(0.0, 1.0);
+        self.demo_scrub_fraction = Some(fraction);
+        self.demo_scrub_last_seek = Some(now);
+        match self.seek_demo_scrub_fraction(fraction, now) {
+            Ok(()) => self.demo_scrub_last_applied_fraction = Some(fraction),
+            Err(error) => {
+                self.console_status = format!("DEMO SEEK ERROR: {error}");
+                self.push_console_line(format!("^1{}", self.console_status));
+            }
+        }
+        self.publish_transient_ui();
+    }
+
+    fn update_demo_scrub(&mut self, x: f64) {
+        if !self.demo_scrub_dragging {
+            return;
+        }
+        let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else { return; };
+        let Some(layout) = ui::demo_timeline_layout(size.width, size.height) else { return; };
+        let fraction = ((x as f32 - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0);
+        self.demo_scrub_fraction = Some(fraction);
+
+        // The real seek happens from `tick_demo_scrub_preview`: winit can deliver
+        // many CursorMoved events in one turn, so keeping only this latest target
+        // truly coalesces them instead of replaying stale intermediate positions.
+        self.publish_transient_ui();
+    }
+
+    fn tick_demo_scrub_preview(&mut self, now: Instant) {
+        if !self.demo_scrub_dragging {
+            return;
+        }
+        let Some(fraction) = self.demo_scrub_fraction else { return; };
+        if self.demo_scrub_last_applied_fraction
+            .is_some_and(|applied| (applied - fraction).abs() <= f32::EPSILON)
+        {
+            return;
+        }
+        let due = self
+            .demo_scrub_last_seek
+            .is_none_or(|last| now.saturating_duration_since(last) >= DEMO_SCRUB_PREVIEW_INTERVAL);
+        if !due {
+            return;
+        }
+        self.demo_scrub_last_seek = Some(now);
+        match self.seek_demo_scrub_fraction(fraction, now) {
+            Ok(()) => self.demo_scrub_last_applied_fraction = Some(fraction),
+            Err(error) => {
+                self.console_status = format!("DEMO SEEK ERROR: {error}");
+                self.push_console_line(format!("^1{}", self.console_status));
+            }
+        }
+    }
+
+    fn finish_demo_scrub(&mut self) {
+        if !self.demo_scrub_dragging {
+            return;
+        }
+        self.demo_scrub_dragging = false;
+        let fraction = self.demo_scrub_fraction.take().unwrap_or(0.0).clamp(0.0, 1.0);
+        self.demo_scrub_last_seek = None;
+        self.demo_scrub_last_applied_fraction = None;
+        let now = Instant::now();
+        let seek_result = self.seek_demo_scrub_fraction(fraction, now);
+        if let Some(session) = self.game_session.as_mut().filter(|session| !session.live) {
+            // The exact release seek is silent too. Only after we are settled at
+            // the final destination do we allow audio presentation again.
+            session.set_audio_suppressed(false);
+            if seek_result.is_ok() && self.demo_scrub_resume_rate > 0.0 {
+                let _ = session.set_playback_rate(now, self.demo_scrub_resume_rate);
+            }
+        }
+        if let Err(error) = seek_result {
+            self.console_status = format!("DEMO SEEK ERROR: {error}");
+            self.push_console_line(format!("^1{}", self.console_status));
+        }
+        self.publish_transient_ui();
+    }
+
+    fn seek_demo_relative(&mut self, delta_ms: i32) {
+        let now = Instant::now();
+        let result = self.game_session.as_mut().and_then(|session| {
+            if session.live { return None; }
+            let current = session.demo_elapsed_ms(now)?.round() as i32;
+            Some(session.seek_demo(now, current.saturating_add(delta_ms)))
+        });
+        if let Some(Ok(sample)) = result {
+            let elapsed = self.game_session.as_ref().and_then(|session| session.demo_elapsed_ms(now)).unwrap_or(0.0).round() as i32;
+            self.restore_demo_transients(elapsed, now);
+            self.third_person_camera = ThirdPersonCameraState::default();
+            self.apply_demo_view(sample, Duration::ZERO);
+            self.previous_tick = now;
+            self.publish_transient_ui();
+        } else if let Some(Err(error)) = result {
+            self.console_status = format!("DEMO SEEK ERROR: {error}");
+            self.push_console_line(format!("^1{}", self.console_status));
         }
     }
 
@@ -2473,7 +3453,7 @@ impl App {
         self.mouse_delta = (0.0, 0.0);
         self.last_mouse_motion_at = None;
         self.pending_mouse_input = None;
-        if let Some(player) = &mut self.local_player {
+        if let Some(player) = &mut self.local_server {
             player.pause();
         }
         if overlay != OverlayMode::None {
@@ -2482,6 +3462,8 @@ impl App {
             self.mouse_buttons_down.clear();
             self.noclip_primary_down = false;
             self.noclip_alt_down = false;
+            self.set_capture(false);
+        } else if self.demo_playback_active() {
             self.set_capture(false);
         } else {
             self.set_capture(true);
@@ -2515,10 +3497,17 @@ impl App {
             self.set_overlay(OverlayMode::Game);
             return;
         }
+        if self.frontend_page == FrontendPage::AssetViewer {
+            self.render_command(RenderCommand::SetAssetPreviewMode(false));
+            self.render_command(RenderCommand::SetAssetPreviewViewport(None));
+            self.asset_preview_viewport_key = None;
+            self.clear_asset_preview_runtime();
+        }
         self.frontend_page = match self.frontend_page {
             FrontendPage::Main => FrontendPage::Main,
-            FrontendPage::Play | FrontendPage::Controls => FrontendPage::Main,
+            FrontendPage::Play | FrontendPage::Controls | FrontendPage::DeveloperTools => FrontendPage::Main,
             FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => FrontendPage::Play,
+            FrontendPage::AssetViewer | FrontendPage::MapViewer => FrontendPage::DeveloperTools,
         };
         self.egui_repaint_requested = true;
         self.publish_ui();
@@ -2735,6 +3724,7 @@ impl App {
         let presentation = config::ClientPresentationSettings {
             third_person: self.third_person,
             first_person_lightsaber: self.first_person_lightsaber,
+            saber_trail: self.saber_trail,
             smoothing: self.presentation_smoothing,
             mouse: self.mouse_input,
             fov: self.camera.cg_fov(),
@@ -2871,7 +3861,7 @@ impl App {
         if !self.physics_fps_editing {
             self.physics_fps_input = config::physics_fps_from_msec(physics_msec).to_string();
         }
-        if let Some(player) = &mut self.local_player {
+        if let Some(player) = &mut self.local_server {
             if let Err(error) = player.set_physics_tick_msec(physics_msec) {
                 self.console_status = format!("PHYSICS FPS ERROR: {error}");
             }
@@ -3071,11 +4061,6 @@ impl App {
             ui::CLOUD_ROW_BASE_VARIATION => {
                 self.video.cloud_base_variation = set(slider, self.video.cloud_base_variation);
             }
-            ui::CLOUD_ROW_WIND_VARIATION => {
-                if toggle {
-                    self.video.cloud_wind_variation = !self.video.cloud_wind_variation;
-                }
-            }
             ui::CLOUD_ROW_SHAPE_EVOLUTION => {
                 if toggle {
                     self.video.cloud_shape_evolution = !self.video.cloud_shape_evolution;
@@ -3138,18 +4123,41 @@ impl App {
         self.publish_ui();
     }
 
-    fn set_cloud_wind_speed(&mut self, value: f32) {
-        self.video.cloud_wind_speed = value.clamp(0.0, ui::CLOUD_WIND_SPEED_MAX);
+    fn set_weather_wind(&mut self, wind: crate::ocean::OceanWind) {
+        let wind = wind.sanitize();
+        self.video.weather_wind = wind;
+        // OceanSettings retains the simulation-facing copy, but Weather is the
+        // only authored/UI source. Keep every ocean instance on the same wind.
+        self.video.ocean_settings.wind = wind;
         self.sync_post_effects();
+        self.render_command(RenderCommand::SetOceanSettings(self.video.ocean_settings));
+        self.publish_authored_oceans();
         self.mark_config_dirty();
         self.publish_ui();
     }
 
-    fn set_cloud_wind_direction(&mut self, value: f32) {
-        self.video.cloud_wind_direction = value.rem_euclid(360.0);
-        self.sync_post_effects();
-        self.mark_config_dirty();
-        self.publish_ui();
+    fn set_weather_wind_speed(&mut self, value: f32) {
+        let mut wind = self.video.weather_wind;
+        wind.speed = value;
+        self.set_weather_wind(wind);
+    }
+
+    fn set_weather_wind_direction(&mut self, value: f32) {
+        let mut wind = self.video.weather_wind;
+        wind.direction = value.rem_euclid(360.0);
+        self.set_weather_wind(wind);
+    }
+
+    fn set_weather_gust_strength(&mut self, value: f32) {
+        let mut wind = self.video.weather_wind;
+        wind.gust = value;
+        self.set_weather_wind(wind);
+    }
+
+    fn set_weather_direction_variation(&mut self, value: f32) {
+        let mut wind = self.video.weather_wind;
+        wind.shift = value;
+        self.set_weather_wind(wind);
     }
 
     fn sync_post_effects(&self) {
@@ -3185,15 +4193,13 @@ impl App {
             cloud_coverage: self.video.cloud_coverage,
             cloud_height: self.video.cloud_height,
             cloud_thickness: self.video.cloud_thickness,
-            cloud_wind_speed: self.video.cloud_wind_speed,
-            cloud_wind_direction: self.video.cloud_wind_direction,
+            weather_wind: self.video.weather_wind,
             cloud_shadows: self.video.cloud_shadows,
             cloud_render_resolution: self.video.cloud_render_resolution,
             cloud_temporal: self.video.cloud_temporal,
             cloud_temporal_depth_fix: self.video.cloud_temporal_depth_fix,
             cloud_shear: self.video.cloud_shear,
             cloud_base_variation: self.video.cloud_base_variation,
-            cloud_wind_variation: self.video.cloud_wind_variation,
             cloud_shape_evolution: self.video.cloud_shape_evolution,
             cloud_terrain_interaction: self.video.cloud_terrain_interaction,
             cloud_empty_skip: self.video.cloud_empty_skip,
@@ -3229,17 +4235,28 @@ impl App {
         });
     }
 
-    fn sync_clustered_lighting(&self) {
-        self.render_command(RenderCommand::SetClusteredLighting(
-            self.video.clustered_lighting,
+    fn sync_dynamic_lighting(&self) {
+        self.render_command(RenderCommand::SetDynamicLighting(self.video.dynamic_lights));
+    }
+
+    fn sync_classic_world_lighting(&self) {
+        self.render_command(RenderCommand::SetClassicWorldLighting {
+            fullbright: !self.video.world_lighting,
+            vertex_light: self.video.vertex_lighting,
+            lightmap_only: self.video.lightmap_only,
+        });
+    }
+
+    fn sync_map_light_simulation(&self) {
+        self.render_command(RenderCommand::SetMapLightSimulation(
+            self.video.map_light_simulation,
         ));
     }
 
     fn sync_entity_ambient_lighting(&self) {
-        self.render_command(RenderCommand::SetIrradianceVolume(matches!(
+        self.render_command(RenderCommand::SetEntityAmbientLighting(
             self.video.entity_ambient_lighting,
-            EntityAmbientLightingMode::BevyIrradianceVolume
-        )));
+        ));
     }
 
     fn sync_emissive_area_lights(&self) {
@@ -3703,9 +4720,11 @@ impl App {
         if self.chat_lines.len() >= 16 {
             self.chat_lines.pop_front();
         }
+        let now = Instant::now();
         self.chat_lines.push_back(ChatRecord {
             text: rendered,
-            created: Instant::now(),
+            created: now,
+            demo_elapsed_ms: self.current_demo_elapsed_ms(now),
         });
         self.last_chat_refresh = Instant::now();
     }
@@ -3722,8 +4741,9 @@ impl App {
                 self.push_chat_line(self.chat_mode, message);
             }
         }
+        // set_overlay publishes the retained UI once; the new chat line is
+        // already included in that snapshot, so avoid a duplicate full publish.
         self.set_overlay(OverlayMode::None);
-        self.publish_ui();
     }
 
     fn console_cvar_value(&self, name: &str) -> Option<String> {
@@ -3781,8 +4801,12 @@ impl App {
             "s_separation" => format!("{:.3}", self.audio.separation),
             "s_mutewhenunfocused" => bool_value(self.audio.mute_when_unfocused),
             "s_steamaudio" => bool_value(self.audio.steam_audio),
+            "s_steamaudiobinaural" => bool_value(self.audio.steam_audio_binaural),
+            "s_steamaudioenvironmental" => bool_value(self.audio.steam_audio_environmental),
             "cg_thirdperson" => bool_value(self.third_person.enabled),
             "cg_fpls" => bool_value(self.first_person_lightsaber),
+            "cg_sabertrail" => self.saber_trail.to_string(),
+            "cg_fxfps" => self.video.fx_fps.to_string(),
             "cg_smoothplayerorigin" => bool_value(self.presentation_smoothing.smooth_player_origin),
             "cg_smooththirdpersonorigin" => bool_value(self.presentation_smoothing.smooth_third_person_origin),
             "cg_smoothplayeranimation" => bool_value(self.presentation_smoothing.smooth_player_animation),
@@ -3875,12 +4899,18 @@ impl App {
             "r_smaa" => bool_value(self.video.smaa),
             "r_taa" => bool_value(self.video.taa),
             "r_contactshadows" => bool_value(self.video.contact_shadows),
+            "r_weatherwind" => format!(
+                "{:.2} {:.1} {:.3} {:.1}",
+                self.video.weather_wind.speed,
+                self.video.weather_wind.direction,
+                self.video.weather_wind.gust,
+                self.video.weather_wind.shift,
+            ),
             "r_cloudshadows" => bool_value(self.video.cloud_shadows),
             "r_cloudrenderresolution" => {
                 self.video.cloud_render_resolution.config_value().to_owned()
             }
             "r_cloudtemporal" => bool_value(self.video.cloud_temporal),
-            "r_cloudwindvariation" => bool_value(self.video.cloud_wind_variation),
             "r_cloudshapeevolution" => bool_value(self.video.cloud_shape_evolution),
             "r_cloudterraininteraction" => bool_value(self.video.cloud_terrain_interaction),
             "r_cloudemptyskip" => bool_value(self.video.cloud_empty_skip),
@@ -3890,10 +4920,18 @@ impl App {
             "r_grass" => bool_value(self.video.grass),
             "r_clouds" => bool_value(self.video.clouds),
             "r_ocean" => bool_value(self.video.ocean),
+            "r_oceanfogcolor" => { let c = self.video.ocean_settings.optics.fog_color; format!("{} {} {}", c[0], c[1], c[2]) },
+            "r_oceanfogdistance" => self.video.ocean_settings.optics.fog_distance.to_string(),
+            "r_oceantransparency" => self.video.ocean_settings.optics.transparency.to_string(),
+            "r_oceandepthdarkening" => self.video.ocean_settings.optics.depth_darkening.to_string(),
+            "r_oceanrefraction" => self.video.ocean_settings.optics.refraction.to_string(),
+            "r_oceancaustics" => self.video.ocean_settings.optics.caustics.to_string(),
+            "r_oceanunderwatercull" => self.video.ocean_settings.optics.underwater_cull.to_string(),
             "r_grassprecompute" => bool_value(self.video.grass_precompute),
             "r_grassmidlod" => bool_value(self.video.grass_mid_lod),
             "r_grassfronttoback" => bool_value(self.video.grass_front_to_back),
             "r_fogmode" => self.video.fog_mode.config_value().to_owned(),
+            "r_drawfog" => self.video.fog_mode.drawfog_value().to_string(),
             "r_fogstrength" => format!("{:.3}", self.video.fog_strength),
             "r_sunoverride" => bool_value(self.video.sun_override),
             "r_sunvisibility" => self.video.sun_visibility.config_value().to_owned(),
@@ -3919,9 +4957,13 @@ impl App {
             "r_hizocclusion" => bool_value(self.video.hiz_occlusion),
             "r_entityambientlighting" => self.video.entity_ambient_lighting.config_value().to_owned(),
             "r_dynamiclights" => self.video.dynamic_lights.config_value().to_owned(),
+            "r_maplightsimulation" => bool_value(self.video.map_light_simulation),
+            "r_fullbright" => bool_value(!self.video.world_lighting),
+            "r_vertexlight" => bool_value(self.video.vertex_lighting),
+            "r_lightmap" => bool_value(self.video.lightmap_only),
             "r_modernsabers" => bool_value(self.video.modern_sabers),
+            "r_sabermarks" => self.video.saber_marks.config_value().to_owned(),
             "r_dynamicshadows" => self.video.dynamic_shadows.config_value().to_owned(),
-            "r_clusteredlighting" => bool_value(self.video.clustered_lighting),
             "r_emissivearealights" => bool_value(self.video.emissive_area_lights),
             "r_voxelprobegi" => bool_value(self.video.voxel_probe_gi),
             "r_locallightshadows" => bool_value(self.video.local_light_shadows),
@@ -3978,7 +5020,7 @@ impl App {
         self.last_mouse_motion_at = None;
         self.pending_mouse_input = None;
         self.last_simulated_mouse_input = None;
-        if let Some(player) = &self.local_player {
+        if let Some(player) = &self.local_server {
             if enabled {
                 player.camera_subframe(&mut self.camera);
             } else {
@@ -4295,6 +5337,7 @@ impl App {
                     return Err("model: expected model[/skin]".to_owned());
                 }
                 self.solo_client_info = ClientInfo::solo_model(trimmed);
+                self.sync_local_client_info();
                 self.mark_config_dirty();
                 self.update_solo_player_view_and_presentation();
                 self.publish_snapshot();
@@ -4302,7 +5345,7 @@ impl App {
             }
             "sensitivity" => {
                 self.mouse_input.sensitivity = finite_number()?;
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.set_mouse_input_settings(self.mouse_input);
                 }
                 self.mark_config_dirty();
@@ -4310,7 +5353,7 @@ impl App {
             }
             "m_yaw" => {
                 self.mouse_input.yaw = finite_number()?;
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.set_mouse_input_settings(self.mouse_input);
                 }
                 self.mark_config_dirty();
@@ -4318,7 +5361,7 @@ impl App {
             }
             "m_pitch" => {
                 self.mouse_input.pitch = finite_number()?;
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.set_mouse_input_settings(self.mouse_input);
                 }
                 self.mark_config_dirty();
@@ -4326,7 +5369,7 @@ impl App {
             }
             "cl_mouseaccel" => {
                 self.mouse_input.accel = finite_number()?;
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.set_mouse_input_settings(self.mouse_input);
                 }
                 self.mark_config_dirty();
@@ -4405,6 +5448,32 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "s_steamaudiobinaural" => {
+                let enabled = boolean()?;
+                self.audio.steam_audio_binaural = enabled;
+                if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+                    sound.set_steam_audio_binaural_enabled(enabled);
+                }
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "s_steamaudioenvironmental" => {
+                let enabled = boolean()?;
+                self.audio.steam_audio_environmental = enabled;
+                if let Some(sound) = self
+                    .game_session
+                    .as_mut()
+                    .and_then(|session| session.sound_presenter.as_mut())
+                {
+                    sound.set_steam_audio_environmental_enabled(enabled);
+                }
+                println!(
+                    "Steam Audio environmental acoustics: {} (live direct occlusion/transmission; no map reload or rebake required)",
+                    if enabled { "enabled" } else { "disabled" },
+                );
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
             "cg_thirdperson" => {
                 self.third_person.enabled = boolean()?;
                 self.third_person_camera.reset();
@@ -4420,6 +5489,37 @@ impl App {
                 self.update_solo_player_view_and_presentation();
                 self.publish_snapshot();
                 self.publish_ui();
+            }
+            "cg_sabertrail" => {
+                self.saber_trail = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| "cg_saberTrail expects 0, 1, or 2".to_owned())?
+                    .clamp(0, 2);
+                self.mark_config_dirty();
+                self.push_console_line(format!("cg_saberTrail = {}", self.saber_trail));
+            }
+            "cg_fxfps" => {
+                let requested = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!(
+                        "cg_fxFPS expects 0 (Legacy JKA) or {}..{} Hz",
+                        crate::fx::FX_FPS_MIN,
+                        crate::fx::FX_FPS_MAX
+                    ))?;
+                self.video.fx_fps = if requested == crate::fx::FX_FPS_LEGACY_JKA {
+                    crate::fx::FX_FPS_LEGACY_JKA
+                } else {
+                    requested.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
+                };
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+                    "FX FPS: LEGACY JKA (ONE CONTINUOUS EFFECT INVOCATION PER PRESENTATION FRAME)".into()
+                } else {
+                    format!("FX FPS: {} HZ", self.video.fx_fps)
+                };
             }
             "cg_smoothplayerorigin" => {
                 self.presentation_smoothing.smooth_player_origin = boolean()?;
@@ -4845,6 +5945,24 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "r_weatherwind" => {
+                let values = value
+                    .split_whitespace()
+                    .map(str::parse::<f32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        format!("{name}: expected speed direction gust direction_variation")
+                    })?;
+                if values.len() != 4 || !values.iter().all(|v| v.is_finite()) {
+                    return Err(format!("{name}: expected four finite numbers"));
+                }
+                self.set_weather_wind(crate::ocean::OceanWind {
+                    speed: values[0],
+                    direction: values[1],
+                    gust: values[2],
+                    shift: values[3],
+                });
+            }
             "r_ocean" => {
                 self.video.ocean = boolean()?;
                 // OFF releases the FFT resources immediately, and ON can be
@@ -4855,6 +5973,30 @@ impl App {
                 }
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "r_oceanfogcolor" => {
+                let values = value.split_whitespace().map(str::parse::<f32>).collect::<Result<Vec<_>,_>>()
+                    .map_err(|_| "Expected three finite color components".to_owned())?;
+                if values.len() != 3 || !values.iter().all(|v| v.is_finite()) {
+                    return Err("Expected three finite color components".to_owned());
+                }
+                self.video.ocean_settings.optics.fog_color = [values[0],values[1],values[2]];
+                self.commit_ocean_settings();
+            }
+            "r_oceanfogdistance" | "r_oceantransparency" | "r_oceandepthdarkening" |
+            "r_oceanrefraction" | "r_oceancaustics" | "r_oceanunderwatercull" => {
+                let v = value.parse::<f32>().map_err(|_| "Expected a finite number".to_owned())?;
+                if !v.is_finite() { return Err("Expected a finite number".to_owned()); }
+                let o = &mut self.video.ocean_settings.optics;
+                match name.to_ascii_lowercase().as_str() {
+                    "r_oceanfogdistance" => o.fog_distance = v,
+                    "r_oceantransparency" => o.transparency = v,
+                    "r_oceandepthdarkening" => o.depth_darkening = v,
+                    "r_oceanrefraction" => o.refraction = v,
+                    "r_oceancaustics" => o.caustics = v,
+                    _ => o.underwater_cull = v,
+                }
+                self.commit_ocean_settings();
             }
             "r_perftrace" => {
                 self.video.perf_trace = boolean()?;
@@ -5002,7 +6144,7 @@ impl App {
             }
             "r_hdr" | "r_tonemap" | "r_autoexposure" | "r_bloom" | "r_halation" | "r_ssao" | "r_staticbspao" | "r_fxaa" | "r_smaa"
             | "r_taa" | "r_contactshadows" | "r_cloudshadows" | "r_cloudtemporal"
-            | "r_cloudwindvariation" | "r_cloudshapeevolution" | "r_cloudterraininteraction" | "r_cloudemptyskip" | "r_rain"
+            | "r_cloudshapeevolution" | "r_cloudterraininteraction" | "r_cloudemptyskip" | "r_rain"
             | "r_sunoverride" | "r_reflectiondebug" | "r_vignette" => {
                 let enabled = boolean()?;
                 match lower.as_str() {
@@ -5053,7 +6195,6 @@ impl App {
                     "r_contactshadows" => self.video.contact_shadows = enabled,
                     "r_cloudshadows" => self.video.cloud_shadows = enabled,
                     "r_cloudtemporal" => self.video.cloud_temporal = enabled,
-                    "r_cloudwindvariation" => self.video.cloud_wind_variation = enabled,
                     "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
                     "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
                     "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
@@ -5124,9 +6265,23 @@ impl App {
             "r_fogmode" => {
                 self.video.fog_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "off" | "0" => FogMode::Off,
-                    "legacy" | "1" => FogMode::Legacy,
+                    "legacy1" => FogMode::LegacyDrawFog1,
+                    "legacy" | "legacy2" | "1" => FogMode::LegacyDrawFog2,
                     "volumetric" | "2" => FogMode::Volumetric,
-                    _ => return Err(format!("{name}: expected off|legacy|volumetric")),
+                    _ => return Err(format!(
+                        "{name}: expected off|legacy1|legacy2|volumetric"
+                    )),
+                };
+                self.sync_post_effects();
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_drawfog" => {
+                self.video.fog_mode = match value.trim() {
+                    "0" => FogMode::Off,
+                    "1" => FogMode::LegacyDrawFog1,
+                    "2" => FogMode::LegacyDrawFog2,
+                    _ => return Err(format!("{name}: expected 0|1|2")),
                 };
                 self.sync_post_effects();
                 self.mark_config_dirty();
@@ -5242,21 +6397,55 @@ impl App {
             }
             "r_dynamiclights" => {
                 self.video.dynamic_lights = DynamicLightsMode::from_config(value)
-                    .ok_or_else(|| format!("{name}: expected off|per_vertex|forward_plus|ray_traced"))?;
-                self.video.clustered_lighting =
-                    matches!(self.video.dynamic_lights, DynamicLightsMode::PerPixelForwardPlus);
-                self.sync_clustered_lighting();
+                    .ok_or_else(|| format!("{name}: expected off|legacy|vertex|clustered_lite|forward_plus|ray_traced"))?;
+                self.sync_dynamic_lighting();
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "r_fullbright" | "r_vertexlight" | "r_lightmap" => {
+                let enabled = boolean()?;
+                match lower.as_str() {
+                    "r_fullbright" => self.video.world_lighting = !enabled,
+                    "r_vertexlight" => self.video.vertex_lighting = enabled,
+                    "r_lightmap" => self.video.lightmap_only = enabled,
+                    _ => unreachable!(),
+                }
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_maplightsimulation" => {
+                self.video.map_light_simulation = boolean()?;
+                self.sync_map_light_simulation();
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = format!(
+                    ".MAP LIGHT SIMULATION: {}",
+                    if self.video.map_light_simulation { "ON" } else { "OFF" }
+                );
+            }
             "r_modernsabers" => {
                 self.video.modern_sabers = boolean()?;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_modern_sabers(self.video.modern_sabers);
+                }
                 self.mark_config_dirty();
                 self.publish_ui();
                 self.console_status = format!(
                     "MODERN SABER RENDERING: {}",
                     if self.video.modern_sabers { "ON" } else { "OFF (OPENJK)" }
                 );
+            }
+            "r_sabermarks" => {
+                self.video.saber_marks = ui::SaberMarkMode::from_config(value)
+                    .ok_or_else(|| format!("{name}: expected off|legacy|enhanced"))?;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_saber_marks(self.video.saber_marks);
+                }
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status =
+                    format!("SABER MARKS: {}", self.video.saber_marks.label().to_ascii_uppercase());
             }
             "r_dynamicshadows" => {
                 self.video.dynamic_shadows = DynamicShadowsMode::from_config(value)
@@ -5266,17 +6455,6 @@ impl App {
                     DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
                 );
                 self.sync_cascaded_shadows();
-                self.mark_config_dirty();
-                self.publish_ui();
-            }
-            "r_clusteredlighting" => {
-                self.video.clustered_lighting = boolean()?;
-                self.video.dynamic_lights = if self.video.clustered_lighting {
-                    DynamicLightsMode::PerPixelForwardPlus
-                } else {
-                    DynamicLightsMode::Off
-                };
-                self.sync_clustered_lighting();
                 self.mark_config_dirty();
                 self.publish_ui();
             }
@@ -5531,6 +6709,14 @@ impl App {
         self.prepared_map_cache = None;
         self.game_session = None;
         self.live_without_world = false;
+        self.demo_without_world = false;
+        self.missing_map_prompt = None;
+        self.demo_missing_map_prompt = None;
+        self.live_missing_map_authorized = false;
+        self.live_auto_download_requested = false;
+        self.live_http_base = None;
+        self.live_download = None;
+        self.live_join_ui = None;
         self.live_cgame_prep_rx = None;
         self.live_cgame_prepared = None;
         self.pending_live_gamestate = false;
@@ -5548,8 +6734,9 @@ impl App {
         self.center_print = None;
         self.last_center_print.clear();
 
-        self.local_player = None;
+        self.local_server = None;
         self.map_collision = None;
+        self.map_visibility = None;
         self.map_physics_collision = PhysicsMapMesh::default();
         self.map_movement = None;
         self.third_person_camera.reset();
@@ -5595,9 +6782,34 @@ impl App {
         self.solo_maps.clear();
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = None;
+        self.source_map_catalog_loaded = false;
+        self.source_map_catalog_error = None;
+        self.source_maps.clear();
+        self.source_map_levelshot_texture = None;
+        self.source_map_levelshot_texture_map = None;
+        self.asset_viewer_catalog_loaded = false;
+        self.asset_viewer_catalog_error = None;
+        self.asset_viewer_entries.clear();
+        self.asset_viewer_selected = None;
+        self.asset_viewer_shader_file.clear();
+        self.asset_viewer_letter = None;
+        self.asset_viewer_jump_letter = None;
+        self.asset_viewer_detail_path = None;
+        self.asset_viewer_detail = None;
+        self.asset_viewer_shader_name = None;
+        self.asset_preview_player_presenter = None;
+        self.asset_preview_entity_presenter = None;
+        self.asset_preview_model_key = None;
+        self.asset_preview_shader_key = None;
+        self.asset_preview_fx = None;
+        self.asset_preview_viewport_key = None;
         self.demo_catalog_loaded = false;
         self.demo_catalog_error = None;
         self.demo_entries.clear();
+        self.demo_metadata_generation = self.demo_metadata_generation.wrapping_add(1);
+        self.demo_metadata_cache.clear();
+        self.demo_metadata_errors.clear();
+        self.demo_metadata_inflight.clear();
     }
 
     /// Resolve a game-relative write without letting the feature decide whether
@@ -5768,9 +6980,11 @@ impl App {
         self.static_ao_progress = None;
         self.reset_asset_catalogs_for_game_change();
         self.map_collision = None;
+        self.map_visibility = None;
         self.map_movement = None;
         self.spawns.clear();
         self.live_without_world = false;
+        self.demo_without_world = false;
         self.map_name = "MAIN MENU".into();
         self.render_command(RenderCommand::UnloadMap);
         println!("FS_GAME: {source}: {previous} -> {next}");
@@ -5846,11 +7060,18 @@ impl App {
             entity_presenter,
             crate::cgame::weapon_fx::WeaponFx::new(fx_assets),
         );
+        session.weapon_fx.set_modern_sabers(self.video.modern_sabers);
+        session.weapon_fx.set_saber_marks(self.video.saber_marks);
+        session.weapon_fx.set_collision_world(self.map_collision.clone());
+        session.weapon_fx.set_saber_trail(self.saber_trail);
+        session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
         match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
             Ok(assets) => {
                 let mut sound = crate::cgame::sound_presenter::SoundPresenter::new(
                     assets,
                     self.audio.steam_audio,
+                    self.audio.steam_audio_binaural,
+                    self.audio.steam_audio_environmental,
                 );
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
@@ -5871,12 +7092,92 @@ impl App {
         Ok(session)
     }
 
+    fn load_local_saber_movement(
+        &self,
+    ) -> Result<[jka_movement::SaberMovementInfo; 2], String> {
+        let mut assets = jka_assets::pk3::AssetSearchPath::open_game(
+            &self.base,
+            self.game.as_deref(),
+        )
+        .map_err(|error| format!("LOCAL SABER ASSET PATH ERROR: {error}"))?;
+        assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+        let definitions = jka_assets::saber::load_saber_definitions(&mut assets)
+            .map_err(|error| format!("LOCAL SABER DEFINITION ERROR: {error}"))?;
+        Ok(crate::local_server::saber_movement_loadout(
+            &definitions,
+            &self.solo_client_info,
+        ))
+    }
+
+    /// Build CGame for the in-process one-client server. The local authority
+    /// publishes decoded snapshots/configstrings at the same boundary as the
+    /// network decoder, so presentation/FX never needs a solo-only branch.
+    fn build_local_game_session(&self, server: &LocalServer) -> Result<GameSession, String> {
+        let mut session = self.build_game_session(
+            format!("local:{}", server.map_name()),
+            "in-process local server".to_owned(),
+            Vec::new(),
+        )?;
+        session.live = true;
+        session.local = true;
+        session.map_name = Some(server.map_name().to_owned());
+        session
+            .client_game
+            .reset_gamestate(server.configstrings(), 0);
+        Ok(session)
+    }
+
+    /// Enqueue the latest authoritative local state exactly where a decoded
+    /// `svc_snapshot` would enter a network GameSession.
+    fn push_local_snapshot(&mut self, force: bool) {
+        let snapshot = self
+            .local_server
+            .as_mut()
+            .and_then(|server| server.take_snapshot(force));
+        let Some(snapshot) = snapshot else { return };
+        let Some(session) = self
+            .game_session
+            .as_mut()
+            .filter(|session| session.local)
+        else { return };
+        if session.live_snapshots.len() >= 128 {
+            session.live_snapshots.pop_front();
+        }
+        session.snapshots = session.snapshots.saturating_add(1);
+        session.live_snapshots.push_back(snapshot);
+    }
+
+    fn sync_local_client_info(&mut self) {
+        let saber_movement = self.load_local_saber_movement();
+        let value = {
+            let Some(server) = self.local_server.as_mut() else { return };
+            server.set_client_info(&self.solo_client_info);
+            match saber_movement {
+                Ok(sabers) => {
+                    if let Err(error) = server.set_saber_movement_info(sabers) {
+                        eprintln!("LOCAL SABER MOVEMENT UPDATE ERROR: {error}");
+                    }
+                }
+                Err(error) => eprintln!("{error}"),
+            }
+            server.player_configstring().map(|value| value.to_vec())
+        };
+        if let (Some(value), Some(session)) = (
+            value,
+            self.game_session.as_mut().filter(|session| session.local),
+        ) {
+            session.client_game.set_configstring(crate::cgame::CS_PLAYERS, value);
+        }
+    }
+
     fn attach_live_sound_presenter(&self, session: &mut GameSession) {
         match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
             Ok(assets) => {
                 let mut sound = crate::cgame::sound_presenter::SoundPresenter::new(
                     assets,
                     self.audio.steam_audio,
+                    self.audio.steam_audio_binaural,
+                    self.audio.steam_audio_environmental,
                 );
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
@@ -5891,6 +7192,14 @@ impl App {
     }
 
     fn play_selected_demo(&mut self) {
+        self.play_selected_demo_from(None);
+    }
+
+    fn play_selected_demo_at(&mut self, elapsed_ms: i32) {
+        self.play_selected_demo_from(Some(elapsed_ms.max(0)));
+    }
+
+    fn play_selected_demo_from(&mut self, start_elapsed_ms: Option<i32>) {
         // Demo presentation assets are opened before the demo's map request, so
         // apply map-scoped CVAR_LATCH values at this boundary too.
         self.apply_latched_console_cvars(ApplyLatchedScope::MapLoad);
@@ -5901,10 +7210,14 @@ impl App {
         }
         self.demo_selected = self.demo_selected.min(self.demo_entries.len() - 1);
         let demo_name = self.demo_entries[self.demo_selected].demo_name.clone();
-        self.play_demo_named(&demo_name);
+        self.play_demo_named_from(&demo_name, start_elapsed_ms);
     }
 
     fn play_demo_named(&mut self, argument: &str) {
+        self.play_demo_named_from(argument, None);
+    }
+
+    fn play_demo_named_from(&mut self, argument: &str, start_elapsed_ms: Option<i32>) {
         let argument = argument.trim().trim_matches('"');
         if argument.is_empty() {
             self.push_console_line("^3demo <demoname>".to_owned());
@@ -5970,7 +7283,7 @@ impl App {
         };
         // CL_PlayDemo_f disconnects the current session before installing demo
         // state. Do it after the read above so an active mod's demos remain visible.
-        if self.net.is_some() || self.game_session.is_some() || self.local_player.is_some() || !self.front_end {
+        if self.net.is_some() || self.game_session.is_some() || self.local_server.is_some() || !self.front_end {
             self.disconnect_to_main_menu();
         }
         if let Err(error) = self.set_session_fs_game(&fs_game, "demo gamestate") {
@@ -5999,8 +7312,60 @@ impl App {
         self.console_status = format!("DEMO GAMESTATE READY: {qpath} -> {map_name}");
         self.push_console_line(format!("^2{}", self.console_status));
         println!("{}", self.console_status);
-        self.game_session = Some(playback);
-        self.request_map(scene::MapSource::Bsp(map_name));
+        // A console-row launch stores its relative timestamp only after all demo
+        // open/gamestate work has succeeded, so a failed launch cannot poison the
+        // next ordinary /demo command.
+        self.demo_launch_seek_ms = start_elapsed_ms.map(|value| value.max(0));
+        let map_source = scene::MapSource::Bsp(map_name.clone());
+        match scene::verify_map_source_exists(&self.base, self.game.as_deref(), &map_source) {
+            Ok(()) => {
+                self.game_session = Some(playback);
+                self.request_map(map_source);
+            }
+            Err(error) => {
+                self.console_status = format!("DEMO MAP NOT FOUND: {map_name}");
+                self.push_console_line(format!("^3Demo map is not installed locally:^7 {map_name}"));
+                self.game_session = Some(playback);
+                self.demo_missing_map_prompt = Some(MissingMapPrompt { map_name, reason: error });
+                self.egui_repaint_requested = true;
+                self.publish_ui();
+            }
+        }
+    }
+
+    fn choose_demo_missing_map_exit(&mut self) {
+        let map_name = self.demo_missing_map_prompt.take().map(|prompt| prompt.map_name)
+            .unwrap_or_else(|| "unknown map".to_owned());
+        self.game_session = None;
+        self.live_without_world = false;
+        self.demo_without_world = false;
+        self.restore_startup_game();
+        self.front_end = true;
+        self.frontend_page = FrontendPage::PlayDemo;
+        self.menu_selected = 0;
+        self.set_overlay(OverlayMode::Game);
+        self.console_status = format!("DEMO ABORTED - MAP NOT INSTALLED: {map_name}");
+        self.push_console_line(format!("^3{}", self.console_status));
+        self.publish_snapshot();
+        self.publish_ui();
+        self.request_frontend_background();
+    }
+
+    fn choose_demo_missing_map_continue(&mut self) {
+        let Some(prompt) = self.demo_missing_map_prompt.take() else { return };
+        let map_name = prompt.map_name;
+        self.prepare_worldless_session(&map_name);
+        self.live_without_world = false;
+        self.demo_without_world = true;
+        if let Some(playback) = self.game_session.as_mut() {
+            let _ = playback.player_presenter.set_physics_map_mesh(&self.map_physics_collision);
+        }
+        self.console_status = format!("DEMO PLAYBACK WITHOUT MAP: {map_name}");
+        self.push_console_line(format!("^3Continuing demo without BSP geometry:^7 {}", prompt.reason));
+        self.push_console_line("^3Recorded snapshots, players, camera and FX continue; world geometry and map-dependent presentation may be missing.".to_owned());
+        self.start_demo_after_map_load(&map_name);
+        self.publish_snapshot();
+        self.publish_ui();
     }
 
     fn start_demo_after_map_load(&mut self, loaded_map: &str) {
@@ -6009,7 +7374,10 @@ impl App {
             return;
         }
         let should_start = self.game_session.as_ref().is_some_and(|playback| {
-            let loaded_qpath = loaded_map.strip_suffix(".bsp").unwrap_or(loaded_map);
+            let loaded_qpath = loaded_map
+                .strip_suffix(".bsp")
+                .or_else(|| loaded_map.strip_suffix(".map"))
+                .unwrap_or(loaded_map);
             playback.phase == SessionPhase::WaitingForMap
                 && playback
                     .map_name
@@ -6021,10 +7389,28 @@ impl App {
         }
 
         let now = Instant::now();
+        let launch_seek_ms = self.demo_launch_seek_ms.take();
         let result = {
             let playback = self.game_session.as_mut().expect("checked above");
             match playback.begin_after_map_load(now) {
-                Ok(sample) => Ok((sample, playback.qpath.clone(), playback.source.clone())),
+                Ok(mut sample) => {
+                    let seek_error = if let Some(elapsed_ms) = launch_seek_ms {
+                        match playback.seek_demo(now, elapsed_ms) {
+                            Ok(seek_sample) => {
+                                sample = seek_sample;
+                                None
+                            }
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(error) = seek_error {
+                        Err(error)
+                    } else {
+                        Ok((sample, playback.qpath.clone(), playback.source.clone()))
+                    }
+                }
                 Err(error) => Err(error),
             }
         };
@@ -6032,8 +7418,19 @@ impl App {
             Ok((sample, qpath, source)) => {
                 // Demo playback is authoritative. Do not run the local movement
                 // simulator on top of the recorded playerstate.
-                self.local_player = None;
+                self.local_server = None;
+                self.demo_scrub_dragging = false;
+                self.demo_scrub_fraction = None;
+                self.demo_scrub_resume_rate = 1.0;
+                self.demo_scrub_last_seek = None;
+                self.demo_scrub_last_applied_fraction = None;
+                self.demo_view_mode = DemoViewMode::Authoritative;
+                self.demo_view_outside_authoritative = false;
+                if let Some(elapsed_ms) = launch_seek_ms {
+                    self.restore_demo_transients(elapsed_ms, now);
+                }
                 self.apply_demo_camera(sample);
+                self.set_capture(false);
                 self.previous_tick = now;
                 self.console_status = format!(
                     "DEMO PLAYING: {qpath} serverTime={} source={source}",
@@ -6112,7 +7509,7 @@ impl App {
                         health: sample.policy.health,
                         dead_yaw: sample.dead_yaw,
                         client_num: sample.client_num,
-                        time: sample.server_time,
+                        time: sample.presentation_time_ms,
                         teleported: sample.teleported,
                     },
                 );
@@ -6127,7 +7524,135 @@ impl App {
         self.camera.pitch = -sample.view_angles[0].to_radians();
     }
 
-    fn tick_demo_playback(&mut self, now: Instant) -> Result<DemoAdvance, String> {
+    fn demo_point_visible_from_authoritative(
+        &self,
+        sample: DemoCameraSample,
+        target_render: [f32; 3],
+    ) -> bool {
+        let Some(visibility) = self.map_visibility.as_ref() else { return true; };
+        let mut source = sample.native_origin;
+        source[2] += sample.view_height as f32;
+        let target = scene::jka_position(target_render);
+        let Some(target_cluster) = visibility.cluster_at(target) else { return false; };
+        if !visibility.visible(visibility.cluster_at(source), &[target_cluster]) {
+            return false;
+        }
+        if let (Some(area), Some(mask)) = (
+            visibility.area_at(target),
+            self.game_session.as_ref().and_then(GameSession::demo_area_mask),
+        ) {
+            if area < 256 && mask[area / 8] & (1 << (area % 8)) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn update_demo_free_camera(&mut self, dt: Duration) {
+        let mut movement = glam::Vec3::ZERO;
+        let forward = self.camera.forward();
+        let flat_forward = glam::Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let right = glam::Vec3::new(-flat_forward.z, 0.0, flat_forward.x);
+        if self.keys.contains(&KeyCode::KeyW) { movement += flat_forward; }
+        if self.keys.contains(&KeyCode::KeyS) { movement -= flat_forward; }
+        if self.keys.contains(&KeyCode::KeyD) { movement += right; }
+        if self.keys.contains(&KeyCode::KeyA) { movement -= right; }
+        if self.keys.contains(&KeyCode::KeyE) { movement += glam::Vec3::Y; }
+        if self.keys.contains(&KeyCode::KeyQ) { movement -= glam::Vec3::Y; }
+        if movement.length_squared() > 0.0 {
+            let boost = if self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight) { 4.0 } else { 1.0 };
+            // ~630 JKA units/s at normal speed. Camera coordinates are native-unit
+            // axes permuted by scene::render_position, so no additional scale exists.
+            self.camera.position += movement.normalize() * 630.0 * boost * dt.as_secs_f32();
+        }
+    }
+
+    fn apply_demo_view(&mut self, sample: DemoCameraSample, dt: Duration) -> i32 {
+        self.demo_view_outside_authoritative = false;
+        match self.demo_view_mode {
+            DemoViewMode::Authoritative => {
+                self.apply_demo_camera(sample);
+                sample.client_num
+            }
+            DemoViewMode::Follow(client) if client == sample.client_num => {
+                self.demo_view_mode = DemoViewMode::Authoritative;
+                self.apply_demo_camera(sample);
+                sample.client_num
+            }
+            DemoViewMode::Follow(client) => {
+                let fake = self.game_session.as_ref().and_then(|session| session.demo_fake_view(client));
+                if let Some(fake) = fake.filter(|view| self.demo_point_visible_from_authoritative(sample, view.eye_position)) {
+                    self.third_person_camera.reset();
+                    self.camera.position = glam::Vec3::from_array(fake.eye_position);
+                    self.camera.yaw = fake.view_angles[1].to_radians();
+                    self.camera.pitch = -fake.view_angles[0].to_radians();
+                    fake.client_num
+                } else {
+                    self.demo_view_mode = DemoViewMode::Authoritative;
+                    self.set_capture(false);
+                    self.console_status = "DEMO FOLLOW TARGET LEFT RECORDED VISIBILITY; RETURNED TO RECORDED POV".into();
+                    self.apply_demo_camera(sample);
+                    sample.client_num
+                }
+            }
+            DemoViewMode::Free => {
+                self.update_demo_free_camera(dt);
+                self.demo_view_outside_authoritative = !self.demo_point_visible_from_authoritative(
+                    sample,
+                    self.camera.position.to_array(),
+                );
+                sample.client_num
+            }
+        }
+    }
+
+    fn reset_demo_view_authoritative(&mut self) {
+        self.demo_view_mode = DemoViewMode::Authoritative;
+        self.demo_view_outside_authoritative = false;
+        self.third_person_camera.reset();
+        self.set_capture(false);
+        self.publish_transient_ui();
+    }
+
+    fn toggle_demo_free_view(&mut self) {
+        if !self.demo_playback_active() { return; }
+        if self.demo_view_mode == DemoViewMode::Free {
+            self.reset_demo_view_authoritative();
+            self.console_status = "DEMO CAMERA: RECORDED POV".into();
+        } else {
+            self.demo_view_mode = DemoViewMode::Free;
+            self.demo_view_outside_authoritative = false;
+            self.set_capture(true);
+            self.console_status = "DEMO CAMERA: FREE (WASD, Q/E, SHIFT, MOUSE)".into();
+            self.publish_transient_ui();
+        }
+    }
+
+    fn cycle_demo_follow(&mut self, direction: i32) {
+        let Some(session) = self.game_session.as_ref().filter(|session| !session.live) else { return; };
+        let players = session.demo_visible_players();
+        let Some(authoritative) = session.demo_followed_client() else { return; };
+        if players.is_empty() { return; }
+        let current = match self.demo_view_mode {
+            DemoViewMode::Follow(client) => client,
+            _ => authoritative,
+        };
+        let index = players.iter().position(|(client, _)| *client == current).unwrap_or(0) as i32;
+        let next_index = (index + direction).rem_euclid(players.len() as i32) as usize;
+        let (next, name) = players[next_index].clone();
+        self.set_capture(false);
+        self.third_person_camera.reset();
+        if next == authoritative {
+            self.demo_view_mode = DemoViewMode::Authoritative;
+            self.console_status = format!("DEMO CAMERA: RECORDED POV ({name})");
+        } else {
+            self.demo_view_mode = DemoViewMode::Follow(next);
+            self.console_status = format!("DEMO CAMERA: FAKE POV {name} (CLIENT {next})");
+        }
+        self.publish_transient_ui();
+    }
+
+    fn tick_demo_playback(&mut self, now: Instant, dt: Duration) -> Result<DemoAdvance, String> {
         let client_frame_started = Instant::now();
         // Player presentation happens inside GameSession::advance, before the
         // final camera is applied for this frame. Pass the current rendered view
@@ -6144,12 +7669,30 @@ impl App {
                 aspect,
             )
         });
+        let local_frame = self.local_server.as_ref().map(|server| {
+            (server.presentation_time(), server.subframe_view_angles())
+        });
         let (advance, sample, debug_lines) = {
             let playback = self
                 .game_session
                 .as_mut()
                 .ok_or_else(|| "DEMO PLAYBACK STATE DISAPPEARED".to_owned())?;
+            playback.demo_hidden_view_client = if playback.live {
+                None
+            } else {
+                match self.demo_view_mode {
+                    DemoViewMode::Follow(client) => Some(client),
+                    _ => None,
+                }
+            };
             playback.weapon_fx.set_modern_sabers(self.video.modern_sabers);
+            playback.weapon_fx.set_saber_marks(self.video.saber_marks);
+            // Collision ownership is map-scoped, not frame-scoped. Rebinding it here
+            // used to clear WeaponFx's per-blade wall-contact history every frame,
+            // so OpenJK-style saber marks could never connect oldPos -> newPos.
+            // build_game_session/map-load paths already install the current world.
+            playback.weapon_fx.set_saber_trail(self.saber_trail);
+            playback.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             playback.player_presenter.set_skinning_mode(self.video.ghoul2_skinning);
             playback
                 .player_presenter
@@ -6169,7 +7712,18 @@ impl App {
                 debug: self.video.physics_debug_draw,
                 stats: self.video.physics_stats,
             });
-            let (advance, sample) = if playback.live {
+            let (advance, sample) = if playback.local {
+                let Some((server_time, _)) = local_frame else {
+                    return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
+                };
+                playback.advance_to(
+                    server_time,
+                    self.third_person,
+                    self.first_person_lightsaber,
+                    self.cg_debug_events,
+                    ghoul2_view,
+                )?
+            } else if playback.live {
                 let Some(net) = self.net.as_ref() else {
                     return Err("LIVE SESSION HAS NO CONNECTION".into());
                 };
@@ -6231,6 +7785,7 @@ impl App {
                 };
                 playback.advance_to_with_prediction(
                     server_time,
+                    f64::from(server_time),
                     self.third_person,
                     self.first_person_lightsaber,
                     self.cg_debug_events,
@@ -6252,11 +7807,29 @@ impl App {
             self.push_console_line(line);
         }
         let mut sample = sample;
-        if let Some(angles) = self.live_view_angles() {
+        if self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.local)
+        {
+            // cl_input_subframe remains presentation-only. The authoritative
+            // local snapshots still contain fixed-Pmove angles, while the camera
+            // can consume mouse motion immediately between those steps.
+            if self.video.input_subframe {
+                if let Some((_, angles)) = local_frame {
+                    sample.view_angles = angles;
+                }
+            }
+        } else if let Some(angles) = self.live_view_angles() {
             sample.view_angles = angles;
         }
-        self.apply_demo_camera(sample);
-        // Use the final camera (including third-person orbit) for spatial audio.
+        let listener_entity = if self.game_session.as_ref().is_some_and(|session| session.live) {
+            self.apply_demo_camera(sample);
+            sample.client_num
+        } else {
+            self.apply_demo_view(sample, dt)
+        };
+        // Use the final camera (including third-person orbit/free/fake follow) for spatial audio.
         if let Some(playback) = &mut self.game_session {
             // FX sprites/lines face the final render view.
             let view = crate::fx::draw::FxView::from_camera(&self.camera);
@@ -6266,18 +7839,22 @@ impl App {
             playback.fx_surfaces = Arc::new(crate::fx::draw::tessellate(
                 &playback.fx_draws,
                 &view,
-                &mut |shader| entity_presenter.fx_material(shader),
+                &mut |shader| entity_presenter.fx_material_stages(shader),
             ));
             playback.client_perf.fx_tessellate_ms =
                 fx_tessellate_started.elapsed().as_secs_f64() * 1000.0;
             let audio_started = Instant::now();
-            if let Some(sound) = &mut playback.sound_presenter {
-                let yaw = self.camera.yaw;
-                sound.frame(crate::audio::Listener {
-                    entity: sample.client_num as u16,
-                    origin: scene::jka_position(self.camera.position.to_array()),
-                    left: [-yaw.sin(), yaw.cos(), 0.0],
-                }, &playback.presented_entities);
+            if !playback.suppress_audio {
+                if let Some(sound) = &mut playback.sound_presenter {
+                    let yaw = self.camera.yaw;
+                    sound.frame(crate::audio::Listener {
+                        entity: listener_entity.max(0) as u16,
+                        origin: scene::jka_position(self.camera.position.to_array()),
+                        ahead: [yaw.cos(), yaw.sin(), 0.0],
+                        up: [0.0, 0.0, 1.0],
+                        left: [-yaw.sin(), yaw.cos(), 0.0],
+                    }, &playback.presented_entities, playback.audio_followed_entity.as_ref());
+                }
             }
             playback.client_perf.audio_ms += audio_started.elapsed().as_secs_f64() * 1000.0;
             playback.client_perf.total_ms = client_frame_started.elapsed().as_secs_f64() * 1000.0;
@@ -6299,11 +7876,413 @@ impl App {
         Ok(())
     }
 
+    fn asset_preview_camera(&self) -> Camera {
+        Camera::new_with_fov([0.0, 0.0, 0.0], 0.0, 65.0)
+    }
+
+    fn ensure_asset_preview_entity_presenter(&mut self) -> Result<(), String> {
+        if self.asset_preview_entity_presenter.is_some() {
+            return Ok(());
+        }
+        let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
+            .map_err(|error| format!("ASSET VIEWER VFS ERROR: {error}"))?;
+        assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+        self.asset_preview_entity_presenter = Some(
+            EntityPresenter::new(assets, self.video.pbr)
+                .map_err(|error| format!("ASSET VIEWER MD3 ERROR: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn ensure_asset_preview_player_presenter(&mut self) -> Result<(), String> {
+        if self.asset_preview_player_presenter.is_some() {
+            return Ok(());
+        }
+        let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
+            .map_err(|error| format!("ASSET VIEWER VFS ERROR: {error}"))?;
+        assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+        self.asset_preview_player_presenter = Some(
+            PlayerPresenter::new(assets, self.video.pbr)
+                .map_err(|error| format!("ASSET VIEWER GLM ERROR: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn clear_asset_preview_runtime(&mut self) {
+        self.solo_dynamic_models = Arc::new(Vec::new());
+        self.asset_preview_model_key = None;
+        self.asset_preview_shader_key = None;
+        self.asset_preview_fx = None;
+    }
+
+    fn set_asset_preview_viewport(&mut self, rect: egui::Rect, pixels_per_point: f32) {
+        let scale = pixels_per_point.max(0.01);
+        let viewport = [
+            (rect.min.x * scale).round().max(0.0) as u32,
+            (rect.min.y * scale).round().max(0.0) as u32,
+            (rect.width() * scale).round().max(1.0) as u32,
+            (rect.height() * scale).round().max(1.0) as u32,
+        ];
+        if self.asset_preview_viewport_key != Some(viewport) {
+            self.asset_preview_viewport_key = Some(viewport);
+            self.render_command(RenderCommand::SetAssetPreviewViewport(Some(viewport)));
+        }
+    }
+
+    fn update_asset_preview_content(&mut self) {
+        if self.frontend_page != FrontendPage::AssetViewer {
+            return;
+        }
+        let Some(detail) = self
+            .asset_viewer_detail
+            .as_ref()
+            .and_then(|detail| detail.as_ref().ok())
+            .cloned()
+        else {
+            self.clear_asset_preview_runtime();
+            return;
+        };
+
+        match detail.kind {
+            AssetKind::Md3 | AssetKind::Glm => self.update_asset_model_preview(&detail),
+            AssetKind::Shader => self.update_asset_shader_preview(&detail),
+            AssetKind::Efx => self.update_asset_efx_preview(&detail),
+        }
+    }
+
+    fn update_asset_model_preview(&mut self, detail: &AssetDetail) {
+        let key = (
+            detail.qpath.clone(),
+            (self.asset_viewer_model_yaw * 10.0).round() as i32,
+            (self.asset_viewer_model_zoom * 1000.0).round() as i32,
+        );
+        if self.asset_preview_model_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        let center = detail.model_center.unwrap_or([0.0; 3]);
+        let radius = detail.model_radius.unwrap_or(32.0).max(1.0);
+        let distance = (radius * 2.45 * self.asset_viewer_model_zoom).clamp(24.0, 7500.0);
+        let yaw = self.asset_viewer_model_yaw.to_radians();
+        let (s, c) = yaw.sin_cos();
+        let axis = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
+        let rotated_center = [
+            axis[0][0] * center[0] + axis[1][0] * center[1] + axis[2][0] * center[2],
+            axis[0][1] * center[0] + axis[1][1] * center[1] + axis[2][1] * center[2],
+            axis[0][2] * center[0] + axis[1][2] * center[1] + axis[2][2] * center[2],
+        ];
+        let target = [distance, 0.0, 0.0];
+        let origin = [
+            target[0] - rotated_center[0],
+            target[1] - rotated_center[1],
+            target[2] - rotated_center[2],
+        ];
+        let qpath = detail.qpath.clone();
+        let kind = detail.kind;
+
+        let result = match kind {
+            AssetKind::Md3 => self
+                .ensure_asset_preview_entity_presenter()
+                .and_then(|_| {
+                    self.asset_preview_entity_presenter
+                        .as_mut()
+                        .expect("asset MD3 presenter initialized")
+                        .present_static_md3(0, &qpath, origin, axis, [1.0; 4], 0)
+                }),
+            AssetKind::Glm => self
+                .ensure_asset_preview_player_presenter()
+                .and_then(|_| {
+                    let presenter = self
+                        .asset_preview_player_presenter
+                        .as_mut()
+                        .expect("asset GLM presenter initialized");
+                    presenter.set_skinning_mode(self.video.ghoul2_skinning);
+                    presenter.set_early_frustum_cull(false);
+                    presenter.set_lod_bias(self.video.ghoul2_lod_bias);
+                    presenter.present_static_glm_preview(0, &qpath, origin, axis, [1.0; 4], 0)
+                }),
+            AssetKind::Efx | AssetKind::Shader => unreachable!(),
+        };
+        match result {
+            Ok(draws) => {
+                self.solo_dynamic_models = Arc::new(draws);
+                self.asset_preview_model_key = Some(key);
+            }
+            Err(error) => {
+                self.solo_dynamic_models = Arc::new(Vec::new());
+                self.asset_preview_model_key = Some(key);
+                let message = format!("ASSET VIEWER PREVIEW: {qpath}: {error}");
+                if self.console_status != message {
+                    self.console_status = message.clone();
+                    self.push_console_line(format!("^1{message}"));
+                }
+            }
+        }
+    }
+
+    fn update_asset_shader_preview(&mut self, detail: &AssetDetail) {
+        let Some(shader_name) = self
+            .asset_viewer_shader_name
+            .clone()
+            .or_else(|| detail.shader_names.first().cloned())
+        else {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            self.asset_preview_shader_key = None;
+            return;
+        };
+        let zoom_key = (self.asset_viewer_model_zoom * 1000.0).round() as i32;
+        let key = (detail.qpath.clone(), shader_name.clone(), zoom_key);
+        if self.asset_preview_shader_key.as_ref() == Some(&key) {
+            return;
+        }
+        if let Err(error) = self.ensure_asset_preview_entity_presenter() {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            self.asset_preview_shader_key = Some(key);
+            self.push_console_line(format!("^1ASSET VIEWER SHADER PREVIEW: {error}"));
+            return;
+        }
+
+        // A material browser is most useful on a neutral, camera-facing card.
+        // Use the existing FX material resolver so blend modes and multi-stage
+        // JKA shaders are represented by the same textures/pipelines as gameplay.
+        let distance = (112.0 * self.asset_viewer_model_zoom).clamp(42.0, 1200.0);
+        let half = 48.0;
+        // Put a neutral checker behind the authored material. Besides making
+        // alpha obvious, this gives filter/modulate stages something sensible
+        // to composite against instead of the viewer's black clear color.
+        let mut draws = Vec::with_capacity(65);
+        let cells = 8_u32;
+        let cell = half * 2.0 / cells as f32;
+        for y in 0..cells {
+            for z in 0..cells {
+                let y0 = -half + y as f32 * cell;
+                let y1 = y0 + cell;
+                let z0 = -half + z as f32 * cell;
+                let z1 = z0 + cell;
+                let shade = if (y + z) & 1 == 0 { 96 } else { 144 };
+                draws.push(crate::fx::system::FxDraw::Quad {
+                    positions: [
+                        [distance + 0.5, y0, z1],
+                        [distance + 0.5, y1, z1],
+                        [distance + 0.5, y1, z0],
+                        [distance + 0.5, y0, z0],
+                    ],
+                    uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    rgba: [shade, shade, shade, 255],
+                    shader: "$whiteimage".to_owned(),
+                });
+            }
+        }
+        draws.push(crate::fx::system::FxDraw::Quad {
+            positions: [
+                [distance, -half, half],
+                [distance, half, half],
+                [distance, half, -half],
+                [distance, -half, -half],
+            ],
+            uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            rgba: [255, 255, 255, 255],
+            shader: shader_name.clone(),
+        });
+        let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
+        let presenter = self
+            .asset_preview_entity_presenter
+            .as_mut()
+            .expect("asset shader presenter initialized");
+        let surfaces = crate::fx::draw::tessellate(&draws, &view, &mut |shader| {
+            presenter.fx_material_stages(shader)
+        });
+        self.solo_dynamic_models = Arc::new(surfaces);
+        self.asset_preview_shader_key = Some(key);
+    }
+
+    fn ensure_asset_preview_fx(&mut self, detail: &AssetDetail) -> Result<(), String> {
+        let zoom_key = (self.asset_viewer_model_zoom * 1000.0).round() as i32;
+        if self
+            .asset_preview_fx
+            .as_ref()
+            .is_some_and(|state| state.qpath == detail.qpath && state.zoom_key == zoom_key)
+        {
+            return Ok(());
+        }
+
+        let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
+            .map_err(|error| format!("ASSET VIEWER EFX VFS ERROR: {error}"))?;
+        assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+        let mut system = crate::fx::system::FxSystem::new();
+        let effect_id = system.register(&detail.qpath, &mut |qpath| {
+            assets
+                .read(qpath, 32 * 1024 * 1024)
+                .ok()
+                .flatten()
+                .map(|asset| asset.bytes)
+        });
+        if effect_id == 0 {
+            return Err(format!("could not register {}", detail.qpath));
+        }
+        system.reset_time(0);
+        self.asset_preview_fx = Some(AssetPreviewFxState {
+            qpath: detail.qpath.clone(),
+            zoom_key,
+            system,
+            effect_id,
+            started: Instant::now(),
+            next_play_ms: 0,
+            cycle_ms: detail.preview_cycle_ms.unwrap_or(1500).clamp(250, 15_000),
+        });
+        Ok(())
+    }
+
+    fn update_asset_efx_preview(&mut self, detail: &AssetDetail) {
+        if let Err(error) = self.ensure_asset_preview_entity_presenter() {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            self.push_console_line(format!("^1ASSET VIEWER EFX PREVIEW: {error}"));
+            return;
+        }
+        if let Err(error) = self.ensure_asset_preview_fx(detail) {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            let message = format!("ASSET VIEWER EFX PREVIEW: {error}");
+            if self.console_status != message {
+                self.console_status = message.clone();
+                self.push_console_line(format!("^1{message}"));
+            }
+            return;
+        }
+
+        let distance = (112.0 * self.asset_viewer_model_zoom).clamp(32.0, 1400.0);
+        let frame = {
+            let state = self.asset_preview_fx.as_mut().expect("asset EFX state initialized");
+            let now_ms = state
+                .started
+                .elapsed()
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            let now_ms = now_ms.max(1);
+            state.system.adjust_time(now_ms);
+            if now_ms >= state.next_play_ms {
+                state
+                    .system
+                    .play_effect_dir(state.effect_id, [distance, 0.0, 0.0], [1.0, 0.0, 0.0]);
+                state.next_play_ms = now_ms.saturating_add(state.cycle_ms);
+            }
+            state.system.frame()
+        };
+
+        // The viewer is intentionally silent; Sound primitives remain metadata.
+        // Visual primitives are run by the real FX scheduler and material path.
+        let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
+        let presenter = self
+            .asset_preview_entity_presenter
+            .as_mut()
+            .expect("asset EFX presenter initialized");
+        let surfaces = crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| {
+            presenter.fx_material_stages(shader)
+        });
+        self.solo_dynamic_models = Arc::new(surfaces);
+    }
+
+    fn update_frontend_foreground_player(&mut self) {
+        let Some(cinematic) = self.frontend_cinematic else {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            return;
+        };
+        if let Err(error) = self.ensure_local_player_presenter() {
+            if self.console_status != error {
+                self.console_status = error.clone();
+                self.push_console_line(format!("^1{error}"));
+            }
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            return;
+        }
+
+        let Some(idle_anim) = jka_assets::animation::animation_index("BOTH_STAND1")
+            .map(|index| index as i32)
+        else {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            return;
+        };
+
+        let forward = self.camera.forward();
+        let right = glam::Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let model_origin = self.camera.position
+            + forward * FRONTEND_FOREGROUND_MODEL_DISTANCE
+            + right * FRONTEND_FOREGROUND_MODEL_SIDE_OFFSET;
+        let model_feet_render = [
+            model_origin.x,
+            model_origin.y - FRONTEND_FOREGROUND_MODEL_HEAD_HEIGHT,
+            model_origin.z,
+        ];
+        let model_feet_jka = scene::jka_position(model_feet_render);
+        let camera_jka = scene::jka_position(self.camera.position.to_array());
+        let to_camera_x = camera_jka[0] - model_feet_jka[0];
+        let to_camera_y = camera_jka[1] - model_feet_jka[1];
+        let face_camera_yaw = to_camera_y.atan2(to_camera_x).to_degrees();
+
+        let mut entity_view = jka_movement::PlayerEntityView::default();
+        entity_view.number = 0;
+        entity_view.entity_type = ET_PLAYER;
+        entity_view.client_num = 0;
+        // Camera/world rendering uses Y-up render coordinates, while the shared
+        // OpenJK player presentation path consumes native JKA Z-up coordinates.
+        entity_view.origin = model_feet_jka;
+        entity_view.angles = [0.0, face_camera_yaw, 0.0];
+        entity_view.legs_anim = idle_anim;
+        entity_view.torso_anim = idle_anim;
+        entity_view.health = 100;
+        entity_view.view_height = FRONTEND_CAMERA_EYE_HEIGHT as i32;
+        entity_view.ground_entity_num = jka_movement::ENTITY_WORLD;
+
+        let Some(entity) = presented_openjk_player(entity_view) else {
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            return;
+        };
+
+        let current_time = cinematic.started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        let presenter = self
+            .local_player_presenter
+            .as_mut()
+            .expect("local player presenter initialized");
+        presenter.set_skinning_mode(self.video.ghoul2_skinning);
+        presenter.set_early_frustum_cull(self.video.ghoul2_early_cull);
+        presenter.set_lod_bias(self.video.ghoul2_lod_bias);
+        let info = ClientInfo::solo_model(FRONTEND_FOREGROUND_MODEL);
+        match presenter.present_player_entity(
+            &entity,
+            &info,
+            current_time,
+            1.0,
+            Some(scene::jka_position(self.camera.position.to_array())),
+            false,
+            true,
+        ) {
+            Ok(draws) => self.solo_dynamic_models = Arc::new(draws),
+            Err(error) => {
+                self.solo_dynamic_models = Arc::new(Vec::new());
+                if self.console_status != error {
+                    self.console_status = error.clone();
+                    self.push_console_line(format!("^1FRONTEND PLAYER PRESENTATION: {error}"));
+                }
+            }
+        }
+    }
+
     fn update_solo_player_view_and_presentation(&mut self) {
+        if self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.local)
+        {
+            // `/map` and `/devmap` are presented exclusively by the shared
+            // snapshot/CGame path. Keeping the legacy direct presenter active
+            // here would double-submit the player and, more importantly, let
+            // local-only FX behavior drift from joined servers again.
+            self.solo_dynamic_models = Arc::new(Vec::new());
+            return;
+        }
         let mut first_person_camera = self.camera;
         let subframe = self.video.input_subframe;
         let Some((mode, player_view, entity_view, view_angles, presentation_origin, presentation_time)) =
-            self.local_player.as_ref().map(|player| {
+            self.local_server.as_ref().map(|player| {
                 if subframe {
                     player.camera_subframe(&mut first_person_camera);
                 } else {
@@ -6325,7 +8304,13 @@ impl App {
                 )
             })
         else {
-            self.solo_dynamic_models = Arc::new(Vec::new());
+            if self.front_end {
+                if self.frontend_page != FrontendPage::AssetViewer {
+                    self.update_frontend_foreground_player();
+                }
+            } else {
+                self.solo_dynamic_models = Arc::new(Vec::new());
+            }
             return;
         };
         let render_third_person = mode == JoinMode::Player
@@ -6352,11 +8337,11 @@ impl App {
                         health: entity_view.health,
                         dead_yaw: entity_view.dead_yaw as f32,
                         client_num: entity_view.client_num,
-                        time: if self.presentation_smoothing.smooth_third_person_time {
+                        time: f64::from(if self.presentation_smoothing.smooth_third_person_time {
                             presentation_time
                         } else {
                             player_view.command_time
-                        },
+                        }),
                         teleported: false,
                     },
                 );
@@ -6438,6 +8423,7 @@ impl App {
             gen_normal_maps: self.video.gen_normal_maps,
             float_lightmap: self.video.float_lightmap && self.video.hdr,
             planar_reflections: self.video.reflection_quality.planar_slot_budget() > 0,
+            source_spatial_batches: self.video.gpu_driven,
             pbr_materials: self.video.pbr,
             allow_asset_overrides: self.video.allow_asset_overrides,
             steam_audio: self.audio.steam_audio,
@@ -6448,11 +8434,66 @@ impl App {
         self.request_map_internal(source, MapLoadPurpose::Gameplay);
     }
 
+    fn request_map_edit_preview(&mut self, path: PathBuf, text: String) {
+        self.latest_request_id = self.latest_request_id.wrapping_add(1);
+        let request_id = self.latest_request_id;
+        self.map_edit_preview_request_id = Some(request_id);
+        self.map_edit_preview_dirty = false;
+        let source = scene::MapSource::MapEditPreview {
+            path,
+            text: Arc::<str>::from(text),
+        };
+        let mut prepare_options = self.current_map_prepare_options();
+        // The preview only replaces render geometry. Do not rebake Rapier or
+        // Steam Audio every time the user releases a brush drag.
+        prepare_options.client_physics = false;
+        prepare_options.steam_audio = false;
+        self.latest_prepare_options = prepare_options;
+        println!("Map editor preview: background rebuild {}", source.label());
+        if self
+            .loader_tx
+            .send(MapLoadRequest {
+                request_id,
+                started: Instant::now(),
+                game: self.game.clone(),
+                source,
+                prepare_options,
+            })
+            .is_err()
+        {
+            self.map_edit_preview_request_id = None;
+            if let Some(editor) = self.map_editor.as_mut() {
+                editor.status = "Textured preview worker is unavailable; wireframe/solid preview remains active.".into();
+            }
+        }
+    }
+
     /// Start map preparation without committing the UI to leave the front end.
     /// Used by the speculative live-server getinfo path while the authenticated
     /// connection/gamestate handshake is still in progress.
     fn prefetch_live_map(&mut self, source: scene::MapSource) {
         self.request_map_internal(source, MapLoadPurpose::LivePrefetch);
+    }
+
+    fn queue_map_edit_preview(&mut self) {
+        if self.map_edit_preview_request_id.is_some() {
+            self.map_edit_preview_dirty = true;
+            return;
+        }
+        let preview = self.map_editor.as_ref().and_then(|editor| {
+            match editor.working_source_text() {
+                Ok(text) => Some((editor.source_path.clone(), text)),
+                Err(error) => {
+                    eprintln!("Map editor preview source build failed: {error}");
+                    None
+                }
+            }
+        });
+        if let Some((path, text)) = preview {
+            self.request_map_edit_preview(path, text);
+        } else if let Some(editor) = self.map_editor.as_mut() {
+            editor.status = "Could not build textured brush preview; see console.".into();
+        }
     }
 
     fn request_frontend_background(&mut self) {
@@ -6480,6 +8521,14 @@ impl App {
     }
 
     fn request_map_internal(&mut self, source: scene::MapSource, purpose: MapLoadPurpose) {
+        self.map_edit_preview_request_id = None;
+        self.map_edit_preview_dirty = false;
+        if purpose != MapLoadPurpose::FrontendBackground {
+            self.render_command(RenderCommand::SetAssetPreviewMode(false));
+            self.render_command(RenderCommand::SetAssetPreviewViewport(None));
+            self.asset_preview_viewport_key = None;
+            self.clear_asset_preview_runtime();
+        }
         self.apply_latched_console_cvars(ApplyLatchedScope::MapLoad);
         // PBR material selection is map-load scoped; synchronize the renderer at
         // the same boundary rather than when a latched cvar is typed. Rebuild the
@@ -6503,7 +8552,7 @@ impl App {
             self.current_map_prepare_options()
         };
         self.latest_prepare_options = prepare_options;
-        let mut loading = MapLoadingState::new(request_id, label.clone());
+        let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
         if !prepare_options.grass {
             loading.skip_task(crate::thread_activity::Task::MapGrass);
         }
@@ -6570,7 +8619,7 @@ impl App {
         let started = Instant::now();
         self.static_ao_progress = None;
         self.preserve_game_state_on_next_map_upload = false;
-        let mut loading = MapLoadingState::new(request_id, label.clone());
+        let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
         let has_ocean = prepare_options.ocean && prepared_map_has_ocean_surface(map.as_ref());
         loading.set_optional_task_presence(
             crate::thread_activity::Task::MapOcean,
@@ -6616,7 +8665,7 @@ impl App {
         }
 
         // Mirror OpenJK writeconfig: bindings + archived cvars. The native
-        // jka-rust.cfg already contains exactly that state, so flush it first
+        // DinurdoJK.cfg already contains exactly that state, so flush it first
         // and then copy the generated snapshot into the active game directory.
         self.config_dirty = true;
         self.flush_config();
@@ -7107,6 +9156,15 @@ impl App {
                             // arriving while the local map is being prepared.
                             if self.net.is_some() {
                                 self.disconnect_to_main_menu();
+                            } else {
+                                // `map`/`devmap` starts a new local server lifetime.
+                                // Do not let the previous local/demo CGame make the
+                                // MapPrepared handler think an external authority
+                                // already owns the new world.
+                                self.game_session = None;
+                                self.local_server = None;
+                                self.predictor.reset();
+                                self.solo_dynamic_models = Arc::new(Vec::new());
                             }
                             self.request_map(source);
                         },
@@ -7203,13 +9261,13 @@ impl App {
                 return;
             }
             [verb] if verb.eq_ignore_ascii_case("force_speed") => {
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.request_power(jka_movement::MovementPower::Speed);
                 }
                 return;
             }
             [verb] if verb.eq_ignore_ascii_case("force_rage") => {
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.request_power(jka_movement::MovementPower::Rage);
                 }
                 return;
@@ -7400,7 +9458,7 @@ impl App {
     fn current_follow_name(&self) -> Option<String> {
         const PMF_FOLLOW: i32 = 4096;
         let session = self.game_session.as_ref()?;
-        let ps = if session.live {
+        let ps = if session.live && !session.local {
             self.predictor
                 .predicted()
                 .or_else(|| session.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state))
@@ -7419,28 +9477,80 @@ impl App {
     }
 
     fn current_movement_hud_state(&self) -> ui::MovementHudState {
+        let movement_keys_active = self.movement_keys_hud.mode != 0;
+        let strafe_helper_active = self.strafe_helper.flags & ui::SHELPER_STYLE_MASK != 0;
+        if !movement_keys_active && !strafe_helper_active {
+            // Keep the mailbox value completely stable when neither feature is
+            // visible. In particular, do not let view yaw/velocity turn into a
+            // pointless per-frame renderer update while the HUD is disabled.
+            return ui::MovementHudState::default();
+        }
+
         if let Some(ps) = self.live_player_state() {
             let mut state = ui::MovementHudState::default();
-            if let Some(cmd) = self.live_provisional {
+            let local_session = self
+                .game_session
+                .as_ref()
+                .is_some_and(|session| session.local);
+            if local_session {
+                let axis = |positive: KeyCode, negative: KeyCode| -> i8 {
+                    match (
+                        self.movement_keys.contains(&positive),
+                        self.movement_keys.contains(&negative),
+                    ) {
+                        (true, false) => 127,
+                        (false, true) => -127,
+                        _ => 0,
+                    }
+                };
+                state.forward_move = axis(KeyCode::KeyW, KeyCode::KeyS);
+                state.right_move = axis(KeyCode::KeyD, KeyCode::KeyA);
+                state.up_move = axis(KeyCode::Space, KeyCode::ControlLeft);
+                if self.noclip_primary_down {
+                    state.buttons |= jka_movement::BUTTON_ATTACK;
+                }
+                if self.noclip_alt_down {
+                    state.buttons |= jka_movement::BUTTON_ALT_ATTACK;
+                }
+                if self.movement_keys.contains(&KeyCode::ShiftLeft) {
+                    state.buttons |= jka_movement::BUTTON_WALKING;
+                }
+            } else if let Some(cmd) = self.live_provisional {
                 state.forward_move = cmd.forward_move;
                 state.right_move = cmd.right_move;
                 state.up_move = cmd.up_move;
                 state.buttons = cmd.buttons;
             }
             state.velocity = playerstate_vec3(ps, "velocity").unwrap_or([0.0; 3]);
-            state.view_yaw = self
-                .live_view_angles()
-                .or_else(|| playerstate_vec3(ps, "viewangles"))
-                .map(|angles| angles[1])
-                .unwrap_or(0.0);
+            state.view_yaw = if local_session && self.video.input_subframe {
+                self.local_server
+                    .as_ref()
+                    .map(|server| server.subframe_view_angles()[1])
+                    .unwrap_or(0.0)
+            } else {
+                self.live_view_angles()
+                    .or_else(|| playerstate_vec3(ps, "viewangles"))
+                    .map(|angles| angles[1])
+                    .unwrap_or(0.0)
+            };
             state.player_speed = ps.field_i32("speed").unwrap_or(250).max(1) as f32;
             state.grounded = ps.field_i32("groundEntityNum").is_some_and(|entity| entity != 1023);
             state.fov_x = self.camera.cg_fov();
+            if !strafe_helper_active {
+                // MovementKeys only consumes command/button state. Zero the
+                // continuous fields so the snapshot changes only when a key or
+                // button actually changes, not every time velocity/yaw moves.
+                state.velocity = [0.0; 3];
+                state.view_yaw = 0.0;
+                state.player_speed = 250.0;
+                state.grounded = false;
+                state.fov_x = 90.0;
+            }
             return state;
         }
 
         let mut state = ui::MovementHudState::default();
-        if let Some(player) = &self.local_player {
+        if let Some(player) = &self.local_server {
             let view = player.view();
             state.velocity = view.velocity;
             state.view_yaw = player.subframe_view_angles()[1];
@@ -7462,6 +9572,13 @@ impl App {
         if self.noclip_alt_down { state.buttons |= jka_movement::BUTTON_ALT_ATTACK; }
         if self.movement_keys.contains(&KeyCode::ShiftLeft) { state.buttons |= jka_movement::BUTTON_WALKING; }
         state.fov_x = self.camera.cg_fov();
+        if !strafe_helper_active {
+            state.velocity = [0.0; 3];
+            state.view_yaw = 0.0;
+            state.player_speed = 250.0;
+            state.grounded = false;
+            state.fov_x = 90.0;
+        }
         state
     }
 
@@ -7481,7 +9598,7 @@ impl App {
                 ammo,
             });
         }
-        self.local_player.as_ref().and_then(|player| {
+        self.local_server.as_ref().and_then(|player| {
             (player.mode == JoinMode::Player).then(|| {
                 let view = player.view();
                 HudState {
@@ -7496,9 +9613,16 @@ impl App {
         })
     }
 
-    /// cg.predictedPlayerState (or the latest snapshot's) while live.
+    /// Shared live playerState. Remote play prefers client prediction; the
+    /// in-process server is already authoritative and reads its current snapshot.
     fn live_player_state(&self) -> Option<&jka_protocol::server::PlayerState> {
         let session = self.game_session.as_ref().filter(|session| session.live)?;
+        if session.local {
+            return session
+                .current_snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.player_state);
+        }
         self.predictor
             .predicted()
             .or_else(|| session.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state))
@@ -7626,13 +9750,30 @@ impl App {
             }
             _ => {}
         }
-        if !self.live_connected() {
+        // Commands such as saberAttackCycle/weapnext are CL_CreateCmd inputs,
+        // not reliable server strings.  The local-server shim must accept the
+        // same client-side commands even though there is deliberately no netchan.
+        let local_active = self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.live && session.local);
+        if !self.live_connected() && !local_active {
             return false;
         }
-        // cgame commands that only change the local usercmd.
+        // cgame commands that only change the next usercmd. Remote servers own
+        // the whole generic-command table. The lightweight local authority
+        // advertises only the game-side cases it actually implements so older
+        // local handlers (currently force_speed/force_rage) still fall through.
         if let Some(value) = crate::net::generic_command(&verb_lower) {
-            self.live_input.queue_generic_command(value);
-            return true;
+            let local_supported = local_active
+                && self
+                    .local_server
+                    .as_ref()
+                    .is_some_and(|server| server.supports_generic_command(value));
+            if self.live_connected() || local_supported {
+                self.live_input.queue_generic_command(value);
+                return true;
+            }
         }
         if matches!(verb_lower.as_str(), "weapnext" | "weapprev" | "weapon") {
             if let Some(ps) = self.live_player_state().cloned() {
@@ -7648,8 +9789,15 @@ impl App {
             }
             return true;
         }
-        // gcmds are registered with no handler: always forwarded while connected.
-        if crate::console::is_server_command(verb) {
+        // Registered game/server commands are reliable strings only for a real
+        // remote connection.  A local-server session deliberately has no
+        // netchan, so consuming them here would prevent the local command
+        // dispatcher below from handling commands such as noclip/force_speed.
+        //
+        // Keep local CL_CreateCmd commands (generic_cmd/weapon selection) above,
+        // but let all other local commands fall through to the lightweight
+        // authority's explicit handlers instead of feeding CL_ForwardCommandToServer.
+        if self.live_connected() && crate::console::is_server_command(verb) {
             self.forward_command_to_server(line);
             return true;
         }
@@ -7746,7 +9894,10 @@ impl App {
     fn normalized_bsp_name(name: &str) -> String {
         let normalized = name.trim().replace('\\', "/");
         let normalized = normalized.strip_prefix("maps/").unwrap_or(&normalized);
-        let normalized = normalized.strip_suffix(".bsp").unwrap_or(normalized);
+        let normalized = normalized
+            .strip_suffix(".bsp")
+            .or_else(|| normalized.strip_suffix(".map"))
+            .unwrap_or(normalized);
         normalized.to_ascii_lowercase()
     }
 
@@ -7768,7 +9919,18 @@ impl App {
         if let Some(timing) = self.live_join_timing.as_mut() {
             timing.server_info_ms = elapsed_ms;
         }
+
+        if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
+            self.live_http_base = crate::download::advertised_http_base(&info, server);
+            if let Some(base) = self.live_http_base.as_deref() {
+                println!("[DOWNLOAD] infoResponse HTTP endpoint: {base}");
+            }
+        }
+
         let Some(map_bytes) = info.get(b"mapname") else {
+            if let Some(net) = self.net.as_mut() {
+                net.resume_connect();
+            }
             return;
         };
         let map_name = String::from_utf8_lossy(map_bytes).into_owned();
@@ -7779,8 +9941,12 @@ impl App {
             elapsed_ms.unwrap_or(0.0)
         );
         if !info.is_protocol_26() {
+            if let Some(net) = self.net.as_mut() {
+                net.resume_connect();
+            }
             return;
         }
+
         let advertised_game = info.get(b"game").unwrap_or_default();
         match self.set_session_fs_game(advertised_game, "server info") {
             Ok(true) => self.start_live_cgame_prep(),
@@ -7791,10 +9957,15 @@ impl App {
                 return;
             }
         }
+
         if self.loaded_map_matches(&map_name) || self.loading_map_matches(&map_name) {
             println!("[JOIN] map {map_name} already loaded/in flight; no prefetch restart");
+            if let Some(net) = self.net.as_mut() {
+                net.resume_connect();
+            }
             return;
         }
+
         let source = scene::MapSource::Bsp(map_name.clone());
         match scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
             Ok(()) => {
@@ -7803,14 +9974,470 @@ impl App {
                 }
                 self.push_console_line(format!("^5[JOIN]^7 prefetching {map_name} during handshake"));
                 self.prefetch_live_map(source);
+                if let Some(net) = self.net.as_mut() {
+                    net.resume_connect();
+                }
             }
             Err(error) => {
-                println!("[JOIN] map prefetch skipped: {error}");
-                self.push_console_line(format!(
-                    "^3[JOIN]^7 map prefetch skipped; {error}"
-                ));
+                println!("[JOIN] map preflight blocked: {error}");
+                self.console_status = format!("MAP NOT FOUND: {map_name}");
+                self.push_console_line(format!("^3[JOIN]^7 map not found locally: {map_name}"));
+                self.missing_map_prompt = Some(MissingMapPrompt {
+                    map_name,
+                    reason: error,
+                });
+                self.egui_repaint_requested = true;
+                self.publish_ui();
+                // Intentionally leave ClientSession's preflight pause engaged.
+                // The dialog explicitly chooses abort, connect-anyway, or
+                // autodownload before the gameplay connect packet is sent.
             }
         }
+    }
+
+    fn choose_missing_map_abort(&mut self) {
+        self.missing_map_prompt = None;
+        self.live_auto_download_requested = false;
+        self.live_missing_map_authorized = false;
+        self.disconnect_to_main_menu();
+        self.console_status = "CONNECTION ABORTED - MAP NOT INSTALLED".into();
+    }
+
+    fn choose_missing_map_connect_anyway(&mut self) {
+        let map = self.missing_map_prompt.take().map(|prompt| prompt.map_name);
+        self.live_missing_map_authorized = true;
+        self.live_auto_download_requested = false;
+        self.console_status = map
+            .as_deref()
+            .map_or_else(|| "CONNECTING WITHOUT LOCAL MAP...".into(), |map| format!("CONNECTING WITHOUT {map}..."));
+        self.continue_live_after_missing_map_choice();
+    }
+
+    fn choose_missing_map_autodownload(&mut self) {
+        if !self.network.allow_http_downloads && !self.network.allow_legacy_downloads {
+            self.console_status = "AUTODOWNLOAD IS DISABLED IN SETUP > NETWORK".into();
+            self.push_console_line("^3Enable HTTP downloads and/or Legacy server downloads in Setup > Network.".to_owned());
+            self.egui_repaint_requested = true;
+            return;
+        }
+        let map_name = self
+            .missing_map_prompt
+            .as_ref()
+            .map(|prompt| prompt.map_name.clone())
+            .unwrap_or_else(|| "server map".to_owned());
+        self.live_join_ui = Some(LiveJoinUiState {
+            map_name,
+            phase: LiveJoinUiPhase::CheckingContent,
+            detail: "Requesting the server package list...".into(),
+        });
+        self.missing_map_prompt = None;
+        self.live_missing_map_authorized = false;
+        self.live_auto_download_requested = true;
+        self.console_status = "CONNECTING TO GET SERVER DOWNLOAD LIST...".into();
+        self.continue_live_after_missing_map_choice();
+    }
+
+    fn continue_live_after_missing_map_choice(&mut self) {
+        let state = self.net.as_ref().map(crate::net::NetClient::state);
+        if state.is_some_and(|state| state < jka_protocol::session::ConnectionState::Connected) {
+            if let Some(net) = self.net.as_mut() {
+                net.resume_connect();
+            }
+            return;
+        }
+        if state.is_some() {
+            // Fallback path for servers that did not answer the speculative
+            // infoResponse: the gamestate itself discovered the missing map.
+            self.start_live_gamestate();
+        }
+    }
+
+    fn show_missing_map_prompt(&mut self, map_name: &str, reason: impl Into<String>) {
+        self.missing_map_prompt = Some(MissingMapPrompt {
+            map_name: map_name.to_owned(),
+            reason: reason.into(),
+        });
+        self.console_status = format!("MAP NOT FOUND: {map_name}");
+        self.egui_repaint_requested = true;
+        self.publish_ui();
+    }
+
+    /// CL_InitDownloads / FS_ComparePaks. The gamestate supplies the complete
+    /// referenced-PK3 list, so this starts only after the pre-connect dialog's
+    /// autodownload choice has allowed the gameplay handshake to reach CA_CONNECTED.
+    fn begin_live_autodownload(
+        &mut self,
+        map_name: &str,
+        configstrings: &BTreeMap<u16, Vec<u8>>,
+    ) {
+        if self.live_download.is_some() {
+            return;
+        }
+        let systeminfo = configstrings
+            .get(&jka_protocol::session::CS_SYSTEMINFO)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let serverinfo = configstrings.get(&0).map(Vec::as_slice).unwrap_or_default();
+        let files = match crate::download::referenced_downloads(&self.base, self.game.as_deref(), systeminfo) {
+            Ok(files) => files,
+            Err(error) => {
+                self.fail_live_autodownload(map_name, error);
+                return;
+            }
+        };
+        if files.is_empty() {
+            self.fail_live_autodownload(
+                map_name,
+                "The server did not advertise any missing referenced PK3s for this map.".to_owned(),
+            );
+            return;
+        }
+
+        let server_allows_legacy = jka_protocol::commands::info_value(serverinfo, b"sv_allowDownload")
+            .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
+        let server_allows_http = jka_protocol::commands::info_value(serverinfo, b"sv_httpDownloads")
+            .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
+        let http_base = if self.network.allow_http_downloads && server_allows_http {
+            self.live_http_base.clone()
+        } else {
+            None
+        };
+        let can_legacy = self.network.allow_legacy_downloads && server_allows_legacy;
+        println!(
+            "[DOWNLOAD] transports: client http={} legacy={}, server http={} legacy={}, endpoint={}",
+            self.network.allow_http_downloads,
+            self.network.allow_legacy_downloads,
+            server_allows_http,
+            server_allows_legacy,
+            http_base.as_deref().unwrap_or("none")
+        );
+        if http_base.is_none() && !can_legacy {
+            self.fail_live_autodownload(
+                map_name,
+                "No allowed download transport is available (HTTP not advertised/allowed and legacy downloads unavailable).".to_owned(),
+            );
+            return;
+        }
+
+        self.push_console_line(format!(
+            "^5DOWNLOAD:^7 {} missing referenced PK3{} for {map_name}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+        self.live_download = Some(LiveDownloadState {
+            map_name: map_name.to_owned(),
+            files,
+            index: 0,
+            http_base,
+            server_allows_legacy,
+            transfer: LiveDownloadTransfer::Idle,
+            received: 0,
+            total: None,
+            status: "Preparing download...".into(),
+        });
+        self.egui_repaint_requested = true;
+        self.start_live_download_current();
+    }
+
+    fn start_live_download_current(&mut self) {
+        let complete = self
+            .live_download
+            .as_ref()
+            .is_some_and(|state| state.index >= state.files.len());
+        if complete {
+            self.finish_live_autodownload();
+            return;
+        }
+
+        let (spec, http_base, can_legacy) = {
+            let Some(state) = self.live_download.as_ref() else { return };
+            let Some(spec) = state.current().cloned() else { return };
+            (
+                spec,
+                state.http_base.clone().filter(|_| self.network.allow_http_downloads),
+                state.server_allows_legacy && self.network.allow_legacy_downloads,
+            )
+        };
+
+        if let Some(http_base) = http_base {
+            let (tx, rx) = mpsc::channel();
+            crate::download::spawn_http_download(http_base, spec.clone(), tx);
+            if let Some(state) = self.live_download.as_mut() {
+                state.received = 0;
+                state.total = None;
+                state.status = format!("HTTP: {}", spec.remote_name);
+                state.transfer = LiveDownloadTransfer::Http { rx };
+            }
+            self.console_status = format!("DOWNLOADING {} (HTTP)", spec.remote_name.to_ascii_uppercase());
+            self.push_console_line(format!("^5HTTP DOWNLOAD:^7 {}", spec.remote_name));
+            self.egui_repaint_requested = true;
+            return;
+        }
+
+        if can_legacy {
+            self.start_live_legacy_download(spec);
+            return;
+        }
+
+        let map_name = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+        self.fail_live_autodownload(&map_name, "No enabled download transport is available.".to_owned());
+    }
+
+    fn start_live_legacy_download(&mut self, spec: crate::download::DownloadSpec) {
+        if let Some(parent) = spec.local_path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                self.fail_live_autodownload(&map, format!("Could not create {}: {error}", parent.display()));
+                return;
+            }
+        }
+        let temp_path = crate::download::temp_path_for(&spec.local_path);
+        let file = match File::create(&temp_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                self.fail_live_autodownload(&map, format!("Could not create {}: {error}", temp_path.display()));
+                return;
+            }
+        };
+        if let Some(state) = self.live_download.as_mut() {
+            state.received = 0;
+            state.total = None;
+            state.status = format!("Legacy JKA: {}", spec.remote_name);
+            state.transfer = LiveDownloadTransfer::Legacy {
+                file,
+                temp_path,
+                expected_block: 0,
+                received: 0,
+                total: None,
+            };
+        }
+        let command = format!("download {}", spec.remote_name);
+        let send_result = self
+            .net
+            .as_mut()
+            .map_or(Ok(()), |net| net.send_reliable_now(command.as_bytes()));
+        if let Err(error) = send_result {
+            let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+            self.fail_live_autodownload(&map, error);
+            return;
+        }
+        self.console_status = format!("DOWNLOADING {} (LEGACY)", spec.remote_name.to_ascii_uppercase());
+        self.push_console_line(format!("^5LEGACY DOWNLOAD:^7 {}", spec.remote_name));
+        self.egui_repaint_requested = true;
+    }
+
+    fn poll_live_download(&mut self) {
+        let events = match self.live_download.as_ref().map(|state| &state.transfer) {
+            Some(LiveDownloadTransfer::Http { rx }) => rx.try_iter().collect::<Vec<_>>(),
+            _ => return,
+        };
+        for event in events {
+            match event {
+                crate::download::HttpEvent::Started { total } => {
+                    if let Some(state) = self.live_download.as_mut() {
+                        state.total = total;
+                    }
+                }
+                crate::download::HttpEvent::Progress { received, total } => {
+                    if let Some(state) = self.live_download.as_mut() {
+                        state.received = received;
+                        state.total = total.or(state.total);
+                    }
+                    self.egui_repaint_requested = true;
+                }
+                crate::download::HttpEvent::Finished(Ok(())) => {
+                    if let Some(state) = self.live_download.as_mut() {
+                        state.index += 1;
+                        state.transfer = LiveDownloadTransfer::Idle;
+                        state.received = 0;
+                        state.total = None;
+                    }
+                    self.start_live_download_current();
+                }
+                crate::download::HttpEvent::Finished(Err(error)) => {
+                    let fallback = self.live_download.as_ref().is_some_and(|state| {
+                        state.server_allows_legacy && self.network.allow_legacy_downloads
+                    });
+                    if fallback {
+                        let spec = self.live_download.as_ref().and_then(LiveDownloadState::current).cloned();
+                        if let Some(state) = self.live_download.as_mut() {
+                            state.transfer = LiveDownloadTransfer::Idle;
+                            state.status = format!("HTTP failed; falling back to legacy: {error}");
+                        }
+                        self.push_console_line(format!("^3HTTP download failed:^7 {error}; trying legacy JKA download."));
+                        if let Some(spec) = spec {
+                            self.start_live_legacy_download(spec);
+                        }
+                    } else {
+                        let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                        self.fail_live_autodownload(&map, error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_live_download_block(&mut self, block: jka_protocol::server::DownloadBlock) {
+        if !matches!(self.live_download.as_ref().map(|state| &state.transfer), Some(LiveDownloadTransfer::Legacy { .. })) {
+            if let Some(net) = self.net.as_mut() {
+                let _ = net.send_reliable_now(b"stopdl");
+            }
+            return;
+        }
+        if let Some(error) = block.error.as_ref() {
+            let message = String::from_utf8_lossy(error).into_owned();
+            let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+            self.fail_live_autodownload(&map, format!("Server refused download: {message}"));
+            return;
+        }
+
+        let mut ack = None;
+        let mut completed = None::<(PathBuf, PathBuf, i32)>;
+        let mut failure = None;
+        if let Some(state) = self.live_download.as_mut() {
+            let completion = state.current().map(|spec| (spec.local_path.clone(), spec.checksum));
+            if let LiveDownloadTransfer::Legacy {
+                file,
+                temp_path,
+                expected_block,
+                received,
+                total,
+            } = &mut state.transfer
+            {
+                if block.block < *expected_block {
+                    ack = Some(block.block);
+                } else if block.block > *expected_block {
+                    return;
+                } else {
+                    if let Some(size) = block.file_size {
+                        if size < 0 {
+                            failure = Some("Server reported a negative download size.".to_owned());
+                        } else if size as u64 > 2 * 1024 * 1024 * 1024 {
+                            failure = Some("Server package exceeds the 2 GiB download safety limit.".to_owned());
+                        } else {
+                            *total = Some(size as u64);
+                            state.total = *total;
+                        }
+                    }
+                    if failure.is_none() {
+                        if let Err(error) = file.write_all(&block.data) {
+                            failure = Some(format!("Writing download failed: {error}"));
+                        } else {
+                            *received += block.data.len() as u64;
+                            state.received = *received;
+                            ack = Some(block.block);
+                            *expected_block = (*expected_block).wrapping_add(1);
+                            if block.data.is_empty() {
+                                if let Some((final_path, checksum)) = completion {
+                                    completed = Some((temp_path.clone(), final_path, checksum));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = failure {
+            let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+            self.fail_live_autodownload(&map, error);
+            return;
+        }
+        if let Some(block) = ack {
+            let command = format!("nextdl {block}");
+            let send_result = self
+                .net
+                .as_mut()
+                .map_or(Ok(()), |net| net.send_reliable_now(command.as_bytes()));
+            if let Err(error) = send_result {
+                let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                self.fail_live_autodownload(&map, error);
+                return;
+            }
+        }
+        if let Some((temp_path, final_path, checksum)) = completed {
+            // Drop/close the file before the Windows rename.
+            if let Some(state) = self.live_download.as_mut() {
+                state.transfer = LiveDownloadTransfer::Idle;
+            }
+            if let Err(error) = crate::download::verify_pk3_checksum(&temp_path, checksum) {
+                let _ = std::fs::remove_file(&temp_path);
+                let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                self.fail_live_autodownload(&map, error);
+                return;
+            }
+            if let Err(error) = std::fs::rename(&temp_path, &final_path) {
+                let map = self.live_download.as_ref().map(|state| state.map_name.clone()).unwrap_or_default();
+                self.fail_live_autodownload(&map, format!("Installing {} failed: {error}", final_path.display()));
+                return;
+            }
+            if let Some(state) = self.live_download.as_mut() {
+                state.index += 1;
+                state.received = 0;
+                state.total = None;
+            }
+            self.start_live_download_current();
+        }
+        self.egui_repaint_requested = true;
+    }
+
+    fn finish_live_autodownload(&mut self) {
+        let Some(state) = self.live_download.take() else { return };
+        let map_name = state.map_name;
+        let source = scene::MapSource::Bsp(map_name.clone());
+        if let Err(error) = scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
+            self.live_auto_download_requested = false;
+            self.live_join_ui = None;
+            if let Some(net) = self.net.as_mut() {
+                let _ = net.send_reliable_now(b"stopdl");
+            }
+            self.show_missing_map_prompt(
+                &map_name,
+                format!("Downloads completed, but the map is still unavailable: {error}"),
+            );
+            return;
+        }
+
+        self.live_auto_download_requested = false;
+        self.live_missing_map_authorized = false;
+        if let Some(join_ui) = self.live_join_ui.as_mut() {
+            join_ui.phase = LiveJoinUiPhase::Synchronizing;
+            join_ui.detail = "Refreshing downloaded assets and requesting a fresh gamestate...".into();
+        }
+        self.live_cgame_prep_rx = None;
+        self.live_cgame_prepared = None;
+        // A downloaded PK3 can contribute strings as well as map/render assets.
+        // Force the post-download prep to rebuild from the refreshed search path.
+        self.stringed = None;
+        self.start_live_cgame_prep();
+        self.console_status = format!("DOWNLOAD COMPLETE: {map_name}; REFRESHING GAMESTATE...");
+        self.push_console_line(format!("^2DOWNLOAD COMPLETE:^7 {map_name}; requesting fresh gamestate."));
+        let finish_result = self
+            .net
+            .as_mut()
+            .map_or(Ok(()), |net| net.send_reliable_now(b"donedl"));
+        if let Err(error) = finish_result {
+            self.push_console_line(format!("^1Could not finish download handshake: {error}"));
+            self.disconnect_to_main_menu();
+            return;
+        }
+        self.egui_repaint_requested = true;
+    }
+
+    fn fail_live_autodownload(&mut self, map_name: &str, error: String) {
+        if let Some(state) = self.live_download.take() {
+            if let LiveDownloadTransfer::Legacy { temp_path, .. } = state.transfer {
+                let _ = std::fs::remove_file(temp_path);
+            }
+        }
+        self.live_auto_download_requested = false;
+        self.live_join_ui = None;
+        if let Some(net) = self.net.as_mut() {
+            let _ = net.send_reliable_now(b"stopdl");
+        }
+        self.push_console_line(format!("^1AUTODOWNLOAD FAILED:^7 {error}"));
+        self.show_missing_map_prompt(map_name, format!("Autodownload failed: {error}"));
     }
 
     fn connect_to_server(&mut self, target: &str) {
@@ -7820,8 +10447,14 @@ impl App {
         // Start before DNS/socket setup so the join metric really measures from
         // the user's connect action to the first rendered world frame.
         self.live_join_timing = Some(LiveJoinTiming::new());
+        self.missing_map_prompt = None;
+        self.live_missing_map_authorized = false;
+        self.live_auto_download_requested = false;
+        self.live_http_base = None;
+        self.live_download = None;
+        self.live_join_ui = None;
         let userinfo = self.network.userinfo(&self.solo_client_info.model_cvar());
-        match crate::net::NetClient::connect(target, userinfo) {
+        match crate::net::NetClient::connect_preflight(target, userinfo) {
             Ok(net) => {
                 let resolved_server = net.session().server();
                 self.push_console_line(format!(
@@ -7849,8 +10482,11 @@ impl App {
     /// Per-frame network work: CL_PacketEvent for every queued datagram,
     /// CL_SetCGameTime, CL_CreateNewCommands and CL_SendCmd.
     fn tick_network(&mut self, frame: Duration) {
-        let Some(net) = self.net.as_mut() else { return };
-        let events = net.pump();
+        self.poll_live_download();
+        let events = {
+            let Some(net) = self.net.as_mut() else { return };
+            net.pump()
+        };
         self.poll_live_cgame_prep();
         for event in events {
             self.handle_session_event(event);
@@ -7990,6 +10626,7 @@ impl App {
             SessionEvent::DemoMessage { sequence, payload, full_snapshot } => {
                 self.record_demo_message(sequence, payload, full_snapshot);
             }
+            SessionEvent::Download(block) => self.handle_live_download_block(block),
             SessionEvent::MapChange => {}
             SessionEvent::Disconnected(reason) => {
                 let reason = self.translate_server_text(reason.as_bytes());
@@ -8003,12 +10640,10 @@ impl App {
         }
     }
 
-    /// Enter CA_PRIMED without loading world geometry. This is the live equivalent
-    /// of finishing downloads with no BSP: CGame/entities keep running, while
-    /// prediction falls back to snapshot interpolation because map collision is absent.
-    fn prime_live_session_without_world(&mut self, map_name: &str, reason: &str) {
+    /// Clear any locally loaded BSP state while preserving the active live/demo session.
+    fn prepare_worldless_session(&mut self, map_name: &str) {
         // Invalidate any previous/front-end map job so a late worker result cannot
-        // repopulate a stale world behind this live session.
+        // repopulate a stale world behind the active session.
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         self.pending_frontend_map_launch = false;
         self.frontend_background_request_id = None;
@@ -8017,9 +10652,11 @@ impl App {
         self.loading = None;
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
+        self.live_join_ui = None;
 
-        self.local_player = None;
+        self.local_server = None;
         self.map_collision = None;
+        self.map_visibility = None;
         self.map_physics_collision = PhysicsMapMesh::default();
         self.map_movement = None;
         self.third_person_camera.reset();
@@ -8038,9 +10675,18 @@ impl App {
         self.front_end = false;
         self.frontend_page = FrontendPage::Main;
         self.menu_selected = 0;
-        self.live_without_world = true;
         self.render_command(RenderCommand::UnloadMap);
         self.sync_render_fps_cap();
+        self.set_overlay(OverlayMode::None);
+    }
+
+    /// Live equivalent of finishing downloads with no BSP: CGame/entities keep
+    /// running, while prediction falls back to snapshot interpolation because
+    /// map collision is absent.
+    fn prime_live_session_without_world(&mut self, map_name: &str, reason: &str) {
+        self.prepare_worldless_session(map_name);
+        self.live_without_world = true;
+        self.demo_without_world = false;
 
         self.console_status = format!("CONNECTED WITHOUT MAP: {map_name}");
         self.push_console_line(format!(
@@ -8060,7 +10706,18 @@ impl App {
         // CL_SystemInfoChanged: the gamestate systeminfo is authoritative for
         // fs_game. Inspect it before accepting any overlapped presenter/map prep
         // that may have been built speculatively from infoResponse.
-        let (map_name, configstrings, command_sequence, client_num, pure, server_name, fs_game) = {
+        let (
+            map_name,
+            configstrings,
+            command_sequence,
+            client_num,
+            pure,
+            server_name,
+            fs_game,
+            basejka_server,
+            server_id,
+            checksum_feed,
+        ) = {
             let Some(net) = self.net.as_ref() else { return };
             let decoder = net.session().decoder();
             let Some(map_name) = decoder.map_name() else {
@@ -8073,6 +10730,16 @@ impl App {
                 .and_then(|info| jka_protocol::commands::info_value(info, b"fs_game"))
                 .unwrap_or_default()
                 .to_vec();
+            let basejka_server = decoder
+                .configstrings
+                .get(&crate::cgame::CS_SERVERINFO)
+                .and_then(|info| jka_protocol::commands::info_value(info, b"gamename"))
+                .map(|gamename| gamename.eq_ignore_ascii_case(b"basejka"))
+                .unwrap_or_else(|| {
+                    fs_game.is_empty()
+                        || fs_game.eq_ignore_ascii_case(b"base")
+                        || fs_game.eq_ignore_ascii_case(b"openjk")
+                });
             (
                 map_name,
                 decoder.configstrings.clone(),
@@ -8081,6 +10748,9 @@ impl App {
                 net.session().sv_pure(),
                 net.server_name.clone(),
                 fs_game,
+                basejka_server,
+                net.session().server_id(),
+                decoder.checksum_feed,
             )
         };
         match self.set_session_fs_game(&fs_game, "gamestate systeminfo") {
@@ -8091,6 +10761,20 @@ impl App {
                 self.disconnect_to_main_menu();
                 return;
             }
+        }
+
+        let source = scene::MapSource::Bsp(map_name.clone());
+        if let Err(error) = scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
+            if self.live_auto_download_requested {
+                self.begin_live_autodownload(&map_name, &configstrings);
+                return;
+            }
+            if !self.live_missing_map_authorized {
+                self.show_missing_map_prompt(&map_name, error);
+                return;
+            }
+        } else {
+            self.live_auto_download_requested = false;
         }
 
         self.poll_live_cgame_prep();
@@ -8105,7 +10789,34 @@ impl App {
         self.pending_live_gamestate = false;
 
         if pure {
-            self.push_console_line("^3Server is sv_pure 1; pure checksums are not sent yet and it may drop this client.");
+            if basejka_server {
+                match crate::pure::build_basejka_bypass_command(&self.base, server_id, checksum_feed) {
+                    Ok(response) => {
+                        let send_result = self
+                            .net
+                            .as_mut()
+                            .ok_or_else(|| "network session disappeared".to_owned())
+                            .and_then(|net| net.send_reliable_now(&response.command));
+                        match send_result {
+                            Ok(()) => self.push_console_line(format!(
+                                "^2sv_pure:^7 TaystJK-style baseJKA bypass sent ({} stock PK3s reported).",
+                                response.reported_paks
+                            )),
+                            Err(error) => self.push_console_line(format!(
+                                "^1sv_pure: failed to send pure checksum response: {error}"
+                            )),
+                        }
+                    }
+                    Err(error) => self.push_console_line(format!(
+                        "^1sv_pure: baseJKA bypass unavailable: {error}"
+                    )),
+                }
+            } else {
+                self.push_console_line(
+                    "^3sv_pure:^7 non-baseJKA server detected; base pure bypass is not applied."
+                        .to_owned(),
+                );
+            }
         }
 
         let mut session = if let Some(prepared) = self.live_cgame_prepared.take() {
@@ -8118,6 +10829,11 @@ impl App {
                 prepared.entity_presenter,
                 crate::cgame::weapon_fx::WeaponFx::new(prepared.fx_assets),
             );
+            session.weapon_fx.set_modern_sabers(self.video.modern_sabers);
+            session.weapon_fx.set_saber_marks(self.video.saber_marks);
+            session.weapon_fx.set_collision_world(self.map_collision.clone());
+            session.weapon_fx.set_saber_trail(self.saber_trail);
+            session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             self.attach_live_sound_presenter(&mut session);
             session
         } else {
@@ -8131,6 +10847,7 @@ impl App {
             }
         };
         session.live = true;
+        session.local = false;
         session.map_name = Some(map_name.clone());
         if let Err(error) = session
             .player_presenter
@@ -8144,7 +10861,7 @@ impl App {
         }
         self.game_session = Some(session);
         self.predictor.reset();
-        self.local_player = None;
+        self.local_server = None;
         println!("NET: gamestate {map_name} clientNum={client_num} configstrings={}", configstrings.len());
         self.push_console_line(format!("^2Gamestate: {map_name} (client {client_num})"));
 
@@ -8157,6 +10874,8 @@ impl App {
                 self.sync_render_fps_cap();
             }
             println!("[JOIN] adopting already-rendered prefetched map {map_name}");
+            self.live_join_ui = None;
+            self.egui_repaint_requested = true;
             self.prime_live_session(&map_name);
             self.publish_snapshot();
             self.publish_ui();
@@ -8182,55 +10901,90 @@ impl App {
                 self.live_without_world = false;
                 self.request_map(source);
             }
-            Err(error) if self.network.allow_missing_map => {
+            Err(error) if self.live_missing_map_authorized => {
                 self.prime_live_session_without_world(&map_name, &error);
             }
             Err(error) => {
-                self.console_status = format!("MAP REQUIRED: {error}");
-                self.push_console_line(format!("^1{}", self.console_status));
-                self.push_console_line(
-                    "^3Set cl_allowMissingMap 1 to connect without world geometry.".to_owned(),
-                );
-                self.disconnect_to_main_menu();
+                self.show_missing_map_prompt(&map_name, error);
             }
         }
     }
 
     /// CL_DownloadsComplete after the map is up: CA_PRIMED, usercmds start.
+    /// Local `/map`/`/devmap` uses the same state transition, but its snapshot
+    /// source is the in-process authority rather than netchan.
     fn prime_live_session(&mut self, loaded_map: &str) {
-        let Some(session) = self.game_session.as_mut().filter(|session| session.live) else { return };
-        let loaded_qpath = loaded_map.strip_suffix(".bsp").unwrap_or(loaded_map);
-        if session.phase != SessionPhase::WaitingForMap
-            || !session.map_name.as_deref().is_some_and(|map| map.eq_ignore_ascii_case(loaded_qpath))
-        {
-            return;
+        let loaded_qpath = loaded_map
+                .strip_suffix(".bsp")
+                .or_else(|| loaded_map.strip_suffix(".map"))
+                .unwrap_or(loaded_map);
+        let is_local = {
+            let Some(session) = self.game_session.as_mut().filter(|session| session.live) else { return };
+            if session.phase != SessionPhase::WaitingForMap
+                || !session
+                    .map_name
+                    .as_deref()
+                    .is_some_and(|map| map.eq_ignore_ascii_case(loaded_qpath))
+            {
+                return;
+            }
+            session.phase = SessionPhase::WaitingForSnapshot;
+            session.local
+        };
+
+        if is_local {
+            // The local server already queued an active snapshot during map prep.
+            // There is no network pump to trigger CL_FirstSnapshot, so enter it
+            // directly once the render world is ready.
+            self.begin_live_session();
+            if self
+                .game_session
+                .as_ref()
+                .is_some_and(|session| session.local && session.phase == SessionPhase::Playing)
+            {
+                self.set_overlay(OverlayMode::None);
+            }
+        } else {
+            self.local_server = None;
+            if let Some(net) = self.net.as_mut() {
+                let realtime = net.realtime();
+                net.session_mut().set_primed(realtime);
+                net.flush();
+            }
+            self.set_overlay(OverlayMode::None);
         }
-        session.phase = SessionPhase::WaitingForSnapshot;
-        self.local_player = None;
-        if let Some(net) = self.net.as_mut() {
-            let realtime = net.realtime();
-            net.session_mut().set_primed(realtime);
-            net.flush();
-        }
-        self.set_overlay(OverlayMode::None);
     }
 
     fn begin_live_session(&mut self) {
-        let Some(session) = self.game_session.as_mut() else { return };
-        match session.begin_live() {
+        let is_local = self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.local);
+        let result = match self.game_session.as_mut() {
+            Some(session) => session.begin_live(),
+            None => return,
+        };
+        match result {
             Ok(true) => {
                 self.previous_tick = Instant::now();
-                println!("NET: first active snapshot; CGame running");
-                self.push_console_line("^2Entered the game.");
-                let summary = if let Some(timing) = self.live_join_timing.as_mut() {
-                    let active_ms = timing.elapsed_ms();
-                    Some(format!(
-                        "[JOIN] active +{active_ms:.1} ms | info {} | cgame {} | gamestate {} | first-world {}",
-                        timing.server_info_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
-                        timing.cgame_ready_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
-                        timing.gamestate_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
-                        timing.first_world_frame_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
-                    ))
+                if is_local {
+                    println!("LOCAL SERVER: first active snapshot; shared CGame running");
+                    self.push_console_line("^2Entered local game through server shim.");
+                } else {
+                    println!("NET: first active snapshot; CGame running");
+                    self.push_console_line("^2Entered the game.");
+                }
+                let summary = if !is_local {
+                    self.live_join_timing.as_mut().map(|timing| {
+                        let active_ms = timing.elapsed_ms();
+                        format!(
+                            "[JOIN] active +{active_ms:.1} ms | info {} | cgame {} | gamestate {} | first-world {}",
+                            timing.server_info_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
+                            timing.cgame_ready_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
+                            timing.gamestate_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
+                            timing.first_world_frame_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
+                        )
+                    })
                 } else {
                     None
                 };
@@ -8283,17 +11037,22 @@ impl App {
                     if self.chat_lines.len() >= 16 {
                         self.chat_lines.pop_front();
                     }
-                    self.chat_lines.push_back(ChatRecord { text, created: Instant::now() });
+                    let now = Instant::now();
+                    let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
+                    self.chat_lines.push_back(ChatRecord { text, created: now, demo_elapsed_ms });
                     self.last_chat_refresh = Instant::now();
-                    self.publish_ui();
+                    self.publish_transient_ui();
                 }
                 crate::cgame::CgameNotice::CenterPrint(text) => {
                     // Every cp resets CG_CenterPrint time, including repeats.
                     // Keep console de-duplication separate from presentation.
                     let rendered = self.translate_server_text(&text);
+                    let now = Instant::now();
+                    let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
                     self.center_print = Some(CenterPrintRecord {
                         text: rendered.clone(),
-                        created: Instant::now(),
+                        created: now,
+                        demo_elapsed_ms,
                     });
                     self.last_center_refresh = Instant::now();
                     if text != self.last_center_print {
@@ -8302,7 +11061,7 @@ impl App {
                         }
                         self.last_center_print = text;
                     }
-                    self.publish_ui();
+                    self.publish_transient_ui();
                 }
                 crate::cgame::CgameNotice::Scores { team_scores, entries } => {
                     self.scoreboard = Some(UiScoreboard {
@@ -8338,8 +11097,8 @@ impl App {
     }
 
     fn toggle_noclip(&mut self) {
-        let result = if let Some(player) = &mut self.local_player {
-            player.toggle_noclip()
+        let result = if let Some(server) = &mut self.local_server {
+            server.toggle_noclip()
         } else {
             Err("NOCLIP: NO LOCAL PLAYER".into())
         };
@@ -8349,10 +11108,12 @@ impl App {
                 self.console_status =
                     "NOCLIP ON  |  MOUSE1/MOUSE2 = 10X SPEED EACH  |  BOTH = 100X".into();
                 self.push_console_line(format!("^2{}", self.console_status));
+                self.push_local_snapshot(true);
             }
             Ok(false) => {
                 self.console_status = "NOCLIP OFF".into();
                 self.push_console_line(format!("^3{}", self.console_status));
+                self.push_local_snapshot(true);
             }
             Err(error) => {
                 self.console_status = error;
@@ -8370,10 +11131,19 @@ impl App {
         }
         self.spawn_index = (self.spawn_index + 1) % self.spawns.len();
         let spawn = self.spawns[self.spawn_index];
-        if let Some(player) = &mut self.local_player {
-            if let Err(error) = player.respawn(spawn) {
-                self.console_status = error;
+        let respawned = if let Some(server) = &mut self.local_server {
+            match server.respawn(spawn) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.console_status = error;
+                    false
+                }
             }
+        } else {
+            false
+        };
+        if respawned {
+            self.push_local_snapshot(true);
         }
         self.third_person_camera.reset();
         self.update_solo_player_view_and_presentation();
@@ -8917,8 +11687,9 @@ impl App {
         self.restart_renderer_internal(true);
     }
 
-    /// Reveal the window that a restart hid. Safe to call at any time; it only
-    /// acts when a restart is actually holding the window hidden.
+    /// Reveal the window that a restart hid once the replacement renderer has
+    /// finished device/surface setup. Safe to call at any time; it only acts when
+    /// a restart is actually holding the window hidden.
     fn show_window_after_restart(&mut self) {
         if !self.window_hidden_for_restart {
             return;
@@ -8987,6 +11758,10 @@ impl App {
         ) {
             Ok(render) => {
                 self.render = Some(render);
+                // Renderer restarts recreate these lightweight runtime flags;
+                // immediately restore the classic world-lighting controls from
+                // the retained VideoSettings state.
+                self.sync_classic_world_lighting();
                 self.applied_renderer_backend = self.video.renderer_backend;
                 self.applied_grass = self.video.grass;
                 self.applied_ocean = self.video.ocean;
@@ -9029,8 +11804,8 @@ impl App {
                 // prepared map whenever its feature-preparation options still match.
                 // The frontend now owns a passive duel3 world too, so restore it
                 // exactly like a gameplay world but never create a local player.
-                if self.live_without_world {
-                    println!("[VID_RESTART] live session has no local BSP; keeping renderer worldless");
+                if self.live_without_world || self.demo_without_world {
+                    println!("[VID_RESTART] active session has no local BSP; keeping renderer worldless");
                 } else if self.front_end && self.frontend_cinematic.is_some() {
                     if !self.reupload_cached_map() {
                         println!(
@@ -9450,6 +12225,21 @@ impl App {
                 self.sync_pbr();
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_WORLD_LIGHTING => {
+                self.video.world_lighting = !self.video.world_lighting;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_VERTEX_LIGHTING => {
+                self.video.vertex_lighting = !self.video.vertex_lighting;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_LIGHTMAP_ONLY => {
+                self.video.lightmap_only = !self.video.lightmap_only;
+                self.sync_classic_world_lighting();
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_DYNAMIC_LIGHTS => {
                 let current = DynamicLightsMode::ALL
                     .iter()
@@ -9458,27 +12248,45 @@ impl App {
                 let next = (current + direction).rem_euclid(DynamicLightsMode::ALL.len() as i32)
                     as usize;
                 self.video.dynamic_lights = DynamicLightsMode::ALL[next];
-                self.video.clustered_lighting =
-                    matches!(self.video.dynamic_lights, DynamicLightsMode::PerPixelForwardPlus);
-                self.sync_clustered_lighting();
+                self.sync_dynamic_lighting();
                 self.mark_config_dirty();
-                if matches!(
-                    self.video.dynamic_lights,
-                    DynamicLightsMode::PerVertexLegacy | DynamicLightsMode::RayTracedHardware
-                ) {
-                    self.console_status = format!(
-                        "DYNAMIC LIGHTS: {} - WIP, CURRENTLY BEHAVES AS OFF",
-                        self.video.dynamic_lights.label()
-                    );
+                if matches!(self.video.dynamic_lights, DynamicLightsMode::RayTracedHardware) {
+                    self.console_status = "DYNAMIC LIGHTS: RAY TRACED - WIP, CURRENTLY BEHAVES AS OFF".into();
                 }
+            }
+            ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
+                self.video.map_light_simulation = !self.video.map_light_simulation;
+                self.sync_map_light_simulation();
+                self.mark_config_dirty();
+                self.console_status = format!(
+                    ".MAP LIGHT SIMULATION: {}",
+                    if self.video.map_light_simulation { "ON" } else { "OFF" }
+                );
             }
             ui::VIDEO_ROW_MODERN_SABERS => {
                 self.video.modern_sabers = !self.video.modern_sabers;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_modern_sabers(self.video.modern_sabers);
+                }
                 self.mark_config_dirty();
                 self.console_status = format!(
                     "MODERN SABER RENDERING: {}",
                     if self.video.modern_sabers { "ON" } else { "OFF (OPENJK)" }
                 );
+            }
+            ui::VIDEO_ROW_SABER_MARKS => {
+                let current = ui::SaberMarkMode::ALL
+                    .iter()
+                    .position(|mode| *mode == self.video.saber_marks)
+                    .unwrap_or(1) as i32;
+                let next = (current + direction).rem_euclid(ui::SaberMarkMode::ALL.len() as i32) as usize;
+                self.video.saber_marks = ui::SaberMarkMode::ALL[next];
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_saber_marks(self.video.saber_marks);
+                }
+                self.mark_config_dirty();
+                self.console_status =
+                    format!("SABER MARKS: {}", self.video.saber_marks.label().to_ascii_uppercase());
             }
             ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS => {
                 self.video.emissive_area_lights = !self.video.emissive_area_lights;
@@ -9821,6 +12629,7 @@ impl App {
     }
 
     fn commit_ocean_settings(&mut self) {
+        self.video.ocean_settings.wind = self.video.weather_wind;
         self.video.ocean_settings = self.video.ocean_settings.sanitize();
         self.render_command(RenderCommand::SetOceanSettings(self.video.ocean_settings));
         self.publish_authored_oceans();
@@ -9833,11 +12642,13 @@ impl App {
         if self.authored_ocean_preview {
             if let Some(ocean) = oceans.get_mut(self.authored_ocean_selected) {
                 ocean.waves = self.video.ocean_settings.authored;
-                let weather = ocean.weather;
-                for ocean in &mut oceans {
-                    if ocean.weather == weather { ocean.wind = self.video.ocean_settings.wind; }
-                }
             }
+        }
+        // There is one atmospheric wind for the whole rendered world. Map/server
+        // ocean descriptors still author swell and volume data, but do not create
+        // a second independent wind source.
+        for ocean in &mut oceans {
+            ocean.wind = self.video.weather_wind;
         }
         self.render_command(RenderCommand::SetAuthoredOceans(oceans));
     }
@@ -9864,7 +12675,12 @@ impl App {
         }
         if let Some(net) = &self.net {
             self.render_command(RenderCommand::SetOceanTime(net.session().server_time() as f32 * 0.001));
-        } else if let Some(time) = self.game_session.as_ref().and_then(|s| s.timeline.as_ref()).map(|t| t.target_time(Instant::now())) {
+        } else if let Some(time) = self
+            .game_session
+            .as_ref()
+            .and_then(|s| s.timeline.as_ref())
+            .map(|t| t.target_time_ms(Instant::now()))
+        {
             self.render_command(RenderCommand::SetOceanTime(time as f32 * 0.001));
         }
     }
@@ -9873,8 +12689,9 @@ impl App {
         match self.environment_selected {
             ui::ENV_ROW_FOG_MODE => {
                 self.video.fog_mode = match self.video.fog_mode {
-                    FogMode::Off => FogMode::Legacy,
-                    FogMode::Legacy => FogMode::Volumetric,
+                    FogMode::Off => FogMode::LegacyDrawFog1,
+                    FogMode::LegacyDrawFog1 => FogMode::LegacyDrawFog2,
+                    FogMode::LegacyDrawFog2 => FogMode::Volumetric,
                     FogMode::Volumetric => FogMode::Off,
                 };
                 self.sync_post_effects();
@@ -9910,11 +12727,17 @@ impl App {
             ui::ENV_ROW_CLOUD_THICKNESS => {
                 self.set_cloud_thickness(self.video.cloud_thickness + direction as f32 * 128.0)
             }
-            ui::ENV_ROW_CLOUD_WIND_SPEED => {
-                self.set_cloud_wind_speed(self.video.cloud_wind_speed + direction as f32 * 20.0)
+            ui::ENV_ROW_WEATHER_WIND_SPEED => {
+                self.set_weather_wind_speed(self.video.weather_wind.speed + direction as f32 * 20.0)
             }
-            ui::ENV_ROW_CLOUD_WIND_DIRECTION => self.set_cloud_wind_direction(
-                self.video.cloud_wind_direction + direction as f32 * 15.0,
+            ui::ENV_ROW_WEATHER_WIND_DIRECTION => self.set_weather_wind_direction(
+                self.video.weather_wind.direction + direction as f32 * 15.0,
+            ),
+            ui::ENV_ROW_WEATHER_GUST_STRENGTH => self.set_weather_gust_strength(
+                self.video.weather_wind.gust + direction as f32 * 0.05,
+            ),
+            ui::ENV_ROW_WEATHER_DIRECTION_VARIATION => self.set_weather_direction_variation(
+                self.video.weather_wind.shift + direction as f32 * 5.0,
             ),
             ui::ENV_ROW_CLOUD_SHADOWS => {
                 self.video.cloud_shadows = !self.video.cloud_shadows;
@@ -10369,12 +13192,83 @@ impl App {
         }
 
         self.tick_network(dt);
-        let demo_is_playing = self
+        self.tick_demo_scrub_preview(now);
+
+        // `/map`/`/devmap` now runs a tiny authoritative one-client server.
+        // Advance that authority first, publish a decoded snapshot, then let
+        // the exact same CGame frame used by remote servers consume it below.
+        let local_is_playing = self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.local && session.phase == SessionPhase::Playing);
+        let mut deformation_stamps = Vec::new();
+        let mut local_movement_error = None;
+        if local_is_playing && self.overlay == OverlayMode::None && self.captured {
+            // Local play originates the same CL_CreateCmd action payload as
+            // remote play. The old offline path only forwarded attack/alt
+            // while noclip was enabled, so normal +attack never reached Pmove.
+            if let Some(ps) = self
+                .game_session
+                .as_ref()
+                .filter(|session| session.local)
+                .and_then(|session| session.current_snapshot.as_ref())
+                .map(|snapshot| snapshot.player_state.clone())
+            {
+                self.live_input.sync_selection(&ps);
+            }
+            let command_buttons = crate::net::CommandButtons {
+                active: &self.live_buttons,
+                any_key: !self.keys.is_empty() || !self.mouse_buttons_down.is_empty(),
+                talking: false,
+            };
+            let local_cmd = crate::net::movement_cmd(&self.live_input.create_cmd(&command_buttons));
+
+            if let Some(server) = &mut self.local_server {
+                server.set_mouse_input_settings(self.mouse_input);
+                let subframe = self.video.input_subframe;
+                let mouse_input = if subframe {
+                    None
+                } else {
+                    self.pending_mouse_input.take()
+                };
+                let simulation_at = Instant::now();
+                let mouse_delta = if subframe {
+                    (0.0, 0.0)
+                } else {
+                    self.mouse_delta
+                };
+                match server.update(
+                    dt,
+                    &self.movement_keys,
+                    mouse_delta,
+                    local_cmd,
+                ) {
+                    Ok(stamps) => deformation_stamps = stamps,
+                    Err(error) => local_movement_error = Some(error),
+                }
+                if let Some((sequence, event_at)) = mouse_input {
+                    self.last_simulated_mouse_input = Some(InputLatencySample {
+                        sequence,
+                        event_at,
+                        simulation_at,
+                    });
+                }
+            }
+            if local_movement_error.is_none() {
+                self.push_local_snapshot(false);
+            }
+        }
+        if let Some(error) = local_movement_error {
+            self.console_status = format!("MOVEMENT ERROR: {error}");
+            self.set_overlay(OverlayMode::Game);
+        }
+
+        let session_is_playing = self
             .game_session
             .as_ref()
             .is_some_and(|playback| playback.phase == SessionPhase::Playing);
-        if demo_is_playing {
-            match self.tick_demo_playback(now) {
+        if session_is_playing {
+            match self.tick_demo_playback(now, dt) {
                 Ok(DemoAdvance::Running) => {}
                 Ok(DemoAdvance::Completed) => {
                     let summary = self.game_session.as_ref().map(|playback| {
@@ -10394,8 +13288,13 @@ impl App {
                     self.console_status = error;
                     self.push_console_line(format!("^1{}", self.console_status));
                     eprintln!("{}", self.console_status);
-                    if self.net.is_some() {
-                        // ERR_DROP: a CGame failure ends the live session too.
+                    if self
+                        .game_session
+                        .as_ref()
+                        .is_some_and(|session| session.live)
+                    {
+                        // ERR_DROP: a CGame failure ends remote and local live
+                        // sessions instead of reviving the legacy solo path.
                         self.disconnect_to_main_menu();
                         return;
                     }
@@ -10408,50 +13307,13 @@ impl App {
         }
 
         self.refresh_authored_oceans();
-        let mut deformation_stamps = Vec::new();
-        if !demo_is_playing && self.overlay == OverlayMode::None && self.captured {
-            if let Some(player) = &mut self.local_player {
-                player.set_mouse_input_settings(self.mouse_input);
-                let subframe = self.video.input_subframe;
-                let mouse_input = if subframe {
-                    None
-                } else {
-                    self.pending_mouse_input.take()
-                };
-                let simulation_at = Instant::now();
-                let mouse_delta = if subframe {
-                    (0.0, 0.0)
-                } else {
-                    self.mouse_delta
-                };
-                let result = player.update(
-                    dt,
-                    &self.movement_keys,
-                    mouse_delta,
-                    self.noclip_primary_down,
-                    self.noclip_alt_down,
-                );
-                deformation_stamps = player.take_deformation_stamps();
-                if let Some((sequence, event_at)) = mouse_input {
-                    self.last_simulated_mouse_input = Some(InputLatencySample {
-                        sequence,
-                        event_at,
-                        simulation_at,
-                    });
-                }
-                if let Err(error) = result {
-                    self.console_status = format!("MOVEMENT ERROR: {error}");
-                    self.set_overlay(OverlayMode::Game);
-                }
-            }
-        }
-        if !demo_is_playing {
-            self.update_solo_player_view_and_presentation();
+        if !session_is_playing {
             self.tick_frontend_cinematic(now);
-            if self.video.depth_of_field_strength > 0.001 {
-                if let Some(player) = &mut self.local_player {
-                    self.dof_focus_target = player.autofocus_distance(&self.camera, 16384.0);
-                }
+            self.update_solo_player_view_and_presentation();
+        }
+        if self.video.depth_of_field_strength > 0.001 {
+            if let Some(server) = &mut self.local_server {
+                self.dof_focus_target = server.autofocus_distance(&self.camera, 16384.0);
             }
         }
         for stamp in deformation_stamps {
@@ -10461,37 +13323,40 @@ impl App {
         self.mouse_delta = (0.0, 0.0);
         self.publish_snapshot();
 
-        let current_hud = self.current_hud_state();
-        let hud_changed = current_hud != self.last_hud_state;
-        if hud_changed {
-            self.last_hud_state = current_hud;
-        }
-
         let refresh_chat = !self.chat_lines.is_empty()
             && now.duration_since(self.last_chat_refresh) >= Duration::from_millis(250);
         if refresh_chat {
-            self.chat_lines.retain(|line| {
-                now.saturating_duration_since(line.created) < Duration::from_secs(10)
+            let demo_now = self.current_demo_elapsed_ms(now);
+            self.chat_lines.retain(|line| match (demo_now, line.demo_elapsed_ms) {
+                (Some(now_ms), Some(created_ms)) => now_ms - created_ms < 10_000.0,
+                _ => now.saturating_duration_since(line.created) < Duration::from_secs(10),
             });
             self.last_chat_refresh = now;
         }
         let refresh_center = self.center_print.is_some()
             && now.duration_since(self.last_center_refresh) >= Duration::from_millis(50);
         if refresh_center {
-            if self.center_print.as_ref().is_some_and(|print| {
-                now.saturating_duration_since(print.created) >= Duration::from_secs(3)
+            let demo_now = self.current_demo_elapsed_ms(now);
+            if self.center_print.as_ref().is_some_and(|print| match (demo_now, print.demo_elapsed_ms) {
+                (Some(now_ms), Some(created_ms)) => now_ms - created_ms >= 3_000.0,
+                _ => now.saturating_duration_since(print.created) >= Duration::from_secs(3),
             }) {
                 self.center_print = None;
             }
             self.last_center_refresh = now;
         }
-        let movement_hud_active = self.movement_keys_hud.mode != 0
-            || self.strafe_helper.flags & ui::SHELPER_STYLE_MASK != 0;
-        if hud_changed || refresh_chat || refresh_center || movement_hud_active {
-            // Strafehelper is velocity/view-angle driven and therefore needs a
-            // fresh retained HUD snapshot while enabled. Keep this cost fully
-            // gated off for the default HUD.
-            self.publish_ui();
+        let refresh_demo_timeline = self.demo_playback_active()
+            && (self.demo_scrub_dragging
+                || now.saturating_duration_since(self.last_demo_timeline_refresh)
+                    >= Duration::from_millis(16));
+        if refresh_demo_timeline {
+            self.last_demo_timeline_refresh = now;
+        }
+        if refresh_chat || refresh_center || refresh_demo_timeline {
+            // Fade/timeline updates are intentionally isolated from retained UI.
+            // This avoids cloning console/menu state and rebuilding unrelated HUD
+            // geometry at render frequency.
+            self.publish_transient_ui();
         }
 
         self.tick_egui_menu();
@@ -10507,9 +13372,10 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        // Keep the native window hidden until wgpu has successfully presented the
-        // splash/loading UI once. Otherwise Windows exposes the unpainted swapchain
-        // area as a white rectangle while the renderer is still building pipelines.
+        // Keep the native window hidden while WGPU creates the device/surface and
+        // builds the initial renderer state. RendererReady reveals it before the
+        // first present; waiting for RendererFirstFrame can deadlock when a hidden
+        // Windows surface reports itself as occluded.
         let mut attributes = Window::default_attributes()
             .with_title("DinurdoJK")
             .with_visible(false)
@@ -10569,6 +13435,7 @@ impl ApplicationHandler<UserEvent> for App {
         };
         self.window = Some(window);
         self.render = Some(render);
+        self.sync_classic_world_lighting();
         self.previous_tick = Instant::now();
         // A config written before this rule, or by hand, can still say 0. Resolve
         // it now that the window exists and the monitor refresh rate is readable.
@@ -10643,13 +13510,26 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 self.push_console_line(format!("^2{}", self.console_status));
                 self.publish_ui();
+
+                // The native window is created hidden so Windows never exposes an
+                // uninitialized swapchain while WGPU is still building. Do not wait
+                // for the first successful present to reveal it, though: a hidden
+                // HWND is allowed to make surface acquisition return Occluded, which
+                // would otherwise create a startup deadlock (hidden -> occluded -> no
+                // first frame -> still hidden). RendererReady means device/surface
+                // setup and the initial UI state are complete, so it is the correct
+                // point to make the window drawable.
+                if !self.startup_first_frame_seen {
+                    if let Some(window) = &self.window {
+                        window.set_visible(true);
+                        window.request_redraw();
+                    }
+                }
+                self.show_window_after_restart();
             }
             UserEvent::RendererFirstFrame => {
-                // A restarted renderer has now presented, so the window is safe to
-                // reveal with a fully formed swapchain behind it.
-                self.show_window_after_restart();
                 if self.startup_first_frame_seen {
-                    if self.front_end || self.live_without_world {
+                    if self.front_end || self.live_without_world || self.demo_without_world {
                         if let Some(restart_started) = self.renderer_restart_started.take() {
                             let total_ms = restart_started.elapsed().as_secs_f64() * 1000.0;
                             println!(
@@ -10664,10 +13544,6 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.startup_first_frame_seen = true;
-                if let Some(window) = &self.window {
-                    window.set_visible(true);
-                    window.request_redraw();
-                }
                 if self.front_end {
                     self.console_status = "MAIN MENU".into();
                     self.publish_ui();
@@ -10746,7 +13622,12 @@ impl ApplicationHandler<UserEvent> for App {
                     active: thread.active,
                     busy_percent: thread.busy_percent,
                 });
-                self.publish_ui();
+                // Perf/thread counters refresh at 2 Hz. Send only their Copy data
+                // instead of cloning the entire retained UI/console snapshot, and
+                // do not send anything when the renderer HUD is not displaying it.
+                if self.video.draw_fps != 0 {
+                    self.publish_telemetry_ui();
+                }
             }
             UserEvent::RendererError(error) => {
                 self.renderer_restart_started = None;
@@ -10900,6 +13781,40 @@ impl ApplicationHandler<UserEvent> for App {
                         map.authored_oceans = oceans;
                     }
                 }
+                if self.map_edit_preview_request_id == Some(request_id) {
+                    // Source-map preparation already rebuilt authoritative brush
+                    // collision from the edited planes. The original preview path
+                    // only consumed render geometry, leaving both App and the
+                    // local-server Pmove clone on stale collision until a full map
+                    // reload. Swap the new source CollisionWorld in-place; this is
+                    // cheap (CollisionWorld clones share the immutable backend)
+                    // and does not reset the player/server timeline.
+                    if let Some(collision) = map.collision.clone() {
+                        self.map_collision = Some(collision.clone());
+                        if let Some(server) = self.local_server.as_mut() {
+                            server.replace_collision_world(collision);
+                        }
+                    } else {
+                        eprintln!(
+                            "Map editor preview {name}: rebuilt source map has no gameplay collision; keeping previous collision world"
+                        );
+                    }
+
+                    // Do not clone this prepared world into the restart cache on
+                    // every mouse gesture. The edit preview is deliberately
+                    // transient; cloning the full CPU map here can cost more than
+                    // the brush rebuild itself on large source maps.
+                    self.triangles = map.triangles;
+                    self.render_command(RenderCommand::LoadMap {
+                        request_id,
+                        started,
+                        name,
+                        map,
+                    });
+                    self.publish_snapshot();
+                    return;
+                }
+
                 let has_grass = !map.grass_patches.is_empty();
                 let has_ocean = self.latest_prepare_options.ocean
                     && prepared_map_has_ocean_surface(map.as_ref());
@@ -10934,6 +13849,39 @@ impl ApplicationHandler<UserEvent> for App {
                     cache_started.elapsed().as_secs_f64() * 1000.0
                 );
                 self.surface_inspector = None;
+                if map.map_file_stats.is_some() {
+                    let loose_map = map.source.extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("map")
+                    });
+                    if loose_map {
+                        let should_refresh_editor = self.map_editor.as_ref().is_none_or(|editor| {
+                            editor.source_path.as_path() != map.source.as_path() || !editor.has_pending_changes()
+                        });
+                        if should_refresh_editor {
+                            match MapEditor::open(&map.source) {
+                                Ok(editor) => self.map_editor = Some(editor),
+                                Err(error) => {
+                                    eprintln!("Source map editor: {error}");
+                                    self.map_editor = None;
+                                    self.console_status = format!("MAP EDITOR UNAVAILABLE: {error}");
+                                }
+                            }
+                        }
+                    } else {
+                        self.map_editor = None;
+                        if self.source_map_edit_on_load {
+                            self.console_status = format!(
+                                "MAP EDITOR: {} is packaged in {}; save-back requires a loose maps/*.map file",
+                                name,
+                                map.source.display()
+                            );
+                            self.push_console_line(format!("^3{}", self.console_status));
+                        }
+                    }
+                } else {
+                    self.map_editor = None;
+                    self.source_map_edit_on_load = false;
+                }
                 println!(
                     "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
                     name,
@@ -10971,6 +13919,17 @@ impl ApplicationHandler<UserEvent> for App {
                         stats.degenerate_faces,
                         stats.skipped_brushes,
                     );
+                    println!(
+                        "Source .map runtime prep: {} utility faces dropped, {} spatial chunks, {} geometry groups -> {} WGPU draw batches, spatial batching={}; {} gameplay collision brushes; brush reconstruction {:.2} ms on {} map worker(s)",
+                        stats.utility_faces_skipped,
+                        stats.spatial_chunks,
+                        stats.geometry_groups,
+                        stats.draw_batches,
+                        stats.spatial_batching,
+                        stats.collision_brushes,
+                        stats.reconstruction_ms,
+                        stats.worker_count,
+                    );
                 }
                 for warning in &map.warnings {
                     if map.map_file_stats.is_some() {
@@ -10980,6 +13939,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.live_without_world = false;
+                self.demo_without_world = false;
                 self.map_name = name.clone();
                 self.triangles = map.triangles;
                 self.map_distance_cull = map
@@ -10990,6 +13950,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.authored_ocean_preview = false;
                 self.refresh_authored_oceans();
                 self.map_collision = map.collision.clone();
+                self.map_visibility = map.visibility.clone();
                 self.map_physics_collision = map.physics_collision.clone();
                 self.map_movement = map.movement.clone();
                 self.steam_audio_acoustic_mesh = map.steam_audio_acoustic_mesh.clone();
@@ -11005,6 +13966,8 @@ impl ApplicationHandler<UserEvent> for App {
                     {
                         eprintln!("RAPIER MAP COLLISION ERROR: {error}");
                     }
+                    session.weapon_fx.set_collision_world(self.map_collision.clone());
+                    session.weapon_fx.set_saber_marks(self.video.saber_marks);
                     if let Some(sound) = session.sound_presenter.as_mut() {
                         sound.set_steam_audio_map(acoustic_mesh, bake);
                     }
@@ -11013,7 +13976,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.solo_dynamic_models = Arc::new(Vec::new());
                 if frontend_background {
                     self.preserve_game_state_on_next_map_upload = false;
-                    self.local_player = None;
+                    self.local_server = None;
                     self.spawns = map.spawns.clone();
                     self.spawn_index = 0;
                     if let Some(spawn) = self.spawns.first().copied() {
@@ -11034,6 +13997,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.keys.clear();
                     self.movement_keys.clear();
+                    self.live_buttons.clear();
                     self.mouse_buttons_down.clear();
                     self.noclip_primary_down = false;
                     self.noclip_alt_down = false;
@@ -11044,35 +14008,81 @@ impl ApplicationHandler<UserEvent> for App {
                     println!("Frontend cinematic: loaded {name} with no local player/session");
                 } else if self.preserve_game_state_on_next_map_upload {
                     self.preserve_game_state_on_next_map_upload = false;
+                } else if self.game_session.is_some() {
+                    // Demo/network sessions already own their authoritative state.
+                    // Never create a second local authority while their map uploads.
+                    self.local_server = None;
+                    self.spawns = map.spawns.clone();
+                    self.spawn_index = 0;
                 } else {
                     self.spawns = map.spawns.clone();
                     self.spawn_index = 0;
+                    // A local server is a new client connection from the input
+                    // layer's point of view. Do not inherit selection or
+                    // one-shot button state from a previous game.
+                    self.live_input = crate::net::LiveInput::default();
+                    self.live_provisional = None;
                     if let Some(spawn) = self.spawns.first().copied() {
                         self.camera = Camera::new_with_fov(
                             spawn.position,
                             spawn.yaw,
                             self.camera.cg_fov(),
                         );
-                        match LocalPlayer::new(map.movement.clone(), map.collision.clone(), spawn) {
-                            Ok(mut player) => {
-                                player.set_mouse_input_settings(self.mouse_input);
+                        let saber_movement = self.load_local_saber_movement().unwrap_or_else(|error| {
+                            eprintln!("{error}; using OpenJK default local saber metadata");
+                            [
+                                jka_movement::SaberMovementInfo::equipped_default(),
+                                jka_movement::SaberMovementInfo::default(),
+                            ]
+                        });
+                        match LocalServer::new(
+                            &name,
+                            map.movement.clone(),
+                            map.collision.clone(),
+                            spawn,
+                            &self.solo_client_info,
+                            saber_movement,
+                            &map.fx_runners,
+                        ) {
+                            Ok(mut server) => {
+                                server.set_mouse_input_settings(self.mouse_input);
                                 if let Err(error) =
-                                    player.set_physics_tick_msec(self.video.physics_msec)
+                                    server.set_physics_tick_msec(self.video.physics_msec)
                                 {
                                     self.console_status = format!("PHYSICS FPS ERROR: {error}");
                                 }
-                                player.camera(&mut self.camera);
+                                server.camera(&mut self.camera);
                                 self.dof_focus_target =
-                                    player.autofocus_distance(&self.camera, 16384.0);
-                                self.local_player = Some(player);
+                                    server.autofocus_distance(&self.camera, 16384.0);
+                                match self.build_local_game_session(&server) {
+                                    Ok(mut session) => {
+                                        if let Some(snapshot) = server.take_snapshot(true) {
+                                            session.snapshots = 1;
+                                            session.live_snapshots.push_back(snapshot);
+                                        }
+                                        println!(
+                                            "LOCAL SERVER: shim ready for {} (decoded snapshot/CGame boundary)",
+                                            server.map_name()
+                                        );
+                                        self.local_server = Some(server);
+                                        self.game_session = Some(session);
+                                    }
+                                    Err(error) => {
+                                        self.local_server = None;
+                                        self.game_session = None;
+                                        eprintln!("Local CGame setup: {error}");
+                                        self.console_status = format!("LOCAL CGAME ERROR: {error}");
+                                    }
+                                }
                             }
                             Err(error) => {
-                                self.local_player = None;
-                                eprintln!("Player setup: {error}");
+                                self.local_server = None;
+                                eprintln!("Local server setup: {error}");
                             }
                         }
                         self.keys.clear();
                         self.movement_keys.clear();
+                        self.live_buttons.clear();
                         self.mouse_buttons_down.clear();
                         self.noclip_primary_down = false;
                         self.noclip_alt_down = false;
@@ -11090,6 +14100,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.menu_selected = 0;
                     self.set_overlay(OverlayMode::None);
                     self.sync_render_fps_cap();
+                }
+                if self.source_map_edit_on_load {
+                    self.source_map_edit_on_load = false;
+                    if self.map_editor.is_some() {
+                        self.set_overlay(OverlayMode::MapEdit);
+                    }
                 }
                 self.apply_distance_cull();
                 self.console_status = format!("UPLOADING {name} TO RENDER THREAD...");
@@ -11116,6 +14132,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                if self.map_edit_preview_request_id == Some(request_id) {
+                    self.map_edit_preview_request_id = None;
+                    self.map_edit_preview_dirty = false;
+                    let message = format!("Textured brush preview failed: {error}");
+                    eprintln!("Map editor preview {name}: {error}");
+                    if let Some(editor) = self.map_editor.as_mut() {
+                        editor.status = message.clone();
+                    }
+                    self.console_status = message;
+                    self.egui_repaint_requested = true;
+                    return;
+                }
                 self.pending_frontend_map_launch = false;
                 self.preserve_game_state_on_next_map_upload = false;
                 self.renderer_restart_started = None;
@@ -11140,7 +14168,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let live_map = self
                     .game_session
                     .as_ref()
-                    .filter(|session| session.live)
+                    .filter(|session| session.live && !session.local)
                     .and_then(|session| session.map_name.clone());
                 if let Some(map_name) = live_map {
                     if self.network.allow_missing_map {
@@ -11180,6 +14208,23 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                if self.map_edit_preview_request_id == Some(request_id) {
+                    self.map_edit_preview_request_id = None;
+                    let needs_newest = self.map_edit_preview_dirty;
+                    self.map_edit_preview_dirty = false;
+                    if needs_newest {
+                        // The cursor advanced while this world was building. It
+                        // is safe to show this intermediate textured state, then
+                        // immediately chase the newest snapped brush position.
+                        self.queue_map_edit_preview();
+                    } else if let Some(editor) = self.map_editor.as_mut() {
+                        editor.mark_preview_synced();
+                    }
+                    self.egui_repaint_requested = true;
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    return;
+                }
                 if self.frontend_background_request_id == Some(request_id) {
                     self.frontend_background_request_id = None;
                 }
@@ -11196,6 +14241,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 })
                         }));
                 if join_first_world {
+                    self.live_join_ui = None;
+                    self.egui_repaint_requested = true;
                     let elapsed = self.live_join_timing.as_ref().map(LiveJoinTiming::elapsed_ms).unwrap_or(0.0);
                     if let Some(timing) = self.live_join_timing.as_mut() {
                         timing.first_world_frame_ms = Some(elapsed);
@@ -11472,12 +14519,35 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = ModifiersState::empty();
                 self.set_capture(false);
                 self.mouse_delta = (0.0, 0.0);
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     player.pause();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = (position.x, position.y);
+                if self.overlay == OverlayMode::MapEdit {
+                    let size = self.window.as_ref().map(|window| window.inner_size()).unwrap_or_default();
+                    let mut changed = false;
+                    if let Some(editor) = self.map_editor.as_mut() {
+                        changed = editor.update_drag(
+                            &self.camera,
+                            size.width,
+                            size.height,
+                            self.cursor_position,
+                        );
+                    }
+                    if changed {
+                        self.egui_repaint_requested = true;
+                        // Keep the real textured world following the brush while
+                        // dragging. Only one source-map rebuild can be in flight;
+                        // additional snapped mouse steps collapse into a dirty bit.
+                        self.queue_map_edit_preview();
+                        self.publish_snapshot();
+                    }
+                }
+                if self.demo_scrub_dragging {
+                    self.update_demo_scrub(position.x);
+                }
                 if self.overlay == OverlayMode::Console && self.console_selecting {
                     let size = self.window.as_ref().map(|window| window.inner_size()).unwrap_or_default();
                     if let Some(point) =
@@ -11500,6 +14570,67 @@ impl ApplicationHandler<UserEvent> for App {
                     _ => None,
                 };
                 if let Some(key) = key { self.bind_control_key(key); }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.overlay == OverlayMode::MapEdit => {
+                let size = self.window.as_ref().map(|window| window.inner_size()).unwrap_or_default();
+                if let Some(editor) = self.map_editor.as_mut() {
+                    editor.begin_drag(&self.camera, size.width, size.height, self.cursor_position);
+                    self.egui_repaint_requested = true;
+                }
+                self.publish_snapshot();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if self.overlay == OverlayMode::MapEdit => {
+                let mut finished_drag = false;
+                let preview = if let Some(editor) = self.map_editor.as_mut() {
+                    if editor.finish_drag() {
+                        finished_drag = true;
+                        match editor.working_source_text() {
+                            Ok(text) => Some((editor.source_path.clone(), text)),
+                            Err(error) => {
+                                editor.status = format!("Could not build textured preview: {error}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if finished_drag {
+                    self.egui_repaint_requested = true;
+                }
+                if preview.is_some() {
+                    self.queue_map_edit_preview();
+                }
+                self.publish_snapshot();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.overlay == OverlayMode::None && self.demo_playback_active() => {
+                match self.demo_timeline_hit(self.cursor_position.0, self.cursor_position.1) {
+                    Some(DemoTimelineHit::PlayPause) => self.toggle_demo_pause_ui(),
+                    Some(DemoTimelineHit::Track(fraction)) => self.begin_demo_scrub(fraction),
+                    Some(DemoTimelineHit::Speed) => self.cycle_demo_speed_ui(),
+                    None => {}
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if self.overlay == OverlayMode::None && self.demo_scrub_dragging => {
+                self.finish_demo_scrub();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -11616,7 +14747,61 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    OverlayMode::MapEdit => {
+                        if event.state == ElementState::Pressed && !event.repeat && code == KeyCode::Escape {
+                            if let Some(editor) = self.map_editor.as_mut() { editor.cancel_drag(); }
+                            self.set_overlay(OverlayMode::None);
+                            self.publish_snapshot();
+                        }
+                        return;
+                    }
                     OverlayMode::None => {}
+                }
+
+                if self.demo_playback_active()
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    match code {
+                        KeyCode::KeyF => {
+                            self.toggle_demo_free_view();
+                            return;
+                        }
+                        KeyCode::BracketLeft => {
+                            self.cycle_demo_follow(-1);
+                            return;
+                        }
+                        KeyCode::BracketRight => {
+                            self.cycle_demo_follow(1);
+                            return;
+                        }
+                        KeyCode::Home => {
+                            self.reset_demo_view_authoritative();
+                            self.console_status = "DEMO CAMERA: RECORDED POV".into();
+                            return;
+                        }
+                        KeyCode::Space => {
+                            self.toggle_demo_pause_ui();
+                            return;
+                        }
+                        KeyCode::ArrowLeft => {
+                            self.seek_demo_relative(-10_000);
+                            return;
+                        }
+                        KeyCode::ArrowRight => {
+                            self.seek_demo_relative(10_000);
+                            return;
+                        }
+                        KeyCode::ArrowUp => {
+                            self.cycle_demo_speed_ui();
+                            return;
+                        }
+                        KeyCode::ArrowDown => {
+                            self.lower_demo_speed_ui();
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
 
                 match event.state {
@@ -11634,7 +14819,7 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if let Some(binding) = self.bindings.get(keybinds::bind_key_for_code(code)).map(str::to_owned) {
-                        if let Some(player) = &mut self.local_player {
+                        if let Some(player) = &mut self.local_server {
                             for command in keybinds::split_binding_commands(&binding) {
                                 let canonical = match command.split_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
                                     "+forward" => Some(KeyCode::KeyW),
@@ -11666,6 +14851,15 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
+            if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
+                let yaw_degrees = delta.0 as f32 * self.mouse_input.sensitivity * self.mouse_input.yaw;
+                let pitch_degrees = delta.1 as f32 * self.mouse_input.sensitivity * self.mouse_input.pitch;
+                self.camera.yaw -= yaw_degrees.to_radians();
+                self.camera.pitch = (self.camera.pitch - pitch_degrees.to_radians())
+                    .clamp((-89.0_f32).to_radians(), 89.0_f32.to_radians());
+                self.publish_snapshot();
+                return;
+            }
             let event_at = Instant::now();
             self.mouse_input_sequence = self.mouse_input_sequence.wrapping_add(1);
             if self.mouse_input_sequence == 0 {
@@ -11675,7 +14869,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Live play samples accumulated mouse in CL_CreateCmd every frame.
             if self.video.input_subframe && self.net.is_none() {
                 let mut applied = false;
-                if let Some(player) = &mut self.local_player {
+                if let Some(player) = &mut self.local_server {
                     let simulation_at = Instant::now();
                     let elapsed = self
                         .last_mouse_motion_at

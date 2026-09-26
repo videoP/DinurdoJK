@@ -22,7 +22,8 @@ int jka_contract(int index) {
     const int values[] = { sizeof(jka_cmd), sizeof(jka_trace), sizeof(jka_view), WP_SABER, PM_NOCLIP, PM_SPECTATOR,
         BUTTON_ATTACK, BUTTON_WALKING, BUTTON_ALT_ATTACK, ENTITYNUM_WORLD, ENTITYNUM_NONE, PMF_DUCKED, PMF_ROLLING, PMF_STUCK_TO_WALL,
         FP_SPEED, FP_RAGE, sizeof(jka_entity_view), sizeof(jka_player_angle_entity),
-        sizeof(jka_player_angle_state), sizeof(jka_bone_angle_command), sizeof(jka_player_angle_result) };
+        sizeof(jka_player_angle_state), sizeof(jka_bone_angle_command), sizeof(jka_player_angle_result),
+        sizeof(jka_saber_movement_info) };
     return index >= 0 && index < sizeof(values)/sizeof(values[0]) ? values[index] : -1;
 }
 
@@ -74,8 +75,33 @@ int jka_load_animations(const unsigned char *data, int length) {
     return BG_ParseAnimationFile("models/players/_humanoid/animation.cfg", bgHumanoidAnimations, qtrue) == 0;
 }
 const char *jka_movement_error(void) { return last_error; }
+extern qboolean BG_SuperBreakWinAnim(int anim);
 
-typedef struct jka_player_s { playerState_t ps; pmove_t move; } jka_player;
+/* Read-only presentation queries from the exact vendored OpenJK gameplay data.
+ * Keep saber trail timing/animation classification owned by the stock C tables
+ * instead of copying those tables into the Rust renderer. */
+int jka_saber_move_trail_length(int move) {
+    if (move < LS_NONE || move >= LS_MOVE_MAX) return 0;
+    return (int)saberMoveData[move].trailLength;
+}
+int jka_super_break_win_anim(int anim) {
+    return BG_SuperBreakWinAnim(anim) ? 1 : 0;
+}
+
+typedef struct jka_player_s {
+    playerState_t ps;
+    pmove_t move;
+    /* gclient_t state needed by the lightweight local-server generic-command
+     * path. These are intentionally server-side and are not transmitted. */
+    int last_generic_cmd;
+    int last_generic_cmd_time;
+    int saber_cycle_queue;
+    /* Per-player saberInfo_t state. Keep this on the player object rather than
+     * permanently in global cgs.clientinfo so local and remote prediction
+     * cannot contaminate each other through the _CGAME OpenJK host. */
+    saberInfo_t saber[2];
+    qboolean saber_present[2];
+} jka_player;
 extern stringID_table_t animTable[MAX_ANIMATIONS+1];
 const char *jka_animation_name(int index) { return GetStringForID(animTable, index); }
 void jka_player_jump_level(void *player, int level) {
@@ -95,6 +121,72 @@ void jka_player_set_noclip(void *player, int enabled) {
     } else if (ps->pm_type == PM_NOCLIP) {
         ps->pm_type = PM_NORMAL;
     }
+}
+
+static void copy_saber_movement_info(saberInfo_t *out, const jka_saber_movement_info *info) {
+    memset(out, 0, sizeof(*out));
+    if (!info || !info->present)
+        return;
+
+    /* BG_MySaber treats a non-empty model as ownership. The actual hilt model
+     * remains renderer-owned; the native movement host only needs an equipped
+     * saberInfo_t with the gameplay fields below. */
+    Q_strncpyz(out->model, DEFAULT_SABER_MODEL, sizeof(out->model));
+    out->numBlades = info->num_blades;
+    out->stylesLearned = info->styles_learned;
+    out->stylesForbidden = info->styles_forbidden;
+    out->saberFlags = info->saber_flags;
+    out->moveSpeedScale = info->move_speed_scale;
+    out->animSpeedScale = info->anim_speed_scale;
+    out->readyAnim = info->ready_anim;
+    out->drawAnim = info->draw_anim;
+    out->putawayAnim = info->putaway_anim;
+    out->kataMove = LS_INVALID;
+    out->lungeAtkMove = LS_INVALID;
+    out->jumpAtkUpMove = LS_INVALID;
+    out->jumpAtkFwdMove = LS_INVALID;
+    out->jumpAtkBackMove = LS_INVALID;
+    out->jumpAtkRightMove = LS_INVALID;
+    out->jumpAtkLeftMove = LS_INVALID;
+}
+
+int jka_player_set_saber_movement_info(void *player, int saber_num,
+                                       const jka_saber_movement_info *info) {
+    jka_player *p = player;
+    if (!p || !info || saber_num < 0 || saber_num >= 2 ||
+        info->num_blades < 1 || info->num_blades > MAX_BLADES ||
+        !isfinite(info->move_speed_scale) || !isfinite(info->anim_speed_scale))
+        return 0;
+
+    p->saber_present[saber_num] = info->present ? qtrue : qfalse;
+    copy_saber_movement_info(&p->saber[saber_num], info);
+
+    /* A real server keeps an attached saber as a separate non-zero entity.
+     * The lightweight host reserves the first non-client slot as the ownership
+     * token; attached sabers do not need a packet entity until thrown. */
+    p->ps.saberEntityNum = p->saber_present[0] ? MAX_CLIENTS : 0;
+    return 1;
+}
+
+static int install_player_saber_info(jka_player *p) {
+    const int client_num = p->ps.clientNum;
+    clientInfo_t *ci;
+    int saber_num;
+    if (client_num < 0 || client_num >= MAX_CLIENTS)
+        return -1;
+    ci = &cgs.clientinfo[client_num];
+    memset(ci, 0, sizeof(*ci));
+    ci->infoValid = qtrue;
+    for (saber_num = 0; saber_num < 2; ++saber_num) {
+        if (p->saber_present[saber_num])
+            memcpy(&ci->saber[saber_num], &p->saber[saber_num], sizeof(saberInfo_t));
+    }
+    return client_num;
+}
+
+static void clear_player_saber_info(int client_num) {
+    if (client_num >= 0 && client_num < MAX_CLIENTS)
+        memset(&cgs.clientinfo[client_num], 0, sizeof(cgs.clientinfo[client_num]));
 }
 
 /* Offline FFA host subset of WP_ForcePowerRun/Update/Regenerate in w_force.c.
@@ -157,7 +249,8 @@ void *jka_player_new(const float *origin, float yaw, int spectator) {
     ps->groundEntityNum = ENTITYNUM_NONE;
     ps->stats[STAT_HEALTH] = ps->stats[STAT_MAX_HEALTH] = 100;
     ps->stats[STAT_WEAPONS] = (1 << WP_SABER);
-    /* Retain single-saber locomotion state without rendering a weapon. */
+    /* Stock local FFA starts with a saber; ownership metadata is attached by
+     * jka_player_set_saber_movement_info after the player is created. */
     ps->weapon = WP_SABER;
     ps->saberMove = LS_READY;
     ps->fd.saberAnimLevel = SS_MEDIUM;
@@ -202,6 +295,69 @@ static void host_trace(trace_t *result, const vec3_t start, const vec3_t mins, c
 }
 static int host_contents(const vec3_t point, int pass) { return contents_callback(callback_context, point, pass); }
 
+/* Lightweight counterpart to the generic_cmd switch in OpenJK g_active.c.
+ * Pmove intentionally does not execute these: on a real server they are
+ * authoritative game-side commands processed after Pmove. Keep that same
+ * ordering here and add cases as the local server grows. */
+static void local_apply_queued_saber_style(jka_player *p) {
+    if (p->saber_cycle_queue && p->ps.weaponTime <= 0) {
+        p->ps.fd.saberAnimLevel = p->saber_cycle_queue;
+        p->saber_cycle_queue = 0;
+    }
+}
+
+static void local_saber_attack_cycle(jka_player *p) {
+    playerState_t *ps = &p->ps;
+    int select_level;
+
+    /* Cmd_SaberAttackCycle_f guards that matter to the one-client FFA host.
+     * The current local authority models the stock single-saber case; dual/
+     * staff saberInfo_t ownership belongs in the later full game-entity shim. */
+    if (ps->stats[STAT_HEALTH] <= 0 || ps->pm_type != PM_NORMAL || ps->weapon != WP_SABER)
+        return;
+
+    select_level = p->saber_cycle_queue ? p->saber_cycle_queue : ps->fd.saberAnimLevel;
+    select_level++;
+    if (select_level > ps->fd.forcePowerLevel[FP_SABER_OFFENSE])
+        select_level = FORCE_LEVEL_1;
+    if (select_level < FORCE_LEVEL_1)
+        select_level = FORCE_LEVEL_1;
+
+    /* OpenJK queues a stance switch while a saber move is busy so chaining is
+     * not reinterpreted halfway through the move. */
+    ps->fd.saberAnimLevelBase = select_level;
+    if (ps->weaponTime <= 0) {
+        ps->fd.saberAnimLevel = select_level;
+        p->saber_cycle_queue = 0;
+    } else {
+        p->saber_cycle_queue = select_level;
+    }
+}
+
+static void local_process_generic_cmd(jka_player *p, int generic_cmd) {
+    const int now = p->ps.commandTime;
+    if (!generic_cmd)
+        return;
+
+    /* g_active.c: allow a changed command immediately, otherwise apply the
+     * stock 300 ms repeat debounce (push/pull are the exceptions there). */
+    if (generic_cmd == p->last_generic_cmd && p->last_generic_cmd_time >= now)
+        return;
+    p->last_generic_cmd = generic_cmd;
+    if (generic_cmd != GENCMD_FORCE_THROW && generic_cmd != GENCMD_FORCE_PULL)
+        p->last_generic_cmd_time = now + 300;
+
+    switch (generic_cmd) {
+    case GENCMD_SABERATTACKCYCLE:
+        local_saber_attack_cycle(p);
+        break;
+    default:
+        /* Other generic commands still require their corresponding game-side
+         * authority (entities, Force targeting, holdables, taunts, etc.). */
+        break;
+    }
+}
+
 int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn trace,
                     jka_contents_fn contents, void *context) {
     if (setjmp(error_target)) return 0;
@@ -232,7 +388,11 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
     p->move.cmd.forwardmove = input->forward;
     p->move.cmd.rightmove = input->right;
     p->move.cmd.upmove = input->up;
+    const int saber_client_num = install_player_saber_info(p);
     Pmove(&p->move);
+    clear_player_saber_info(saber_client_num);
+    local_apply_queued_saber_style(p);
+    local_process_generic_cmd(p, input->generic_command);
     return 1;
 }
 void jka_player_view(const void *player, jka_view *view) {

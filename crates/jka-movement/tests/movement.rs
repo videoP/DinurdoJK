@@ -348,3 +348,52 @@ fn cannot_stand_up_into_a_low_ceiling() {
     assert_eq!(view.maxs[2], 16.0);
     assert_ne!(view.pm_flags & PMF_DUCKED, 0);
 }
+
+#[test]
+fn equipped_saber_drives_stock_idle_stance_style_and_crouch_torso() {
+    use jka_movement::{SaberMovementInfo, UserCmd, GENCMD_SABERATTACKCYCLE, TICK_MSEC};
+
+    let movement = animations();
+    let mut world = Map::floor().world();
+    let mut p = player(24.125);
+    p.set_saber_movement_info(0, SaberMovementInfo::equipped_default())
+        .unwrap();
+    p.set_saber_movement_info(1, SaberMovementInfo::default())
+        .unwrap();
+    assert_ne!(p.entity_view().saber_entity_num, 0);
+
+    let medium = tick(&movement, &mut p, &mut world, 0, 0, 0);
+    assert_eq!(medium.torso_animation_name(), "BOTH_STAND2");
+
+    let cmd = UserCmd {
+        server_time: p.view().command_time + TICK_MSEC,
+        generic_command: GENCMD_SABERATTACKCYCLE,
+        ..UserCmd::default()
+    };
+    movement.step(&mut p, cmd, &mut world).unwrap();
+    let strong = tick(&movement, &mut p, &mut world, 0, 0, 0);
+    assert_eq!(strong.torso_animation_name(), "BOTH_SABERSLOW_STANCE");
+
+    // Let the stock 300 ms generic-command debounce expire, then strong -> fast.
+    for _ in 0..40 {
+        tick(&movement, &mut p, &mut world, 0, 0, 0);
+    }
+    let cmd = UserCmd {
+        server_time: p.view().command_time + TICK_MSEC,
+        generic_command: GENCMD_SABERATTACKCYCLE,
+        ..UserCmd::default()
+    };
+    movement.step(&mut p, cmd, &mut world).unwrap();
+    let fast = tick(&movement, &mut p, &mut world, 0, 0, 0);
+    assert_eq!(fast.torso_animation_name(), "BOTH_SABERFAST_STANCE");
+
+    // Crouch locomotion owns the legs, but OpenJK deliberately keeps the
+    // current saber stance on the torso while crouch-walking. Give the fixed
+    // simulation a few ticks to settle the locomotion transition.
+    let mut crouch = tick(&movement, &mut p, &mut world, 20, 0, -127);
+    for _ in 0..3 {
+        crouch = tick(&movement, &mut p, &mut world, 20, 0, -127);
+    }
+    assert_eq!(crouch.legs_animation_name(), "BOTH_CROUCH1WALK");
+    assert_eq!(crouch.torso_animation_name(), "BOTH_SABERFAST_STANCE");
+}

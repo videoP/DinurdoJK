@@ -41,8 +41,12 @@ pub struct NetworkSettings {
     pub error_decay: f32,
     pub no_predict: bool,
     pub show_miss: bool,
-    /// Continue a live connection when the server map BSP is not installed locally.
+    /// Legacy compatibility escape hatch; normal joins now use the explicit missing-map prompt.
     pub allow_missing_map: bool,
+    /// Allow HTTP package autodownload when the server advertises a TaystJK mvhttp/mvhttpurl endpoint.
+    pub allow_http_downloads: bool,
+    /// Allow the stock protocol-26 svc_download transport.
+    pub allow_legacy_downloads: bool,
     /// Usercmds per second (OpenJK: one per com_maxfps client frame).
     pub command_rate: u32,
 }
@@ -65,7 +69,9 @@ impl Default for NetworkSettings {
             error_decay: 100.0,
             no_predict: false,
             show_miss: false,
-            allow_missing_map: true,
+            allow_missing_map: false,
+            allow_http_downloads: true,
+            allow_legacy_downloads: true,
             command_rate: 125,
         }
     }
@@ -90,6 +96,8 @@ impl NetworkSettings {
             "cg_nopredict" => u8::from(self.no_predict).to_string(),
             "cg_showmiss" => u8::from(self.show_miss).to_string(),
             "cl_allowmissingmap" => u8::from(self.allow_missing_map).to_string(),
+            "cl_allowhttpdownload" => u8::from(self.allow_http_downloads).to_string(),
+            "cl_allowdownload" => u8::from(self.allow_legacy_downloads).to_string(),
             "cl_commandrate" => self.command_rate.to_string(),
             _ => return None,
         })
@@ -135,6 +143,8 @@ impl NetworkSettings {
             "cg_nopredict" => Ok({ self.no_predict = atoi(value.as_bytes()) != 0; false }),
             "cg_showmiss" => Ok({ self.show_miss = atoi(value.as_bytes()) != 0; false }),
             "cl_allowmissingmap" => Ok({ self.allow_missing_map = atoi(value.as_bytes()) != 0; false }),
+            "cl_allowhttpdownload" => Ok({ self.allow_http_downloads = atoi(value.as_bytes()) != 0; false }),
+            "cl_allowdownload" => Ok({ self.allow_legacy_downloads = atoi(value.as_bytes()) != 0; false }),
             "cl_commandrate" => number(15, 1000).map(|v| { self.command_rate = v as u32; false }),
             _ => return None,
         };
@@ -188,6 +198,8 @@ impl NetworkSettings {
         let _ = writeln!(out, "seta cg_errorDecay \"{}\"", self.error_decay);
         let _ = writeln!(out, "seta cg_noPredict \"{}\"", u8::from(self.no_predict));
         let _ = writeln!(out, "seta cl_allowMissingMap \"{}\"", u8::from(self.allow_missing_map));
+        let _ = writeln!(out, "seta cl_allowHttpDownload \"{}\"", u8::from(self.allow_http_downloads));
+        let _ = writeln!(out, "seta cl_allowDownload \"{}\"", u8::from(self.allow_legacy_downloads));
         let _ = writeln!(out, "seta cl_commandRate \"{}\"", self.command_rate);
     }
 }
@@ -222,7 +234,7 @@ pub fn generic_command(name: &str) -> Option<u8> {
         "use_ammodisp" => 23,
         "use_eweb" => 24,
         "use_cloak" => 25,
-        "saberattackcycle" => 26,
+        "saberattackcycle" => jka_movement::GENCMD_SABERATTACKCYCLE,
         "taunt" => 27,
         "bow" => 28,
         "meditate" => 29,
@@ -298,7 +310,16 @@ pub fn resolve_server(text: &str) -> Result<SocketAddr, String> {
 }
 
 impl NetClient {
+    #[cfg(test)]
     pub fn connect(server_name: &str, userinfo: Vec<u8>) -> Result<Self, String> {
+        Self::connect_inner(server_name, userinfo, false)
+    }
+
+    pub fn connect_preflight(server_name: &str, userinfo: Vec<u8>) -> Result<Self, String> {
+        Self::connect_inner(server_name, userinfo, true)
+    }
+
+    fn connect_inner(server_name: &str, userinfo: Vec<u8>, preflight: bool) -> Result<Self, String> {
         let server = resolve_server(server_name)?;
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("UDP bind failed: {error}"))?;
         socket
@@ -306,7 +327,23 @@ impl NetClient {
             .map_err(|error| format!("UDP socket setup failed: {error}"))?;
         let epoch = Instant::now();
         let seed = random_u32();
-        let session = ClientSession::connect(server, userinfo, (seed & 0xffff) as u16, (seed >> 1) as i32, 0);
+        let session = if preflight {
+            ClientSession::connect_preflight(
+                server,
+                userinfo,
+                (seed & 0xffff) as u16,
+                (seed >> 1) as i32,
+                0,
+            )
+        } else {
+            ClientSession::connect(
+                server,
+                userinfo,
+                (seed & 0xffff) as u16,
+                (seed >> 1) as i32,
+                0,
+            )
+        };
         let mut client = Self { socket, session, epoch, server_name: server_name.to_owned() };
         client.flush();
         Ok(client)
@@ -319,6 +356,20 @@ impl NetClient {
 
     pub fn session(&self) -> &ClientSession { &self.session }
     pub fn session_mut(&mut self) -> &mut ClientSession { &mut self.session }
+
+    pub fn resume_connect(&mut self) {
+        let now = self.realtime();
+        self.session.resume_connect(now);
+        self.flush();
+    }
+
+    pub fn send_reliable_now(&mut self, command: &[u8]) -> Result<(), String> {
+        self.session.add_reliable_command(command, false)?;
+        let now = self.realtime();
+        self.session.write_packet_now(now);
+        self.flush();
+        Ok(())
+    }
 
     /// Com_EventLoop's packet delivery plus per-frame resend/timeout checks.
     pub fn pump(&mut self) -> Vec<SessionEvent> {
@@ -648,7 +699,7 @@ fn from_native(state: NetworkPlayerState) -> PlayerState {
     player
 }
 
-fn movement_cmd(cmd: &UserCmd) -> MovementCmd {
+pub(crate) fn movement_cmd(cmd: &UserCmd) -> MovementCmd {
     MovementCmd {
         server_time: cmd.server_time,
         angles: cmd.angles,

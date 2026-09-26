@@ -52,6 +52,11 @@ pub enum FxBlend {
     Alpha,
     /// GL_DST_COLOR GL_ZERO / GL_ZERO GL_SRC_COLOR.
     Modulate,
+    /// GL_DST_COLOR GL_SRC_COLOR: Quake 3/JKA 2x modulation.
+    /// RGB = src*dst + dst*src = 2*src*dst. Stock rivetmark uses this.
+    Modulate2x,
+    /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
+    Darken,
     /// No blendFunc.
     Opaque,
 }
@@ -63,6 +68,8 @@ impl FxBlend {
             ["add"] | ["gl_one", "gl_one"] => Self::Add,
             ["gl_src_alpha", "gl_one"] => Self::AddAlpha,
             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
+            ["gl_dst_color", "gl_src_color"] => Self::Modulate2x,
+            ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
             [] => Self::Opaque,
             _ => Self::Alpha,
         }
@@ -81,6 +88,8 @@ impl FxBlend {
             Self::Add => DynamicModelAlphaMode::AdditiveOne,
             Self::AddAlpha => DynamicModelAlphaMode::Additive,
             Self::Modulate => DynamicModelAlphaMode::Modulate,
+            Self::Modulate2x => DynamicModelAlphaMode::Modulate2x,
+            Self::Darken => DynamicModelAlphaMode::Darken,
             Self::Alpha | Self::Opaque => DynamicModelAlphaMode::BlendUnlit,
         }
     }
@@ -105,7 +114,7 @@ impl FxMaterial {
         let rgb = if self.rgb_vertex { [0, 1, 2].map(|i| f32::from(rgba[i]) / 255.0) } else { self.rgb_const };
         let alpha = match self.blend {
             // Additive-one ignores alpha; the pipeline multiplies by it.
-            FxBlend::Add | FxBlend::Modulate => 1.0,
+            FxBlend::Add | FxBlend::Modulate | FxBlend::Modulate2x | FxBlend::Darken => 1.0,
             _ if self.alpha_vertex => f32::from(rgba[3]) / 255.0,
             _ => self.alpha_const,
         };
@@ -147,48 +156,35 @@ impl Batch {
     }
 }
 
-/// Build per-shader FX surfaces for this view. `material` resolves a shader
-/// name (cached by the caller).
+/// Build per-shader/per-stage FX surfaces for this view. `materials` resolves
+/// every renderable stage of a shader. This matters for stock JKA effects such
+/// as `gfx/effects/sabers/saberBlur`, whose glow and hot core are two additive
+/// stages over the same trail quad.
 pub fn tessellate(
     draws: &[FxDraw],
     view: &FxView,
-    material: &mut dyn FnMut(&str) -> FxMaterial,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    let mut batches: HashMap<String, (FxMaterial, Batch)> = HashMap::new();
+    let mut batches: HashMap<(String, usize), (FxMaterial, Batch)> = HashMap::new();
+    let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     for draw in draws {
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
+            | FxDraw::Quad { shader, .. }
+            | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. } => shader,
         };
-        let entry = batches
-            .entry(shader.to_ascii_lowercase())
-            .or_insert_with(|| (material(shader), Batch::default()));
-        let (mat, batch) = (&entry.0, &mut entry.1);
-        match draw {
-            FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
-                let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
-                batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
-            }
-            FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
-                let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
-                batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
-            }
-            FxDraw::Line { start, end, width, rgba, .. } => {
-                // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
-                let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
-                let color = mat.vertex_color(*rgba);
-                let v0 = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
-                let v1 = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
-                let v2 = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
-                let v3 = batch.vertex(sub(*end, scale(right, *width)), [1.0, 1.0], color);
-                batch.triangle(v0, v1, v2);
-                batch.triangle(v2, v1, v3);
-            }
-            FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
-                cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba), view);
-            }
+        let shader_key = shader.to_ascii_lowercase();
+        let stages = material_cache
+            .entry(shader_key.clone())
+            .or_insert_with(|| materials(shader));
+        for (stage_index, mat) in stages.iter().enumerate() {
+            let entry = batches
+                .entry((shader_key.clone(), stage_index))
+                .or_insert_with(|| (mat.clone(), Batch::default()));
+            append_draw(draw, view, mat, &mut entry.1);
         }
     }
     let mut surfaces: Vec<_> = batches
@@ -198,6 +194,7 @@ pub fn tessellate(
             entity_num: FX_ENTITY_NUM,
             vertices: Arc::new(batch.vertices),
             indices: Arc::new(batch.indices),
+            lighting_origin: None,
             ghoul2_gpu: None,
             texture: mat.texture.clone(),
             alpha_mode: mat.blend.alpha_mode(),
@@ -206,6 +203,62 @@ pub fn tessellate(
     // Deterministic submission order across frames.
     surfaces.sort_by_key(|surface| (surface.alpha_mode as u8, surface.vertices.len()));
     surfaces
+}
+
+fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch) {
+    match draw {
+        FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
+            let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
+        }
+        FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
+            let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
+        }
+        FxDraw::Line { start, end, width, rgba, .. } => {
+            // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
+            let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
+            let color = mat.vertex_color(*rgba);
+            let v0 = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
+            let v1 = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
+            let v2 = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
+            let v3 = batch.vertex(sub(*end, scale(right, *width)), [1.0, 1.0], color);
+            batch.triangle(v0, v1, v2);
+            batch.triangle(v2, v1, v3);
+        }
+        FxDraw::Quad { positions, uvs, rgba, .. } => {
+            let color = mat.vertex_color(*rgba);
+            let v0 = batch.vertex(positions[0], uvs[0], color);
+            let v1 = batch.vertex(positions[1], uvs[1], color);
+            let v2 = batch.vertex(positions[2], uvs[2], color);
+            let v3 = batch.vertex(positions[3], uvs[3], color);
+            // Saber/FX shaders commonly specify cull twosided. Dynamic FX
+            // batches do not currently carry shader cull state, so emit the
+            // reverse winding as well, matching the existing two-sided FX path.
+            batch.triangle(v0, v1, v3);
+            batch.triangle(v3, v1, v2);
+            batch.triangle(v3, v1, v0);
+            batch.triangle(v2, v1, v3);
+        }
+        FxDraw::Mesh { positions, uvs, rgba, indices, .. } => {
+            if positions.is_empty() || positions.len() != uvs.len() || positions.len() != rgba.len() {
+                return;
+            }
+            let base = batch.vertices.len() as u32;
+            for ((position, uv), color) in positions.iter().zip(uvs).zip(rgba) {
+                batch.vertex(*position, *uv, mat.vertex_color(*color));
+            }
+            for triangle in indices.chunks_exact(3) {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
+                if a < positions.len() as u32 && b < positions.len() as u32 && c < positions.len() as u32 {
+                    batch.triangle(base + a, base + b, base + c);
+                }
+            }
+        }
+        FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
+            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba), view);
+        }
+    }
 }
 
 /// RB_SurfaceSprite/OrientedQuad rotation of the left/up frame.
@@ -300,13 +353,18 @@ mod tests {
         assert_eq!(FxBlend::from_blend_func("GL_SRC_ALPHA GL_ONE"), FxBlend::AddAlpha);
         assert_eq!(FxBlend::from_blend_func("blend"), FxBlend::Alpha);
         assert_eq!(FxBlend::from_blend_func("gl_dst_color gl_zero"), FxBlend::Modulate);
+        assert_eq!(FxBlend::from_blend_func("gl_dst_color gl_src_color"), FxBlend::Modulate2x);
+        assert_eq!(
+            FxBlend::from_blend_func("gl_zero gl_one_minus_src_color"),
+            FxBlend::Darken
+        );
         assert_eq!(FxBlend::from_blend_func(""), FxBlend::Opaque);
     }
 
     #[test]
     fn sprite_faces_view_with_radius_half_extent_and_add_ignores_alpha_byte() {
         let draws = [FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255, 128, 0, 0], shader: "a".into() }];
-        let surfaces = tessellate(&draws, &view(), &mut |_| white(FxBlend::Add));
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Add)]);
         let surface = &surfaces[0];
         assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::AdditiveOne);
         let jka: Vec<_> = surface.vertices.iter().map(|v| scene::jka_position(v.position)).collect();
@@ -319,11 +377,45 @@ mod tests {
     #[test]
     fn line_width_spans_perpendicular_to_view_and_segment() {
         let draws = [FxDraw::Line { start: [100.0, 0.0, 0.0], end: [100.0, 50.0, 0.0], width: 1.5, rgba: [255, 255, 255, 128], shader: "b".into() }];
-        let surfaces = tessellate(&draws, &view(), &mut |_| white(FxBlend::AddAlpha));
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
         let jka: Vec<_> = surfaces[0].vertices.iter().map(|v| scene::jka_position(v.position)).collect();
         // (start - view) x (end - view) points along +Z here.
         assert!((jka[0][2] - 1.5).abs() < 1e-4 && (jka[1][2] + 1.5).abs() < 1e-4);
         assert!((surfaces[0].vertices[0].color[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arbitrary_quad_keeps_uvs_and_multistage_shader_draws_both_passes() {
+        let draws = [FxDraw::Quad {
+            positions: [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            uvs: [[0.0, 1.0], [0.0, 0.0], [0.5, 0.0], [0.5, 1.0]],
+            rgba: [255, 64, 0, 255],
+            shader: "gfx/effects/sabers/saberBlur".into(),
+        }];
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![
+            white(FxBlend::Add),
+            FxMaterial { rgb_vertex: false, ..white(FxBlend::Add) },
+        ]);
+        assert_eq!(surfaces.len(), 2, "one surface per renderable shader stage");
+        assert!(surfaces.iter().all(|surface| surface.indices.len() == 12));
+        assert!(surfaces.iter().any(|surface| surface.vertices[2].uv == [0.5, 0.0]));
+    }
+
+    #[test]
+    fn indexed_mesh_preserves_per_vertex_colour_and_indices() {
+        let draws = [FxDraw::Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            rgba: vec![[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]],
+            indices: vec![0, 1, 2],
+            shader: "mesh".into(),
+        }];
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Add)]);
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].vertices.len(), 3);
+        assert_eq!(surfaces[0].indices.len(), 6, "mesh triangles are emitted two-sided");
+        assert_eq!(surfaces[0].vertices[0].color[..3], [1.0, 0.0, 0.0]);
+        assert_eq!(surfaces[0].vertices[1].color[..3], [0.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -333,7 +425,7 @@ mod tests {
             FxDraw::Sprite { origin: [20.0, 0.0, 0.0], radius: 1.0, rotation: 0.0, rgba: [255; 4], shader: "X".into() },
             FxDraw::Cylinder { start: [0.0; 3], end: [0.0, 0.0, 10.0], axis: [0.0, 0.0, 1.0], start_radius: 1.0, end_radius: 3.0, rgba: [255; 4], shader: "c".into() },
         ];
-        let surfaces = tessellate(&draws, &view(), &mut |_| white(FxBlend::Alpha));
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Alpha)]);
         assert_eq!(surfaces.len(), 2);
         let cylinder = surfaces.iter().find(|s| s.vertices.len() > 8).unwrap();
         let radii: Vec<f32> = cylinder

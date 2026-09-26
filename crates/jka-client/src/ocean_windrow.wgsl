@@ -54,7 +54,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dt = clamp(state.wind_time.w, 0.0, 0.1);
     let wind = state.wind_time.xy;
     let speed = length(wind);
-    let active = smooth01(8.0, 14.0, speed);
+    let wind_activity = smooth01(8.0, 14.0, speed);
     var wind_dir = vec2<f32>(1.0, 0.0);
     if (speed > 1e-4) { wind_dir = wind / speed; }
     let cross_dir = vec2<f32>(-wind_dir.y, wind_dir.x);
@@ -67,7 +67,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let phase = 6.28318530718 * across / spacing
         + 0.62 * sin(along * 0.035 + state.wind_time.z * 0.020)
         + 0.24 * sin(along * 0.083 - state.wind_time.z * 0.014);
-    let convergence_speed = min(0.80, speed * 0.035) * active;
+    let convergence_speed = min(0.80, speed * 0.035) * wind_activity;
     let cross_velocity = -sin(phase) * convergence_speed;
     let drift = wind * 0.030;
     let velocity = drift + cross_dir * cross_velocity;
@@ -80,7 +80,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Semi-Lagrangian scalar advection does not conserve density by itself. A
     // small compression term makes actual convergence bands collect foam instead
     // of merely translating the pattern.
-    let compression = max(cos(phase), 0.0) * active;
+    let compression = max(cos(phase), 0.0) * wind_activity;
     foam *= 1.0 + compression * dt * 0.85;
 
     // Existing accumulated FFT/Jacobian foam is the only source. A fairly high
@@ -91,7 +91,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let source_uv = world_m * vec2<f32>(1.0, -1.0) * state.map_scales[i].xy;
         breaker += textureSampleLevel(breaker_normal, repeat_sampler, source_uv, i32(i), 0.0).w;
     }
-    let source = smooth01(0.55, 1.35, breaker) * active * state.params.y;
+    let source = smooth01(0.55, 1.35, breaker) * wind_activity * state.params.y;
     foam += source * dt * 0.18;
 
     // Surface foam persists much longer than crest spray but eventually clears.

@@ -54,37 +54,6 @@ impl ProgressState {
         request_id
     }
 
-    fn begin_progressive(&self, task: Task, total_units: u32) -> u64 {
-        let request_id = self.request_id.load(Ordering::Acquire);
-        let index = task as usize;
-        let total_units = total_units.max(1);
-        self.completed[index].store(0, Ordering::Relaxed);
-        self.total[index].store(total_units, Ordering::Relaxed);
-        self.report(request_id, task, 0, total_units);
-        request_id
-    }
-
-    fn set_progressive(&self, request_id: u64, task: Task, completed_units: u32) {
-        if self.request_id.load(Ordering::Acquire) != request_id {
-            return;
-        }
-        let index = task as usize;
-        let total = self.total[index].load(Ordering::Relaxed).max(1);
-        let completed = completed_units.min(total);
-        self.completed[index].store(completed, Ordering::Relaxed);
-        self.report(request_id, task, completed, total);
-    }
-
-    fn finish_progressive(&self, request_id: u64, task: Task) {
-        if self.request_id.load(Ordering::Acquire) != request_id {
-            return;
-        }
-        let index = task as usize;
-        let total = self.total[index].load(Ordering::Relaxed).max(1);
-        self.completed[index].store(total, Ordering::Relaxed);
-        self.report(request_id, task, total, total);
-    }
-
     fn finished(&self, request_id: u64, task: Task) {
         if self.request_id.load(Ordering::Acquire) != request_id {
             return;
@@ -122,30 +91,6 @@ pub struct MapJobPool {
 
 pub struct JobHandle<T> {
     receiver: mpsc::Receiver<Result<T, String>>,
-}
-
-#[derive(Clone)]
-pub struct JobProgress {
-    request_id: u64,
-    task: Task,
-    total_units: u32,
-    state: Arc<ProgressState>,
-}
-
-impl JobProgress {
-    pub fn set_units(&self, completed_units: u32) {
-        self.state
-            .set_progressive(self.request_id, self.task, completed_units.min(self.total_units));
-    }
-
-    pub fn set_fraction(&self, fraction: f32) {
-        let fraction = if fraction.is_finite() {
-            fraction.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self.set_units((fraction * self.total_units as f32).round() as u32);
-    }
 }
 
 impl<T> JobHandle<T> {
@@ -235,42 +180,6 @@ impl MapJobPool {
         Ok(JobHandle { receiver: rx })
     }
 
-    /// Submit a single long-running task that can expose fractional progress in
-    /// the normal map loading UI. This is intentionally separate from `submit`:
-    /// ordinary tasks report job counts, while heavyweight bakes report units.
-    pub fn submit_progressive<T, F>(
-        &self,
-        task: Task,
-        total_units: u32,
-        job: F,
-    ) -> Result<JobHandle<T>, String>
-    where
-        T: Send + 'static,
-        F: FnOnce(JobProgress) -> T + Send + 'static,
-    {
-        let total_units = total_units.max(1);
-        let request_id = self.progress.begin_progressive(task, total_units);
-        let (tx, rx) = mpsc::channel();
-        let state = Arc::clone(&self.progress);
-        let job_progress = JobProgress {
-            request_id,
-            task,
-            total_units,
-            state: Arc::clone(&state),
-        };
-        let run = Box::new(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| job(job_progress)))
-                .map_err(|_| format!("map worker panicked while running {}", task.label()));
-            state.finish_progressive(request_id, task);
-            let _ = tx.send(result);
-        });
-        self.sender
-            .as_ref()
-            .ok_or("map worker pool is shutting down")?
-            .send(Job { task, run })
-            .map_err(|_| "map worker pool disconnected".to_string())?;
-        Ok(JobHandle { receiver: rx })
-    }
 }
 
 impl Drop for MapJobPool {

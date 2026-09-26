@@ -63,10 +63,11 @@ pub struct EntityPresenter {
     shaders: BTreeMap<String, Shader>,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
+    missing_texture: Arc<TextureData>,
     md3_models: HashMap<String, Arc<Md3Asset>>,
     failed_models: HashSet<String>,
     logged_unsupported: HashSet<String>,
-    fx_materials: HashMap<String, crate::fx::draw::FxMaterial>,
+    fx_materials: HashMap<String, Vec<crate::fx::draw::FxMaterial>>,
 }
 
 impl EntityPresenter {
@@ -86,6 +87,7 @@ impl EntityPresenter {
             shaders,
             textures: Textures::new(),
             texture_arcs: HashMap::new(),
+            missing_texture: Arc::new(materials::missing_texture_data()),
             md3_models: HashMap::new(),
             failed_models: HashSet::new(),
             logged_unsupported: HashSet::new(),
@@ -154,9 +156,10 @@ impl EntityPresenter {
                 }
                 EntityPresentationKind::Fx => {
                     summary.fx += 1;
-                    let effect_index = entity.state.field_i32("modelindex").unwrap_or(0);
-                    let effect = game.effect_qpath(effect_index).unwrap_or_else(|| "<unresolved>".into());
-                    self.log_entity_once(entity, &format!("ET_FX effect index {effect_index} ({effect}) needs FX runtime"));
+                    // OpenJK CG_FX. Map-authored fx_runner entities are server
+                    // entities of type ET_FX; modelindex/modelindex2 carry the
+                    // effect resource and off/one-shot/continuous state.
+                    weapon_fx.entity_fx(entity, game);
                 }
                 EntityPresentationKind::Player
                 | EntityPresentationKind::Invisible
@@ -346,6 +349,7 @@ impl EntityPresenter {
                 entity_num,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
+                lighting_origin: Some(submission.origin),
                 ghoul2_gpu: None,
                 texture,
                 alpha_mode: blend_for_alpha(alpha_mode, submission.rgba[3]),
@@ -421,9 +425,69 @@ impl EntityPresenter {
                 entity_num: entity.number,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
+                lighting_origin: Some(entity.origin),
                 ghoul2_gpu: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if color[3] < 1.0 {
+                    match surface_asset.alpha_mode {
+                        DynamicModelAlphaMode::Opaque => DynamicModelAlphaMode::Blend,
+                        DynamicModelAlphaMode::Mask => DynamicModelAlphaMode::MaskBlend,
+                        mode => mode,
+                    }
+                } else {
+                    surface_asset.alpha_mode
+                },
+            });
+        }
+        Ok(draws)
+    }
+
+    /// Developer Asset Viewer path: submit an arbitrary MD3 through the same
+    /// material/texture registration used by live CGame entities, without
+    /// fabricating a protocol entity just to inspect a model.
+    pub fn present_static_md3(
+        &mut self,
+        entity_num: u16,
+        qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        frame: usize,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let asset = self.load_md3(qpath)?;
+        let frame = frame.min(asset.model.frames.len().saturating_sub(1));
+        let mut draws = Vec::with_capacity(asset.surfaces.len());
+        for surface_asset in &asset.surfaces {
+            let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else {
+                continue;
+            };
+            let Some(vertices) = surface.frame_vertices(frame) else {
+                continue;
+            };
+            if vertices.is_empty() || surface.indices.is_empty() {
+                continue;
+            }
+            let vertices = vertices
+                .iter()
+                .map(|vertex| DynamicModelVertex {
+                    position: transform_model_point(vertex.position, axis, origin, 1.0),
+                    normal: transform_model_normal(vertex.normal, axis),
+                    uv: vertex.uv,
+                    color: rgba,
+                })
+                .collect::<Vec<_>>();
+            let mut indices = surface.indices.clone();
+            for triangle in indices.chunks_exact_mut(3) {
+                triangle.swap(1, 2);
+            }
+            draws.push(DynamicModelSurface {
+                entity_num,
+                vertices: Arc::new(vertices),
+                indices: Arc::new(indices),
+                lighting_origin: Some(origin),
+                ghoul2_gpu: None,
+                texture: surface_asset.texture.clone(),
+                alpha_mode: if rgba[3] < 1.0 {
                     match surface_asset.alpha_mode {
                         DynamicModelAlphaMode::Opaque => DynamicModelAlphaMode::Blend,
                         DynamicModelAlphaMode::Mask => DynamicModelAlphaMode::MaskBlend,
@@ -486,45 +550,105 @@ impl EntityPresenter {
         }
     }
 
-    /// FX shader material (first renderable stage): texture, blendFunc and
-    /// vertex color generation, cached per shader name.
+    /// First renderable FX shader stage, retained for model customShader users.
     pub fn fx_material(&mut self, shader_name: &str) -> crate::fx::draw::FxMaterial {
+        self.fx_material_stages(shader_name)
+            .into_iter()
+            .next()
+            .expect("FX material resolver always returns at least one stage")
+    }
+
+    /// Every renderable stage of an FX shader. Jedi Academy effects are often
+    /// multi-pass; notably `saberBlur` draws blurglow then blurcore, both with
+    /// GL_ONE GL_ONE. Keeping this generic fixes other multi-stage FX too.
+    pub fn fx_material_stages(&mut self, shader_name: &str) -> Vec<crate::fx::draw::FxMaterial> {
         use crate::fx::draw::{FxBlend, FxMaterial};
         use jka_assets::shader::{AlphaGen, RgbGen};
         let key = shader_name.replace('\\', "/").to_ascii_lowercase();
-        if let Some(material) = self.fx_materials.get(&key) {
-            return material.clone();
+        if let Some(materials) = self.fx_materials.get(&key) {
+            return materials.clone();
         }
-        let stage = self.shaders.get(&key).and_then(Shader::primary).cloned();
-        let material = match stage {
-            Some(stage) => {
-                let texture = if stage.image.eq_ignore_ascii_case("$whiteimage") {
-                    None
-                } else {
-                    self.load_texture_arc(&stage.image, stage.clamp)
-                };
-                FxMaterial {
-                    texture,
-                    blend: FxBlend::from_blend_func(&stage.blend),
-                    rgb_vertex: stage.rgb_gen.uses_vertex_color(),
-                    alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
-                    rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
-                    alpha_const: stage.alpha.unwrap_or(1.0),
+
+        let has_shader_definition = self.shaders.contains_key(&key);
+        let stages = self.shaders.get(&key).map(|shader| {
+            shader.stages.iter().filter(|stage| {
+                !stage.image.is_empty()
+                    && (!stage.image.starts_with('$') || stage.image == "$whiteimage" || stage.image == "$lightmap")
+            }).cloned().collect::<Vec<_>>()
+        }).unwrap_or_default();
+        let mut materials = Vec::with_capacity(stages.len().max(1));
+        for stage in stages {
+            // None is reserved for intentional built-ins such as $whiteimage.
+            // Real image qpaths that fail lookup use the engine-wide missing
+            // material checker instead of silently sampling white.
+            let texture = if stage.image.eq_ignore_ascii_case("$whiteimage") || stage.image.eq_ignore_ascii_case("$lightmap") {
+                None
+            } else {
+                Some(self.load_texture_arc_or_missing(&stage.image, stage.clamp, "FX"))
+            };
+            materials.push(FxMaterial {
+                texture,
+                blend: FxBlend::from_blend_func(&stage.blend),
+                rgb_vertex: stage.rgb_gen.uses_vertex_color(),
+                alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
+                rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
+                alpha_const: stage.alpha.unwrap_or(1.0),
+            });
+        }
+        if materials.is_empty() {
+            if has_shader_definition {
+                // An authored shader that produced no renderable stage in this
+                // path is genuinely unresolved here: keep the engine-wide
+                // magenta/checker convention instead of silently inventing a
+                // material.
+                println!(
+                    "FX MATERIAL WARNING: {shader_name}: shader has no renderable image stage; using shared missing texture placeholder"
+                );
+                materials.push(FxMaterial {
+                    texture: Some(Arc::clone(&self.missing_texture)),
+                    blend: FxBlend::Opaque,
+                    rgb_vertex: true,
+                    alpha_vertex: true,
+                    rgb_const: [1.0; 3],
+                    alpha_const: 1.0,
+                });
+            } else {
+                // Faithful RE_RegisterShader behavior: an explicit .shader
+                // definition is optional. If an image with the requested qpath
+                // exists, OpenJK builds an implicit LIGHTMAP_2D shader for it
+                // (CGEN_VERTEX/AGEN_VERTEX, SRC_ALPHA/ONE_MINUS_SRC_ALPHA).
+                // This is exactly how stock image-only FX such as rivet marks
+                // remain transparent/dark instead of becoming opaque gray.
+                match self.load_texture_arc(&key, false) {
+                    Some(texture) => materials.push(FxMaterial {
+                        texture: Some(texture),
+                        blend: FxBlend::Alpha,
+                        rgb_vertex: true,
+                        alpha_vertex: true,
+                        rgb_const: [1.0; 3],
+                        alpha_const: 1.0,
+                    }),
+                    None => {
+                        if let Some(warning) = self.textures.warnings.last() {
+                            println!("FX TEXTURE WARNING: {warning}");
+                        }
+                        println!(
+                            "FX MATERIAL WARNING: {shader_name}: no shader definition or implicit image; using shared missing texture placeholder"
+                        );
+                        materials.push(FxMaterial {
+                            texture: Some(Arc::clone(&self.missing_texture)),
+                            blend: FxBlend::Opaque,
+                            rgb_vertex: true,
+                            alpha_vertex: true,
+                            rgb_const: [1.0; 3],
+                            alpha_const: 1.0,
+                        });
+                    }
                 }
             }
-            // An image path used directly as a shader (implicit default
-            // shader): opaque texture with vertex color, like R_FindShader.
-            None => FxMaterial {
-                texture: self.load_texture_arc(&key, false),
-                blend: FxBlend::Opaque,
-                rgb_vertex: true,
-                alpha_vertex: true,
-                rgb_const: [1.0; 3],
-                alpha_const: 1.0,
-            },
-        };
-        self.fx_materials.insert(key, material.clone());
-        material
+        }
+        self.fx_materials.insert(key, materials.clone());
+        materials
     }
 
     fn load_texture_arc(&mut self, image: &str, clamp: bool) -> Option<Arc<TextureData>> {
@@ -533,6 +657,23 @@ impl EntityPresenter {
             .entry(index)
             .or_insert_with(|| Arc::new(self.textures.images[index].clone()));
         Some(Arc::clone(&self.texture_arcs[&index]))
+    }
+
+    fn load_texture_arc_or_missing(
+        &mut self,
+        image: &str,
+        clamp: bool,
+        log_prefix: &str,
+    ) -> Arc<TextureData> {
+        match self.load_texture_arc(image, clamp) {
+            Some(texture) => texture,
+            None => {
+                if let Some(warning) = self.textures.warnings.last() {
+                    println!("{log_prefix} TEXTURE WARNING: {warning}");
+                }
+                Arc::clone(&self.missing_texture)
+            }
+        }
     }
 
     fn resolve_surface_material(
@@ -551,24 +692,14 @@ impl EntityPresenter {
                     crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
                         .custom_shader_alpha_mode()
                 };
-                (stage.image.as_str(), stage.clamp, alpha_mode)
+                (stage.image.clone(), stage.clamp, alpha_mode)
             })
-            .unwrap_or((shader_name, false, DynamicModelAlphaMode::Opaque));
+            .unwrap_or((shader_name.to_owned(), false, DynamicModelAlphaMode::Opaque));
 
         if image_name.eq_ignore_ascii_case("$whiteimage") {
             return (None, alpha_mode);
         }
-        let texture = self.textures.load(&mut self.assets, image_name, clamp).map(|index| {
-            self.texture_arcs
-                .entry(index)
-                .or_insert_with(|| Arc::new(self.textures.images[index].clone()));
-            Arc::clone(&self.texture_arcs[&index])
-        });
-        if texture.is_none() {
-            if let Some(warning) = self.textures.warnings.last() {
-                println!("ENTITY TEXTURE WARNING: {warning}");
-            }
-        }
+        let texture = Some(self.load_texture_arc_or_missing(&image_name, clamp, "ENTITY"));
         (texture, alpha_mode)
     }
 
@@ -846,7 +977,7 @@ mod tests {
                         for draw in &frame.draws {
                             kinds.insert(format!("{:?}", std::mem::discriminant(draw)));
                         }
-                        let surfaces = crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| presenter.fx_material(shader));
+                        let surfaces = crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| presenter.fx_material_stages(shader));
                         surfaces_total += surfaces.len();
                         textured += surfaces.iter().filter(|surface| surface.texture.is_some()).count();
                     }

@@ -92,6 +92,19 @@ pub enum FxDraw {
     OrientedQuad { origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
     Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: String },
+    /// Arbitrary two-sided textured quad. OpenJK saber trails use exactly this
+    /// shape to connect the current blade base/tip to the previous sample.
+    Quad { positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4], rgba: [u8; 4], shader: String },
+    /// Arbitrary indexed two-sided mesh with per-vertex colour. This is used by
+    /// smooth cosmetic FX that need more than a quad (for example enhanced
+    /// saber melt relief) without adding a bespoke renderer hot path.
+    Mesh {
+        positions: Vec<[f32; 3]>,
+        uvs: Vec<[f32; 2]>,
+        rgba: Vec<[u8; 4]>,
+        indices: Vec<u32>,
+        shader: String,
+    },
     /// RT_CYLINDER: `start_radius` ring at start, `end_radius` ring at end.
     Cylinder { start: [f32; 3], end: [f32; 3], axis: [f32; 3], start_radius: f32, end_radius: f32, rgba: [u8; 4], shader: String },
 }
@@ -187,6 +200,15 @@ impl FxSystem {
         self.active.clear();
         self.scheduled.clear();
         self.sounds.clear();
+    }
+
+    /// Reset the scheduler clock and transient primitives at a demo seek boundary.
+    pub fn reset_time(&mut self, time: i32) {
+        self.clear_active();
+        self.time = time;
+        self.old_time = time;
+        self.frame_time = 0;
+        self.real_time = 0.0;
     }
 
     /// CFxScheduler::RegisterEffect. `read` returns a file's bytes by qpath.

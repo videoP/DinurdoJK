@@ -233,6 +233,9 @@ struct PlayerSurfaceAsset {
     surface_index: usize,
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
+    /// Asset Viewer only: this surface had no usable authored material, so
+    /// render it neutral gray instead of disappearing into the black preview.
+    fallback_gray: bool,
     /// Static bind-pose mesh for each authored GLM LOD. A surface can be
     /// absent from a lower LOD, matching Ghoul2's per-LOD surface tables.
     gpu_meshes: Vec<Option<Arc<Ghoul2GpuMeshSource>>>,
@@ -285,6 +288,17 @@ pub enum PlayerFxRequest {
         radius: f32,
         color: i32,
         entity_alpha: f32,
+        /// Identity/state needed by OpenJK CG_AddSaberBlade's persistent
+        /// per-blade trail history.
+        entity_num: u16,
+        saber_num: u8,
+        blade_num: u8,
+        saber_move: i32,
+        torso_anim: i32,
+        saber_in_flight: bool,
+        trail_style: i32,
+        /// Authored OpenJK noWallMarks/noWallMarks2 for the active blade style.
+        no_wall_marks: bool,
     },
     /// CG_ForcePushBlur's LE_PUFF path (two sprites drifting sideways).
     PushPuffs { origin: [f32; 3] },
@@ -601,6 +615,17 @@ fn resolve_vehicle_model_request(
 }
 
 impl PlayerPresenter {
+    /// Reset only per-entity/time-dependent presentation state for demo seeking.
+    /// Asset/model caches stay hot so scrubbing does not turn into a reload path.
+    pub fn reset_for_seek(&mut self) {
+        self.fx_requests.clear();
+        self.entities.clear();
+        self.force_grip_targets.clear();
+        self.force_gripped_entities.clear();
+        self.thrown_sabers.clear();
+        self.ragdolls.reset_dynamic_for_seek();
+    }
+
     pub fn vehicle_definition_for_model_request(&self, requested: &str) -> Option<&VehicleDefinition> {
         let model_request = requested
             .rsplit_once('*')
@@ -856,8 +881,13 @@ impl PlayerPresenter {
                 let (texture, base_alpha_mode) = custom_material
                     .clone()
                     .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode));
+                let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
+                    [0.58, 0.58, 0.58, rgba[3]]
+                } else {
+                    rgba
+                };
                 let alpha_mode = if apply_alpha_blend {
-                    blend_for_alpha(base_alpha_mode, rgba[3])
+                    blend_for_alpha(base_alpha_mode, surface_rgba[3])
                 } else {
                     base_alpha_mode
                 };
@@ -865,6 +895,7 @@ impl PlayerPresenter {
                     entity_num,
                     vertices: Arc::clone(&empty_vertices),
                     indices: Arc::clone(&gpu_mesh.indices),
+                    lighting_origin: Some(origin),
                     ghoul2_gpu: Some(Ghoul2GpuSkinning {
                         mesh_key: Arc::clone(&gpu_mesh.key),
                         vertices: Arc::clone(&gpu_mesh.vertices),
@@ -872,7 +903,7 @@ impl PlayerPresenter {
                         bones: Arc::clone(&bones),
                         axis,
                         origin,
-                        color: rgba,
+                        color: surface_rgba,
                     }),
                     texture,
                     alpha_mode,
@@ -900,6 +931,11 @@ impl PlayerPresenter {
         let mut draws = Vec::with_capacity(jobs.len());
         for ((asset, _, gpu_mesh), skinned) in jobs.into_iter().zip(skinned) {
             let skinned = skinned?;
+            let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
+                [0.58, 0.58, 0.58, rgba[3]]
+            } else {
+                rgba
+            };
             if used_workers {
                 self.perf.surfaces_skinned = self.perf.surfaces_skinned.saturating_add(1);
                 self.perf.vertices_skinned = self
@@ -914,7 +950,7 @@ impl PlayerPresenter {
                     position: transform_model_point(vertex.position, axis, origin),
                     normal: transform_model_normal(vertex.normal, axis),
                     uv: vertex.uv,
-                    color: rgba,
+                    color: surface_rgba,
                 })
                 .collect::<Vec<_>>();
             if vertices.is_empty() || gpu_mesh.indices.is_empty() {
@@ -924,7 +960,7 @@ impl PlayerPresenter {
                 .clone()
                 .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode));
             let alpha_mode = if apply_alpha_blend {
-                blend_for_alpha(base_alpha_mode, rgba[3])
+                blend_for_alpha(base_alpha_mode, surface_rgba[3])
             } else {
                 base_alpha_mode
             };
@@ -932,6 +968,7 @@ impl PlayerPresenter {
                 entity_num,
                 vertices: Arc::new(vertices),
                 indices: Arc::clone(&gpu_mesh.indices),
+                lighting_origin: Some(origin),
                 ghoul2_gpu: None,
                 texture,
                 alpha_mode,
@@ -970,6 +1007,7 @@ impl PlayerPresenter {
             entity_num: surface.entity_num,
             vertices,
             indices: Arc::clone(&surface.indices),
+            lighting_origin: surface.lighting_origin,
             ghoul2_gpu,
             texture,
             alpha_mode,
@@ -1071,6 +1109,7 @@ impl PlayerPresenter {
         siege_classes: &[jka_assets::siege::SiegeClassVisual],
         current_time: i32,
         preserve_entity: Option<u16>,
+        hidden_first_person_entity: Option<u16>,
         view: Option<Ghoul2PresentationView>,
     ) -> Vec<DynamicModelSurface> {
         if let Some(snapshot) = game.current_snapshot() {
@@ -1110,6 +1149,19 @@ impl PlayerPresenter {
             {
                 live_ragdolls.insert(entity.number);
             }
+
+            // OpenJK CG_AddPacketEntities first synthesizes/adds the predicted
+            // player from playerState, then explicitly skips that same client
+            // number while walking snapshot entities. `preserve_entity` is our
+            // separately-presented local/followed player, so presenting the
+            // snapshot copy here as well queues a second SaberBlade for the same
+            // (entity,saber,blade) key. If the two poses disagree about wall
+            // contact, the later copy clears haveOldPos every frame and saber
+            // marks can never connect. Keep it live, but do not present it twice.
+            if preserve_entity == Some(entity.number) {
+                continue;
+            }
+
             // CG_Player returns before animating or submitting anything for
             // EF_NODRAW (e.g. NPCs a spawner is still holding, parked with
             // anim 0) and EF2_SHIP_DEATH; the centity itself stays alive.
@@ -1169,7 +1221,7 @@ impl PlayerPresenter {
                 1.0,
                 look_target_origin,
                 false,
-                true,
+                hidden_first_person_entity != Some(entity.number),
                 view,
             ) {
                 Ok(mut player_draws) => draws.append(&mut player_draws),
@@ -1764,6 +1816,7 @@ impl PlayerPresenter {
                 surface_index: surface.surface_index,
                 texture,
                 alpha_mode,
+                fallback_gray: false,
                 gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
             });
         }
@@ -1841,6 +1894,8 @@ impl PlayerPresenter {
             return Ok(());
         }
         let in_flight = entity.state.field_i32("saberInFlight").unwrap_or(0) != 0;
+        let saber_move = entity.state.field_i32("saberMove").unwrap_or(0);
+        let torso_anim = entity.state.field_i32("torsoAnim").unwrap_or(0);
         let mut sabers = Vec::with_capacity(2);
         // WP_SetSaber "none"/"remove" empties a slot; an NPC without
         // npcSaber1 has a zeroed saber[0] and draws no hilt.
@@ -1952,6 +2007,18 @@ impl PlayerPresenter {
                 let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, player_axis));
                 let blade = definition.blade(blade_index);
                 let saber_color = blade_color(info, saber_color, &blade);
+                let secondary_style = definition.blade_style2_start > 0
+                    && blade_index >= definition.blade_style2_start;
+                let trail_style = if secondary_style {
+                    definition.trail_style2
+                } else {
+                    definition.trail_style
+                };
+                let no_wall_marks = if secondary_style {
+                    definition.no_wall_marks2
+                } else {
+                    definition.no_wall_marks
+                };
                 if let Some(request) = saber_blade_fx_request(
                     origin_world,
                     dir_world,
@@ -1959,6 +2026,14 @@ impl PlayerPresenter {
                     blade.radius,
                     saber_color,
                     entity_alpha,
+                    entity.number,
+                    saber_num as u8,
+                    blade_index as u8,
+                    saber_move,
+                    torso_anim,
+                    in_flight,
+                    trail_style,
+                    no_wall_marks,
                 ) {
                     self.fx_requests.push(request);
                 }
@@ -2141,6 +2216,18 @@ impl PlayerPresenter {
             let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, blade_axis));
             let blade = definition.blade(blade_index);
             let saber_color = blade_color(info, info.saber_color, &blade);
+            let secondary_style = definition.blade_style2_start > 0
+                && blade_index >= definition.blade_style2_start;
+            let trail_style = if secondary_style {
+                definition.trail_style2
+            } else {
+                definition.trail_style
+            };
+            let no_wall_marks = if secondary_style {
+                definition.no_wall_marks2
+            } else {
+                definition.no_wall_marks
+            };
             if let Some(request) = saber_blade_fx_request(
                 origin_world,
                 dir_world,
@@ -2148,6 +2235,14 @@ impl PlayerPresenter {
                 blade.radius,
                 saber_color,
                 entity_alpha,
+                owner.number,
+                0,
+                blade_index as u8,
+                owner.state.field_i32("saberMove").unwrap_or(0),
+                owner.state.field_i32("torsoAnim").unwrap_or(0),
+                true,
+                trail_style,
+                no_wall_marks,
             ) {
                 self.fx_requests.push(request);
             }
@@ -2223,14 +2318,30 @@ impl PlayerPresenter {
         custom_skin: Option<&str>,
         label: &str,
     ) -> Result<Arc<SaberModelAsset>, String> {
-        let key = format!("{}|{}", model_qpath, custom_skin.unwrap_or("")).to_ascii_lowercase();
+        self.load_static_glm_with_options(model_qpath, custom_skin, label, false)
+    }
+
+    fn load_static_glm_with_options(
+        &mut self,
+        model_qpath: &str,
+        custom_skin: Option<&str>,
+        label: &str,
+        preview_fallback: bool,
+    ) -> Result<Arc<SaberModelAsset>, String> {
+        let key = format!(
+            "{}|{}|preview_fallback={}",
+            model_qpath,
+            custom_skin.unwrap_or(""),
+            u8::from(preview_fallback),
+        )
+        .to_ascii_lowercase();
         if let Some(model) = self.saber_models.get(&key) {
             return Ok(Arc::clone(model));
         }
         if self.failed_saber_models.contains(&key) {
             return Err(format!("Ghoul2 model {model_qpath} failed registration earlier"));
         }
-        let result = self.load_static_glm_uncached(model_qpath, custom_skin, label);
+        let result = self.load_static_glm_uncached(model_qpath, custom_skin, label, preview_fallback);
         match result {
             Ok(model) => {
                 let model = Arc::new(model);
@@ -2249,6 +2360,7 @@ impl PlayerPresenter {
         model_qpath: &str,
         custom_skin: Option<&str>,
         label: &str,
+        preview_fallback: bool,
     ) -> Result<SaberModelAsset, String> {
         let model_bytes = self
             .assets
@@ -2274,10 +2386,20 @@ impl PlayerPresenter {
         }
 
         let skin_map = if let Some(skin_qpath) = custom_skin {
-            self.load_skin_qpath(skin_qpath)?
-                .into_iter()
-                .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-                .collect::<HashMap<_, _>>()
+            match self.load_skin_qpath(skin_qpath) {
+                Ok(skin) => skin
+                    .into_iter()
+                    .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
+                    .collect::<HashMap<_, _>>(),
+                Err(error) if preview_fallback => {
+                    println!(
+                        "ASSET VIEWER GLM SKIN FALLBACK: model={} skin={} error={}; using embedded shaders/gray fallback",
+                        model_qpath, skin_qpath, error,
+                    );
+                    HashMap::new()
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             HashMap::new()
         };
@@ -2299,14 +2421,32 @@ impl PlayerPresenter {
                 .get(&hierarchy.name.to_ascii_lowercase())
                 .map(String::as_str)
                 .unwrap_or(hierarchy.shader.as_str());
-            if shader_name.is_empty() || shader_name.eq_ignore_ascii_case("*off") {
+            if shader_name.eq_ignore_ascii_case("*off") {
                 continue;
             }
+            let missing_shader = shader_name.is_empty();
+            let shader_name = if missing_shader {
+                if preview_fallback {
+                    // Player/NPC GLMs often have no embedded shader refs and
+                    // normally rely entirely on model_default.skin. If that
+                    // skin is absent/incomplete, keep the geometry inspectable
+                    // instead of silently producing zero draw surfaces.
+                    "$whiteimage"
+                } else {
+                    continue;
+                }
+            } else {
+                shader_name
+            };
             let (texture, alpha_mode) = self.resolve_surface_material(shader_name);
+            let fallback_gray = preview_fallback
+                && (missing_shader
+                    || (!shader_name.eq_ignore_ascii_case("$whiteimage") && texture.is_none()));
             surfaces.push(PlayerSurfaceAsset {
                 surface_index: surface.surface_index,
                 texture,
                 alpha_mode,
+                fallback_gray,
                 gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
             });
         }
@@ -2470,6 +2610,49 @@ impl PlayerPresenter {
             true,
         )?;
         Ok(draws)
+    }
+
+    /// Developer Asset Viewer GLM path. Player/NPC model.glm files usually
+    /// obtain their materials from model_default.skin rather than from the GLM
+    /// hierarchy itself. Try that sibling skin automatically. If it is absent
+    /// or incomplete, retain renderable geometry with a neutral $whiteimage
+    /// material instead of making the model disappear against the black viewer.
+    pub fn present_static_glm_preview(
+        &mut self,
+        entity_num: u16,
+        model_qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        current_time: i32,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let normalized = model_qpath.replace('\\', "/");
+        let inferred_skin = normalized
+            .rsplit_once('/')
+            .filter(|(_, leaf)| leaf.eq_ignore_ascii_case("model.glm"))
+            .map(|(folder, _)| format!("{folder}/model_default.skin"));
+        let model = self.load_static_glm_with_options(
+            model_qpath,
+            inferred_skin.as_deref(),
+            model_qpath,
+            true,
+        )?;
+        let pose_started = Instant::now();
+        let pose = Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+        record_pose_eval(&mut self.perf, pose_started);
+        self.render_glm_surfaces(
+            entity_num,
+            model_qpath,
+            &model.glm,
+            &model.surfaces,
+            &pose,
+            0,
+            axis,
+            origin,
+            rgba,
+            None,
+            true,
+        )
     }
 
     /// OpenJK's `RE_RegisterModels_GetDiskFile` treats `*default.gla` as a
@@ -2913,7 +3096,7 @@ mod tests {
                         }
                         snapshots += 1;
                         let entities = game.present_entities(snapshot.server_time).unwrap();
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
                         for npc in entities.iter().filter(|entity| entity.entity_type == ET_NPC) {
                             let drawn = draws.iter().any(|surface| surface.entity_num == npc.number);
                             let nodraw = npc.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0;
@@ -3039,7 +3222,7 @@ mod tests {
                             if active & (1 << FP_RAGE) != 0 { *state_counts.entry("FP_RAGE").or_insert(0) += 1; }
                             if active & (1 << FP_GRIP) != 0 { *state_counts.entry("FP_GRIP").or_insert(0) += 1; }
                         }
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
                         shell_surfaces += draws.iter().filter(|surface| surface.alpha_mode == DynamicModelAlphaMode::Additive && surface.vertices.len() > 50).count();
                         for request in presenter.drain_fx_requests() {
                             let key = match &request {
@@ -3096,7 +3279,7 @@ mod tests {
                         let npcs = entities.iter().filter(|entity| entity.entity_type == ET_NPC).collect::<Vec<_>>();
                         if npcs.is_empty() { continue; }
                         npc_frames += 1;
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
                         for npc in npcs {
                             if infos.len() < 3 {
                                 let info = game.npc_client_info(&npc.state).unwrap();
@@ -3168,7 +3351,7 @@ mod tests {
                         let again = presenter.load_model(&info).unwrap();
                         assert!(Arc::ptr_eq(&fallback, &again), "fallback assets must be reused");
                         let draws = presenter.present_snapshot_players(
-                            &entities, &game, &[], snapshot.server_time, None, None,
+                            &entities, &game, &[], snapshot.server_time, None, None, None,
                         );
                         assert!(draws.iter().any(|surface| surface.entity_num == 2
                             && !surface.vertices.is_empty() && !surface.indices.is_empty()));
@@ -3345,6 +3528,7 @@ pub(super) fn saber_name_is_removed(name: &str) -> bool {
     name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("remove")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn saber_blade_fx_request(
     origin: [f32; 3],
     direction: [f32; 3],
@@ -3352,6 +3536,14 @@ fn saber_blade_fx_request(
     radius: f32,
     color: i32,
     entity_alpha: f32,
+    entity_num: u16,
+    saber_num: u8,
+    blade_num: u8,
+    saber_move: i32,
+    torso_anim: i32,
+    saber_in_flight: bool,
+    trail_style: i32,
+    no_wall_marks: bool,
 ) -> Option<PlayerFxRequest> {
     if length < 0.5 || radius <= 0.0 {
         return None;
@@ -3363,5 +3555,13 @@ fn saber_blade_fx_request(
         radius,
         color,
         entity_alpha: entity_alpha.clamp(0.0, 1.0),
+        entity_num,
+        saber_num,
+        blade_num,
+        saber_move,
+        torso_anim,
+        saber_in_flight,
+        trail_style,
+        no_wall_marks,
     })
 }

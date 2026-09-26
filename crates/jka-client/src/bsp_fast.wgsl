@@ -27,6 +27,13 @@ struct Material {
 @group(1) @binding(10) var sky_dn: texture_2d<f32>;
 @group(1) @binding(11) var sky_sampler: sampler;
 
+const CLASSIC_FULLBRIGHT: u32 = 1u;
+const CLASSIC_VERTEX_LIGHT: u32 = 2u;
+const CLASSIC_LIGHTMAP_ONLY: u32 = 4u;
+const MATERIAL_EXPLICIT_LIGHTMAP: u32 = 8388608u;
+const MATERIAL_HAS_LIGHTMAP: u32 = 16777216u;
+const MATERIAL_OPAQUE_STAGE: u32 = 33554432u;
+
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
@@ -131,17 +138,31 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
     output.world_normal = surface_deformation_vertex_normal(
         input.position, input.normal, material.header.w, instance_index, true
     );
-    output.shell_kind = select(0u, 1u, instance_index != 0u);
+    // The fast pipeline intentionally exposes the camera uniform to the vertex
+    // stage only. Pack the three classic-lighting flags into the unused upper
+    // bits of the already-flat shell_kind varying rather than adding fragment
+    // camera visibility or another interpolator. Bit 0 remains shell_kind.
+    let shell_kind = select(0u, 1u, instance_index != 0u);
+    output.shell_kind = shell_kind | (camera.render_flags.z << 1u);
     output.shell_coverage = deformation.w;
     return output;
 }
 
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let shell_kind = input.shell_kind & 1u;
+    let classic_flags = input.shell_kind >> 1u;
     if (surface_deformation_should_discard(
-        input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy, true
+        input.world_position, material.header.w, input.world_normal, shell_kind, input.shell_coverage, input.clip_position.xy, true
     )) {
         discard;
     }
+    let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
+    let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
+    let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    let explicit_lightmap_stage = (material.header.z & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
+    let has_lightmap = (material.header.z & MATERIAL_HAS_LIGHTMAP) != 0u;
+    let opaque_stage = (material.header.z & MATERIAL_OPAQUE_STAGE) != 0u;
+
     var stage_color = material.color;
     if ((material.header.z & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
@@ -157,25 +178,56 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
 
-    var base = textureSample(base_texture, base_sampler, input.uv) * stage_color;
+    var source_sample = textureSample(base_texture, base_sampler, input.uv);
+
+    if (explicit_lightmap_stage) {
+        if (classic_fullbright || (classic_vertex_light && classic_lightmap_only)) {
+            source_sample = vec4<f32>(1.0);
+        } else if (classic_vertex_light) {
+            source_sample = vec4<f32>(input.color.rgb, source_sample.a);
+        }
+    }
+
+    if (classic_lightmap_only && has_lightmap
+        && !explicit_lightmap_stage
+        && (material.header.z & 2u) == 0u) {
+        if (opaque_stage) {
+            source_sample = vec4<f32>(1.0);
+            stage_color = vec4<f32>(1.0);
+        } else {
+            discard;
+        }
+    }
+
+    var base = source_sample * stage_color;
     if (material.params.x > 0.0 && base.a < material.params.x) {
         discard;
     }
 
     // Only the synthesized implicit material uses a single-pass
-    // base-texture Ã— lightmap path. Explicit JKA shader scripts render their
+    // base-texture × lightmap path. Explicit JKA shader scripts render their
     // `$lightmap` as its own ordered blend stage instead.
     if ((material.header.z & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
-        base = vec4<f32>(
-            base.rgb * textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb,
-            base.a
-        );
+        var lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+        if (classic_fullbright) {
+            lightmap_color = vec3<f32>(1.0);
+        } else if (classic_vertex_light) {
+            lightmap_color = select(input.color.rgb, vec3<f32>(1.0), classic_lightmap_only);
+        }
+        if (classic_lightmap_only) {
+            base = vec4<f32>(lightmap_color, base.a);
+        } else {
+            base = vec4<f32>(base.rgb * lightmap_color, base.a);
+        }
     }
-    // Cached static BSP AO only modulates the baked-light contribution.
-    // Explicit $lightmap stages use tcGen lightmap (header.x == 1); the synthesized
-    // one-pass material is identified by the modulate-lightmap bit. Dynamic lights
-    // added by the advanced shaders therefore remain unoccluded by this static cache.
-    if (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u) {
+
+    if (classic_lightmap_only && (material.header.z & 131072u) != 0u && !has_lightmap) {
+        base = vec4<f32>(select(input.color.rgb, vec3<f32>(1.0), classic_vertex_light), base.a);
+    }
+
+    // Cached static BSP AO only modulates the normal baked-light contribution.
+    if (classic_flags == 0u
+        && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
@@ -184,7 +236,7 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         input.world_normal,
         material.header.w,
         material.header.x,
-        input.shell_kind,
+        shell_kind,
         input.shell_coverage,
         base
     );

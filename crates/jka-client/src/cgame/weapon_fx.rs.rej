@@ -1,0 +1,435 @@
+diff a/crates/jka-client/src/cgame/weapon_fx.rs b/crates/jka-client/src/cgame/weapon_fx.rs	(rejected hunks)
+@@ -221,17 +221,17 @@ fn surface_ribbon(
+     Some((positions, uvs))
+ }
+ 
+-/// OpenJK CG_CreateSaberMarks texture projection. The stock rivet/glow images
+-/// are authored around UV 0.5,0.5; mapping a slash to 0..1 made short sampled
+-/// segments look like isolated dots. Keep the same centered projection scales
+-/// while lifting the polygon slightly because the dynamic FX path does not yet
+-/// carry q3 shader polygonOffset/depth bias.
++/// OpenJK CG_CreateSaberMarks texture projection for the unfragmented quad.
++/// The original renderer then clips this polygon with R_MarkFragments; this
++/// WGPU path still stores one quad, but its radius, cap extension and per-vertex
++/// UV jitter match the OpenJK source.
+ fn saber_mark_ribbon(
+     start: [f32; 3],
+     end: [f32; 3],
+     normal: [f32; 3],
+     half_width: f32,
+     normal_offset: f32,
++    rng: &mut Rng,
+ ) -> Option<([[f32; 3]; 4], [[f32; 2]; 4])> {
+     let delta = sub3(end, start);
+     let distance = length3(delta);
+@@ -258,17 +258,14 @@ fn saber_mark_ribbon(
+     ];
+     let positions = positions_unpushed.map(|point| add3(point, push));
+     let mid = scale3(add3(start, end), 0.5);
+-    // OpenJK randomizes these within 0.05..0.08 and 0.15..0.20. Midpoints
+-    // preserve the same visual frequency without introducing frame-rate RNG.
+-    let u_scale = 0.065;
+-    let v_scale = 0.175;
+-    let uvs = positions_unpushed.map(|point| {
++    let mut uvs = [[0.0; 2]; 4];
++    for (index, point) in positions_unpushed.iter().copied().enumerate() {
+         let d = sub3(point, mid);
+-        [
+-            0.5 + dot3(d, tangent) * u_scale,
+-            0.5 + dot3(d, side) * v_scale,
+-        ]
+-    });
++        uvs[index] = [
++            0.5 + dot3(d, tangent) * (0.05 + rng.flrand(0.0, 1.0) * 0.03),
++            0.5 + dot3(d, side) * (0.15 + rng.flrand(0.0, 1.0) * 0.05),
++        ];
++    }
+     Some((positions, uvs))
+ }
+ 
+@@ -407,15 +404,13 @@ struct SaberTrailSegment {
+ 
+ #[derive(Clone, Copy, Debug)]
+ struct SaberContactHistory {
++    /// OpenJK blade[].trail.haveOldPos: the previous presentation-frame wall
++    /// contact used to connect the next CG_CreateSaberMarks segment.
+     have_old_pos: bool,
+-    /// Previous *FX-rate* contact sample. Do not overwrite this every render
+-    /// frame or a capped cg_fxFPS produces tiny dot-sized mark fragments.
+     old_pos: [f32; 3],
+-    old_normal: [f32; 3],
+     last_time: i32,
+-    /// Next fixed-rate contact-FX sample time. Legacy JKA ignores this and
+-    /// samples every presentation frame, matching the original client.
+-    next_fx_sample_time: f64,
++    /// OpenJK blade[].hitWallDebounceTime. Only the sound is debounced; wall
++    /// traces, sparks and mark generation still run every presentation frame.
+     last_sound_time: i32,
+ }
+ 
+@@ -424,9 +419,7 @@ impl Default for SaberContactHistory {
+         Self {
+             have_old_pos: false,
+             old_pos: [0.0; 3],
+-            old_normal: [0.0, 1.0, 0.0],
+             last_time: i32::MIN / 2,
+-            next_fx_sample_time: f64::NEG_INFINITY,
+             last_sound_time: i32::MIN / 2,
+         }
+     }
+@@ -442,6 +435,9 @@ struct SaberWallMark {
+     drip_origin: [f32; 3],
+     drip_direction: [f32; 3],
+     drip_length: f32,
++    /// OpenJK persistent mSaberDamageGlow mark color. Legacy uses the exact
++    /// 215..255 / 96..128 / 0..15 ranges picked when the mark is created.
++    legacy_glow_rgba: [u8; 4],
+     enhanced: bool,
+ }
+ 
+@@ -473,10 +469,6 @@ pub struct WeaponFx {
+     immediate_draws: Vec<FxDraw>,
+     immediate_sounds: Vec<FxSound>,
+     immediate_lights: Vec<FxLight>,
+-    /// Temporary saber-mark diagnostics; throttled so a wall drag stays readable.
+-    saber_mark_debug: bool,
+-    last_saber_mark_debug_time: i32,
+-    last_saber_mark_render_debug_time: i32,
+     modern_sabers: bool,
+     saber_marks: SaberMarkMode,
+     collision_world: Option<CollisionWorld>,
+@@ -510,9 +502,6 @@ impl WeaponFx {
+             immediate_draws: Vec::new(),
+             immediate_sounds: Vec::new(),
+             immediate_lights: Vec::new(),
+-            saber_mark_debug: false,
+-            last_saber_mark_debug_time: i32::MIN / 2,
+-            last_saber_mark_render_debug_time: i32::MIN / 2,
+             modern_sabers: false,
+             saber_marks: SaberMarkMode::Legacy,
+             collision_world: None,
+@@ -547,15 +536,6 @@ impl WeaponFx {
+         }
+     }
+ 
+-    pub fn set_saber_mark_debug(&mut self, enabled: bool) {
+-        if self.saber_mark_debug != enabled {
+-            self.saber_mark_debug = enabled;
+-            self.last_saber_mark_debug_time = i32::MIN / 2;
+-            self.last_saber_mark_render_debug_time = i32::MIN / 2;
+-            println!("SABER MARK DEBUG: {}", if enabled { "ON" } else { "OFF" });
+-        }
+-    }
+-
+     /// Presentation-only collision clone used by the saber/world contact pass.
+     pub fn set_collision_world(&mut self, world: Option<CollisionWorld>) {
+         self.collision_world = world;
+@@ -789,23 +769,17 @@ impl WeaponFx {
+         length: f32,
+         no_wall_marks: bool,
+     ) -> f32 {
+-        // Off is a true quality/performance gate: preserve the previous blade
+-        // behavior with no per-blade collision work at all.
++        // Off remains a true quality/performance gate. Legacy otherwise follows
++        // OpenJK CG_AddSaberBlade: contact is presentation-frame driven and is
++        // deliberately independent of cg_fxFPS.
+         if matches!(self.saber_marks, SaberMarkMode::Off) || length < 0.5 {
+             self.saber_contact_history.remove(&key);
+             return length;
+         }
+         let direction = normalize3(direction);
+-        // OpenJK traces slightly beyond the rendered blade so damage/visuals do
+-        // not poke through the far side of a wall.
++        // OpenJK traces one unit beyond the rendered blade.
+         let end = madd3(origin, direction, length + 1.0);
+         let Some(world) = self.collision_world.as_mut() else {
+-            if self.saber_mark_debug
+-                && self.time.saturating_sub(self.last_saber_mark_debug_time) >= 250
+-            {
+-                println!("SABER MARK DEBUG contact: no collision world");
+-                self.last_saber_mark_debug_time = self.time;
+-            }
+             return length;
+         };
+         let hit = world.trace(TraceQuery {
+@@ -813,81 +787,52 @@ impl WeaponFx {
+             mins: [0.0; 3],
+             maxs: [0.0; 3],
+             end,
+-            pass_entity: i32::from(key.entity_num),
++            pass_entity: ENTITY_NONE,
+             mask: SABER_CONTACT_MASK,
+         });
+         if hit.fraction >= 1.0 {
+             if let Some(history) = self.saber_contact_history.get_mut(&key) {
++                // OpenJK clears trail.haveOldPos as soon as the blade is no
++                // longer impacting architecture.
+                 history.have_old_pos = false;
+                 history.last_time = self.time;
+-                history.next_fx_sample_time = f64::NEG_INFINITY;
+             }
+             return length;
+         }
+ 
+-        let clipped_length = (length * hit.fraction).max(0.1);
++        // OpenJK recomputes the visible length from the actual trace endpoint
++        // (the trace itself is saberLen + 1), rather than multiplying saberLen
++        // by trace.fraction.
++        let clipped_length = length3(sub3(hit.end, origin)).max(0.1);
+         let hit_normal = normalize3(hit.normal);
+-        let can_impact = hit.surface_flags & SURF_NOIMPACT == 0;
+-        let can_mark = can_impact
+-            && hit.surface_flags & SURF_NOMARKS == 0
+-            && hit.entity == ENTITY_WORLD
+-            && !no_wall_marks;
+         let previous = self.saber_contact_history.get(&key).copied().unwrap_or_default();
+         let mut next = previous;
+         next.last_time = self.time;
+ 
+-        // Saber contact generation uses the same cg_fxFPS setting as continuous
+-        // projectile FX. Legacy JKA (0) intentionally samples once per rendered
+-        // presentation, reproducing the original frame-rate-dependent behavior.
+-        let now = f64::from(self.time);
+-        let sample_due = if self.continuous_fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+-            true
+-        } else {
+-            now + f64::EPSILON >= previous.next_fx_sample_time
+-        };
+-
+-        let debug_due = self.saber_mark_debug
+-            && self.time.saturating_sub(self.last_saber_mark_debug_time) >= 250;
+-        let mut debug_distance = -1.0_f32;
+-        let mut debug_same_surface = false;
+-        let mut debug_mark_created = false;
+-
+-        if sample_due {
+-            if self.continuous_fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+-                next.next_fx_sample_time = now;
+-            } else {
+-                let period = 1000.0 / f64::from(self.continuous_fx_fps.max(1));
+-                let mut next_time = if previous.next_fx_sample_time.is_finite() {
+-                    previous.next_fx_sample_time + period
+-                } else {
+-                    now + period
+-                };
+-                // Do not burst missed contact samples after a hitch. One visible
+-                // segment connects the previous sampled contact to the newest.
+-                if next_time <= now {
+-                    let skipped = ((now - next_time) / period).floor() + 1.0;
+-                    next_time += skipped * period;
+-                }
+-                next.next_fx_sample_time = next_time;
+-            }
+-
+-            if !no_wall_marks && can_impact {
+-                self.play("sparks/spark_nosnd", hit.end, hit_normal);
+-            }
++        // SFL2_NO_WALL_MARKS suppresses both the wall sparks and marks. Sparks
++        // have no separate cadence in OpenJK; they are requested each contact
++        // presentation frame unless SURF_NOIMPACT is set.
++        if !no_wall_marks && hit.surface_flags & SURF_NOIMPACT == 0 {
++            self.play("sparks/spark_nosnd", hit.end, hit_normal);
++        }
+ 
+-            if can_mark && previous.have_old_pos {
+-                let segment = sub3(hit.end, previous.old_pos);
+-                let distance = length3(segment);
+-                let same_surface = dot3(previous.old_normal, hit_normal) > 0.50;
+-                debug_distance = distance;
+-                debug_same_surface = same_surface;
+-                if distance > 0.08 && distance < 96.0 && same_surface {
+-                    debug_mark_created = self.push_saber_wall_mark(previous.old_pos, hit.end, hit_normal);
++        if no_wall_marks {
++            next.have_old_pos = false;
++        } else if previous.have_old_pos {
++            // Our collision clone is static BSP/terrain, so ENTITY_WORLD is the
++            // architecture branch corresponding to OpenJK's WORLD/TERRAIN/
++            // EF_PERMANENT check. R_MarkFragments would reject NOMARKS faces;
++            // make that explicit until the mark-fragment projector is ported.
++            let architecture = hit.entity == ENTITY_WORLD;
++            if architecture {
++                if hit.surface_flags & SURF_NOMARKS == 0 {
++                    self.push_saber_wall_mark(previous.old_pos, hit.end, hit_normal);
+                 }
+-                // OpenJK's saberHitWallSoundDebounceTime is 100 ms. The check
+-                // occurs on an FX sample so cg_fxFPS also controls contact FX.
++                // This is the actual OpenJK debounce: only the wall-hit sound
++                // is rate-limited, to one random saberhitwall1..3 sound per
++                // 100 ms while contact continues. It is not first-touch-only.
+                 if self.time.saturating_sub(previous.last_sound_time) >= 100 {
+-                    let variant = 1 + (self.time.unsigned_abs() % 3);
++                    let variant = self.runner_rng.irand(1, 3);
+                     self.immediate_sounds.push(FxSound {
+                         origin: hit.end,
+                         qpath: format!("sound/weapons/saber/saberhitwall{variant}.wav"),
+@@ -895,28 +840,17 @@ impl WeaponFx {
+                     next.last_sound_time = self.time;
+                 }
+             }
+-
+-            // Crucial: oldPos in OpenJK is the prior mark sample. When we cap
+-            // contact FX, keeping overwriting it every render frame makes each
+-            // generated slash only one frame long, which looks like a dot and
+-            // leaves gaps. Advance it only when this FX-rate sample is emitted.
+-            next.have_old_pos = can_mark;
+-            next.old_pos = hit.end;
+-            next.old_normal = hit_normal;
++        } else {
++            // First contact only arms the connect-the-dots history. OpenJK does
++            // not create a slash or play saberhitwall until a subsequent frame.
++            next.have_old_pos = true;
+         }
+ 
+-        if debug_due {
+-            println!(
+-                "SABER MARK DEBUG contact: t={} ent={} saber={} blade={} hit=1 frac={:.4} hitEnt={} flags=0x{:08x} normal=({:.3},{:.3},{:.3}) impact={} mark={} noWall={} sample={} prev={} dist={:.3} samePlane={} created={} alive={}",
+-                self.time, key.entity_num, key.saber_num, key.blade_num, hit.fraction, hit.entity,
+-                hit.surface_flags as u32, hit_normal[0], hit_normal[1], hit_normal[2],
+-                can_impact, can_mark, no_wall_marks, sample_due, previous.have_old_pos,
+-                debug_distance, debug_same_surface, debug_mark_created, self.saber_wall_marks.len()
+-            );
+-            self.last_saber_mark_debug_time = self.time;
+-        }
++        // OpenJK stashes the newest contact every hit frame. This is intentionally
++        // not tied to cg_fxFPS or to the 100 ms sound debounce.
++        next.old_pos = hit.end;
+ 
+-        if matches!(self.saber_marks, SaberMarkMode::Enhanced) && can_impact {
++        if matches!(self.saber_marks, SaberMarkMode::Enhanced) && hit.surface_flags & SURF_NOIMPACT == 0 {
+             let flicker = 0.90 + ((self.time as f32 * 0.031).sin() * 0.10);
+             self.immediate_lights.push(FxLight {
+                 origin: madd3(hit.end, hit_normal, 0.8),
+@@ -929,15 +863,22 @@ impl WeaponFx {
+         clipped_length
+     }
+ 
+-    fn push_saber_wall_mark(&mut self, start: [f32; 3], end: [f32; 3], normal: [f32; 3]) -> bool {
++    fn push_saber_wall_mark(&mut self, start: [f32; 3], end: [f32; 3], normal: [f32; 3]) {
+         let enhanced = matches!(self.saber_marks, SaberMarkMode::Enhanced);
+         let radius = if enhanced { 1.15 } else { 0.65 };
+-        // Stock marks rely on shader polygonOffset. Dynamic FX surfaces do not
+-        // carry that state yet, so use a small world-normal lift to avoid depth
+-        // fighting while keeping the OpenJK 0.65 legacy radius.
+-        let mark_offset = if enhanced { 0.30 } else { 0.24 };
+-        let Some((positions, uvs)) = saber_mark_ribbon(start, end, normal, radius, mark_offset) else {
+-            return false;
++        // R_MarkFragments places OpenJK marks on the actual world polygon. Our
++        // current dynamic FX quad needs a very small lift until that projector
++        // is ported, otherwise equal-depth fragments z-fight.
++        let mark_offset = if enhanced { 0.12 } else { 0.06 };
++        let Some((positions, uvs)) = saber_mark_ribbon(
++            start,
++            end,
++            normal,
++            radius,
++            mark_offset,
++            &mut self.runner_rng,
++        ) else {
++            return;
+         };
+         let center = scale3(add3(start, end), 0.5);
+         let gravity = [0.0, 0.0, -1.0];
+@@ -955,6 +896,15 @@ impl WeaponFx {
+         } else {
+             0.0
+         };
++        // CG_CreateSaberMarks persistent glow color ranges. Blue and alpha use
++        // the same random 0..15 value in OpenJK.
++        let glow_low = self.runner_rng.flrand(0.0, 1.0);
++        let legacy_glow_rgba = [
++            (215.0 + self.runner_rng.flrand(0.0, 1.0) * 40.0) as u8,
++            (96.0 + self.runner_rng.flrand(0.0, 1.0) * 32.0) as u8,
++            (glow_low * 15.0) as u8,
++            (glow_low * 15.0) as u8,
++        ];
+         self.saber_wall_marks.push(SaberWallMark {
+             start_time: self.time,
+             end_time: self.time
+@@ -969,19 +919,17 @@ impl WeaponFx {
+             drip_origin: madd3(center, normal, 0.08),
+             drip_direction,
+             drip_length,
++            legacy_glow_rgba,
+             enhanced,
+         });
+         if self.saber_wall_marks.len() > SABER_MARK_MAX {
+             let excess = self.saber_wall_marks.len() - SABER_MARK_MAX;
+             self.saber_wall_marks.drain(..excess);
+         }
+-        true
+     }
+ 
+     fn append_saber_wall_marks(&mut self, frame: &mut FxFrame) {
+         let time = self.time;
+-        let draws_before = frame.draws.len();
+-        let marks_before = self.saber_wall_marks.len();
+         let mut retained = Vec::with_capacity(self.saber_wall_marks.len());
+         for mark in self.saber_wall_marks.drain(..) {
+             if time >= mark.end_time {
+@@ -993,11 +941,13 @@ impl WeaponFx {
+             } else {
+                 1.0
+             };
+-            let burn = (255.0 * burn_fade.clamp(0.0, 1.0)).round() as u8;
++            let burn_alpha = (255.0 * burn_fade.clamp(0.0, 1.0)).round() as u8;
+             frame.draws.push(FxDraw::Quad {
+                 positions: mark.positions,
+                 uvs: mark.uvs,
+-                rgba: [burn, burn, burn, burn],
++                // OpenJK burn marks keep RGB white and use alphaFade=true; only
++                // alpha changes during the final MARK_FADE_TIME second.
++                rgba: [255, 255, 255, burn_alpha],
+                 shader: "gfx/damage/rivetmark".to_owned(),
+             });
+ 
+@@ -1019,22 +969,25 @@ impl WeaponFx {
+                         255,
+                     ]
+                 } else {
++                    // OpenJK backdates the glow mark by 8500 ms. That gives it
++                    // 500 ms at its generated color, then 1000 ms of RGB fade
++                    // before the 10 s mark allocator expires it.
+                     let fade = if age <= 500 {
+                         1.0
+                     } else {
+                         1.0 - (age - 500) as f32 / (glow_lifetime - 500).max(1) as f32
+                     };
+                     [
+-                        (235.0 * fade.max(0.0)) as u8,
+-                        (118.0 * fade.max(0.0)) as u8,
+-                        (12.0 * fade.max(0.0)) as u8,
+-                        255,
++                        (f32::from(mark.legacy_glow_rgba[0]) * fade.max(0.0)) as u8,
++                        (f32::from(mark.legacy_glow_rgba[1]) * fade.max(0.0)) as u8,
++                        (f32::from(mark.legacy_glow_rgba[2]) * fade.max(0.0)) as u8,
++                        mark.legacy_glow_rgba[3],
+                     ]
+                 };
+                 if mark.enhanced {
+                     let start = scale3(add3(mark.positions[0], mark.positions[3]), 0.5);
+                     let end = scale3(add3(mark.positions[1], mark.positions[2]), 0.5);
+-                    if let Some((inner, inner_uvs)) = saber_mark_ribbon(start, end, mark.normal, 0.52, 0.10) {
++                    if let Some((inner, inner_uvs)) = surface_ribbon(start, end, mark.normal, 0.52, 0.10) {
+                         frame.draws.push(FxDraw::Quad {
+                             positions: inner,
+                             uvs: inner_uvs,
+@@ -1091,18 +1044,9 @@ impl WeaponFx {
+             retained.push(mark);
+         }
+         self.saber_wall_marks = retained;
+-        if self.saber_mark_debug
+-            && marks_before > 0
+-            && time.saturating_sub(self.last_saber_mark_render_debug_time) >= 500
+-        {
+-            println!(
+-                "SABER MARK DEBUG render: t={} marksBefore={} marksAlive={} drawsAdded={} frameDraws={}",
+-                time, marks_before, self.saber_wall_marks.len(), frame.draws.len().saturating_sub(draws_before), frame.draws.len()
+-            );
+-            self.last_saber_mark_render_debug_time = time;
+-        }
+     }
+ 
++
+     #[allow(clippy::too_many_arguments)]
+     fn saber_trail(
+         &mut self,

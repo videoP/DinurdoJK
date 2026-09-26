@@ -11,6 +11,10 @@ struct CameraUniform {
     camera_forward: vec4<f32>,
 };
 
+// Pipeline-specialized: false compiles the self-applied Legacy fog out entirely.
+// Rebuilt only when FogSystem::legacy_self_fog toggles, never checked per frame.
+override ENABLE_LEGACY_FOG: bool = false;
+
 struct GrassGlobals {
     sun_direction_strength: vec4<f32>,
     sun_color: vec4<f32>,
@@ -19,6 +23,10 @@ struct GrassGlobals {
     sss_color: vec4<f32>,
     params: vec4<f32>,
     weather_wind: vec4<f32>,
+    // Self-applied Legacy fog: linear RGB, depthForOpaque.
+    legacy_fog_color_depth: vec4<f32>,
+    // x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    legacy_fog_params: vec4<f32>,
 };
 
 struct ShadowSettings {
@@ -289,16 +297,23 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let instance = load_grass_instance(input.blade_index);
     let world_scale = grass.params.x;
     let clumping_factor = grass.params.y;
-    let prevailing_world_angle = grass.params.z;
-    let atmospheric_wind_dir = grass.weather_wind.xy;
-    let atmospheric_wind_speed = max(grass.weather_wind.z, 0.0);
-    let wind_speed = max(grass.weather_wind.w, 0.0);
+    let time = camera.camera_pos_time.w;
+    let gust_wave = sin(time * 0.83) * 0.65 + sin(time * 1.71 + 1.9) * 0.35;
+    let shift_wave = sin(time * 0.13) * 0.7 + sin(time * 0.047 + 2.4) * 0.3;
+    let base_world_angle = grass.params.z;
+    let base_wind_dir = vec2<f32>(cos(base_world_angle), sin(base_world_angle));
+    let prevailing_world_angle = base_world_angle + grass.weather_wind.z * shift_wave;
+    let gust_scale = max(0.0, 1.0 + grass.weather_wind.y * gust_wave);
+    let wind_speed = max(grass.weather_wind.w, 0.0) * gust_scale;
+    // Keep the shared Perlin field on the base transport path. Gust/veer change
+    // the instantaneous bend direction and strength below, but never multiply a
+    // changing heading by total uptime (which would make the noise field jump).
+    let wind_advection_offset = base_wind_dir * max(grass.weather_wind.x, 0.0) * time;
     let reference_sprite_height = max(grass.params.w, 0.0001);
 
     let root_world = instance.position;
     let root_m3 = root_world * world_scale;
     let camera_m = camera.camera_pos_time.xyz * world_scale;
-    let time = camera.camera_pos_time.w;
     let height_factor = 1.0 - input.uv.y;
 
     let hash0 = hash12(root_m3.xz);
@@ -325,14 +340,14 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let vertex_model = vertex_m;
 
     // --- WIND ---
-    // The volumetric-cloud setting is the prevailing atmospheric wind. The exact
-    // GodotGrass noise texture adds only broad local direction/gust variance, and
-    // the whole field advects at the full cloud speed so every weather effect sees
+    // Weather is the prevailing atmospheric wind. The exact GodotGrass noise
+    // texture adds only broad local direction/gust variance, and the whole field
+    // follows the continuously integrated shared wind so every weather effect sees
     // the same gust at the same world location/time. Grass responds to 20% of that
     // air speed (prepared on the CPU in grass.weather_wind.w).
     let crushed_factor = 1.0;
     let turn_angle_base = (mix(-0.15, 0.15, hash0) + clump2 * clumping_factor) * TAU;
-    let advected_root = root_m3.xz - atmospheric_wind_dir * atmospheric_wind_speed * time;
+    let advected_root = root_m3.xz - wind_advection_offset;
     let direction_noise = textureSampleLevel(
         wind_noise,
         noise_sampler,
@@ -341,7 +356,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     ).x;
     let local_world_angle = prevailing_world_angle + (direction_noise * 2.0 - 1.0) * (PI / 6.0);
     // Grass' authored turn angle uses +Z at zero, while weather direction uses
-    // +X at zero like the cloud shader. Convert between those conventions.
+    // +X at zero like the atmospheric shaders. Convert between those conventions.
     let wind_direction = 0.5 * PI - local_world_angle;
     var wind_strength = mix(
         0.25,
@@ -360,7 +375,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let bend_angle_base = mix(0.12, 0.25, hash1 + height_offset * 0.1) * PI * height_factor;
     let turbulence_time = time + height_factor * height_factor * 0.25;
     let turbulence_root = root_m3.xz
-        - atmospheric_wind_dir * atmospheric_wind_speed * turbulence_time;
+        - base_wind_dir * max(grass.weather_wind.x, 0.0) * turbulence_time;
     var wind_strength_turbulence = mix(
         0.25,
         1.0,
@@ -428,6 +443,35 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.baked_light = instance.baked_light.rgb;
     out.ground_tint = instance.ground_tint;
     return out;
+}
+
+// Legacy fog: procedural grass is not a BSP material stage, so it fogs itself
+// with the same curves as bsp.wgsl legacy_fog_color_amount (see
+// FogSystem::legacy_self_fog). Legacy 1 authored global fog is instead composited
+// in post over the grass using the ground depth behind it.
+fn apply_grass_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
+    if (!ENABLE_LEGACY_FOG) {
+        return rgb;
+    }
+    let mode = grass.legacy_fog_params.x;
+    if (mode < 0.5) {
+        return rgb;
+    }
+    let authored_depth = max(grass.legacy_fog_color_depth.a, 0.001);
+    let scale = grass.legacy_fog_params.y;
+    var amount = 0.0;
+    if (mode < 1.5) {
+        let forward_distance = max(
+            dot(world_position - camera.camera_pos_time.xyz, normalize(camera.camera_forward.xyz)),
+            0.0
+        );
+        let scaled = forward_distance / authored_depth * scale;
+        amount = 1.0 - exp(-5.5412635 * scaled * scaled);
+    } else {
+        let radial = distance(world_position, camera.camera_pos_time.xyz) / authored_depth;
+        amount = 1.0 - exp(-radial * scale * 0.26);
+    }
+    return mix(rgb, grass.legacy_fog_color_depth.rgb, clamp(amount, 0.0, 1.0));
 }
 
 @fragment
@@ -537,5 +581,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let ambient = baked_tint * ambient_strength;
 
     let lit = albedo * (ambient + direct) + edge_transmission;
-    return vec4<f32>(lit, 1.0);
+    return vec4<f32>(apply_grass_legacy_fog(lit, input.world_position), 1.0);
 }

@@ -3,17 +3,52 @@
 //! OpenJK concatenates every visible `ext_data/sabers/*.sab` file into one
 //! COM-parsed token stream and applies `WP_SaberSetDefaults` before reading a
 //! named block.  This module keeps the subset needed by the Rust client:
-//! animation speed plus the authored hilt/blade presentation fields.
+//! animation speed plus authored hilt/blade and BG/Pmove gameplay fields.
 
 use std::collections::BTreeMap;
 
-use crate::pk3::AssetSearchPath;
+use crate::{animation::animation_index, pk3::AssetSearchPath};
 
 const SABER_DIRECTORY: &str = "ext_data/sabers/";
 const SABER_EXTENSION: &str = ".sab";
 const MAX_SABER_DATA_SIZE: usize = 0x80000;
 const MAX_SABER_BLADES: usize = 8;
 const DEFAULT_SABER_MODEL: &str = "models/weapons2/saber_reborn/saber_w.glm";
+
+// OpenJK saber_styles_t values.
+const SS_NONE: i32 = 0;
+const SS_FAST: i32 = 1;
+const SS_MEDIUM: i32 = 2;
+const SS_STRONG: i32 = 3;
+const SS_DESANN: i32 = 4;
+const SS_TAVION: i32 = 5;
+const SS_DUAL: i32 = 6;
+const SS_STAFF: i32 = 7;
+const SS_NUM_SABER_STYLES: i32 = 8;
+
+// OpenJK SFL_* bits from bg_public.h. Keep the numeric values here because
+// .sab files are parsed by jka-assets while the native movement crate owns C.
+pub const SFL_NOT_LOCKABLE: i32 = 1 << 0;
+pub const SFL_NOT_THROWABLE: i32 = 1 << 1;
+pub const SFL_NOT_DISARMABLE: i32 = 1 << 2;
+pub const SFL_NOT_ACTIVE_BLOCKING: i32 = 1 << 3;
+pub const SFL_TWO_HANDED: i32 = 1 << 4;
+pub const SFL_SINGLE_BLADE_THROWABLE: i32 = 1 << 5;
+pub const SFL_RETURN_DAMAGE: i32 = 1 << 6;
+pub const SFL_BOUNCE_ON_WALLS: i32 = 1 << 8;
+pub const SFL_BOLT_TO_WRIST: i32 = 1 << 9;
+pub const SFL_NO_PULL_ATTACK: i32 = 1 << 10;
+pub const SFL_NO_BACK_ATTACK: i32 = 1 << 11;
+pub const SFL_NO_STABDOWN: i32 = 1 << 12;
+pub const SFL_NO_WALL_RUNS: i32 = 1 << 13;
+pub const SFL_NO_WALL_FLIPS: i32 = 1 << 14;
+pub const SFL_NO_WALL_GRAB: i32 = 1 << 15;
+pub const SFL_NO_ROLLS: i32 = 1 << 16;
+pub const SFL_NO_FLIPS: i32 = 1 << 17;
+pub const SFL_NO_CARTWHEELS: i32 = 1 << 18;
+pub const SFL_NO_KICKS: i32 = 1 << 19;
+pub const SFL_NO_MIRROR_ATTACKS: i32 = 1 << 20;
+pub const SFL_NO_ROLL_STAB: i32 = 1 << 21;
 
 #[derive(Debug, Clone, Default)]
 pub struct SaberAnimationScales {
@@ -61,6 +96,19 @@ pub fn translate_saber_color(name: &str) -> i32 {
     }
 }
 
+fn translate_saber_style(name: &str) -> i32 {
+    match name.to_ascii_lowercase().as_str() {
+        "fast" => SS_FAST,
+        "medium" => SS_MEDIUM,
+        "strong" => SS_STRONG,
+        "desann" => SS_DESANN,
+        "tavion" => SS_TAVION,
+        "dual" => SS_DUAL,
+        "staff" => SS_STAFF,
+        _ => SS_NONE,
+    }
+}
+
 impl Default for SaberBladeDefinition {
     fn default() -> Self {
         // OpenJK gameplay defaults are 32/3.  Individual JA .sab definitions
@@ -85,6 +133,23 @@ pub struct SaberDefinition {
     /// This selects per-blade secondary properties; runtime blade activation
     /// (for example half-holstered staff) is controlled by saberHolstered.
     pub blade_style2_start: usize,
+    /// OpenJK saber trail style: 0 = normal saber blur, 1 = sword/motion trail,
+    /// >1 = no trail. Secondary style follows bladeStyle2Start.
+    pub trail_style: i32,
+    pub trail_style2: i32,
+    /// OpenJK SFL2_NO_WALL_MARKS / SFL2_NO_WALL_MARKS2 equivalents. These
+    /// suppress wall sparks/marks for the primary/secondary blade style.
+    pub no_wall_marks: bool,
+    pub no_wall_marks2: bool,
+    /// OpenJK saberInfo_t gameplay fields consumed by shared BG/Pmove.
+    pub move_speed_scale: f32,
+    pub anim_speed_scale: f32,
+    pub styles_learned: i32,
+    pub styles_forbidden: i32,
+    pub saber_flags: i32,
+    pub ready_anim: i32,
+    pub draw_anim: i32,
+    pub putaway_anim: i32,
     /// SFL_RETURN_DAMAGE: retain angular motion while the saber returns.
     pub return_damage: bool,
     /// `soundLoop`: the hum CGame adds as a looping sound while a blade is lit.
@@ -104,6 +169,18 @@ impl SaberDefinition {
             num_blades: 1,
             blades: vec![SaberBladeDefinition::default()],
             blade_style2_start: 0,
+            trail_style: 0,
+            trail_style2: 0,
+            no_wall_marks: false,
+            no_wall_marks2: false,
+            move_speed_scale: 1.0,
+            anim_speed_scale: 1.0,
+            styles_learned: 0,
+            styles_forbidden: 0,
+            saber_flags: 0,
+            ready_anim: -1,
+            draw_anim: -1,
+            putaway_anim: -1,
             return_damage: false,
             // OpenJK MP WP_SaberSetDefaults.
             sound_loop: "sound/weapons/saber/saberhum3.wav".to_owned(),
@@ -235,7 +312,93 @@ fn parse_saber_file(
                         if let Ok(parsed) = value.parse::<f32>() {
                             if parsed.is_finite() {
                                 anim_speed_scale = parsed;
+                                definition.anim_speed_scale = parsed;
                             }
+                        }
+                    }
+                }
+                "movespeedscale" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Ok(parsed) = value.parse::<f32>() {
+                            if parsed.is_finite() {
+                                definition.move_speed_scale = parsed;
+                            }
+                        }
+                    }
+                }
+                "readyanim" | "drawanim" | "putawayanim" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Some(index) = animation_index(&value) {
+                            let index = index as i32;
+                            match lower.as_str() {
+                                "readyanim" => definition.ready_anim = index,
+                                "drawanim" => definition.draw_anim = index,
+                                "putawayanim" => definition.putaway_anim = index,
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
+                "saberstyle" => {
+                    if let Some(value) = parser.token(false)? {
+                        let style = translate_saber_style(&value);
+                        definition.styles_learned = 1 << style;
+                        definition.styles_forbidden = 0;
+                        for other in (SS_NONE + 1)..SS_NUM_SABER_STYLES {
+                            if other != style {
+                                definition.styles_forbidden |= 1 << other;
+                            }
+                        }
+                    }
+                }
+                "saberstylelearned" => {
+                    if let Some(value) = parser.token(false)? {
+                        definition.styles_learned |= 1 << translate_saber_style(&value);
+                    }
+                }
+                "saberstyleforbidden" => {
+                    if let Some(value) = parser.token(false)? {
+                        definition.styles_forbidden |= 1 << translate_saber_style(&value);
+                    }
+                }
+                "lockable" | "throwable" | "disarmable" | "blocking" => {
+                    if let Some(value) = parser.token(false)? {
+                        if value.parse::<i32>().ok() == Some(0) {
+                            definition.saber_flags |= match lower.as_str() {
+                                "lockable" => SFL_NOT_LOCKABLE,
+                                "throwable" => SFL_NOT_THROWABLE,
+                                "disarmable" => SFL_NOT_DISARMABLE,
+                                "blocking" => SFL_NOT_ACTIVE_BLOCKING,
+                                _ => unreachable!(),
+                            };
+                        }
+                    }
+                }
+                "twohanded" | "singlebladethrowable" | "bounceonwalls" | "bolttowrist"
+                | "norollstab" | "nopullattack" | "nobackattack" | "nostabdown"
+                | "nowallruns" | "nowallflips" | "nowallgrab" | "norolls"
+                | "noflips" | "nocartwheels" | "nokicks" | "nomirrorattacks" => {
+                    if let Some(value) = parser.token(false)? {
+                        if matches!(value.parse::<i32>(), Ok(value) if value != 0) {
+                            definition.saber_flags |= match lower.as_str() {
+                                "twohanded" => SFL_TWO_HANDED,
+                                "singlebladethrowable" => SFL_SINGLE_BLADE_THROWABLE,
+                                "bounceonwalls" => SFL_BOUNCE_ON_WALLS,
+                                "bolttowrist" => SFL_BOLT_TO_WRIST,
+                                "norollstab" => SFL_NO_ROLL_STAB,
+                                "nopullattack" => SFL_NO_PULL_ATTACK,
+                                "nobackattack" => SFL_NO_BACK_ATTACK,
+                                "nostabdown" => SFL_NO_STABDOWN,
+                                "nowallruns" => SFL_NO_WALL_RUNS,
+                                "nowallflips" => SFL_NO_WALL_FLIPS,
+                                "nowallgrab" => SFL_NO_WALL_GRAB,
+                                "norolls" => SFL_NO_ROLLS,
+                                "noflips" => SFL_NO_FLIPS,
+                                "nocartwheels" => SFL_NO_CARTWHEELS,
+                                "nokicks" => SFL_NO_KICKS,
+                                "nomirrorattacks" => SFL_NO_MIRROR_ATTACKS,
+                                _ => unreachable!(),
+                            };
                         }
                     }
                 }
@@ -267,6 +430,30 @@ fn parse_saber_file(
                         }
                     }
                 }
+                "trailstyle" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Ok(parsed) = value.parse::<i32>() {
+                            definition.trail_style = parsed.max(0);
+                        }
+                    }
+                }
+                "trailstyle2" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Ok(parsed) = value.parse::<i32>() {
+                            definition.trail_style2 = parsed.max(0);
+                        }
+                    }
+                }
+                "nowallmarks" | "nowallmarks2" => {
+                    if let Some(value) = parser.token(false)? {
+                        let enabled = matches!(value.parse::<i32>(), Ok(value) if value != 0);
+                        if lower == "nowallmarks2" {
+                            definition.no_wall_marks2 = enabled;
+                        } else {
+                            definition.no_wall_marks = enabled;
+                        }
+                    }
+                }
                 "soundloop" => {
                     if let Some(value) = parser.token(false)? {
                         if !value.is_empty() {
@@ -292,6 +479,9 @@ fn parse_saber_file(
                         if let Ok(parsed) = value.parse::<i32>() {
                             // OpenJK sets this flag when nonzero; zero does not clear it.
                             definition.return_damage |= parsed != 0;
+                            if parsed != 0 {
+                                definition.saber_flags |= SFL_RETURN_DAMAGE;
+                            }
                         }
                     }
                 }
@@ -497,12 +687,22 @@ mod tests {
                 single_1 {
                     name "Training Saber"
                     animSpeedScale 1.25
+                    moveSpeedScale 0.85
+                    readyAnim BOTH_SABERFAST_STANCE
+                    drawAnim BOTH_STAND2
+                    putawayAnim BOTH_STAND2
+                    saberStyleLearned tavion
+                    saberStyleForbidden strong
+                    noCartwheels 1
+                    noRolls 1
                     saberModel models/weapons2/saber/saber_w.glm
                     numBlades 2
                     saberLength 40
                     saberLength2 28
                     saberRadius 3.5
                     bladeStyle2Start 1
+                    trailStyle 1
+                    trailStyle2 2
                     returnDamage 1
                     returnDamage 0
                     soundLoop "sound\weapons\saber\saberhum4.wav"
@@ -525,11 +725,22 @@ mod tests {
         assert_eq!(set.get("DEFAULTISH"), 1.0);
         assert_eq!(set.get("missing"), 1.0);
         let def = defs.get("single_1").unwrap();
+        assert_eq!(def.anim_speed_scale, 1.25);
+        assert_eq!(def.move_speed_scale, 0.85);
+        assert_eq!(def.ready_anim, animation_index("BOTH_SABERFAST_STANCE").unwrap() as i32);
+        assert_eq!(def.draw_anim, animation_index("BOTH_STAND2").unwrap() as i32);
+        assert_eq!(def.putaway_anim, animation_index("BOTH_STAND2").unwrap() as i32);
+        assert_ne!(def.styles_learned & (1 << SS_TAVION), 0);
+        assert_ne!(def.styles_forbidden & (1 << SS_STRONG), 0);
+        assert_ne!(def.saber_flags & SFL_NO_CARTWHEELS, 0);
+        assert_ne!(def.saber_flags & SFL_NO_ROLLS, 0);
+        assert_ne!(def.saber_flags & SFL_RETURN_DAMAGE, 0);
         assert_eq!(def.num_blades, 2);
         assert_eq!(def.blade(0).length, 40.0);
         assert_eq!(def.blade(1).length, 28.0);
         assert_eq!(def.blade(0).radius, 3.5);
         assert_eq!(def.blade_style2_start, 1);
+        assert_eq!((def.trail_style, def.trail_style2), (1, 2));
         assert!(def.return_damage);
         assert!(!defs.get("defaultish").unwrap().return_damage);
         assert_eq!(def.sound_loop, "sound/weapons/saber/saberhum4.wav");

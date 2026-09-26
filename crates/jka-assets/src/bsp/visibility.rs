@@ -12,6 +12,7 @@ pub struct Visibility {
     nodes: Vec<Node>,
     planes: Vec<Plane>,
     leaves: Vec<i32>,
+    leaf_areas: Vec<i32>,
     pub surface_clusters: Vec<Vec<usize>>,
     /// BSP portal-area membership for each surface. Bit N means the surface is
     /// referenced by at least one non-solid leaf in area N. JKA RBSP limits
@@ -59,6 +60,7 @@ impl Visibility {
         let mut surface_clusters = vec![Vec::new(); surfaces];
         let mut surface_area_masks = vec![[0_u64; 4]; surfaces];
         let mut leaf_clusters = Vec::new();
+        let mut leaf_areas = Vec::new();
         for row in leaves.as_chunks::<48>().0 {
             let cluster = int(row, 0);
             let area = int(row, 4);
@@ -84,6 +86,7 @@ impl Visibility {
                 }
             }
             leaf_clusters.push(cluster);
+            leaf_areas.push(area);
         }
         for clusters in &mut surface_clusters {
             clusters.sort_unstable();
@@ -137,6 +140,7 @@ impl Visibility {
             nodes: parsed,
             planes: planes.to_vec(),
             leaves: leaf_clusters,
+            leaf_areas,
             surface_clusters,
             surface_area_masks,
             clusters,
@@ -144,14 +148,14 @@ impl Visibility {
             bits: vis[8..].to_vec(),
         }))
     }
-    pub fn cluster_at(&self, point: [f32; 3]) -> Option<usize> {
+    fn leaf_at(&self, point: [f32; 3]) -> Option<usize> {
         if !point.iter().all(|v| v.is_finite()) {
             return None;
         }
         let mut node = 0i32;
         for _ in 0..=self.nodes.len() {
             if node < 0 {
-                return usize::try_from(self.leaves[-(node + 1) as usize]).ok();
+                return Some(-(node + 1) as usize);
             }
             let record = &self.nodes[node as usize];
             let plane = self.planes[record.plane];
@@ -159,6 +163,17 @@ impl Visibility {
             node = record.children[usize::from(distance < 0.0)];
         }
         None
+    }
+
+    pub fn cluster_at(&self, point: [f32; 3]) -> Option<usize> {
+        self.leaf_at(point)
+            .and_then(|leaf| usize::try_from(self.leaves[leaf]).ok())
+    }
+
+    /// BSP portal area containing `point`, when the leaf is assigned to one.
+    pub fn area_at(&self, point: [f32; 3]) -> Option<usize> {
+        self.leaf_at(point)
+            .and_then(|leaf| usize::try_from(self.leaf_areas[leaf]).ok())
     }
     /// Missing/invalid source or unassigned surfaces conservatively remain visible.
     pub fn visible(&self, from: Option<usize>, targets: &[usize]) -> bool {

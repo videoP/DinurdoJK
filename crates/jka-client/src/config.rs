@@ -1,13 +1,14 @@
 use crate::camera::{ThirdPersonSettings, DEFAULT_CG_FOV, MAX_CG_FOV, MIN_CG_FOV};
 use crate::player::{LocalPresentationSettings, MouseInputSettings};
+use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::ui::{
     CloudRenderResolution, CloudType, ColorLutPreset, DofQuality, DynamicLightsMode,
     DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
     CrosshairSettings, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
     MovementKeysSettings, StrafeHelperSettings,
-    PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter,
+    PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter,
     VideoSettings, VsyncMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_THICKNESS_MAX,
-    CLOUD_THICKNESS_MIN, CLOUD_WIND_SPEED_MAX, MAX_DISTANCE_CULL_SCALE, MAX_FOG_STRENGTH,
+    CLOUD_THICKNESS_MIN, MAX_DISTANCE_CULL_SCALE, MAX_FOG_STRENGTH,
 };
 use std::{fs, path::Path};
 
@@ -22,6 +23,9 @@ const PHYSICS_MSEC_MAX: u32 = 33;
 pub struct ClientPresentationSettings {
     pub third_person: ThirdPersonSettings,
     pub first_person_lightsaber: bool,
+    /// OpenJK cg_saberTrail: 0 disables saber swing trails, 1 is normal,
+    /// 2 requests the legacy special/high-frequency mode.
+    pub saber_trail: i32,
     pub smoothing: LocalPresentationSettings,
     pub mouse: MouseInputSettings,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
@@ -49,6 +53,10 @@ pub struct AudioSettings {
     /// Master gate for Valve Steam Audio integration. Off preserves the legacy
     /// OpenJK-compatible mixer and skips all acoustic scene/bake preparation.
     pub steam_audio: bool,
+    /// Live Steam Audio HRTF rendering for positional sounds.
+    pub steam_audio_binaural: bool,
+    /// Live direct-path Steam Audio occlusion and transmission.
+    pub steam_audio_environmental: bool,
 }
 
 impl Default for AudioSettings {
@@ -61,6 +69,8 @@ impl Default for AudioSettings {
             separation: 0.5,
             mute_when_unfocused: true,
             steam_audio: false,
+            steam_audio_binaural: true,
+            steam_audio_environmental: true,
         }
     }
 }
@@ -117,6 +127,12 @@ pub fn load_audio_settings(primary: &Path, fallback: Option<&Path>) -> AudioSett
             "s_steamaudio" => {
                 settings.steam_audio = parse_bool(value).unwrap_or(settings.steam_audio)
             }
+            "s_steamaudiobinaural" => {
+                settings.steam_audio_binaural = parse_bool(value).unwrap_or(settings.steam_audio_binaural)
+            }
+            "s_steamaudioenvironmental" => {
+                settings.steam_audio_environmental = parse_bool(value).unwrap_or(settings.steam_audio_environmental)
+            }
             _ => {}
         }
     }
@@ -128,6 +144,7 @@ impl Default for ClientPresentationSettings {
         Self {
             third_person: ThirdPersonSettings::default(),
             first_person_lightsaber: true,
+            saber_trail: 1,
             smoothing: LocalPresentationSettings::default(),
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
@@ -279,6 +296,14 @@ pub fn load_client_presentation_settings(
                 settings.first_person_lightsaber =
                     parse_bool(value).unwrap_or(settings.first_person_lightsaber)
             }
+            "cg_sabertrail" => {
+                settings.saber_trail = value
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .map(|value| value.clamp(0, 2))
+                    .unwrap_or(settings.saber_trail)
+            }
             "cg_smoothplayerorigin" => {
                 settings.smoothing.smooth_player_origin =
                     parse_bool(value).unwrap_or(settings.smoothing.smooth_player_origin)
@@ -355,8 +380,10 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
     let mut pvs_mode = None;
     let mut anisotropy = None;
     let mut tone_mapping_seen = false;
-    let mut dynamic_lights_mode_seen = false;
     let mut dynamic_shadows_mode_seen = false;
+    let mut weather_wind_explicit = false;
+    let mut legacy_cloud_wind_speed_seen = false;
+    let mut legacy_cloud_wind_direction_seen = false;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
@@ -453,6 +480,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "com_maxfps" => {
                 settings.fps_cap = normalize_fps_cap(value, settings.fps_cap);
+            }
+            "cg_fxfps" => {
+                settings.fx_fps = normalize_fx_fps(value, settings.fx_fps);
             }
             "cg_drawfps" => {
                 if let Ok(mode) = value.parse::<u8>() {
@@ -607,19 +637,23 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_fogmode" => {
                 settings.fog_mode = match value.to_ascii_lowercase().as_str() {
                     "off" | "0" => FogMode::Off,
-                    "legacy" | "1" => FogMode::Legacy,
+                    // Keep the old "legacy"/"1" spelling pointed at JKA's default
+                    // r_drawfog 2 behavior so existing DinurdoJK.cfg files retain
+                    // their intended visual mode.
+                    "legacy" | "legacy2" | "1" => FogMode::LegacyDrawFog2,
+                    "legacy1" => FogMode::LegacyDrawFog1,
                     "volumetric" | "2" => FogMode::Volumetric,
                     _ => settings.fog_mode,
                 }
             }
-            // OpenJK's r_drawfog 1/2 both use the map-authored surface fog;
-            // mode 2 additionally avoids double-fogging global-fog redraws.
-            // Our fused surface path has no redraw, so either value maps to
-            // the single legacy mode.
+            // Preserve OpenJK's real r_drawfog split:
+            //   1 = explicit fog redraw after the material stages
+            //   2 = global fog during shader stages; local brush fog still redraws
             "r_drawfog" => {
                 settings.fog_mode = match value {
                     "0" => FogMode::Off,
-                    "1" | "2" => FogMode::Legacy,
+                    "1" => FogMode::LegacyDrawFog1,
+                    "2" => FogMode::LegacyDrawFog2,
                     _ => settings.fog_mode,
                 }
             }
@@ -706,21 +740,22 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     .map(|v| v.clamp(CLOUD_THICKNESS_MIN, CLOUD_THICKNESS_MAX))
                     .unwrap_or(settings.cloud_thickness)
             }
+            // Legacy aliases from before all atmospheric systems shared one wind.
             "r_cloudwindspeed" => {
-                settings.cloud_wind_speed = value
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|v| v.is_finite())
-                    .map(|v| v.clamp(0.0, CLOUD_WIND_SPEED_MAX))
-                    .unwrap_or(settings.cloud_wind_speed)
+                if !weather_wind_explicit {
+                    if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.weather_wind.speed = v.clamp(0.0, 8192.0);
+                        legacy_cloud_wind_speed_seen = true;
+                    }
+                }
             }
             "r_cloudwinddirection" => {
-                settings.cloud_wind_direction = value
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|v| v.is_finite())
-                    .map(|v| v.rem_euclid(360.0))
-                    .unwrap_or(settings.cloud_wind_direction)
+                if !weather_wind_explicit {
+                    if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.weather_wind.direction = v.rem_euclid(360.0);
+                        legacy_cloud_wind_direction_seen = true;
+                    }
+                }
             }
             "r_cloudshadows" => {
                 settings.cloud_shadows = parse_bool(value).unwrap_or(settings.cloud_shadows)
@@ -750,9 +785,8 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     .map(|v| v.clamp(0.0, 1.0))
                     .unwrap_or(settings.cloud_base_variation)
             }
-            "r_cloudwindvariation" => {
-                settings.cloud_wind_variation = parse_bool(value).unwrap_or(settings.cloud_wind_variation)
-            }
+            // Obsolete boolean predecessor of weather gust/direction-variation.
+            "r_cloudwindvariation" => {}
             "r_cloudshapeevolution" => {
                 settings.cloud_shape_evolution = parse_bool(value).unwrap_or(settings.cloud_shape_evolution)
             }
@@ -819,10 +853,27 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     }
                 }
             }
-            "r_oceanweather" => {
+            "r_weatherwind" => {
                 let v: Option<Vec<f32>> = value.split_whitespace().map(|s| s.parse().ok()).collect();
                 if let Some(v) = v.filter(|v| v.len() == 4) {
-                    settings.ocean_settings.wind = crate::ocean::OceanWind { speed:v[0],direction:v[1],gust:v[2],shift:v[3] }.sanitize();
+                    settings.weather_wind = crate::ocean::OceanWind {
+                        speed: v[0], direction: v[1], gust: v[2], shift: v[3],
+                    }.sanitize();
+                    weather_wind_explicit = true;
+                }
+            }
+            // Legacy ocean weather cvar. Preserve the old cloud speed/direction
+            // when present, but migrate ocean gust/shift into the shared wind.
+            "r_oceanweather" => {
+                if !weather_wind_explicit {
+                    let v: Option<Vec<f32>> = value.split_whitespace().map(|s| s.parse().ok()).collect();
+                    if let Some(v) = v.filter(|v| v.len() == 4) {
+                        let old = settings.weather_wind;
+                        let mut wind = crate::ocean::OceanWind { speed:v[0],direction:v[1],gust:v[2],shift:v[3] }.sanitize();
+                        if legacy_cloud_wind_speed_seen { wind.speed = old.speed; }
+                        if legacy_cloud_wind_direction_seen { wind.direction = old.direction; }
+                        settings.weather_wind = wind;
+                    }
                 }
             }
             "r_oceanmapsize" => {
@@ -836,6 +887,24 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "r_oceanroughness" => {
                 if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.roughness=v; } }
+            }
+            "r_oceanfogcolor" => settings.ocean_settings.optics.fog_color = parse_vec3(value).unwrap_or(settings.ocean_settings.optics.fog_color),
+            "r_oceanfogdistance" | "r_oceantransparency" | "r_oceandepthdarkening" |
+            "r_oceanrefraction" | "r_oceancaustics" | "r_oceanunderwatercull" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() {
+                        let o = &mut settings.ocean_settings.optics;
+                        match name.to_ascii_lowercase().as_str() {
+                            "r_oceanfogdistance" => o.fog_distance = v,
+                            "r_oceantransparency" => o.transparency = v,
+                            "r_oceandepthdarkening" => o.depth_darkening = v,
+                            "r_oceanrefraction" => o.refraction = v,
+                            "r_oceancaustics" => o.caustics = v,
+                            _ => o.underwater_cull = v,
+                        }
+                        *o = o.sanitize();
+                    }
+                }
             }
             "r_oceannormalstrength" => {
                 if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.normal_strength=v; } }
@@ -937,11 +1006,26 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_dynamiclights" => {
                 if let Some(mode) = DynamicLightsMode::from_config(value) {
                     settings.dynamic_lights = mode;
-                    dynamic_lights_mode_seen = true;
                 }
+            }
+            "r_maplightsimulation" => {
+                settings.map_light_simulation =
+                    parse_bool(value).unwrap_or(settings.map_light_simulation);
+            }
+            "r_fullbright" => {
+                settings.world_lighting = !parse_bool(value).unwrap_or(!settings.world_lighting);
+            }
+            "r_vertexlight" => {
+                settings.vertex_lighting = parse_bool(value).unwrap_or(settings.vertex_lighting);
+            }
+            "r_lightmap" => {
+                settings.lightmap_only = parse_bool(value).unwrap_or(settings.lightmap_only);
             }
             "r_modernsabers" => {
                 settings.modern_sabers = parse_bool(value).unwrap_or(settings.modern_sabers)
+            }
+            "r_sabermarks" => {
+                settings.saber_marks = SaberMarkMode::from_config(value).unwrap_or(settings.saber_marks)
             }
             "r_pbr" => settings.pbr = parse_bool(value).unwrap_or(settings.pbr),
             "fs_allowassetoverrides" => {
@@ -958,10 +1042,6 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     settings.dynamic_shadows = mode;
                     dynamic_shadows_mode_seen = true;
                 }
-            }
-            "r_clusteredlighting" => {
-                settings.clustered_lighting =
-                    parse_bool(value).unwrap_or(settings.clustered_lighting)
             }
             "r_emissivearealights" => {
                 settings.emissive_area_lights =
@@ -987,18 +1067,7 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             _ => {}
         }
     }
-    // New mode selectors preserve compatibility with older boolean cvars.
-    // WIP selections intentionally behave exactly like OFF until implemented.
-    if dynamic_lights_mode_seen {
-        settings.clustered_lighting =
-            matches!(settings.dynamic_lights, DynamicLightsMode::PerPixelForwardPlus);
-    } else {
-        settings.dynamic_lights = if settings.clustered_lighting {
-            DynamicLightsMode::PerPixelForwardPlus
-        } else {
-            DynamicLightsMode::Off
-        };
-    }
+    // r_dynamicLights is the source of truth for all runtime-light techniques.
     if dynamic_shadows_mode_seen {
         settings.cascaded_shadows = matches!(
             settings.dynamic_shadows,
@@ -1018,6 +1087,7 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
     if !tone_mapping_seen {
         settings.tone_mapping = settings.hdr;
     }
+    settings.ocean_settings.wind = settings.weather_wind;
     if let (Some(width), Some(height)) = (custom_width, custom_height) {
         settings.resolution = [width, height];
     }
@@ -1151,15 +1221,13 @@ seta r_cloudQuality \"{:.3}\"\n\
 seta r_cloudCoverage \"{:.3}\"\n\
 seta r_cloudHeight \"{:.1}\"\n\
 seta r_cloudThickness \"{:.1}\"\n\
-seta r_cloudWindSpeed \"{:.2}\"\n\
-seta r_cloudWindDirection \"{:.1}\"\n\
+seta r_weatherWind \"{:.2} {:.1} {:.3} {:.1}\"\n\
 seta r_cloudShadows \"{}\"\n\
 seta r_cloudRenderResolution \"{}\"\n\
 seta r_cloudTemporal \"{}\"\n\
 seta r_cloudTemporalDepthFix \"{}\"\n\
 seta r_cloudShear \"{:.3}\"\n\
 seta r_cloudBaseVariation \"{:.3}\"\n\
-seta r_cloudWindVariation \"{}\"\n\
 seta r_cloudShapeEvolution \"{}\"\n\
 seta r_cloudTerrainInteraction \"{}\"\n\
 seta r_cloudEmptySkip \"{}\"\n\
@@ -1200,14 +1268,15 @@ seta r_gpuDriven \"{}\"\n\
 seta r_hizOcclusion \"{}\"\n\
 seta r_entityAmbientLighting \"{}\"\n\
 seta r_dynamicLights \"{}\"\n\
+seta r_mapLightSimulation \"{}\"\n\
 seta r_modernSabers \"{}\"\n\
+seta r_saberMarks \"{}\"\n\
 seta r_pbr \"{}\"\n\
 seta fs_allowAssetOverrides \"{}\"\n\
 seta r_genNormalMaps \"{}\"\n\
 seta r_deluxeMapping \"{}\"\n\
 seta r_deluxeSpecular \"{:.3}\"\n\
 seta r_dynamicShadows \"{}\"\n\
-seta r_clusteredLighting \"{}\"\n\
 seta r_emissiveAreaLights \"{}\"\n\
 seta r_voxelProbeGI \"{}\"\n\
 seta r_localLightShadows \"{}\"\n\
@@ -1272,15 +1341,16 @@ seta r_cascadedShadows \"{}\"\n\
         settings.cloud_coverage,
         settings.cloud_height,
         settings.cloud_thickness,
-        settings.cloud_wind_speed,
-        settings.cloud_wind_direction,
+        settings.weather_wind.speed,
+        settings.weather_wind.direction,
+        settings.weather_wind.gust,
+        settings.weather_wind.shift,
         u8::from(settings.cloud_shadows),
         settings.cloud_render_resolution.config_value(),
         u8::from(settings.cloud_temporal),
         u8::from(settings.cloud_temporal_depth_fix),
         settings.cloud_shear,
         settings.cloud_base_variation,
-        u8::from(settings.cloud_wind_variation),
         u8::from(settings.cloud_shape_evolution),
         u8::from(settings.cloud_terrain_interaction),
         u8::from(settings.cloud_empty_skip),
@@ -1321,20 +1391,29 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.hiz_occlusion),
         settings.entity_ambient_lighting.config_value(),
         settings.dynamic_lights.config_value(),
+        u8::from(settings.map_light_simulation),
         u8::from(settings.modern_sabers),
+        settings.saber_marks.config_value(),
         u8::from(settings.pbr),
         u8::from(settings.allow_asset_overrides),
         u8::from(settings.gen_normal_maps),
         u8::from(settings.deluxe_mapping),
         settings.deluxe_specular,
         settings.dynamic_shadows.config_value(),
-        u8::from(settings.clustered_lighting),
         u8::from(settings.emissive_area_lights),
         u8::from(settings.voxel_probe_gi),
         u8::from(settings.local_light_shadows),
         u8::from(settings.cascaded_shadows),
     );
+    use std::fmt::Write as _;
     let mut text = text;
+    text.push_str(&format!(
+        "seta r_fullbright \"{}\"\nseta r_vertexLight \"{}\"\nseta r_lightmap \"{}\"\n",
+        u8::from(!settings.world_lighting),
+        u8::from(settings.vertex_lighting),
+        u8::from(settings.lightmap_only),
+    ));
+    let _ = writeln!(text, "seta cg_fxFPS \"{}\"", settings.fx_fps);
     text.push_str(&format!(
         "seta r_physics \"{}\"\n\
 seta r_physicsHz \"{}\"\n\
@@ -1377,7 +1456,6 @@ seta r_physicsStats \"{}\"\n",
         u8::from(settings.physics_debug_draw),
         u8::from(settings.physics_stats),
     ));
-    use std::fmt::Write as _;
     let _ = writeln!(text, "seta model \"{}\"", presentation.model);
     let _ = writeln!(text, "seta cg_drawCrosshair \"{}\"", presentation.crosshair.style);
     let _ = writeln!(text, "seta cg_crosshairSize \"{:.3}\"", presentation.crosshair.size);
@@ -1419,6 +1497,7 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta cl_mouseAccel \"{:.6}\"", presentation.mouse.accel);
     let _ = writeln!(text, "seta cg_thirdPerson \"{}\"", u8::from(presentation.third_person.enabled));
     let _ = writeln!(text, "seta cg_fpls \"{}\"", u8::from(presentation.first_person_lightsaber));
+    let _ = writeln!(text, "seta cg_saberTrail \"{}\"", presentation.saber_trail);
     let _ = writeln!(text, "seta cg_smoothPlayerOrigin \"{}\"", u8::from(presentation.smoothing.smooth_player_origin));
     let _ = writeln!(text, "seta cg_smoothThirdPersonOrigin \"{}\"", u8::from(presentation.smoothing.smooth_third_person_origin));
     let _ = writeln!(text, "seta cg_smoothPlayerAnimation \"{}\"", u8::from(presentation.smoothing.smooth_player_animation));
@@ -1438,11 +1517,18 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta s_separation \"{:.3}\"", audio.separation);
     let _ = writeln!(text, "seta s_muteWhenUnfocused \"{}\"", u8::from(audio.mute_when_unfocused));
     let _ = writeln!(text, "seta s_steamAudio \"{}\"", u8::from(audio.steam_audio));
+    let _ = writeln!(text, "seta s_steamAudioBinaural \"{}\"", u8::from(audio.steam_audio_binaural));
+    let _ = writeln!(text, "seta s_steamAudioEnvironmental \"{}\"", u8::from(audio.steam_audio_environmental));
     bindings.write_cfg(&mut text);
     let a = settings.ocean_settings.authored;
-    let w = settings.ocean_settings.wind;
+    let o = settings.ocean_settings.optics;
+    let _ = writeln!(text, "seta r_oceanFogColor \"{} {} {}\"", o.fog_color[0], o.fog_color[1], o.fog_color[2]);
+    for (name, value) in [("FogDistance", o.fog_distance), ("Transparency", o.transparency),
+        ("DepthDarkening", o.depth_darkening), ("Refraction", o.refraction),
+        ("Caustics", o.caustics), ("UnderwaterCull", o.underwater_cull)] {
+        let _ = writeln!(text, "seta r_ocean{name} \"{value}\"");
+    }
     let _ = writeln!(text, "seta r_oceanAuthoring \"{} {} {} {} {} {} {} {} {} {} {}\"", a.amplitude,a.wavelength,a.speed,a.direction,a.steepness,a.slosh,a.wind_chop,a.foam,a.foam_lifetime,a.spray,a.seed);
-    let _ = writeln!(text, "seta r_oceanWeather \"{} {} {} {}\"",w.speed,w.direction,w.gust,w.shift);
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -1461,6 +1547,14 @@ pub fn normalize_physics_msec(value: &str, fallback: u32) -> u32 {
         .ok()
         .map(|msec| msec.clamp(PHYSICS_MSEC_MIN, PHYSICS_MSEC_MAX))
         .unwrap_or_else(|| fallback.clamp(PHYSICS_MSEC_MIN, PHYSICS_MSEC_MAX))
+}
+
+pub fn normalize_fx_fps(value: &str, fallback: u32) -> u32 {
+    match value.trim().parse::<u32>() {
+        Ok(FX_FPS_LEGACY_JKA) => FX_FPS_LEGACY_JKA,
+        Ok(value) => value.clamp(FX_FPS_MIN, FX_FPS_MAX),
+        Err(_) => fallback,
+    }
 }
 
 pub fn physics_msec_from_fps(value: &str, fallback_msec: u32) -> u32 {
@@ -1562,9 +1656,10 @@ mod tests {
             amplitude: 512.0, wavelength: 8192.0, direction: -75.0, seed: u32::MAX,
             wind_chop: 2.5, foam_lifetime: 12.0, ..Default::default()
         };
-        settings.ocean_settings.wind = crate::ocean::OceanWind {
+        settings.weather_wind = crate::ocean::OceanWind {
             speed: 800.0, direction: 160.0, gust: 0.5, shift: 30.0,
         };
+        settings.ocean_settings.wind = settings.weather_wind;
         save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
             &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
         let loaded = load_video_settings(&path, None);
@@ -1647,6 +1742,7 @@ mod tests {
         assert!(text.contains("seta s_separation \"0.750\""));
         assert!(text.contains("seta s_muteWhenUnfocused \"0\""));
         assert!(text.contains("seta s_steamAudio \"1\""));
+        assert!(text.contains("seta s_steamAudioEnvironmental \"1\""));
     }
 
     #[test]
@@ -1695,7 +1791,7 @@ mod tests {
         settings.cloud_temporal_depth_fix = false;
         settings.cloud_shear = 0.75;
         settings.cloud_base_variation = 0.125;
-        settings.cloud_wind_variation = true;
+        settings.weather_wind = crate::ocean::OceanWind { speed: 720.0, direction: 135.0, gust: 0.6, shift: 28.0 };
         settings.cloud_shape_evolution = true;
         settings.cloud_terrain_interaction = true;
         settings.cloud_empty_skip = true;
@@ -1728,7 +1824,7 @@ mod tests {
         assert_eq!(loaded.cloud_temporal_depth_fix, false);
         assert!((loaded.cloud_shear - 0.75).abs() < 1e-3);
         assert!((loaded.cloud_base_variation - 0.125).abs() < 1e-3);
-        assert_eq!(loaded.cloud_wind_variation, true);
+        assert_eq!(loaded.weather_wind, settings.weather_wind);
         assert_eq!(loaded.cloud_shape_evolution, true);
         assert_eq!(loaded.cloud_terrain_interaction, true);
         assert_eq!(loaded.cloud_empty_skip, true);
@@ -1823,6 +1919,7 @@ mod tests {
                 "seta cg_fov \"110\"\n",
                 "seta cg_thirdPerson \"1\"\n",
                 "seta cg_fpls \"0\"\n",
+                "seta cg_saberTrail \"2\"\n",
                 "seta cg_smoothPlayerOrigin \"0\"\n",
                 "seta cg_smoothThirdPersonOrigin \"0\"\n",
                 "seta cg_smoothPlayerAnimation \"0\"\n",
@@ -1861,6 +1958,7 @@ mod tests {
         assert!((loaded.fov - 110.0).abs() < 1e-6);
         assert!(loaded.third_person.enabled);
         assert!(!loaded.first_person_lightsaber);
+        assert_eq!(loaded.saber_trail, 2);
         assert!(!loaded.smoothing.smooth_player_origin);
         assert!(!loaded.smoothing.smooth_third_person_origin);
         assert!(!loaded.smoothing.smooth_player_animation);
@@ -1905,6 +2003,7 @@ mod tests {
         presentation.fov = 105.0;
         presentation.third_person.enabled = true;
         presentation.first_person_lightsaber = false;
+        presentation.saber_trail = 0;
         presentation.smoothing.smooth_player_origin = false;
         presentation.smoothing.smooth_third_person_origin = false;
         presentation.smoothing.smooth_player_animation = false;
@@ -1949,6 +2048,8 @@ mod tests {
         assert!(text.contains("seta cg_fov \"105.000\""));
         assert!(text.contains("seta cg_thirdPerson \"1\""));
         assert!(text.contains("seta cg_fpls \"0\""));
+        assert!(text.contains("seta cg_saberTrail \"0\""));
+        assert!(text.contains("seta cg_fxFPS \"90\""));
         assert!(text.contains("seta cg_smoothPlayerOrigin \"0\""));
         assert!(text.contains("seta cg_smoothThirdPersonOrigin \"0\""));
         assert!(text.contains("seta cg_smoothPlayerAnimation \"0\""));
@@ -1981,6 +2082,7 @@ mod tests {
         assert!((settings.fov - DEFAULT_CG_FOV).abs() < 1e-6);
         assert!(!settings.third_person.enabled);
         assert!(settings.first_person_lightsaber);
+        assert_eq!(settings.saber_trail, 1);
         assert!(settings.smoothing.smooth_player_origin);
         assert!(settings.smoothing.smooth_third_person_origin);
         assert!(settings.smoothing.smooth_player_animation);
@@ -2006,6 +2108,16 @@ mod tests {
     fn parses_jka_style_lines() {
         let words = split_cfg_words("seta r_textureMode \"GL_LINEAR_MIPMAP_LINEAR\"");
         assert_eq!(words, ["seta", "r_textureMode", "GL_LINEAR_MIPMAP_LINEAR"]);
+    }
+
+    #[test]
+    fn fx_fps_defaults_and_normalization_preserve_legacy_sentinel() {
+        assert_eq!(VideoSettings::default().fx_fps, crate::fx::FX_FPS_DEFAULT);
+        assert_eq!(normalize_fx_fps("0", 90), crate::fx::FX_FPS_LEGACY_JKA);
+        assert_eq!(normalize_fx_fps("1", 90), crate::fx::FX_FPS_MIN);
+        assert_eq!(normalize_fx_fps("137", 90), 137);
+        assert_eq!(normalize_fx_fps("9999", 90), crate::fx::FX_FPS_MAX);
+        assert_eq!(normalize_fx_fps("bad", 90), 90);
     }
 
     #[test]

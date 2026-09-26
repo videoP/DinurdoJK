@@ -9,6 +9,10 @@ struct CameraUniform {
     camera_forward: vec4<f32>,
 };
 
+// Pipeline-specialized: false compiles the self-applied Legacy fog out entirely.
+// Rebuilt only when FogSystem::legacy_self_fog toggles, never checked per frame.
+override ENABLE_LEGACY_FOG: bool = false;
+
 struct GrassGlobals {
     sun_direction_strength: vec4<f32>,
     sun_color: vec4<f32>,
@@ -17,6 +21,10 @@ struct GrassGlobals {
     sss_color: vec4<f32>,
     params: vec4<f32>,
     weather_wind: vec4<f32>,
+    // Self-applied Legacy fog: linear RGB, depthForOpaque.
+    legacy_fog_color_depth: vec4<f32>,
+    // x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    legacy_fog_params: vec4<f32>,
 };
 
 struct ShadowSettings {
@@ -348,6 +356,35 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+// Legacy fog: procedural grass is not a BSP material stage, so it fogs itself
+// with the same curves as bsp.wgsl legacy_fog_color_amount (see
+// FogSystem::legacy_self_fog). Legacy 1 authored global fog is instead composited
+// in post over the grass using the ground depth behind it.
+fn apply_grass_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
+    if (!ENABLE_LEGACY_FOG) {
+        return rgb;
+    }
+    let mode = grass.legacy_fog_params.x;
+    if (mode < 0.5) {
+        return rgb;
+    }
+    let authored_depth = max(grass.legacy_fog_color_depth.a, 0.001);
+    let scale = grass.legacy_fog_params.y;
+    var amount = 0.0;
+    if (mode < 1.5) {
+        let forward_distance = max(
+            dot(world_position - camera.camera_pos_time.xyz, normalize(camera.camera_forward.xyz)),
+            0.0
+        );
+        let scaled = forward_distance / authored_depth * scale;
+        amount = 1.0 - exp(-5.5412635 * scaled * scaled);
+    } else {
+        let radial = distance(world_position, camera.camera_pos_time.xyz) / authored_depth;
+        amount = 1.0 - exp(-radial * scale * 0.26);
+    }
+    return mix(rgb, grass.legacy_fog_color_depth.rgb, clamp(amount, 0.0, 1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = exp(-input.camera_distance_m * 0.017);
@@ -483,5 +520,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             * (specular * 0.52 * micro_variation + fresnel * 0.010);
         lit += wet_sheen;
     }
-    return vec4<f32>(lit, 1.0);
+    return vec4<f32>(apply_grass_legacy_fog(lit, input.world_position), 1.0);
 }

@@ -52,6 +52,11 @@ struct PrepareJob {
 };
 @group(1) @binding(3) var<uniform> job: PrepareJob;
 
+var<workgroup> shared_base_wind_dir: vec2<f32>;
+var<workgroup> shared_prevailing_world_angle: f32;
+var<workgroup> shared_wind_speed: f32;
+var<workgroup> shared_wind_advection_offset: vec2<f32>;
+
 const PI: f32 = 3.14159265358979323846;
 const TAU: f32 = 6.28318530717958647692;
 const PREPARED_WORDS: u32 = 11u;
@@ -178,7 +183,23 @@ fn blade_root_wetness(root_world: vec3<f32>, camera_distance_m: f32, world_scale
 }
 
 @compute @workgroup_size(64)
-fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn cs_main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) workgroup_lane: u32,
+) {
+    let time = job.camera_pos_time.w;
+    if (workgroup_lane == 0u) {
+        let gust_wave = sin(time * 0.83) * 0.65 + sin(time * 1.71 + 1.9) * 0.35;
+        let shift_wave = sin(time * 0.13) * 0.7 + sin(time * 0.047 + 2.4) * 0.3;
+        let base_world_angle = grass.params.z;
+        shared_base_wind_dir = vec2<f32>(cos(base_world_angle), sin(base_world_angle));
+        shared_prevailing_world_angle = base_world_angle + grass.weather_wind.z * shift_wave;
+        let gust_scale = max(0.0, 1.0 + grass.weather_wind.y * gust_wave);
+        shared_wind_speed = max(grass.weather_wind.w, 0.0) * gust_scale;
+        shared_wind_advection_offset = shared_base_wind_dir * max(grass.weather_wind.x, 0.0) * time;
+    }
+    workgroupBarrier();
+
     let local_index = global_id.x;
     let total_count = job.low_count + job.mid_count + job.high_count;
     if (local_index >= total_count) {
@@ -204,16 +225,15 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let instance = load_grass_instance(source_index);
     let world_scale = grass.params.x;
     let clumping_factor = grass.params.y;
-    let prevailing_world_angle = grass.params.z;
-    let atmospheric_wind_dir = grass.weather_wind.xy;
-    let atmospheric_wind_speed = max(grass.weather_wind.z, 0.0);
-    let wind_speed = max(grass.weather_wind.w, 0.0);
+    let base_wind_dir = shared_base_wind_dir;
+    let prevailing_world_angle = shared_prevailing_world_angle;
+    let wind_speed = shared_wind_speed;
+    let wind_advection_offset = shared_wind_advection_offset;
     let reference_sprite_height = max(grass.params.w, 0.0001);
 
     let root_world = instance.position;
     let root_m3 = root_world * world_scale;
     let camera_m = job.camera_pos_time.xyz * world_scale;
-    let time = job.camera_pos_time.w;
 
     let hash0 = hash12(root_m3.xz);
     let hash1 = hash12(-root_m3.zx);
@@ -239,7 +259,7 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         * (1.0 + min(ease_in_quartic(0.033 * camera_distance_m), 75.0));
 
     let turn_angle_base = (mix(-0.15, 0.15, hash0) + clump2 * clumping_factor) * TAU;
-    let advected_root = root_m3.xz - atmospheric_wind_dir * atmospheric_wind_speed * time;
+    let advected_root = root_m3.xz - wind_advection_offset;
     let direction_noise = textureSampleLevel(
         wind_noise,
         noise_sampler,
@@ -281,7 +301,7 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // The source shifts the turbulence sample smoothly with blade height. Sample
     // the same advected weather field a quarter-second farther along for the tip.
     let tip_root = root_m3.xz
-        - atmospheric_wind_dir * atmospheric_wind_speed * (time + 0.25);
+        - base_wind_dir * max(grass.weather_wind.x, 0.0) * (time + 0.25);
     var turbulence1 = mix(
         0.25,
         1.0,

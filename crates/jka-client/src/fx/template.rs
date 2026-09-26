@@ -254,15 +254,24 @@ impl PrimitiveTemplate {
                 "life" => set_range(&mut prim.life, value),
                 "delay" => set_range(&mut prim.spawn_delay, value),
                 "cullrange" => {}
-                "bounce" | "intensity" => set_range(&mut prim.elasticity, value),
+                "bounce" | "intensity" => {
+                    set_range(&mut prim.elasticity, value);
+                    // OpenJK ParseElasticity: authoring bounce/intensity is an
+                    // implicit request for primitive physics.
+                    prim.flags |= FX_APPLY_PHYSICS;
+                }
                 "min" => {
                     if let Some((min, _)) = parse_vector(value) {
                         prim.min = min;
+                        // OpenJK ParseMin: a bounding box implies physics.
+                        prim.flags |= FX_USE_BBOX | FX_APPLY_PHYSICS;
                     }
                 }
                 "max" => {
                     if let Some((max, _)) = parse_vector(value) {
                         prim.max = max;
+                        // OpenJK ParseMax: a bounding box implies physics.
+                        prim.flags |= FX_USE_BBOX | FX_APPLY_PHYSICS;
                     }
                 }
                 "angle" | "angles" => set_vector(&mut prim.angle, value),
@@ -511,6 +520,17 @@ mod tests {
         let particle = &effect.primitives[2];
         assert_eq!(particle.kind, PrimType::Particle);
         assert_eq!(particle.spawn_flags, FX_ORG_ON_SPHERE | FX_EVEN_DISTRIBUTION);
+    }
+
+    #[test]
+    fn bounds_and_elasticity_imply_openjk_physics_flags() {
+        let bytes = b"particle\n{\n min -1 -2 -3\n max 1 2 3\n bounce 0.4\n}\n";
+        let effect = parse_effect("physics_flags", &gp2::parse(bytes));
+        let prim = &effect.primitives[0];
+        assert_eq!(prim.min, [-1.0, -2.0, -3.0]);
+        assert_eq!(prim.max, [1.0, 2.0, 3.0]);
+        assert_eq!(prim.elasticity, Range::fixed(0.4));
+        assert_eq!(prim.flags & (FX_USE_BBOX | FX_APPLY_PHYSICS), FX_USE_BBOX | FX_APPLY_PHYSICS);
     }
 
     #[test]
