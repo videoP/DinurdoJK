@@ -40,6 +40,7 @@ mod thread_activity;
 mod ui;
 mod vgs;
 mod weather;
+mod windows_timer;
 
 use runtime::UserEvent;
 use std::{

@@ -2,7 +2,7 @@ use crate::camera::{ThirdPersonSettings, DEFAULT_CG_FOV, MAX_CG_FOV, MIN_CG_FOV}
 use crate::player::{LocalPresentationSettings, MouseInputSettings};
 use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::ui::{
-    CloudRenderResolution, CloudType, ColorLutPreset, DofQuality, DynamicLightsMode,
+    CloudRenderResolution, CloudType, ColorLutPreset, DetailTextureMode, DofQuality, DynamicLightsMode,
     DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
     CrosshairSettings, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
     MovementKeysSettings, StrafeHelperSettings,
@@ -457,6 +457,20 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_ext_texture_filter_anisotropic" => {
                 anisotropy = value.parse::<f32>().ok().filter(|v| v.is_finite());
             }
+            "r_detailtextures" => {
+                settings.detail_textures =
+                    DetailTextureMode::from_config(value).unwrap_or(settings.detail_textures);
+            }
+            "r_detailtexturefade" => {
+                settings.detail_texture_fade = parse_bool(value).unwrap_or(settings.detail_texture_fade);
+            }
+            "r_detailtexturefadedistance" => {
+                if let Ok(distance) = value.parse::<f32>() {
+                    if distance.is_finite() {
+                        settings.detail_texture_fade_distance = distance.clamp(64.0, 8192.0);
+                    }
+                }
+            }
             "r_showtris" => {
                 if let Ok(mask) = value.trim().parse::<u32>() {
                     settings.wireframe_mask = mask & crate::ui::wireframe::ALL;
@@ -511,6 +525,10 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "cl_input_subframe" => {
                 settings.input_subframe = parse_bool(value).unwrap_or(settings.input_subframe);
+            }
+            "cl_timerresolution1ms" => {
+                settings.timer_resolution_1ms =
+                    parse_bool(value).unwrap_or(settings.timer_resolution_1ms);
             }
             "cl_input_latelatch" => {
                 settings.input_latelatch = parse_bool(value).unwrap_or(settings.input_latelatch);
@@ -1195,6 +1213,9 @@ seta r_maxFrameLatency \"{}\"\n\
 seta r_ext_multisample \"{}\"\n\
 seta r_textureMode \"{}\"\n\
 seta r_ext_texture_filter_anisotropic \"{}\"\n\
+seta r_detailTextures \"{}\"\n\
+seta r_detailTextureFade \"{}\"\n\
+seta r_detailTextureFadeDistance \"{:.0}\"\n\
 seta r_showtris \"{}\"\n\
 seta r_skipUi \"{}\"\n\
 seta developer \"{}\"\n\
@@ -1210,6 +1231,7 @@ seta com_maxfps \"{}\"\n\
 seta cg_drawFPS \"{}\"\n\
 seta pmove_msec \"{}\"\n\
 seta cl_input_subframe \"{}\"\n\
+seta cl_timerResolution1ms \"{}\"\n\
 seta cl_input_latelatch \"{}\"\n\
 seta r_gamma \"{:.3}\"\n\
 seta r_hdr \"{}\"\n\
@@ -1317,6 +1339,9 @@ seta r_cascadedShadows \"{}\"\n\
         msaa,
         texture_mode,
         anisotropy,
+        settings.detail_textures.config_value(),
+        u8::from(settings.detail_texture_fade),
+        settings.detail_texture_fade_distance,
         settings.wireframe_mask,
         u8::from(settings.skip_ui),
         u8::from(settings.developer_tools),
@@ -1332,6 +1357,7 @@ seta r_cascadedShadows \"{}\"\n\
         settings.draw_fps,
         settings.physics_msec,
         u8::from(settings.input_subframe),
+        u8::from(settings.timer_resolution_1ms),
         u8::from(settings.input_latelatch),
         settings.gamma,
         u8::from(settings.hdr),

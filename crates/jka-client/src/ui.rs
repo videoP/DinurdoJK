@@ -510,6 +510,75 @@ impl TextureFilter {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DetailTextureMode {
+    #[default]
+    Off,
+    /// Mid-grey-neutral 2x modulation. The detail sample is converted back to
+    /// its encoded (legacy fixed-function-like) value before modulation so 128
+    /// grey is approximately a no-op.
+    Neutral2x,
+    /// Direct linear-space equivalent of blendFunc GL_DST_COLOR GL_SRC_COLOR.
+    Linear2x,
+    /// Previous test path: blendFunc GL_DST_COLOR GL_ONE.
+    DstColorOne,
+    /// Plain multiplicative modulation: blendFunc GL_DST_COLOR GL_ZERO.
+    Multiply,
+}
+
+impl DetailTextureMode {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Neutral2x,
+        Self::Linear2x,
+        Self::DstColorOne,
+        Self::Multiply,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Neutral2x => "NEUTRAL 2X",
+            Self::Linear2x => "LINEAR 2X",
+            Self::DstColorOne => "DST COLOR + ONE",
+            Self::Multiply => "MULTIPLY",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Neutral2x => "neutral2x",
+            Self::Linear2x => "linear2x",
+            Self::DstColorOne => "dstcolor_one",
+            Self::Multiply => "multiply",
+        }
+    }
+
+    /// Numeric value sent directly to the WGSL override constant.
+    pub fn shader_mode(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Neutral2x => 1,
+            Self::Linear2x => 2,
+            Self::DstColorOne => 3,
+            Self::Multiply => 4,
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Some(Self::Off),
+            // Preserve configs written by the first detail-texture patch.
+            "1" | "on" | "true" | "enhanced" | "neutral2x" | "softlight" => Some(Self::Neutral2x),
+            "2" | "linear2x" | "modulate2x" => Some(Self::Linear2x),
+            "3" | "dstcolor_one" | "dstcolorone" => Some(Self::DstColorOne),
+            "4" | "multiply" | "modulate" => Some(Self::Multiply),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PvsMode {
     Off,
     Minimal,
@@ -904,7 +973,7 @@ impl DynamicShadowsMode {
             Self::BlobStencilLegacy => "BLOB / STENCIL (LEGACY) [WIP]",
             Self::CascadedShadowMaps => "CASCADED SHADOW MAPS (CSM)",
             Self::CascadedShadowMapsBevy => "CASCADED SHADOW MAPS (BEVY)",
-            Self::RayTraced => "RAY TRACED SHADOWS [WIP]",
+            Self::RayTraced => "RAY TRACED SHADOWS",
         }
     }
 
@@ -1257,6 +1326,7 @@ pub const VIDEO_ROW_LIGHTMAP_ONLY: usize = 64;
 pub const VIDEO_ROW_MAP_LIGHT_SIMULATION: usize = 65;
 pub const VIDEO_ROW_SABER_MARKS: usize = 66;
 pub const VIDEO_ROW_MAX_FRAME_LATENCY: usize = 67;
+pub const VIDEO_ROW_DETAIL_TEXTURES: usize = 68;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -1559,6 +1629,11 @@ pub struct VideoSettings {
     pub window_position: Option<[i32; 2]>,
     pub window_maximized: bool,
     pub texture_filter: TextureFilter,
+    pub detail_textures: DetailTextureMode,
+    /// Port of the standard distance-based detail fade: blend the detail contribution
+    /// back to its neutral identity as camera distance approaches the configured range.
+    pub detail_texture_fade: bool,
+    pub detail_texture_fade_distance: f32,
     pub wireframe_mask: u32,
     pub skip_ui: bool,
     pub pvs_mode: PvsMode,
@@ -1576,6 +1651,9 @@ pub struct VideoSettings {
     pub ghoul2_batch_draws: Ghoul2BatchMode,
     pub physics_msec: u32,
     pub input_subframe: bool,
+    /// Request a 1 ms Windows multimedia timer period for timeout/sleep waits.
+    /// Raw mouse events already wake the event loop independently.
+    pub timer_resolution_1ms: bool,
     /// Experimental render-thread late latch. Only effective with
     /// `cl_input_subframe`; the renderer resamples the newest real view
     /// orientation at its last coherent camera point for the active path.
@@ -1739,6 +1817,9 @@ impl Default for VideoSettings {
             window_position: None,
             window_maximized: false,
             texture_filter: TextureFilter::Trilinear,
+            detail_textures: DetailTextureMode::Off,
+            detail_texture_fade: false,
+            detail_texture_fade_distance: 512.0,
             wireframe_mask: 0,
             skip_ui: false,
             pvs_mode: PvsMode::Auto,
@@ -1754,6 +1835,7 @@ impl Default for VideoSettings {
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             physics_msec: 8,
             input_subframe: false,
+            timer_resolution_1ms: false,
             input_latelatch: false,
             client_physics: false,
             client_physics_hz: 60,

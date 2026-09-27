@@ -281,6 +281,8 @@ pub struct PlayerView {
     pub force_power_max: i32,
     pub weapon: i32,
     pub ammo: i32,
+    /// Host-only: final OpenJK PmoveSingle forced the view via PM_SetPMViewAngle.
+    pub view_forced: i32,
 }
 pub const BONE_ANGLES_POSTMULT: i32 = 0x0002;
 pub const G2_ORIGIN: i32 = 0;

@@ -133,6 +133,11 @@ pub struct LocalPlayer {
     accumulated: Duration,
     tick_msec: i32,
     input_angles: [f32; 3],
+    // Usercmd angle basis that produced the current local Pmove state.
+    // Subframe presentation advances from ps.viewangles by only mouse motion
+    // accumulated since this command. Forced-view delta_angles are gameplay
+    // state, not a presentation offset to replay after a saber lock.
+    subframe_base_cmd_angles: [i32; 3],
     previous_eye: [f32; 3],
     current_eye: [f32; 3],
     previous_origin: [f32; 3],
@@ -186,6 +191,11 @@ impl LocalPlayer {
             accumulated: Duration::ZERO,
             tick_msec: TICK_MSEC,
             input_angles: [0.0, spawn.yaw.to_degrees(), 0.0],
+            subframe_base_cmd_angles: [
+                angle_to_short(0.0),
+                angle_to_short(spawn.yaw.to_degrees()),
+                angle_to_short(0.0),
+            ],
             previous_eye: eye,
             current_eye: eye,
             previous_origin: spectator_view.origin,
@@ -335,8 +345,13 @@ impl LocalPlayer {
         self.input_angles = std::array::from_fn(|i| {
             view.view_angles[i] - delta_angle_degrees(view.delta_angles[i])
         });
-        self.input_angles[0] = self.input_angles[0].clamp(-JKA_MAX_VIEW_PITCH, JKA_MAX_VIEW_PITCH);
+        // Match OpenJK cl.viewangles semantics: the command-angle accumulator is
+        // not clamped to the gameplay pitch range. PM_UpdateViewAngles owns the
+        // +/-16000 short-angle clamp and adjusts ps.delta_angles to preserve the
+        // client command basis. Clamping here corrupts that relationship after
+        // PM_SetPMViewAngle (saber locks, wall-run locks, etc.).
         self.input_angles[1] = self.input_angles[1].rem_euclid(360.0);
+        self.subframe_base_cmd_angles = self.input_angles.map(angle_to_short);
         self.current_eye = view.eye_origin();
         self.previous_eye = self.current_eye;
         self.current_origin = view.origin;
@@ -377,8 +392,11 @@ impl LocalPlayer {
         let (mx, my) = self.mouse_input.scale_delta(mouse, elapsed);
         self.input_angles[1] =
             (self.input_angles[1] - self.mouse_input.yaw * mx).rem_euclid(360.0);
-        self.input_angles[0] = (self.input_angles[0] + self.mouse_input.pitch * my)
-            .clamp(-JKA_MAX_VIEW_PITCH, JKA_MAX_VIEW_PITCH);
+        // OpenJK accumulates mouse pitch into cl.viewangles without applying the
+        // gameplay pitch clamp here. The resulting usercmd is clamped later by
+        // PM_UpdateViewAngles, which also updates delta_angles. Keeping this raw
+        // accumulator unbounded is required for forced-view delta compensation.
+        self.input_angles[0] += self.mouse_input.pitch * my;
     }
 
     /// Convenience path used by unit tests without a timing sample. Runtime mouse
@@ -475,6 +493,9 @@ impl LocalPlayer {
             let view = self
                 .movement
                 .step_with_msec(state, cmd, self.tick_msec, &mut self.world)?;
+            // The current Pmove state came from this exact command. Subframe
+            // presentation uses it as the baseline, like remote prediction does.
+            self.subframe_base_cmd_angles = cmd.angles;
             self.current_eye = view.eye_origin();
             self.current_origin = view.origin;
             self.current_command_time = view.command_time;
@@ -566,9 +587,23 @@ impl LocalPlayer {
 
     pub fn subframe_view_angles(&self) -> [f32; 3] {
         let view = self.state().view();
-        let yaw = self.input_angles[1] + delta_angle_degrees(view.delta_angles[1]);
-        let pitch = (self.input_angles[0] + delta_angle_degrees(view.delta_angles[0]))
+        if view.view_forced != 0 {
+            // OpenJK owns the view for this Pmove state. Do not apply the
+            // extra render/subframe mouse delta while it is locked.
+            return view.view_angles;
+        }
+
+        // Start at OpenJK's Pmove result and add only mouse motion newer
+        // than the usercmd that produced it. This prevents lock-time
+        // PM_SetPMViewAngle compensation from being replayed on unlock.
+        let since_pmove = |axis: usize| {
+            let now = angle_to_short(self.input_angles[axis]);
+            (now.wrapping_sub(self.subframe_base_cmd_angles[axis]) as i16) as f32
+                * SHORT_TO_DEGREES
+        };
+        let pitch = (view.view_angles[0] + since_pmove(0))
             .clamp(-JKA_MAX_VIEW_PITCH, JKA_MAX_VIEW_PITCH);
+        let yaw = view.view_angles[1] + since_pmove(1);
         [pitch, yaw, view.view_angles[2]]
     }
 
@@ -673,13 +708,56 @@ mod tests {
     }
 
     #[test]
-    fn mouse_pitch_uses_stock_openjk_limit() {
+    fn mouse_pitch_accumulator_stays_raw_while_pmove_clamps_the_view() {
         let (mut player, _) = local();
-        player.apply_mouse_look((0.0, -100_000.0));
-        assert!((player.input_angles[0] + JKA_MAX_VIEW_PITCH).abs() < 1.0e-5);
 
-        player.apply_mouse_look((0.0, 200_000.0));
-        assert!((player.input_angles[0] - JKA_MAX_VIEW_PITCH).abs() < 1.0e-5);
+        // OpenJK CL_MouseMove accumulates cl.viewangles directly. A 1000-count
+        // movement at the stock 5 * 0.022 scale is 110 degrees, beyond the
+        // gameplay pitch limit; the client accumulator must still keep 110.
+        player.apply_mouse_look((0.0, 1000.0));
+        assert!((player.input_angles[0] - 110.0).abs() < 1.0e-4);
+
+        // PM_UpdateViewAngles, not CL_MouseMove, applies the actual +/-16000
+        // short-angle view limit and updates delta_angles accordingly.
+        player
+            .update(
+                Duration::from_millis(TICK_MSEC as u64),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd::default(),
+            )
+            .unwrap();
+        let view = player.state().view();
+        assert!((view.view_angles[0] - JKA_MAX_VIEW_PITCH).abs() < 1.0e-3);
+        assert!((player.input_angles[0] - 110.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn subframe_view_is_relative_to_the_last_pmove_command() {
+        let (mut player, _) = local();
+
+        // Force PM_UpdateViewAngles to create a non-zero delta compensation.
+        // With no newer mouse after that command, subframe presentation must
+        // still be exactly the Pmove view, not input_angles + delta_angles.
+        player.apply_mouse_look((0.0, 1000.0));
+        player
+            .update(
+                Duration::from_millis(TICK_MSEC as u64),
+                &HashSet::new(),
+                (0.0, 0.0),
+                UserCmd::default(),
+            )
+            .unwrap();
+        let view = player.state().view();
+        assert_ne!(view.delta_angles[0], 0);
+        let subframe = player.subframe_view_angles();
+        assert!((subframe[0] - view.view_angles[0]).abs() < 1.0e-4);
+        assert!((subframe[1] - view.view_angles[1]).abs() < 1.0e-4);
+
+        // Mouse newer than the Pmove command still advances presentation.
+        player.apply_mouse_look((0.0, -10.0));
+        let advanced = player.subframe_view_angles();
+        assert_ne!(advanced[0], view.view_angles[0]);
     }
 
     #[test]

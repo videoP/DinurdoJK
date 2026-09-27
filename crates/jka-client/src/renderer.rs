@@ -14,7 +14,7 @@ use crate::{
     },
     weather::{self, FroxelUniform, WeatherOcclusionCache, WeatherSurfaceUniform, WeatherSystem},
     ui::{
-        self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofQuality, FogMode,
+        self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DetailTextureMode, DofQuality, FogMode,
         DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PvsMode, RainIntensity,
         ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex, VsyncMode,
     },
@@ -28,7 +28,7 @@ use jka_assets::{
     shader::{AlphaGen, RgbGen, TcGen, TcMod},
 };
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -87,6 +87,19 @@ const BEVY_CSM_MAXIMUM_DISTANCE: f32 = 150.0 * JKA_UNITS_PER_METER;
 const BEVY_CSM_OVERLAP_PROPORTION: f32 = 0.20;
 const BEVY_CSM_SHADOW_DEPTH_BIAS: f32 = 0.02;
 const BEVY_CSM_SHADOW_NORMAL_BIAS: f32 = 1.8;
+// Bevy Solari samples directional-light visibility across a finite cone. JKA's
+// authored sun has no angular-radius field, so RT Shadows uses Earth's measured
+// apparent solar diameter as its default emitter extent. The shader receives
+// cos(half-angle), matching Bevy's DirectionalLight representation.
+const RT_SUN_ANGULAR_DIAMETER_RADIANS: f32 = 0.00930842;
+const RT_SHADOW_SAMPLES_PER_PIXEL: f32 = 1.0;
+// Dynamic RT casters are deliberately bounded. Static BSP plus inline movers
+// occupy fixed slots first; ordinary rigid entities use the remaining tail.
+// This avoids allowing an effects-heavy custom server to turn one shadow mode
+// into an unbounded TLAS build.
+const RT_DYNAMIC_TLAS_INSTANCE_BUDGET: usize = 1024;
+const RT_RIGID_BLAS_CACHE_LIMIT: usize = 2048;
+const RT_SKINNED_BLAS_CACHE_LIMIT: usize = 2048;
 const FALLBACK_SUN_DIRECTION: [f32; 3] = [-0.38, -0.84, -0.39];
 const FALLBACK_SUN_COLOR: [f32; 3] = [0.57735026, 0.57735026, 0.57735026];
 const FALLBACK_SUN_INTENSITY: f32 = 250.0;
@@ -390,6 +403,31 @@ pub struct Ghoul2GpuVertex {
     pub _padding: [u32; 3],
 }
 
+/// Storage-buffer-safe repack used only by the RT-on compute skinning path.
+/// Keeping vec4-sized fields avoids WGSL storage-layout padding ambiguity while
+/// the normal RT-off raster path keeps its original compact vertex unchanged.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct Ghoul2RtInputVertex {
+    position_uv_x: [f32; 4],
+    normal_uv_y: [f32; 4],
+    bone_indices: [u32; 4],
+    weights: [f32; 4],
+    params: [u32; 4],
+}
+
+impl From<&Ghoul2GpuVertex> for Ghoul2RtInputVertex {
+    fn from(vertex: &Ghoul2GpuVertex) -> Self {
+        Self {
+            position_uv_x: [vertex.position[0], vertex.position[1], vertex.position[2], vertex.uv[0]],
+            normal_uv_y: [vertex.normal[0], vertex.normal[1], vertex.normal[2], vertex.uv[1]],
+            bone_indices: vertex.bone_indices,
+            weights: vertex.weights,
+            params: [vertex.weight_count, 0, 0, 0],
+        }
+    }
+}
+
 /// One final CPU-evaluated Ghoul2 bone matrix. GPU mode intentionally keeps
 /// animation, BG_G2PlayerAngles and bolt semantics on the CPU; only the GLM
 /// vertex deformation moves to the vertex shader.
@@ -435,17 +473,81 @@ impl DynamicWireframeClass {
 }
 
 #[derive(Clone)]
+pub struct RayTracedRigidInstance {
+    /// Stable asset identity shared by every instance of this MD3. The RT cache
+    /// combines this with surface/frame so one object-space BLAS can be reused
+    /// by any number of TLAS instances.
+    asset_key: Arc<str>,
+    model: Arc<jka_assets::md3::Model>,
+    surface_index: u32,
+    frame: u32,
+    /// Object-space JKA MD3 -> renderer world-space affine transform, stored in
+    /// wgpu/Vulkan TLAS row-major 3x4 form.
+    transform: [f32; 12],
+}
+
+impl RayTracedRigidInstance {
+    pub fn md3(
+        asset_key: Arc<str>,
+        model: Arc<jka_assets::md3::Model>,
+        surface_index: usize,
+        frame: usize,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        scale: f32,
+    ) -> Self {
+        // EntityPresenter's raster path computes:
+        // render_position(origin + axis0*x + axis1*y + axis2*z).  Keep the
+        // BLAS in native MD3/JKA object space and put that exact linear map in
+        // the TLAS instance instead of rebuilding geometry for transform-only
+        // motion.
+        let c0 = scene::render_position([axis[0][0] * scale, axis[0][1] * scale, axis[0][2] * scale]);
+        let c1 = scene::render_position([axis[1][0] * scale, axis[1][1] * scale, axis[1][2] * scale]);
+        let c2 = scene::render_position([axis[2][0] * scale, axis[2][1] * scale, axis[2][2] * scale]);
+        let translation = scene::render_position(origin);
+        Self {
+            asset_key,
+            model,
+            surface_index: u32::try_from(surface_index).unwrap_or(u32::MAX),
+            frame: u32::try_from(frame).unwrap_or(u32::MAX),
+            transform: [
+                c0[0], c1[0], c2[0], translation[0],
+                c0[1], c1[1], c2[1], translation[1],
+                c0[2], c1[2], c2[2], translation[2],
+            ],
+        }
+    }
+
+    fn mesh_key(&self, non_opaque: bool) -> RayTracedRigidMeshKey {
+        RayTracedRigidMeshKey {
+            asset_key: Arc::clone(&self.asset_key),
+            surface_index: self.surface_index,
+            frame: self.frame,
+            non_opaque,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct DynamicModelSurface {
-    /// Presentation identity retained for diagnostics/culling work even though
-    /// the current render pass does not branch on it.
-    #[allow(dead_code)]
+    /// Presentation identity retained for diagnostics/culling work and dynamic
+    /// RT BLAS ownership.
     pub entity_num: u16,
     pub wireframe_class: DynamicWireframeClass,
+    /// False for conservative RT-only Ghoul2 casters that were rejected by the
+    /// main-camera frustum. They still feed skinning/BLAS but never color/depth.
+    pub raster_visible: bool,
     pub vertices: Arc<Vec<DynamicModelVertex>>,
     pub indices: Arc<Vec<u32>>,
     /// JKA-space point used for classic BSP entity-lighting lookup. Effects and
     /// other deliberately-unlit transient geometry leave this unset.
     pub lighting_origin: Option<[f32; 3]>,
+    /// Transform-only rigid source for hardware RT shadow casting. This is
+    /// deliberately absent for FX and deforming/Ghoul2 geometry.
+    pub rt_rigid: Option<RayTracedRigidInstance>,
+    /// Stable deforming GLM surface identity. Present only while RT Shadows is
+    /// active so CPU- and GPU-skinned Ghoul2 can share one dynamic BLAS path.
+    pub rt_skinned_key: Option<Arc<str>>,
     /// Present only for r_ghoul2Skinning gpu. CPU geometry keeps this None.
     pub ghoul2_gpu: Option<Ghoul2GpuSkinning>,
     pub texture: Option<Arc<TextureData>>,
@@ -499,6 +601,25 @@ impl InlineModelInstance {
 
     fn rotate(&self, v: [f32; 3]) -> [f32; 3] {
         std::array::from_fn(|i| self.axis[0][i] * v[0] + self.axis[1][i] * v[1] + self.axis[2][i] * v[2])
+    }
+
+    /// Affine transform used by a TLAS instance whose BLAS vertices are the
+    /// compiled inline-model `base` vertices in renderer space. Derive it from
+    /// the same authoritative point transform used by raster movers so the two
+    /// representations cannot drift on JKA<->render axis conversion.
+    fn rt_transform(&self) -> [f32; 12] {
+        let p0 = self.transform_point([0.0, 0.0, 0.0]);
+        let px = self.transform_point([1.0, 0.0, 0.0]);
+        let py = self.transform_point([0.0, 1.0, 0.0]);
+        let pz = self.transform_point([0.0, 0.0, 1.0]);
+        let c0 = [px[0] - p0[0], px[1] - p0[1], px[2] - p0[2]];
+        let c1 = [py[0] - p0[0], py[1] - p0[1], py[2] - p0[2]];
+        let c2 = [pz[0] - p0[0], pz[1] - p0[1], pz[2] - p0[2]];
+        [
+            c0[0], c1[0], c2[0], p0[0],
+            c0[1], c1[1], c2[1], p0[1],
+            c0[2], c1[2], c2[2], p0[2],
+        ]
     }
 }
 
@@ -661,6 +782,9 @@ pub enum RenderCommand {
     SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
+    SetDetailTextures(DetailTextureMode),
+    SetDetailTexture { path: String, game: Option<PathBuf> },
+    SetDetailTextureFade { enabled: bool, distance: f32 },
     SetWireframeMask(u32),
     SetPvsMode(PvsMode),
     SetFpsCap(u32),
@@ -758,6 +882,7 @@ impl RenderThread {
         initial_ui: UiSnapshot,
         base: PathBuf,
         game: Option<PathBuf>,
+        detail_texture_path: String,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::channel();
         // Render snapshots are mailbox state, not a work queue: the renderer only
@@ -808,6 +933,7 @@ impl RenderThread {
                         initial_ui,
                         base,
                         game,
+                        detail_texture_path,
                     )
                 }));
                 if let Err(payload) = result {
@@ -894,6 +1020,7 @@ fn render_thread_main(
     initial_ui: UiSnapshot,
     base: PathBuf,
     game: Option<PathBuf>,
+    detail_texture_path: String,
 ) {
     let renderer_init_started = Instant::now();
     let mut renderer = match block_on(Renderer::new(
@@ -903,6 +1030,7 @@ fn render_thread_main(
         &base,
         game.as_deref(),
         initial_ui.video.max_frame_latency,
+        &detail_texture_path,
     )) {
         Ok(renderer) => renderer,
         Err(error) => {
@@ -917,6 +1045,11 @@ fn render_thread_main(
     renderer.set_vsync(initial_ui.video.vsync);
     renderer.set_msaa(initial_ui.video.msaa_samples);
     renderer.set_texture_filter(initial_ui.video.texture_filter);
+    renderer.set_detail_textures(initial_ui.video.detail_textures);
+    renderer.set_detail_texture_fade(
+        initial_ui.video.detail_texture_fade,
+        initial_ui.video.detail_texture_fade_distance,
+    );
     renderer.set_wireframe_mask(initial_ui.video.wireframe_mask);
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
     let mut fps_cap = initial_ui.video.fps_cap;
@@ -1100,6 +1233,15 @@ fn render_thread_main(
                     Ok(RenderCommand::SetMsaa(samples)) => renderer.set_msaa(samples),
                     Ok(RenderCommand::SetTextureFilter(filter)) => {
                         renderer.set_texture_filter(filter)
+                    }
+                    Ok(RenderCommand::SetDetailTextures(mode)) => {
+                        renderer.set_detail_textures(mode)
+                    }
+                    Ok(RenderCommand::SetDetailTexture { path, game }) => {
+                        renderer.set_detail_texture(&path, game.as_deref())
+                    }
+                    Ok(RenderCommand::SetDetailTextureFade { enabled, distance }) => {
+                        renderer.set_detail_texture_fade(enabled, distance)
                     }
                     Ok(RenderCommand::SetWireframeMask(mask)) => renderer.set_wireframe_mask(mask),
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
@@ -1641,8 +1783,9 @@ fn render_thread_main(
                 client.dynamic_indices,
             );
             println!(
-                "[JKA PERF GPU] frame={}ms world={}ms dyn_models={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
+                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dyn_models={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
                 gpu_ms(GpuPass::Frame),
+                gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
                 dynamic_model_ms,
                 gpu_ms(GpuPass::OceanOptics),
@@ -1656,6 +1799,31 @@ fn render_thread_main(
                 gpu_ms(GpuPass::Cluster),
                 gpu_ms(GpuPass::Ui),
             );
+            if renderer.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+                if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
+                    println!(
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays=up_to_1_per_receiver local_rays={} (budget_per_light_evaluation; not_measured)",
+                    gpu_ms(GpuPass::RtBuild),
+                    gpu_ms(GpuPass::RtSkin),
+                    gpu_ms(GpuPass::RtAcceleration),
+                    rt.geometry_count,
+                    rt.triangle_count,
+                    rt.masked_geometry_count,
+                    rt.masked_triangle_count,
+                    rt.last_dynamic_instance_count,
+                    rt.active_rigid_triangles,
+                    rt.active_skinned_triangles,
+                    rt.active_masked_rigid,
+                    rt.active_masked_skinned,
+                    rt.rigid_blas_cache.len(),
+                    rt.skinned_blas_cache.len(),
+                    rt.alpha_textures.len(),
+                    rt.alpha_texels.len(),
+                        rt.alpha_buffers_generation,
+                        if renderer.local_light_shadows_enabled { "up_to_1_per_clustered_light" } else { "0" },
+                    );
+                }
+            }
             let grass = last_info.grass;
             println!(
                 "[JKA GRASS PERF] cpu_select={:.4}ms gpu={}ms gpu_prepare={}ms gpu_draw={}ms patches={}/{} reject[pvs={} frustum={} distance={} lod_empty={}] draw_records={} submit_calls={} blades[high={} mid={} low={}] triangles={} ab[precompute={} mid_lod={} front_to_back={}]",
@@ -2168,8 +2336,10 @@ struct LightingSettings {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PbrSettings {
-    values: [u32; 4], // PBR enabled, parallax enabled, height scale * 1000
-    deluxe: [f32; 4], // enabled, specular scale, reserved, reserved
+    values: [u32; 4], // PBR enabled, parallax enabled, height scale * 1000, reserved
+    // x deluxe enabled, y deluxe specular, z detail distance fade enabled,
+    // w detail fade distance in JKA map units.
+    deluxe: [f32; 4],
 }
 
 #[repr(C)]
@@ -2189,6 +2359,627 @@ struct ShadowReceiverUniform {
 struct ShadowCasterUniform {
     view_proj: [[f32; 4]; 4],
     camera_pos_time: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RayTracedRigidMeshKey {
+    asset_key: Arc<str>,
+    surface_index: u32,
+    frame: u32,
+    non_opaque: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct RtAlphaVertexGpu {
+    // xyz object-space position, w base-u
+    position_u: [f32; 4],
+    // xyz object-space normal, w base-v
+    normal_v: [f32; 4],
+    // xy lightmap uv, z vertex alpha, w unused
+    lightmap_alpha: [f32; 4],
+}
+
+impl From<&GpuVertex> for RtAlphaVertexGpu {
+    fn from(vertex: &GpuVertex) -> Self {
+        Self {
+            position_u: [vertex.position[0], vertex.position[1], vertex.position[2], vertex.uv[0]],
+            normal_v: [vertex.normal[0], vertex.normal[1], vertex.normal[2], vertex.uv[1]],
+            lightmap_alpha: [vertex.lightmap_uv[0], vertex.lightmap_uv[1], vertex.color[3], 0.0],
+        }
+    }
+}
+
+impl From<&DynamicModelVertex> for RtAlphaVertexGpu {
+    fn from(vertex: &DynamicModelVertex) -> Self {
+        Self {
+            position_u: [vertex.position[0], vertex.position[1], vertex.position[2], vertex.uv[0]],
+            normal_v: [vertex.normal[0], vertex.normal[1], vertex.normal[2], vertex.uv[1]],
+            lightmap_alpha: [0.0, 0.0, vertex.color[3], 0.0],
+        }
+    }
+}
+
+impl From<&Ghoul2GpuVertex> for RtAlphaVertexGpu {
+    fn from(vertex: &Ghoul2GpuVertex) -> Self {
+        Self {
+            position_u: [vertex.position[0], vertex.position[1], vertex.position[2], vertex.uv[0]],
+            normal_v: [vertex.normal[0], vertex.normal[1], vertex.normal[2], vertex.uv[1]],
+            lightmap_alpha: [0.0, 0.0, 1.0, 0.0],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct RtAlphaGeometryGpu {
+    // x first vertex, y first index, z material index, w reserved
+    values: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct RtAlphaTextureGpu {
+    // x texel offset, y width, z height, w clamp (1) / repeat (0)
+    values: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RtAlphaMaterialGpu {
+    header: [u32; 4],
+    vector_s: [f32; 4],
+    vector_t: [f32; 4],
+    mods: [[f32; 4]; 8],
+    color: [f32; 4],
+    params: [f32; 4],
+    // x alpha-texture descriptor index; remaining fields reserved.
+    texture: [u32; 4],
+}
+
+#[derive(Clone)]
+struct RtAlphaTextureSource {
+    key: String,
+    width: u32,
+    height: u32,
+    clamp: bool,
+    alpha: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct RtAlphaMaterialSource {
+    uniform: MaterialUniform,
+    texture: RtAlphaTextureSource,
+}
+
+#[derive(Clone)]
+struct RtAlphaMaskSource {
+    vertices: Vec<RtAlphaVertexGpu>,
+    indices: Vec<u32>,
+    material: RtAlphaMaterialSource,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RtAlphaAttributeRange {
+    first_vertex: u32,
+    first_index: u32,
+}
+
+fn rt_alpha_texture_key(texture: Option<&TextureData>) -> String {
+    let Some(texture) = texture else { return "<rt-alpha-white>".to_owned() };
+    let count = (texture.width as usize).saturating_mul(texture.height as usize);
+    let (width, height) = if count == 0 || texture.rgba.len() < count.saturating_mul(4) {
+        (1, 1)
+    } else {
+        (texture.width, texture.height)
+    };
+    format!("{}:{}x{}:{}", texture.label, width, height, texture.clamp)
+}
+
+fn rt_alpha_texture_source(texture: Option<&TextureData>) -> RtAlphaTextureSource {
+    let Some(texture) = texture else {
+        return RtAlphaTextureSource {
+            key: "<rt-alpha-white>".to_owned(),
+            width: 1,
+            height: 1,
+            clamp: true,
+            alpha: vec![255],
+        };
+    };
+    let texel_count = (texture.width as usize).saturating_mul(texture.height as usize);
+    let mut alpha = Vec::with_capacity(texel_count);
+    for rgba in texture.rgba.get(..texel_count.saturating_mul(4)).unwrap_or(&[]).chunks_exact(4) {
+        alpha.push(rgba[3]);
+    }
+    let (width, height) = if alpha.len() != texel_count || texel_count == 0 {
+        alpha.clear();
+        alpha.push(255);
+        (1, 1)
+    } else {
+        (texture.width.max(1), texture.height.max(1))
+    };
+    RtAlphaTextureSource {
+        key: rt_alpha_texture_key(Some(texture)),
+        width,
+        height,
+        clamp: texture.clamp,
+        alpha,
+    }
+}
+
+fn rt_alpha_material_from_draw(batch: &DrawBatch, texture: Option<&TextureData>) -> RtAlphaMaterialSource {
+    RtAlphaMaterialSource {
+        // Detail textures affect RGB only; candidate rejection uses base alpha.
+        uniform: material_uniform(batch, false),
+        texture: rt_alpha_texture_source(texture),
+    }
+}
+
+fn rt_alpha_dynamic_material(texture_index: u32) -> RtAlphaMaterialGpu {
+    let mut material = RtAlphaMaterialGpu::zeroed();
+    material.color = [1.0; 4];
+    material.params[0] = 0.5;
+    material.texture[0] = texture_index;
+    material
+}
+
+fn rt_alpha_mask_source_from_gpu_vertices(
+    vertices: &[GpuVertex],
+    batch: &DrawBatch,
+    texture: Option<&TextureData>,
+) -> Option<RtAlphaMaskSource> {
+    let range = batch.vertices.start as usize..batch.vertices.end as usize;
+    let source = vertices.get(range)?;
+    if source.len() < 3 || source.len() % 3 != 0 {
+        return None;
+    }
+    Some(RtAlphaMaskSource {
+        vertices: source.iter().map(RtAlphaVertexGpu::from).collect(),
+        indices: (0..u32::try_from(source.len()).ok()?).collect(),
+        material: rt_alpha_material_from_draw(batch, texture),
+    })
+}
+
+fn rt_alpha_material_gpu(source: &RtAlphaMaterialSource, texture_index: u32) -> RtAlphaMaterialGpu {
+    let material = source.uniform;
+    RtAlphaMaterialGpu {
+        header: material.header,
+        vector_s: material.vector_s,
+        vector_t: material.vector_t,
+        mods: material.mods,
+        color: material.color,
+        params: material.params,
+        texture: [texture_index, 0, 0, 0],
+    }
+}
+
+/// One immutable object-space triangle BLAS. Static inline BSP meshes and MD3
+/// frame/surfaces share this representation; only their TLAS transform changes.
+struct RayTracedTriangleBlas {
+    _vertex_buffer: wgpu::Buffer,
+    _index_buffer: wgpu::Buffer,
+    size: wgpu::BlasTriangleGeometrySizeDescriptor,
+    blas: wgpu::Blas,
+    triangle_count: u32,
+}
+
+struct RayTracedMaskBlas {
+    sizes: Vec<wgpu::BlasTriangleGeometrySizeDescriptor>,
+    ranges: Vec<RtAlphaAttributeRange>,
+    blas: wgpu::Blas,
+    triangle_count: u32,
+    geometry_base: u32,
+}
+
+/// Persistent BLAS object for one deforming Ghoul2 entity/surface. The final
+/// skinned vertices live in DynamicModelRenderer's shared RT buffer and are
+/// rebuilt into this BLAS each RT frame; world placement is already baked into
+/// those vertices, so the TLAS instance remains identity.
+struct RayTracedSkinnedBlas {
+    size: wgpu::BlasTriangleGeometrySizeDescriptor,
+    blas: wgpu::Blas,
+}
+
+/// Hardware ray-query resources for the BSP sun-shadow visibility path.
+///
+/// This is deliberately separate from the normal cascaded-shadow bind group and
+/// pipeline layouts.  The ordinary raster shaders/layouts remain byte-for-byte
+/// unchanged until Ray Traced Shadows is selected, preserving the renderer's
+/// lazy-pipeline/zero-overhead-off principle.
+struct RayTracedShadowResources {
+    receiver_layout: wgpu::BindGroupLayout,
+    world_pipeline_layout: wgpu::PipelineLayout,
+    world_pipeline_layout_lean: wgpu::PipelineLayout,
+    world_shader: wgpu::ShaderModule,
+    world_shader_lean: wgpu::ShaderModule,
+    receiver_bind_group: wgpu::BindGroup,
+    _blas: wgpu::Blas,
+    static_mask_blas: Option<RayTracedMaskBlas>,
+    _tlas: wgpu::Tlas,
+    /// Fixed slot-per-inline-model opaque BLASes plus an optional non-opaque
+    /// alpha-tested BLAS in the paired TLAS slot.
+    inline_blas: Vec<Option<RayTracedTriangleBlas>>,
+    inline_mask_blas: Vec<Option<RayTracedMaskBlas>>,
+    rigid_blas_cache: HashMap<RayTracedRigidMeshKey, RayTracedTriangleBlas>,
+    skinned_blas_cache: HashMap<RayTracedSkinnedMeshKey, RayTracedSkinnedBlas>,
+    rigid_alpha_attributes: HashMap<RayTracedRigidMeshKey, RtAlphaAttributeRange>,
+    skinned_alpha_attributes: HashMap<Arc<str>, RtAlphaAttributeRange>,
+    alpha_vertices: Vec<RtAlphaVertexGpu>,
+    alpha_indices: Vec<u32>,
+    alpha_geometries: Vec<RtAlphaGeometryGpu>,
+    alpha_materials: Vec<RtAlphaMaterialGpu>,
+    alpha_textures: Vec<RtAlphaTextureGpu>,
+    alpha_texels: Vec<u32>,
+    alpha_texture_cache: HashMap<String, u32>,
+    alpha_vertex_buffer: wgpu::Buffer,
+    alpha_index_buffer: wgpu::Buffer,
+    alpha_geometry_buffer: wgpu::Buffer,
+    alpha_material_buffer: wgpu::Buffer,
+    alpha_texture_buffer: wgpu::Buffer,
+    alpha_texel_buffer: wgpu::Buffer,
+    alpha_dynamic_geometry_base: u32,
+    alpha_dynamic_material_base: u32,
+    alpha_buffers_generation: u64,
+    inline_slot_count: usize,
+    dynamic_instance_capacity: usize,
+    last_scene_signature: u64,
+    last_dynamic_instance_count: usize,
+    rigid_cache_limit_warned: bool,
+    skinned_cache_limit_warned: bool,
+    geometry_count: usize,
+    triangle_count: u64,
+    masked_geometry_count: usize,
+    masked_triangle_count: u64,
+    active_masked_rigid: usize,
+    active_masked_skinned: usize,
+    active_rigid_triangles: u64,
+    active_skinned_triangles: u64,
+}
+
+
+fn rt_alpha_append_texture(
+    source: &RtAlphaTextureSource,
+    textures: &mut Vec<RtAlphaTextureGpu>,
+    texels: &mut Vec<u32>,
+    cache: &mut HashMap<String, u32>,
+) -> u32 {
+    if let Some(&index) = cache.get(&source.key) {
+        return index;
+    }
+    let index = u32::try_from(textures.len()).unwrap_or(u32::MAX);
+    let offset = u32::try_from(texels.len()).unwrap_or(u32::MAX);
+    for chunk in source.alpha.chunks(4) {
+        let mut packed = 0u32;
+        for (lane, alpha) in chunk.iter().copied().enumerate() {
+            packed |= u32::from(alpha) << (lane * 8);
+        }
+        texels.push(packed);
+    }
+    textures.push(RtAlphaTextureGpu {
+        // x is the packed-u32 base. Four alpha texels occupy each word.
+        values: [offset, source.width.max(1), source.height.max(1), u32::from(source.clamp)],
+    });
+    cache.insert(source.key.clone(), index);
+    index
+}
+
+fn rt_alpha_ensure_dynamic_texture(
+    texture: Option<&TextureData>,
+    textures: &mut Vec<RtAlphaTextureGpu>,
+    texels: &mut Vec<u32>,
+    cache: &mut HashMap<String, u32>,
+) -> u32 {
+    // Check metadata before touching pixels: animated casters reuse this table
+    // every frame and often share a texture across many entity instances.
+    if let Some(&index) = cache.get(&rt_alpha_texture_key(texture)) {
+        return index;
+    }
+    rt_alpha_append_texture(&rt_alpha_texture_source(texture), textures, texels, cache)
+}
+
+fn rt_alpha_append_material(
+    source: &RtAlphaMaterialSource,
+    materials: &mut Vec<RtAlphaMaterialGpu>,
+    textures: &mut Vec<RtAlphaTextureGpu>,
+    texels: &mut Vec<u32>,
+    cache: &mut HashMap<String, u32>,
+) -> u32 {
+    let texture = rt_alpha_append_texture(&source.texture, textures, texels, cache);
+    let index = u32::try_from(materials.len()).unwrap_or(u32::MAX);
+    materials.push(rt_alpha_material_gpu(source, texture));
+    index
+}
+
+fn rt_alpha_append_attributes(
+    source: &RtAlphaMaskSource,
+    vertices: &mut Vec<RtAlphaVertexGpu>,
+    indices: &mut Vec<u32>,
+) -> RtAlphaAttributeRange {
+    let first_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+    let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+    vertices.extend_from_slice(&source.vertices);
+    indices.extend_from_slice(&source.indices);
+    RtAlphaAttributeRange { first_vertex, first_index }
+}
+
+fn rt_alpha_append_dynamic_attributes(
+    source_vertices: impl IntoIterator<Item = RtAlphaVertexGpu>,
+    source_indices: &[u32],
+    vertices: &mut Vec<RtAlphaVertexGpu>,
+    indices: &mut Vec<u32>,
+) -> RtAlphaAttributeRange {
+    let first_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+    let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+    vertices.extend(source_vertices);
+    indices.extend_from_slice(source_indices);
+    RtAlphaAttributeRange { first_vertex, first_index }
+}
+
+fn rt_alpha_empty_buffer_descriptor<T: Pod>(
+    label: &str,
+    extra_usage: wgpu::BufferUsages,
+) -> wgpu::BufferDescriptor<'_> {
+    wgpu::BufferDescriptor {
+        label: Some(label),
+        // A bound WGSL runtime array requires space for at least one element,
+        // even when this scene has no masked geometry and never indexes it.
+        size: (std::mem::size_of::<T>() as u64).max(16),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra_usage,
+        mapped_at_creation: false,
+    }
+}
+
+fn create_rt_alpha_buffer<T: Pod>(
+    device: &wgpu::Device,
+    label: &str,
+    values: &[T],
+    extra_usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    if values.is_empty() {
+        return device.create_buffer(&rt_alpha_empty_buffer_descriptor::<T>(label, extra_usage));
+    }
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(values),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra_usage,
+    })
+}
+
+fn create_rt_mask_blas(
+    device: &wgpu::Device,
+    label: &str,
+    sources: &[RtAlphaMaskSource],
+    alpha_vertices: &mut Vec<RtAlphaVertexGpu>,
+    alpha_indices: &mut Vec<u32>,
+    alpha_geometries: &mut Vec<RtAlphaGeometryGpu>,
+    alpha_materials: &mut Vec<RtAlphaMaterialGpu>,
+    alpha_textures: &mut Vec<RtAlphaTextureGpu>,
+    alpha_texels: &mut Vec<u32>,
+    texture_cache: &mut HashMap<String, u32>,
+) -> Option<RayTracedMaskBlas> {
+    if sources.is_empty() {
+        return None;
+    }
+    let geometry_base = u32::try_from(alpha_geometries.len()).ok()?;
+    let mut sizes = Vec::with_capacity(sources.len());
+    let mut ranges = Vec::with_capacity(sources.len());
+    let mut triangle_count = 0u32;
+    for source in sources {
+        if source.vertices.is_empty() || source.indices.len() < 3 || source.indices.len() % 3 != 0 {
+            continue;
+        }
+        let range = rt_alpha_append_attributes(source, alpha_vertices, alpha_indices);
+        let material_index = rt_alpha_append_material(
+            &source.material, alpha_materials, alpha_textures, alpha_texels, texture_cache,
+        );
+        let vertex_count = u32::try_from(source.vertices.len()).ok()?;
+        let index_count = u32::try_from(source.indices.len()).ok()?;
+        sizes.push(wgpu::BlasTriangleGeometrySizeDescriptor {
+            vertex_format: wgpu::VertexFormat::Float32x3,
+            vertex_count,
+            index_format: Some(wgpu::IndexFormat::Uint32),
+            index_count: Some(index_count),
+            flags: wgpu::AccelerationStructureGeometryFlags::empty(),
+        });
+        ranges.push(range);
+        alpha_geometries.push(RtAlphaGeometryGpu {
+            values: [range.first_vertex, range.first_index, material_index, 0],
+        });
+        triangle_count = triangle_count.saturating_add(index_count / 3);
+    }
+    if sizes.is_empty() {
+        return None;
+    }
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some(label),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::Triangles { descriptors: sizes.clone() },
+    );
+    Some(RayTracedMaskBlas { sizes, ranges, blas, triangle_count, geometry_base })
+}
+
+fn rt_mask_blas_build_entry<'a>(
+    resource: &'a RayTracedMaskBlas,
+    vertex_buffer: &'a wgpu::Buffer,
+    index_buffer: &'a wgpu::Buffer,
+) -> wgpu::BlasBuildEntry<'a> {
+    let geometries = resource
+        .sizes
+        .iter()
+        .zip(resource.ranges.iter())
+        .map(|(size, range)| wgpu::BlasTriangleGeometry {
+            size,
+            vertex_buffer,
+            first_vertex: range.first_vertex,
+            vertex_stride: std::mem::size_of::<RtAlphaVertexGpu>() as wgpu::BufferAddress,
+            index_buffer: Some(index_buffer),
+            first_index: Some(range.first_index),
+            transform_buffer: None,
+            transform_buffer_offset: None,
+        })
+        .collect::<Vec<_>>();
+    wgpu::BlasBuildEntry {
+        blas: &resource.blas,
+        geometry: wgpu::BlasGeometries::TriangleGeometries(geometries),
+    }
+}
+
+
+fn create_rt_triangle_blas(
+    device: &wgpu::Device,
+    label: &str,
+    positions: &[[f32; 3]],
+    indices: &[u32],
+    non_opaque: bool,
+) -> Option<RayTracedTriangleBlas> {
+    if positions.is_empty()
+        || indices.len() < 3
+        || indices.len() % 3 != 0
+        || indices.iter().any(|&index| index as usize >= positions.len())
+    {
+        return None;
+    }
+    let vertex_count = u32::try_from(positions.len()).ok()?;
+    let index_count = u32::try_from(indices.len()).ok()?;
+    let size = wgpu::BlasTriangleGeometrySizeDescriptor {
+        vertex_format: wgpu::VertexFormat::Float32x3,
+        vertex_count,
+        index_format: Some(wgpu::IndexFormat::Uint32),
+        index_count: Some(index_count),
+        flags: if non_opaque {
+            wgpu::AccelerationStructureGeometryFlags::empty()
+        } else {
+            wgpu::AccelerationStructureGeometryFlags::OPAQUE
+        },
+    };
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some(label),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::Triangles {
+            descriptors: vec![size.clone()],
+        },
+    );
+    let vertex_label = format!("{label} vertices");
+    let index_label = format!("{label} indices");
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&vertex_label),
+        contents: bytemuck::cast_slice(positions),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&index_label),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    Some(RayTracedTriangleBlas {
+        _vertex_buffer: vertex_buffer,
+        _index_buffer: index_buffer,
+        size,
+        blas,
+        triangle_count: index_count / 3,
+    })
+}
+
+fn rt_triangle_blas_build_entry(resource: &RayTracedTriangleBlas) -> wgpu::BlasBuildEntry<'_> {
+    wgpu::BlasBuildEntry {
+        blas: &resource.blas,
+        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+            size: &resource.size,
+            vertex_buffer: &resource._vertex_buffer,
+            first_vertex: 0,
+            vertex_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+            index_buffer: Some(&resource._index_buffer),
+            first_index: Some(0),
+            transform_buffer: None,
+            transform_buffer_offset: None,
+        }]),
+    }
+}
+
+fn rt_skinned_blas_build_entry<'a>(
+    resource: &'a RayTracedSkinnedBlas,
+    caster: &RayTracedSkinnedPrepared,
+    vertex_buffer: &'a wgpu::Buffer,
+    index_buffer: &'a wgpu::Buffer,
+) -> wgpu::BlasBuildEntry<'a> {
+    wgpu::BlasBuildEntry {
+        blas: &resource.blas,
+        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+            size: &resource.size,
+            vertex_buffer,
+            first_vertex: caster.first_vertex,
+            vertex_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+            index_buffer: Some(index_buffer),
+            first_index: Some(caster.first_index),
+            transform_buffer: None,
+            transform_buffer_offset: None,
+        }]),
+    }
+}
+
+fn inline_rt_pose(model: &InlineModelGpu) -> Option<InlineModelInstance> {
+    model
+        .uploaded
+        .unwrap_or_else(|| Some(InlineModelInstance::compiled(model.model)))
+}
+
+fn hash_rt_transform(hasher: &mut impl Hasher, transform: [f32; 12]) {
+    for value in transform {
+        value.to_bits().hash(hasher);
+    }
+}
+
+fn rt_dynamic_scene_signature(
+    world: &WorldGpu,
+    inline_slot_count: usize,
+    static_mask_present: bool,
+    dynamic_models: &[DynamicModelSurface],
+    dynamic_instance_capacity: usize,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    inline_slot_count.hash(&mut hasher);
+    static_mask_present.hash(&mut hasher);
+    for (slot, model) in world.inline_models.iter().take(inline_slot_count).enumerate() {
+        slot.hash(&mut hasher);
+        model.model.hash(&mut hasher);
+        model.rt_indices.is_empty().hash(&mut hasher);
+        model.rt_mask_sources.is_empty().hash(&mut hasher);
+        match inline_rt_pose(model) {
+            Some(pose) => {
+                true.hash(&mut hasher);
+                hash_rt_transform(&mut hasher, pose.rt_transform());
+            }
+            None => false.hash(&mut hasher),
+        }
+    }
+    let mut dynamic_count = 0usize;
+    for surface in dynamic_models {
+        if dynamic_count >= dynamic_instance_capacity {
+            break;
+        }
+        if !matches!(surface.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask) {
+            continue;
+        }
+        let Some(source) = surface.rt_rigid.as_ref() else { continue };
+        let non_opaque = surface.alpha_mode == DynamicModelAlphaMode::Mask;
+        source.asset_key.hash(&mut hasher);
+        source.surface_index.hash(&mut hasher);
+        source.frame.hash(&mut hasher);
+        non_opaque.hash(&mut hasher);
+        if non_opaque {
+            rt_alpha_texture_key(surface.texture.as_deref()).hash(&mut hasher);
+        }
+        hash_rt_transform(&mut hasher, source.transform);
+        dynamic_count += 1;
+    }
+    dynamic_count.hash(&mut hasher);
+    hasher.finish()
 }
 
 struct ShadowResources {
@@ -2246,6 +3037,159 @@ struct LocalShadowResources {
 struct GpuImage {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+const AUTO_DETAIL_ENABLED_BIT: u8 = 0x80;
+const AUTO_DETAIL_INDEX_MASK: u8 = 0x7f;
+
+const AUTO_DETAIL_TEXTURE_FILES: &[&str] = &[
+    "dt_brick.tga", "dt_carpet1.tga", "dt_conc.tga", "dt_fabric1.tga", "dt_fabric2.tga",
+    "dt_grass1.tga", "dt_ground1.tga", "dt_ground2.tga", "dt_ground3.tga", "dt_ground4.tga",
+    "dt_ground5.tga", "dt_leather1.tga", "dt_metal1.tga", "dt_metal2.tga", "dt_plaster1.tga",
+    "dt_plaster2.tga", "dt_rock1.tga", "dt_rough1.tga", "dt_smooth1.tga", "dt_smooth2.tga",
+    "dt_snow.tga", "dt_snow1.tga", "dt_snow2.tga", "dt_ssteel1.tga", "dt_stone1.tga",
+    "dt_stone2.tga", "dt_stone3.tga", "dt_stone4.tga", "dt_wood.tga", "dt_wood1.tga",
+    "dt_wood2.tga", "dt_wood3.tga",
+];
+
+fn auto_detail_candidates(material: u8) -> &'static [&'static str] {
+    match material & 31 {
+        1 | 2 => &["dt_wood1.tga", "dt_wood2.tga", "dt_wood3.tga", "dt_wood.tga"],
+        3 | 4 => &["dt_metal1.tga", "dt_metal2.tga", "dt_ssteel1.tga"],
+        5 | 6 => &["dt_grass1.tga"],
+        7 => &["dt_ground1.tga", "dt_ground3.tga", "dt_ground4.tga", "dt_ground5.tga"],
+        8 => &["dt_ground2.tga", "dt_ground1.tga"],
+        9 => &["dt_ground3.tga", "dt_rough1.tga"],
+        10 | 18 | 29 => &["dt_smooth1.tga", "dt_smooth2.tga"],
+        11 => &["dt_conc.tga", "dt_brick.tga", "dt_rough1.tga"],
+        12 => &["dt_smooth1.tga", "dt_stone1.tga", "dt_stone2.tga"],
+        13 | 15 => &["dt_smooth1.tga", "dt_smooth2.tga"],
+        14 => &["dt_snow.tga", "dt_snow1.tga", "dt_snow2.tga"],
+        16 => &["dt_leather1.tga", "dt_fabric1.tga"],
+        17 => &["dt_ground4.tga", "dt_ground5.tga", "dt_ground1.tga"],
+        19 => &["dt_ground5.tga", "dt_ground3.tga"],
+        20 => &["dt_grass1.tga", "dt_ground5.tga"],
+        21 => &["dt_fabric1.tga", "dt_fabric2.tga"],
+        22 => &["dt_fabric2.tga", "dt_fabric1.tga"],
+        23 => &["dt_rock1.tga", "dt_stone1.tga", "dt_stone2.tga", "dt_stone3.tga", "dt_stone4.tga", "dt_rough1.tga"],
+        24 => &["dt_smooth2.tga", "dt_rough1.tga"],
+        25 => &["dt_smooth1.tga", "dt_smooth2.tga"],
+        26 => &["dt_stone1.tga", "dt_stone2.tga", "dt_smooth1.tga"],
+        27 => &["dt_carpet1.tga", "dt_fabric1.tga"],
+        28 => &["dt_plaster1.tga", "dt_plaster2.tga"],
+        30 => &["dt_ssteel1.tga", "dt_metal2.tga", "dt_metal1.tga"],
+        31 => &["dt_metal1.tga", "dt_smooth1.tga", "dt_ssteel1.tga"],
+        _ => &["dt_rough1.tga", "dt_smooth1.tga", "dt_conc.tga"],
+    }
+}
+
+fn auto_detail_texture_index(name: &str) -> Option<u8> {
+    AUTO_DETAIL_TEXTURE_FILES
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(name))
+        .and_then(|index| u8::try_from(index).ok())
+}
+
+fn auto_detail_fallback_index() -> u8 {
+    auto_detail_texture_index("dt_rough1.tga").unwrap_or(0)
+}
+
+fn auto_detail_index_for_material(material: u8) -> u8 {
+    auto_detail_candidates(material)
+        .first()
+        .and_then(|candidate| auto_detail_texture_index(candidate))
+        .unwrap_or_else(auto_detail_fallback_index)
+}
+
+/// Resolve AUTO detail selection once per already-bound base texture. The BSP
+/// compactor already requires identical `source.texture` to merge draws, so
+/// making detail choice a pure function of that existing state cannot split a
+/// packable group. If one base image is authored with conflicting MATERIAL_*
+/// classes, use the generic fallback rather than smuggling new material state
+/// into the draw key. No shader/texture filename heuristics are used.
+fn build_auto_detail_by_base_texture<'a>(
+    texture_count: usize,
+    sources: impl Iterator<Item = &'a DrawBatch>,
+) -> Vec<u8> {
+    let fallback = auto_detail_fallback_index();
+    let mut selected = vec![None::<u8>; texture_count];
+    let mut conflicted = vec![false; texture_count];
+    let mut seen = vec![false; texture_count];
+    let mut all_eligible = vec![true; texture_count];
+
+    for source in sources {
+        let Some(texture) = source.texture else { continue; };
+        let Some(seen_slot) = seen.get_mut(texture) else { continue; };
+        *seen_slot = true;
+        if let Some(eligible) = all_eligible.get_mut(texture) {
+            *eligible &= source.detail_texture_eligible;
+        }
+        if !source.detail_texture_eligible {
+            continue;
+        }
+
+        let Some(slot) = selected.get_mut(texture) else { continue; };
+        let desired = auto_detail_index_for_material(source.surface_material);
+        match *slot {
+            None => *slot = Some(desired),
+            Some(existing) if existing == desired => {}
+            Some(_) => {
+                *slot = Some(fallback);
+                if let Some(flag) = conflicted.get_mut(texture) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+
+    selected
+        .into_iter()
+        .enumerate()
+        .map(|(texture, choice)| {
+            let index = if conflicted.get(texture).copied().unwrap_or(false) {
+                fallback
+            } else {
+                choice.unwrap_or(fallback)
+            } & AUTO_DETAIL_INDEX_MASK;
+            let eligible = seen.get(texture).copied().unwrap_or(false)
+                && all_eligible.get(texture).copied().unwrap_or(false);
+            index | if eligible { AUTO_DETAIL_ENABLED_BIT } else { 0 }
+        })
+        .collect()
+}
+
+fn required_auto_detail_indices(plan: &[u8]) -> BTreeSet<u8> {
+    plan.iter()
+        .copied()
+        .filter(|word| (word & AUTO_DETAIL_ENABLED_BIT) != 0)
+        .map(|word| word & AUTO_DETAIL_INDEX_MASK)
+        .collect()
+}
+
+fn detail_texture_for_source<'a>(
+    source: &DrawBatch,
+    manual: &'a GpuImage,
+    auto_enabled: bool,
+    auto_textures: &'a HashMap<String, GpuImage>,
+    auto_by_base_texture: &[u8],
+) -> &'a GpuImage {
+    if !auto_enabled {
+        return manual;
+    }
+    let fallback = auto_detail_fallback_index();
+    let selected = source
+        .texture
+        .and_then(|texture| auto_by_base_texture.get(texture).copied())
+        .map(|word| word & AUTO_DETAIL_INDEX_MASK)
+        .unwrap_or(fallback);
+    let name = AUTO_DETAIL_TEXTURE_FILES
+        .get(usize::from(selected))
+        .copied()
+        .unwrap_or("dt_rough1.tga");
+    auto_textures
+        .get(name)
+        .or_else(|| auto_textures.get("dt_rough1.tga"))
+        .unwrap_or(manual)
 }
 
 #[repr(C)]
@@ -2857,6 +3801,51 @@ struct Ghoul2GpuMesh {
     index_count: u32,
 }
 
+struct Ghoul2RtComputeMesh {
+    input_buffer: wgpu::Buffer,
+    draw_indices_buffer: wgpu::Buffer,
+    draw_indices_capacity: u64,
+    bind_group: wgpu::BindGroup,
+    vertex_count: u32,
+}
+
+#[derive(Clone)]
+struct Ghoul2RtComputeBatch {
+    mesh_key: Arc<str>,
+    instance_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RayTracedSkinnedMeshKey {
+    entity_num: u16,
+    mesh_key: Arc<str>,
+    non_opaque: bool,
+}
+
+#[derive(Clone)]
+struct RayTracedSkinnedPrepared {
+    key: RayTracedSkinnedMeshKey,
+    first_vertex: u32,
+    vertex_count: u32,
+    first_index: u32,
+    index_count: u32,
+    alpha_texture: Option<Arc<TextureData>>,
+}
+
+struct Ghoul2RtSkinningResources {
+    mesh_layout: wgpu::BindGroupLayout,
+    global_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    meshes: HashMap<Arc<str>, Ghoul2RtComputeMesh>,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
+    global_bind_group: wgpu::BindGroup,
+    batches: Vec<Ghoul2RtComputeBatch>,
+    casters: Vec<RayTracedSkinnedPrepared>,
+}
+
 struct Ghoul2PreparedDraw {
     mesh_key: Arc<str>,
     texture_key: Option<Arc<str>>,
@@ -2922,6 +3911,7 @@ struct DynamicGpuTexture {
 struct DynamicPreparedDraw {
     first_index: u32,
     index_count: u32,
+    base_vertex: i32,
     texture_key: Option<Arc<str>>,
     alpha_mode: DynamicModelAlphaMode,
     wireframe_class: DynamicWireframeClass,
@@ -2998,6 +3988,10 @@ struct DynamicModelRenderer {
     scratch_draw_data: Vec<Ghoul2GpuDrawUniform>,
     scratch_bone_offsets: HashMap<usize, u32>,
     scratch_skin_pending: Vec<Ghoul2PendingDraw>,
+    /// Lazily created only while RT Shadows is active. RT-off keeps the original
+    /// Ghoul2 vertex-shader skinning path and never allocates/dispatches this.
+    rt_skinning: Option<Ghoul2RtSkinningResources>,
+    rt_prepared: bool,
     // Per-frame pointer -> stable key cache. TextureData is Arc-backed and immutable
     // during prepare, so identical surfaces can avoid rebuilding the same formatted
     // texture cache key hundreds of times in crowd scenes. Cleared every frame so
@@ -3232,8 +4226,184 @@ impl DynamicModelRenderer {
             scratch_draw_data: Vec::new(),
             scratch_bone_offsets: HashMap::new(),
             scratch_skin_pending: Vec::new(),
+            rt_skinning: None,
+            rt_prepared: false,
             frame_texture_keys: HashMap::new(),
         }
+    }
+
+    fn ensure_rt_skinning_resources(&mut self, device: &wgpu::Device) {
+        if self.rt_skinning.is_some() {
+            return;
+        }
+        let mesh_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Ghoul2 RT compute mesh layout"),
+            entries: &[
+                storage_buffer_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(1, true, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let global_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Ghoul2 RT compute global layout"),
+            entries: &[
+                storage_buffer_entry(0, true, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(1, true, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(2, false, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Ghoul2 RT compute skinning pipeline layout"),
+            bind_group_layouts: &[Some(&mesh_layout), Some(&global_layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Ghoul2 RT compute skinning shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ghoul2_skin_compute.wgsl").into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("JKA Ghoul2 RT compute skinning pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let vertex_capacity = 4096;
+        let index_capacity = 4096;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA RT skinned dynamic vertex buffer"),
+            size: vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::BLAS_INPUT,
+            mapped_at_creation: false,
+        });
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA RT skinned dynamic index buffer"),
+            size: index_capacity,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::BLAS_INPUT,
+            mapped_at_creation: false,
+        });
+        let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA Ghoul2 RT compute global bind group"),
+            layout: &global_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.skin_bone_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.skin_draw_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: vertex_buffer.as_entire_binding() },
+            ],
+        });
+        self.rt_skinning = Some(Ghoul2RtSkinningResources {
+            mesh_layout,
+            global_layout,
+            pipeline,
+            meshes: HashMap::new(),
+            vertex_buffer,
+            index_buffer,
+            vertex_capacity,
+            index_capacity,
+            global_bind_group,
+            batches: Vec::new(),
+            casters: Vec::new(),
+        });
+        println!("RT Shadows: Ghoul2 compute-skin path initialized (RT-only; normal GPU skinning unchanged when RT is off)");
+    }
+
+    fn ensure_rt_skinning_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        vertex_required: u64,
+        index_required: u64,
+    ) {
+        let Some(rt) = self.rt_skinning.as_mut() else { return };
+        let mut vertex_changed = false;
+        if vertex_required > rt.vertex_capacity {
+            rt.vertex_capacity = vertex_required.next_power_of_two().max(4096);
+            rt.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA RT skinned dynamic vertex buffer"),
+                size: rt.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::BLAS_INPUT,
+                mapped_at_creation: false,
+            });
+            vertex_changed = true;
+        }
+        if index_required > rt.index_capacity {
+            rt.index_capacity = index_required.next_power_of_two().max(4096);
+            rt.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA RT skinned dynamic index buffer"),
+                size: rt.index_capacity,
+                usage: wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::BLAS_INPUT,
+                mapped_at_creation: false,
+            });
+        }
+        if vertex_changed {
+            rt.global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JKA Ghoul2 RT compute global bind group"),
+                layout: &rt.global_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.skin_bone_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.skin_draw_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: rt.vertex_buffer.as_entire_binding() },
+                ],
+            });
+        }
+    }
+
+    fn rebuild_rt_skinning_global_bind_group(&mut self, device: &wgpu::Device) {
+        let Some(rt) = self.rt_skinning.as_mut() else { return };
+        rt.global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA Ghoul2 RT compute global bind group"),
+            layout: &rt.global_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.skin_bone_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.skin_draw_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rt.vertex_buffer.as_entire_binding() },
+            ],
+        });
+    }
+
+    fn encode_rt_skinning(&self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.rt_prepared {
+            return;
+        }
+        let Some(rt) = self.rt_skinning.as_ref() else { return };
+        if rt.batches.is_empty() {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("JKA Ghoul2 RT compute skinning"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&rt.pipeline);
+        pass.set_bind_group(1, &rt.global_bind_group, &[]);
+        for batch in &rt.batches {
+            let Some(mesh) = rt.meshes.get(&batch.mesh_key) else { continue };
+            if mesh.vertex_count == 0 || batch.instance_count == 0 {
+                continue;
+            }
+            pass.set_bind_group(0, &mesh.bind_group, &[]);
+            pass.dispatch_workgroups(mesh.vertex_count.div_ceil(64), batch.instance_count, 1);
+        }
+    }
+
+    fn rt_skinned_casters(&self) -> &[RayTracedSkinnedPrepared] {
+        self.rt_skinning
+            .as_ref()
+            .filter(|_| self.rt_prepared)
+            .map_or(&[], |rt| rt.casters.as_slice())
+    }
+
+    fn rt_skinning_buffers(&self) -> Option<(&wgpu::Buffer, &wgpu::Buffer)> {
+        let rt = self.rt_skinning.as_ref().filter(|_| self.rt_prepared)?;
+        Some((&rt.vertex_buffer, &rt.index_buffer))
     }
 
     fn set_ghoul2_batch_draws(&mut self, mode: Ghoul2BatchMode) {
@@ -3380,6 +4550,7 @@ impl DynamicModelRenderer {
                     wgpu::BindGroupEntry { binding: 1, resource: self.skin_draw_buffer.as_entire_binding() },
                 ],
             });
+            self.rebuild_rt_skinning_global_bind_group(device);
         }
     }
 
@@ -3461,6 +4632,329 @@ impl DynamicModelRenderer {
         );
     }
 
+    fn prepare_rt_skinned(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surfaces: &[DynamicModelSurface],
+        classic_grid: Option<&scene::ClassicEntityLightGrid>,
+    ) {
+        self.ensure_rt_skinning_resources(device);
+        self.draws.clear();
+        self.skin_draws.clear();
+        self.frame_texture_keys.clear();
+        self.ghoul2_input_instances = 0;
+        self.ghoul2_encoded_draws = 0;
+
+        let mut vertices = std::mem::take(&mut self.scratch_vertices);
+        vertices.clear();
+        let mut indices = std::mem::take(&mut self.scratch_indices);
+        indices.clear();
+        let mut bones = std::mem::take(&mut self.scratch_bones);
+        bones.clear();
+        let mut gpu_draw_data = std::mem::take(&mut self.scratch_draw_data);
+        gpu_draw_data.clear();
+        let mut bone_offsets = std::mem::take(&mut self.scratch_bone_offsets);
+        bone_offsets.clear();
+        let mut skin_pending = std::mem::take(&mut self.scratch_skin_pending);
+        skin_pending.clear();
+
+        let estimated_vertices = surfaces.iter().map(DynamicModelSurface::vertex_count).sum();
+        let estimated_indices = surfaces.iter().map(DynamicModelSurface::index_count).sum();
+        vertices.reserve(estimated_vertices);
+        indices.reserve(estimated_indices);
+        gpu_draw_data.reserve(surfaces.len());
+        bone_offsets.reserve(surfaces.len());
+
+        let mut mesh_draw_indices = HashMap::<Arc<str>, Vec<u32>>::new();
+        let mut rt_casters = Vec::<RayTracedSkinnedPrepared>::new();
+        let mut visible_gpu_draws = 0u32;
+
+        for surface in surfaces {
+            // Camera-culled RT-only surfaces should never leak into ordinary
+            // entity rendering. Non-Ghoul2/non-RT transient surfaces have no
+            // reason to survive the presentation cull.
+            if !surface.raster_visible && surface.rt_skinned_key.is_none() {
+                continue;
+            }
+            let texture_key = surface
+                .raster_visible
+                .then(|| self.ensure_texture(device, queue, surface.texture.as_ref()))
+                .flatten();
+            let classic_light = if surface.raster_visible
+                && self.entity_ambient_lighting == EntityAmbientLightingMode::BspLightgridClassic
+                && !matches!(
+                    surface.alpha_mode,
+                    DynamicModelAlphaMode::AdditiveOne
+                        | DynamicModelAlphaMode::Additive
+                        | DynamicModelAlphaMode::BlendUnlit
+                        | DynamicModelAlphaMode::Modulate
+                )
+            {
+                match (surface.lighting_origin, classic_grid) {
+                    (Some(origin), Some(grid)) => grid.sample_classic_entity_light(origin),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(skin) = surface.ghoul2_gpu.as_ref() {
+                if skin.vertices.is_empty() || skin.indices.is_empty() || skin.bones.is_empty() {
+                    continue;
+                }
+                let mesh_key = Arc::clone(&skin.mesh_key);
+                let needs_mesh = self
+                    .rt_skinning
+                    .as_ref()
+                    .is_none_or(|rt| !rt.meshes.contains_key(&mesh_key));
+                if needs_mesh {
+                    let packed = skin
+                        .vertices
+                        .iter()
+                        .map(Ghoul2RtInputVertex::from)
+                        .collect::<Vec<_>>();
+                    let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("JKA Ghoul2 RT compute input {mesh_key}")),
+                        contents: bytemuck::cast_slice(packed.as_slice()),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                    let draw_indices_capacity = 4u64;
+                    let draw_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("JKA Ghoul2 RT draw indices {mesh_key}")),
+                        size: draw_indices_capacity,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let rt = self.rt_skinning.as_mut().expect("created above");
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("JKA Ghoul2 RT compute mesh bind group {mesh_key}")),
+                        layout: &rt.mesh_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: draw_indices_buffer.as_entire_binding() },
+                        ],
+                    });
+                    rt.meshes.insert(
+                        Arc::clone(&mesh_key),
+                        Ghoul2RtComputeMesh {
+                            input_buffer,
+                            draw_indices_buffer,
+                            draw_indices_capacity,
+                            bind_group,
+                            vertex_count: u32::try_from(skin.vertices.len()).unwrap_or(u32::MAX),
+                        },
+                    );
+                }
+
+                let base_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+                let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+                vertices.resize(
+                    vertices.len().saturating_add(skin.vertices.len()),
+                    DynamicModelVertex::zeroed(),
+                );
+                indices.extend_from_slice(skin.indices.as_slice());
+
+                let pose_key = Arc::as_ptr(&skin.bones) as usize;
+                let bone_base = match bone_offsets.entry(pose_key) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        let base = u32::try_from(bones.len()).unwrap_or(u32::MAX);
+                        bones.extend_from_slice(skin.bones.as_slice());
+                        entry.insert(base);
+                        base
+                    }
+                };
+                let draw_index = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
+                gpu_draw_data.push(Ghoul2GpuDrawUniform {
+                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], 0.0],
+                    axis1: [skin.axis[1][0], skin.axis[1][1], skin.axis[1][2], 0.0],
+                    axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
+                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
+                    color: skin.color,
+                    params: [bone_base, u32::from(classic_light.is_some()), base_vertex, 0],
+                    classic_ambient: classic_light
+                        .map(|light| [light.ambient[0], light.ambient[1], light.ambient[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_directed: classic_light
+                        .map(|light| [light.directed[0], light.directed[1], light.directed[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_direction: classic_light
+                        .map(|light| [light.direction[0], light.direction[1], light.direction[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                });
+                mesh_draw_indices
+                    .entry(Arc::clone(&mesh_key))
+                    .or_default()
+                    .push(draw_index);
+                self.ghoul2_input_instances = self.ghoul2_input_instances.saturating_add(1);
+
+                if surface.raster_visible {
+                    self.draws.push(DynamicPreparedDraw {
+                        first_index,
+                        index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
+                        base_vertex: i32::try_from(base_vertex).unwrap_or(i32::MAX),
+                        texture_key,
+                        alpha_mode: surface.alpha_mode,
+                        wireframe_class: surface.wireframe_class,
+                    });
+                    visible_gpu_draws = visible_gpu_draws.saturating_add(1);
+                }
+                if matches!(surface.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask) {
+                    if let Some(mesh_key) = surface.rt_skinned_key.as_ref() {
+                        rt_casters.push(RayTracedSkinnedPrepared {
+                            key: RayTracedSkinnedMeshKey {
+                                entity_num: surface.entity_num,
+                                mesh_key: Arc::clone(mesh_key),
+                                non_opaque: surface.alpha_mode == DynamicModelAlphaMode::Mask,
+                            },
+                            first_vertex: base_vertex,
+                            vertex_count: u32::try_from(skin.vertices.len()).unwrap_or(u32::MAX),
+                            first_index,
+                            index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
+                            alpha_texture: surface.texture.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            if surface.vertices.is_empty() || surface.indices.is_empty() {
+                continue;
+            }
+            let base_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+            let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+            if let Some(light) = classic_light {
+                for source in surface.vertices.iter() {
+                    let normal = Vec3::from_array(source.normal).normalize_or_zero();
+                    let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
+                    let mut vertex = *source;
+                    for channel in 0..3 {
+                        let illumination =
+                            (light.ambient[channel] + incoming * light.directed[channel])
+                                .clamp(0.0, 255.0)
+                                / 255.0;
+                        vertex.color[channel] *= illumination;
+                    }
+                    vertices.push(vertex);
+                }
+            } else {
+                vertices.extend_from_slice(surface.vertices.as_slice());
+            }
+            // RT-on keeps each surface's original local index values and uses
+            // base_vertex at raster time. The same ranges can therefore feed a
+            // BLAS without repacking another index stream.
+            indices.extend_from_slice(surface.indices.as_slice());
+            if surface.raster_visible {
+                self.draws.push(DynamicPreparedDraw {
+                    first_index,
+                    index_count: u32::try_from(surface.indices.len()).unwrap_or(u32::MAX),
+                    base_vertex: i32::try_from(base_vertex).unwrap_or(i32::MAX),
+                    texture_key,
+                    alpha_mode: surface.alpha_mode,
+                    wireframe_class: surface.wireframe_class,
+                });
+            }
+            if matches!(surface.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask) {
+                if let Some(mesh_key) = surface.rt_skinned_key.as_ref() {
+                    rt_casters.push(RayTracedSkinnedPrepared {
+                        key: RayTracedSkinnedMeshKey {
+                            entity_num: surface.entity_num,
+                            mesh_key: Arc::clone(mesh_key),
+                            non_opaque: surface.alpha_mode == DynamicModelAlphaMode::Mask,
+                        },
+                        first_vertex: base_vertex,
+                        vertex_count: u32::try_from(surface.vertices.len()).unwrap_or(u32::MAX),
+                        first_index,
+                        index_count: u32::try_from(surface.indices.len()).unwrap_or(u32::MAX),
+                        alpha_texture: surface.texture.clone(),
+                    });
+                }
+            }
+        }
+
+        // Material shell/custom clones can reference the same physical Ghoul2
+        // geometry. Prefer an opaque occurrence over a masked shell because the
+        // opaque surface already blocks the complete triangle in JKA's depth
+        // semantics; otherwise retain one masked caster with its alpha material.
+        let mut chosen = HashMap::<(u16, Arc<str>), usize>::new();
+        let mut deduped = Vec::<RayTracedSkinnedPrepared>::with_capacity(rt_casters.len());
+        for caster in rt_casters.drain(..) {
+            let physical = (caster.key.entity_num, Arc::clone(&caster.key.mesh_key));
+            if let Some(&index) = chosen.get(&physical) {
+                if deduped[index].key.non_opaque && !caster.key.non_opaque {
+                    deduped[index] = caster;
+                }
+                continue;
+            }
+            chosen.insert(physical, deduped.len());
+            deduped.push(caster);
+        }
+        rt_casters = deduped;
+
+        self.ghoul2_encoded_draws = visible_gpu_draws;
+        let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
+        let index_bytes = bytemuck::cast_slice(indices.as_slice());
+        let bone_bytes = bytemuck::cast_slice(bones.as_slice());
+        let draw_bytes = bytemuck::cast_slice(gpu_draw_data.as_slice());
+
+        self.ensure_skin_capacity(device, bone_bytes.len() as u64, draw_bytes.len() as u64);
+        self.ensure_rt_skinning_capacity(device, vertex_bytes.len() as u64, index_bytes.len() as u64);
+        let rt = self.rt_skinning.as_mut().expect("created above");
+        if !vertex_bytes.is_empty() {
+            queue.write_buffer(&rt.vertex_buffer, 0, vertex_bytes);
+        }
+        if !index_bytes.is_empty() {
+            queue.write_buffer(&rt.index_buffer, 0, index_bytes);
+        }
+        if !bone_bytes.is_empty() {
+            queue.write_buffer(&self.skin_bone_buffer, 0, bone_bytes);
+        }
+        if !draw_bytes.is_empty() {
+            queue.write_buffer(&self.skin_draw_buffer, 0, draw_bytes);
+        }
+
+        rt.batches.clear();
+        for (mesh_key, draw_indices) in mesh_draw_indices {
+            if draw_indices.is_empty() {
+                continue;
+            }
+            let mesh = rt.meshes.get_mut(&mesh_key).expect("created while preparing surface");
+            let bytes = bytemuck::cast_slice(draw_indices.as_slice());
+            if bytes.len() as u64 > mesh.draw_indices_capacity {
+                mesh.draw_indices_capacity = (bytes.len() as u64).next_power_of_two().max(4);
+                mesh.draw_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("JKA Ghoul2 RT draw indices {mesh_key}")),
+                    size: mesh.draw_indices_capacity,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                mesh.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("JKA Ghoul2 RT compute mesh bind group {mesh_key}")),
+                    layout: &rt.mesh_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: mesh.input_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: mesh.draw_indices_buffer.as_entire_binding() },
+                    ],
+                });
+            }
+            queue.write_buffer(&mesh.draw_indices_buffer, 0, bytes);
+            rt.batches.push(Ghoul2RtComputeBatch {
+                mesh_key,
+                instance_count: u32::try_from(draw_indices.len()).unwrap_or(u32::MAX),
+            });
+        }
+        rt.casters = rt_casters;
+        self.rt_prepared = true;
+
+        self.scratch_vertices = vertices;
+        self.scratch_indices = indices;
+        self.scratch_bones = bones;
+        self.scratch_draw_data = gpu_draw_data;
+        self.scratch_bone_offsets = bone_offsets;
+        self.scratch_skin_pending = skin_pending;
+    }
+
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -3468,7 +4962,13 @@ impl DynamicModelRenderer {
         surfaces: &[DynamicModelSurface],
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
         separate_wireframe_classes: bool,
+        ray_traced_shadows: bool,
     ) {
+        self.rt_prepared = false;
+        if ray_traced_shadows {
+            self.prepare_rt_skinned(device, queue, surfaces, classic_grid);
+            return;
+        }
         self.draws.clear();
         self.skin_draws.clear();
         self.frame_texture_keys.clear();
@@ -3613,6 +5113,7 @@ impl DynamicModelRenderer {
             self.draws.push(DynamicPreparedDraw {
                 first_index,
                 index_count: surface.indices.len() as u32,
+                base_vertex: 0,
                 texture_key,
                 alpha_mode: surface.alpha_mode,
                 wireframe_class: surface.wireframe_class,
@@ -3749,6 +5250,15 @@ impl DynamicModelRenderer {
         self.scratch_skin_pending = skin_pending;
     }
 
+    fn prepared_dynamic_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        if self.rt_prepared {
+            if let Some(rt) = self.rt_skinning.as_ref() {
+                return (&rt.vertex_buffer, &rt.index_buffer);
+            }
+        }
+        (&self.vertex_buffer, &self.index_buffer)
+    }
+
     fn draw_phase<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
@@ -3761,8 +5271,9 @@ impl DynamicModelRenderer {
         // capture, while saber glow, smoke and every other non-depth-writing FX
         // draw after the ocean surface/spray so water cannot paint over them.
         if !self.draws.is_empty() {
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_bind_group(0, camera, &[]);
 
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
@@ -3785,7 +5296,11 @@ impl DynamicModelRenderer {
                 for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
                     let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
                     pass.set_bind_group(1, bind_group, &[]);
-                    pass.draw_indexed(draw.first_index..draw.first_index.saturating_add(draw.index_count), 0, 0..1);
+                    pass.draw_indexed(
+                        draw.first_index..draw.first_index.saturating_add(draw.index_count),
+                        draw.base_vertex,
+                        0..1,
+                    );
                 }
             }
         }
@@ -3873,14 +5388,15 @@ impl DynamicModelRenderer {
             {
                 if !bound {
                     pass.set_pipeline(pipeline);
-                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                    pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(0, camera, &[]);
                     bound = true;
                 }
                 pass.draw_indexed(
                     draw.first_index..draw.first_index.saturating_add(draw.index_count),
-                    0,
+                    draw.base_vertex,
                     0..1,
                 );
             }
@@ -3921,8 +5437,9 @@ impl DynamicModelRenderer {
             (DynamicModelAlphaMode::Mask, &self.prepass_mask_pipeline, &self.skin_prepass_mask_pipeline),
         ];
         if !self.draws.is_empty() {
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_bind_group(0, camera, &[]);
             for (alpha_mode, pipeline, _) in prepass_modes {
                 let mut bound = false;
@@ -3938,7 +5455,11 @@ impl DynamicModelRenderer {
                         let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
                         pass.set_bind_group(1, bind_group, &[]);
                     }
-                    pass.draw_indexed(draw.first_index..draw.first_index.saturating_add(draw.index_count), 0, 0..1);
+                    pass.draw_indexed(
+                        draw.first_index..draw.first_index.saturating_add(draw.index_count),
+                        draw.base_vertex,
+                        0..1,
+                    );
                 }
             }
         }
@@ -4025,9 +5546,11 @@ struct WorldShaderVariantKey {
     voxel_gi: bool,
     local_shadows: bool,
     cascaded_shadows: bool,
+    ray_traced_shadows: bool,
     planar_reflections: bool,
     legacy_fog: bool,
     ocean: bool,
+    detail_texture_mode: u32,
 }
 
 impl WorldShaderVariantKey {
@@ -4039,8 +5562,8 @@ impl WorldShaderVariantKey {
         }
     }
 
-    fn compilation_constants(self) -> [(&'static str, f64); 22] {
-        [
+    fn compilation_constants(self) -> Vec<(&'static str, f64)> {
+        let mut constants = vec![
             ("ENABLE_PBR", f64::from(u8::from(self.pbr))),
             ("ENABLE_POM", f64::from(u8::from(self.pom))),
             (
@@ -4095,8 +5618,17 @@ impl WorldShaderVariantKey {
                 f64::from(u8::from(self.planar_reflections)),
             ),
             ("ENABLE_OCEAN", f64::from(u8::from(self.ocean))),
+            ("DETAIL_TEXTURE_MODE", f64::from(self.detail_texture_mode)),
             ("ENABLE_LEGACY_FOG", f64::from(u8::from(self.legacy_fog))),
-        ]
+        ];
+        // The stock BSP shaders intentionally do not declare the experimental
+        // ray-query override. Only the lazily-created RT shader receives it, so
+        // selecting any raster shadow mode keeps the normal WGSL/layout exactly
+        // as it was before hardware RT support existed.
+        if self.ray_traced_shadows {
+            constants.push(("ENABLE_RAY_TRACED_SHADOWS", 1.0));
+        }
+        constants
     }
 
     fn short_label(self) -> String {
@@ -4155,6 +5687,9 @@ impl WorldShaderVariantKey {
         if self.cascaded_shadows {
             enabled.push("sun-shadow");
         }
+        if self.ray_traced_shadows {
+            enabled.push("rt-shadow");
+        }
         if self.planar_reflections {
             enabled.push("planar");
         }
@@ -4163,6 +5698,9 @@ impl WorldShaderVariantKey {
         }
         if self.ocean {
             enabled.push("ocean");
+        }
+        if self.detail_texture_mode != 0 {
+            enabled.push("detail");
         }
         if enabled.is_empty() {
             "base".to_string()
@@ -4184,7 +5722,7 @@ struct FramePlan {
     use_clustered_lighting: bool,
 }
 
-const GPU_PASS_COUNT: usize = 13;
+const GPU_PASS_COUNT: usize = 16;
 const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 const GPU_PROFILER_SLOTS: usize = 3;
 const CULL_DIAGNOSTIC_READBACK_SLOTS: usize = 3;
@@ -4212,6 +5750,12 @@ enum GpuPass {
     // Sub-timing inside World: non-depth-writing dynamic FX deferred until after
     // ocean surface/spray composition so water cannot overpaint sabers/particles.
     DynamicModelsTranslucent = 12,
+    // Independent pre-world interval: RT-only Ghoul2 compute skinning plus
+    // dynamic BLAS/TLAS construction. Cold when RT Shadows is disabled.
+    RtBuild = 13,
+    // Sub-intervals of RtBuild; exclude from the frame-time fallback sum.
+    RtSkin = 14,
+    RtAcceleration = 15,
 }
 
 impl GpuPass {
@@ -4254,6 +5798,7 @@ impl GpuTiming {
             GpuPass::Cull,
             GpuPass::Cluster,
             GpuPass::GrassPrepare,
+            GpuPass::RtBuild,
             GpuPass::World,
             GpuPass::Post,
             GpuPass::Ui,
@@ -5029,6 +6574,12 @@ struct InlineModelGpu {
     gpu_vertex_start: u32,
     /// Compiled render-space vertices, in GPU order.
     base: Vec<GpuVertex>,
+    /// Local indices for opaque RT casting. Kept CPU-side only until the user
+    /// selects RT Shadows, at which point an immutable mover BLAS is built.
+    rt_indices: Vec<u32>,
+    /// Authored alpha-tested stages that have no opaque depth-writing sibling.
+    /// These are added to the same mover BLAS as non-opaque geometries.
+    rt_mask_sources: Vec<RtAlphaMaskSource>,
     coarse_batches: Vec<usize>,
     full_batches: Vec<usize>,
     /// Last uploaded pose: `None` = never updated (buffer holds the compiled
@@ -5052,6 +6603,12 @@ struct WorldGpu {
     inline_models: Vec<InlineModelGpu>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    /// Opaque, static-world index ranges eligible for the ray-query BLAS.
+    rt_shadow_ranges: Vec<std::ops::Range<u32>>,
+    /// Alpha-tested static stages with no opaque depth-writing sibling. They are
+    /// stored as compact CPU geometry only until RT Shadows is selected.
+    rt_shadow_masks: Vec<RtAlphaMaskSource>,
+    rt_vertex_count: u32,
     /// Coarsest clipmap cell size; the clipmap centre snaps to this lattice.
     ocean_coarsest_spacing: f32,
     cull_records_buffer: wgpu::Buffer,
@@ -5138,6 +6695,11 @@ struct WorldGpu {
     static_ao_gpu_vertices: Vec<GpuVertex>,
     static_ao_lightmap_active: bool,
     texture_clamp: Vec<bool>,
+    /// AUTO detail image index keyed by the already-bound base texture index.
+    /// This keeps detail selection packing-neutral: batches that can share a draw
+    /// already require the same base texture, so they necessarily resolve the
+    /// same detail image. Conflicting MATERIAL_* uses collapse to generic.
+    detail_texture_by_base: Vec<u8>,
     material_debug: scene::MaterialDebugInfo,
     inspector_vertices: Vec<InspectorVertex>,
     inspector_textures: Vec<InspectorTextureMeta>,
@@ -7241,6 +8803,8 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    ray_tracing_supported: bool,
+    ray_traced_shadows: Option<RayTracedShadowResources>,
     size: PhysicalSize<u32>,
     present_modes: Vec<wgpu::PresentMode>,
     /// Set by [`Renderer::request_scene_rebuild`], consumed once per frame.
@@ -7269,6 +8833,10 @@ struct Renderer {
     ocean_optics: crate::ocean::optics::Resources,
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
+    detail_texture: GpuImage,
+    detail_texture_auto: bool,
+    detail_texture_game: Option<PathBuf>,
+    detail_auto_textures: HashMap<String, GpuImage>,
     ocean: Option<crate::ocean::OceanGpu>,
     authored_oceans: Vec<(crate::ocean::authoring::AuthoredOcean, crate::ocean::OceanGpu)>,
     authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
@@ -7337,6 +8905,9 @@ struct Renderer {
     lightmap_sampler: wgpu::Sampler,
     sky_sampler: wgpu::Sampler,
     texture_filter: TextureFilter,
+    detail_textures_mode: DetailTextureMode,
+    detail_texture_fade: bool,
+    detail_texture_fade_distance: f32,
     gamma: f32,
     hdr_enabled: bool,
     tone_mapping_enabled: bool,
@@ -7742,6 +9313,7 @@ impl Renderer {
         base: &Path,
         game: Option<&Path>,
         desired_maximum_frame_latency: u32,
+        _detail_texture_path: &str,
     ) -> Result<Self, String> {
         let size = window.inner_size();
         let adapter_started = Instant::now();
@@ -7786,6 +9358,8 @@ impl Renderer {
         let timestamp_encoder_feature = wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         let timestamp_pass_feature = wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let bc_compression_feature = wgpu::Features::TEXTURE_COMPRESSION_BC;
+        let ray_query_feature = wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+        let ray_tracing_supported = adapter_features.contains(ray_query_feature);
         let bc_compression_supported = adapter_features.contains(bc_compression_feature);
         let wireframe_supported = adapter_features.contains(wireframe_feature);
         let gpu_compaction_supported =
@@ -7817,6 +9391,9 @@ impl Renderer {
                 required_features |= timestamp_pass_feature;
             }
         }
+        if ray_tracing_supported {
+            required_features |= ray_query_feature;
+        }
         println!(
             "Wireframe polygon mode: {}",
             if wireframe_supported {
@@ -7836,6 +9413,14 @@ impl Renderer {
         println!(
             "PBR companion BC compression: {}",
             if bc_compression_supported { "supported" } else { "unavailable" }
+        );
+        println!(
+            "Hardware ray queries: {}",
+            if ray_tracing_supported {
+                "supported (RT Shadows available)"
+            } else {
+                "unavailable on this adapter/backend"
+            }
         );
         println!(
             "GPU timestamps: {}{}",
@@ -7858,7 +9443,13 @@ impl Renderer {
                 label: Some("DinurdoJK renderer"),
                 required_features,
                 required_limits: adapter.limits(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                experimental_features: if ray_tracing_supported {
+                    // wgpu 29 gates the native ray-query API behind its explicit
+                    // experimental-feature token as well as EXPERIMENTAL_RAY_QUERY.
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -8022,6 +9613,8 @@ impl Renderer {
                 sampler_entry_stages(27, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 sampler_entry(28),
                 texture_entry(29),
+                texture_entry(30),
+                sampler_entry(31),
             ],
         });
         // Exact descriptor layouts used by the known-fast renderer. Advanced
@@ -8375,6 +9968,24 @@ impl Renderer {
             &missing_texture_data,
         );
         let ocean_spray_albedo = upload_texture(&device, &queue, &ocean_spray_albedo_data);
+        // Detail textures are permanently AUTO and intentionally lazy. Renderer
+        // startup must not scan/decode the DT_* library before a BSP even exists.
+        // This neutral 1x1 is only a safe binding fallback until the current map's
+        // MATERIAL_* plan requests real detail images.
+        let detail_texture_auto = true;
+        let detail_texture_data = TextureData {
+            label: "neutral AUTO BSP detail fallback".to_owned(),
+            source: None,
+            width: 1,
+            height: 1,
+            rgba: vec![128, 128, 128, 255],
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: false,
+            srgb: true,
+        };
+        let detail_texture = upload_texture(&device, &queue, &detail_texture_data);
+        let detail_auto_textures = HashMap::new();
         let world_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("JKA BSP pipeline layout"),
@@ -9377,6 +10988,8 @@ impl Renderer {
             device,
             queue,
             config,
+            ray_tracing_supported,
+            ray_traced_shadows: None,
             size,
             present_modes: caps.present_modes,
             scene_rebuild_pending: false,
@@ -9404,6 +11017,10 @@ impl Renderer {
             ocean_optics,
             ocean_inert_bind_group,
             ocean_spray_albedo,
+            detail_texture,
+            detail_texture_auto,
+            detail_texture_game: game.map(Path::to_path_buf),
+            detail_auto_textures,
             ocean: None,
             authored_oceans: Vec::new(),
             authored_ocean_definitions: Vec::new(),
@@ -9467,6 +11084,9 @@ impl Renderer {
             lightmap_sampler,
             sky_sampler,
             texture_filter,
+            detail_textures_mode: DetailTextureMode::Off,
+            detail_texture_fade: false,
+            detail_texture_fade_distance: 512.0,
             gamma,
             hdr_enabled: false,
             tone_mapping_enabled: false,
@@ -10462,6 +12082,7 @@ impl Renderer {
             lightmaps,
             deluxemaps,
             texture_clamp,
+            detail_texture_by_base,
             reflection_probes,
             coarse_batches,
             full_batches,
@@ -10480,6 +12101,13 @@ impl Renderer {
             .chain(auto2_batches.iter_mut())
             .chain(auto4_batches.iter_mut())
         {
+            let detail_texture = detail_texture_for_source(
+                &batch.source,
+                &self.detail_texture,
+                self.detail_texture_auto,
+                &self.detail_auto_textures,
+                detail_texture_by_base,
+            );
             batch.bind_group = create_world_bind_group(
                 &self.device,
                 &self.surface_layout,
@@ -10492,6 +12120,7 @@ impl Renderer {
                 &self.pbr_clamp_sampler,
                 &self.lightmap_sampler,
                 &self.sky_sampler,
+                detail_texture,
                 textures,
                 lightmaps,
                 deluxemaps,
@@ -10762,6 +12391,10 @@ impl Renderer {
         let weather_occlusion = map.weather_occlusion.take();
         self.weather.rain.start_map_occlusion(weather_occlusion);
         self.inspector_vertex_range = None;
+        // Acceleration structures point at the previous world's buffers. Drop
+        // them before replacing the world; they are rebuilt lazily below only
+        // when RT Shadows is actually selected.
+        self.ray_traced_shadows = None;
         self.surface_deformation.clear(&self.queue);
         let footprint_mask = map
             .footprint_mark_textures
@@ -10801,7 +12434,23 @@ impl Renderer {
             }),
         );
         let source_map = map.map_file_stats.is_some();
-        let initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
+        // The BLAS needs the uploaded world buffers, so map upload always creates
+        // a normal raster variant first.  If RT Shadows is selected we build the
+        // acceleration structures immediately after WorldGpu is installed, then
+        // lazily compile/switch to the dedicated RT pipeline variant.
+        let mut initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
+        initial_shader_variant.ray_traced_shadows = false;
+        let detail_texture_by_base = build_auto_detail_by_base_texture(
+            map.textures.len(),
+            map.batches
+                .iter()
+                .chain(map.pvs_batches.iter())
+                .chain(map.portal_batches.iter())
+                .chain(map.inline_batches.iter()),
+        );
+        if self.detail_textures_mode != DetailTextureMode::Off {
+            self.ensure_auto_detail_textures_for_plan(&detail_texture_by_base);
+        }
         let (world_pipeline_layout, world_shader) = match initial_shader_variant.family() {
             WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
@@ -10818,6 +12467,7 @@ impl Renderer {
             &self.fast_world_shader,
             self.scene_format(),
             self.msaa_samples,
+            self.ray_tracing_supported,
             initial_shader_variant.legacy_fog,
             &self.white,
             &self.missing,
@@ -10828,6 +12478,10 @@ impl Renderer {
             &self.pbr_clamp_sampler,
             &self.lightmap_sampler,
             &self.sky_sampler,
+            &self.detail_texture,
+            self.detail_texture_auto,
+            &self.detail_auto_textures,
+            detail_texture_by_base,
             &self.cluster_compute_layout,
             &self.lighting_layout,
             &self.lighting_layout_lean,
@@ -10876,6 +12530,9 @@ impl Renderer {
             &self.weather.rain.gpu.wind_noise_sampler,
         ));
         self.world = Some(world);
+        if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+            self.ensure_ray_traced_shadow_resources();
+        }
         // build_world allocates the fixed-capacity storage with every authored
         // light so the buffer exists before Renderer owns the WorldGpu. Rewrite
         // it immediately through the active source-class filter: source .map
@@ -10940,6 +12597,8 @@ impl Renderer {
     }
 
     fn unload_map(&mut self) {
+        // BLAS/TLAS resources refer to the current world's static geometry.
+        self.ray_traced_shadows = None;
         // Returning to the front end is a real world teardown, not just another
         // overlay over the last gameplay frame. Drop all map-owned GPU state so
         // the renderer returns to the same world-less state used at startup.
@@ -11208,6 +12867,9 @@ impl Renderer {
                 &self.pbr_clamp_sampler,
                 &self.lightmap_sampler,
                 &self.sky_sampler,
+                &self.detail_texture,
+                self.detail_texture_auto,
+                &self.detail_auto_textures,
                 self.surface_deformation.buffer(),
                 self.surface_deformation.field_views(),
                 self.surface_deformation.field_sampler(),
@@ -11226,6 +12888,150 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    fn ensure_auto_detail_textures_for_plan(&mut self, plan: &[u8]) {
+        if !self.detail_texture_auto {
+            return;
+        }
+        let mut needed = required_auto_detail_indices(plan);
+        if needed.is_empty() {
+            return;
+        }
+        needed.insert(auto_detail_fallback_index());
+        needed.retain(|index| {
+            AUTO_DETAIL_TEXTURE_FILES
+                .get(usize::from(*index))
+                .is_some_and(|name| !self.detail_auto_textures.contains_key(*name))
+        });
+        if needed.is_empty() {
+            return;
+        }
+
+        let started = Instant::now();
+        let mut assets = match AssetSearchPath::open_game(&self.base, self.detail_texture_game.as_deref()) {
+            Ok(assets) => assets,
+            Err(error) => {
+                eprintln!("AUTO BSP detail texture asset search: {error}");
+                return;
+            }
+        };
+        const PREFIX: &str = "textures/japro/detail/";
+        let available = assets
+            .names()
+            .filter(|name| name.to_ascii_lowercase().starts_with(PREFIX))
+            .filter_map(|name| {
+                name.rsplit('/')
+                    .next()
+                    .map(|leaf| (leaf.to_ascii_lowercase(), name.to_owned()))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut loaded = 0usize;
+        for index in needed {
+            let Some(wanted) = AUTO_DETAIL_TEXTURE_FILES.get(usize::from(index)).copied() else {
+                continue;
+            };
+            let Some(path) = available.get(wanted) else {
+                eprintln!("AUTO BSP detail texture: missing {PREFIX}{wanted}");
+                continue;
+            };
+            let Some(data) = try_load_texture_asset_from_search_path(
+                &mut assets,
+                path,
+                false,
+                true,
+                true,
+                "AUTO BSP detail texture",
+            ) else {
+                continue;
+            };
+            self.detail_auto_textures
+                .insert(wanted.to_owned(), upload_texture(&self.device, &self.queue, &data));
+            loaded += 1;
+        }
+        println!(
+            "AUTO BSP detail cache: loaded {} texture(s) lazily in {:.1} ms ({} cached)",
+            loaded,
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.detail_auto_textures.len(),
+        );
+    }
+
+    fn set_detail_textures(&mut self, mode: DetailTextureMode) {
+        if self.detail_textures_mode == mode {
+            return;
+        }
+        self.detail_textures_mode = mode;
+
+        // If a map was loaded while details were disabled, populate only the
+        // textures selected by that world's MATERIAL_* plan when details are
+        // enabled. The world keeps the plan specifically so this stays lazy.
+        if mode != DetailTextureMode::Off {
+            let plan = self
+                .world
+                .as_ref()
+                .map(|world| world.detail_texture_by_base.clone());
+            if let Some(plan) = plan {
+                self.ensure_auto_detail_textures_for_plan(&plan);
+                if let Some(mut world) = self.world.take() {
+                    self.rebuild_world_surface_bind_groups(&mut world);
+                    self.world = Some(world);
+                }
+            }
+        }
+
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+        println!(
+            "Detail textures: {} (textures/japro/detail; eligible opaque BSP stages only)",
+            mode.label()
+        );
+    }
+
+    fn set_detail_texture(&mut self, _path: &str, game: Option<&Path>) {
+        // The image choice is permanently AUTO. A game/mod change invalidates
+        // only the cached DT_* images; do not repopulate them until a loaded
+        // world actually needs them.
+        self.detail_texture_auto = true;
+        let next_game = game.map(Path::to_path_buf);
+        if self.detail_texture_game == next_game {
+            return;
+        }
+        self.detail_texture_game = next_game;
+        self.detail_auto_textures.clear();
+
+        let plan = self
+            .world
+            .as_ref()
+            .map(|world| world.detail_texture_by_base.clone());
+        if self.detail_textures_mode != DetailTextureMode::Off {
+            if let Some(plan) = plan {
+                self.ensure_auto_detail_textures_for_plan(&plan);
+                if let Some(mut world) = self.world.take() {
+                    self.rebuild_world_surface_bind_groups(&mut world);
+                    self.world = Some(world);
+                }
+            }
+        }
+        println!("Detail texture image: AUTO (lazy MATERIAL_* selection)");
+    }
+
+    fn set_detail_texture_fade(&mut self, enabled: bool, distance: f32) {
+        let distance = distance.clamp(64.0, 8192.0);
+        if self.detail_texture_fade == enabled
+            && (self.detail_texture_fade_distance - distance).abs() < 0.01
+        {
+            return;
+        }
+        self.detail_texture_fade = enabled;
+        self.detail_texture_fade_distance = distance;
+        self.write_material_enhancement_settings();
+        println!(
+            "Detail texture distance fade: {} (distance {:.0})",
+            if enabled { "ON" } else { "OFF" },
+            distance,
+        );
     }
 
     fn set_wireframe_mask(&mut self, mask: u32) {
@@ -11332,9 +13138,19 @@ impl Renderer {
         if needs_deformed_world {
             if let Some(key) = active_key {
                 if !self.world_wireframe_pipelines.contains_key(&key) {
-                    let (layout, shader) = match key.family() {
-                        WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
-                        WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+                    let (layout, shader) = if key.ray_traced_shadows {
+                        let Some(rt) = self.ray_traced_shadows.as_ref() else {
+                            return;
+                        };
+                        match key.family() {
+                            WorldShaderFamily::Lean => (&rt.world_pipeline_layout_lean, &rt.world_shader_lean),
+                            WorldShaderFamily::Enhanced => (&rt.world_pipeline_layout, &rt.world_shader),
+                        }
+                    } else {
+                        match key.family() {
+                            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+                            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+                        }
                     };
                     let pipeline = create_world_wireframe_pipeline(
                         &self.device,
@@ -11394,6 +13210,967 @@ impl Renderer {
         true
     }
 
+    /// Build the static BSP BLAS/TLAS and the matching ray-query BSP shader.
+    /// Opaque geometry stays on the fast auto-commit path. Authored mask stages
+    /// are separate non-opaque geometries so WGSL can evaluate candidate alpha
+    /// exactly before confirming a shadow hit. Everything remains cold/lazy.
+    fn ensure_ray_traced_shadow_resources(&mut self) -> bool {
+        if self.ray_traced_shadows.is_some() {
+            return true;
+        }
+        if !self.ray_tracing_supported {
+            println!("RT Shadows: unavailable - EXPERIMENTAL_RAY_QUERY is not supported by this adapter/backend");
+            return false;
+        }
+
+        let Some(world) = self.world.as_ref() else {
+            return false;
+        };
+        if world.rt_shadow_ranges.is_empty() || world.rt_vertex_count == 0 {
+            println!("RT Shadows: current map has no eligible opaque static BSP triangles");
+            return false;
+        }
+
+        let geometry_count = world.rt_shadow_ranges.len();
+        let triangle_count = world
+            .rt_shadow_ranges
+            .iter()
+            .map(|range| u64::from(range.end.saturating_sub(range.start) / 3))
+            .sum::<u64>();
+        let limits = self.device.limits();
+        if geometry_count > limits.max_blas_geometry_count as usize {
+            println!(
+                "RT Shadows: map requires {geometry_count} opaque BLAS geometries, adapter limit is {}; leaving RT shadows inactive",
+                limits.max_blas_geometry_count
+            );
+            return false;
+        }
+        if triangle_count > u64::from(limits.max_blas_primitive_count) {
+            println!(
+                "RT Shadows: map requires {triangle_count} opaque BLAS triangles, adapter limit is {}; leaving RT shadows inactive",
+                limits.max_blas_primitive_count
+            );
+            return false;
+        }
+        let max_tlas_instances = limits.max_tlas_instance_count as usize;
+        if max_tlas_instances == 0 {
+            println!("RT Shadows: adapter reports max_tlas_instance_count=0; leaving RT shadows inactive");
+            return false;
+        }
+
+        let geometry_sizes = world
+            .rt_shadow_ranges
+            .iter()
+            .map(|range| wgpu::BlasTriangleGeometrySizeDescriptor {
+                vertex_format: wgpu::VertexFormat::Float32x3,
+                vertex_count: world.rt_vertex_count,
+                index_format: Some(wgpu::IndexFormat::Uint32),
+                index_count: Some(range.end.saturating_sub(range.start)),
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect::<Vec<_>>();
+
+        let blas = self.device.create_blas(
+            &wgpu::CreateBlasDescriptor {
+                label: Some("JKA RT Shadows static opaque BSP BLAS"),
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            },
+            wgpu::BlasGeometrySizeDescriptors::Triangles { descriptors: geometry_sizes.clone() },
+        );
+
+        // Build candidate-attribute storage only for alpha-tested geometry. This
+        // data does not exist at all until RT Shadows is selected.
+        let mut alpha_vertices = Vec::<RtAlphaVertexGpu>::new();
+        let mut alpha_indices = Vec::<u32>::new();
+        let mut alpha_geometries = Vec::<RtAlphaGeometryGpu>::new();
+        let mut alpha_materials = Vec::<RtAlphaMaterialGpu>::new();
+        let mut alpha_textures = Vec::<RtAlphaTextureGpu>::new();
+        let mut alpha_texels = Vec::<u32>::new();
+        let mut alpha_texture_cache = HashMap::<String, u32>::new();
+
+        let static_mask_blas = if world.rt_shadow_masks.len() <= limits.max_blas_geometry_count as usize {
+            create_rt_mask_blas(
+                &self.device,
+                "JKA RT Shadows static alpha-tested BSP BLAS",
+                &world.rt_shadow_masks,
+                &mut alpha_vertices,
+                &mut alpha_indices,
+                &mut alpha_geometries,
+                &mut alpha_materials,
+                &mut alpha_textures,
+                &mut alpha_texels,
+                &mut alpha_texture_cache,
+            )
+        } else {
+            println!(
+                "RT Shadows: {} static masked geometries exceed adapter BLAS geometry limit {}; masked BSP casting disabled",
+                world.rt_shadow_masks.len(), limits.max_blas_geometry_count
+            );
+            None
+        };
+
+        // Each mover can consume two fixed TLAS slots (opaque + alpha-tested).
+        // Reserve static world slots first, then the bounded dynamic tail.
+        let static_slot_count = 1usize + usize::from(static_mask_blas.is_some());
+        let inline_slot_count = world
+            .inline_models
+            .len()
+            .min(max_tlas_instances.saturating_sub(static_slot_count) / 2);
+        if inline_slot_count < world.inline_models.len() {
+            println!(
+                "RT Shadows: TLAS limit {} truncates inline BSP casters from {} to {}",
+                limits.max_tlas_instance_count, world.inline_models.len(), inline_slot_count
+            );
+        }
+
+        let mut inline_blas = (0..inline_slot_count)
+            .map(|_| None)
+            .collect::<Vec<Option<RayTracedTriangleBlas>>>();
+        let mut inline_mask_blas = (0..inline_slot_count)
+            .map(|_| None)
+            .collect::<Vec<Option<RayTracedMaskBlas>>>();
+        let mut inline_triangle_count = 0u64;
+        let mut inline_geometry_count = 0usize;
+        let mut inline_mask_triangle_count = 0u64;
+        let mut inline_mask_geometry_count = 0usize;
+        for (slot, model) in world.inline_models.iter().take(inline_slot_count).enumerate() {
+            if !model.rt_indices.is_empty() {
+                let triangles = model.rt_indices.len() / 3;
+                if triangles <= limits.max_blas_primitive_count as usize {
+                    let positions = model.base.iter().map(|vertex| vertex.position).collect::<Vec<_>>();
+                    let label = format!("JKA RT Shadows inline BSP *{} opaque BLAS", model.model);
+                    if let Some(resource) = create_rt_triangle_blas(
+                        &self.device, &label, &positions, &model.rt_indices, false,
+                    ) {
+                        inline_triangle_count += u64::from(resource.triangle_count);
+                        inline_geometry_count += 1;
+                        inline_blas[slot] = Some(resource);
+                    }
+                }
+            }
+            if model.rt_mask_sources.len() <= limits.max_blas_geometry_count as usize {
+                let label = format!("JKA RT Shadows inline BSP *{} alpha-tested BLAS", model.model);
+                if let Some(resource) = create_rt_mask_blas(
+                    &self.device,
+                    &label,
+                    &model.rt_mask_sources,
+                    &mut alpha_vertices,
+                    &mut alpha_indices,
+                    &mut alpha_geometries,
+                    &mut alpha_materials,
+                    &mut alpha_textures,
+                    &mut alpha_texels,
+                    &mut alpha_texture_cache,
+                ) {
+                    inline_mask_triangle_count += u64::from(resource.triangle_count);
+                    inline_mask_geometry_count += resource.sizes.len();
+                    inline_mask_blas[slot] = Some(resource);
+                }
+            }
+        }
+
+        let fixed_slot_count = static_slot_count + inline_slot_count.saturating_mul(2);
+        let dynamic_instance_capacity = max_tlas_instances
+            .saturating_sub(fixed_slot_count)
+            .min(RT_DYNAMIC_TLAS_INSTANCE_BUDGET);
+        let tlas_instance_capacity = fixed_slot_count + dynamic_instance_capacity;
+
+        // Reserve one geometry/material record per dynamic TLAS slot. Masked
+        // instances overwrite their slot every frame; opaque instances never
+        // enter candidate handling, so their record is irrelevant.
+        let alpha_dynamic_geometry_base = u32::try_from(alpha_geometries.len()).unwrap_or(u32::MAX);
+        let alpha_dynamic_material_base = u32::try_from(alpha_materials.len()).unwrap_or(u32::MAX);
+        alpha_geometries.resize(
+            alpha_geometries.len().saturating_add(dynamic_instance_capacity),
+            RtAlphaGeometryGpu::zeroed(),
+        );
+        alpha_materials.resize(
+            alpha_materials.len().saturating_add(dynamic_instance_capacity),
+            RtAlphaMaterialGpu::zeroed(),
+        );
+
+        let alpha_vertex_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha candidate vertices", &alpha_vertices, wgpu::BufferUsages::BLAS_INPUT,
+        );
+        let alpha_index_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha candidate indices", &alpha_indices, wgpu::BufferUsages::BLAS_INPUT,
+        );
+        let alpha_geometry_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha geometry table", &alpha_geometries, wgpu::BufferUsages::empty(),
+        );
+        let alpha_material_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha material table", &alpha_materials, wgpu::BufferUsages::empty(),
+        );
+        let alpha_texture_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha texture table", &alpha_textures, wgpu::BufferUsages::empty(),
+        );
+        let alpha_texel_buffer = create_rt_alpha_buffer(
+            &self.device, "JKA RT alpha texels", &alpha_texels, wgpu::BufferUsages::empty(),
+        );
+
+        let mut tlas = self.device.create_tlas(&wgpu::CreateTlasDescriptor {
+            label: Some("JKA RT Shadows world + dynamic TLAS"),
+            max_instances: u32::try_from(tlas_instance_capacity).unwrap_or(limits.max_tlas_instance_count),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        });
+        let identity = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        tlas[0] = Some(wgpu::TlasInstance::new(&blas, identity, 0, 0xff));
+        let mut inline_base = 1usize;
+        if let Some(mask) = static_mask_blas.as_ref() {
+            tlas[1] = Some(wgpu::TlasInstance::new(
+                &mask.blas, identity, mask.geometry_base, 0xff,
+            ));
+            inline_base += 1;
+        }
+        for slot in 0..inline_slot_count {
+            let Some(model) = world.inline_models.get(slot) else { continue };
+            let Some(pose) = inline_rt_pose(model) else { continue };
+            let base = inline_base + slot * 2;
+            if let Some(caster) = inline_blas[slot].as_ref() {
+                tlas[base] = Some(wgpu::TlasInstance::new(&caster.blas, pose.rt_transform(), 0, 0xff));
+            }
+            if let Some(caster) = inline_mask_blas[slot].as_ref() {
+                tlas[base + 1] = Some(wgpu::TlasInstance::new(
+                    &caster.blas, pose.rt_transform(), caster.geometry_base, 0xff,
+                ));
+            }
+        }
+
+        let geometries = world
+            .rt_shadow_ranges
+            .iter()
+            .zip(geometry_sizes.iter())
+            .map(|(range, size)| wgpu::BlasTriangleGeometry {
+                size,
+                vertex_buffer: &world.vertex_buffer,
+                first_vertex: 0,
+                vertex_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                index_buffer: Some(&world.index_buffer),
+                first_index: Some(range.start),
+                transform_buffer: None,
+                transform_buffer_offset: None,
+            })
+            .collect::<Vec<_>>();
+        let static_blas_build = wgpu::BlasBuildEntry {
+            blas: &blas,
+            geometry: wgpu::BlasGeometries::TriangleGeometries(geometries),
+        };
+        let inline_blas_builds = inline_blas
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(rt_triangle_blas_build_entry)
+            .collect::<Vec<_>>();
+        let static_mask_build = static_mask_blas
+            .as_ref()
+            .map(|mask| rt_mask_blas_build_entry(mask, &alpha_vertex_buffer, &alpha_index_buffer));
+        let inline_mask_builds = inline_mask_blas
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|mask| rt_mask_blas_build_entry(mask, &alpha_vertex_buffer, &alpha_index_buffer))
+            .collect::<Vec<_>>();
+        let mut blas_builds = Vec::with_capacity(
+            1 + inline_blas_builds.len() + usize::from(static_mask_build.is_some()) + inline_mask_builds.len(),
+        );
+        blas_builds.push(static_blas_build);
+        blas_builds.extend(inline_blas_builds);
+        if let Some(build) = static_mask_build {
+            blas_builds.push(build);
+        }
+        blas_builds.extend(inline_mask_builds);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("JKA RT Shadows acceleration-structure build"),
+        });
+        encoder.build_acceleration_structures(blas_builds.iter(), std::iter::once(&tlas));
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let receiver_layout = create_ray_traced_shadow_receiver_layout(&self.device);
+        let world_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA BSP ray-traced-shadow pipeline layout"),
+            bind_group_layouts: &[
+                Some(&self.camera_layout),
+                Some(&self.surface_layout),
+                Some(&self.lighting_layout),
+                Some(&receiver_layout),
+                Some(&self.planar_reflection_layout),
+                Some(&self.ocean_optics_layout),
+                Some(&self.ocean_layout),
+            ],
+            immediate_size: 0,
+        });
+        let world_pipeline_layout_lean = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA BSP ray-traced-shadow pipeline layout (lean baseline)"),
+            bind_group_layouts: &[
+                Some(&self.camera_layout),
+                Some(&self.surface_layout),
+                Some(&self.lighting_layout_lean),
+                Some(&receiver_layout),
+                Some(&self.planar_reflection_layout),
+            ],
+            immediate_size: 0,
+        });
+
+        let world_shader_source = ray_traced_world_shader_source(include_str!("bsp.wgsl"))
+            .expect("RT Shadows: bsp.wgsl transform must match the renderer shader");
+        let world_shader_lean_source = ray_traced_world_shader_source(include_str!("bsp_lean.wgsl"))
+            .expect("RT Shadows: bsp_lean.wgsl transform must match the renderer shader");
+        let world_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA BSP shader (hardware ray-traced shadows)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\
+{}", world_shader_source, include_str!("surface_deformation.wgsl")).into(),
+            ),
+        });
+        let world_shader_lean = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA BSP shader lean (hardware ray-traced shadows)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\
+{}", world_shader_lean_source, include_str!("surface_deformation.wgsl")).into(),
+            ),
+        });
+        let receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
+            &self.device,
+            &receiver_layout,
+            &self.shadow_resources._array_view,
+            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+                &self.shadow_resources.bevy_sampler
+            } else {
+                &self.shadow_resources.legacy_sampler
+            },
+            &self.shadow_resources.sky_array_view,
+            &self.shadow_resources.receiver_buffer,
+            self.weather.fog.legacy_control_buffer(),
+            &self.shadow_resources.weather_height_view,
+            &self.shadow_resources.weather_sampler,
+            &self.shadow_resources.weather_surface_buffer,
+            &tlas,
+            &alpha_vertex_buffer,
+            &alpha_index_buffer,
+            &alpha_geometry_buffer,
+            &alpha_material_buffer,
+            &alpha_texture_buffer,
+            &alpha_texel_buffer,
+        );
+
+        let static_mask_geometry_count = static_mask_blas.as_ref().map_or(0, |mask| mask.sizes.len());
+        let static_mask_triangle_count = static_mask_blas.as_ref().map_or(0, |mask| u64::from(mask.triangle_count));
+        let masked_geometry_count = static_mask_geometry_count + inline_mask_geometry_count;
+        let masked_triangle_count = static_mask_triangle_count + inline_mask_triangle_count;
+
+        self.ray_traced_shadows = Some(RayTracedShadowResources {
+            receiver_layout,
+            world_pipeline_layout,
+            world_pipeline_layout_lean,
+            world_shader,
+            world_shader_lean,
+            receiver_bind_group,
+            _blas: blas,
+            static_mask_blas,
+            _tlas: tlas,
+            inline_blas,
+            inline_mask_blas,
+            rigid_blas_cache: HashMap::new(),
+            skinned_blas_cache: HashMap::new(),
+            rigid_alpha_attributes: HashMap::new(),
+            skinned_alpha_attributes: HashMap::new(),
+            alpha_vertices,
+            alpha_indices,
+            alpha_geometries,
+            alpha_materials,
+            alpha_textures,
+            alpha_texels,
+            alpha_texture_cache,
+            alpha_vertex_buffer,
+            alpha_index_buffer,
+            alpha_geometry_buffer,
+            alpha_material_buffer,
+            alpha_texture_buffer,
+            alpha_texel_buffer,
+            alpha_dynamic_geometry_base,
+            alpha_dynamic_material_base,
+            alpha_buffers_generation: 0,
+            inline_slot_count,
+            dynamic_instance_capacity,
+            last_scene_signature: u64::MAX,
+            last_dynamic_instance_count: 0,
+            rigid_cache_limit_warned: false,
+            skinned_cache_limit_warned: false,
+            geometry_count,
+            triangle_count,
+            masked_geometry_count,
+            masked_triangle_count,
+            active_masked_rigid: 0,
+            active_masked_skinned: 0,
+            active_rigid_triangles: 0,
+            active_skinned_triangles: 0,
+        });
+        println!(
+            "RT Shadows: built HW BLAS/TLAS: opaque BSP {geometry_count} geometries / {triangle_count} tris; alpha-tested BSP+movers {masked_geometry_count} geometries / {masked_triangle_count} tris; opaque inline {inline_geometry_count} BLASes / {inline_triangle_count} tris; dynamic capacity {dynamic_instance_capacity}"
+        );
+        true
+    }
+
+    fn rebuild_rt_alpha_candidate_buffers(&mut self) {
+        let Some(mut rt) = self.ray_traced_shadows.take() else { return };
+        rt.alpha_vertex_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha candidate vertices",
+            &rt.alpha_vertices,
+            wgpu::BufferUsages::BLAS_INPUT,
+        );
+        rt.alpha_index_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha candidate indices",
+            &rt.alpha_indices,
+            wgpu::BufferUsages::BLAS_INPUT,
+        );
+        rt.alpha_geometry_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha geometry table",
+            &rt.alpha_geometries,
+            wgpu::BufferUsages::empty(),
+        );
+        rt.alpha_material_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha material table",
+            &rt.alpha_materials,
+            wgpu::BufferUsages::empty(),
+        );
+        rt.alpha_texture_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha texture table",
+            &rt.alpha_textures,
+            wgpu::BufferUsages::empty(),
+        );
+        rt.alpha_texel_buffer = create_rt_alpha_buffer(
+            &self.device,
+            "JKA RT alpha texels",
+            &rt.alpha_texels,
+            wgpu::BufferUsages::empty(),
+        );
+        rt.alpha_buffers_generation = rt.alpha_buffers_generation.wrapping_add(1);
+        rt.receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
+            &self.device,
+            &rt.receiver_layout,
+            &self.shadow_resources._array_view,
+            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+                &self.shadow_resources.bevy_sampler
+            } else {
+                &self.shadow_resources.legacy_sampler
+            },
+            &self.shadow_resources.sky_array_view,
+            &self.shadow_resources.receiver_buffer,
+            self.weather.fog.legacy_control_buffer(),
+            &self.shadow_resources.weather_height_view,
+            &self.shadow_resources.weather_sampler,
+            &self.shadow_resources.weather_surface_buffer,
+            &rt._tlas,
+            &rt.alpha_vertex_buffer,
+            &rt.alpha_index_buffer,
+            &rt.alpha_geometry_buffer,
+            &rt.alpha_material_buffer,
+            &rt.alpha_texture_buffer,
+            &rt.alpha_texel_buffer,
+        );
+        self.ray_traced_shadows = Some(rt);
+    }
+
+    /// Rebuild dynamic ray-tracing geometry before the first world ray query.
+    ///
+    /// Rigid BSP/MD3 casters retain immutable BLAS geometry and only update TLAS
+    /// transforms. Ghoul2 casters are different: animation deforms their actual
+    /// triangles, so RT-on compute skinning writes the final world-space vertices
+    /// once and each active skinned BLAS is rebuilt from that shared buffer.
+    fn encode_ray_traced_dynamic_casters(
+        &mut self,
+        dynamic_models: &[DynamicModelSurface],
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        if self.cascaded_shadow_mode != DynamicShadowsMode::RayTraced {
+            return;
+        }
+        if self.ray_traced_shadows.is_none() && !self.ensure_ray_traced_shadow_resources() {
+            return;
+        }
+
+        let skinned_prepared = self.dynamic_model_renderer.rt_skinned_casters().to_vec();
+        let Some(world) = self.world.as_ref() else { return };
+        let Some(rt_read) = self.ray_traced_shadows.as_ref() else { return };
+
+        // Skinned player/NPC geometry takes priority in the bounded dynamic TLAS
+        // tail. Rigid MD3s use whatever slots remain.
+        let skinned_requested = skinned_prepared
+            .len()
+            .min(rt_read.dynamic_instance_capacity);
+        let rigid_capacity = rt_read
+            .dynamic_instance_capacity
+            .saturating_sub(skinned_requested);
+        let signature = rt_dynamic_scene_signature(
+            world,
+            rt_read.inline_slot_count,
+            rt_read.static_mask_blas.is_some(),
+            dynamic_models,
+            rigid_capacity,
+        );
+        let inline_transforms = world
+            .inline_models
+            .iter()
+            .take(rt_read.inline_slot_count)
+            .map(|model| inline_rt_pose(model).map(|pose| pose.rt_transform()))
+            .collect::<Vec<_>>();
+        // A deforming BLAS must be rebuilt even when entity transforms did not
+        // change, because the current animation pose may have changed.
+        if skinned_requested == 0 && signature == rt_read.last_scene_signature {
+            return;
+        }
+
+        let limits = self.device.limits();
+        let eligible_rigid = dynamic_models
+            .iter()
+            .filter(|surface| {
+                matches!(surface.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                    && surface.rt_rigid.is_some()
+            })
+            .take(rigid_capacity)
+            .collect::<Vec<_>>();
+
+        // Find missing immutable MD3 frame/surface BLASes before taking the
+        // mutable cache borrow. The cache key includes whether the triangles are
+        // opaque or alpha-tested because candidate handling is a BLAS geometry flag.
+        let mut missing_rigid = Vec::<(RayTracedRigidInstance, bool)>::new();
+        let mut queued_rigid = HashSet::<RayTracedRigidMeshKey>::new();
+        for surface in &eligible_rigid {
+            let Some(source) = surface.rt_rigid.as_ref() else { continue };
+            let non_opaque = surface.alpha_mode == DynamicModelAlphaMode::Mask;
+            let key = source.mesh_key(non_opaque);
+            if rt_read.rigid_blas_cache.contains_key(&key) || !queued_rigid.insert(key) {
+                continue;
+            }
+            missing_rigid.push((source.clone(), non_opaque));
+        }
+
+        let device = &self.device;
+        let alpha_storage_changed;
+        let mut new_rigid_keys = Vec::<RayTracedRigidMeshKey>::new();
+        {
+            let Some(rt) = self.ray_traced_shadows.as_mut() else { return };
+            let alpha_vertex_len_before = rt.alpha_vertices.len();
+            let alpha_index_len_before = rt.alpha_indices.len();
+            let alpha_texture_len_before = rt.alpha_textures.len();
+            let alpha_texel_len_before = rt.alpha_texels.len();
+
+            // A cached MD3 BLAS can be used with a newly selected skin. Texture
+            // residency must follow active materials, independently of BLAS misses.
+            for surface in &eligible_rigid {
+                if surface.alpha_mode == DynamicModelAlphaMode::Mask {
+                    rt_alpha_ensure_dynamic_texture(
+                        surface.texture.as_deref(),
+                        &mut rt.alpha_textures,
+                        &mut rt.alpha_texels,
+                        &mut rt.alpha_texture_cache,
+                    );
+                }
+            }
+
+            for (source, non_opaque) in missing_rigid {
+                if rt.rigid_blas_cache.len() >= RT_RIGID_BLAS_CACHE_LIMIT {
+                    if !rt.rigid_cache_limit_warned {
+                        println!(
+                            "RT Shadows: rigid BLAS cache reached {} entries; additional MD3 frame/surfaces will not cast until the map changes",
+                            RT_RIGID_BLAS_CACHE_LIMIT
+                        );
+                        rt.rigid_cache_limit_warned = true;
+                    }
+                    break;
+                }
+                let key = source.mesh_key(non_opaque);
+                if rt.rigid_blas_cache.contains_key(&key) {
+                    continue;
+                }
+                let Some(surface) = source.model.surfaces.get(source.surface_index as usize) else {
+                    continue;
+                };
+                let Some(vertices) = surface.frame_vertices(source.frame as usize) else {
+                    continue;
+                };
+                if vertices.is_empty() || surface.indices.is_empty() || surface.indices.len() % 3 != 0 {
+                    continue;
+                }
+                let triangles = surface.indices.len() / 3;
+                if triangles > limits.max_blas_primitive_count as usize {
+                    println!(
+                        "RT Shadows: {} surface {} frame {} has {triangles} triangles, over adapter BLAS limit {}; skipping caster",
+                        source.asset_key,
+                        source.surface_index,
+                        source.frame,
+                        limits.max_blas_primitive_count
+                    );
+                    continue;
+                }
+                let positions = vertices.iter().map(|vertex| vertex.position).collect::<Vec<_>>();
+                let label = format!(
+                    "JKA RT Shadows MD3 {} surface {} frame {} {} BLAS",
+                    source.asset_key,
+                    source.surface_index,
+                    source.frame,
+                    if non_opaque { "alpha-tested" } else { "opaque" }
+                );
+                let Some(resource) = create_rt_triangle_blas(
+                    device,
+                    &label,
+                    &positions,
+                    &surface.indices,
+                    non_opaque,
+                ) else {
+                    continue;
+                };
+                if non_opaque && !rt.rigid_alpha_attributes.contains_key(&key) {
+                    let attrs = rt_alpha_append_dynamic_attributes(
+                        vertices.iter().map(|vertex| RtAlphaVertexGpu {
+                            position_u: [vertex.position[0], vertex.position[1], vertex.position[2], vertex.uv[0]],
+                            normal_v: [vertex.normal[0], vertex.normal[1], vertex.normal[2], vertex.uv[1]],
+                            lightmap_alpha: [0.0, 0.0, 1.0, 0.0],
+                        }),
+                        &surface.indices,
+                        &mut rt.alpha_vertices,
+                        &mut rt.alpha_indices,
+                    );
+                    rt.rigid_alpha_attributes.insert(key.clone(), attrs);
+                }
+                rt.rigid_blas_cache.insert(key.clone(), resource);
+                new_rigid_keys.push(key);
+            }
+
+            // Create persistent BLAS objects for newly encountered deforming
+            // entity/surfaces. Their backing geometry stays in the shared RT skinned
+            // vertex/index buffers and is rebuilt below after the compute pass.
+            for caster in skinned_prepared.iter().take(skinned_requested) {
+                if !rt.skinned_blas_cache.contains_key(&caster.key) {
+                    if rt.skinned_blas_cache.len() >= RT_SKINNED_BLAS_CACHE_LIMIT {
+                        if !rt.skinned_cache_limit_warned {
+                            println!(
+                                "RT Shadows: skinned Ghoul2 BLAS cache reached {} entries; additional entity/surfaces will not cast until the map changes",
+                                RT_SKINNED_BLAS_CACHE_LIMIT
+                            );
+                            rt.skinned_cache_limit_warned = true;
+                        }
+                        break;
+                    }
+                    if caster.vertex_count == 0 || caster.index_count < 3 || caster.index_count % 3 != 0 {
+                        continue;
+                    }
+                    let triangles = caster.index_count / 3;
+                    if triangles > limits.max_blas_primitive_count {
+                        println!(
+                            "RT Shadows: skinned entity {} mesh {} has {triangles} triangles, over adapter BLAS limit {}; skipping caster",
+                            caster.key.entity_num,
+                            caster.key.mesh_key,
+                            limits.max_blas_primitive_count
+                        );
+                        continue;
+                    }
+                    let size = wgpu::BlasTriangleGeometrySizeDescriptor {
+                        vertex_format: wgpu::VertexFormat::Float32x3,
+                        vertex_count: caster.vertex_count,
+                        index_format: Some(wgpu::IndexFormat::Uint32),
+                        index_count: Some(caster.index_count),
+                        flags: if caster.key.non_opaque {
+                            wgpu::AccelerationStructureGeometryFlags::empty()
+                        } else {
+                            wgpu::AccelerationStructureGeometryFlags::OPAQUE
+                        },
+                    };
+                    let label = format!(
+                        "JKA RT Shadows Ghoul2 entity {} {} {} BLAS",
+                        caster.key.entity_num,
+                        caster.key.mesh_key,
+                        if caster.key.non_opaque { "alpha-tested" } else { "opaque" }
+                    );
+                    let blas = device.create_blas(
+                        &wgpu::CreateBlasDescriptor {
+                            label: Some(&label),
+                            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD,
+                            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                        },
+                        wgpu::BlasGeometrySizeDescriptors::Triangles {
+                            descriptors: vec![size.clone()],
+                        },
+                    );
+                    rt.skinned_blas_cache
+                        .insert(caster.key.clone(), RayTracedSkinnedBlas { size, blas });
+                }
+
+                if caster.key.non_opaque
+                    && !rt.skinned_alpha_attributes.contains_key(&caster.key.mesh_key)
+                {
+                    let source = dynamic_models.iter().find(|surface| {
+                        surface.entity_num == caster.key.entity_num
+                            && surface.alpha_mode == DynamicModelAlphaMode::Mask
+                            && surface.rt_skinned_key.as_ref() == Some(&caster.key.mesh_key)
+                    });
+                    if let Some(source) = source {
+                        let attrs = if let Some(skin) = source.ghoul2_gpu.as_ref() {
+                            rt_alpha_append_dynamic_attributes(
+                                skin.vertices.iter().map(RtAlphaVertexGpu::from),
+                                skin.indices.as_slice(),
+                                &mut rt.alpha_vertices,
+                                &mut rt.alpha_indices,
+                            )
+                        } else {
+                            rt_alpha_append_dynamic_attributes(
+                                source.vertices.iter().map(RtAlphaVertexGpu::from),
+                                source.indices.as_slice(),
+                                &mut rt.alpha_vertices,
+                                &mut rt.alpha_indices,
+                            )
+                        };
+                        rt.skinned_alpha_attributes
+                            .insert(Arc::clone(&caster.key.mesh_key), attrs);
+                    }
+                }
+                if caster.key.non_opaque {
+                    rt_alpha_ensure_dynamic_texture(
+                        caster.alpha_texture.as_deref(),
+                        &mut rt.alpha_textures,
+                        &mut rt.alpha_texels,
+                        &mut rt.alpha_texture_cache,
+                    );
+                }
+            }
+
+            alpha_storage_changed = rt.alpha_vertices.len() != alpha_vertex_len_before
+                || rt.alpha_indices.len() != alpha_index_len_before
+                || rt.alpha_textures.len() != alpha_texture_len_before
+                || rt.alpha_texels.len() != alpha_texel_len_before;
+        }
+
+        // Candidate attribute/texture tables are append-only. Reallocate them
+        // only when a new masked asset/frame is first encountered, never every frame.
+        if alpha_storage_changed {
+            self.rebuild_rt_alpha_candidate_buffers();
+        }
+
+        let Some(rt) = self.ray_traced_shadows.as_mut() else { return };
+        let active_skinned = skinned_prepared
+            .iter()
+            .take(skinned_requested)
+            .filter(|caster| rt.skinned_blas_cache.contains_key(&caster.key))
+            .collect::<Vec<_>>();
+
+        // Static masked world may occupy TLAS slot 1. Each inline model then owns
+        // a fixed opaque/masked slot pair so hiding or moving a BSP mover updates
+        // both representations together without touching its immutable BLASes.
+        let inline_base = 1 + usize::from(rt.static_mask_blas.is_some());
+        for slot in 0..rt.inline_slot_count {
+            let base = inline_base + slot * 2;
+            let pose = inline_transforms.get(slot).copied().flatten();
+            rt._tlas[base] = pose.and_then(|transform| {
+                rt.inline_blas
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(|caster| wgpu::TlasInstance::new(&caster.blas, transform, 0, 0xff))
+            });
+            rt._tlas[base + 1] = pose.and_then(|transform| {
+                rt.inline_mask_blas
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(|caster| {
+                        wgpu::TlasInstance::new(
+                            &caster.blas,
+                            transform,
+                            caster.geometry_base,
+                            0xff,
+                        )
+                    })
+            });
+        }
+
+        let dynamic_base = inline_base + rt.inline_slot_count * 2;
+        let identity = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let mut active_masked_skinned = 0usize;
+        let mut active_skinned_triangles = 0u64;
+        let mut populated_dynamic_slots = 0usize;
+
+        for caster in &active_skinned {
+            if populated_dynamic_slots >= rt.dynamic_instance_capacity {
+                break;
+            }
+            if !rt.skinned_blas_cache.contains_key(&caster.key) {
+                continue;
+            }
+            let slot = populated_dynamic_slots;
+            let index = dynamic_base + slot;
+            let custom_data = if caster.key.non_opaque {
+                let Some(attrs) = rt.skinned_alpha_attributes.get(&caster.key.mesh_key).copied() else {
+                    continue;
+                };
+                let geometry_index = rt.alpha_dynamic_geometry_base.saturating_add(slot as u32);
+                let material_index = rt.alpha_dynamic_material_base.saturating_add(slot as u32);
+                let Some(&texture_index) = rt.alpha_texture_cache.get(&rt_alpha_texture_key(caster.alpha_texture.as_deref())) else {
+                    continue;
+                };
+                if let Some(record) = rt.alpha_geometries.get_mut(geometry_index as usize) {
+                    *record = RtAlphaGeometryGpu {
+                        values: [attrs.first_vertex, attrs.first_index, material_index, 0],
+                    };
+                }
+                if let Some(record) = rt.alpha_materials.get_mut(material_index as usize) {
+                    *record = rt_alpha_dynamic_material(texture_index);
+                }
+                active_masked_skinned += 1;
+                geometry_index
+            } else {
+                0
+            };
+            let instance = rt.skinned_blas_cache.get(&caster.key).map(|resource| {
+                wgpu::TlasInstance::new(&resource.blas, identity, custom_data, 0xff)
+            });
+            rt._tlas[index] = instance;
+            active_skinned_triangles = active_skinned_triangles
+                .saturating_add(u64::from(caster.index_count / 3));
+            populated_dynamic_slots += 1;
+        }
+
+        let mut active_rigid_instances = 0usize;
+        let mut active_masked_rigid = 0usize;
+        let mut active_rigid_triangles = 0u64;
+        for surface in &eligible_rigid {
+            if populated_dynamic_slots >= rt.dynamic_instance_capacity {
+                break;
+            }
+            let Some(source) = surface.rt_rigid.as_ref() else { continue };
+            let non_opaque = surface.alpha_mode == DynamicModelAlphaMode::Mask;
+            let key = source.mesh_key(non_opaque);
+            if !rt.rigid_blas_cache.contains_key(&key) {
+                continue;
+            }
+            let slot = populated_dynamic_slots;
+            let index = dynamic_base + slot;
+            let custom_data = if non_opaque {
+                let Some(attrs) = rt.rigid_alpha_attributes.get(&key).copied() else { continue };
+                let geometry_index = rt.alpha_dynamic_geometry_base.saturating_add(slot as u32);
+                let material_index = rt.alpha_dynamic_material_base.saturating_add(slot as u32);
+                let Some(&texture_index) = rt.alpha_texture_cache.get(&rt_alpha_texture_key(surface.texture.as_deref())) else {
+                    continue;
+                };
+                if let Some(record) = rt.alpha_geometries.get_mut(geometry_index as usize) {
+                    *record = RtAlphaGeometryGpu {
+                        values: [attrs.first_vertex, attrs.first_index, material_index, 0],
+                    };
+                }
+                if let Some(record) = rt.alpha_materials.get_mut(material_index as usize) {
+                    *record = rt_alpha_dynamic_material(texture_index);
+                }
+                active_masked_rigid += 1;
+                geometry_index
+            } else {
+                0
+            };
+            let (instance, triangle_count) = rt.rigid_blas_cache.get(&key).map_or(
+                (None, 0u32),
+                |caster| (Some(wgpu::TlasInstance::new(&caster.blas, source.transform, custom_data, 0xff)), caster.triangle_count),
+            );
+            rt._tlas[index] = instance;
+            active_rigid_instances += 1;
+            active_rigid_triangles = active_rigid_triangles.saturating_add(u64::from(triangle_count));
+            populated_dynamic_slots += 1;
+        }
+        for slot in populated_dynamic_slots..rt.last_dynamic_instance_count {
+            rt._tlas[dynamic_base + slot] = None;
+        }
+
+        // Dynamic geometry/material records have fixed slots, so updating them
+        // does not allocate or rebuild bind groups on ordinary animated frames.
+        if active_masked_skinned + active_masked_rigid > 0 {
+            self.queue.write_buffer(
+                &rt.alpha_geometry_buffer,
+                0,
+                bytemuck::cast_slice(rt.alpha_geometries.as_slice()),
+            );
+            self.queue.write_buffer(
+                &rt.alpha_material_buffer,
+                0,
+                bytemuck::cast_slice(rt.alpha_materials.as_slice()),
+            );
+        }
+
+        let new_rigid_builds = new_rigid_keys
+            .iter()
+            .filter_map(|key| rt.rigid_blas_cache.get(key))
+            .map(rt_triangle_blas_build_entry)
+            .collect::<Vec<_>>();
+
+        // Borrow the shared RT-skinned buffers only after any alpha-table
+        // reallocation above. Keeping this borrow late avoids tying up the
+        // DynamicModelRenderer while the RT receiver bind group is rebuilt.
+        let skinned_buffers = self.dynamic_model_renderer.rt_skinning_buffers();
+        let skinned_builds = match skinned_buffers {
+            Some((vertex_buffer, index_buffer)) => active_skinned
+                .iter()
+                .filter_map(|caster| {
+                    let resource = rt.skinned_blas_cache.get(&caster.key)?;
+                    Some(rt_skinned_blas_build_entry(
+                        resource,
+                        caster,
+                        vertex_buffer,
+                        index_buffer,
+                    ))
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+
+        // wgpu tracks compute-storage-write -> BLAS_INPUT dependencies inside
+        // this encoder. Rigid BLASes build only when first cached; deforming
+        // Ghoul2 BLASes rebuild each active RT frame, followed by the TLAS.
+        encoder.build_acceleration_structures(
+            new_rigid_builds.iter().chain(skinned_builds.iter()),
+            std::iter::once(&rt._tlas),
+        );
+        drop(new_rigid_builds);
+        drop(skinned_builds);
+
+        let previous_dynamic_count = rt.last_dynamic_instance_count;
+        rt.last_scene_signature = signature;
+        rt.last_dynamic_instance_count = populated_dynamic_slots;
+        rt.active_masked_rigid = active_masked_rigid;
+        rt.active_masked_skinned = active_masked_skinned;
+        rt.active_rigid_triangles = active_rigid_triangles;
+        rt.active_skinned_triangles = active_skinned_triangles;
+
+        if previous_dynamic_count != populated_dynamic_slots || !new_rigid_keys.is_empty() {
+            let inline_active = inline_transforms
+                .iter()
+                .enumerate()
+                .filter(|(slot, transform)| {
+                    transform.is_some()
+                        && (rt.inline_blas[*slot].is_some() || rt.inline_mask_blas[*slot].is_some())
+                })
+                .count();
+            println!(
+                "RT Shadows dynamic casters: inline BSP {inline_active}/{}, skinned GLM {}/{}, rigid MD3 {active_rigid_instances}/{}, alpha-tested dynamic {} (GLM {} + MD3 {}), cached skinned BLAS {}, cached rigid BLAS {} (+{})",
+                rt.inline_slot_count,
+                active_skinned.len(),
+                rt.dynamic_instance_capacity,
+                rt.dynamic_instance_capacity,
+                active_masked_skinned + active_masked_rigid,
+                active_masked_skinned,
+                active_masked_rigid,
+                rt.skinned_blas_cache.len(),
+                rt.rigid_blas_cache.len(),
+                new_rigid_keys.len()
+            );
+        }
+    }
     fn rebuild_weather_surface_receiver_bind_group(&mut self) {
         self.shadow_resources.receiver_bind_group = create_shadow_receiver_bind_group(
             &self.device,
@@ -11411,6 +14188,31 @@ impl Renderer {
             &self.shadow_resources.weather_sampler,
             &self.shadow_resources.weather_surface_buffer,
         );
+        if let Some(rt) = self.ray_traced_shadows.as_mut() {
+            rt.receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
+                &self.device,
+                &rt.receiver_layout,
+                &self.shadow_resources._array_view,
+                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+                    &self.shadow_resources.bevy_sampler
+                } else {
+                    &self.shadow_resources.legacy_sampler
+                },
+                &self.shadow_resources.sky_array_view,
+                &self.shadow_resources.receiver_buffer,
+                self.weather.fog.legacy_control_buffer(),
+                &self.shadow_resources.weather_height_view,
+                &self.shadow_resources.weather_sampler,
+                &self.shadow_resources.weather_surface_buffer,
+                &rt._tlas,
+                &rt.alpha_vertex_buffer,
+                &rt.alpha_index_buffer,
+                &rt.alpha_geometry_buffer,
+                &rt.alpha_material_buffer,
+                &rt.alpha_texture_buffer,
+                &rt.alpha_texel_buffer,
+            );
+        }
     }
 
     fn advance_surface_wetness(&mut self, frame_time: f32) -> bool {
@@ -11813,7 +14615,17 @@ impl Renderer {
         }
     }
 
+    fn ray_traced_local_shadows_active(&self) -> bool {
+        self.local_light_shadows_enabled
+            && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_shadows)
+    }
+
     fn update_local_shadow_selection(&mut self, camera: &Camera) {
+        // RT queries cover all existing clustered lights, including transient
+        // lights with no cubemap slot. Keep the raster cache intact for toggles.
+        if self.ray_traced_local_shadows_active() {
+            return;
+        }
         let direct_local_lighting_enabled =
             self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
@@ -11939,6 +14751,9 @@ impl Renderer {
     }
 
     fn ensure_local_shadow_cache(&mut self) {
+        if self.ray_traced_local_shadows_active() {
+            return;
+        }
         let direct_local_lighting_enabled =
             self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
@@ -12108,12 +14923,15 @@ impl Renderer {
             // not create a redundant pipeline permutation.
             local_shadows: self.local_light_shadows_enabled && shadowable_local_lights,
             cascaded_shadows: self.cascaded_shadows_enabled,
+            ray_traced_shadows: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+                && self.ray_tracing_supported,
             planar_reflections: self.planar_reflection.active,
             // MAP/DEFAULT is a no-op on maps with no authored fog. FogSystem owns
             // the current map's authored-fog state and decides whether the legacy
             // JKA fragment path is actually required.
             legacy_fog: self.weather.fog.legacy_effective(),
             ocean: self.ocean_enabled,
+            detail_texture_mode: self.detail_textures_mode.shader_mode(),
         }
     }
 
@@ -12122,7 +14940,12 @@ impl Renderer {
     }
 
     fn activate_world_pipeline_variant(&mut self) {
-        let key = self.world_shader_variant_key();
+        let mut key = self.world_shader_variant_key();
+        if key.ray_traced_shadows && !self.ensure_ray_traced_shadow_resources() {
+            // Preserve a valid raster pipeline if the adapter exposes the feature
+            // but this particular map exceeds an acceleration-structure limit.
+            key.ray_traced_shadows = false;
+        }
         let Some(current_key) = self
             .world
             .as_ref()
@@ -12152,9 +14975,19 @@ impl Renderer {
 
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
-        let (layout, shader) = match key.family() {
-            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
-            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+        let (layout, shader) = if key.ray_traced_shadows {
+            let Some(rt) = self.ray_traced_shadows.as_ref() else {
+                return;
+            };
+            match key.family() {
+                WorldShaderFamily::Enhanced => (&rt.world_pipeline_layout, &rt.world_shader),
+                WorldShaderFamily::Lean => (&rt.world_pipeline_layout_lean, &rt.world_shader_lean),
+            }
+        } else {
+            match key.family() {
+                WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+                WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+            }
         };
         println!(
             "Renderer pipeline cache: miss {} -> compiling lazily",
@@ -12455,22 +15288,19 @@ impl Renderer {
         self.activate_world_pipeline_variant();
     }
 
-    fn set_pbr_settings(&mut self, enabled: bool, deluxe_mapping: bool, deluxe_specular: f32) {
-        self.pbr_enabled = enabled;
-        self.deluxe_mapping_enabled = deluxe_mapping;
-        self.deluxe_specular = deluxe_specular.clamp(0.0, 1.0);
+    fn write_material_enhancement_settings(&self) {
         let settings = PbrSettings {
             values: [
-                u32::from(enabled && PBR_PROFILE_MATERIALS),
-                u32::from(enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+                u32::from(self.pbr_enabled && PBR_PROFILE_MATERIALS),
+                u32::from(self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
                 40,
                 0,
             ],
             deluxe: [
-                f32::from(enabled && deluxe_mapping),
+                f32::from(self.pbr_enabled && self.deluxe_mapping_enabled),
                 self.deluxe_specular,
-                0.0,
-                0.0,
+                f32::from(self.detail_texture_fade),
+                self.detail_texture_fade_distance,
             ],
         };
         self.queue.write_buffer(
@@ -12478,6 +15308,13 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&settings),
         );
+    }
+
+    fn set_pbr_settings(&mut self, enabled: bool, deluxe_mapping: bool, deluxe_specular: f32) {
+        self.pbr_enabled = enabled;
+        self.deluxe_mapping_enabled = deluxe_mapping;
+        self.deluxe_specular = deluxe_specular.clamp(0.0, 1.0);
+        self.write_material_enhancement_settings();
         let sun = self.active_sun();
         self.grass_renderer.update_environment(
             &self.queue,
@@ -13171,10 +16008,29 @@ impl Renderer {
             mode,
             DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
         );
+        let rt_active = if mode == DynamicShadowsMode::RayTraced {
+            let active = self.ensure_ray_traced_shadow_resources();
+            if active {
+                if let Some(rt) = self.ray_traced_shadows.as_ref() {
+                    println!(
+                        "RT Shadows: active - hardware ray queries, {} BLAS geometries / {} static opaque BSP triangles; soft directional emitter {:.2} deg, 1 spp{}",
+                        rt.geometry_count,
+                        rt.triangle_count,
+                        RT_SUN_ANGULAR_DIAMETER_RADIANS.to_degrees(),
+                        if self.taa_enabled { " + temporal TAA" } else { " (stable spatial sample)" }
+                    );
+                }
+            } else if !self.ray_tracing_supported {
+                println!("RT Shadows: requested but unsupported on the current adapter/backend");
+            }
+            active
+        } else {
+            false
+        };
         self.rebuild_weather_surface_receiver_bind_group();
         self.rebuild_frame_plan();
         self.activate_world_pipeline_variant();
-        if !self.cascaded_shadows_enabled {
+        if !self.cascaded_shadows_enabled && !rt_active {
             self.write_shadow_uniforms(
                 &[Mat4::IDENTITY; SHADOW_CASCADES],
                 &[0.0; SHADOW_CASCADES],
@@ -13257,12 +16113,28 @@ impl Renderer {
             ],
             camera_forward: [camera_forward.x, camera_forward.y, camera_forward.z, self.sun_visibility.shader_value()],
             cascade_texel_sizes: *texel_sizes,
-            bevy_params: [
-                BEVY_CSM_SHADOW_DEPTH_BIAS,
-                BEVY_CSM_SHADOW_NORMAL_BIAS,
-                BEVY_CSM_OVERLAP_PROPORTION,
-                if bevy_mode { SHADOW_CASCADES as f32 } else { LEGACY_SHADOW_CASCADES as f32 },
-            ],
+            bevy_params: if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+                // RT interpretation:
+                // x = cos(max directional-light cone half-angle), matching Bevy Solari
+                // y = visibility rays per shaded fragment (kept at 1 for RT performance)
+                // z = temporal sampling enabled (existing Bevy-style TAA accumulates the result)
+                // w = reserved for future generic emitter sampling controls
+                let half_angle_radians =
+                    0.5 * RT_SUN_ANGULAR_DIAMETER_RADIANS;
+                [
+                    half_angle_radians.cos(),
+                    RT_SHADOW_SAMPLES_PER_PIXEL,
+                    if self.taa_enabled { 1.0 } else { 0.0 },
+                    0.0,
+                ]
+            } else {
+                [
+                    BEVY_CSM_SHADOW_DEPTH_BIAS,
+                    BEVY_CSM_SHADOW_NORMAL_BIAS,
+                    BEVY_CSM_OVERLAP_PROPORTION,
+                    if bevy_mode { SHADOW_CASCADES as f32 } else { LEGACY_SHADOW_CASCADES as f32 },
+                ]
+            },
         };
         self.queue.write_buffer(
             &self.shadow_resources.receiver_buffer,
@@ -13421,6 +16293,7 @@ impl Renderer {
             && self.color_lut_preset == ColorLutPreset::Off
             && !self.gpu_driven_enabled
             && !self.hiz_occlusion_enabled
+            && self.detail_textures_mode == DetailTextureMode::Off
             && !self.point_lighting_enabled()
             && !matches!(
                 self.dynamic_lights_mode,
@@ -13432,6 +16305,7 @@ impl Renderer {
             && !self.local_light_shadows_enabled
             && !self.pbr_enabled
             && !self.cascaded_shadows_enabled
+            && !(self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced && self.ray_traced_shadows.is_some())
             && self.cull_debug_mode == CullDebugMode::Off
             && !self.planar_reflection.active
             && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off;
@@ -13750,12 +16624,31 @@ impl Renderer {
         // every cached render pipeline. Rebuild only the active specialized
         // variant plus the known-fast baseline; future settings combinations
         // are created lazily again on demand.
-        let key = self.world_shader_variant_key();
+        //
+        // Keep this selection identical to activate_world_pipeline_variant():
+        // an RT key must always be paired with the lazily-created RT WGSL and
+        // RT group-3 layout. Passing the RT specialization constant to the stock
+        // BSP shader is invalid because that shader intentionally does not
+        // declare ENABLE_RAY_TRACED_SHADOWS.
+        let mut key = self.world_shader_variant_key();
+        if key.ray_traced_shadows && !self.ensure_ray_traced_shadow_resources() {
+            key.ray_traced_shadows = false;
+        }
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
-        let (layout, shader) = match key.family() {
-            WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
-            WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+        let (layout, shader) = if key.ray_traced_shadows {
+            let Some(rt) = self.ray_traced_shadows.as_ref() else {
+                return;
+            };
+            match key.family() {
+                WorldShaderFamily::Enhanced => (&rt.world_pipeline_layout, &rt.world_shader),
+                WorldShaderFamily::Lean => (&rt.world_pipeline_layout_lean, &rt.world_shader_lean),
+            }
+        } else {
+            match key.family() {
+                WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+                WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+            }
         };
         let (
             pipelines,
@@ -14429,7 +17322,7 @@ impl Renderer {
         let mut info = FrameInfo::default();
         let prepare_started = Instant::now();
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models, None, false);
+            .prepare(&self.device, &self.queue, dynamic_models, None, false, false);
         info.dynamic_model_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) = self.dynamic_model_renderer.ghoul2_draw_stats();
         info.ghoul2_gpu_instances = ghoul2_gpu_instances;
@@ -14551,7 +17444,7 @@ impl Renderer {
                 self.started.elapsed().as_secs_f32(),
             ],
             clip_plane: [0.0; 4],
-            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), if self.taa_enabled { self.taa_frame_index } else { 0 }],
             camera_forward: render_camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
@@ -14621,6 +17514,7 @@ impl Renderer {
                 dynamic_models,
                 entity_light_grid,
                 split_dynamic_wireframe,
+                false,
             );
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
@@ -15390,7 +18284,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos_time,
             clip_plane: [0.0; 4],
-            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
+            render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), if self.taa_enabled { self.taa_frame_index } else { 0 }],
             camera_forward: camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: unjittered_view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: previous_unjittered_view_proj.to_cols_array_2d(),
@@ -15457,6 +18351,21 @@ impl Renderer {
                 &matrices, &splits, &texel_sizes, true, camera.forward(), camera_pos_time, bevy_mode
             );
             Some(matrices)
+        } else if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+            && self.ray_traced_shadows.is_some()
+        {
+            // RT uses the same authoritative map sun direction/intensity data as
+            // CSM, but does not render or sample any cascade shadow maps.
+            self.write_shadow_uniforms(
+                &[Mat4::IDENTITY; SHADOW_CASCADES],
+                &[0.0; SHADOW_CASCADES],
+                &[0.0; SHADOW_CASCADES],
+                true,
+                camera.forward(),
+                camera_pos_time,
+                false,
+            );
+            None
         } else {
             None
         };
@@ -15703,6 +18612,44 @@ impl Renderer {
         self.update_local_shadow_selection(camera);
         self.ensure_local_shadow_cache();
 
+        // Prepare dynamic geometry before command encoding. With RT Shadows enabled,
+        // Ghoul2 is compute-skinned once into the shared raster/BLAS buffer; the
+        // ordinary RT-off vertex-shader skinning path remains unchanged.
+        let dynamic_prepare_started = Instant::now();
+        let entity_light_grid = self
+            .world
+            .as_ref()
+            .and_then(|world| world.entity_light_grid.as_ref());
+        let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
+        let ray_traced_shadows = self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced;
+        self.dynamic_model_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                dynamic_models,
+                entity_light_grid,
+                split_dynamic_wireframe,
+                ray_traced_shadows,
+            );
+        self.ensure_prepared_wireframe_pipelines(
+            prepared_grass.as_ref(),
+            prepared_surface_sprite_effects.as_ref(),
+        );
+        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
+            self.dynamic_model_renderer.ghoul2_draw_stats();
+        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
+        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
+        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
+        info.dynamic_model_vertices = dynamic_models
+            .iter()
+            .map(|surface| surface.vertex_count() as u64)
+            .sum();
+        info.dynamic_model_indices = dynamic_models
+            .iter()
+            .map(|surface| surface.index_count() as u64)
+            .sum();
+
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         // One-shot diagnostic for CurrentSurfaceTexture::Validation. Wgpu's
         // Validation variant means a validation error occurred inside
@@ -15784,6 +18731,26 @@ impl Renderer {
             });
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
+        // Hardware RT skinned casters are deformed once before acceleration
+        // structures consume the shared skinned vertex buffer. The following
+        // dynamic-caster build then reconstructs deforming BLASes/TLAS before
+        // the first ray-querying world pass.
+        if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtBuild, false);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtSkin, false);
+            self.dynamic_model_renderer.encode_rt_skinning(&mut encoder);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtSkin, true);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtAcceleration, false);
+            self.encode_ray_traced_dynamic_casters(dynamic_models, &mut encoder);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtAcceleration, true);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::RtBuild, true);
+        }
         let ocean_sun = self.active_sun();
         let ocean_scene_context = self.world.as_ref().map(|world| {
             (
@@ -15976,41 +18943,6 @@ impl Renderer {
         }
 
         self.weather.rain.dispatch_simulation(&mut encoder);
-
-        // Entities must be uploaded before the depth prepass, which now carries
-        // them so linear depth is the single authoritative nearest-opaque depth.
-        let dynamic_prepare_started = Instant::now();
-        let entity_light_grid = self
-            .world
-            .as_ref()
-            .and_then(|world| world.entity_light_grid.as_ref());
-        let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
-        self.dynamic_model_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                dynamic_models,
-                entity_light_grid,
-                split_dynamic_wireframe,
-            );
-        self.ensure_prepared_wireframe_pipelines(
-            prepared_grass.as_ref(),
-            prepared_surface_sprite_effects.as_ref(),
-        );
-        info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
-        let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
-            self.dynamic_model_renderer.ghoul2_draw_stats();
-        info.ghoul2_gpu_instances = ghoul2_gpu_instances;
-        info.ghoul2_gpu_draw_calls = ghoul2_gpu_draw_calls;
-        info.dynamic_model_surfaces = u32::try_from(dynamic_models.len()).unwrap_or(u32::MAX);
-        info.dynamic_model_vertices = dynamic_models
-            .iter()
-            .map(|surface| surface.vertex_count() as u64)
-            .sum();
-        info.dynamic_model_indices = dynamic_models
-            .iter()
-            .map(|surface| surface.index_count() as u64)
-            .sum();
 
         if plan.needs_linear_depth {
             self.gpu_profiler
@@ -16294,7 +19226,15 @@ impl Renderer {
                     },
                     &[],
                 );
-                pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                let shadow_receiver_bind_group = if world.active_pipeline_variant.ray_traced_shadows {
+                    self.ray_traced_shadows
+                        .as_ref()
+                        .map(|rt| &rt.receiver_bind_group)
+                        .unwrap_or(&self.shadow_resources.receiver_bind_group)
+                } else {
+                    &self.shadow_resources.receiver_bind_group
+                };
+                pass.set_bind_group(3, shadow_receiver_bind_group, &[]);
                 pass.set_bind_group(4, &self.planar_reflection.reflection_pass_bind_group, &[]);
                 if enhanced_world_shader {
                     let ocean_bind_group = self
@@ -16434,6 +19374,16 @@ impl Renderer {
             .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
         if let Some(world) = &self.world {
             let active_pipeline_variant = &world.pipeline_variants[&world.active_pipeline_variant];
+            // SMAA keeps self.smaa_target mutably borrowed until the frame resolves.
+            // Borrow only the disjoint shadow fields instead of all of self.
+            let world_shadow_receiver_bind_group = if world.active_pipeline_variant.ray_traced_shadows {
+                self.ray_traced_shadows
+                    .as_ref()
+                    .map(|rt| &rt.receiver_bind_group)
+                    .unwrap_or(&self.shadow_resources.receiver_bind_group)
+            } else {
+                &self.shadow_resources.receiver_bind_group
+            };
             let (color_view, resolve_target) = if let Some(msaa_view) = &self.targets.msaa_view {
                 (msaa_view, Some(scene_output))
             } else {
@@ -16472,7 +19422,7 @@ impl Renderer {
                 },
                 &[],
             );
-            pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+            pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
             pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
             if enhanced_world_shader {
                 let ocean_bind_group = self
@@ -16585,7 +19535,7 @@ impl Renderer {
                                 },
                                 &[],
                             );
-                            pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                            pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                             pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                             if enhanced_world_shader {
                                 let ocean_bind_group = self
@@ -16779,7 +19729,7 @@ impl Renderer {
                         },
                         &[],
                     );
-                    pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                    pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                     pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                     if enhanced_world_shader {
                         let ocean_bind_group = self
@@ -16858,7 +19808,7 @@ impl Renderer {
                 pass.set_pipeline(&active_pipeline_variant.pipelines[&ocean_pipeline_key()]);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(2, &world.lighting_bind_group, &[]);
-                pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                 pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                 pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
@@ -16939,7 +19889,7 @@ impl Renderer {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, &self.camera_bind_group, &[]);
                         pass.set_bind_group(2, &world.lighting_bind_group, &[]);
-                        pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                        pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                         pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                         pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
@@ -16980,7 +19930,7 @@ impl Renderer {
                                 pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                             }
                         }
-                        pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                        pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                         pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
                         for draw in &world.snow_shell.draws {
@@ -18215,6 +21165,7 @@ fn build_world(
     fast_shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
+    ray_tracing_supported: bool,
     legacy_fog: bool,
     white: &GpuImage,
     missing: &GpuImage,
@@ -18225,6 +21176,10 @@ fn build_world(
     pbr_clamp_sampler: &wgpu::Sampler,
     lightmap_sampler: &wgpu::Sampler,
     sky_sampler: &wgpu::Sampler,
+    detail_texture: &GpuImage,
+    detail_texture_auto: bool,
+    detail_auto_textures: &HashMap<String, GpuImage>,
+    detail_texture_by_base: Vec<u8>,
     cluster_compute_layout: &wgpu::BindGroupLayout,
     lighting_layout: &wgpu::BindGroupLayout,
     lighting_layout_lean: &wgpu::BindGroupLayout,
@@ -18428,10 +21383,14 @@ fn build_world(
         }
         inline_gpu_starts.push(gpu_start);
     }
+    let mut world_vertex_usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+    if ray_tracing_supported {
+        world_vertex_usage |= wgpu::BufferUsages::BLAS_INPUT;
+    }
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA indexed static world vertices"),
         contents: bytemuck::cast_slice(&indexed_builder.vertices),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: world_vertex_usage,
     });
     let auto4_source_indices = Arc::new(std::mem::take(&mut indexed_builder.indices));
     let base_index_count = u32::try_from(auto4_source_indices.len()).unwrap_or(u32::MAX);
@@ -18461,10 +21420,14 @@ fn build_world(
     let index_buffer_size = base_index_bytes
         .saturating_add(auto4_cache_bytes)
         .max(std::mem::size_of::<u32>() as u64);
+    let mut world_index_usage = wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST;
+    if ray_tracing_supported {
+        world_index_usage |= wgpu::BufferUsages::BLAS_INPUT;
+    }
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("JKA static world indices + AUTO 4 collapse cache"),
         size: index_buffer_size,
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        usage: world_index_usage,
         mapped_at_creation: false,
     });
     if !auto4_source_indices.is_empty() {
@@ -18628,7 +21591,14 @@ fn build_world(
             if let Some((plane, _, _)) = water_plane {
                 source.planar_plane = [0.0, 1.0, 0.0, -plane];
             }
-            let material_uniform = material_uniform(&source);
+            let detail_auto_word = source
+                .texture
+                .and_then(|texture| detail_texture_by_base.get(texture).copied())
+                .unwrap_or(0);
+            let material_uniform = material_uniform(
+                &source,
+                (detail_auto_word & AUTO_DETAIL_ENABLED_BIT) != 0,
+            );
             let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("JKA material uniform"),
                 contents: bytemuck::bytes_of(&material_uniform),
@@ -18642,6 +21612,13 @@ fn build_world(
                 source.legacy2_fog_in_stage_safe,
                 source.global_fog_post_eligible,
             );
+            let selected_detail_texture = detail_texture_for_source(
+                &source,
+                detail_texture,
+                detail_texture_auto,
+                detail_auto_textures,
+                &detail_texture_by_base,
+            );
             let bind_group = create_world_bind_group(
                 device,
                 surface_layout,
@@ -18654,6 +21631,7 @@ fn build_world(
                 pbr_clamp_sampler,
                 lightmap_sampler,
                 sky_sampler,
+                selected_detail_texture,
                 &textures,
                 &lightmaps,
                 &deluxemaps,
@@ -18742,6 +21720,127 @@ fn build_world(
     // static batch index (reflectors, snow, AO) is unchanged. Their empty PVS
     // signature keeps them in every cluster's list.
     let inline_coarse_start = coarse_batches.len();
+    let mut rt_shadow_ranges = Vec::<std::ops::Range<u32>>::new();
+    let mut rt_shadow_surfaces = BTreeSet::<(u32, u32)>::new();
+    for batch in &coarse_batches[..inline_coarse_start] {
+        if batch.source.pipeline.class != DrawClass::Opaque
+            || batch.source.pipeline.blend != BlendMode::Opaque
+            || batch.indexed_range.is_empty()
+        {
+            continue;
+        }
+        // A Q3 shader can render the same BSP surface in several stages. The
+        // indexed builder gives those stages distinct index ranges, but putting
+        // every copy in the BLAS would trace duplicate coplanar triangles. Keep
+        // one opaque copy of each authored surface.
+        let surface_key = (batch.source.vertices.start, batch.source.vertices.end);
+        if !rt_shadow_surfaces.insert(surface_key) {
+            continue;
+        }
+        // Merge adjacent opaque index runs. This reduces BLAS geometry count
+        // without ever spanning a skipped sky/mask/translucent stage.
+        if let Some(last) = rt_shadow_ranges.last_mut() {
+            if last.end == batch.indexed_range.start {
+                last.end = batch.indexed_range.end;
+                continue;
+            }
+        }
+        rt_shadow_ranges.push(batch.indexed_range.clone());
+    }
+    // Vulkan ray-query alpha testing: only surfaces without an opaque depth-
+    // writing sibling need a non-opaque candidate geometry. This mirrors the
+    // raster depth semantics and avoids turning decorative mask stages layered
+    // over an opaque base into holes in the RT caster.
+    let rt_opaque_surfaces = rt_shadow_surfaces.clone();
+    let mut rt_mask_surfaces = BTreeSet::<(u32, u32)>::new();
+    let mut rt_shadow_masks = Vec::<RtAlphaMaskSource>::new();
+    for batch in &coarse_batches[..inline_coarse_start] {
+        if batch.source.pipeline.class != DrawClass::Mask
+            || batch.source.pipeline.blend != BlendMode::Opaque
+            || !batch.source.pipeline.depth_write
+            || batch.source.vertices.is_empty()
+        {
+            continue;
+        }
+        let surface_key = (batch.source.vertices.start, batch.source.vertices.end);
+        if rt_opaque_surfaces.contains(&surface_key) || !rt_mask_surfaces.insert(surface_key) {
+            continue;
+        }
+        let texture = batch.source.texture.and_then(|index| texture_data.get(index));
+        if let Some(mask) = rt_alpha_mask_source_from_gpu_vertices(&vertices, &batch.source, texture) {
+            rt_shadow_masks.push(mask);
+        }
+    }
+    let rt_vertex_count = u32::try_from(indexed_builder.vertices.len()).unwrap_or(u32::MAX);
+    // Preserve one object-space opaque triangle list per inline BSP model for
+    // hardware RT. Raster movers continue to rewrite their private region of
+    // the shared world vertex buffer; RT instead builds this local mesh once and
+    // moves it with a TLAS transform, matching the Vulkan transform-only dynamic
+    // object model.
+    let inline_rt_indices = inline_model_sources
+        .iter()
+        .map(|model| {
+            let mut seen_surfaces = BTreeSet::<(u32, u32)>::new();
+            let mut indices = Vec::<u32>::new();
+            for batch_index in model.batches.clone() {
+                let Some(batch) = inline_batch_sources.get(batch_index) else { continue };
+                if batch.pipeline.class != DrawClass::Opaque
+                    || batch.pipeline.blend != BlendMode::Opaque
+                    || batch.vertices.is_empty()
+                {
+                    continue;
+                }
+                let surface_key = (batch.vertices.start, batch.vertices.end);
+                if !seen_surfaces.insert(surface_key) {
+                    continue;
+                }
+                indices.extend(
+                    batch
+                        .vertices
+                        .clone()
+                        .filter_map(|vertex| vertex.checked_sub(model.vertices.start)),
+                );
+            }
+            indices
+        })
+        .collect::<Vec<_>>();
+    let inline_rt_masks = inline_model_sources
+        .iter()
+        .map(|model| {
+            let opaque_surfaces = model
+                .batches
+                .clone()
+                .filter_map(|batch_index| inline_batch_sources.get(batch_index))
+                .filter(|batch| {
+                    batch.pipeline.class == DrawClass::Opaque
+                        && batch.pipeline.blend == BlendMode::Opaque
+                        && batch.pipeline.depth_write
+                })
+                .map(|batch| (batch.vertices.start, batch.vertices.end))
+                .collect::<BTreeSet<_>>();
+            let mut seen_masks = BTreeSet::<(u32, u32)>::new();
+            let mut masks = Vec::<RtAlphaMaskSource>::new();
+            for batch_index in model.batches.clone() {
+                let Some(batch) = inline_batch_sources.get(batch_index) else { continue };
+                if batch.pipeline.class != DrawClass::Mask
+                    || batch.pipeline.blend != BlendMode::Opaque
+                    || !batch.pipeline.depth_write
+                    || batch.vertices.is_empty()
+                {
+                    continue;
+                }
+                let surface_key = (batch.vertices.start, batch.vertices.end);
+                if opaque_surfaces.contains(&surface_key) || !seen_masks.insert(surface_key) {
+                    continue;
+                }
+                let texture = batch.texture.and_then(|index| texture_data.get(index));
+                if let Some(mask) = rt_alpha_mask_source_from_gpu_vertices(&inline_vertices, batch, texture) {
+                    masks.push(mask);
+                }
+            }
+            masks
+        })
+        .collect::<Vec<_>>();
     coarse_batches.extend(upload_batches(
         inline_batch_sources.clone(),
         inline_index_ranges.clone(),
@@ -18771,10 +21870,14 @@ fn build_world(
     let inline_models = inline_model_sources
         .iter()
         .zip(inline_gpu_starts)
-        .map(|(model, gpu_vertex_start)| InlineModelGpu {
+        .zip(inline_rt_indices)
+        .zip(inline_rt_masks)
+        .map(|(((model, gpu_vertex_start), rt_indices), rt_mask_sources)| InlineModelGpu {
             model: model.model,
             gpu_vertex_start,
             base: inline_vertices[model.vertices.start as usize..model.vertices.end as usize].to_vec(),
+            rt_indices,
+            rt_mask_sources,
             coarse_batches: model.batches.clone().map(|index| inline_coarse_start + index).collect(),
             full_batches: if visibility.is_some() {
                 model.batches.clone().map(|index| inline_full_start + index).collect()
@@ -19372,6 +22475,9 @@ fn build_world(
             inline_models,
             vertex_buffer,
             index_buffer,
+            rt_shadow_ranges,
+            rt_shadow_masks,
+            rt_vertex_count,
             ocean_coarsest_spacing: upload_timings.ocean_coarsest_spacing,
             cull_records_buffer,
             indirect_buffer,
@@ -19438,6 +22544,7 @@ fn build_world(
             static_ao_gpu_vertices,
             static_ao_lightmap_active: false,
             texture_clamp,
+            detail_texture_by_base,
             material_debug,
             inspector_vertices,
             inspector_textures,
@@ -20267,6 +23374,7 @@ fn create_world_bind_group(
     pbr_clamp_sampler: &wgpu::Sampler,
     lightmap_sampler: &wgpu::Sampler,
     sky_sampler: &wgpu::Sampler,
+    detail_texture: &GpuImage,
     textures: &[GpuImage],
     lightmaps: &[GpuImage],
     deluxemaps: &[GpuImage],
@@ -20477,6 +23585,8 @@ fn create_world_bind_group(
             wgpu::BindGroupEntry { binding: 27, resource: wgpu::BindingResource::Sampler(deformation_field_sampler) },
             wgpu::BindGroupEntry { binding: 28, resource: wgpu::BindingResource::Sampler(pbr_sampler) },
             wgpu::BindGroupEntry { binding: 29, resource: wgpu::BindingResource::TextureView(&deluxemap.view) },
+            wgpu::BindGroupEntry { binding: 30, resource: wgpu::BindingResource::TextureView(&detail_texture.view) },
+            wgpu::BindGroupEntry { binding: 31, resource: wgpu::BindingResource::Sampler(repeat_sampler) },
         ],
     })
 }
@@ -20495,6 +23605,9 @@ fn rebuild_world_bind_groups(
     pbr_clamp_sampler: &wgpu::Sampler,
     lightmap_sampler: &wgpu::Sampler,
     sky_sampler: &wgpu::Sampler,
+    detail_texture: &GpuImage,
+    detail_texture_auto: bool,
+    detail_auto_textures: &HashMap<String, GpuImage>,
     surface_deformation_buffer: &wgpu::Buffer,
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
@@ -20509,6 +23622,7 @@ fn rebuild_world_bind_groups(
         lightmaps,
         deluxemaps,
         texture_clamp,
+        detail_texture_by_base,
         primary_skybox,
         reflection_probes,
         footprint_mark_textures,
@@ -20525,6 +23639,13 @@ fn rebuild_world_bind_groups(
         .chain(auto2_batches.iter_mut())
         .chain(auto4_batches.iter_mut())
     {
+        let selected_detail_texture = detail_texture_for_source(
+            &batch.source,
+            detail_texture,
+            detail_texture_auto,
+            detail_auto_textures,
+            detail_texture_by_base,
+        );
         batch.bind_group = create_world_bind_group(
             device,
             surface_layout,
@@ -20537,6 +23658,7 @@ fn rebuild_world_bind_groups(
             pbr_clamp_sampler,
             lightmap_sampler,
             sky_sampler,
+            selected_detail_texture,
             textures,
             lightmaps,
             deluxemaps,
@@ -20574,7 +23696,7 @@ fn rebuild_world_bind_groups(
     }
 }
 
-fn material_uniform(source: &DrawBatch) -> MaterialUniform {
+fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> MaterialUniform {
     let mut out = MaterialUniform::default();
     match source.tc_gen {
         TcGen::Base => out.header[0] = 0,
@@ -20702,6 +23824,9 @@ fn material_uniform(source: &DrawBatch) -> MaterialUniform {
     }
     if source.skybox.is_some() {
         out.header[3] |= 1;
+    }
+    if detail_texture_eligible {
+        out.header[3] |= 2;
     }
     out.header[3] |= u32::from(source.surface_material & 31) << 8;
     out.color = source.color;
@@ -23742,9 +26867,8 @@ fn try_load_ui_font_asset(assets: &mut AssetSearchPath, path: &str) -> Option<Te
     None
 }
 
-fn try_load_texture_asset(
-    base: &Path,
-    game: Option<&Path>,
+fn try_load_texture_asset_from_search_path(
+    assets: &mut AssetSearchPath,
     path: &str,
     clamp: bool,
     mipmaps: bool,
@@ -23763,14 +26887,6 @@ fn try_load_texture_asset(
             candidates.push(candidate);
         }
     }
-
-    let mut assets = match AssetSearchPath::open_game(base, game) {
-        Ok(assets) => assets,
-        Err(error) => {
-            eprintln!("{log_prefix} asset search: {error}");
-            return None;
-        }
-    };
 
     for name in candidates {
         let asset = match assets.read(&name, 16 * 1024 * 1024) {
@@ -23804,6 +26920,26 @@ fn try_load_texture_asset(
     None
 }
 
+fn try_load_texture_asset(
+    base: &Path,
+    game: Option<&Path>,
+    path: &str,
+    clamp: bool,
+    mipmaps: bool,
+    srgb: bool,
+    log_prefix: &str,
+) -> Option<TextureData> {
+    let mut assets = match AssetSearchPath::open_game(base, game) {
+        Ok(assets) => assets,
+        Err(error) => {
+            eprintln!("{log_prefix} asset search: {error}");
+            return None;
+        }
+    };
+    try_load_texture_asset_from_search_path(
+        &mut assets, path, clamp, mipmaps, srgb, log_prefix,
+    )
+}
 fn load_texture_asset_or_missing(
     base: &Path,
     game: Option<&Path>,
@@ -24725,13 +27861,19 @@ fn create_world_pipeline(
     };
     let color_write = wgpu::ColorWrites::ALL;
     let shader_constants = shader_variant.map(WorldShaderVariantKey::compilation_constants);
-    // WGSL overrides are module-level, but wgpu specialization is supplied per
-    // entry point/stage. Several world variants (notably Dynamic Lights > Vertex,
-    // PBR_VERTEX_LIGHTGRID and ocean vertex work) consume these overrides in
-    // vs_main, so specializing only fs_main silently leaves the vertex stage at
-    // each override's WGSL default. Feed the exact same immutable constant set
-    // to both stages.
-    let vertex_compilation_options = match shader_constants.as_ref() {
+    // wgpu validates specialization constants per entry point, not merely per
+    // WGSL module. ENABLE_RAY_TRACED_SHADOWS is intentionally fragment-only, so
+    // do not submit it while specializing vs_main. The remaining world overrides
+    // are still fed to both stages because several existing variants consume them
+    // in vertex work.
+    let vertex_shader_constants = shader_constants.as_ref().map(|constants| {
+        constants
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != "ENABLE_RAY_TRACED_SHADOWS")
+            .collect::<Vec<_>>()
+    });
+    let vertex_compilation_options = match vertex_shader_constants.as_ref() {
         Some(constants) => wgpu::PipelineCompilationOptions {
             constants,
             ..Default::default()
@@ -25347,6 +28489,482 @@ fn aabb_intersects_clip_frustum(minimum: [f32; 3], maximum: [f32; 3], view_proj:
     let outside_far = clip.iter().all(|point| point.z > point.w);
 
     !(outside_left || outside_right || outside_bottom || outside_top || outside_near || outside_far)
+}
+
+/// Produce the hardware-ray-query BSP shader from the authoritative raster BSP
+/// shader. Keeping this as a narrow source transform means the RT variant shares
+/// every JKA lighting/material rule with the normal shader; sun and local-light
+/// visibility are replaced. The stock WGSL is still what all raster modes
+/// compile.
+fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
+    const BINDING: &str = "@group(3) @binding(7) var sky_admission_texture: texture_depth_2d_array;";
+    const CASCADE_FN: &str = "fn cascaded_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {";
+    const LOCAL_FN: &str = "fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {";
+    const SURFACE_SUN: &str = "        let shadow_visibility = cascaded_shadow_visibility(input, input.world_normal);\n        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);";
+
+    if !base.contains(BINDING) {
+        return Err("group-3 sky-admission binding anchor not found".to_string());
+    }
+    if !base.contains(CASCADE_FN) {
+        return Err("cascaded_shadow_visibility anchor not found".to_string());
+    }
+    if !base.contains(LOCAL_FN) {
+        return Err("local_light_shadow_visibility anchor not found".to_string());
+    }
+    // Both checked-in shaders can have CRLF on Windows. Normalize only the
+    // generated RT variant so multiline source anchors are platform-independent.
+    let base = base.replace("\r\n", "\n");
+    if !base.contains(SURFACE_SUN) {
+        return Err("surface sun contribution anchor not found".to_string());
+    }
+
+    let mut source = format!("enable wgpu_ray_query;\n{base}");
+    source = source.replacen(
+        "override ENABLE_CASCADED_SHADOWS: bool = false;",
+        "override ENABLE_CASCADED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SHADOWS: bool = false;",
+        1,
+    );
+    source = source.replacen(
+        BINDING,
+        concat!(
+            "@group(3) @binding(7) var sky_admission_texture: texture_depth_2d_array;\n",
+            "@group(3) @binding(8) var rt_shadow_scene: acceleration_structure;\n",
+            "\nstruct RtAlphaVertex {\n    position_u: vec4<f32>,\n    normal_v: vec4<f32>,\n    lightmap_alpha: vec4<f32>,\n};\n\nstruct RtAlphaGeometry {\n    values: vec4<u32>,\n};\n\nstruct RtAlphaMaterial {\n    header: vec4<u32>,\n    vector_s: vec4<f32>,\n    vector_t: vec4<f32>,\n    mods: array<vec4<f32>, 8>,\n    color: vec4<f32>,\n    params: vec4<f32>,\n    texture: vec4<u32>,\n};\n\nstruct RtAlphaTexture {\n    values: vec4<u32>,\n};\n\n@group(3) @binding(9) var<storage, read> rt_alpha_vertices: array<RtAlphaVertex>;\n@group(3) @binding(10) var<storage, read> rt_alpha_indices: array<u32>;\n@group(3) @binding(11) var<storage, read> rt_alpha_geometries: array<RtAlphaGeometry>;\n@group(3) @binding(12) var<storage, read> rt_alpha_materials: array<RtAlphaMaterial>;\n@group(3) @binding(13) var<storage, read> rt_alpha_textures: array<RtAlphaTexture>;\n@group(3) @binding(14) var<storage, read> rt_alpha_texels: array<u32>;"
+        ),
+        1,
+    );
+
+    let rt_visibility = r#"// Ported from Bevy Solari directional-light sampling:
+// - bevy_solari/src/scene/sampling.wesl::resolve_light_sample
+// - bevy_pbr/src/render/utils.wesl::{rand_f, rand_vec2f}
+// - bevy_render/src/maths.wesl::orthonormalize
+//
+// The sampler itself is generic for finite angular directional emitters. The
+// current RT Shadows caller supplies the JKA authored sun direction and an
+// Earth-like angular extent through shadow_settings.bevy_params.x.
+fn rt_rand_f(state: ptr<function, u32>) -> f32 {
+    *state = *state * 747796405u + 2891336453u;
+    let word = ((*state >> ((*state >> 28u) + 4u)) ^ *state) * 277803737u;
+    return f32((word >> 22u) ^ word) * bitcast<f32>(0x2f800004u);
+}
+
+fn rt_rand_vec2f(state: ptr<function, u32>) -> vec2<f32> {
+    return vec2<f32>(rt_rand_f(state), rt_rand_f(state));
+}
+
+fn rt_copysign(a: f32, b: f32) -> f32 {
+    return bitcast<f32>((bitcast<u32>(a) & 0x7fffffffu) | (bitcast<u32>(b) & 0x80000000u));
+}
+
+fn rt_orthonormalize(z_basis: vec3<f32>) -> mat3x3<f32> {
+    let sign = rt_copysign(1.0, z_basis.z);
+    let a = -1.0 / (sign + z_basis.z);
+    let b = z_basis.x * z_basis.y * a;
+    let x_basis = vec3<f32>(1.0 + sign * z_basis.x * z_basis.x * a, sign * b, -sign * z_basis.x);
+    let y_basis = vec3<f32>(b, sign + z_basis.y * z_basis.y * a, -z_basis.y);
+    return mat3x3<f32>(x_basis, y_basis, z_basis);
+}
+
+fn rt_sample_directional_emitter(
+    direction_to_light: vec3<f32>,
+    cos_theta_max: f32,
+    rng: ptr<function, u32>,
+) -> vec3<f32> {
+    // Bevy Solari: sample uniformly in solid angle inside the directional
+    // light's cone, then rotate that local +Z cone onto the light direction.
+    let random = rt_rand_vec2f(rng);
+    let cos_theta = (1.0 - random.x) + random.x * cos_theta_max;
+    let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+    let phi = random.y * 6.28318530717958647692;
+    let local_direction = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+    return rt_orthonormalize(direction_to_light) * local_direction;
+}
+
+fn rt_alpha_repeat_coord(value: i32, size: i32) -> i32 {
+    let remainder = value % size;
+    return select(remainder + size, remainder, remainder >= 0);
+}
+
+fn rt_alpha_texel(texture: RtAlphaTexture, x: i32, y: i32) -> f32 {
+    let width = max(i32(texture.values.y), 1);
+    let height = max(i32(texture.values.z), 1);
+    var sx = x;
+    var sy = y;
+    if (texture.values.w != 0u) {
+        sx = clamp(sx, 0, width - 1);
+        sy = clamp(sy, 0, height - 1);
+    } else {
+        sx = rt_alpha_repeat_coord(sx, width);
+        sy = rt_alpha_repeat_coord(sy, height);
+    }
+    let linear_index = u32(sy * width + sx);
+    let packed = rt_alpha_texels[texture.values.x + linear_index / 4u];
+    let shift = (linear_index & 3u) * 8u;
+    return f32((packed >> shift) & 0xffu) * (1.0 / 255.0);
+}
+
+fn rt_sample_alpha(texture_index: u32, uv: vec2<f32>) -> f32 {
+    let texture = rt_alpha_textures[texture_index];
+    let size = vec2<f32>(f32(max(texture.values.y, 1u)), f32(max(texture.values.z, 1u)));
+    let sample_position = uv * size - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(sample_position));
+    let fraction = fract(sample_position);
+    let a00 = rt_alpha_texel(texture, base.x, base.y);
+    let a10 = rt_alpha_texel(texture, base.x + 1, base.y);
+    let a01 = rt_alpha_texel(texture, base.x, base.y + 1);
+    let a11 = rt_alpha_texel(texture, base.x + 1, base.y + 1);
+    return mix(mix(a00, a10, fraction.x), mix(a01, a11, fraction.x), fraction.y);
+}
+
+fn rt_alpha_generated_uv(
+    material: RtAlphaMaterial,
+    base_uv: vec2<f32>,
+    lightmap_uv: vec2<f32>,
+    world_position: vec3<f32>,
+    world_normal: vec3<f32>,
+) -> vec2<f32> {
+    var uv = base_uv;
+    if (material.header.x == 1u) {
+        uv = lightmap_uv;
+    }
+    if (material.header.x == 2u) {
+        uv = vec2<f32>(
+            dot(world_position, material.vector_s.xyz),
+            dot(world_position, material.vector_t.xyz)
+        );
+    }
+    if (material.header.x == 3u) {
+        let n = normalize(world_normal);
+        let view = normalize(camera.camera_pos_time.xyz - world_position);
+        let reflected = reflect(-view, n);
+        uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
+    }
+
+    let time = camera.camera_pos_time.w;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (i >= material.header.y) {
+            break;
+        }
+        let a = material.mods[i * 2u];
+        let b = material.mods[i * 2u + 1u];
+        let kind = u32(a.x + 0.5);
+        if (kind == 1u) {
+            uv = uv + a.yz * time;
+        }
+        if (kind == 2u) {
+            uv = uv * a.yz;
+        }
+        if (kind == 3u) {
+            let radians = a.y * time * 0.017453292519943295;
+            let c = cos(radians);
+            let sn = sin(radians);
+            let p = uv - vec2<f32>(0.5);
+            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
+        }
+        if (kind == 4u) {
+            uv = vec2<f32>(
+                uv.x * a.y + uv.y * a.z + a.w,
+                uv.x * b.x + uv.y * b.y + b.z
+            );
+        }
+        if (kind == 5u) {
+            let wave = a.y
+                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
+            uv = uv + vec2<f32>(wave);
+        }
+    }
+    return uv;
+}
+
+fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
+    let geometry_index = candidate.instance_custom_data + candidate.geometry_index;
+    let geometry = rt_alpha_geometries[geometry_index];
+    let material = rt_alpha_materials[geometry.values.z];
+    let first_index = geometry.values.y + candidate.primitive_index * 3u;
+    let first_vertex = geometry.values.x;
+    let i0 = first_vertex + rt_alpha_indices[first_index];
+    let i1 = first_vertex + rt_alpha_indices[first_index + 1u];
+    let i2 = first_vertex + rt_alpha_indices[first_index + 2u];
+    let v0 = rt_alpha_vertices[i0];
+    let v1 = rt_alpha_vertices[i1];
+    let v2 = rt_alpha_vertices[i2];
+    let bary = vec3<f32>(
+        1.0 - candidate.barycentrics.x - candidate.barycentrics.y,
+        candidate.barycentrics.x,
+        candidate.barycentrics.y
+    );
+    let object_position = v0.position_u.xyz * bary.x
+        + v1.position_u.xyz * bary.y
+        + v2.position_u.xyz * bary.z;
+    let object_normal = v0.normal_v.xyz * bary.x
+        + v1.normal_v.xyz * bary.y
+        + v2.normal_v.xyz * bary.z;
+    let base_uv = vec2<f32>(
+        v0.position_u.w * bary.x + v1.position_u.w * bary.y + v2.position_u.w * bary.z,
+        v0.normal_v.w * bary.x + v1.normal_v.w * bary.y + v2.normal_v.w * bary.z
+    );
+    let lightmap_uv = v0.lightmap_alpha.xy * bary.x
+        + v1.lightmap_alpha.xy * bary.y
+        + v2.lightmap_alpha.xy * bary.z;
+    let vertex_alpha = v0.lightmap_alpha.z * bary.x
+        + v1.lightmap_alpha.z * bary.y
+        + v2.lightmap_alpha.z * bary.z;
+    let world_position = candidate.object_to_world * vec4<f32>(object_position, 1.0);
+    let world_normal = candidate.object_to_world * vec4<f32>(object_normal, 0.0);
+    let uv = rt_alpha_generated_uv(material, base_uv, lightmap_uv, world_position, world_normal);
+    var alpha_multiplier = material.color.a;
+    // Match the existing BSP shader's alphaGen semantics exactly. RGB generation
+    // uses different bits; RT candidate rejection must only follow alphaGen.
+    if ((material.header.z & 1048576u) != 0u) {
+        alpha_multiplier *= vertex_alpha;
+    } else if ((material.header.z & 2097152u) != 0u) {
+        alpha_multiplier *= (1.0 - vertex_alpha);
+    }
+    let alpha = rt_sample_alpha(material.texture.x, uv) * alpha_multiplier;
+    return alpha >= material.params.x;
+}
+
+fn rt_trace_shadow_visibility(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> f32 {
+    // RayDesc requires t_max >= t_min. Very close emitters have no traceable
+    // segment after the receiver and emitter endpoint biases are applied.
+    if (max_distance <= 0.25) {
+        return 1.0;
+    }
+    var query: ray_query;
+    // TERMINATE_ON_FIRST_HIT | SKIP_AABBS. Opaque BLAS triangles auto-commit;
+    // non-opaque mask triangles interrupt traversal as candidates so their
+    // authored alpha test can decide whether traversal continues.
+    rayQueryInitialize(
+        &query,
+        rt_shadow_scene,
+        RayDesc(0x204u, 0xffu, 0.25, max_distance, origin, direction_to_light)
+    );
+    loop {
+        let has_candidate = rayQueryProceed(&query);
+        if (!has_candidate) {
+            break;
+        }
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        if (candidate.kind == 1u && rt_alpha_candidate_blocks(candidate)) {
+            rayQueryConfirmIntersection(&query);
+            rayQueryTerminate(&query);
+        }
+    }
+    let hit = rayQueryGetCommittedIntersection(&query);
+    return select(1.0, 0.0, hit.kind != 0u);
+}
+
+fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    // Local shadows remain independently switchable. The cubemap slot/count
+    // are deliberately irrelevant here, including for transient FX lights.
+    if (!ENABLE_LOCAL_SHADOWS || camera.render_flags.x != 0u) {
+        return 1.0;
+    }
+    let delta = light.position_radius.xyz - world_position;
+    let distance_squared = dot(delta, delta);
+    let radius = max(light.position_radius.w, 0.0);
+    if (distance_squared <= 1e-8 || distance_squared >= radius * radius) {
+        return 1.0;
+    }
+    let direction = delta * inverseSqrt(distance_squared);
+    // Match the contribution rules shared by the existing clustered callers.
+    // Ordinary lights contribute neither diffuse nor specular on the back side.
+    // Authored q3map lighting has different angle rules, so preserve that path.
+    let ndotl = max(dot(normal, direction), 0.0);
+    if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
+        let scalar = q3map_light_scalar(light, sqrt(distance_squared), q3map_surface_angle(light, ndotl));
+        if (!q3map_fast_contribution_visible(scalar)) {
+            return 1.0;
+        }
+    } else if (ndotl <= 0.0 || light.color_intensity.a == 0.0) {
+        return 1.0;
+    }
+    if (emitter_visibility(light, direction) <= 0.0) {
+        return 1.0;
+    }
+    let surface_normal = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
+    let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction) >= 0.0);
+    // Limit the offset near an emitter, and recompute the direction from the
+    // biased origin so the finite segment still ends exactly at that emitter.
+    let origin = world_position + oriented_normal * min(0.5, sqrt(distance_squared) * 0.25);
+    let to_emitter = light.position_radius.xyz - origin;
+    let distance = length(to_emitter);
+    if (distance <= 0.5) {
+        return 1.0;
+    }
+    return rt_trace_shadow_visibility(origin, to_emitter / distance, distance - 0.25);
+}
+
+fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
+    if (!ENABLE_RAY_TRACED_SHADOWS || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) {
+        return 1.0;
+    }
+
+    // ShadowSettings stores the direction the authored light travels. Receiver
+    // rays travel in the opposite direction, toward the finite emitter.
+    let toward_light = -shadow_settings.light_direction_enabled.xyz;
+    let light_len_sq = dot(toward_light, toward_light);
+    if (light_len_sq < 1e-8) {
+        return 1.0;
+    }
+    let direction_to_light = toward_light * inverseSqrt(light_len_sq);
+    let normal_len_sq = max(dot(normal, normal), 1e-12);
+    let surface_normal = normal * inverseSqrt(normal_len_sq);
+    let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction_to_light) >= 0.0);
+    let origin = input.world_position + oriented_normal * 0.5;
+
+    // Seed layout follows Bevy's per-pixel/per-frame stochastic approach. With
+    // TAA enabled render_flags.w advances every frame so the existing temporal
+    // resolve integrates a new sun-disc sample. Without TAA the frame term is
+    // held at zero: each pixel keeps one deterministic sample, avoiding temporal
+    // sparkle without multiplying hardware ray traversal cost.
+    let px = u32(max(input.clip_position.x, 0.0));
+    let py = u32(max(input.clip_position.y, 0.0));
+    let viewport_width = max(lighting_settings.values.z, 1u);
+    let pixel_index = px + py * viewport_width;
+    var rng = pixel_index + camera.render_flags.w;
+    let cos_theta_max = clamp(shadow_settings.bevy_params.x, 0.0, 1.0);
+    let sampled_direction = rt_sample_directional_emitter(direction_to_light, cos_theta_max, &rng);
+    return rt_trace_shadow_visibility(origin, sampled_direction, 1000000.0);
+}
+
+"#;
+    source = source.replacen(
+        CASCADE_FN,
+        &format!(
+            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
+        ),
+        1,
+    );
+
+    source = source.replacen(
+        LOCAL_FN,
+        &format!(
+            "{LOCAL_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS) {{\n        return ray_traced_local_shadow_visibility(light, world_position, receiver_normal);\n    }}"
+        ),
+        1,
+    );
+
+    // Ordinary BSP sun visibility is multiplied by sun_facing and strength.
+    // Avoid a full traversal when that multiplier is zero. Keep this at the
+    // contribution site: ocean specular uses the shared visibility helper too,
+    // and must retain its own receiver rules.
+    source = source.replacen(
+        SURFACE_SUN,
+        "        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);\n        var shadow_visibility = 1.0;\n        if (sun_facing > 0.0 && shadow_settings.params.z != 0.0) {\n            shadow_visibility = cascaded_shadow_visibility(input, input.world_normal);\n        }",
+        1,
+    );
+
+    // The enhanced ocean path has one outer guard that bypasses the common
+    // visibility helper. Let the RT variant enter that same authoritative path.
+    source = source.replace(
+        "ENABLE_CASCADED_SHADOWS && shadow_settings.light_direction_enabled.w > 0.5",
+        "(ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SHADOWS) && shadow_settings.light_direction_enabled.w > 0.5",
+    );
+    Ok(source)
+}
+
+fn rt_alpha_storage_entry<T: Pod>(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            // Validate table sizes at bind-group creation instead of first draw.
+            min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
+        },
+        count: None,
+    }
+}
+
+fn rt_alpha_storage_entries() -> [wgpu::BindGroupLayoutEntry; 6] {
+    [
+        rt_alpha_storage_entry::<RtAlphaVertexGpu>(9),
+        rt_alpha_storage_entry::<u32>(10),
+        rt_alpha_storage_entry::<RtAlphaGeometryGpu>(11),
+        rt_alpha_storage_entry::<RtAlphaMaterialGpu>(12),
+        rt_alpha_storage_entry::<RtAlphaTextureGpu>(13),
+        rt_alpha_storage_entry::<u32>(14),
+    ]
+}
+
+fn create_ray_traced_shadow_receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let alpha_entries = rt_alpha_storage_entries();
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("JKA hardware ray-traced sun/weather receiver layout"),
+        entries: &[
+            depth_array_texture_entry(0),
+            comparison_sampler_entry(1),
+            uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+            uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+            unfilterable_texture_entry_stages(
+                4,
+                wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ),
+            uniform_entry(
+                5,
+                wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ),
+            nonfiltering_sampler_entry(6, wgpu::ShaderStages::FRAGMENT),
+            depth_array_texture_entry(7),
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            },
+            alpha_entries[0],
+            alpha_entries[1],
+            alpha_entries[2],
+            alpha_entries[3],
+            alpha_entries[4],
+            alpha_entries[5],
+        ],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_ray_traced_shadow_receiver_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    shadow_array_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+    sky_array_view: &wgpu::TextureView,
+    receiver_buffer: &wgpu::Buffer,
+    fog_control_buffer: &wgpu::Buffer,
+    weather_height_view: &wgpu::TextureView,
+    weather_sampler: &wgpu::Sampler,
+    weather_surface_buffer: &wgpu::Buffer,
+    tlas: &wgpu::Tlas,
+    alpha_vertex_buffer: &wgpu::Buffer,
+    alpha_index_buffer: &wgpu::Buffer,
+    alpha_geometry_buffer: &wgpu::Buffer,
+    alpha_material_buffer: &wgpu::Buffer,
+    alpha_texture_buffer: &wgpu::Buffer,
+    alpha_texel_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(shadow_array_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(shadow_sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: receiver_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: fog_control_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(weather_height_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: weather_surface_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(weather_sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(sky_array_view) },
+            wgpu::BindGroupEntry { binding: 8, resource: tlas.as_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: alpha_vertex_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: alpha_index_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: alpha_geometry_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: alpha_material_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: alpha_texture_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: alpha_texel_buffer.as_entire_binding() },
+        ],
+    })
 }
 
 fn create_shadow_receiver_bind_group(
@@ -27061,6 +30679,102 @@ fn create_ui_pipeline(
 mod shader_tests {
     use super::*;
 
+    #[test]
+    fn rt_empty_alpha_tables_satisfy_shader_binding_sizes() {
+        let descriptors = [
+            rt_alpha_empty_buffer_descriptor::<RtAlphaVertexGpu>("vertices", wgpu::BufferUsages::BLAS_INPUT),
+            rt_alpha_empty_buffer_descriptor::<u32>("indices", wgpu::BufferUsages::BLAS_INPUT),
+            rt_alpha_empty_buffer_descriptor::<RtAlphaGeometryGpu>("geometries", wgpu::BufferUsages::empty()),
+            rt_alpha_empty_buffer_descriptor::<RtAlphaMaterialGpu>("materials", wgpu::BufferUsages::empty()),
+            rt_alpha_empty_buffer_descriptor::<RtAlphaTextureGpu>("textures", wgpu::BufferUsages::empty()),
+            rt_alpha_empty_buffer_descriptor::<u32>("texels", wgpu::BufferUsages::empty()),
+        ];
+        let entries = rt_alpha_storage_entries();
+        for base in [include_str!("bsp.wgsl"), include_str!("bsp_lean.wgsl")] {
+            let source = format!("{}\n{}", ray_traced_world_shader_source(base).unwrap(), include_str!("surface_deformation.wgsl"));
+            let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+            for (entry, descriptor) in entries.iter().zip(&descriptors) {
+                let global = module.global_variables.iter().map(|(_, global)| global)
+                    .find(|global| global.binding.as_ref().is_some_and(|binding| binding.group == 3 && binding.binding == entry.binding))
+                    .expect("RT alpha binding must exist in both generated shaders");
+                let wgpu::naga::TypeInner::Array { stride, size: wgpu::naga::ArraySize::Dynamic, .. } = module.types[global.ty].inner else {
+                    panic!("RT alpha binding must be a runtime array");
+                };
+                let wgpu::BindingType::Buffer { min_binding_size: Some(minimum), .. } = entry.ty else {
+                    panic!("RT alpha binding must declare its minimum size");
+                };
+                assert_eq!(minimum.get(), u64::from(stride), "Rust/WGSL element mismatch at binding {}", entry.binding);
+                assert!(descriptor.size >= u64::from(stride), "empty {} buffer is smaller than one WGSL element", descriptor.label.unwrap());
+                assert!(descriptor.usage.contains(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST));
+            }
+        }
+    }
+
+    #[test]
+    fn rt_alpha_cache_reuses_textures_and_accepts_changed_skins() {
+        let mut textures = Vec::new();
+        let mut texels = Vec::new();
+        let mut cache = HashMap::new();
+        let mut skin = TextureData {
+            label: "mask_a".into(), source: None, width: 2, height: 1,
+            rgba: vec![255, 255, 255, 0, 255, 255, 255, 192],
+            rgba16f: None, mip_level_count: 1, clamp: false, srgb: true,
+        };
+        let first = rt_alpha_ensure_dynamic_texture(Some(&skin), &mut textures, &mut texels, &mut cache);
+        assert_eq!(texels, [192 << 8]);
+        assert_eq!(textures[first as usize].values, [0, 2, 1, 0]);
+        for _ in 0..4 {
+            assert_eq!(rt_alpha_ensure_dynamic_texture(Some(&skin), &mut textures, &mut texels, &mut cache), first);
+        }
+        assert_eq!((textures.len(), texels.len()), (1, 1));
+        skin.label = "mask_b".into();
+        skin.rgba[3] = 255;
+        let second = rt_alpha_ensure_dynamic_texture(Some(&skin), &mut textures, &mut texels, &mut cache);
+        assert_ne!(first, second);
+        assert_eq!(texels, [192 << 8, 255 | (192 << 8)]);
+        let material = rt_alpha_dynamic_material(second);
+        assert_eq!(material.texture[0], second);
+        assert_eq!(material.params[0], 0.5);
+        assert_eq!(material.color, [1.0; 4]);
+        // Missing/truncated pixel data uses the same white fallback key during
+        // both table insertion and the subsequent per-frame material lookup.
+        skin.rgba.clear();
+        let fallback = rt_alpha_ensure_dynamic_texture(Some(&skin), &mut textures, &mut texels, &mut cache);
+        assert_eq!(cache[&rt_alpha_texture_key(Some(&skin))], fallback);
+        assert_eq!(textures[fallback as usize].values[1..3], [1, 1]);
+        assert_eq!(*texels.last().unwrap(), 255);
+    }
+
+    #[test]
+    fn rt_shader_variants_specialize_and_emit_spirv() {
+        use wgpu::naga;
+        for base in [include_str!("bsp.wgsl"), include_str!("bsp_lean.wgsl")] {
+            let source = format!("{}\n{}", ray_traced_world_shader_source(base).unwrap(), include_str!("surface_deformation.wgsl"));
+            let module = naga::front::wgsl::parse_str(&source).unwrap();
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all(),
+            ).validate(&module).unwrap();
+            // Exercise both lighting branches with local shadows enabled. The
+            // sun-only permutation verifies the independent local-shadow switch.
+            for (pbr, local) in [(0.0, 1.0), (1.0, 1.0), (0.0, 0.0)] {
+                let constants = [
+                    ("ENABLE_RAY_TRACED_SHADOWS".into(), 1.0),
+                    ("ENABLE_LOCAL_SHADOWS".into(), local),
+                    ("ENABLE_POINT_LIGHTS".into(), 1.0),
+                    ("ENABLE_PBR".into(), pbr),
+                ].into_iter().collect();
+                let (specialized, specialized_info) = naga::back::pipeline_constants::process_overrides(
+                    &module, &info, None, &constants,
+                ).unwrap();
+                naga::back::spv::write_vec(
+                    &specialized, &specialized_info,
+                    &naga::back::spv::Options { lang_version: (1, 4), ..Default::default() },
+                    None,
+                ).expect("RT shadow variants must compile through the Vulkan shader backend");
+            }
+        }
+    }
+
     fn mover_vertex(jka: [f32; 3], normal: [f32; 3]) -> GpuVertex {
         GpuVertex {
             position: scene::render_position(jka),
@@ -27093,6 +30807,26 @@ mod shader_tests {
         let (compiled, _, _) = posed_inline_vertices(&base, Some(InlineModelInstance::compiled(3)));
         assert_eq!(compiled[0].position, base[0].position);
         assert_eq!(compiled[1].normal, base[1].normal);
+    }
+
+    #[test]
+    fn inline_model_rt_transform_matches_raster_pose() {
+        let pose = InlineModelInstance {
+            model: 7,
+            origin: [5.0, -3.0, 2.0],
+            axis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let point = scene::render_position([10.0, 4.0, -6.0]);
+        let expected = pose.transform_point(point);
+        let transform = pose.rt_transform();
+        let actual = [
+            transform[0] * point[0] + transform[1] * point[1] + transform[2] * point[2] + transform[3],
+            transform[4] * point[0] + transform[5] * point[1] + transform[6] * point[2] + transform[7],
+            transform[8] * point[0] + transform[9] * point[1] + transform[10] * point[2] + transform[11],
+        ];
+        for axis in 0..3 {
+            assert!((actual[axis] - expected[axis]).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -27273,6 +31007,7 @@ mod shader_tests {
             ("ocean_windrow", include_str!("ocean_windrow.wgsl")),
             ("md3", include_str!("md3.wgsl")),
             ("ghoul2_skin", include_str!("ghoul2_skin.wgsl")),
+            ("ghoul2_skin_compute", include_str!("ghoul2_skin_compute.wgsl")),
             ("grass", include_str!("grass.wgsl")),
             ("grass_prepared", include_str!("grass_prepared.wgsl")),
             ("snowflow_deformation_sim", include_str!("snowflow_deformation_sim.wgsl")),
@@ -27287,6 +31022,26 @@ mod shader_tests {
             )
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+        }
+
+        // RT variants are source-transformed lazily at runtime. Validate the
+        // transformed WGSL here too so candidate-intersection alpha handling
+        // cannot silently drift from Naga/wgpu's current ray-query grammar.
+        for (name, base) in [
+            ("bsp_rt", include_str!("bsp.wgsl")),
+            ("bsp_lean_rt", include_str!("bsp_lean.wgsl")),
+        ] {
+            let transformed = ray_traced_world_shader_source(base)
+                .unwrap_or_else(|error| panic!("{name}: RT source transform failed: {error}"));
+            let source = format!("{}\n{}", transformed, include_str!("surface_deformation.wgsl"));
+            let module = wgpu::naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
         }
     }
 }

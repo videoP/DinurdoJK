@@ -7,7 +7,7 @@
 //! network, demo, and local/offline sources use this exact same presentation code.
 
 use crate::{
-    cgame::{ClientGameState, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER},
+    cgame::{ClientGameState, Ghoul2ServerCommand, PresentationEvent, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER},
     materials::{self, TextureData, Textures},
     renderer::{
         DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, Ghoul2GpuBone,
@@ -46,6 +46,8 @@ use std::{
 
 const EF_TELEPORT_BIT: i32 = 1 << 3;
 const WP_SABER: i32 = 3;
+const WP_BRYAR_PISTOL: i32 = 4;
+const EV_DESTROY_WEAPON_MODEL: i32 = 104;
 const EF_NODRAW: i32 = 1 << 8;
 const EF_DEAD: i32 = 1 << 1;
 const EF_RAG: i32 = 1 << 6;
@@ -254,6 +256,105 @@ struct SaberModelAsset {
     surfaces: Vec<PlayerSurfaceAsset>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BodyQueueCopyState {
+    source_client: u16,
+    _known_weapon: i32,
+    _light_side: bool,
+    /// Ghoul2 model index 1 after CG_BodyQueueCopy has duplicated the source
+    /// instance and applied its knownWeapon correction. This is deliberately a
+    /// g2WeaponInstances-style weapon identity: for ET_BODY, WP_SABER resolves
+    /// to OpenJK's default saber instance rather than the live client's custom
+    /// primary saber instance.
+    model1_weapon: Option<i32>,
+    /// Ghoul2 model index 2 survives the body copy independently. OpenJK uses
+    /// it for the second saber and does not strip it with the model-1 rule.
+    model2_saber: bool,
+}
+
+/// OpenJK stores current/desired blade length in clientInfo_t::saber[].blade[].
+/// Keep the same persistent presentation state so EF_DEAD can retract a live
+/// player's blade instead of snapping it back to its authored full length.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SaberBladeLengthKey {
+    client_num: usize,
+    saber_num: u8,
+    blade_num: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SaberBladeLengthState {
+    length: f32,
+    length_max: f32,
+    desired_length: f32,
+    extend_debounce: i32,
+    last_update_time: i32,
+}
+
+impl SaberBladeLengthState {
+    fn new(length_max: f32, desired_length: f32, time: i32) -> Self {
+        let length_max = length_max.max(0.0);
+        let length = if desired_length == 0.0 { 0.0 } else { length_max };
+        Self {
+            length,
+            length_max,
+            desired_length,
+            extend_debounce: time,
+            last_update_time: time,
+        }
+    }
+
+    /// Direct arithmetic port of OpenJK BG_SI_SetLengthGradual for one blade.
+    fn set_desired_and_update(&mut self, desired_length: f32, length_max: f32, time: i32) -> f32 {
+        self.length_max = length_max.max(0.0);
+        self.length = self.length.clamp(0.0, self.length_max);
+        self.desired_length = desired_length;
+        if self.last_update_time == time {
+            return self.length;
+        }
+        self.last_update_time = time;
+
+        let desired = if self.desired_length == -1.0 {
+            self.length_max
+        } else {
+            self.desired_length.clamp(0.0, self.length_max)
+        };
+        if self.length == desired {
+            return self.length;
+        }
+        if self.length == self.length_max || self.length == 0.0 {
+            self.extend_debounce = time;
+            if self.length == 0.0 {
+                self.length += 1.0;
+            } else {
+                self.length -= 1.0;
+            }
+        }
+        let mut amount = (time - self.extend_debounce) as f32 * 0.01;
+        if amount < 0.2 {
+            amount = 0.2;
+        }
+        if self.length < desired {
+            self.length += amount;
+            if self.length > desired {
+                self.length = desired;
+            }
+            if self.length > self.length_max {
+                self.length = self.length_max;
+            }
+        } else if self.length > desired {
+            self.length -= amount;
+            if self.length < desired {
+                self.length = desired;
+            }
+            if self.length < 0.0 {
+                self.length = 0.0;
+            }
+        }
+        self.length
+    }
+}
+
 struct EntityPlayerState {
     model_key: String,
     // Cache the resolved model directly on the persistent centity-like state.
@@ -270,8 +371,17 @@ struct EntityPlayerState {
     last_client_num: i32,
     /// `cent->ghoul2weapon`: which g2WeaponInstances entry was last copied.
     ghoul2_weapon: Option<i32>,
-    /// Ghoul2 model index 1 on the player: the bolted non-saber weapon.
+    /// OpenJK `cent->weapon`: identity of the weapon model(s) currently bolted
+    /// into the persistent Ghoul2 instance. This intentionally survives death
+    /// even when currentState.weapon changes; EV_DESTROY_WEAPON_MODEL or a
+    /// later live weapon swap is what changes the bolted model state.
+    cent_weapon: i32,
+    /// Ghoul2 model index 1 on the player when it is a non-saber weapon.
     attached_weapon: Option<i32>,
+    /// Ghoul2 model index 1 when occupied by the primary saber hilt.
+    primary_saber_attached: bool,
+    /// Ghoul2 model index 2 when occupied by the second saber hilt.
+    secondary_saber_attached: bool,
 }
 
 /// Force-power visuals CG_Player hands to the FX system / local entities.
@@ -330,34 +440,149 @@ const WP_MELEE: i32 = 2;
 const WP_EMPLACED_GUN: i32 = 17;
 const TEAM_SPECTATOR: i32 = 3;
 
-/// OpenJK CG_Player's weapon-instance swap (cg_players.c) and
-/// CG_CopyG2WeaponInstance (cg_weapons.c) for Ghoul2 model index 1.
-/// `instance` is g2WeaponInstances[weapon] (None when that weapon has no
-/// IT_WEAPON item, e.g. WP_NONE). Sabers are drawn by the saber path, so a
-/// saber copy only clears the non-saber attachment.
+/// The saber-specific weapon bootstrap at the end of OpenJK's
+/// CG_ResetPlayerEntity. A remote player entering the PVS (including every
+/// entity in an initial demo snapshot) copies the complete WP_SABER Ghoul2
+/// weapon instance before CG_Player applies saberInFlight. The copy itself
+/// runs CG_CopyG2WeaponInstance, which places saber 0 at model index 1 and
+/// saber 1 at model index 2. This is deliberately separate from the normal
+/// per-frame weapon-pointer comparison below: ghoul2weapon identifies the
+/// primary weapon instance and is not evidence that model index 2 was copied.
+#[allow(clippy::too_many_arguments)]
+fn reset_remote_player_saber_attachment(
+    ghoul2_weapon: &mut Option<i32>,
+    cent_weapon: &mut i32,
+    attached_weapon: &mut Option<i32>,
+    primary_saber_attached: &mut bool,
+    secondary_saber_attached: &mut bool,
+    requested_weapon: i32,
+    remote_from_predicted_player: bool,
+    has_primary_saber: bool,
+    has_secondary_saber: bool,
+) {
+    // cg_players.c::CG_ResetPlayerEntity:
+    //   currentState.number != predictedPlayerState.clientNum
+    //   && currentState.weapon == WP_SABER
+    //   && cent->weapon != currentState.weapon
+    if !remote_from_predicted_player
+        || requested_weapon != WP_SABER
+        || *cent_weapon == requested_weapon
+    {
+        return;
+    }
+
+    *cent_weapon = requested_weapon;
+
+    // CG_CopyG2WeaponInstance(WP_SABER) copies both configured saber slots.
+    // In this Rust presenter these booleans are the actual model-index state.
+    *attached_weapon = None;
+    *primary_saber_attached = has_primary_saber;
+    *secondary_saber_attached = has_secondary_saber;
+    *ghoul2_weapon = Some(WP_SABER);
+}
+
+/// OpenJK CG_Player + CG_CopyG2WeaponInstance. `ghoul2_weapon` is the last
+/// g2WeaponInstances pointer identity, `cent_weapon` is the persistent centity
+/// weapon identity, and the three model-slot arguments are the actual Ghoul2
+/// attachment state. Death clears only ghoul2weapon; it does not
+/// manufacture/remove held models.
+#[allow(clippy::too_many_arguments)]
 fn update_weapon_attachment(
     ghoul2_weapon: &mut Option<i32>,
-    attached: &mut Option<i32>,
+    cent_weapon: &mut i32,
+    attached_weapon: &mut Option<i32>,
+    primary_saber_attached: &mut bool,
+    secondary_saber_attached: &mut bool,
+    requested_weapon: i32,
     instance: Option<i32>,
+    saber_in_flight: bool,
     dead: bool,
     spectator: bool,
+    has_primary_saber: bool,
+    has_secondary_saber: bool,
 ) {
-    if !dead && *ghoul2_weapon != instance {
-        if spectator {
-            *ghoul2_weapon = None;
-            return;
-        }
-        match instance {
-            Some(WP_SABER | WP_MELEE | WP_EMPLACED_GUN) => *attached = None,
-            Some(other) => *attached = Some(other),
-            // No instance to copy: the previous model stays bolted on.
-            None => {}
-        }
-        *ghoul2_weapon = instance;
-    } else if dead {
-        // "be sure to update after respawning": the model itself stays.
+    // CG_Player recomputes whether Ghoul2 model index 1 actually exists every
+    // frame. If it does not, OpenJK forcibly clears both tracking fields so a
+    // weapon can be recopied later (cg_players.c: g2HasWeapon check immediately
+    // before the weapon update block). This is essential for saber return: the
+    // in-flight path removes model index 1 while leaving the logical saber
+    // instance selected, and the missing-slot check is what makes the catch
+    // reattach it on the next non-flight frame.
+    let g2_has_weapon = attached_weapon.is_some() || *primary_saber_attached;
+    if !g2_has_weapon {
         *ghoul2_weapon = None;
+        *cent_weapon = 0;
     }
+
+    // CG_Player does this after the actual model-slot test and before its
+    // death/spectator tests so an in-flight primary saber cannot be
+    // copied back into the hand until the server says it has returned.
+    if saber_in_flight {
+        *ghoul2_weapon = Some(WP_SABER);
+    }
+
+    if dead {
+        // CG_Player / CG_CheckPlayerG2Weapons: "no updating weapons when dead". The
+        // copied models stay exactly as they were until an explicit event or
+        // body-copy operation changes them.
+        *ghoul2_weapon = None;
+        return;
+    }
+
+    if spectator {
+        // OpenJK resets the tracking pointers for spectators, but does not
+        // issue a Ghoul2 RemoveGhoul2Model here. Preserve the actual slots.
+        *ghoul2_weapon = None;
+        *cent_weapon = 0;
+        return;
+    }
+
+    if *ghoul2_weapon == instance {
+        return;
+    }
+
+    match instance {
+        Some(WP_SABER) => {
+            // CG_CopyG2WeaponInstance copies saber 0 to model index 1 and, for
+            // dual sabers, saber 1 to model index 2.
+            *attached_weapon = None;
+            *primary_saber_attached = has_primary_saber;
+            *secondary_saber_attached = has_secondary_saber;
+        }
+        Some(WP_MELEE | WP_EMPLACED_GUN) => {
+            // These weapon instances deliberately remove held Ghoul2 models.
+            *attached_weapon = None;
+            *primary_saber_attached = false;
+            *secondary_saber_attached = false;
+        }
+        Some(other) => {
+            *attached_weapon = Some(other);
+            *primary_saber_attached = false;
+            *secondary_saber_attached = false;
+        }
+        // No g2WeaponInstances entry means CG_CopyG2WeaponInstance does
+        // nothing; the previous actual model slots remain bolted on.
+        None => {}
+    }
+
+    *cent_weapon = requested_weapon;
+    *ghoul2_weapon = instance;
+}
+
+/// OpenJK CG_BodyQueueCopy first duplicates the source Ghoul2 instance and
+/// only then applies this correction to model index 1. Crucially, a missing
+/// source model is never manufactured from knownWeapon.
+fn body_queue_model1_weapon(source_model1: Option<i32>, known_weapon: i32) -> Option<i32> {
+    let source_model1 = source_model1?;
+    if known_weapon > WP_BRYAR_PISTOL {
+        return None;
+    }
+    if known_weapon == WP_SABER {
+        return Some(WP_SABER);
+    }
+    // CG_G2WeaponInstance must exist for CopySpecificGhoul2Model to replace
+    // model index 1. If it does not, retain the duplicated source slot.
+    weapon_world_model(known_weapon).map_or(Some(source_model1), |_| Some(known_weapon))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -562,6 +787,10 @@ pub struct PlayerPresenter {
     force_grip_targets: HashMap<u16, u16>,
     force_gripped_entities: HashSet<u16>,
     thrown_sabers: HashMap<u16, SaberThrowState>,
+    /// OpenJK CG_BodyQueueCopy state delivered by reliable `ircg`.
+    body_queue_copies: HashMap<u16, BodyQueueCopyState>,
+    /// OpenJK clientInfo_t saber blade current/desired lengths.
+    saber_blade_lengths: HashMap<SaberBladeLengthKey, SaberBladeLengthState>,
     failed_models: HashMap<String, String>,
     player_diagnostics: HashMap<u16, String>,
     failed_saber_models: HashSet<String>,
@@ -571,6 +800,9 @@ pub struct PlayerPresenter {
     logged_first_draw: bool,
     skinning_mode: Ghoul2SkinningMode,
     early_frustum_cull: bool,
+    /// When true, camera-culled Ghoul2 models may still be submitted as
+    /// shadow-only RT casters. Normal RT-off presentation is unchanged.
+    rt_shadow_casters_enabled: bool,
     lod_bias: i32,
     skinning_pool: rayon::ThreadPool,
 }
@@ -628,6 +860,8 @@ impl PlayerPresenter {
         self.force_grip_targets.clear();
         self.force_gripped_entities.clear();
         self.thrown_sabers.clear();
+        self.body_queue_copies.clear();
+        self.saber_blade_lengths.clear();
         self.ragdolls.reset_dynamic_for_seek();
     }
 
@@ -688,6 +922,8 @@ impl PlayerPresenter {
             force_grip_targets: HashMap::new(),
             force_gripped_entities: HashSet::new(),
             thrown_sabers: HashMap::new(),
+            body_queue_copies: HashMap::new(),
+            saber_blade_lengths: HashMap::new(),
             failed_models: HashMap::new(),
             player_diagnostics: HashMap::new(),
             failed_saber_models: HashSet::new(),
@@ -697,6 +933,7 @@ impl PlayerPresenter {
             logged_first_draw: false,
             skinning_mode: Ghoul2SkinningMode::Gpu,
             early_frustum_cull: true,
+            rt_shadow_casters_enabled: false,
             lod_bias: 0,
             skinning_pool,
         })
@@ -709,6 +946,76 @@ impl PlayerPresenter {
 
     pub fn begin_perf_frame(&mut self) {
         self.perf = Ghoul2PerfStats::default();
+    }
+
+    /// OpenJK CG_RestoreClientGhoul_f / CG_BodyQueueCopy presentation state.
+    pub fn apply_ghoul2_server_command(&mut self, command: Ghoul2ServerCommand) {
+        match command {
+            Ghoul2ServerCommand::BodyQueueCopy {
+                source_client,
+                body_entity,
+                known_weapon,
+                light_side,
+            } => {
+                // CG_RestoreClientGhoul_f returns immediately when the source
+                // has no Ghoul2 instance. `entities` is this presenter's
+                // equivalent persistent instance state, so do the same here.
+                let Some(source) = self.entities.get(&source_client) else {
+                    return;
+                };
+                let source_model1 = if source.primary_saber_attached {
+                    Some(WP_SABER)
+                } else {
+                    source.attached_weapon
+                };
+                let source_model2_saber = source.secondary_saber_attached;
+
+                // CG_BodyQueueCopy duplicates the actual source Ghoul2 first,
+                // then applies knownWeapon only to model index 1.
+                self.body_queue_copies.insert(
+                    body_entity,
+                    BodyQueueCopyState {
+                        source_client,
+                        _known_weapon: known_weapon,
+                        _light_side: light_side,
+                        model1_weapon: body_queue_model1_weapon(source_model1, known_weapon),
+                        model2_saber: source_model2_saber,
+                    },
+                );
+
+                // The command handler resets the live centity tracking fields
+                // after the body has been copied. It does not remove the source
+                // model slots themselves.
+                if let Some(source) = self.entities.get_mut(&source_client) {
+                    source.cent_weapon = 0;
+                    source.ghoul2_weapon = None;
+                }
+                self.thrown_sabers.remove(&source_client);
+            }
+            Ghoul2ServerCommand::RestoreClient { source_client } => {
+                // Same early return as CG_RestoreClientGhoul_f.
+                let Some(source) = self.entities.get_mut(&source_client) else {
+                    return;
+                };
+                source.cent_weapon = 0;
+                source.ghoul2_weapon = None;
+                self.thrown_sabers.remove(&source_client);
+            }
+        }
+    }
+
+    /// OpenJK EV_DESTROY_WEAPON_MODEL removes Ghoul2 model index 1 only.
+    pub fn apply_entity_event(&mut self, event: &PresentationEvent) {
+        if event.event != EV_DESTROY_WEAPON_MODEL {
+            return;
+        }
+        let Ok(target) = u16::try_from(event.parm) else {
+            return;
+        };
+        if let Some(runtime) = self.entities.get_mut(&target) {
+            runtime.attached_weapon = None;
+            runtime.primary_saber_attached = false;
+        }
     }
 
     pub fn set_ragdoll_config(&mut self, config: RagdollConfig) {
@@ -830,6 +1137,10 @@ impl PlayerPresenter {
         self.early_frustum_cull = enabled;
     }
 
+    pub fn set_rt_shadow_casters_enabled(&mut self, enabled: bool) {
+        self.rt_shadow_casters_enabled = enabled;
+    }
+
     pub fn set_lod_bias(&mut self, lod_bias: i32) {
         // OpenJK's renderer cvar is not range-checked, but its Ghoul2 path
         // takes max(r_lodbias, modelBias). Our current per-model bias is 0,
@@ -899,9 +1210,12 @@ impl PlayerPresenter {
                 draws.push(DynamicModelSurface {
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Player,
+                    raster_visible: true,
                     vertices: Arc::clone(&empty_vertices),
                     indices: Arc::clone(&gpu_mesh.indices),
                     lighting_origin: Some(origin),
+                    rt_rigid: None,
+                    rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.key)),
                     ghoul2_gpu: Some(Ghoul2GpuSkinning {
                         mesh_key: Arc::clone(&gpu_mesh.key),
                         vertices: Arc::clone(&gpu_mesh.vertices),
@@ -973,9 +1287,12 @@ impl PlayerPresenter {
             draws.push(DynamicModelSurface {
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Player,
+                raster_visible: true,
                 vertices: Arc::new(vertices),
                 indices: Arc::clone(&gpu_mesh.indices),
                 lighting_origin: Some(origin),
+                rt_rigid: None,
+                rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.key)),
                 ghoul2_gpu: None,
                 texture,
                 alpha_mode,
@@ -1013,9 +1330,12 @@ impl PlayerPresenter {
         DynamicModelSurface {
             entity_num: surface.entity_num,
             wireframe_class: DynamicWireframeClass::Player,
+            raster_visible: surface.raster_visible,
             vertices,
             indices: Arc::clone(&surface.indices),
             lighting_origin: surface.lighting_origin,
+            rt_rigid: surface.rt_rigid.clone(),
+            rt_skinned_key: surface.rt_skinned_key.as_ref().map(Arc::clone),
             ghoul2_gpu,
             texture,
             alpha_mode,
@@ -1062,13 +1382,17 @@ impl PlayerPresenter {
         };
 
         let render_origin = ghoul2_render_origin(entity);
+        let mut raster_visible = true;
         let lod = if let Some(view) = view {
             if self.early_frustum_cull {
                 self.perf.frustum_tests = self.perf.frustum_tests.saturating_add(1);
                 let radius = ghoul2_entity_radius(entity) * ghoul2_model_scale(entity);
                 if view.sphere_outside(render_origin, radius) {
                     self.perf.frustum_culled = self.perf.frustum_culled.saturating_add(1);
-                    return Ok(Vec::new());
+                    if !self.rt_shadow_casters_enabled {
+                        return Ok(Vec::new());
+                    }
+                    raster_visible = false;
                 }
             }
             let lod = ghoul2_lod_for_view(
@@ -1095,7 +1419,7 @@ impl PlayerPresenter {
         record_pose_eval(&mut self.perf, pose_started);
         let axis = angles_to_axis(entity.angles);
         let (axis, origin) = ghoul2_render_transform(entity, axis);
-        self.render_glm_surfaces(
+        let mut draws = self.render_glm_surfaces(
             entity.number,
             &requested,
             &model.glm,
@@ -1107,7 +1431,13 @@ impl PlayerPresenter {
             [1.0, 1.0, 1.0, 1.0],
             None,
             true,
-        )
+        )?;
+        if !raster_visible {
+            for surface in &mut draws {
+                surface.raster_visible = false;
+            }
+        }
+        Ok(draws)
     }
 
     pub fn present_snapshot_players(
@@ -1139,8 +1469,10 @@ impl PlayerPresenter {
             .map(|entity| (entity.number, entity.origin))
             .collect::<HashMap<_, _>>();
 
-        // CG_AddCEntity sends ET_NPC through CG_G2Animated -> CG_Player with
-        // `ci = cent->npcClient` instead of cgs.clientinfo[clientNum].
+        // ET_PLAYER uses CG_Player and ET_NPC uses CG_G2Animated. ET_BODY is
+        // CG_General in OpenJK; this Rust presenter still owns the shared body
+        // mesh/ragdoll submission, but its weapon state comes only from ircg.
+        // NPCs resolve `ci = cent->npcClient` instead of cgs.clientinfo[].
         for entity in entities
             .iter()
             .filter(|entity| {
@@ -1355,30 +1687,47 @@ impl PlayerPresenter {
                         .field_i32("clientNum")
                         .unwrap_or(i32::from(entity.number)),
                     ghoul2_weapon: None,
+                    cent_weapon: 0,
                     attached_weapon: None,
+                    primary_saber_attached: false,
+                    secondary_saber_attached: false,
                 },
             );
         }
 
-        let runtime = self
-            .entities
-            .get_mut(&entity.number)
-            .ok_or_else(|| "player animation state disappeared".to_owned())?;
+        let body_copy = if entity.entity_type == ET_BODY {
+            self.body_queue_copies
+                .get(&entity.number)
+                .copied()
+                .filter(|copy| usize::from(copy.source_client) == info.client_num)
+        } else {
+            None
+        };
 
         let e_flags = entity.state.field_i32("eFlags").unwrap_or(0);
         let client_num = entity
             .state
             .field_i32("clientNum")
             .unwrap_or(i32::from(entity.number));
+        let runtime = self
+            .entities
+            .get_mut(&entity.number)
+            .ok_or_else(|| "player animation state disappeared".to_owned())?;
+        let previous_e_flags = runtime.last_e_flags;
         let time_rewound = current_time < runtime.last_angle_time;
-        if openjk_player_entity_needs_reset(
-            runtime.last_e_flags,
-            runtime.last_client_num,
-            e_flags,
-            client_num,
-            force_reset,
-            time_rewound,
-        ) {
+        // CG_SetInitialSnapshot calls CG_ResetEntity for every entity, and
+        // CG_TransitionEntity does the same whenever interpolation breaks. A
+        // newly-created Rust runtime is the initial-snapshot/PVS equivalent.
+        let reset_player_entity = recreate
+            || openjk_player_entity_needs_reset(
+                previous_e_flags,
+                runtime.last_client_num,
+                e_flags,
+                client_num,
+                force_reset,
+                time_rewound,
+            );
+        if reset_player_entity {
             // OpenJK CG_TransitionEntity -> CG_ResetEntity ->
             // CG_ResetPlayerEntity when interpolation is broken.  This resets
             // the lerp frames and the persistent torso/legs angle swing state.
@@ -1398,15 +1747,85 @@ impl PlayerPresenter {
         runtime.last_client_num = client_num;
 
         let weapon = entity.state.field_i32("weapon").unwrap_or(0);
-        let instance = weapon_world_model(weapon).map(|_| weapon);
-        update_weapon_attachment(
-            &mut runtime.ghoul2_weapon,
-            &mut runtime.attached_weapon,
-            instance,
-            e_flags & EF_DEAD != 0,
-            info.team == TEAM_SPECTATOR && entity.entity_type == ET_PLAYER,
-        );
+        let has_primary_saber = !saber_name_is_removed(&info.saber_name);
+        let has_secondary_saber = !info.saber2_name.is_empty()
+            && !saber_name_is_removed(&info.saber2_name);
+        if entity.entity_type == ET_BODY {
+            // ET_BODY is CG_General in OpenJK. Never derive its held models from
+            // currentState.weapon: `ircg` already captured the duplicated G2
+            // model slots and CG_BodyQueueCopy's knownWeapon correction.
+            runtime.ghoul2_weapon = None;
+            runtime.cent_weapon = 0;
+            if let Some(copy) = body_copy {
+                // CG_BodyQueueCopy operates on an ET_BODY destination. Its
+                // low-tier model-1 replacement therefore goes through
+                // CG_G2WeaponInstance(body, knownWeapon): WP_SABER is the
+                // default g2WeaponInstances saber, not the client's custom
+                // primary hilt. Model index 2 is not replaced and can retain
+                // the copied custom second saber.
+                runtime.attached_weapon = copy.model1_weapon;
+                runtime.primary_saber_attached = false;
+                runtime.secondary_saber_attached = copy.model2_saber;
+            } else {
+                runtime.attached_weapon = None;
+                runtime.primary_saber_attached = false;
+                runtime.secondary_saber_attached = false;
+            }
+        } else {
+            // CG_ResetPlayerEntity performs this remote-saber copy before the
+            // ordinary CG_Player weapon update. In particular, if saber 0 is
+            // already in flight when a remote player first appears, this copy
+            // creates both model index 1 and model index 2; the later flight
+            // path removes only index 1, leaving the second saber in hand.
+            if reset_player_entity {
+                reset_remote_player_saber_attachment(
+                    &mut runtime.ghoul2_weapon,
+                    &mut runtime.cent_weapon,
+                    &mut runtime.attached_weapon,
+                    &mut runtime.primary_saber_attached,
+                    &mut runtime.secondary_saber_attached,
+                    weapon,
+                    i32::from(entity.number) != self.viewer_client,
+                    has_primary_saber,
+                    has_secondary_saber,
+                );
+            }
+
+            let dead = e_flags & EF_DEAD != 0;
+            let instance = if weapon == WP_SABER && has_primary_saber {
+                Some(WP_SABER)
+            } else {
+                weapon_world_model(weapon).map(|_| weapon)
+            };
+            update_weapon_attachment(
+                &mut runtime.ghoul2_weapon,
+                &mut runtime.cent_weapon,
+                &mut runtime.attached_weapon,
+                &mut runtime.primary_saber_attached,
+                &mut runtime.secondary_saber_attached,
+                weapon,
+                instance,
+                entity.state.field_i32("saberInFlight").unwrap_or(0) != 0,
+                dead,
+                info.team == TEAM_SPECTATOR && entity.entity_type == ET_PLAYER,
+                has_primary_saber,
+                has_secondary_saber,
+            );
+
+            // CG_Player's saber presentation removes model index 1 while the
+            // primary saber is in flight and copies it back when held again.
+            // This is model-slot state, separate from whether blades are lit.
+            if weapon == WP_SABER && runtime.cent_weapon == WP_SABER && has_primary_saber {
+                if entity.state.field_i32("saberInFlight").unwrap_or(0) != 0 {
+                    runtime.primary_saber_attached = false;
+                } else {
+                    runtime.attached_weapon = None;
+                    runtime.primary_saber_attached = true;
+                }
+            }
+        }
         let attached_weapon = runtime.attached_weapon;
+        let attached_sabers = [runtime.primary_saber_attached, runtime.secondary_saber_attached];
 
         runtime.animation.update(
             &entity.state,
@@ -1418,11 +1837,10 @@ impl PlayerPresenter {
             true,
         )?;
 
-        // OpenJK sends Ghoul2 corpses through CG_G2Animated -> CG_Player and
-        // enters Broadsword from CG_G2PlayerAngles. Once ragging, that path
-        // forces pitch/roll to zero and keeps only entity yaw. Do the same only
-        // while our Rapier corpse path is actually active; otherwise preserve
-        // the existing JKA player-angle behavior exactly.
+        // OpenJK renders ET_BODY through CG_General using the Ghoul2 instance
+        // copied at respawn. Our renderer still owns the equivalent corpse pose
+        // and Rapier handoff here; once ragging, preserve the existing yaw-only
+        // corpse orientation used by this port.
         runtime.animation.animator.clear_bone_angle_overrides();
         // Match OpenJK CG_G2PlayerAngles/CG_G2Animated: dead entities and
         // explicit EF_RAG entities enter the ragdoll seam regardless of whether
@@ -1529,6 +1947,7 @@ impl PlayerPresenter {
         };
 
         let cull_origin = ghoul2_render_origin(entity);
+        let mut raster_visible = submit_geometry;
 
         // Keep the cgame-side player-angle/animation state advancing exactly
         // as it does for a visible entity, then mirror OpenJK's renderer-side
@@ -1541,7 +1960,12 @@ impl PlayerPresenter {
                     let radius = ghoul2_entity_radius(entity) * ghoul2_model_scale(entity);
                     if view.sphere_outside(cull_origin, radius) {
                         self.perf.frustum_culled = self.perf.frustum_culled.saturating_add(1);
-                        return Ok(Vec::new());
+                        if !self.rt_shadow_casters_enabled {
+                            return Ok(Vec::new());
+                        }
+                        // Camera visibility is not shadow visibility: a caster
+                        // just outside the viewport may still shadow visible BSP.
+                        raster_visible = false;
                     }
                 }
                 let lod = ghoul2_lod_for_view(
@@ -1600,7 +2024,7 @@ impl PlayerPresenter {
             current_time,
         )?;
 
-        if !submit_geometry {
+        if !submit_geometry && !self.rt_shadow_casters_enabled {
             // OpenJK still runs CG_Player for the local player in first person
             // and marks the refEntity RF_THIRD_PERSON.  Keep all animation and
             // Ghoul2 state advancing, but suppress geometry submission here.
@@ -1647,9 +2071,10 @@ impl PlayerPresenter {
                 }
             }
         }
-        if entity.state.field_i32("weapon").unwrap_or(0) == 3 { // WP_SABER
+        if attached_sabers[0] || attached_sabers[1] {
             if let Err(error) = self.append_player_sabers(
                 &mut draws, entity, info, &model, &pose, render_axis, render_origin, current_time, entity_alpha,
+                attached_sabers, entity.entity_type != ET_BODY,
             ) {
                 self.report_saber_warning_once(entity.number, &error);
             }
@@ -1659,6 +2084,11 @@ impl PlayerPresenter {
                 &mut draws, entity, weapon, &model, &pose, render_axis, render_origin, current_time, entity_alpha,
             ) {
                 self.report_saber_warning_once(entity.number, &format!("held weapon {weapon}: {error}"));
+            }
+        }
+        if !raster_visible {
+            for surface in &mut draws {
+                surface.raster_visible = false;
             }
         }
         Ok(draws)
@@ -1885,6 +2315,27 @@ impl PlayerPresenter {
         }
     }
 
+    fn presented_saber_blade_length(
+        &mut self,
+        client_num: usize,
+        saber_num: usize,
+        blade_num: usize,
+        authored_length: f32,
+        desired_length: f32,
+        current_time: i32,
+    ) -> f32 {
+        let key = SaberBladeLengthKey {
+            client_num,
+            saber_num: saber_num as u8,
+            blade_num: blade_num as u8,
+        };
+        let state = self
+            .saber_blade_lengths
+            .entry(key)
+            .or_insert_with(|| SaberBladeLengthState::new(authored_length, desired_length, current_time));
+        state.set_desired_and_update(desired_length, authored_length, current_time)
+    }
+
     fn append_player_sabers(
         &mut self,
         draws: &mut Vec<DynamicModelSurface>,
@@ -1896,23 +2347,25 @@ impl PlayerPresenter {
         player_origin: [f32; 3],
         current_time: i32,
         entity_alpha: f32,
+        attached_sabers: [bool; 2],
+        process_blades: bool,
     ) -> Result<(), String> {
+        let dead = entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0;
+        let weapon = entity.state.field_i32("weapon").unwrap_or(0);
         let holstered = entity.state.field_i32("saberHolstered").unwrap_or(0);
-        if holstered >= 2 {
-            return Ok(());
-        }
         let in_flight = entity.state.field_i32("saberInFlight").unwrap_or(0) != 0;
         let saber_move = entity.state.field_i32("saberMove").unwrap_or(0);
         let torso_anim = entity.state.field_i32("torsoAnim").unwrap_or(0);
         let mut sabers = Vec::with_capacity(2);
-        // WP_SetSaber "none"/"remove" empties a slot; an NPC without
-        // npcSaber1 has a zeroed saber[0] and draws no hilt.
-        if !in_flight && !saber_name_is_removed(&info.saber_name) {
+        // These booleans are the Rust equivalent of actual Ghoul2 model
+        // indices 1/2. Hilt visibility follows those slots, not holster/death
+        // guesses from currentState.
+        if attached_sabers[0] && !saber_name_is_removed(&info.saber_name) {
             sabers.push((0usize, info.saber_name.as_str(), info.saber_color, "*r_hand"));
         }
-        if !info.saber2_name.is_empty()
+        if attached_sabers[1]
+            && !info.saber2_name.is_empty()
             && !saber_name_is_removed(&info.saber2_name)
-            && holstered == 0
         {
             sabers.push((1usize, info.saber2_name.as_str(), info.saber2_color, "*l_hand"));
         }
@@ -1946,18 +2399,32 @@ impl PlayerPresenter {
                 None,
                 false,
             )?;
+            // Two saber slots may legitimately use the exact same hilt model.
+            // Keep their RT BLAS identities distinct while material-shell clones
+            // of one physical hilt continue sharing the same caster identity.
+            if self.rt_shadow_casters_enabled {
+                for surface in &mut hilt_draws {
+                    if let Some(key) = surface.rt_skinned_key.take() {
+                        surface.rt_skinned_key = Some(Arc::<str>::from(format!(
+                            "{}#held-saber{}",
+                            key.as_ref(),
+                            saber_num,
+                        )));
+                    }
+                }
+            }
             draws.append(&mut hilt_draws);
+            // ET_BODY goes through CG_General in OpenJK. The copied hilt model
+            // remains, but CG_Player/CG_AddSaberBlade never runs for the body.
+            if !process_blades {
+                continue;
+            }
 
-            // OpenJK's half-holstered staff state is not bladeStyle2Start.
-            // bladeStyle2Start selects the secondary authored effect/style
-            // parameters. saberHolstered==1 on a multi-blade primary saber
-            // leaves blade 0 active and turns every extra blade off.
-            let blade_limit = if saber_num == 0 && holstered == 1 && definition.num_blades > 1 {
-                1
-            } else {
-                definition.num_blades
-            };
-            for blade_index in 0..blade_limit.min(definition.num_blades) {
+            // Process every authored blade, including blades that are turning
+            // off. OpenJK still advances those lengths and calls the saber-blade
+            // path with dontDraw once they reach zero; our zero-length request
+            // is what clears WeaponFx trail/contact history.
+            for blade_index in 0..definition.num_blades {
                 let tag_name = format!("*blade{}", blade_index + 1);
                 let (blade_bolt, resolved_tag) = if let Some(matrix) = model_bolt_matrix_timed(
                     &mut self.perf,
@@ -2014,6 +2481,39 @@ impl PlayerPresenter {
                 let origin_world = transform_jka_model_point(origin_model, player_axis, player_origin);
                 let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, player_axis));
                 let blade = definition.blade(blade_index);
+                // stillDoSaber in OpenJK:
+                // - EF_DEAD + WP_SABER => both sabers desired 0, gradual
+                // - saberHolstered==1 => primary blade0 on, extra/second off
+                // - saberHolstered>=2 => both desired 0, gradual
+                // - non-saber weapon => lengths are immediately zeroed
+                let desired_length = if weapon != WP_SABER || dead || holstered >= 2 {
+                    0.0
+                } else if holstered == 1 && (saber_num > 0 || blade_index > 0) {
+                    0.0
+                } else {
+                    -1.0
+                };
+                let presented_length = if weapon == WP_SABER {
+                    self.presented_saber_blade_length(
+                        info.client_num,
+                        saber_num,
+                        blade_index,
+                        blade.length,
+                        desired_length,
+                        current_time,
+                    )
+                } else {
+                    let key = SaberBladeLengthKey {
+                        client_num: info.client_num,
+                        saber_num: saber_num as u8,
+                        blade_num: blade_index as u8,
+                    };
+                    self.saber_blade_lengths.insert(
+                        key,
+                        SaberBladeLengthState::new(blade.length, 0.0, current_time),
+                    );
+                    0.0
+                };
                 let saber_color = blade_color(info, saber_color, &blade);
                 let secondary_style = definition.blade_style2_start > 0
                     && blade_index >= definition.blade_style2_start;
@@ -2030,7 +2530,7 @@ impl PlayerPresenter {
                 if let Some(request) = saber_blade_fx_request(
                     origin_world,
                     dir_world,
-                    blade.length,
+                    presented_length,
                     blade.radius,
                     saber_color,
                     entity_alpha,
@@ -2059,7 +2559,7 @@ impl PlayerPresenter {
                         resolved_tag,
                         origin_world[0], origin_world[1], origin_world[2],
                         dir_world[0], dir_world[1], dir_world[2],
-                        blade.length,
+                        presented_length,
                         blade.radius,
                         saber_color,
                     ),
@@ -2225,6 +2725,9 @@ impl PlayerPresenter {
                 transform_jka_model_point(origin_model, blade_axis, saber_entity.origin);
             let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, blade_axis));
             let blade = definition.blade(blade_index);
+            let presented_length = self.presented_saber_blade_length(
+                info.client_num, 0, blade_index, blade.length, -1.0, current_time,
+            );
             let saber_color = blade_color(info, info.saber_color, &blade);
             let secondary_style = definition.blade_style2_start > 0
                 && blade_index >= definition.blade_style2_start;
@@ -2241,7 +2744,7 @@ impl PlayerPresenter {
             if let Some(request) = saber_blade_fx_request(
                 origin_world,
                 dir_world,
-                blade.length,
+                presented_length,
                 blade.radius,
                 saber_color,
                 entity_alpha,
@@ -2271,7 +2774,7 @@ impl PlayerPresenter {
                     resolved_tag,
                     origin_world[0], origin_world[1], origin_world[2],
                     dir_world[0], dir_world[1], dir_world[2],
-                    blade.length,
+                    presented_length,
                     blade.radius,
                     saber_color,
                 ),
@@ -2957,6 +3460,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn body_queue_weapon_rule_copies_actual_model_then_applies_known_weapon() {
+        // CG_BodyQueueCopy never manufactures model index 1 when the source
+        // Ghoul2 did not actually have one.
+        assert_eq!(body_queue_model1_weapon(None, WP_SABER), None);
+        // A normal saber death keeps model index 1 occupied, but OpenJK's
+        // ET_BODY replacement resolves WP_SABER through the default weapon
+        // instance rather than the live client's custom primary saber.
+        assert_eq!(body_queue_model1_weapon(Some(WP_SABER), WP_SABER), Some(WP_SABER));
+        // Weapons newer than Bryar are stripped from model index 1. Their
+        // separately dropped ET_ITEM, when the server creates one, owns them.
+        assert_eq!(body_queue_model1_weapon(Some(WP_BRYAR_PISTOL + 1), WP_BRYAR_PISTOL + 1), None);
+        // Low-tier known weapons replace an already-existing duplicated slot.
+        assert_eq!(
+            body_queue_model1_weapon(Some(WP_SABER), WP_BRYAR_PISTOL),
+            Some(WP_BRYAR_PISTOL),
+        );
+    }
+
+    #[test]
+    fn openjk_dead_saber_length_retracts_toward_zero() {
+        let mut blade = SaberBladeLengthState::new(40.0, -1.0, 1000);
+        assert_eq!(blade.length, 40.0);
+        let first = blade.set_desired_and_update(0.0, 40.0, 1016);
+        assert!(first < 40.0 && first > 0.0);
+        let later = blade.set_desired_and_update(0.0, 40.0, 1100);
+        assert!(later < first);
+    }
+
+    #[test]
+    fn zero_length_saber_request_reaches_weapon_fx_cleanup() {
+        let request = saber_blade_fx_request(
+            [0.0; 3], [1.0, 0.0, 0.0], 0.0, 3.0, 4, 1.0, 7, 0, 0, 0, 0,
+            false, 0, 1, false, false,
+        )
+        .expect("zero-length terminal sample must reach WeaponFx cleanup");
+        let PlayerFxRequest::SaberBlade { length, .. } = request else {
+            panic!("expected saber blade request");
+        };
+        assert_eq!(length, 0.0);
+    }
+
+    #[test]
     fn force_grip_trace_hits_default_player_box() {
         let start = Vec3::new(0.0, 0.0, DEFAULT_VIEWHEIGHT);
         let forward = Vec3::X;
@@ -3384,20 +3929,152 @@ mod tests {
 
     #[test]
     fn weapon_attachment_follows_cg_player_copy_rules() {
-        let (mut instance, mut attached) = (None, None);
-        update_weapon_attachment(&mut instance, &mut attached, Some(5), false, false);
-        assert_eq!((instance, attached), (Some(5), Some(5)), "blaster bolted on");
-        update_weapon_attachment(&mut instance, &mut attached, None, false, false);
-        assert_eq!(attached, Some(5), "WP_NONE has no instance: the old model stays");
-        update_weapon_attachment(&mut instance, &mut attached, Some(2), false, false);
-        assert_eq!(attached, None, "melee removes the weapon model");
-        update_weapon_attachment(&mut instance, &mut attached, Some(11), false, false);
-        update_weapon_attachment(&mut instance, &mut attached, Some(3), true, false);
-        assert_eq!((instance, attached), (None, Some(11)), "dead players keep what they held");
-        update_weapon_attachment(&mut instance, &mut attached, Some(3), false, false);
-        assert_eq!(attached, None, "the saber replaces model index 1");
+        let mut instance = None;
+        let mut cent_weapon = 0;
+        let mut attached = None;
+        let mut saber1 = false;
+        let mut saber2 = false;
+
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            5, Some(5), false, false, false, true, false,
+        );
+        assert_eq!((instance, cent_weapon, attached, saber1, saber2), (Some(5), 5, Some(5), false, false));
+
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            0, None, false, false, false, true, false,
+        );
+        assert_eq!(attached, Some(5), "a NULL G2 weapon instance does not remove the old model");
+        assert_eq!(cent_weapon, 0);
+
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            WP_MELEE, Some(WP_MELEE), false, false, false, true, false,
+        );
+        assert_eq!((attached, saber1, saber2), (None, false, false));
+
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            11, Some(11), false, false, false, true, false,
+        );
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            WP_SABER, Some(WP_SABER), true, true, false, true, true,
+        );
+        assert_eq!(instance, None, "dead CG_Player clears only ghoul2weapon");
+        assert_eq!(cent_weapon, 11, "dead CG_Player preserves cent->weapon");
+        assert_eq!((attached, saber1, saber2), (Some(11), false, false));
+
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            WP_SABER, Some(WP_SABER), false, false, false, true, true,
+        );
+        assert_eq!((cent_weapon, attached, saber1, saber2), (WP_SABER, None, true, true));
         assert!(weapon_world_model(8).unwrap().ends_with("heavy_repeater_w.glm"));
         assert!(weapon_world_model(0).is_none());
+    }
+
+    #[test]
+    fn reset_player_entity_copies_both_dual_sabers_before_primary_flight_removal() {
+        let mut instance = None;
+        let mut cent_weapon = 0;
+        let mut attached = None;
+        let mut saber1 = false;
+        let mut saber2 = false;
+
+        // CG_SetInitialSnapshot -> CG_ResetEntity -> CG_ResetPlayerEntity.
+        // CG_CopyG2WeaponInstance(WP_SABER) copies *both* configured saber
+        // models before CG_Player sees that saber 0 is already in flight.
+        reset_remote_player_saber_attachment(
+            &mut instance,
+            &mut cent_weapon,
+            &mut attached,
+            &mut saber1,
+            &mut saber2,
+            WP_SABER,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(instance, Some(WP_SABER));
+        assert_eq!(cent_weapon, WP_SABER);
+        assert_eq!((attached, saber1, saber2), (None, true, true));
+
+        // The following CG_Player weapon update is pointer-equal and therefore
+        // does not recopy anything merely because the primary is in flight.
+        update_weapon_attachment(
+            &mut instance,
+            &mut cent_weapon,
+            &mut attached,
+            &mut saber1,
+            &mut saber2,
+            WP_SABER,
+            Some(WP_SABER),
+            true,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!((saber1, saber2), (true, true));
+
+        // cg_players.c's saberInFlight model path removes Ghoul2 model index 1
+        // only. Model index 2 is deliberately untouched.
+        saber1 = false;
+        assert_eq!((saber1, saber2), (false, true));
+
+        // On subsequent in-flight frames the index-1 g2HasWeapon test resets
+        // tracking, but saberInFlight pins ghoul2weapon and still must not
+        // disturb model index 2.
+        update_weapon_attachment(
+            &mut instance,
+            &mut cent_weapon,
+            &mut attached,
+            &mut saber1,
+            &mut saber2,
+            WP_SABER,
+            Some(WP_SABER),
+            true,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!((saber1, saber2), (false, true));
+    }
+
+    #[test]
+    fn saber_return_rearms_missing_model_slot_like_openjk_g2hasweapon() {
+        let mut instance = Some(WP_SABER);
+        let mut cent_weapon = WP_SABER;
+        let mut attached = None;
+        let mut saber1 = false;
+        let mut saber2 = false;
+
+        // Model index 1 has been removed by the in-flight saber path. While the
+        // saber is still away, OpenJK's g2HasWeapon check clears cent->weapon,
+        // then saberInFlight pins ghoul2weapon to the saber instance so it is
+        // not immediately recopied into the hand.
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            WP_SABER, Some(WP_SABER), true, false, false, true, false,
+        );
+        assert_eq!(instance, Some(WP_SABER));
+        assert_eq!(cent_weapon, 0);
+        assert_eq!((attached, saber1, saber2), (None, false, false));
+
+        // On the first frame where saberInFlight clears, model index 1 is still
+        // absent. The same g2HasWeapon check therefore clears ghoul2weapon, the
+        // normal mismatch test fires, and CG_CopyG2WeaponInstance semantics
+        // restore the hilt. This is the catch/recovery transition from OpenJK.
+        update_weapon_attachment(
+            &mut instance, &mut cent_weapon, &mut attached, &mut saber1, &mut saber2,
+            WP_SABER, Some(WP_SABER), false, false, false, true, false,
+        );
+        assert_eq!(instance, Some(WP_SABER));
+        assert_eq!(cent_weapon, WP_SABER);
+        assert_eq!((attached, saber1, saber2), (None, true, false));
     }
 
     #[test]
@@ -3559,7 +4236,9 @@ fn saber_blade_fx_request(
     no_dlight: bool,
     no_wall_marks: bool,
 ) -> Option<PlayerFxRequest> {
-    if length < 0.5 || radius <= 0.0 {
+    // A zero/near-zero terminal sample clears WeaponFx contact history when
+    // OpenJK retracts a dead blade. Geometry itself is still omitted downstream.
+    if length < 0.0 || radius <= 0.0 {
         return None;
     }
     Some(PlayerFxRequest::SaberBlade {

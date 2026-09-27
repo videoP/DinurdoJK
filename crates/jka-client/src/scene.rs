@@ -101,6 +101,11 @@ pub struct DrawBatch {
     /// Keep this distinct from `texture == None`: the latter means a missing/
     /// unresolved regular image and must continue to use the missing-texture fallback.
     pub texture_is_white: bool,
+    /// This stage is a safe receiver for DinurdoJK's optional fallback
+    /// close-range detail texture. It is precomputed from authored material
+    /// semantics so the fragment shader needs only one packed bit when the
+    /// detail pipeline variant is active.
+    pub detail_texture_eligible: bool,
     /// Optional linear-data enhancement maps associated with the material base image.
     pub normal_texture: Option<usize>,
     pub roughness_texture: Option<usize>,
@@ -2107,6 +2112,15 @@ fn stage_batch(
         StageTexture::Lightmap => (None, true, false),
         StageTexture::White => (None, false, true),
     };
+    let pipeline = stage_pipeline(material, stage, first);
+    let detail_texture_eligible = !material.authored_detail
+        && !material.water
+        && !material.planar_reflection
+        && matches!(stage.texture, StageTexture::Image(_))
+        && matches!(stage.tc_gen, TcGen::Base)
+        && stage.tc_mods.is_empty()
+        && pipeline.class == DrawClass::Opaque
+        && pipeline.blend == BlendMode::Opaque;
     DrawBatch {
         vertices,
         bsp_shader_index: bsp_shader_index.map_or(u32::MAX, |index| index as u32),
@@ -2115,6 +2129,7 @@ fn stage_batch(
         texture,
         texture_is_lightmap,
         texture_is_white,
+        detail_texture_eligible,
         normal_texture: stage.enhancements.normal_texture,
         roughness_texture: stage.enhancements.roughness_texture,
         height_texture: stage.enhancements.height_texture,
@@ -2131,7 +2146,7 @@ fn stage_batch(
         lightmap,
         modulate_lightmap: false,
         vertex_lit,
-        pipeline: stage_pipeline(material, stage, first),
+        pipeline,
         tc_gen: stage.tc_gen,
         tc_mods: stage.tc_mods.clone(),
         rgb_gen: stage.rgb_gen,

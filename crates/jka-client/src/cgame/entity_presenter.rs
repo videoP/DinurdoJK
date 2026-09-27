@@ -15,7 +15,10 @@ use super::{
 };
 use crate::{
     materials::{self, TextureData, Textures},
-    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, InlineModelInstance},
+    renderer::{
+        DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex,
+        InlineModelInstance, RayTracedRigidInstance,
+    },
     scene,
 };
 use jka_assets::{
@@ -42,6 +45,7 @@ struct Md3SurfaceAsset {
 }
 
 struct Md3Asset {
+    key: Arc<str>,
     model: Arc<Md3Model>,
     surfaces: Vec<Md3SurfaceAsset>,
 }
@@ -68,6 +72,9 @@ pub struct EntityPresenter {
     failed_models: HashSet<String>,
     logged_unsupported: HashSet<String>,
     fx_materials: HashMap<String, Vec<crate::fx::draw::FxMaterial>>,
+    /// True only while the renderer is actually using hardware RT shadows.
+    /// Keep RT source metadata completely off the ordinary raster presentation path.
+    rt_rigid_casters_enabled: bool,
 }
 
 impl EntityPresenter {
@@ -92,6 +99,7 @@ impl EntityPresenter {
             failed_models: HashSet::new(),
             logged_unsupported: HashSet::new(),
             fx_materials: HashMap::new(),
+            rt_rigid_casters_enabled: false,
         })
     }
 
@@ -104,7 +112,9 @@ impl EntityPresenter {
         time: i32,
         ghoul2: &mut PlayerPresenter,
         weapon_fx: &mut WeaponFx,
+        rt_rigid_casters_enabled: bool,
     ) -> (Vec<DynamicModelSurface>, Vec<InlineModelInstance>, EntityDispatchSummary) {
+        self.rt_rigid_casters_enabled = rt_rigid_casters_enabled;
         let mut draws = Vec::new();
         let mut inline_models = Vec::new();
         let mut summary = EntityDispatchSummary::default();
@@ -348,9 +358,20 @@ impl EntityPresenter {
             draws.push(DynamicModelSurface {
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(submission.origin),
+                rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
+                    Arc::clone(&asset.key),
+                    Arc::clone(&asset.model),
+                    surface_asset.surface_index,
+                    0,
+                    submission.axis,
+                    submission.origin,
+                    1.0,
+                )),
+                rt_skinned_key: None,
                 ghoul2_gpu: None,
                 texture,
                 alpha_mode: blend_for_alpha(alpha_mode, submission.rgba[3]),
@@ -425,9 +446,20 @@ impl EntityPresenter {
             draws.push(DynamicModelSurface {
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(entity.origin),
+                rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
+                    Arc::clone(&asset.key),
+                    Arc::clone(&asset.model),
+                    surface_asset.surface_index,
+                    frame,
+                    axis,
+                    entity.origin,
+                    scale,
+                )),
+                rt_skinned_key: None,
                 ghoul2_gpu: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if color[3] < 1.0 {
@@ -485,9 +517,20 @@ impl EntityPresenter {
             draws.push(DynamicModelSurface {
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(origin),
+                rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
+                    Arc::clone(&asset.key),
+                    Arc::clone(&asset.model),
+                    surface_asset.surface_index,
+                    frame,
+                    axis,
+                    origin,
+                    1.0,
+                )),
+                rt_skinned_key: None,
                 ghoul2_gpu: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if rgba[3] < 1.0 {
@@ -537,7 +580,7 @@ impl EntityPresenter {
                 model.tags.first().map_or(0, Vec::len),
                 model.surfaces.len(),
             );
-            Ok::<_, String>(Md3Asset { model, surfaces })
+            Ok::<_, String>(Md3Asset { key: Arc::from(key.as_str()), model, surfaces })
         })();
 
         match result {
@@ -900,7 +943,7 @@ mod tests {
                         snapshots += 1;
                         let entities = game.present_entities(snapshot.server_time).unwrap();
                         let (draws, _, _) = presenter.present_snapshot_entities(
-                            &entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx,
+                            &entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx, false,
                         );
                         for entity in entities.iter().filter(|entity| entity.entity_type == super::super::ET_ITEM) {
                             let item = jka_movement::bg_item(entity.state.field_i32("modelindex").unwrap_or(0)).unwrap();
@@ -971,7 +1014,7 @@ mod tests {
                             }
                         }
                         let missiles = entities.iter().filter(|entity| entity.entity_type == super::super::ET_MISSILE).count();
-                        presenter.present_snapshot_entities(&entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx);
+                        presenter.present_snapshot_entities(&entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx, false);
                         let frame = weapon_fx.end_frame();
                         if missiles > 0 && !frame.draws.is_empty() {
                             trail_frames += 1;
@@ -1044,7 +1087,7 @@ mod tests {
                         game.set_initial_snapshot(snapshot).unwrap();
                         let entities = game.present_entities(snapshot.server_time).unwrap();
                         let (_, inline, _) = presenter.present_snapshot_entities(
-                            &entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx,
+                            &entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx, false,
                         );
                         snapshots += 1;
                         for instance in inline {

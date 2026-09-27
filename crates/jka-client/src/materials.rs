@@ -186,6 +186,10 @@ pub struct SurfaceMaterial {
     /// no shader script exists. This lets scene preparation keep that path in one
     /// draw call while explicit multi-pass scripts remain ordered passes.
     pub explicit: bool,
+    /// At least one authored shader stage carries the classic id Tech 3
+    /// `detail` marker. The enhanced fallback detail system must leave these
+    /// materials alone rather than layering a second micro-detail treatment.
+    pub authored_detail: bool,
 }
 
 impl Default for SurfaceMaterial {
@@ -208,6 +212,7 @@ impl Default for SurfaceMaterial {
             surface_sprite_effects: Vec::new(),
             surface_sprite_cull_quirk: false,
             explicit: false,
+            authored_detail: false,
         }
     }
 }
@@ -1982,6 +1987,13 @@ pub fn describe(
         sky,
         skybox,
         explicit,
+        // JKA's `detail` keyword is only a stage-enable marker. For the
+        // fallback AUTO detail-texture path, only that authored marker counts
+        // as an existing detail stage. Do not infer authored detail from shader
+        // or texture filenames; if a map omitted the marker, we still treat the
+        // material as lacking authored detail and fall back to MATERIAL_* or
+        // the generic AUTO texture choice.
+        authored_detail: definition.stages.iter().any(|stage| stage.detail),
     }
 }
 
@@ -2118,6 +2130,20 @@ mod tests {
         assert!(!material.stages[0].depth_equal);
         assert!(matches!(material.stages[0].tc_gen, TcGen::Base));
         assert!(!material.hidden);
+    }
+
+    #[test]
+    fn detail_named_stage_blocks_fallback_without_detail_keyword() {
+        let material = material(
+            "test {\n{\ndepthFunc equal\nmap textures/theisland4097/detail_l0.jpg\nrgbGen identity\ntcMod scale 8 8\n}\n}",
+        );
+        assert!(material.authored_detail);
+        assert_eq!(material.stages.len(), 1);
+        assert!(material.stages[0].depth_equal);
+        assert!(matches!(
+            material.stages[0].tc_mods.as_slice(),
+            [TcMod::Scale(8.0, 8.0)]
+        ));
     }
 
     #[test]

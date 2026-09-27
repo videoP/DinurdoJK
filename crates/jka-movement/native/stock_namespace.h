@@ -14,5 +14,7 @@
 #define jka_player_get_network stock_jka_player_get_network
 #define jka_player_update_view_angles stock_jka_player_update_view_angles
 #define jka_player_predict stock_jka_player_predict
+#define jka_pmove_begin_view_tracking stock_jka_pmove_begin_view_tracking
+#define jka_pmove_note_forced_view stock_jka_pmove_note_forced_view
 #define jka_load_animations stock_jka_load_animations
 #define jka_movement_error stock_jka_movement_error

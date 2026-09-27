@@ -952,6 +952,68 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        const DETAIL_TEXTURES: [(DetailTextureMode, &str); 5] = [
+            (DetailTextureMode::Off, "Off"),
+            (DetailTextureMode::Neutral2x, "Neutral 2×"),
+            (DetailTextureMode::Linear2x, "Linear 2×"),
+            (DetailTextureMode::DstColorOne, "DstColor + One"),
+            (DetailTextureMode::Multiply, "Multiply"),
+        ];
+        if let Some(target) = quality_table_row(
+            ui,
+            "Detail textures",
+            "Adds the selected textures/japro/detail/* image as a synthetic high-frequency layer on \
+             eligible opaque BSP materials. Modes expose several blend equations for A/B testing; \
+             authored detail stages are left untouched. Off keeps the stripped fast BSP path.",
+            theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
+            self.video.detail_textures,
+            &DETAIL_TEXTURES,
+            0,
+        ) {
+            let current = index_of(&DETAIL_TEXTURES, self.video.detail_textures, 0);
+            self.video_selected = ui::VIDEO_ROW_DETAIL_TEXTURES;
+            self.change_video_setting(target as i32 - current as i32);
+        }
+
+        theme::row(
+            ui,
+            "Detail distance fade",
+            "Ports the standard distance-based detail blend: camera/world distance is divided by the fade distance, raised to the fourth power and clamped, then the detail contribution is lerped back to its neutral identity. This avoids alpha/transparency rendering and keeps the normal opaque BSP path.",
+            theme::Reset::None,
+            |ui| {
+                let mut enabled = self.video.detail_texture_fade;
+                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    self.video.detail_texture_fade = enabled;
+                    self.render_command(RenderCommand::SetDetailTextureFade {
+                        enabled,
+                        distance: self.video.detail_texture_fade_distance,
+                    });
+                    self.mark_config_dirty();
+                }
+            },
+        );
+
+        if self.video.detail_texture_fade {
+            theme::row(
+                ui,
+                "Detail fade distance",
+                "Distance in JKA map units where the ported distance fade reaches the neutral/no-detail result. The reference technique uses 512 units.",
+                theme::Reset::None,
+                |ui| {
+                    let mut value = self.video.detail_texture_fade_distance;
+                    let readout = format!("{value:.0}");
+                    if theme::slider(ui, &mut value, 64.0..=8192.0, &readout) {
+                        self.video.detail_texture_fade_distance = value;
+                        self.render_command(RenderCommand::SetDetailTextureFade {
+                            enabled: self.video.detail_texture_fade,
+                            distance: value,
+                        });
+                        self.mark_config_dirty();
+                    }
+                },
+            );
+        }
+
         // HDR is a framebuffer format decision, not a post effect: it decides
         // the precision everything downstream (bloom, tone mapping) works in.
         self.egui_toggle_row(
@@ -1345,14 +1407,13 @@ impl App {
             (
                 DynamicShadowsMode::RayTraced,
                 "Ray traced",
-                "Traces visibility rays for sub-pixel contact shadows and soft penumbras. WIP — currently behaves as Off.",
+                "Hardware ray-query sun visibility using the current wgpu BLAS/TLAS API. This first port traces opaque static BSP casters; alpha-tested/translucent surfaces and moving/skinned casters are deliberately excluded rather than approximated.",
             ),
         ];
         if let Some(target) = mode_row(
             ui,
             "Dynamic shadows",
-            "Technique used for shadows cast by things that move. Map geometry \
-             keeps its baked lightmap shadows either way.",
+            "Real-time shadow technique layered over the map's authored/baked lighting. Hardware ray tracing currently covers opaque static BSP sun occlusion.",
             theme::Reset::Video(ui::VIDEO_ROW_DYNAMIC_SHADOWS),
             self.video.dynamic_shadows,
             &SHADOW_OPTIONS,
@@ -1364,8 +1425,9 @@ impl App {
         self.egui_toggle_row(
             ui,
             "Local light shadows",
-            "Lets point and spot lights cast their own shadows instead of only \
-             the sun. One extra shadow pass per shadowing light.",
+            "Adds shadows to local lights. With RT Shadows, uses hard ray-traced \
+             shadows for clustered lights, including moving FX lights. Other \
+             shadow modes use cached shadow cubemaps. Requires local lighting.",
             ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS,
             self.video.local_light_shadows,
         );
@@ -3392,6 +3454,17 @@ impl App {
             ui::VIDEO_ROW_TEXTURE_FILTER => {
                 self.video.texture_filter = defaults.texture_filter;
                 self.render_command(RenderCommand::SetTextureFilter(self.video.texture_filter));
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_DETAIL_TEXTURES => {
+                self.video.detail_textures = defaults.detail_textures;
+                self.video.detail_texture_fade = defaults.detail_texture_fade;
+                self.video.detail_texture_fade_distance = defaults.detail_texture_fade_distance;
+                self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
+                self.render_command(RenderCommand::SetDetailTextureFade {
+                    enabled: self.video.detail_texture_fade,
+                    distance: self.video.detail_texture_fade_distance,
+                });
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PVS => {

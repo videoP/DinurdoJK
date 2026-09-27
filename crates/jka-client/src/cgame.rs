@@ -374,6 +374,24 @@ pub struct ScoreEntry {
     pub team: i32,
 }
 
+/// Reliable Ghoul2 lifecycle commands emitted by the OpenJK server.
+///
+/// These are presentation state, not UI notices: `ircg` is the authoritative
+/// body-queue copy signal and `rcg` forces the live client Ghoul2 weapon state
+/// to be reinitialized on respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ghoul2ServerCommand {
+    BodyQueueCopy {
+        source_client: u16,
+        body_entity: u16,
+        known_weapon: i32,
+        light_side: bool,
+    },
+    RestoreClient {
+        source_client: u16,
+    },
+}
+
 /// Text/output state from CG_ServerCommand for the console and HUD UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CgameNotice {
@@ -409,6 +427,7 @@ pub struct ClientGameState {
     predictable_events: [i32; MAX_PREDICTED_EVENTS],
     pending_events: VecDeque<PresentationEvent>,
     pending_event_traces: VecDeque<EventCheckTrace>,
+    pending_ghoul2_commands: VecDeque<Ghoul2ServerCommand>,
 }
 
 impl Default for ClientGameState {
@@ -427,6 +446,7 @@ impl Default for ClientGameState {
             predictable_events: [0; MAX_PREDICTED_EVENTS],
             pending_events: VecDeque::new(),
             pending_event_traces: VecDeque::new(),
+            pending_ghoul2_commands: VecDeque::new(),
         }
     }
 }
@@ -453,6 +473,11 @@ impl ClientGameState {
         self.predictable_events = [0; MAX_PREDICTED_EVENTS];
         self.pending_events.clear();
         self.pending_event_traces.clear();
+        self.pending_ghoul2_commands.clear();
+    }
+
+    pub fn drain_ghoul2_commands(&mut self) -> Vec<Ghoul2ServerCommand> {
+        self.pending_ghoul2_commands.drain(..).collect()
     }
 
     pub fn drain_notices(&mut self) -> Vec<CgameNotice> {
@@ -1167,6 +1192,46 @@ impl ClientGameState {
             self.notices.push_back(CgameNotice::MapRestart);
             return Ok(());
         }
+        if name.eq_ignore_ascii_case(b"ircg") {
+            // OpenJK CG_RestoreClientGhoul_f: ircg <client> <body> <weapon> <side>.
+            // Keep this byte/token parser aligned with the protocol command; do
+            // not reconstruct corpse equipment from snapshot guesses.
+            let source_client = parts.get(1).and_then(|v| parse_i32_ascii(v));
+            let body_entity = parts.get(2).and_then(|v| parse_i32_ascii(v));
+            let known_weapon = parts.get(3).and_then(|v| parse_i32_ascii(v));
+            let light_side = parts.get(4).and_then(|v| parse_i32_ascii(v)).unwrap_or(0) != 0;
+            let (Some(source_client), Some(body_entity), Some(known_weapon)) =
+                (source_client, body_entity, known_weapon)
+            else {
+                return Ok(());
+            };
+            if !(0..MAX_CLIENTS as i32).contains(&source_client)
+                || !(0..MAX_GENTITIES as i32).contains(&body_entity)
+            {
+                return Ok(());
+            }
+            self.pending_ghoul2_commands.push_back(Ghoul2ServerCommand::BodyQueueCopy {
+                source_client: source_client as u16,
+                body_entity: body_entity as u16,
+                known_weapon,
+                light_side,
+            });
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"rcg") {
+            // Same OpenJK handler without a body-copy target. It still resets
+            // clent->weapon / clent->ghoul2weapon so respawn reattaches cleanly.
+            let Some(source_client) = parts.get(1).and_then(|v| parse_i32_ascii(v)) else {
+                return Ok(());
+            };
+            if !(0..MAX_CLIENTS as i32).contains(&source_client) {
+                return Ok(());
+            }
+            self.pending_ghoul2_commands.push_back(Ghoul2ServerCommand::RestoreClient {
+                source_client: source_client as u16,
+            });
+            return Ok(());
+        }
         if !name.eq_ignore_ascii_case(b"cs") {
             return Ok(());
         }
@@ -1848,6 +1913,34 @@ mod tests {
             vec![b"cs".as_slice(), b"1", b"a  \xff // b"]);
         assert_eq!(server_command_tokens(b"cs 1 \"a\\\"b"), vec![b"cs".as_slice(), b"1", b"a\\", b"b"]);
         assert_eq!(server_command_tokens(b"cs 1 abc\0ignored"), vec![b"cs".as_slice(), b"1", b"abc"]);
+    }
+
+    #[test]
+    fn ghoul2_body_queue_server_commands_follow_openjk_ircg_rcg() {
+        let mut game = ClientGameState::new();
+        game.execute_server_command(&ServerCommand {
+            sequence: 76,
+            text: b"ircg 7 71 3 1".to_vec(),
+        })
+        .unwrap();
+        game.execute_server_command(&ServerCommand {
+            sequence: 77,
+            text: b"rcg 7".to_vec(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            game.drain_ghoul2_commands(),
+            vec![
+                Ghoul2ServerCommand::BodyQueueCopy {
+                    source_client: 7,
+                    body_entity: 71,
+                    known_weapon: 3,
+                    light_side: true,
+                },
+                Ghoul2ServerCommand::RestoreClient { source_client: 7 },
+            ]
+        );
     }
 
     #[test]

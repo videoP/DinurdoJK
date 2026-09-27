@@ -142,6 +142,10 @@ pub struct Stage {
     pub depth_equal: bool,
     /// OpenJK/Rend2 stage marker used by the glow/bloom path.
     pub glow: bool,
+    /// Classic id Tech 3 `detail` marker. Jedi Academy content rarely uses it,
+    /// but retaining it lets modern fallback detail avoid double-applying to a
+    /// material that already authored its own close-range detail pass.
+    pub detail: bool,
     /// Jedi Academy `surfaceSprites` metadata. This describes a procedural
     /// surface effect; it is not an ordinary material pass.
     pub surface_sprite: Option<SurfaceSprite>,
@@ -818,7 +822,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                     "glow" => stage.glow = true,
                     "depthfunc" if first == "equal" => stage.depth_equal = true,
                     "depthfunc" => stage.unsupported.push(format!("depthfunc {first}")),
-                    "detail" => (),
+                    "detail" => stage.detail = true,
                     _ => stage.unsupported.push(key),
                 }
             } else {

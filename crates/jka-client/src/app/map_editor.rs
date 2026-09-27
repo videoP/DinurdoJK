@@ -380,9 +380,12 @@ impl MapEditor {
         (!indices.is_empty()).then(|| DynamicModelSurface {
             entity_num: u16::MAX,
             wireframe_class: DynamicWireframeClass::Entity,
+            raster_visible: true,
             vertices: Arc::new(vertices),
             indices: Arc::new(indices),
             lighting_origin: None,
+            rt_rigid: None,
+            rt_skinned_key: None,
             ghoul2_gpu: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,

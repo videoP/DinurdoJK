@@ -139,12 +139,44 @@ typedef struct jka_player_s {
      * cannot contaminate each other through the _CGAME OpenJK host. */
     saberInfo_t saber[2];
     qboolean saber_present[2];
+    /* Host-only presentation metadata. This deliberately does not live in
+     * playerState_t because OpenJK does not network this fact. */
+    qboolean view_forced;
 #ifdef JKA_JAPRO
     jka_prediction_entity entities[MAX_GENTITIES];
     int entity_count;
     uint64_t entities_revision;
 #endif
 } jka_player;
+
+/* PM_SetPMViewAngle is OpenJK's authoritative "pmove owns the view" path.
+ * Pmove may split one command into several PmoveSingle calls, so reset at the
+ * start of every single step. The value left after Pmove returns therefore
+ * describes the final step rather than OR-ing stale state from an earlier one. */
+static playerState_t *view_tracking_ps;
+static qboolean view_forced_for_current_single;
+
+void jka_pmove_begin_view_tracking(playerState_t *ps) {
+    if (ps == view_tracking_ps)
+        view_forced_for_current_single = qfalse;
+}
+
+void jka_pmove_note_forced_view(playerState_t *ps) {
+    if (ps == view_tracking_ps)
+        view_forced_for_current_single = qtrue;
+}
+
+static void begin_pmove_view_tracking(playerState_t *ps) {
+    view_tracking_ps = ps;
+    view_forced_for_current_single = qfalse;
+}
+
+static qboolean end_pmove_view_tracking(void) {
+    qboolean forced = view_forced_for_current_single;
+    view_tracking_ps = NULL;
+    view_forced_for_current_single = qfalse;
+    return forced;
+}
 
 #ifdef JKA_JAPRO
 int japro_set_entities(void *player, const jka_prediction_entity *entities, int count) {
@@ -507,7 +539,9 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
     p->move.cmd.rightmove = input->right;
     p->move.cmd.upmove = input->up;
     const int saber_client_num = install_player_saber_info(p);
+    begin_pmove_view_tracking(p->move.ps);
     Pmove(&p->move);
+    p->view_forced = end_pmove_view_tracking();
     clear_player_saber_info(saber_client_num);
     local_apply_queued_saber_style(p);
     local_process_generic_cmd(p, input->generic_command);
@@ -535,6 +569,7 @@ void jka_player_view(const void *player, jka_view *view) {
     view->max_health = ps->stats[STAT_MAX_HEALTH];
     view->force_power_max = ps->fd.forcePowerMax;
     view->weapon = ps->weapon;
+    view->view_forced = p->view_forced ? 1 : 0;
     view->ammo = -1;
     if (ps->weapon >= 0 && ps->weapon < WP_NUM_WEAPONS) {
         const int ammo_index = weaponData[ps->weapon].ammoIndex;
@@ -719,6 +754,7 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
     memcpy(p->ps.persistant, persistant, sizeof(int32_t) * MAX_PERSISTANT);
     memcpy(p->ps.ammo, ammo, sizeof(int32_t) * 16);
     memcpy(p->ps.powerups, powerups, sizeof(int32_t) * MAX_POWERUPS);
+    p->view_forced = qfalse;
 #ifdef JKA_JAPRO
     p->entities_revision = next_entities_revision++;
 #endif
@@ -813,7 +849,9 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     p->move.stepSlideFix = settings->step_slide_fix;
     p->move.noSpecMove = settings->no_spec_move;
     fill_cmd(&p->move.cmd, input);
+    begin_pmove_view_tracking(p->move.ps);
     Pmove(&p->move);
+    p->view_forced = end_pmove_view_tracking();
 #ifdef JKA_JAPRO
     p->ps = cg.predictedPlayerState;
     p->move.ps = &p->ps;

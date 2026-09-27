@@ -3889,6 +3889,32 @@ impl App {
                 }
             },
         );
+
+        theme::section(
+            ui,
+            "ADVANCED LATENCY (A/B)",
+            "Windows scheduling experiments. These do not alter JKA movement or networking.",
+        );
+        theme::row(
+            ui,
+            "1 ms Windows timer",
+            "cl_timerResolution1ms. Windows only: requests timeBeginPeriod(1) while enabled, then pairs it with timeEndPeriod(1) when disabled/shutting down. This can improve timeout/sleep wake precision (for example capped frame pacing), but raw mouse input already wakes the event loop immediately, so it is not expected to reduce raw mouse-event wake latency. May increase power use.",
+            theme::Reset::None,
+            |ui| {
+                if !cfg!(windows) {
+                    ui.add_enabled(false, egui::Label::new("Windows only"));
+                    return;
+                }
+                if let Some(enabled) = theme::switch(ui, self.video.timer_resolution_1ms) {
+                    if let Err(error) = self.set_timer_resolution_1ms(enabled) {
+                        self.console_status = format!("1 MS WINDOWS TIMER FAILED: {error}");
+                        self.push_console_line(format!("^1{}", self.console_status));
+                        self.publish_ui();
+                    }
+                    self.egui_repaint_requested = true;
+                }
+            },
+        );
     }
 
     fn egui_network_page(&mut self, ui: &mut egui::Ui) {

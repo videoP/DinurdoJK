@@ -21,6 +21,9 @@ typedef struct jka_view_s {
     int32_t touch_count, touches[32];
     int32_t delta_angles[3], health, active_powers, rage_recovery;
     int32_t armor, max_health, force_power_max, weapon, ammo;
+    /* Host-only prediction metadata: the final PmoveSingle forced viewangles
+     * through OpenJK PM_SetPMViewAngle. Not part of playerState_t/network state. */
+    int32_t view_forced;
 } jka_view;
 
 /* Read-only presentation projection produced by OpenJK BG_PlayerStateToEntityState. */

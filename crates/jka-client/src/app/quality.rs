@@ -43,6 +43,7 @@ impl QualityPreset {
                 // lets active_quality_preset() compare against the getter.
                 ("r_ext_multisample", "0"),
                 ("r_texturemode", "GL_LINEAR_MIPMAP_NEAREST"),
+                ("r_detailTextures", "off"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -95,6 +96,7 @@ impl QualityPreset {
             Self::Low => &[
                 ("r_ext_multisample", "2"),
                 ("r_ext_texture_filter_anisotropic", "16"),
+                ("r_detailTextures", "off"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -152,6 +154,7 @@ impl QualityPreset {
                 // normalized single-sample state instead of asking for both.
                 ("r_ext_multisample", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
+                ("r_detailTextures", "enhanced"),
                 ("r_hdr", "1"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "1"),
@@ -211,6 +214,7 @@ impl QualityPreset {
                 // MSAA, so the preset must match that final state.
                 ("r_ext_multisample", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
+                ("r_detailTextures", "enhanced"),
                 ("r_hdr", "1"),
                 ("r_floatLightmap", "1"),
                 ("r_tonemap", "1"),

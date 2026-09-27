@@ -44,7 +44,8 @@ struct LightingSettings {
 struct PbrSettings {
     // x: PBR companions enabled, y: parallax enabled, z: height scale * 1000.
     values: vec4<u32>,
-    // x: directional baked lighting enabled, y: deluxe specular scale.
+    // x: directional baked lighting enabled, y: deluxe specular scale,
+    // z: detail distance fade enabled, w: detail fade distance in JKA units.
     deluxe: vec4<f32>,
 };
 struct StaticLightGridSettings {
@@ -152,6 +153,7 @@ override ENABLE_PLANAR_REFLECTIONS: bool = false;
 override ENABLE_OCEAN: bool = false;
 // Legacy fog pipeline variant (WorldShaderVariantKey::legacy_fog).
 override ENABLE_LEGACY_FOG: bool = false;
+override DETAIL_TEXTURE_MODE: u32 = 0u;
 // PBR optimization switches. These remain pipeline-specialized so each option
 // can be benchmarked independently without paying a runtime branch in the hot path.
 override PBR_SHARED_MATERIAL_EVAL: bool = true;
@@ -184,6 +186,8 @@ override PBR_VERTEX_LIGHTGRID: bool = false;
 @group(1) @binding(20) var reflection_probe_sampler: sampler;
 @group(1) @binding(28) var pbr_sampler: sampler;
 @group(1) @binding(29) var deluxemap_texture: texture_2d<f32>;
+@group(1) @binding(30) var detail_texture: texture_2d<f32>;
+@group(1) @binding(31) var detail_sampler: sampler;
 @group(2) @binding(0) var<storage, read> dynamic_lights: array<PointLight>;
 @group(2) @binding(1) var<storage, read> light_clusters: array<ClusterRecord>;
 @group(2) @binding(2) var<uniform> lighting_settings: LightingSettings;
@@ -2613,6 +2617,56 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     }
     let surface_uv = parallax_uv(input, shared_frame);
     var source_sample = textureSample(base_texture, base_sampler, surface_uv);
+    if (DETAIL_TEXTURE_MODE != 0u && (material.header.w & 2u) != 0u) {
+        // Synthetic fallback only. Keep scale fixed at the authored-style
+        // tcMod scale 8 8 while exposing several blend equations for live A/B.
+        // Authored stages are never routed through this block.
+        //
+        // When distance fade is enabled, resolve its weight *before* sampling
+        // the detail texture. At/after the fade distance the branch is coherent
+        // for distant surfaces and skips the detail fetch/blend entirely.
+        var detail_weight = 1.0;
+        if (pbr_settings.deluxe.z > 0.5) {
+            let fade_distance = max(pbr_settings.deluxe.w, 1.0);
+            let to_surface = input.world_position - camera.camera_pos_time.xyz;
+            // Algebraically identical to pow(distance / fade_distance, 4),
+            // but avoids both the sqrt in distance() and a general pow().
+            let distance_ratio_sq = dot(to_surface, to_surface) / (fade_distance * fade_distance);
+            let far_weight = clamp(distance_ratio_sq * distance_ratio_sq, 0.0, 1.0);
+            detail_weight = 1.0 - far_weight;
+        }
+
+        if (detail_weight > 0.0) {
+            let detail_linear = textureSample(
+                detail_texture,
+                detail_sampler,
+                surface_uv * 8.0
+            ).rgb;
+            var detail_factor = vec3<f32>(1.0);
+            if (DETAIL_TEXTURE_MODE == 1u) {
+                // Mid-grey-neutral doubled modulation. Color textures are sampled
+                // through an sRGB view in this renderer, so recover the encoded
+                // detail value before applying the fixed-function-style factor.
+                let lo = detail_linear * 12.92;
+                let hi = 1.055 * pow(max(detail_linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+                let detail_encoded = select(lo, hi, detail_linear > vec3<f32>(0.0031308));
+                detail_factor = detail_encoded * 2.0;
+            } else if (DETAIL_TEXTURE_MODE == 2u) {
+                // blendFunc GL_DST_COLOR GL_SRC_COLOR in the renderer's linear space:
+                // src*dst + dst*src == 2*src*dst.
+                detail_factor = detail_linear * 2.0;
+            } else if (DETAIL_TEXTURE_MODE == 3u) {
+                // Previous test: blendFunc GL_DST_COLOR GL_ONE.
+                detail_factor = vec3<f32>(1.0) + detail_linear;
+            } else {
+                // Plain modulation: blendFunc GL_DST_COLOR GL_ZERO.
+                detail_factor = detail_linear;
+            }
+
+            let faded_detail_factor = mix(vec3<f32>(1.0), detail_factor, detail_weight);
+            source_sample = vec4<f32>(source_sample.rgb * faded_detail_factor, source_sample.a);
+        }
+    }
 
     // Planar promotion is a *source substitution for this exact shader stage*.
     // For tcGen environment this removes the legacy sphere-map image/UVs and

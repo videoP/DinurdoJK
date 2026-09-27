@@ -193,9 +193,12 @@ pub fn tessellate(
         .map(|(_, (mat, batch))| DynamicModelSurface {
             entity_num: FX_ENTITY_NUM,
             wireframe_class: DynamicWireframeClass::Effect,
+            raster_visible: true,
             vertices: Arc::new(batch.vertices),
             indices: Arc::new(batch.indices),
             lighting_origin: None,
+            rt_rigid: None,
+            rt_skinned_key: None,
             ghoul2_gpu: None,
             texture: mat.texture.clone(),
             alpha_mode: mat.blend.alpha_mode(),

@@ -872,6 +872,9 @@ pub struct Predictor {
     display: Option<PlayerState>,
     /// usercmd angles `display` was predicted with.
     display_angles: Option<[i32; 3]>,
+    /// Host-only OpenJK Pmove result. Kept out of protocol PlayerState.
+    predicted_view_forced: bool,
+    display_view_forced: bool,
     predicted_error: [f32; 3],
     predicted_error_time: i32,
     old_time: i32,
@@ -917,6 +920,16 @@ impl Predictor {
     /// usercmd angles behind [`Self::predicted`].
     pub fn predicted_command_angles(&self) -> Option<[i32; 3]> {
         self.display_angles
+    }
+
+    /// True when the Pmove step backing the presented state called
+    /// OpenJK PM_SetPMViewAngle for the local player.
+    pub fn view_forced(&self) -> bool {
+        if self.display.is_some() {
+            self.display_view_forced
+        } else {
+            self.predicted.is_some() && self.predicted_view_forced
+        }
     }
 
     /// CG_CalcViewValues: the decaying prediction error added to the view.
@@ -968,6 +981,8 @@ impl Predictor {
             self.predicted = None;
             self.display = None;
             self.display_angles = None;
+            self.predicted_view_forced = false;
+            self.display_view_forced = false;
             return Ok(());
         }
         let old = self.predicted.clone().expect("seeded above");
@@ -1022,6 +1037,7 @@ impl Predictor {
         let mut world = PredictionWorld { world, solids: &solids, client_num };
 
         let mut moved = false;
+        let mut replay_view_forced = self.predicted_view_forced;
         let mut command_time = base_ps.field_i32("commandTime").unwrap_or(0);
         for number in first..=current {
             let mut cmd = command(number);
@@ -1084,19 +1100,27 @@ impl Predictor {
                 cmd.server_time = ((cmd.server_time + msec - 1) / msec) * msec;
             }
             movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
-            command_time = native.view().command_time;
+            let native_view = native.view();
+            command_time = native_view.command_time;
+            replay_view_forced = native_view.view_forced != 0;
             moved = true;
         }
         // OpenJK leaves cg.predictedPlayerState at the base snapshot's state
         // when no command was replayed.
         self.predicted = Some(if moved { from_native(native.network()) } else { base_ps.clone() });
+        if moved {
+            self.predicted_view_forced = replay_view_forced;
+        }
         self.display = self.predicted.clone();
+        self.display_view_forced = self.predicted_view_forced;
         self.display_angles = session.command(current).map(|cmd| cmd.angles);
         if let Some(cmd) = provisional {
             let reached = native.view().command_time;
             if prediction_settings.pmove_fixed == 0 && cmd.server_time > reached && cmd.server_time > latest.server_time {
                 movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
+                let native_view = native.view();
                 self.display = Some(from_native(native.network()));
+                self.display_view_forced = native_view.view_forced != 0;
                 self.display_angles = Some(cmd.angles);
             }
         }

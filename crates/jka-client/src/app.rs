@@ -38,7 +38,7 @@ use crate::{
     ui::{
         self, ChatMode, CloudRenderResolution, CloudType, ColorLutPreset, ConsoleSearchMatch,
         ConsoleSelection, ConsoleSize, CullDebugMode, DofQuality, DynamicLightsMode,
-        DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
+        DetailTextureMode, DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
         Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudLayout, HudState, MapLoadingBar, MapLoadingUi, OverlayMode, PerfStats,
         PlanarReflectionDebugMode, PvsMode, RainIntensity, ReflectionQuality, RendererBackend,
         SunVisibilityMode, TextureFilter, ThreadPerfStats, UiChatLine, UiScoreEntry, UiScoreboard, UiSnapshot,
@@ -1446,6 +1446,7 @@ impl GameSession {
         first_person_lightsaber: bool,
         debug_events: u8,
         ghoul2_view: Option<Ghoul2PresentationView>,
+        rt_rigid_casters_enabled: bool,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         if self.phase != SessionPhase::Playing {
             return Err("DEMO PLAYBACK ADVANCED BEFORE MAP LOAD".to_owned());
@@ -1462,6 +1463,7 @@ impl GameSession {
             first_person_lightsaber,
             debug_events,
             ghoul2_view,
+            rt_rigid_casters_enabled,
             None,
         )
     }
@@ -1473,6 +1475,7 @@ impl GameSession {
         first_person_lightsaber: bool,
         debug_events: u8,
         ghoul2_view: Option<Ghoul2PresentationView>,
+        rt_rigid_casters_enabled: bool,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.advance_to_with_prediction(
             target_server_time,
@@ -1481,6 +1484,7 @@ impl GameSession {
             first_person_lightsaber,
             debug_events,
             ghoul2_view,
+            rt_rigid_casters_enabled,
             None,
         )
     }
@@ -1495,10 +1499,13 @@ impl GameSession {
         first_person_lightsaber: bool,
         debug_events: u8,
         ghoul2_view: Option<Ghoul2PresentationView>,
+        rt_rigid_casters_enabled: bool,
         predict: Option<&mut dyn FnMut(&ProtocolSnapshot, Option<&ProtocolSnapshot>, &[PresentedEntity]) -> Result<Option<LivePredictionFrame>, String>>,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.client_perf = ClientFramePerf::default();
         self.player_presenter.begin_perf_frame();
+        self.player_presenter
+            .set_rt_shadow_casters_enabled(rt_rigid_casters_enabled);
         self.client_perf.ghoul2_skinning_mode = self.player_presenter.skinning_mode();
         let snapshot_started = Instant::now();
         let current_time = self
@@ -1564,6 +1571,13 @@ impl GameSession {
             self.current_snapshot = self.next_snapshot.take();
             self.next_snapshot = self.read_next_snapshot()?;
             self.client_game.set_next_snapshot(self.next_snapshot.as_ref())?;
+        }
+
+        // CG_ExecuteNewServerCommands runs before entity presentation. In
+        // OpenJK, reliable ircg/rcg commands mutate Ghoul2 instances before
+        // CG_AddPacketEntities sees the corresponding body/respawn state.
+        for command in self.client_game.drain_ghoul2_commands() {
+            self.player_presenter.apply_ghoul2_server_command(command);
         }
 
         // FX_AdjustTime: effects spawned by this frame's events and entities
@@ -1675,6 +1689,10 @@ impl GameSession {
         }
 
         for event in self.client_game.drain_presentation_events() {
+            // OpenJK EV_DESTROY_WEAPON_MODEL mutates the target Ghoul2 model
+            // before the frame's player/body rendering. This is what prevents
+            // a dropped pickup weapon from also remaining on the corpse.
+            self.player_presenter.apply_entity_event(&event);
             let fx_dispatch = self.weapon_fx.entity_event(&event, &self.client_game);
             let sound_dispatch_started = Instant::now();
             let sound_dispatch = if self.suppress_audio {
@@ -1794,6 +1812,7 @@ impl GameSession {
                 target_server_time,
                 &mut self.player_presenter,
                 &mut self.weapon_fx,
+                rt_rigid_casters_enabled,
             );
         self.client_perf.entity_present_ms = entity_present_started.elapsed().as_secs_f64() * 1000.0;
         self.inline_models = Arc::new(inline_models);
@@ -2383,6 +2402,8 @@ pub struct App {
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
+    /// Owns the paired timeBeginPeriod(1)/timeEndPeriod(1) request while enabled.
+    windows_timer_resolution: crate::windows_timer::TimerResolutionGuard,
     /// Last quality preset explicitly applied, plus the canonical cvar values
     /// produced by its setters. This makes preset highlighting follow the
     /// actual applied state instead of brittle literal table values.
@@ -2514,7 +2535,7 @@ impl App {
         // If no native client config exists yet, persist the effective defaults
         // (or imported jampconfig values) shortly after startup. Also rewrite
         // legacy configs that stacked multiple AA methods.
-        let config_dirty = !config_path.is_file() || aa_normalized;
+        let mut config_dirty = !config_path.is_file() || aa_normalized;
         let fresh_install = !config_path.is_file();
         let initial_label = initial_source.label();
         let initial_loading = launch_map.then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
@@ -2522,6 +2543,14 @@ impl App {
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
         let server_browser = BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
         let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
+        let mut windows_timer_resolution = crate::windows_timer::TimerResolutionGuard::default();
+        if video.timer_resolution_1ms {
+            if let Err(error) = windows_timer_resolution.set_enabled(true) {
+                eprintln!("1 ms Windows timer request disabled: {error}");
+                video.timer_resolution_1ms = false;
+                config_dirty = true;
+            }
+        }
         let mut app = Self {
             base,
             startup_game: game.clone(),
@@ -2724,6 +2753,7 @@ impl App {
             cloud_tuning_open: false,
             cloud_tuning_selected: 0,
             video,
+            windows_timer_resolution,
             quality_preset_selected: None,
             quality_preset_values: Vec::new(),
             applied_fullscreen: video.fullscreen,
@@ -3137,12 +3167,17 @@ impl App {
         if !self.video.input_subframe {
             return None;
         }
-        if let Some(angles) = self.live_view_angles() {
-            return Some([angles[1].to_radians(), -angles[0].to_radians()]);
+        if !self.live_remote_view_forced() {
+            if let Some(angles) = self.live_view_angles() {
+                return Some([angles[1].to_radians(), -angles[0].to_radians()]);
+            }
         }
-        self.local_server.as_ref().map(|server| {
+        self.local_server.as_ref().and_then(|server| {
+            if server.view().view_forced != 0 {
+                return None;
+            }
             let angles = server.subframe_view_angles();
-            [angles[1].to_radians(), -angles[0].to_radians()]
+            Some([angles[1].to_radians(), -angles[0].to_radians()])
         })
     }
 
@@ -3232,7 +3267,7 @@ impl App {
     /// decides whether they map directly to first person or through the cheap
     /// no-trace portion of the existing OpenJK third-person camera.
     fn publish_live_subframe_view(&self, input: InputLatencySample) {
-        if !self.video.input_subframe {
+        if !self.video.input_subframe || self.live_remote_view_forced() {
             return;
         }
         let Some(view_angles) = self.live_view_angles() else {
@@ -3255,6 +3290,9 @@ impl App {
             return false;
         };
         let player_view = server.view();
+        if player_view.view_forced != 0 {
+            return false;
+        }
         let entity_view = server.entity_view();
         let policy = PlayerViewPolicyState::from_entity_view(entity_view, player_view.legs_timer);
         if rendering_third_person(self.third_person, self.first_person_lightsaber, policy)
@@ -4945,6 +4983,7 @@ impl App {
             "cg_thirdpersonvertoffset" => format!("{:.3}", self.third_person.vert_offset),
             "pmove_msec" => self.video.physics_msec.to_string(),
             "cl_input_subframe" => bool_value(self.video.input_subframe),
+            "cl_timerresolution1ms" => bool_value(self.video.timer_resolution_1ms),
             "cl_input_latelatch" => bool_value(self.video.input_latelatch),
             "r_physics" => bool_value(self.video.client_physics),
             "r_physicshz" => self.video.client_physics_hz.to_string(),
@@ -4989,6 +5028,10 @@ impl App {
                 TextureFilter::Anisotropic16x => "16".into(),
                 _ => "0".into(),
             },
+            "r_detailtextures" => self.video.detail_textures.config_value().into(),
+            "r_detailtexture" => "auto".into(),
+            "r_detailtexturefade" => bool_value(self.video.detail_texture_fade),
+            "r_detailtexturefadedistance" => format!("{:.0}", self.video.detail_texture_fade_distance),
             "r_customwidth" => self.video.resolution[0].to_string(),
             "r_customheight" => self.video.resolution[1].to_string(),
             "r_windowx" => self
@@ -5166,6 +5209,25 @@ impl App {
         self.mark_config_dirty();
         self.publish_snapshot();
         self.publish_ui();
+    }
+
+    fn set_timer_resolution_1ms(&mut self, enabled: bool) -> Result<(), String> {
+        if self.video.timer_resolution_1ms == enabled
+            && self.windows_timer_resolution.is_active() == enabled
+        {
+            return Ok(());
+        }
+
+        self.windows_timer_resolution.set_enabled(enabled)?;
+        self.video.timer_resolution_1ms = enabled;
+        self.mark_config_dirty();
+        self.console_status = if enabled {
+            "WINDOWS TIMER RESOLUTION: 1 MS (A/B TEST ENABLED)".into()
+        } else {
+            "WINDOWS TIMER RESOLUTION: DEFAULT".into()
+        };
+        self.publish_ui();
+        Ok(())
     }
 
     fn set_input_latelatch(&mut self, enabled: bool) {
@@ -5808,6 +5870,10 @@ impl App {
                 let enabled = boolean()?;
                 self.set_input_subframe(enabled);
             }
+            "cl_timerresolution1ms" => {
+                let enabled = boolean()?;
+                self.set_timer_resolution_1ms(enabled)?;
+            }
             "cl_input_latelatch" => {
                 let enabled = boolean()?;
                 self.set_input_latelatch(enabled);
@@ -5985,6 +6051,43 @@ impl App {
                     _ => return Err(format!("{name}: unknown texture mode")),
                 };
                 self.render_command(RenderCommand::SetTextureFilter(self.video.texture_filter));
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_detailtextures" => {
+                self.video.detail_textures = DetailTextureMode::from_config(value)
+                    .ok_or_else(|| format!("{name}: expected off|neutral2x|linear2x|dstcolor_one|multiply"))?;
+                self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_detailtexture" => {
+                return Err(format!("{name}: detail texture selection is fixed to AUTO"));
+            }
+            "r_detailtexturefade" => {
+                self.video.detail_texture_fade = match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "on" | "true" | "yes" => true,
+                    "0" | "off" | "false" | "no" => false,
+                    _ => return Err(format!("{name}: expected 0 or 1")),
+                };
+                self.render_command(RenderCommand::SetDetailTextureFade {
+                    enabled: self.video.detail_texture_fade,
+                    distance: self.video.detail_texture_fade_distance,
+                });
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_detailtexturefadedistance" => {
+                let distance = value.trim().parse::<f32>()
+                    .map_err(|_| format!("{name}: expected 64..8192"))?;
+                if !distance.is_finite() {
+                    return Err(format!("{name}: expected 64..8192"));
+                }
+                self.video.detail_texture_fade_distance = distance.clamp(64.0, 8192.0);
+                self.render_command(RenderCommand::SetDetailTextureFade {
+                    enabled: self.video.detail_texture_fade,
+                    distance: self.video.detail_texture_fade_distance,
+                });
                 self.mark_config_dirty();
                 self.publish_ui();
             }
@@ -7028,6 +7131,13 @@ impl App {
         self.asset_preview_shader_key = None;
         self.asset_preview_fx = None;
         self.asset_preview_viewport_key = None;
+        // Detail texture selection is always material-driven AUTO. A game/mod
+        // change invalidates its VFS source, so refresh the renderer-side AUTO
+        // cache without enumerating a manual settings list.
+        self.render_command(RenderCommand::SetDetailTexture {
+            path: "auto".to_owned(),
+            game: self.game.clone(),
+        });
         self.demo_catalog_loaded = false;
         self.demo_catalog_error = None;
         self.demo_entries.clear();
@@ -7950,6 +8060,8 @@ impl App {
                 debug: self.video.physics_debug_draw,
                 stats: self.video.physics_stats,
             });
+            let rt_rigid_casters_enabled =
+                self.video.dynamic_shadows == DynamicShadowsMode::RayTraced;
             let (advance, sample) = if playback.local {
                 let Some((server_time, _)) = local_frame else {
                     return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
@@ -7960,6 +8072,7 @@ impl App {
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     ghoul2_view,
+                    rt_rigid_casters_enabled,
                 )?
             } else if playback.live {
                 let Some(net) = self.net.as_ref() else {
@@ -8028,6 +8141,7 @@ impl App {
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     ghoul2_view,
+                    rt_rigid_casters_enabled,
                     Some(&mut predict),
                 )?
             } else {
@@ -8037,6 +8151,7 @@ impl App {
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     ghoul2_view,
+                    rt_rigid_casters_enabled,
                 )?
             };
             (advance, sample, playback.take_event_debug_lines())
@@ -8058,8 +8173,10 @@ impl App {
                     sample.view_angles = angles;
                 }
             }
-        } else if let Some(angles) = self.live_view_angles() {
-            sample.view_angles = angles;
+        } else if !(self.video.input_subframe && self.live_remote_view_forced()) {
+            if let Some(angles) = self.live_view_angles() {
+                sample.view_angles = angles;
+            }
         }
         let listener_entity = if self.game_session.as_ref().is_some_and(|session| session.live) {
             self.apply_demo_camera(sample);
@@ -9886,6 +10003,17 @@ impl App {
         self.predictor
             .predicted()
             .or_else(|| session.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state))
+    }
+
+    /// True only for a joined remote game whose current predicted/display Pmove
+    /// step says OpenJK owns the local view angle. This is presentation metadata;
+    /// it must never change the ordinary/non-subframe camera path.
+    fn live_remote_view_forced(&self) -> bool {
+        self.game_session
+            .as_ref()
+            .is_some_and(|session| session.live && !session.local)
+            && self.predictor.predicted().is_some()
+            && self.predictor.view_forced()
     }
 
     /// View angles for this render frame: the predicted playerstate's angles
@@ -12089,6 +12217,7 @@ impl App {
             initial_ui,
             self.base.clone(),
             self.game.clone(),
+            "auto".to_owned(),
         ) {
             Ok(render) => {
                 self.render = Some(render);
@@ -12468,6 +12597,16 @@ impl App {
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(self.video.gamma + direction as f32 * 0.05),
             ui::VIDEO_ROW_ANTI_ALIASING => self.cycle_anti_aliasing(direction),
             ui::VIDEO_ROW_TEXTURE_FILTER => self.cycle_texture_filter(direction),
+            ui::VIDEO_ROW_DETAIL_TEXTURES => {
+                let current = DetailTextureMode::ALL
+                    .iter()
+                    .position(|mode| *mode == self.video.detail_textures)
+                    .unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(DetailTextureMode::ALL.len() as i32);
+                self.video.detail_textures = DetailTextureMode::ALL[next as usize];
+                self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_PVS => {
                 const MODES: [PvsMode; 7] = [
                     PvsMode::Off,
@@ -12688,14 +12827,14 @@ impl App {
                 );
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
-                if matches!(
-                    self.video.dynamic_shadows,
-                    DynamicShadowsMode::BlobStencilLegacy | DynamicShadowsMode::RayTraced
-                ) {
+                if self.video.dynamic_shadows == DynamicShadowsMode::BlobStencilLegacy {
                     self.console_status = format!(
                         "DYNAMIC SHADOWS: {} - WIP, CURRENTLY BEHAVES AS OFF",
                         self.video.dynamic_shadows.label()
                     );
+                } else if self.video.dynamic_shadows == DynamicShadowsMode::RayTraced {
+                    self.console_status =
+                        "DYNAMIC SHADOWS: RAY TRACED SHADOWS - HARDWARE RAY QUERY (STATIC OPAQUE BSP CASTERS)".to_string();
                 }
             }
             ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS => {
@@ -13777,6 +13916,7 @@ impl ApplicationHandler<UserEvent> for App {
             initial_ui,
             self.base.clone(),
             self.game.clone(),
+            "auto".to_owned(),
         ) {
             Ok(render) => render,
             Err(error) => {
@@ -15276,9 +15416,15 @@ impl ApplicationHandler<UserEvent> for App {
                         applied = true;
                     }
                     if applied {
-                        let direct_view_published = applied_sample
-                            .is_some_and(|sample| self.publish_local_subframe_view(sample));
-                        if !direct_view_published {
+                        // OpenJK-forced views still accumulate mouse into future usercmds,
+                        // but they do no render-only subframe camera work.
+                        let subframe_event_handled = self
+                            .local_server
+                            .as_ref()
+                            .is_some_and(|server| server.view().view_forced != 0)
+                            || applied_sample
+                                .is_some_and(|sample| self.publish_local_subframe_view(sample));
+                        if !subframe_event_handled {
                             // The no-trace third-person latch is unavailable
                             // (for example camera collision/damping). Preserve the
                             // old local fallback and rerun the authoritative CGame

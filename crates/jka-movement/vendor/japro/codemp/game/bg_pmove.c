@@ -1747,9 +1747,16 @@ static void PM_JumpForDir( void )
 	}
 }
 
+/* DinurdoJK host instrumentation only: report the exact OpenJK view-authority
+ * path without duplicating saber/movement predicates in Rust. */
+extern void jka_pmove_begin_view_tracking(playerState_t *ps);
+extern void jka_pmove_note_forced_view(playerState_t *ps);
+
 void PM_SetPMViewAngle(playerState_t *ps, vec3_t angle, usercmd_t *ucmd)
 {
 	int			i;
+
+	jka_pmove_note_forced_view(ps);
 
 	for (i=0 ; i<3 ; i++)
 	{ // set the delta angle
@@ -13986,6 +13993,7 @@ void PmoveSingle (pmove_t *pmove) {
 	int savedGravity = 0;
 
 	pm = pmove;
+	jka_pmove_begin_view_tracking(pmove->ps);
 
 #ifdef _CGAME
 	if (cgs.serverMod != SVMOD_JAPLUS || pm->ps->weapon != WP_MELEE) {

@@ -277,6 +277,12 @@ pub const ENTRIES: &[Entry] = &[
         "Apply mouse-look on each raw mouse event instead of waiting for the client tick.",
     ),
     cvar(
+        "cl_timerResolution1ms",
+        "0",
+        "0|1",
+        "Windows-only A/B toggle for timeBeginPeriod(1). Affects timeout/sleep granularity, not raw mouse-event wakeup.",
+    ),
+    cvar(
         "cl_input_latelatch",
         "0",
         "0..1",
@@ -377,6 +383,24 @@ pub const ENTRIES: &[Entry] = &[
         "0",
         "0|2|4|8|16",
         "Anisotropic texture filtering level.",
+    ),
+    cvar(
+        "r_detailTextures",
+        "off",
+        "off|neutral2x|linear2x|dstcolor_one|multiply",
+        "Fallback detail-texture blend mode for eligible opaque BSP materials that do not author a classic detail stage.",
+    ),
+    cvar(
+        "r_detailTextureFade",
+        "0",
+        "0|1",
+        "Fade the synthetic detail contribution back to neutral with camera distance.",
+    ),
+    cvar(
+        "r_detailTextureFadeDistance",
+        "512",
+        "64..8192",
+        "JKA-unit distance where the ported power-4 detail fade reaches zero detail contribution.",
     ),
     latched_cvar("r_customwidth", "1280", "320..", "Windowed render width.", LatchScope::VidRestart),
     latched_cvar("r_customheight", "800", "240..", "Windowed render height.", LatchScope::VidRestart),
