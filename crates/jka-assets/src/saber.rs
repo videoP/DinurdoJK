@@ -141,6 +141,8 @@ pub struct SaberDefinition {
     /// suppress wall sparks/marks for the primary/secondary blade style.
     pub no_wall_marks: bool,
     pub no_wall_marks2: bool,
+    /// OpenJK SFL2_NO_DLIGHT equivalent (`noDlight` in .sab files).
+    pub no_dlight: bool,
     /// OpenJK saberInfo_t gameplay fields consumed by shared BG/Pmove.
     pub move_speed_scale: f32,
     pub anim_speed_scale: f32,
@@ -173,6 +175,7 @@ impl SaberDefinition {
             trail_style2: 0,
             no_wall_marks: false,
             no_wall_marks2: false,
+            no_dlight: false,
             move_speed_scale: 1.0,
             anim_speed_scale: 1.0,
             styles_learned: 0,
@@ -454,6 +457,11 @@ fn parse_saber_file(
                         }
                     }
                 }
+                "nodlight" => {
+                    if let Some(value) = parser.token(false)? {
+                        definition.no_dlight = matches!(value.parse::<i32>(), Ok(value) if value != 0);
+                    }
+                }
                 "soundloop" => {
                     if let Some(value) = parser.token(false)? {
                         if !value.is_empty() {
@@ -703,6 +711,7 @@ mod tests {
                     bladeStyle2Start 1
                     trailStyle 1
                     trailStyle2 2
+                    noDlight 1
                     returnDamage 1
                     returnDamage 0
                     soundLoop "sound\weapons\saber\saberhum4.wav"
@@ -741,8 +750,10 @@ mod tests {
         assert_eq!(def.blade(0).radius, 3.5);
         assert_eq!(def.blade_style2_start, 1);
         assert_eq!((def.trail_style, def.trail_style2), (1, 2));
+        assert!(def.no_dlight);
         assert!(def.return_damage);
         assert!(!defs.get("defaultish").unwrap().return_damage);
+        assert!(!defs.get("defaultish").unwrap().no_dlight);
         assert_eq!(def.sound_loop, "sound/weapons/saber/saberhum4.wav");
         assert_eq!(def.swing_sounds[0].as_deref(), Some("sound/weapons/custom/swing1.wav"));
         assert_eq!(def.swing_sounds[1].as_deref(), Some("sound/weapons/custom/swing2.wav"));

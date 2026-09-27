@@ -69,6 +69,7 @@ pub struct ThirdPersonCameraState {
     last_frame: f64,
     last_yaw: f32,
     stiff_factor: f32,
+    last_camera_trace_fraction: f32,
     initialized: bool,
 }
 
@@ -80,6 +81,7 @@ impl Default for ThirdPersonCameraState {
             last_frame: 0.0,
             last_yaw: 0.0,
             stiff_factor: 0.0,
+            last_camera_trace_fraction: 0.0,
             initialized: false,
         }
     }
@@ -113,6 +115,18 @@ pub struct ThirdPersonViewOutput {
     pub origin: [f32; 3],
     /// Final camera angles in native JKA degrees.
     pub angles: [f32; 3],
+    /// Render-only state that can rebuild the ordinary on-foot camera from a
+    /// newer real mouse orientation without repeating BSP collision traces.
+    /// This is only provided when camera damping has already resolved directly
+    /// to the ideal location and the authoritative camera trace was unobstructed.
+    pub late_latch: Option<ThirdPersonLateLatchView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThirdPersonLateLatchView {
+    settings: ThirdPersonSettings,
+    current_target: [f32; 3],
+    ideal_target: [f32; 3],
 }
 
 #[inline]
@@ -194,24 +208,32 @@ fn vector_to_angles(value: [f32; 3]) -> [f32; 3] {
     [-pitch, yaw, 0.0]
 }
 
+fn camera_trace_with_fraction<W: TraceWorld>(
+    world: &mut W,
+    start: [f32; 3],
+    end: [f32; 3],
+    pass_entity: i32,
+) -> ([f32; 3], f32) {
+    let mins = [-CAMERA_SIZE; 3];
+    let maxs = [CAMERA_SIZE; 3];
+    let trace = world.trace(TraceQuery {
+        start,
+        mins,
+        maxs,
+        end,
+        pass_entity,
+        mask: MASK_CAMERACLIP,
+    });
+    (trace.end, trace.fraction)
+}
+
 fn camera_trace<W: TraceWorld>(
     world: &mut W,
     start: [f32; 3],
     end: [f32; 3],
     pass_entity: i32,
 ) -> [f32; 3] {
-    let mins = [-CAMERA_SIZE; 3];
-    let maxs = [CAMERA_SIZE; 3];
-    world
-        .trace(TraceQuery {
-            start,
-            mins,
-            maxs,
-            end,
-            pass_entity,
-            mask: MASK_CAMERACLIP,
-        })
-        .end
+    camera_trace_with_fraction(world, start, end, pass_entity).0
 }
 
 fn ideal_target(settings: ThirdPersonSettings, input: ThirdPersonViewInput) -> ([f32; 3], [f32; 3]) {
@@ -242,8 +264,10 @@ fn reset_third_person_damp<W: TraceWorld>(
     let location = ideal_location(target, forward, settings.range);
 
     state.current_target = camera_trace(world, focus, target, input.client_num);
-    state.current_location =
-        camera_trace(world, state.current_target, location, input.client_num);
+    let (location, camera_fraction) =
+        camera_trace_with_fraction(world, state.current_target, location, input.client_num);
+    state.current_location = location;
+    state.last_camera_trace_fraction = camera_fraction;
     state.last_frame = input.time;
     state.last_yaw = focus_angles[1];
     state.stiff_factor = 0.0;
@@ -301,12 +325,14 @@ fn update_camera_damp<W: TraceWorld>(
         let ratio = left.powf(dtime);
         state.current_location = add(ideal, scale(diff, -ratio));
     }
-    state.current_location = camera_trace(
+    let (location, camera_fraction) = camera_trace_with_fraction(
         world,
         state.current_target,
         state.current_location,
         input.client_num,
     );
+    state.current_location = location;
+    state.last_camera_trace_fraction = camera_fraction;
 }
 
 /// Port of the ordinary, on-foot OpenJK MP CG_OffsetThirdPersonView camera
@@ -329,7 +355,8 @@ pub fn offset_third_person_view<W: TraceWorld>(
         focus_angles[0] += settings.pitch_offset;
     }
 
-    if !state.initialized || state.last_frame == 0.0 || state.last_frame > input.time {
+    let reset_damp = !state.initialized || state.last_frame == 0.0 || state.last_frame > input.time;
+    if reset_damp {
         reset_third_person_damp(world, settings, state, input, &mut focus_angles);
     } else {
         focus_angles[0] = focus_angles[0].clamp(-80.0, 80.0);
@@ -371,9 +398,57 @@ pub fn offset_third_person_view<W: TraceWorld>(
     }
 
     state.last_frame = input.time;
+    let (_, ideal_target) = ideal_target(settings, input);
+    let late_latch = (!reset_damp
+        && input.health > 0
+        && !input.teleported
+        && settings.camera_damp >= 1.0
+        && state.last_camera_trace_fraction >= 0.999_999)
+        .then_some(ThirdPersonLateLatchView {
+            settings,
+            current_target: state.current_target,
+            ideal_target,
+        });
     ThirdPersonViewOutput {
         origin: state.current_location,
         angles,
+        late_latch,
+    }
+}
+
+/// Rebuild only the angle-dependent, no-collision portion of the ordinary
+/// OpenJK third-person camera. The authoritative camera call above has already
+/// resolved target damping/target clipping for this presentation frame. This
+/// helper is intentionally available only through `ThirdPersonLateLatchView`,
+/// which is withheld while the camera is damped or collision-clipped.
+pub fn late_latch_third_person_view(
+    latch: ThirdPersonLateLatchView,
+    view_angles: [f32; 3],
+) -> ThirdPersonViewOutput {
+    let mut focus_angles = view_angles;
+    focus_angles[1] += latch.settings.angle;
+    focus_angles[0] += latch.settings.pitch_offset;
+    focus_angles[0] = focus_angles[0].clamp(-80.0, 80.0);
+
+    let (forward, _, _) = angle_vectors(focus_angles);
+    let mut location = ideal_location(latch.ideal_target, forward, latch.settings.range);
+    let (mut aim, dist) = normalize(sub(latch.current_target, location));
+    if dist == 0.0 || aim[0] == 0.0 || aim[1] == 0.0 {
+        aim = forward;
+    }
+    let angles = vector_to_angles(aim);
+
+    if latch.settings.horz_offset != 0.0 {
+        location = add(
+            location,
+            scale(angles_axis1(angles), latch.settings.horz_offset),
+        );
+    }
+
+    ThirdPersonViewOutput {
+        origin: location,
+        angles,
+        late_latch: Some(latch),
     }
 }
 

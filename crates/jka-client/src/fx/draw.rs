@@ -6,7 +6,7 @@ use super::system::{make_normal_vectors, FxDraw};
 use crate::{
     camera::Camera,
     materials::TextureData,
-    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex},
+    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex},
     scene,
 };
 use std::{collections::HashMap, sync::Arc};
@@ -192,6 +192,7 @@ pub fn tessellate(
         .filter(|(_, (_, batch))| !batch.indices.is_empty())
         .map(|(_, (mat, batch))| DynamicModelSurface {
             entity_num: FX_ENTITY_NUM,
+            wireframe_class: DynamicWireframeClass::Effect,
             vertices: Arc::new(batch.vertices),
             indices: Arc::new(batch.indices),
             lighting_origin: None,

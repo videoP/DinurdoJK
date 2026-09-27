@@ -1573,6 +1573,7 @@ fn emissive_surface_light_stats(texture: &TextureData) -> Option<([f32; 3], f32)
 pub fn primary_texture_requests(
     used_shader_names: &[String],
     library: &BTreeMap<String, Shader>,
+    omit_environment_stages: bool,
 ) -> Vec<(String, bool, bool)> {
     let mut requests = Vec::<(String, bool, bool)>::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -1598,6 +1599,9 @@ pub fn primary_texture_requests(
                     }
                 }
                 for stage in &shader.stages {
+                    if omit_environment_stages && matches!(stage.tc_gen, TcGen::Environment) {
+                        continue;
+                    }
                     if stage.surface_sprite.is_some_and(|sprite| {
                         matches!(sprite.kind, shader::SurfaceSpriteType::Vertical)
                     }) {
@@ -1632,10 +1636,14 @@ pub fn describe(
     assets: &mut AssetSearchPath,
     textures: &mut Textures,
     gen_normal_maps: bool,
+    omit_environment_stages: bool,
 ) -> SurfaceMaterial {
     let empty = Shader::default();
     let definition = definition.unwrap_or(&empty);
     let explicit = !definition.stages.is_empty();
+    let stage_is_omitted = |stage: &shader::Stage| {
+        omit_environment_stages && matches!(stage.tc_gen, TcGen::Environment)
+    };
     let preferred_source = origin
         .filter(|origin| origin.mtr_override)
         .map(|origin| origin.source.as_path());
@@ -1644,6 +1652,7 @@ pub fn describe(
     let surface_sprite_cull_quirk = definition
         .stages
         .iter()
+        .filter(|stage| !stage_is_omitted(stage))
         .any(|stage| stage.surface_sprite.is_some());
     let mut surface_light = (definition.surface_light > 0.0).then(|| {
         // q3map uses q3map_lightimage for emitter color when present; without
@@ -1652,6 +1661,7 @@ pub fn describe(
             definition
                 .stages
                 .iter()
+                .filter(|stage| !stage_is_omitted(stage))
                 .map(|stage| stage.image.as_str())
                 .find(|image| !image.is_empty() && !image.starts_with('$'))
         });
@@ -1691,10 +1701,33 @@ pub fn describe(
     let mut stages = Vec::new();
     let mut grass = None;
     let mut surface_sprite_effects = Vec::new();
+    // Removing a stage must not accidentally remove the opaque/depth seed for
+    // the whole material. Scene preparation intentionally gives only the first
+    // ordinary unblended stage implicit depthWrite, so remember whether the
+    // authored first ordinary stage was an environment pass that supplied that
+    // coverage. The first surviving ordinary stage can then inherit the base
+    // role on the cold material-specialization path.
+    let mut saw_authored_ordinary_stage = false;
+    let mut omitted_front_depth_base = false;
 
     if !sky && !base_hidden {
         if explicit {
             for source in &definition.stages {
+                let procedural_sprite_only = source.surface_sprite.is_some_and(|sprite| {
+                    matches!(
+                        sprite.kind,
+                        shader::SurfaceSpriteType::Vertical | shader::SurfaceSpriteType::Effect
+                    )
+                });
+                let authored_ordinary_stage = !source.image.is_empty() && !procedural_sprite_only;
+                if stage_is_omitted(source) {
+                    if authored_ordinary_stage && !saw_authored_ordinary_stage {
+                        omitted_front_depth_base =
+                            source.depth_write || stage_blend(source).is_none();
+                    }
+                    saw_authored_ordinary_stage |= authored_ordinary_stage;
+                    continue;
+                }
                 if let Some(sprite) = source.surface_sprite {
                     if matches!(sprite.kind, shader::SurfaceSpriteType::Vertical) {
                         if grass.is_none() {
@@ -1783,12 +1816,21 @@ pub fn describe(
                 } else {
                     source.tc_gen
                 };
-                let blend = stage_blend(source);
+                let promote_to_base = omitted_front_depth_base && stages.is_empty();
+                let mut blend = stage_blend(source);
                 if !source.blend.is_empty() && blend.is_none() {
                     textures.warnings.push(format!(
                         "{name}: unsupported blendFunc {}; rendering stage opaque",
                         source.blend
                     ));
+                }
+                if promote_to_base {
+                    // This stage was authored to composite over the removed
+                    // environment base. Make it the new opaque base instead of
+                    // blending it against whatever happened to be rendered
+                    // behind the surface. This restores both color opacity and
+                    // main-scene depth occlusion without a runtime shader branch.
+                    blend = None;
                 }
                 let base_index = match texture {
                     StageTexture::Image(index) => Some(index),
@@ -1813,8 +1855,44 @@ pub fn describe(
                     alpha_gen: source.alpha_gen,
                     tc_gen,
                     tc_mods: source.tc_mods.clone(),
-                    depth_write: source.depth_write,
-                    depth_equal: source.depth_equal,
+                    depth_write: source.depth_write || promote_to_base,
+                    // A later pass commonly authors depthFunc equal because the
+                    // removed base already populated depth. Once promoted to the
+                    // base pass there is no earlier depth value to compare with.
+                    depth_equal: source.depth_equal && !promote_to_base,
+                });
+                saw_authored_ordinary_stage |= authored_ordinary_stage;
+            }
+
+            // A non-translucent shader made entirely from tcGen environment
+            // stages must still be solid when reflections are strictly Off.
+            // Prefer its same-named diffuse image as a non-reflective fallback;
+            // if the asset does not exist, white still preserves depth/occlusion
+            // instead of turning a wall into a hole. This exists only in the
+            // specialized Off material set.
+            if omit_environment_stages
+                && omitted_front_depth_base
+                && stages.is_empty()
+                && !definition.translucent
+                && !definition.water
+            {
+                let texture = textures
+                    .load(assets, name, false)
+                    .map(StageTexture::Image)
+                    .unwrap_or(StageTexture::White);
+                stages.push(MaterialStage {
+                    texture,
+                    enhancements: StageEnhancements::default(),
+                    blend: None,
+                    alpha_cutoff: 0.0,
+                    opacity: 1.0,
+                    color: [1.0; 3],
+                    rgb_gen: RgbGen::Identity,
+                    alpha_gen: AlphaGen::Identity,
+                    tc_gen: TcGen::Base,
+                    tc_mods: Vec::new(),
+                    depth_write: true,
+                    depth_equal: false,
                 });
             }
         } else {
@@ -1911,7 +1989,10 @@ pub fn describe(
 mod tests {
     use super::*;
 
-    fn material(text: &str) -> SurfaceMaterial {
+    fn material_with_environment_policy(
+        text: &str,
+        omit_environment_stages: bool,
+    ) -> SurfaceMaterial {
         let shaders = shader::parse(text).unwrap();
         let root =
             std::env::temp_dir().join(format!("jka-material-fixture-{}", std::process::id()));
@@ -1924,7 +2005,12 @@ mod tests {
             &mut assets,
             &mut Textures::new(),
             false,
+            omit_environment_stages,
         )
+    }
+
+    fn material(text: &str) -> SurfaceMaterial {
+        material_with_environment_policy(text, false)
     }
 
     #[test]
@@ -1990,6 +2076,50 @@ mod tests {
         );
         assert_eq!(material.stages[2].texture, StageTexture::Lightmap);
     }
+    #[test]
+    fn reflection_off_omits_environment_stage_without_touching_siblings() {
+        let material = material_with_environment_policy(
+            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n{\nmap $lightmap\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}",
+            true,
+        );
+        assert!(material.explicit);
+        assert_eq!(material.stages.len(), 2);
+        assert!(material
+            .stages
+            .iter()
+            .all(|stage| !matches!(stage.tc_gen, TcGen::Environment)));
+        assert!(matches!(material.stages[1].tc_gen, TcGen::Lightmap));
+    }
+
+    #[test]
+    fn reflection_off_promotes_survivor_after_opaque_environment_base() {
+        let material = material_with_environment_policy(
+            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc blend\ndepthFunc equal\n}\n{\nmap $lightmap\nblendFunc filter\n}\n}",
+            true,
+        );
+        assert_eq!(material.stages.len(), 2);
+        assert!(material.stages[0].blend.is_none());
+        assert!(material.stages[0].depth_write);
+        assert!(!material.stages[0].depth_equal);
+        assert!(matches!(material.stages[0].tc_gen, TcGen::Base));
+        assert!(material.stages[1].blend.is_some());
+        assert!(matches!(material.stages[1].tc_gen, TcGen::Lightmap));
+    }
+
+    #[test]
+    fn reflection_off_keeps_environment_only_opaque_surface_as_occluder() {
+        let material = material_with_environment_policy(
+            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n}",
+            true,
+        );
+        assert_eq!(material.stages.len(), 1);
+        assert!(material.stages[0].blend.is_none());
+        assert!(material.stages[0].depth_write);
+        assert!(!material.stages[0].depth_equal);
+        assert!(matches!(material.stages[0].tc_gen, TcGen::Base));
+        assert!(!material.hidden);
+    }
+
     #[test]
     fn detail_blend_keeps_destination_color() {
         let material = material(

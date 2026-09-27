@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     materials::{self, TextureData, Textures},
-    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex, InlineModelInstance},
+    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, InlineModelInstance},
     scene,
 };
 use jka_assets::{
@@ -347,6 +347,7 @@ impl EntityPresenter {
                 .unwrap_or_else(|| (surface_asset.texture.clone(), surface_asset.alpha_mode));
             draws.push(DynamicModelSurface {
                 entity_num,
+                wireframe_class: DynamicWireframeClass::Entity,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(submission.origin),
@@ -423,6 +424,7 @@ impl EntityPresenter {
             }
             draws.push(DynamicModelSurface {
                 entity_num: entity.number,
+                wireframe_class: DynamicWireframeClass::Entity,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(entity.origin),
@@ -482,6 +484,7 @@ impl EntityPresenter {
             }
             draws.push(DynamicModelSurface {
                 entity_num,
+                wireframe_class: DynamicWireframeClass::Entity,
                 vertices: Arc::new(vertices),
                 indices: Arc::new(indices),
                 lighting_origin: Some(origin),

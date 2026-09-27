@@ -342,22 +342,117 @@ pub(super) fn switch(ui: &mut egui::Ui, on: bool) -> Option<bool> {
 /// ordering of the options is visible at a glance. Clicking or dragging a
 /// segment selects it.
 ///
-/// When the ladder starts at "Off" that stop is a true zero: it never lights a
-/// segment, gets no marker of its own, and the fill ramp spans only the stops
-/// above it. Picking Off leaves the bar completely empty, which is the reading.
-/// The leftmost cell still selects Off when clicked.
+/// A ladder whose first value is literally `Off` is presented as a master
+/// switch followed by a meter containing only the enabled quality levels. Off
+/// therefore has no segment of its own: switch Off means zero filled segments;
+/// switch On always means at least the first quality segment is filled. The
+/// widget remembers the most recent enabled level so an Off -> On A/B toggle
+/// restores it instead of silently dropping back to the cheapest mode.
 pub(super) fn quality_meter(
     ui: &mut egui::Ui,
     current: usize,
     labels: &[&str],
     track_width: f32,
 ) -> Option<usize> {
+    quality_meter_impl(ui, Some(current), labels, track_width, None)
+}
+
+/// Same ordered segmented meter as [`quality_meter`], but permits a genuine
+/// unselected state. In that state no segment is filled or ticked and
+/// `empty_label` is shown to the right. This is useful for quality presets:
+/// once any preset-owned cvar is edited, the settings are Custom rather than a
+/// different preset.
+pub(super) fn quality_meter_optional(
+    ui: &mut egui::Ui,
+    current: Option<usize>,
+    labels: &[&str],
+    track_width: f32,
+    empty_label: &str,
+) -> Option<usize> {
+    quality_meter_impl(ui, current, labels, track_width, Some(empty_label))
+}
+
+fn quality_meter_impl(
+    ui: &mut egui::Ui,
+    current: Option<usize>,
+    labels: &[&str],
+    track_width: f32,
+    empty_label: Option<&str>,
+) -> Option<usize> {
     let segments = labels.len();
     if segments == 0 {
         return None;
     }
-    let current = current.min(segments - 1);
-    let zero_stop = labels[0].eq_ignore_ascii_case("off");
+    let current = current.map(|value| value.min(segments - 1));
+
+    // `Off` is an enable state, not a quality level. Keep it out of the meter
+    // so segment 0 always means the first *enabled* quality choice.
+    if labels[0].eq_ignore_ascii_case("off") && segments > 1 {
+        let on = current.is_some_and(|selected| selected > 0);
+        let last_on_id = ui.id().with("quality_meter_last_on");
+
+        // Keep the restore target warm whenever the setting is enabled. Temp
+        // UI memory is sufficient: this is presentation state, not a cvar.
+        if let Some(selected) = current.filter(|selected| *selected > 0) {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(last_on_id, selected));
+        }
+
+        if let Some(next_on) = switch(ui, on) {
+            if next_on {
+                let restore = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<usize>(last_on_id))
+                    .unwrap_or(1)
+                    .clamp(1, segments - 1);
+                return Some(restore);
+            }
+            if let Some(selected) = current.filter(|selected| *selected > 0) {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(last_on_id, selected));
+            }
+            return Some(0);
+        }
+
+        ui.add_space(10.0);
+        let enabled_labels = &labels[1..];
+        let selected_enabled = current
+            .filter(|selected| *selected > 0)
+            .map(|selected| selected - 1);
+
+        // Recompute after the switch/readout consumed horizontal space. This
+        // keeps the enabled-quality meter aligned without reserving a phantom
+        // segment for Off.
+        let enabled_track_width = self::track_width(ui).min(track_width);
+        if let Some(target) = quality_meter_track(
+            ui,
+            selected_enabled,
+            enabled_labels,
+            enabled_track_width,
+            if on { None } else { Some("") },
+        ) {
+            // Clicking a quality segment while disabled is an explicit request
+            // to enable that quality, so the returned enum index is +1.
+            return Some(target + 1);
+        }
+        return None;
+    }
+
+    quality_meter_track(ui, current, labels, track_width, empty_label)
+}
+
+fn quality_meter_track(
+    ui: &mut egui::Ui,
+    current: Option<usize>,
+    labels: &[&str],
+    track_width: f32,
+    empty_label: Option<&str>,
+) -> Option<usize> {
+    let segments = labels.len();
+    if segments == 0 {
+        return None;
+    }
+    let current = current.map(|value| value.min(segments - 1));
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(track_width, 18.0), egui::Sense::click_and_drag());
     let gap = 2.0;
@@ -370,21 +465,20 @@ pub(super) fn quality_meter(
         .filter(|pos| rect.contains(*pos))
         .map(|pos| index_at(pos.x));
 
-    let first_lit = usize::from(zero_stop);
     let painter = ui.painter().clone();
     for segment in 0..segments {
         let x = rect.left() + segment as f32 * (seg_w + gap);
         let seg_rect =
             egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, rect.height()));
-        let lit = segment >= first_lit && segment <= current;
+        let lit = current.is_some_and(|selected| segment <= selected);
         let fill = if lit {
             // Ramp the filled run from deep to bright so "more" reads as
             // "heavier" rather than as a flat block of one color.
-            let span = current.saturating_sub(first_lit);
-            let t = if span == 0 {
+            let selected = current.expect("lit segments require an active selection");
+            let t = if selected == 0 {
                 1.0
             } else {
-                (segment - first_lit) as f32 / span as f32
+                segment as f32 / selected as f32
             };
             ACCENT_DEEP.lerp_to_gamma(ACCENT, t)
         } else if hovered == Some(segment) {
@@ -394,11 +488,10 @@ pub(super) fn quality_meter(
         };
         painter.rect_filled(seg_rect, egui::CornerRadius::ZERO, fill);
     }
-    // Mark the selected step with a full-height tick so the exact level is
-    // unambiguous when several segments share the same ramp color. At the zero
-    // stop there is deliberately nothing to mark: an empty bar is the reading.
-    if !(zero_stop && current == 0) {
-        let tick_x = rect.left() + current as f32 * (seg_w + gap) + seg_w - 2.0;
+
+    // Mark the exact selected level. An empty/disabled meter has no marker.
+    if let Some(selected) = current {
+        let tick_x = rect.left() + selected as f32 * (seg_w + gap) + seg_w - 2.0;
         painter.rect_filled(
             egui::Rect::from_min_size(
                 egui::pos2(tick_x, rect.top() - 2.0),
@@ -410,13 +503,16 @@ pub(super) fn quality_meter(
     }
 
     ui.add_space(10.0);
-    glow_label(ui, labels[current], 12.5, TEXT);
+    match current {
+        Some(selected) => glow_label(ui, labels[selected], 12.5, TEXT),
+        None => glow_label(ui, empty_label.unwrap_or("Custom"), 12.5, TEXT_FAINT),
+    };
 
     let interacted = response.clicked() || response.dragged();
     let target = interacted
         .then(|| response.interact_pointer_pos().map(|pos| index_at(pos.x)))
         .flatten();
-    target.filter(|value| *value != current)
+    target.filter(|value| current != Some(*value))
 }
 
 /// Which stored setting a row's label restores when it is clicked.

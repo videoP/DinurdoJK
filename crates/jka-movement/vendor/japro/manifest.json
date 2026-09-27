@@ -1,0 +1,306 @@
+{
+  "repository": "https://github.com/taysta/TaystJK",
+  "revision": "b35ed06fec41c53644352743c6b199a5d5d500f3",
+  "files": [
+    {
+      "path": "LICENSE.txt",
+      "sha256": "db296f2f7f35bca3a174efb0eb392b3b17bd94b341851429a3dff411b1c2fc73"
+    },
+    {
+      "path": "codemp/cgame/animtable.h",
+      "sha256": "91c56641826acc23e05abeceb233643bf310a1135a824363480ca547ed58dd78"
+    },
+    {
+      "path": "codemp/cgame/cg_local.h",
+      "sha256": "9dea3e83a77084802722bd9f7bbf858af925248490f9d27790247a3305784b3a"
+    },
+    {
+      "path": "codemp/cgame/cg_public.h",
+      "sha256": "30f56be5187cd913bad47c64a4a10ce41e96afe33a6e068f4e392aa29e169a01"
+    },
+    {
+      "path": "codemp/cgame/cg_xcvar.h",
+      "sha256": "698dbdbc0905093364c9ee7be09f2225bd282662eef021a7870fb3b75076c7b5"
+    },
+    {
+      "path": "codemp/game/ai.h",
+      "sha256": "335eecb81c83f77a8fc39a1dd39fe5a2d2e997c76d9ec5342ca38361a40c7df7"
+    },
+    {
+      "path": "codemp/game/anims.h",
+      "sha256": "3b522a980a74b922e8bc76776bcbe9ecfe87f9f111cecb70dd897303cc8b203c"
+    },
+    {
+      "path": "codemp/game/b_public.h",
+      "sha256": "c2c0dfee9c82d5f0eab3ab9d7a78b580f3bf07cd1389cfd72f63df0c4c1a9f0e"
+    },
+    {
+      "path": "codemp/game/bg_local.h",
+      "sha256": "1b9f00334eff2f5efa64a84b0024f2649d23c874d05218dd965e5ed4e62c294f"
+    },
+    {
+      "path": "codemp/game/bg_misc.c",
+      "sha256": "ddb6374a53f7afdd9da45bfd539b4fb3495beb4ee72305f9c32a790653b94d86"
+    },
+    {
+      "path": "codemp/game/bg_panimate.c",
+      "sha256": "812cbed91a190f2f4533c4c5337830d10fbe7519ec99b5e75dcb3f5949c9a3ae"
+    },
+    {
+      "path": "codemp/game/bg_pmove.c",
+      "sha256": "cc301df2c6c82d1d0b16337bf28462a9fb42736bc99714494b2ea2f183a087c5"
+    },
+    {
+      "path": "codemp/game/bg_public.h",
+      "sha256": "eeb443669f96d3de6b03e40731daf135d276528c9c23d1cb7d9480373d0308c8"
+    },
+    {
+      "path": "codemp/game/bg_saber.c",
+      "sha256": "0eb402402c88dc4a613533be67e33b9dbfb83e2963d910c7490b6921ab9f98d1"
+    },
+    {
+      "path": "codemp/game/bg_slidemove.c",
+      "sha256": "a9ab1543f6df027ea986a288d84063244883aff3e7c8c08ab24fba9c13e4af55"
+    },
+    {
+      "path": "codemp/game/bg_vehicles.h",
+      "sha256": "6828bda5bfa26dfddb987231de83b2194c31dfbe87cdd71a266aac1c0d8a18f7"
+    },
+    {
+      "path": "codemp/game/bg_weapons.c",
+      "sha256": "b3ef50a3f73595b404044254bc556c5397da9a66685261b96c19be1d13282ee8"
+    },
+    {
+      "path": "codemp/game/bg_weapons.h",
+      "sha256": "1b3dcecae0e76ad5aa63b27f9847050550295415a1dbc7df1f6229f84744834b"
+    },
+    {
+      "path": "codemp/game/g_local.h",
+      "sha256": "6a70c44699871df1cce3169e5ce53dd86ea323bfb1a242ab33753013a72e8c1d"
+    },
+    {
+      "path": "codemp/game/g_public.h",
+      "sha256": "c23a359066b843e47a49090a09eacbf56386cda653200ae0cf3d8e9598562ea8"
+    },
+    {
+      "path": "codemp/game/g_team.h",
+      "sha256": "9b18b74f0927bc30402fee0af2490edc2be877122ba4af5b8c717f8b03533559"
+    },
+    {
+      "path": "codemp/game/g_unlagged.h",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "path": "codemp/game/g_xcvar.h",
+      "sha256": "6cbdd85d1c13f1bf84ecb500de59346a3370dc6340e56fbe976fdc6fcd99886f"
+    },
+    {
+      "path": "codemp/game/surfaceflags.h",
+      "sha256": "ef4f47d249e4be2101193a942111bf424c9aaa0ac58c3e8573c25b57e9a194a9"
+    },
+    {
+      "path": "codemp/game/teams.h",
+      "sha256": "d3b9d742c375542553cf49dd10a6d60bca785fc3b811b895d29e8c94479499f5"
+    },
+    {
+      "path": "codemp/game/w_saber.h",
+      "sha256": "76f8357af0d8bce9afd9982a35f2d3f58e7d87a1ebb3090321f8cc2f52879da3"
+    },
+    {
+      "path": "codemp/ghoul2/G2.h",
+      "sha256": "43781288167db83c89b026efe47eb7925387c89ae347cfaec918c487bcf5d782"
+    },
+    {
+      "path": "codemp/icarus/blockstream.h",
+      "sha256": "79400be8f6b968b1a8c9b6ddff94a366dda737109e5e1b254b41830601b4bc23"
+    },
+    {
+      "path": "codemp/icarus/icarus.h",
+      "sha256": "b95e052719da6613b5e7dc019c8cabce85f3016f6806c1d46182d132727e1d30"
+    },
+    {
+      "path": "codemp/icarus/instance.h",
+      "sha256": "dd4a7aa08d04a64d4135c8a8e7864247f74067306f26811f789e08a1abbc5214"
+    },
+    {
+      "path": "codemp/icarus/interface.h",
+      "sha256": "287610013c7d24e765db05c70db5ddfc3696911778eb63ec92af111fe6a9ec47"
+    },
+    {
+      "path": "codemp/icarus/interpreter.h",
+      "sha256": "3195a489d755d52a2be95fa817a83a4c17f7090ea934372b397081b60e67f579"
+    },
+    {
+      "path": "codemp/icarus/sequence.h",
+      "sha256": "14a9e3c7fd97b0167a2be7684236e9b495b371494f97ef8062369024d9d9d4d9"
+    },
+    {
+      "path": "codemp/icarus/sequencer.h",
+      "sha256": "fd4cf37590ef954c5b6a310809a245331b9c90f89d8f0b7aacf2dd519313c20a"
+    },
+    {
+      "path": "codemp/icarus/taskmanager.h",
+      "sha256": "c026cb3a6c3d1cecf9a8b03b9a1983e7c56f55c0b7aade6b167f3828f3401c41"
+    },
+    {
+      "path": "codemp/icarus/tokenizer.h",
+      "sha256": "40fd23a75eb036035b0609ae79f1a841ecbe0b22e3dd59b201d97f80d7f6f894"
+    },
+    {
+      "path": "codemp/qcommon/disablewarnings.h",
+      "sha256": "af37bc176dad5f6a2308de4388d14cce5b33c641efa8701735204dd4f147a19e"
+    },
+    {
+      "path": "codemp/qcommon/q_shared.c",
+      "sha256": "b819b419f47a072659983af1b640944a757157c435f27d00393ff2c9f2c61eea"
+    },
+    {
+      "path": "codemp/qcommon/q_shared.h",
+      "sha256": "b8d4d55aada0f6b6f7fc826d62000e17117ee524e43584f68e90cfd97b85e481"
+    },
+    {
+      "path": "codemp/qcommon/qcommon.h",
+      "sha256": "57852eff174dde95134d59d4fad59b5d52a969b39c986afe15e4cee67d213de4"
+    },
+    {
+      "path": "codemp/qcommon/qfiles.h",
+      "sha256": "119346259ac7d88ed1be6e5d2aa7ee77bb705e1b4a7041f9cd118d512e0696e1"
+    },
+    {
+      "path": "codemp/qcommon/tags.h",
+      "sha256": "3ffc97deda9f5ec88cbe93e5b75886ec24efd801753cd07f55e0b2e46856a8c2"
+    },
+    {
+      "path": "codemp/rd-common/mdx_format.h",
+      "sha256": "87dd2c63d859916661f1fd7e5751c6936ca2e3496c072a78389a5a6eace62558"
+    },
+    {
+      "path": "codemp/rd-common/tr_types.h",
+      "sha256": "ac88b05922ea548cc09ff123652581a2eea07dcc25ba21c534e881fafb708396"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_platform.h",
+      "sha256": "a2cd9085c66776845d2524c3b0e73ccf4827ba046aa6f676c4b8ddbed47d6552"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_av1std.h",
+      "sha256": "c75c1d324b97d247aef0008024bc7f3adb98c741ab7f66c882ec38fdacc7ee33"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_av1std_decode.h",
+      "sha256": "7e3a1ce177c12546d410f3179ce1b81f2da7a8eba4f525b29cd563ab4099c0e5"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_av1std_encode.h",
+      "sha256": "8d166b4543260a38347860443b1a59c7a5e86cdb0d0facaf4c704f667de030e3"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h264std.h",
+      "sha256": "2ed07b8b4272c68891b137b326613e02e53a9e23868747b22dfd9a9ce53957bc"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h264std_decode.h",
+      "sha256": "37b970c3d80536ad1ac074cfe19b58ee03c3075378e02179e1dc5e4351266821"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h264std_encode.h",
+      "sha256": "227e092b53c4e7ca1a948ed021704511c1ed16040cd6188ff6703e5ae66db64d"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h265std.h",
+      "sha256": "0b81f8986ada015ef2e127449eff9d9634899bb59a0a9277a4054e9ec4416c12"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h265std_decode.h",
+      "sha256": "879a0dd370a1b1ad184638906c52bdfe7d80d639fbc5a5baa8b02d7c5b60b147"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_h265std_encode.h",
+      "sha256": "abb3e72af22e4e0a3dbe5dff7be1b275949388809fb3987830341e8f495ea1c7"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_vp9std.h",
+      "sha256": "0a47125865376a3fe7014b69ff6db9d04e30ebf8c4d15664f1d894649ad5c09d"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codec_vp9std_decode.h",
+      "sha256": "1ceb1a8d0e3370e508cf688a6e57dc314cd82186b60f3cef420ea4b1b483865d"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vk_video/vulkan_video_codecs_common.h",
+      "sha256": "d2e7caa396c521d03d491a269572b1d31b925b5127d22fda14199951ebae89f8"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vulkan.h",
+      "sha256": "096f50152d0b298d8df84a561a37d8190c8a60af34dff0e2cc8328b24491a640"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vulkan_core.h",
+      "sha256": "682de8fb5d47f9839d62732975e8c7d54f8d2e8c178d79977d698e34ebc64da9"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vulkan_win32.h",
+      "sha256": "72f0b6de71287d3b04d12235e4f2fef8f343126f85be4963c516d31d5bb4c099"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vulkan_xlib.h",
+      "sha256": "3c44e97d3f380eb912e01a79e9667457fdf5e18164f0b09b3c61431f421bc551"
+    },
+    {
+      "path": "codemp/rd-vulkan/vulkan/vulkan_xlib_xrandr.h",
+      "sha256": "188233d112d812cca1777cfa6c1585073f1f2b033fa08b2f11c8d0757fcc232e"
+    },
+    {
+      "path": "codemp/ui/keycodes.h",
+      "sha256": "0d836b446ea1f2d7a1eed09e50904b9a83e27add2d8816fe2e210055bbb0867f"
+    },
+    {
+      "path": "codemp/ui/menudef.h",
+      "sha256": "be5cca7622284ef56eb108c0fa46935f12c4f643f0f134c2694e70cc38d977b2"
+    },
+    {
+      "path": "codemp/ui/ui_local.h",
+      "sha256": "83c0eadc272715f6ec3ba0c51c08324c32bfe35c4b34cced753a98a0662d1866"
+    },
+    {
+      "path": "codemp/ui/ui_public.h",
+      "sha256": "4b1ed259c5dd83016340fa6e78894277a446039c5490302fe70d472e3f6c6a86"
+    },
+    {
+      "path": "codemp/ui/ui_shared.h",
+      "sha256": "b1b976d62d3d79409a39b5064b5f1983d82412088288cf7d65d808174aa1f8b4"
+    },
+    {
+      "path": "codemp/ui/ui_xcvar.h",
+      "sha256": "6259ff4bd6964594b06d96338412f6b499e496f92611d270143d01c5350cfbda"
+    },
+    {
+      "path": "shared/qcommon/q_color.h",
+      "sha256": "fc1126912aabfdbc4af8819f0e893465c8316fe59ea33d2da76f7b32dc185eb7"
+    },
+    {
+      "path": "shared/qcommon/q_math.c",
+      "sha256": "3897fb92b9dc96da861b8a24c4717f43f2a81e8e71dd6128e2f5e205a60f74b0"
+    },
+    {
+      "path": "shared/qcommon/q_math.h",
+      "sha256": "8fbd11a3079070626e06c217ec1164e91a984aa33ddafa13796e71c7e1d0baa0"
+    },
+    {
+      "path": "shared/qcommon/q_platform.h",
+      "sha256": "6eca14c04c97c8c5104684a552eb0f5958a2dabcae30c9f1924a0d9b17e87d39"
+    },
+    {
+      "path": "shared/qcommon/q_string.c",
+      "sha256": "1a013dc474c1f2bd5b1eda387e4993650b71ce8952a387d88ddfefe9075bc193"
+    },
+    {
+      "path": "shared/qcommon/q_string.h",
+      "sha256": "b6ae4dee643d94014d6c81c8aeb4d2676390283527e2023e98dd2bdb3b6c52de"
+    },
+    {
+      "path": "shared/sys/sys_public.h",
+      "sha256": "7e3b603501e2f9b07545b32b5ea72ed18712491d06ad8b1f246cf6d29597ca1c"
+    }
+  ]
+}

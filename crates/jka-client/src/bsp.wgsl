@@ -2924,3 +2924,11 @@ fn sky_uv(s: f32, t: f32) -> vec2<f32> {
     let m = a.z;
     return textureSample(sky_dn, sky_sampler, sky_uv(-d.y / m, d.x / m));
 }
+
+
+// Diagnostic-only line overlay. The pipeline reuses vs_main so procedural
+// vertex motion (Snowflow/ocean) stays identical to the filled geometry.
+@fragment
+fn fs_wireframe() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}

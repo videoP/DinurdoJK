@@ -521,6 +521,28 @@ pub struct PredictSettings {
     pub no_spec_move: i32,
     pub tracemask: i32,
     pub no_footsteps: i32,
+    /// Native backend: 0 = stock OpenJK, 1 = JAPRO. Physics stays in C.
+    pub server_mod: i32,
+    pub jcinfo: i32,
+    pub jcinfo2: i32,
+    pub taystjk_info: i32,
+    pub dmflags: i32,
+    pub hook_pull: i32,
+    pub restricts: i32,
+    pub plugin_disable: i32,
+    pub legacy_fixes: u32,
+}
+
+impl Default for PredictSettings {
+    fn default() -> Self {
+        Self {
+            pmove_fixed: 0, pmove_msec: 8, pmove_float: 0, gametype: 0,
+            debug_melee: 0, step_slide_fix: 1, no_spec_move: 0,
+            tracemask: 0x1111, no_footsteps: 0, server_mod: 0,
+            jcinfo: 0, jcinfo2: 0, taystjk_info: 0, dmflags: 0,
+            hook_pull: 0, restricts: 0, plugin_disable: 1536, legacy_fixes: 0,
+        }
+    }
 }
 
 /// A playerState_t in wire form: the stock playerStateFields slots in schema
@@ -550,9 +572,49 @@ pub fn weapon_info(weapon: i32) -> Option<(i32, i32, i32)> {
 pub struct PlayerState {
     raw: NonNull<c_void>,
 }
+
+/// Snapshot entity inputs used by native mod collision and movement helpers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredictionEntity {
+    pub number: i32,
+    pub entity_type: i32,
+    pub model_index: i32,
+    pub bolt1: i32,
+    pub trajectory_type: i32,
+    pub origin: [f32; 3],
+    pub velocity: [f32; 3],
+    pub angular_velocity: [f32; 3],
+    pub legs_anim: i32,
+    pub torso_anim: i32,
+    pub saber_move: i32,
+}
 // Ownership is exclusive; native globals are always protected by NativeGuard.
 unsafe impl Send for PlayerState {}
 impl PlayerState {
+    pub fn set_prediction_entities(&mut self, entities: &[PredictionEntity]) -> Result<(), String> {
+        if entities.len() > 1024 || entities.iter().any(|e| !e.origin.iter().chain(&e.velocity).chain(&e.angular_velocity).all(|v| v.is_finite())) {
+            return Err("Invalid prediction entities".into());
+        }
+        let _guard = ffi::NativeGuard::new();
+        if unsafe { ffi::jka_player_set_entities(self.raw.as_ptr(), entities.as_ptr(), entities.len() as i32) } == 0 {
+            return Err("Native prediction entities rejected".into());
+        }
+        Ok(())
+    }
+
+    pub fn clips_prediction_entity(&self, entity: &PredictionEntity) -> bool {
+        let _guard = ffi::NativeGuard::new();
+        unsafe { ffi::jka_player_clip_entity(self.raw.as_ptr(), entity) != 0 }
+    }
+    /// Install connection settings before loading a snapshot or updating angles.
+    pub fn configure(&mut self, settings: &PredictSettings) -> Result<(), String> {
+        let _guard = ffi::NativeGuard::new();
+        if unsafe { ffi::jka_player_configure(self.raw.as_ptr(), settings) } == 0 {
+            return Err("Native movement configuration rejected".into());
+        }
+        Ok(())
+    }
     /// A native playerState_t loaded from a snapshot (`cg.predictedPlayerState = cg.snap->ps`).
     pub fn from_network(state: &NetworkPlayerState) -> Result<Self, String> {
         let mut player = Self::spawn([0.0; 3], 0.0, JoinMode::Spectator)?;
@@ -607,6 +669,7 @@ impl PlayerState {
         state
     }
     pub fn set_force_jump_level(&mut self, level: u8) -> Result<(), String> {
+        let _guard = ffi::NativeGuard::new();
         if level > 3 {
             return Err("Force jump level must be 0..3".into());
         }
@@ -614,6 +677,7 @@ impl PlayerState {
         Ok(())
     }
     pub fn apply_knockback(&mut self, velocity: [f32; 3], duration_ms: i32) -> Result<(), String> {
+        let _guard = ffi::NativeGuard::new();
         if !velocity.iter().all(|v| v.is_finite()) || !(0..=200).contains(&duration_ms) {
             return Err("Invalid knockback".into());
         }

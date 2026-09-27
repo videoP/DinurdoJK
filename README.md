@@ -1,6 +1,6 @@
 # DinurdoJK
 
-DinurdoJK is a Rust Jedi Academy (JKA) client targeting protocol 26. It aims to support demo playback and normal multiplayer while preserving OpenJK gameplay and presentation behavior. Rendering, assets, protocol handling, and client systems are implemented in Rust; pinned OpenJK movement and collision code is retained behind a Rust interface. See [THIRD_PARTY.md](THIRD_PARTY.md) for source and license details.
+DinurdoJK is a Rust Jedi Academy (JKA) client targeting protocol 26. It aims to support demo playback and normal multiplayer while preserving OpenJK gameplay and presentation behavior. Rendering, assets, protocol handling, and client systems are implemented in Rust; pinned OpenJK and TaystJK/JAPRO movement code remains native C, alongside OpenJK collision. See [THIRD_PARTY.md](THIRD_PARTY.md) for source and license details.
 
 ## AI use
 
@@ -9,6 +9,7 @@ AI tools were used extensively to create and modify this codebase. AI-generated 
 ## Current status
 
 - Connects to live protocol-26 servers, processes gamestates and snapshots, sends client commands, and predicts player movement.
+- Detects JAPRO servers and selects native JAPRO movement prediction. The Mod menu exposes movement preferences; see [mod support scope and review items](crates/jka-movement/MOD_SUPPORT.md).
 - Plays demos through the same CGame presentation path used for live sessions.
 - Loads user-provided Jedi Academy PK3 assets and BSP maps. No game assets are included.
 - Includes a native winit/wgpu renderer, Ghoul2 character rendering, world entities, effects, sabers, and a diagnostic tool (`jka-probe`). Compatibility and visual gaps remain.

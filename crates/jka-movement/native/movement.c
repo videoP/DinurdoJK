@@ -1,4 +1,5 @@
-/* The host owns state and services; all movement runs in unmodified stock bg_*.c. */
+/* The host owns state and services. Build this once for stock OpenJK and once
+ * for the pinned TaystJK/JAPRO sources, with isolated native symbols. */
 #include "qcommon/q_shared.h"
 #include "cgame/cg_local.h"
 #include "game/bg_local.h"
@@ -11,6 +12,38 @@ vmCvar_t bg_fighterAltControl;
 vehWeaponInfo_t g_vehWeaponInfo[MAX_VEH_WEAPONS];
 static cgameImport_t imports;
 cgameImport_t *trap = &imports;
+#ifdef JKA_JAPRO
+cg_t cg;
+vmCvar_t cp_pluginDisable, cg_jumpHeight, cg_legstuck, pmove_fixed;
+int cg_dueltypes[MAX_CLIENTS];
+static snapshot_t prediction_snapshot;
+static playerState_t remote_players[MAX_GENTITIES];
+static char legacy_fixes_string[32] = "0";
+static uint32_t previous_legacy_fixes;
+static int legacy_fixes_initialized;
+static uint64_t next_entities_revision = 1;
+void japro_configure(const jka_predict_settings *settings) {
+    cgs.serverMod = SVMOD_JAPRO;
+    cgs.gametype = settings->gametype;
+    cgs.jcinfo = cgs.cinfo = settings->jcinfo;
+    cgs.jcinfo2 = settings->jcinfo2;
+    cgs.taystJKinfo = settings->taystjk_info;
+    cgs.dmflags = settings->dmflags;
+    cgs.hookpull = settings->hook_pull;
+    cgs.restricts = settings->restricts;
+    cgs.legacyProtocol = qfalse;
+    cp_pluginDisable.integer = settings->plugin_disable;
+    pmove_fixed.integer = settings->pmove_fixed;
+    cg.snap = &prediction_snapshot;
+    if (!legacy_fixes_initialized || previous_legacy_fixes != settings->legacy_fixes) {
+        snprintf(legacy_fixes_string, sizeof(legacy_fixes_string), "%u", settings->legacy_fixes);
+        BG_FixSaberMoveData();
+        BG_FixWeaponAttackAnim();
+        previous_legacy_fixes = settings->legacy_fixes;
+        legacy_fixes_initialized = 1;
+    }
+}
+#endif
 static jmp_buf error_target;
 static char last_error[1024];
 static const unsigned char *animation_file;
@@ -23,7 +56,7 @@ int jka_contract(int index) {
         BUTTON_ATTACK, BUTTON_WALKING, BUTTON_ALT_ATTACK, ENTITYNUM_WORLD, ENTITYNUM_NONE, PMF_DUCKED, PMF_ROLLING, PMF_STUCK_TO_WALL,
         FP_SPEED, FP_RAGE, sizeof(jka_entity_view), sizeof(jka_player_angle_entity),
         sizeof(jka_player_angle_state), sizeof(jka_bone_angle_command), sizeof(jka_player_angle_result),
-        sizeof(jka_saber_movement_info) };
+        sizeof(jka_saber_movement_info), sizeof(jka_predict_settings), sizeof(jka_prediction_entity) };
     return index >= 0 && index < sizeof(values)/sizeof(values[0]) ? values[index] : -1;
 }
 
@@ -38,7 +71,12 @@ static void host_print(const char *format, ...) { (void)format; }
 NORETURN_PTR void (*Com_Error)(int, const char *, ...) = host_error;
 void (*Com_Printf)(const char *, ...) = host_print;
 
-const char *CG_ConfigString(int index) { (void)index; return "0"; }
+const char *CG_ConfigString(int index) {
+#ifdef JKA_JAPRO
+    if (index == CS_LEGACY_FIXES) return legacy_fixes_string;
+#endif
+    return "0";
+}
 void CG_GetVehicleCamPos(vec3_t position) { host_error(ERR_DROP, "Vehicle camera is outside the offline player host"); }
 qboolean BG_FighterUpdate(Vehicle_t *vehicle, const usercmd_t *cmd, vec3_t mins, vec3_t maxs,
                          float gravity, void (*trace)(trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int)) {
@@ -101,7 +139,81 @@ typedef struct jka_player_s {
      * cannot contaminate each other through the _CGAME OpenJK host. */
     saberInfo_t saber[2];
     qboolean saber_present[2];
+#ifdef JKA_JAPRO
+    jka_prediction_entity entities[MAX_GENTITIES];
+    int entity_count;
+    uint64_t entities_revision;
+#endif
 } jka_player;
+
+#ifdef JKA_JAPRO
+int japro_set_entities(void *player, const jka_prediction_entity *entities, int count) {
+    jka_player *p = player;
+    int i;
+    if (count < 0 || count > MAX_GENTITIES) return 0;
+    for (i = 0; i < count; ++i)
+        if (entities[i].number < 0 || entities[i].number >= MAX_GENTITIES) return 0;
+    memcpy(p->entities, entities, count * sizeof(*entities));
+    p->entity_count = count;
+    p->entities_revision = next_entities_revision++;
+    return 1;
+}
+
+/* CG_ClipMoveToEntities' JAPRO prediction rules. PointContents deliberately
+ * retains all inline models, as in the reference. */
+int japro_clip_entity(const void *player, const jka_prediction_entity *ent) {
+    const playerState_t *ps = &((const jka_player *)player)->ps;
+    if (ent->entity_type == ET_SPECIAL && ent->model_index == HI_SHIELD) return 0;
+    if (ps->duelInProgress) {
+        if (ent->number != ps->duelIndex && ent->entity_type != ET_MOVER) return 0;
+    } else {
+        if (ent->bolt1 && ent->entity_type == ET_PLAYER) return 0;
+        if (ps->stats[STAT_RACEMODE]) {
+            if (ent->entity_type != ET_MOVER) return 0;
+            if (ent->trajectory_type != TR_SINE &&
+                (VectorLengthSquared(ent->velocity) || VectorLengthSquared(ent->angular_velocity))) return 0;
+        }
+    }
+    return 1;
+}
+
+static void install_prediction_entities(const jka_player *p) {
+    static const jka_player *installed_player;
+    static uint64_t installed_revision;
+    static int installed_numbers[MAX_GENTITIES + 1];
+    static int installed_count;
+    int i;
+    if (installed_player == p && installed_revision == p->entities_revision) return;
+    /* Reference CG_PredictPlayerState installs remote state once per replay,
+     * not once per command. Clear only entries touched by the previous host. */
+    for (i = 0; i < installed_count; ++i)
+        memset(&cg_entities[installed_numbers[i]], 0, sizeof(cg_entities[0]));
+    installed_count = 0;
+    memset(cg_dueltypes, 0, sizeof(cg_dueltypes));
+    for (i = 0; i < p->entity_count; ++i) {
+        const jka_prediction_entity *ent = &p->entities[i];
+        playerState_t *ps = &remote_players[ent->number];
+        centity_t *cent = &cg_entities[ent->number];
+        installed_numbers[installed_count++] = ent->number;
+        memset(ps, 0, sizeof(*ps));
+        cent->currentState.number = ent->number;
+        cent->currentState.eType = ent->entity_type;
+        cent->currentState.bolt1 = ent->bolt1;
+        if (ent->entity_type != ET_PLAYER && ent->entity_type != ET_NPC) continue;
+        VectorCopy(ent->origin, ps->origin);
+        VectorCopy(ent->velocity, ps->velocity);
+        ps->clientNum = ent->number;
+        ps->legsAnim = ent->legs_anim;
+        ps->torsoAnim = ent->torso_anim;
+        ps->saberMove = ent->saber_move;
+        cent->playerState = ps;
+    }
+    if (p->ps.clientNum >= 0 && p->ps.clientNum < MAX_CLIENTS)
+        installed_numbers[installed_count++] = p->ps.clientNum;
+    installed_player = p;
+    installed_revision = p->entities_revision;
+}
+#endif
 extern stringID_table_t animTable[MAX_ANIMATIONS+1];
 const char *jka_animation_name(int index) { return GetStringForID(animTable, index); }
 void jka_player_jump_level(void *player, int level) {
@@ -240,6 +352,9 @@ void jka_player_offline_force_tick(void *player, int time, int requested_power) 
 void *jka_player_new(const float *origin, float yaw, int spectator) {
     jka_player *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
+#ifdef JKA_JAPRO
+    p->entities_revision = next_entities_revision++;
+#endif
     playerState_t *ps = &p->ps;
     VectorCopy(origin, ps->origin);
     ps->viewangles[YAW] = yaw;
@@ -274,6 +389,9 @@ void jka_player_free(void *player) { free(player); }
 void *jka_player_clone(const void *player) {
     jka_player *p = malloc(sizeof(*p));
     if (p) memcpy(p, player, sizeof(*p));
+#ifdef JKA_JAPRO
+    if (p) p->entities_revision = next_entities_revision++;
+#endif
     return p;
 }
 static void host_trace(trace_t *result, const vec3_t start, const vec3_t mins, const vec3_t maxs,
@@ -601,6 +719,9 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
     memcpy(p->ps.persistant, persistant, sizeof(int32_t) * MAX_PERSISTANT);
     memcpy(p->ps.ammo, ammo, sizeof(int32_t) * 16);
     memcpy(p->ps.powerups, powerups, sizeof(int32_t) * MAX_POWERUPS);
+#ifdef JKA_JAPRO
+    p->entities_revision = next_entities_revision++;
+#endif
     return 1;
 }
 
@@ -637,6 +758,10 @@ void jka_player_update_view_angles(void *player, const jka_cmd *input) {
     jka_player *p = player;
     usercmd_t cmd;
     fill_cmd(&cmd, input);
+#ifdef JKA_JAPRO
+    p->move.ps = &p->ps;
+    pm = &p->move;
+#endif
     PM_UpdateViewAngles(&p->ps, &cmd);
 }
 
@@ -649,10 +774,27 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     if (setjmp(error_target)) return 0;
     trace_callback = trace; contents_callback = contents; callback_context = context;
     client = p->ps.clientNum;
+#ifdef JKA_JAPRO
+    if (p->ps.m_iVehicleNum) host_error(ERR_DROP, "Vehicle prediction requires a vehicle entity host");
+    install_prediction_entities(p);
+    cg.clientNum = client;
+    prediction_snapshot.ps = p->ps;
+    cg.predictedPlayerState = p->ps;
+#endif
     if (client < 0 || client >= MAX_CLIENTS) host_error(ERR_DROP, "Predicted clientNum %d out of range", client);
     memset(&cg_entities[client], 0, sizeof(cg_entities[client]));
+#ifdef JKA_JAPRO
+    cg_entities[client].currentState.number = client;
+    cg_entities[client].currentState.eType = ET_PLAYER;
+#endif
     cg_entities[client].playerState = &p->ps;
     p->move.ps = &p->ps;
+#ifdef JKA_JAPRO
+    /* The reference sometimes writes cg.predictedPlayerState directly. Keep
+     * exactly that alias while Pmove runs, including SP/surf crouch jumps. */
+    cg_entities[client].playerState = &cg.predictedPlayerState;
+    p->move.ps = &cg.predictedPlayerState;
+#endif
     p->move.ghoul2 = NULL;
     VectorClear(p->move.modelScale);
     p->move.nonHumanoid = qfalse;
@@ -672,6 +814,11 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     p->move.noSpecMove = settings->no_spec_move;
     fill_cmd(&p->move.cmd, input);
     Pmove(&p->move);
+#ifdef JKA_JAPRO
+    p->ps = cg.predictedPlayerState;
+    p->move.ps = &p->ps;
+    cg_entities[client].playerState = &p->ps;
+#endif
     return 1;
 }
 

@@ -369,6 +369,20 @@ impl SoundPresenter {
             .or_else(|| without_marker.strip_suffix(".mp3"))
             .unwrap_or(without_marker);
 
+        // TaystJK CG_CustomSound treats the jaPRO VGS table specially: VGS
+        // tokens always resolve from the fixed generic male/female banks rather
+        // than the speaking player's authored model sound directory.
+        if crate::vgs::is_vgs_sound(custom_name) {
+            let generic = if profile.female {
+                "mp_generic_female"
+            } else {
+                "mp_generic_male"
+            };
+            let qpath = format!("sound/chars/{generic}/misc/{stem}");
+            let sound = self.assets.register(&qpath)?;
+            return Ok((qpath, sound));
+        }
+
         let mut candidates = Vec::with_capacity(3);
         if !profile.sound_dir.is_empty() {
             candidates.push(format!("sound/chars/{}/misc/{stem}", profile.sound_dir));

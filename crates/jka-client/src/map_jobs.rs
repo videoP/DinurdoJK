@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-const TASK_COUNT: usize = 16;
+const TASK_COUNT: usize = 17;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MapJobProgress {
@@ -54,6 +54,28 @@ impl ProgressState {
         request_id
     }
 
+    fn begin_explicit(&self, task: Task, total: u32) -> u64 {
+        let request_id = self.request_id.load(Ordering::Acquire);
+        let index = task as usize;
+        let total = total.max(1);
+        self.completed[index].store(0, Ordering::Relaxed);
+        self.total[index].store(total, Ordering::Relaxed);
+        self.report(request_id, task, 0, total);
+        request_id
+    }
+
+    fn set_explicit(&self, request_id: u64, task: Task, completed: u32, total: u32) {
+        if self.request_id.load(Ordering::Acquire) != request_id {
+            return;
+        }
+        let index = task as usize;
+        let total = total.max(1);
+        let completed = completed.min(total);
+        self.total[index].store(total, Ordering::Relaxed);
+        self.completed[index].store(completed, Ordering::Relaxed);
+        self.report(request_id, task, completed, total);
+    }
+
     fn finished(&self, request_id: u64, task: Task) {
         if self.request_id.load(Ordering::Acquire) != request_id {
             return;
@@ -91,6 +113,21 @@ pub struct MapJobPool {
 
 pub struct JobHandle<T> {
     receiver: mpsc::Receiver<Result<T, String>>,
+}
+
+#[derive(Clone)]
+pub struct MapTaskProgress {
+    request_id: u64,
+    task: Task,
+    total: u32,
+    progress: Arc<ProgressState>,
+}
+
+impl MapTaskProgress {
+    pub fn set_completed(&self, completed: u32) {
+        self.progress
+            .set_explicit(self.request_id, self.task, completed, self.total);
+    }
 }
 
 impl<T> JobHandle<T> {
@@ -170,6 +207,40 @@ impl MapJobPool {
             let result = panic::catch_unwind(AssertUnwindSafe(job))
                 .map_err(|_| format!("map worker panicked while running {}", task.label()));
             progress.finished(request_id, task);
+            let _ = tx.send(result);
+        });
+        self.sender
+            .as_ref()
+            .ok_or("map worker pool is shutting down")?
+            .send(Job { task, run })
+            .map_err(|_| "map worker pool disconnected".to_string())?;
+        Ok(JobHandle { receiver: rx })
+    }
+
+    pub fn submit_progress<T, F>(
+        &self,
+        task: Task,
+        total: u32,
+        job: F,
+    ) -> Result<JobHandle<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(MapTaskProgress) -> T + Send + 'static,
+    {
+        let total = total.max(1);
+        let request_id = self.progress.begin_explicit(task, total);
+        let task_progress = MapTaskProgress {
+            request_id,
+            task,
+            total,
+            progress: Arc::clone(&self.progress),
+        };
+        let (tx, rx) = mpsc::channel();
+        let progress = Arc::clone(&self.progress);
+        let run = Box::new(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(move || job(task_progress)))
+                .map_err(|_| format!("map worker panicked while running {}", task.label()));
+            progress.set_explicit(request_id, task, total, total);
             let _ = tx.send(result);
         });
         self.sender

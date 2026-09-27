@@ -1,0 +1,18 @@
+/* Only the public host entry points are renamed; stock BG stays untouched. */
+#define jka_player_jump_level stock_jka_player_jump_level
+#define jka_player_knockback stock_jka_player_knockback
+#define jka_player_set_noclip stock_jka_player_set_noclip
+#define jka_player_set_saber_movement_info stock_jka_player_set_saber_movement_info
+#define jka_player_offline_force_tick stock_jka_player_offline_force_tick
+#define jka_player_new stock_jka_player_new
+#define jka_player_free stock_jka_player_free
+#define jka_player_clone stock_jka_player_clone
+#define jka_player_step stock_jka_player_step
+#define jka_player_view stock_jka_player_view
+#define jka_player_entity_view stock_jka_player_entity_view
+#define jka_player_set_network stock_jka_player_set_network
+#define jka_player_get_network stock_jka_player_get_network
+#define jka_player_update_view_angles stock_jka_player_update_view_angles
+#define jka_player_predict stock_jka_player_predict
+#define jka_load_animations stock_jka_load_animations
+#define jka_movement_error stock_jka_movement_error

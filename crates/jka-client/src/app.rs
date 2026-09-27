@@ -30,7 +30,7 @@ use crate::{
     player::{LocalPresentationSettings, MouseInputSettings},
     renderer::{
         ClientFramePerf, DynamicModelSurface, EguiRenderData, InputLatencySample, PostEffects,
-        RenderCommand, RenderSnapshot, RenderThread, TransientLight,
+        RenderCommand, RenderSnapshot, RenderThread, TransientLight, ViewLatchMode,
     },
     runtime::{SurfaceInspectorInfo, UserEvent},
     scene::{self, SpawnPoint},
@@ -338,7 +338,7 @@ struct MapLoadingState {
     name: String,
     active_game_dir: Option<String>,
     preparation_finished: bool,
-    bars: [MapLoadingBarState; 8],
+    bars: [MapLoadingBarState; 9],
 }
 
 impl MapLoadingState {
@@ -402,6 +402,13 @@ impl MapLoadingState {
                 MapLoadingBarState {
                     task: Task::MapAcoustics,
                     label: "ACOUSTICS",
+                    completed: 0,
+                    total: 0,
+                    skipped: false,
+                },
+                MapLoadingBarState {
+                    task: Task::MapPortalPlans,
+                    label: "PVS DRAW PLANS",
                     completed: 0,
                     total: 0,
                     skipped: false,
@@ -492,7 +499,10 @@ impl MapLoadingState {
                         || (bar.total == 0
                             && matches!(
                                 bar.task,
-                                Task::MapGrass | Task::MapOcean | Task::MapAcoustics
+                                Task::MapGrass
+                                    | Task::MapOcean
+                                    | Task::MapAcoustics
+                                    | Task::MapPortalPlans
                             )),
                 })
                 .collect(),
@@ -2267,6 +2277,9 @@ pub struct App {
     render: Option<RenderThread>,
     startup_first_frame_seen: bool,
     camera: Camera,
+    /// Render-only mapping from the newest real local viewangles onto the camera.
+    /// Third-person data is produced by the existing OpenJK camera port.
+    render_view_latch: ViewLatchMode,
     local_server: Option<LocalServer>,
     map_collision: Option<CollisionWorld>,
     map_visibility: Option<jka_assets::bsp::Visibility>,
@@ -2328,6 +2341,8 @@ pub struct App {
     console_status: String,
     console_lines: VecDeque<String>,
     console_timestamps: bool,
+    ui_vgs: i32,
+    vgs_menu: crate::vgs::Menu,
     log_rx: Receiver<crate::logging::LogRecord>,
     console_history: Vec<String>,
     console_history_index: Option<usize>,
@@ -2368,6 +2383,11 @@ pub struct App {
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
+    /// Last quality preset explicitly applied, plus the canonical cvar values
+    /// produced by its setters. This makes preset highlighting follow the
+    /// actual applied state instead of brittle literal table values.
+    quality_preset_selected: Option<quality::QualityPreset>,
+    quality_preset_values: Vec<(String, String)>,
     applied_fullscreen: FullscreenMode,
     applied_renderer_backend: RendererBackend,
     applied_resolution: [u32; 2],
@@ -2609,6 +2629,7 @@ impl App {
             render: None,
             startup_first_frame_seen: false,
             camera: Camera::new_with_fov([0.0, 0.0, 0.0], 0.0, presentation.fov),
+            render_view_latch: ViewLatchMode::Disabled,
             local_server: None,
             map_collision: None,
             map_visibility: None,
@@ -2668,6 +2689,8 @@ impl App {
             console_status: if front_end { "MAIN MENU".into() } else { "STARTING".into() },
             console_lines: VecDeque::with_capacity(1024),
             console_timestamps: presentation.console_timestamps,
+            ui_vgs: presentation.ui_vgs,
+            vgs_menu: crate::vgs::Menu::Main,
             log_rx,
             console_history: Vec::with_capacity(128),
             console_history_index: None,
@@ -2701,6 +2724,8 @@ impl App {
             cloud_tuning_open: false,
             cloud_tuning_selected: 0,
             video,
+            quality_preset_selected: None,
+            quality_preset_values: Vec::new(),
             applied_fullscreen: video.fullscreen,
             applied_renderer_backend: video.renderer_backend,
             applied_resolution: video.resolution,
@@ -2728,6 +2753,7 @@ impl App {
                 gen_normal_maps: video.gen_normal_maps,
                 float_lightmap: video.float_lightmap && video.hdr,
                 planar_reflections: video.reflection_quality.planar_slot_budget() > 0,
+                omit_environment_stages: video.reflection_quality.omits_environment_stages(),
                 source_spatial_batches: video.gpu_driven,
                 pbr_materials: video.pbr,
                 allow_asset_overrides: video.allow_asset_overrides,
@@ -3107,6 +3133,19 @@ impl App {
         }
     }
 
+    fn subframe_input_view_rotation(&self) -> Option<[f32; 2]> {
+        if !self.video.input_subframe {
+            return None;
+        }
+        if let Some(angles) = self.live_view_angles() {
+            return Some([angles[1].to_radians(), -angles[0].to_radians()]);
+        }
+        self.local_server.as_ref().map(|server| {
+            let angles = server.subframe_view_angles();
+            [angles[1].to_radians(), -angles[0].to_radians()]
+        })
+    }
+
     fn render_snapshot(&self) -> RenderSnapshot {
         let demo_player_position = self
             .game_session
@@ -3145,12 +3184,19 @@ impl App {
             .as_ref()
             .filter(|playback| playback.current_snapshot.is_some())
             .map(|playback| Arc::clone(&playback.inline_models));
+        let input_view_rotation = self.subframe_input_view_rotation();
         RenderSnapshot {
             camera: if self.front_end && self.frontend_page == FrontendPage::AssetViewer {
                 self.asset_preview_camera()
             } else {
                 self.camera
             },
+            view_latch: if self.front_end || input_view_rotation.is_none() {
+                ViewLatchMode::Disabled
+            } else {
+                self.render_view_latch
+            },
+            input_view_rotation,
             player_position: demo_player_position
                 .or_else(|| self.local_server.as_ref().map(LocalServer::world_position)),
             area_mask: self
@@ -3179,6 +3225,56 @@ impl App {
         if let Some(render) = &self.render {
             render.publish(self.render_snapshot());
         }
+    }
+
+    /// Feed the render-only latest-view mailbox directly from live mouse input.
+    /// The mailbox always contains raw local viewangles; RenderSnapshot::view_latch
+    /// decides whether they map directly to first person or through the cheap
+    /// no-trace portion of the existing OpenJK third-person camera.
+    fn publish_live_subframe_view(&self, input: InputLatencySample) {
+        if !self.video.input_subframe {
+            return;
+        }
+        let Some(view_angles) = self.live_view_angles() else {
+            return;
+        };
+        if let Some(render) = &self.render {
+            render.publish_subframe_view_rotation(
+                view_angles[1].to_radians(),
+                -view_angles[0].to_radians(),
+                input,
+            );
+        }
+    }
+
+    fn publish_local_subframe_view(&self, input: InputLatencySample) -> bool {
+        if !self.video.input_subframe {
+            return false;
+        }
+        let Some(server) = self.local_server.as_ref() else {
+            return false;
+        };
+        let player_view = server.view();
+        let entity_view = server.entity_view();
+        let policy = PlayerViewPolicyState::from_entity_view(entity_view, player_view.legs_timer);
+        if rendering_third_person(self.third_person, self.first_person_lightsaber, policy)
+            && !matches!(self.render_view_latch, ViewLatchMode::ThirdPerson(_))
+        {
+            // Around a wall, during camera damping, or on the first camera frame,
+            // keep the pre-existing local fallback that reruns the authoritative
+            // CGame camera instead of using an untraced third-person orbit.
+            return false;
+        }
+        let view_angles = server.subframe_view_angles();
+        if let Some(render) = &self.render {
+            render.publish_subframe_view_rotation(
+                view_angles[1].to_radians(),
+                -view_angles[0].to_radians(),
+                input,
+            );
+            return true;
+        }
+        false
     }
 
     fn publish_ui(&self) {
@@ -3734,6 +3830,7 @@ impl App {
             movement_keys: self.movement_keys_hud,
             strafe_helper: self.strafe_helper,
             console_timestamps: self.console_timestamps,
+            ui_vgs: self.ui_vgs,
             network: self.network.clone(),
             master_servers: self.server_browser.master_servers.clone(),
         };
@@ -3765,7 +3862,7 @@ impl App {
     ///
     /// Only DX12 with FAST vsync has one: wgpu presents Mailbox without the DXGI
     /// tearing flag, so presents retire at vblank and at most
-    /// [`crate::renderer::MAX_FRAME_LATENCY`] frames can retire per refresh. VSync OFF
+    /// `r_maxFrameLatency` frames can retire per refresh. VSync OFF
     /// (Immediate) sets the tearing flag and is uncapped, ON/Adaptive are
     /// refresh-bound by definition on every backend, and Vulkan's Mailbox lets
     /// the app render ahead freely.
@@ -3776,7 +3873,7 @@ impl App {
             return None;
         }
         let refresh = self.monitor_refresh_hz()?;
-        Some((refresh * f64::from(crate::renderer::MAX_FRAME_LATENCY)) as u32)
+        Some((refresh * f64::from(self.video.max_frame_latency)) as u32)
     }
 
     /// Highest cap that means anything here: the DX12 FAST present ceiling when
@@ -3832,7 +3929,7 @@ impl App {
                 self.console_status = format!(
                     "DX12 + FAST VSYNC TOPS OUT AT {ceiling} FPS ({} FRAMES x {:.0} HZ); \
                      CAP SNAPPED BACK. USE VSYNC OFF FOR UNCAPPED.",
-                    crate::renderer::MAX_FRAME_LATENCY,
+                    self.video.max_frame_latency,
                     self.monitor_refresh_hz().unwrap_or_default()
                 );
                 self.push_console_line(format!("^3{}", self.console_status));
@@ -3844,6 +3941,30 @@ impl App {
         }
         self.sync_render_fps_cap();
         self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    fn set_max_frame_latency(&mut self, latency: u32) {
+        let latency = latency.clamp(1, 3);
+        if self.video.max_frame_latency == latency {
+            return;
+        }
+        self.video.max_frame_latency = latency;
+        self.render_command(RenderCommand::SetMaxFrameLatency(latency));
+        self.mark_config_dirty();
+
+        // DX12 + FAST has a real present-rate ceiling proportional to the
+        // configured frame queue. Update the active cap without rewriting the
+        // user's requested com_maxfps so A/B switching remains reversible.
+        self.sync_render_fps_cap();
+        self.console_status = format!(
+            "MAX FRAME LATENCY: {latency} ({})",
+            match latency {
+                1 => "LOWEST LATENCY",
+                2 => "BALANCED",
+                _ => "MAXIMUM THROUGHPUT",
+            }
+        );
         self.publish_ui();
     }
 
@@ -4785,6 +4906,7 @@ impl App {
             "cg_hudgridsize" => format!("{:.3}", self.hud_layout.grid_size),
             "model" => self.solo_client_info.model_cvar(),
             "con_timestamps" => bool_value(self.console_timestamps),
+            "ui_vgs" => self.ui_vgs.to_string(),
             "sv_master1" => self.server_browser.master_servers[0].clone(),
             "sv_master2" => self.server_browser.master_servers[1].clone(),
             "sv_master3" => self.server_browser.master_servers[2].clone(),
@@ -4823,6 +4945,7 @@ impl App {
             "cg_thirdpersonvertoffset" => format!("{:.3}", self.third_person.vert_offset),
             "pmove_msec" => self.video.physics_msec.to_string(),
             "cl_input_subframe" => bool_value(self.video.input_subframe),
+            "cl_input_latelatch" => bool_value(self.video.input_latelatch),
             "r_physics" => bool_value(self.video.client_physics),
             "r_physicshz" => self.video.client_physics_hz.to_string(),
             "r_physicsmaxsubsteps" => self.video.client_physics_max_substeps.to_string(),
@@ -4846,6 +4969,7 @@ impl App {
             "r_fullscreen" => self.video.fullscreen.config_value().to_string(),
             "r_backend" => self.video.renderer_backend.config_value().to_owned(),
             "r_swapinterval" => self.video.vsync.config_value().to_string(),
+            "r_maxframelatency" => self.video.max_frame_latency.to_string(),
             "r_ext_multisample" => {
                 if self.video.msaa_samples <= 1 {
                     "0".into()
@@ -4911,6 +5035,7 @@ impl App {
                 self.video.cloud_render_resolution.config_value().to_owned()
             }
             "r_cloudtemporal" => bool_value(self.video.cloud_temporal),
+            "r_cloudtemporaldepthfix" => bool_value(self.video.cloud_temporal_depth_fix),
             "r_cloudshapeevolution" => bool_value(self.video.cloud_shape_evolution),
             "r_cloudterraininteraction" => bool_value(self.video.cloud_terrain_interaction),
             "r_cloudemptyskip" => bool_value(self.video.cloud_empty_skip),
@@ -4919,7 +5044,13 @@ impl App {
             "r_footprints" => self.video.footprints.config_value().to_owned(),
             "r_grass" => bool_value(self.video.grass),
             "r_clouds" => bool_value(self.video.clouds),
+            "r_cloudquality" => format!("{:.3}", self.video.cloud_quality),
             "r_ocean" => bool_value(self.video.ocean),
+            "r_oceanmapsize" => self.video.ocean_settings.map_size.to_string(),
+            "r_oceanmeshquality" => self.video.ocean_settings.mesh_quality.to_string(),
+            "r_oceanupdates" => format!("{:.3}", self.video.ocean_settings.updates_per_second),
+            "r_oceanseaspray" => bool_value(self.video.ocean_settings.sea_spray),
+            "r_oceanwindfoam" => bool_value(self.video.ocean_settings.wind_foam_streaks),
             "r_oceanfogcolor" => { let c = self.video.ocean_settings.optics.fog_color; format!("{} {} {}", c[0], c[1], c[2]) },
             "r_oceanfogdistance" => self.video.ocean_settings.optics.fog_distance.to_string(),
             "r_oceantransparency" => self.video.ocean_settings.optics.transparency.to_string(),
@@ -4978,7 +5109,7 @@ impl App {
                 .planar_reflection_debug
                 .label()
                 .to_ascii_lowercase(),
-            "r_showtris" => bool_value(self.video.show_wireframe),
+            "r_showtris" => self.video.wireframe_mask.to_string(),
             "r_skipui" => bool_value(self.video.skip_ui),
             "developer" => bool_value(self.video.developer_tools),
             "r_perftrace" => bool_value(self.video.perf_trace),
@@ -4988,7 +5119,7 @@ impl App {
             "r_lodbias" => self.video.ghoul2_lod_bias.to_string(),
             "r_ghoul2batchdraws" => self.video.ghoul2_batch_draws.config_value().to_owned(),
             "r_novis" => bool_value(self.video.pvs_mode == PvsMode::Off),
-            "r_pvsmode" => self.video.pvs_mode.label().to_ascii_lowercase(),
+            "r_pvsmode" => self.video.pvs_mode.config_value().to_owned(),
             _ => return None,
         })
     }
@@ -5016,6 +5147,11 @@ impl App {
             return;
         }
         self.video.input_subframe = enabled;
+        self.render_command(RenderCommand::SetInputSubframe(enabled));
+        if !enabled && self.video.input_latelatch {
+            self.video.input_latelatch = false;
+            self.render_command(RenderCommand::SetInputLateLatch(false));
+        }
         self.mouse_delta = (0.0, 0.0);
         self.last_mouse_motion_at = None;
         self.pending_mouse_input = None;
@@ -5029,6 +5165,24 @@ impl App {
         }
         self.mark_config_dirty();
         self.publish_snapshot();
+        self.publish_ui();
+    }
+
+    fn set_input_latelatch(&mut self, enabled: bool) {
+        if enabled && !self.video.input_subframe {
+            self.set_input_subframe(true);
+        }
+        if enabled == self.video.input_latelatch {
+            return;
+        }
+        self.video.input_latelatch = enabled;
+        self.render_command(RenderCommand::SetInputLateLatch(enabled));
+        self.mark_config_dirty();
+        // Seed the tiny render-thread view mailbox immediately when enabling.
+        // It is otherwise refreshed naturally by subsequent snapshots/events.
+        if enabled {
+            self.publish_snapshot();
+        }
         self.publish_ui();
     }
 
@@ -5218,6 +5372,19 @@ impl App {
                 self.console_timestamps = boolean()?;
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "ui_vgs" => {
+                self.ui_vgs = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| format!("{name}: expected an integer"))?;
+                self.mark_config_dirty();
+                if self.ui_vgs == 0 && self.overlay == OverlayMode::Vgs {
+                    self.vgs_menu = crate::vgs::Menu::Main;
+                    self.set_overlay(OverlayMode::None);
+                } else {
+                    self.publish_ui();
+                }
             }
             "sv_master1" | "sv_master2" | "sv_master3" | "sv_master4" | "sv_master5" => {
                 let slot = lower
@@ -5641,6 +5808,10 @@ impl App {
                 let enabled = boolean()?;
                 self.set_input_subframe(enabled);
             }
+            "cl_input_latelatch" => {
+                let enabled = boolean()?;
+                self.set_input_latelatch(enabled);
+            }
             "r_physics" | "r_physicsccd" | "r_physicssleeping" | "r_ragdolls"
             | "r_ragdollselfcollision" | "r_physicsprops" | "r_physicsdebris"
             | "r_physicsplayerpush" | "r_physicsweaponimpulses"
@@ -5771,6 +5942,16 @@ impl App {
                 }
                 self.publish_ui();
             }
+            "r_maxframelatency" => {
+                let latency = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name}: expected 1, 2, or 3"))?;
+                if !(1..=3).contains(&latency) {
+                    return Err(format!("{name}: expected 1, 2, or 3"));
+                }
+                self.set_max_frame_latency(latency);
+            }
             "r_ext_multisample" => {
                 let samples = value
                     .trim()
@@ -5885,12 +6066,18 @@ impl App {
                 self.set_gamma(gamma);
             }
             "r_showtris" => {
-                let enabled = boolean()?;
-                if enabled && !self.wireframe_supported {
+                let mask = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name}: expected an integer bitmask (0..{})", ui::wireframe::ALL))?;
+                if mask & !ui::wireframe::ALL != 0 {
+                    return Err(format!("{name}: unsupported wireframe bits; valid range is 0..{}", ui::wireframe::ALL));
+                }
+                if mask != 0 && !self.wireframe_supported {
                     return Err("r_showtris: wireframe overlay is not supported by this GPU".into());
                 }
-                self.video.show_wireframe = enabled;
-                self.render_command(RenderCommand::SetWireframe(enabled));
+                self.video.wireframe_mask = mask;
+                self.render_command(RenderCommand::SetWireframeMask(mask));
                 self.mark_config_dirty();
                 self.publish_ui();
             }
@@ -5924,7 +6111,10 @@ impl App {
                     "minimal" | "1" => PvsMode::Minimal,
                     "full" | "2" => PvsMode::Full,
                     "auto" | "3" => PvsMode::Auto,
-                    _ => return Err(format!("{name}: expected off|minimal|full|auto")),
+                    "auto2" | "4" => PvsMode::Auto2,
+                    "auto3" | "5" => PvsMode::Auto3,
+                    "auto4" | "batched" | "pvsbatched" | "6" => PvsMode::Auto4,
+                    _ => return Err(format!("{name}: expected off|minimal|full|auto|auto2|auto3|auto4")),
                 };
                 self.render_command(RenderCommand::SetPvsMode(self.video.pvs_mode));
                 self.mark_config_dirty();
@@ -5944,6 +6134,9 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "r_cloudquality" => {
+                self.set_cloud_quality(finite_number()?);
             }
             "r_weatherwind" => {
                 let values = value
@@ -5973,6 +6166,37 @@ impl App {
                 }
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "r_oceanmapsize" => {
+                let requested = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name}: expected 128|256|512|1024"))?;
+                if !matches!(requested, 128 | 256 | 512 | 1024) {
+                    return Err(format!("{name}: expected 128|256|512|1024"));
+                }
+                self.video.ocean_settings.map_size = requested;
+                self.commit_ocean_settings();
+            }
+            "r_oceanmeshquality" => {
+                self.video.ocean_settings.mesh_quality = match value.trim().to_ascii_lowercase().as_str() {
+                    "0" | "low" => 0,
+                    "1" | "high" => 1,
+                    _ => return Err(format!("{name}: expected 0|1 or low|high")),
+                };
+                self.commit_ocean_settings();
+            }
+            "r_oceanupdates" => {
+                self.video.ocean_settings.updates_per_second = finite_number()?.clamp(0.0, 60.0);
+                self.commit_ocean_settings();
+            }
+            "r_oceanseaspray" => {
+                self.video.ocean_settings.sea_spray = boolean()?;
+                self.commit_ocean_settings();
+            }
+            "r_oceanwindfoam" => {
+                self.video.ocean_settings.wind_foam_streaks = boolean()?;
+                self.commit_ocean_settings();
             }
             "r_oceanfogcolor" => {
                 let values = value.split_whitespace().map(str::parse::<f32>).collect::<Result<Vec<_>,_>>()
@@ -6144,7 +6368,7 @@ impl App {
             }
             "r_hdr" | "r_tonemap" | "r_autoexposure" | "r_bloom" | "r_halation" | "r_ssao" | "r_staticbspao" | "r_fxaa" | "r_smaa"
             | "r_taa" | "r_contactshadows" | "r_cloudshadows" | "r_cloudtemporal"
-            | "r_cloudshapeevolution" | "r_cloudterraininteraction" | "r_cloudemptyskip" | "r_rain"
+            | "r_cloudtemporaldepthfix" | "r_cloudshapeevolution" | "r_cloudterraininteraction" | "r_cloudemptyskip" | "r_rain"
             | "r_sunoverride" | "r_reflectiondebug" | "r_vignette" => {
                 let enabled = boolean()?;
                 match lower.as_str() {
@@ -6195,6 +6419,7 @@ impl App {
                     "r_contactshadows" => self.video.contact_shadows = enabled,
                     "r_cloudshadows" => self.video.cloud_shadows = enabled,
                     "r_cloudtemporal" => self.video.cloud_temporal = enabled,
+                    "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
                     "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
                     "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
                     "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
@@ -6218,7 +6443,7 @@ impl App {
             }
             "r_reflectionquality" => {
                 self.video.reflection_quality = ReflectionQuality::from_config(value)
-                    .ok_or_else(|| format!("{name}: expected off|low|medium|high|ultra"))?;
+                    .ok_or_else(|| format!("{name}: expected off|legacy|low|medium|high|ultra"))?;
                 self.mark_config_dirty();
                 self.console_status = format!(
                     "REFLECTION QUALITY: {} - RUN VID_RESTART TO APPLY",
@@ -7449,6 +7674,11 @@ impl App {
     }
 
     fn apply_demo_camera(&mut self, sample: DemoCameraSample) {
+        self.render_view_latch = ViewLatchMode::Disabled;
+        let latch_input_available = self.video.input_subframe
+            && sample.policy.health > 0
+            && sample.policy.vehicle_num == 0
+            && self.subframe_input_view_rotation().is_some();
         if rendering_third_person(
             self.third_person,
             self.first_person_lightsaber,
@@ -7516,12 +7746,20 @@ impl App {
                 self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
                 self.camera.yaw = view.angles[1].to_radians();
                 self.camera.pitch = -view.angles[0].to_radians();
+                if latch_input_available {
+                    if let Some(latch) = view.late_latch {
+                        self.render_view_latch = ViewLatchMode::ThirdPerson(latch);
+                    }
+                }
                 return;
             }
         }
         self.camera.position = glam::Vec3::from_array(sample.eye_position);
         self.camera.yaw = sample.view_angles[1].to_radians();
         self.camera.pitch = -sample.view_angles[0].to_radians();
+        if latch_input_available {
+            self.render_view_latch = ViewLatchMode::Direct;
+        }
     }
 
     fn demo_point_visible_from_authoritative(
@@ -8267,6 +8505,7 @@ impl App {
     }
 
     fn update_solo_player_view_and_presentation(&mut self) {
+        self.render_view_latch = ViewLatchMode::Disabled;
         if self
             .game_session
             .as_ref()
@@ -8313,12 +8552,17 @@ impl App {
             }
             return;
         };
+        let policy = PlayerViewPolicyState::from_entity_view(entity_view, player_view.legs_timer);
         let render_third_person = mode == JoinMode::Player
             && rendering_third_person(
                 self.third_person,
                 self.first_person_lightsaber,
-                PlayerViewPolicyState::from_entity_view(entity_view, player_view.legs_timer),
+                policy,
             );
+        let latch_input_available = mode == JoinMode::Player
+            && self.video.input_subframe
+            && policy.health > 0
+            && policy.vehicle_num == 0;
 
         if render_third_person {
             if let Some(world) = self.map_collision.as_mut() {
@@ -8348,11 +8592,22 @@ impl App {
                 self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
                 self.camera.yaw = view.angles[1].to_radians();
                 self.camera.pitch = -view.angles[0].to_radians();
+                if latch_input_available {
+                    if let Some(latch) = view.late_latch {
+                        self.render_view_latch = ViewLatchMode::ThirdPerson(latch);
+                    }
+                }
             } else {
                 self.camera = first_person_camera;
+                if latch_input_available {
+                    self.render_view_latch = ViewLatchMode::Direct;
+                }
             }
         } else {
             self.camera = first_person_camera;
+            if latch_input_available {
+                self.render_view_latch = ViewLatchMode::Direct;
+            }
         }
 
         // As in OpenJK CG_Player, keep the local player animation/Ghoul2 state
@@ -8423,6 +8678,7 @@ impl App {
             gen_normal_maps: self.video.gen_normal_maps,
             float_lightmap: self.video.float_lightmap && self.video.hdr,
             planar_reflections: self.video.reflection_quality.planar_slot_budget() > 0,
+            omit_environment_stages: self.video.reflection_quality.omits_environment_stages(),
             source_spatial_batches: self.video.gpu_driven,
             pbr_materials: self.video.pbr,
             allow_asset_overrides: self.video.allow_asset_overrides,
@@ -8855,6 +9111,10 @@ impl App {
 
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
+            [verb] if verb.eq_ignore_ascii_case("voicechat") => {
+                self.open_vgs_voicechat();
+                return;
+            }
             [verb] if verb.eq_ignore_ascii_case("hudedit") => {
                 if self.front_end {
                     self.push_console_line("^3hudedit:^7 enter a game before editing the HUD".to_owned());
@@ -9661,6 +9921,71 @@ impl App {
         ])
     }
 
+    fn active_server_mod(&self) -> crate::net::mod_support::ServerMod {
+        self.net
+            .as_ref()
+            .map(|net| {
+                crate::net::mod_support::ServerMod::detect(crate::net::mod_support::server_info(
+                    &net.session().decoder().configstrings,
+                ))
+            })
+            .unwrap_or(crate::net::mod_support::ServerMod::Unknown)
+    }
+
+    /// TaystJK UIMENU_VOICECHAT: jaPRO + ui_vgs opens ingame_vgs. DinurdoJK
+    /// does not substitute a made-up stock Raven voice menu for the other path.
+    fn open_vgs_voicechat(&mut self) {
+        if !self.live_connected()
+            || self.ui_vgs == 0
+            || self.active_server_mod() != crate::net::mod_support::ServerMod::Japro
+        {
+            return;
+        }
+        self.vgs_menu = crate::vgs::Menu::Main;
+        self.set_overlay(OverlayMode::Vgs);
+    }
+
+    fn activate_vgs_action(&mut self, action: crate::vgs::Action) {
+        match action {
+            crate::vgs::Action::Menu(menu) => {
+                self.vgs_menu = menu;
+                self.egui_repaint_requested = true;
+            }
+            crate::vgs::Action::Command(token) => {
+                self.forward_command_to_server(&format!("vgs_cmd {token}"));
+                self.vgs_menu = crate::vgs::Menu::Main;
+                self.set_overlay(OverlayMode::None);
+            }
+        }
+    }
+
+    fn handle_vgs_key(&mut self, event: &KeyEvent, code: KeyCode) {
+        if event.state != ElementState::Pressed || event.repeat {
+            return;
+        }
+        if code == KeyCode::Escape {
+            // TaystJK ingame_vgs onESC closes all; it does not navigate back.
+            self.vgs_menu = crate::vgs::Menu::Main;
+            self.set_overlay(OverlayMode::None);
+            return;
+        }
+        let key = match code {
+            KeyCode::KeyA => 'a', KeyCode::KeyB => 'b', KeyCode::KeyC => 'c',
+            KeyCode::KeyD => 'd', KeyCode::KeyE => 'e', KeyCode::KeyF => 'f',
+            KeyCode::KeyG => 'g', KeyCode::KeyH => 'h', KeyCode::KeyI => 'i',
+            KeyCode::KeyJ => 'j', KeyCode::KeyK => 'k', KeyCode::KeyL => 'l',
+            KeyCode::KeyM => 'm', KeyCode::KeyN => 'n', KeyCode::KeyO => 'o',
+            KeyCode::KeyP => 'p', KeyCode::KeyQ => 'q', KeyCode::KeyR => 'r',
+            KeyCode::KeyS => 's', KeyCode::KeyT => 't', KeyCode::KeyU => 'u',
+            KeyCode::KeyV => 'v', KeyCode::KeyW => 'w', KeyCode::KeyX => 'x',
+            KeyCode::KeyY => 'y', KeyCode::KeyZ => 'z',
+            _ => return,
+        };
+        if let Some(action) = crate::vgs::action_for_key(self.vgs_menu, key) {
+            self.activate_vgs_action(action);
+        }
+    }
+
     /// CL_ForwardCommandToServer.
     fn forward_command_to_server(&mut self, line: &str) {
         let line = line.trim();
@@ -9685,7 +10010,10 @@ impl App {
         if !self.live_connected() {
             return;
         }
-        let info = self.network.userinfo(&self.solo_client_info.model_cvar());
+        let server_mod = self.net.as_ref().map(|net| {
+            crate::net::mod_support::ServerMod::detect(crate::net::mod_support::server_info(&net.session().decoder().configstrings))
+        }).unwrap_or(crate::net::mod_support::ServerMod::Unknown);
+        let info = self.network.userinfo_for_mod(&self.solo_client_info.model_cvar(), server_mod);
         let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
         if let Some(net) = self.net.as_mut() {
             let _ = net.session_mut().add_reliable_command(&command, false);
@@ -10603,6 +10931,10 @@ impl App {
                 self.start_live_gamestate();
             }
             SessionEvent::ServerCommand(command) => {
+                // Decoder configstrings are current before this event is delivered.
+                if command.text.starts_with(b"cs 0 ") || command.text.starts_with(b"bcs2 0 ") {
+                    self.send_userinfo();
+                }
                 if let Some(session) = self.game_session.as_mut().filter(|session| session.live) {
                     session.client_game.queue_server_command(command);
                 } else if self.net.is_some() {
@@ -10703,6 +11035,7 @@ impl App {
 
     /// CL_ParseGamestate -> CL_InitCGame: a new CGame for the new gamestate.
     fn start_live_gamestate(&mut self) {
+        self.send_userinfo();
         // CL_SystemInfoChanged: the gamestate systeminfo is authoritative for
         // fs_game. Inspect it before accepting any overlapped presenter/map prep
         // that may have been built speculatively from infoResponse.
@@ -11537,6 +11870,7 @@ impl App {
             || requested.gen_normal_maps != prepared.gen_normal_maps
             || requested.float_lightmap != prepared.float_lightmap
             || requested.planar_reflections != prepared.planar_reflections
+            || requested.omit_environment_stages != prepared.omit_environment_stages
             || requested.pbr_materials != prepared.pbr_materials
             || requested.allow_asset_overrides != prepared.allow_asset_overrides
     }
@@ -12123,17 +12457,26 @@ impl App {
                 // Entering FAST on DX12 can make the standing cap unreachable.
                 self.set_fps_cap(self.video.fps_cap);
             }
+            ui::VIDEO_ROW_MAX_FRAME_LATENCY => {
+                let next = (self.video.max_frame_latency as i32 + direction - 1)
+                    .rem_euclid(3)
+                    + 1;
+                self.set_max_frame_latency(next as u32);
+            }
             ui::VIDEO_ROW_FPS_CAP => self.begin_fps_cap_edit(),
             ui::VIDEO_ROW_PHYSICS_FPS => self.begin_physics_fps_edit(),
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(self.video.gamma + direction as f32 * 0.05),
             ui::VIDEO_ROW_ANTI_ALIASING => self.cycle_anti_aliasing(direction),
             ui::VIDEO_ROW_TEXTURE_FILTER => self.cycle_texture_filter(direction),
             ui::VIDEO_ROW_PVS => {
-                const MODES: [PvsMode; 4] = [
+                const MODES: [PvsMode; 7] = [
                     PvsMode::Off,
                     PvsMode::Minimal,
                     PvsMode::Full,
                     PvsMode::Auto,
+                    PvsMode::Auto2,
+                    PvsMode::Auto3,
+                    PvsMode::Auto4,
                 ];
                 let current = MODES
                     .iter()
@@ -12225,15 +12568,16 @@ impl App {
                 self.sync_pbr();
                 self.mark_config_dirty();
             }
-            ui::VIDEO_ROW_WORLD_LIGHTING => {
-                self.video.world_lighting = !self.video.world_lighting;
-                self.sync_classic_world_lighting();
-                self.mark_config_dirty();
-            }
-            ui::VIDEO_ROW_VERTEX_LIGHTING => {
-                self.video.vertex_lighting = !self.video.vertex_lighting;
-                self.sync_classic_world_lighting();
-                self.mark_config_dirty();
+            ui::VIDEO_ROW_WORLD_LIGHTING | ui::VIDEO_ROW_VERTEX_LIGHTING => {
+                let current = if !self.video.world_lighting {
+                    0
+                } else if self.video.vertex_lighting {
+                    1
+                } else {
+                    2
+                };
+                let next = (current as i32 + direction).rem_euclid(3) as usize;
+                self.set_world_lighting_quality(next);
             }
             ui::VIDEO_ROW_LIGHTMAP_ONLY => {
                 self.video.lightmap_only = !self.video.lightmap_only;
@@ -12368,7 +12712,7 @@ impl App {
                 let current = ReflectionQuality::ALL
                     .iter()
                     .position(|quality| *quality == self.video.reflection_quality)
-                    .unwrap_or(3) as i32;
+                    .unwrap_or(4) as i32;
                 let next = (current + direction).clamp(0, ReflectionQuality::ALL.len() as i32 - 1)
                     as usize;
                 self.video.reflection_quality = ReflectionQuality::ALL[next];
@@ -12470,8 +12814,12 @@ impl App {
             }
             ui::VIDEO_ROW_WIREFRAME => {
                 if self.wireframe_supported {
-                    self.video.show_wireframe = !self.video.show_wireframe;
-                    self.render_command(RenderCommand::SetWireframe(self.video.show_wireframe));
+                    self.video.wireframe_mask = if self.video.wireframe_mask == 0 {
+                        ui::wireframe::MAP
+                    } else {
+                        0
+                    };
+                    self.render_command(RenderCommand::SetWireframeMask(self.video.wireframe_mask));
                     self.mark_config_dirty();
                 } else {
                     self.console_status = "WIREFRAME OVERLAY IS NOT SUPPORTED BY THIS GPU".into();
@@ -13135,8 +13483,12 @@ impl App {
         if self.front_end {
             self.frontend_back();
         } else {
-            self.menu_selected = 4;
-            self.set_overlay(OverlayMode::Game);
+            // Setup is an overlay on the live game, just like the other in-game
+            // menu pages. ESC should leave the menu completely. Switching back
+            // to OverlayMode::Game while menu_selected is TOP_SETUP leaves the
+            // normal menu pointing at a page it deliberately does not render,
+            // producing a blank body that persists the next time ESC is pressed.
+            self.set_overlay(OverlayMode::None);
         }
     }
 
@@ -13495,8 +13847,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.video.msaa_samples = 1;
                     self.mark_config_dirty();
                 }
-                if !self.wireframe_supported && self.video.show_wireframe {
-                    self.video.show_wireframe = false;
+                if !self.wireframe_supported && self.video.wireframe_mask != 0 {
+                    self.video.wireframe_mask = 0;
                     self.mark_config_dirty();
                 }
                 self.console_status = format!(
@@ -13572,6 +13924,7 @@ impl ApplicationHandler<UserEvent> for App {
                     cpu_acquire_ms: stats.cpu_acquire_ms,
                     cpu_encode_ms: stats.cpu_encode_ms,
                     cpu_submit_ms: stats.cpu_submit_ms,
+                    cpu_present_ms: stats.cpu_present_ms,
                     dynamic_model_prepare_ms: stats.dynamic_model_prepare_ms,
                     dynamic_model_surfaces: stats.dynamic_model_surfaces,
                     dynamic_model_vertices: stats.dynamic_model_vertices,
@@ -13612,8 +13965,11 @@ impl ApplicationHandler<UserEvent> for App {
                     cull_area_rejected: stats.cull_area_rejected,
                     input_event_to_sim_ms: stats.input_event_to_sim_ms,
                     input_sim_to_render_ms: stats.input_sim_to_render_ms,
-                    input_event_to_present_ms: stats.input_event_to_present_ms,
-                    input_event_to_present_max_ms: stats.input_event_to_present_max_ms,
+                    input_event_to_latch_ms: stats.input_event_to_latch_ms,
+                    input_latch_to_submit_ms: stats.input_latch_to_submit_ms,
+                    input_latch_to_present_call_ms: stats.input_latch_to_present_call_ms,
+                    input_event_to_present_call_ms: stats.input_event_to_present_call_ms,
+                    input_event_to_present_call_max_ms: stats.input_event_to_present_call_max_ms,
                     input_latency_samples: stats.input_latency_samples,
                 };
                 self.threads = stats.threads.map(|thread| ThreadPerfStats {
@@ -13777,7 +14133,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if !oceans.is_empty() {
                         let map = map.as_mut();
-                        scene::append_authored_ocean_planes(&oceans, &mut map.vertices, &mut map.batches, &mut map.pvs_batches);
+                        scene::append_authored_ocean_planes(
+                            &oceans,
+                            &mut map.vertices,
+                            &mut map.batches,
+                            &mut map.pvs_batches,
+                            &mut map.portal_batches,
+                        );
                         map.authored_oceans = oceans;
                     }
                 }
@@ -14281,12 +14643,13 @@ impl ApplicationHandler<UserEvent> for App {
                     post_upload_wait_ms,
                 ));
                 self.push_console_line(format!(
-                    "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms",
+                    "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms | PVS plans {:.1} ms",
                     timings.grass_ms,
                     timings.grass_cpu_ms,
                     timings.gi_ms,
                     timings.ocean_ms,
                     timings.steam_audio_ms,
+                    timings.portal_plans_ms,
                 ));
                 self.push_console_line(format!(
                     "^6[OCEAN MESH]^7 promoted water surfaces {} | clipmap {} verts / {} tris, inner cell {:.0}u, outer cell {:.0}u",
@@ -14739,6 +15102,10 @@ impl ApplicationHandler<UserEvent> for App {
                         self.handle_video_key(&event, code);
                         return;
                     }
+                    OverlayMode::Vgs => {
+                        self.handle_vgs_key(&event, code);
+                        return;
+                    }
                     OverlayMode::HudEdit => {
                         if event.state == ElementState::Pressed && !event.repeat && code == KeyCode::Escape {
                             self.hud_edit_drag_origin = None;
@@ -14811,7 +15178,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.refresh_bound_state();
                 if event.state == ElementState::Pressed && !event.repeat {
                     if code == KeyCode::Escape {
-                        self.set_overlay(OverlayMode::Game);
+                        let overlay = self.remembered_in_game_menu_overlay();
+                        self.set_overlay(overlay);
                         return;
                     }
                     if code == KeyCode::KeyN && self.modifiers.shift_key() {
@@ -14866,30 +15234,59 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mouse_input_sequence = 1;
             }
 
-            // Live play samples accumulated mouse in CL_CreateCmd every frame.
-            if self.video.input_subframe && self.net.is_none() {
-                let mut applied = false;
-                if let Some(player) = &mut self.local_server {
+            if self.video.input_subframe {
+                let elapsed = self
+                    .last_mouse_motion_at
+                    .replace(event_at)
+                    .map(|last| event_at.saturating_duration_since(last))
+                    .unwrap_or(Duration::from_millis(1));
+                if self.net.as_ref().is_some_and(|net| {
+                    net.state() >= jka_protocol::session::ConnectionState::Primed
+                }) {
+                    // Event-rate CL_MouseMove. This only advances cl.viewangles;
+                    // Pmove/usercmd cadence remains unchanged. The next normal
+                    // client frame consumes the same viewangles for prediction,
+                    // while the renderer may expose this real mouse sample to
+                    // first person or the safe no-trace third-person latch path.
                     let simulation_at = Instant::now();
-                    let elapsed = self
-                        .last_mouse_motion_at
-                        .replace(event_at)
-                        .map(|last| event_at.saturating_duration_since(last))
-                        .unwrap_or(Duration::from_millis(1));
-                    player.set_mouse_input_settings(self.mouse_input);
-                    player.apply_mouse_look_timed(delta, elapsed);
-                    self.last_simulated_mouse_input = Some(InputLatencySample {
+                    let (mx, my) = self.mouse_input.scale_mouse(delta, elapsed);
+                    self.live_input
+                        .apply_mouse(self.mouse_input.yaw * mx, self.mouse_input.pitch * my);
+                    let sample = InputLatencySample {
                         sequence: self.mouse_input_sequence,
                         event_at,
                         simulation_at,
-                    });
-                    applied = true;
-                }
-                if applied {
-                    self.update_solo_player_view_and_presentation();
-                    // Publish immediately so the render thread can use this exact
-                    // mouse event without waiting for the next client/physics tick.
-                    self.publish_snapshot();
+                    };
+                    self.last_simulated_mouse_input = Some(sample);
+                    self.publish_live_subframe_view(sample);
+                } else {
+                    let mut applied = false;
+                    let mut applied_sample = None;
+                    if let Some(player) = &mut self.local_server {
+                        let simulation_at = Instant::now();
+                        player.set_mouse_input_settings(self.mouse_input);
+                        player.apply_mouse_look_timed(delta, elapsed);
+                        let sample = InputLatencySample {
+                            sequence: self.mouse_input_sequence,
+                            event_at,
+                            simulation_at,
+                        };
+                        self.last_simulated_mouse_input = Some(sample);
+                        applied_sample = Some(sample);
+                        applied = true;
+                    }
+                    if applied {
+                        let direct_view_published = applied_sample
+                            .is_some_and(|sample| self.publish_local_subframe_view(sample));
+                        if !direct_view_published {
+                            // The no-trace third-person latch is unavailable
+                            // (for example camera collision/damping). Preserve the
+                            // old local fallback and rerun the authoritative CGame
+                            // camera rather than approximating through geometry.
+                            self.update_solo_player_view_and_presentation();
+                            self.publish_snapshot();
+                        }
+                    }
                 }
             } else {
                 self.last_mouse_motion_at = Some(event_at);

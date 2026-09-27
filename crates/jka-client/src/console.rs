@@ -69,6 +69,7 @@ const fn command(name: &'static str, description: &'static str) -> Entry {
 }
 
 pub const ENTRIES: &[Entry] = &[
+    cvar("cp_pluginDisable", "1536", "0..2147483647", "JAPRO preference bitfield; also available in the Mod menu."),
     cvar(
         "com_maxfps",
         "0",
@@ -176,6 +177,7 @@ pub const ENTRIES: &[Entry] = &[
         "TaystJK legacy style-0 mouse acceleration; 0 disables it.",
     ),
     cvar("con_timestamps", "1", "0..1", "Prefix console lines with local HH:MM:SS timestamps."),
+    cvar("ui_vgs", "1", "0=off, nonzero=on", "TaystJK: use the jaPRO VGS canned-voice menu."),
     cvar("s_volume", "0.5", "0..1", "OpenJK game/effects volume."),
     cvar("s_volumeVoice", "1.0", "0..1", "OpenJK voice-channel volume."),
     cvar("s_musicvolume", "0.25", "0..1", "OpenJK background music volume (playback presenter pending)."),
@@ -274,6 +276,12 @@ pub const ENTRIES: &[Entry] = &[
         "0..1",
         "Apply mouse-look on each raw mouse event instead of waiting for the client tick.",
     ),
+    cvar(
+        "cl_input_latelatch",
+        "0",
+        "0..1",
+        "Experimental: resample the newest subframe view orientation on the render thread at the latest coherent camera point.",
+    ),
     cvar("r_physics", "0", "0..1", "Master switch for Rapier client-side visual physics."),
     cvar("r_physicsHz", "60", "30|60|120|240", "Fixed timestep for client-side visual physics."),
     cvar("r_physicsMaxSubsteps", "4", "1|2|4|8", "Maximum visual-physics catch-up steps after a slow frame."),
@@ -336,10 +344,22 @@ pub const ENTRIES: &[Entry] = &[
     command("trace_clear", "Clear the pinned surface inspection and triangle highlight."),
     command("toggle", "OpenJK-style cvar toggle: toggle <cvar> [value1 value2 ...]."),
     command("messagemode", "Open global chat input."),
+    command("voicechat", "Open TaystJK VGS when connected to a jaPRO server and ui_vgs is enabled."),
     command("+scores", "Show the live scoreboard while held and request fresh scores."),
     command("-scores", "Hide the live scoreboard."),
     command("messagemode2", "Open team chat input."),
-    cvar("r_swapInterval", "0", "0..1", "Vertical synchronization."),
+    cvar(
+        "r_swapInterval",
+        "0",
+        "0|1|2|3",
+        "Presentation mode: 0 off, 1 on, 2 fast/mailbox, 3 adaptive.",
+    ),
+    cvar(
+        "r_maxFrameLatency",
+        "3",
+        "1|2|3",
+        "Maximum WGPU surface frames in flight: 1 lowest latency, 2 balanced, 3 maximum throughput.",
+    ),
     cvar(
         "r_ext_multisample",
         "0",
@@ -706,7 +726,12 @@ pub const ENTRIES: &[Entry] = &[
         "0..1",
         "Legacy boolean alias for Dynamic Shadows: Cascaded Shadow Maps.",
     ),
-    cvar("r_showtris", "0", "0..1", "Wireframe triangle overlay."),
+    cvar(
+        "r_showtris",
+        "0",
+        "0..127",
+        "Wireframe category bitmask: 1 map, 2 players, 4 entities, 8 effects, 16 grass, 32 ocean, 64 deformation.",
+    ),
     cvar(
         "r_novis",
         "0",
@@ -716,8 +741,8 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "r_pvsMode",
         "auto",
-        "off|minimal|full|auto",
-        "Potentially-visible-set culling mode.",
+        "off|minimal|full|auto|auto2|auto3|auto4",
+        "Potentially-visible-set culling mode; Auto 4 uses map-load portal/cluster draw plans with shared compatible merged batches.",
     ),
     command("devmap", "Load a map for local development: devmap <map>."),
     command("map", "Load a map: map <map>."),
@@ -852,6 +877,7 @@ pub const SERVER_COMMANDS: &[Entry] = &[
     server_command("teamvote", "Vote in a team vote: teamvote <yes|no>."),
     server_command("tell", "Private message: tell <client number|name> <message>."),
     server_command("voice_cmd", "Send a voice command."),
+    server_command("vgs_cmd", "Send a jaPRO VGS canned voice command."),
     server_command("vote", "Vote in a vote: vote <yes|no>."),
     server_command("where", "Print your current origin."),
     server_command("zoom", "Toggle binocular zoom."),
@@ -985,7 +1011,8 @@ mod tests {
         ] {
             assert!(is_server_command(name), "{name}");
         }
-        assert_eq!(SERVER_COMMANDS.len(), 29);
+        assert!(is_server_command("vgs_cmd"));
+        assert_eq!(SERVER_COMMANDS.len(), 30);
     }
 
     #[test]

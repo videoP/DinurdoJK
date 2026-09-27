@@ -16,6 +16,91 @@ use super::quality::QualityPreset;
 use super::*;
 
 impl App {
+    pub(super) fn egui_mod_settings(&mut self, ui: &mut egui::Ui) {
+        use crate::net::mod_support::{server_info, ServerMod};
+
+        theme::page_title(ui, "MOD", "Settings for the connected server's mod.");
+        let active = self
+            .net
+            .as_ref()
+            .map(|net| ServerMod::detect(server_info(&net.session().decoder().configstrings)));
+
+        theme::section(ui, "SERVER MOD", "Detected from the current server's game state.");
+        theme::row(
+            ui,
+            "Active mod",
+            "The server mod detected from its advertised/configstring state.",
+            theme::Reset::None,
+            |ui| {
+                theme::glow_label(
+                    ui,
+                    active.map_or("Not connected", ServerMod::label),
+                    12.5,
+                    theme::TEXT_DIM,
+                );
+            },
+        );
+
+        match active {
+            Some(ServerMod::Japro) => {}
+            Some(_) => {
+                theme::section(
+                    ui,
+                    "SETTINGS",
+                    "No client-side settings are available for this server mod yet.",
+                );
+                return;
+            }
+            None => {
+                theme::section(
+                    ui,
+                    "SETTINGS",
+                    "Connect to a server to view settings for its active mod.",
+                );
+                return;
+            }
+        }
+
+        theme::section(
+            ui,
+            "JAPRO MOVEMENT PREFERENCES",
+            "Saved locally and sent when you join a JAPRO server. Server rules still apply.",
+        );
+        let mut bits = self.network.plugin_disable;
+        for (bit, label) in [
+            (15, "Disable katas"),
+            (16, "Disable butterflies"),
+            (17, "Disable backstabs and roll stabs"),
+            (18, "Disable DFA attacks"),
+            (19, "Only bunny hop"),
+            (20, "Disable rolls"),
+            (21, "Disable cartwheels"),
+            (22, "Use Jawa run animation"),
+        ] {
+            let enabled = bits & (1 << bit) != 0;
+            theme::row(
+                ui,
+                label,
+                "JAPRO cp_pluginDisable preference. This is a client preference; server rules still take precedence.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(enabled) = theme::switch(ui, enabled) {
+                        if enabled {
+                            bits |= 1 << bit;
+                        } else {
+                            bits &= !(1 << bit);
+                        }
+                    }
+                },
+            );
+        }
+        if bits != self.network.plugin_disable {
+            if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
+                self.push_console_line(error);
+            }
+        }
+    }
+
     pub(super) fn egui_game_settings(&mut self, ui: &mut egui::Ui) {
         theme::page_title(
             ui,
@@ -588,22 +673,24 @@ impl App {
     // ------------------------------------------------------------ rendering --
 
     fn egui_display_settings(&mut self, ui: &mut egui::Ui) {
-        let presets: Vec<(Option<QualityPreset>, &str)> = QualityPreset::ALL
-            .iter()
-            .map(|preset| (Some(*preset), preset.label()))
-            .collect();
-        if let Some(Some(preset)) = segmented_row(
+        const PRESETS: [(QualityPreset, &str); 4] = [
+            (QualityPreset::Minimal, "Minimal"),
+            (QualityPreset::Low, "Low"),
+            (QualityPreset::Medium, "Medium"),
+            (QualityPreset::High, "High"),
+        ];
+        if let Some(index) = optional_quality_table_row(
             ui,
             "Quality preset",
             "Sets every rendering cost lever at once. Resolution, display mode, \
-             render backend, vsync, FPS cap and the debug toggles are left \
-             alone. No chip is lit once you change an individual setting.",
+             render backend, vsync, frame queue, FPS cap and the debug toggles are left \
+             alone. The bar becomes Custom once you change a preset-controlled setting.",
             theme::Reset::Video(ui::VIDEO_ROW_QUALITY_PRESET),
             self.active_quality_preset(),
-            &presets,
+            &PRESETS,
         ) {
             self.video_selected = ui::VIDEO_ROW_QUALITY_PRESET;
-            self.apply_quality_preset(preset);
+            self.apply_quality_preset(PRESETS[index].0);
         }
 
         const BACKENDS: [(RendererBackend, &str); 2] = [
@@ -706,6 +793,28 @@ impl App {
             let current = index_of(&VSYNC, self.video.vsync, 0);
             let next = index_of(&VSYNC, target, current);
             self.video_selected = ui::VIDEO_ROW_VSYNC;
+            self.change_video_setting(next as i32 - current as i32);
+        }
+
+        const FRAME_LATENCY: [(u32, &str); 3] = [
+            (1, "1 Lowest"),
+            (2, "2 Balanced"),
+            (3, "3 Throughput"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Frame queue",
+            "Maximum WGPU presentation frames in flight. 1 favors the lowest \
+             presentation/input latency, 2 balances latency and throughput, and 3 \
+             favors maximum throughput. Changes apply live through a surface-only \
+             reconfigure: no shader or render-pipeline rebuild. Useful for A/B testing.",
+            theme::Reset::Video(ui::VIDEO_ROW_MAX_FRAME_LATENCY),
+            self.video.max_frame_latency,
+            &FRAME_LATENCY,
+        ) {
+            let current = index_of(&FRAME_LATENCY, self.video.max_frame_latency, 2);
+            let next = index_of(&FRAME_LATENCY, target, current);
+            self.video_selected = ui::VIDEO_ROW_MAX_FRAME_LATENCY;
             self.change_video_setting(next as i32 - current as i32);
         }
 
@@ -866,17 +975,25 @@ impl App {
     }
 
     fn egui_visibility(&mut self, ui: &mut egui::Ui) {
-        const PVS: [(PvsMode, &str); 4] = [
+        const PVS: [(PvsMode, &str); 7] = [
             (PvsMode::Off, "Off"),
             (PvsMode::Minimal, "Minimal"),
             (PvsMode::Full, "Full"),
             (PvsMode::Auto, "Auto"),
+            (PvsMode::Auto2, "Auto 2"),
+            (PvsMode::Auto3, "Auto 3"),
+            (PvsMode::Auto4, "Auto 4"),
         ];
         if let Some(target) = segmented_row(
             ui,
             "PVS portal culling",
             "Uses the map's precomputed visibility set to skip rooms the camera \
-             cannot see. Auto picks a level from the map's own data.",
+             cannot see. Auto keeps the existing whole-cluster coarse/full choice; \
+             Auto 2 chooses coarse or full independently per material surface group. Auto 3 uses\
+             coarse only when it is exactly equivalent to the currently visible Full children. Auto 4\
+             builds portal/cluster-owned base batches at map load, precomputes the exact visible batch\
+             recipe for every camera cluster, merges compatible batches there, and reuses identical\
+             merged batches and whole recipes across clusters.",
             theme::Reset::Video(ui::VIDEO_ROW_PVS),
             self.video.pvs_mode,
             &PVS,
@@ -1011,29 +1128,30 @@ impl App {
             },
         );
 
-        self.egui_toggle_row(
+        // Classic world lighting is one three-state control. `Off` maps to
+        // r_fullbright 1; once enabled, the meter chooses between the cheap
+        // r_vertexLight path and normal authored BSP lightmaps.
+        let world_lighting = if !self.video.world_lighting {
+            0
+        } else if self.video.vertex_lighting {
+            1
+        } else {
+            2
+        };
+        const WORLD_LIGHTING: [&str; 3] = ["Off", "Vertex light", "BSP lightmaps"];
+        if let Some(target) = quality_row(
             ui,
             "World lighting",
-            "Use baked world lighting. Off is vanilla r_fullbright 1: lightmap contribution is replaced by white while textures remain visible.",
-            ui::VIDEO_ROW_WORLD_LIGHTING,
-            self.video.world_lighting,
-        );
-
-        self.egui_toggle_row(
-            ui,
-            "Vertex lighting",
-            "Classic r_vertexLight world lighting: use BSP vertex colors instead of sampling baked lightmaps. As in JKA, this suppresses runtime dlights; Dynamic Lights > Vertex is a separate dlight mode, not this setting.",
-            ui::VIDEO_ROW_VERTEX_LIGHTING,
-            self.video.vertex_lighting,
-        );
-
-        self.egui_toggle_row(
-            ui,
-            "Lightmap only",
-            "Classic r_lightmap debug view: show the baked lightmap/vertex-light contribution without the diffuse texture where available.",
-            ui::VIDEO_ROW_LIGHTMAP_ONLY,
-            self.video.lightmap_only,
-        );
+            "Master for classic BSP world lighting. Off is vanilla r_fullbright 1. \
+             When enabled, Vertex light uses BSP vertex colors (r_vertexLight 1); \
+             BSP lightmaps uses the normal authored baked-lightmap path (r_vertexLight 0).",
+            theme::Reset::Video(ui::VIDEO_ROW_WORLD_LIGHTING),
+            world_lighting,
+            &WORLD_LIGHTING,
+        ) {
+            self.video_selected = ui::VIDEO_ROW_WORLD_LIGHTING;
+            self.set_world_lighting_quality(target);
+        }
 
         const LIGHT_OPTIONS: [(DynamicLightsMode, &str, &str); 6] = [
             (
@@ -1262,8 +1380,9 @@ impl App {
     }
 
     fn egui_reflections(&mut self, ui: &mut egui::Ui) {
-        const REFLECTION_QUALITY: [(ReflectionQuality, &str); 5] = [
+        const REFLECTION_QUALITY: [(ReflectionQuality, &str); 6] = [
             (ReflectionQuality::Off, "Off"),
+            (ReflectionQuality::Legacy, "Legacy"),
             (ReflectionQuality::Low, "Low"),
             (ReflectionQuality::Medium, "Medium"),
             (ReflectionQuality::High, "High"),
@@ -1272,18 +1391,20 @@ impl App {
         if let Some(target) = quality_table_row(
             ui,
             "Reflection quality",
-            "Master reflection policy. Low uses reflection probes only; Medium adds temporal \
+            "Master reflection policy. Off removes authored tcGen environment stages entirely; \
+             Legacy preserves those vanilla environment-mapped stages but enables no enhanced \
+             reflection technique. Low uses reflection probes only; Medium adds temporal \
              screen-space reflections; High adds one dynamically selected planar reflector; \
              Ultra raises SSR quality and allows up to four planar reflectors. Reflection \
-             quality is applied on vid_restart because planar modes preserve reflection-plane \
-             BSP topology; Off/Low/Medium can fully batch tcGen environment geometry instead. \
-             Expensive techniques fall back to cheaper ones automatically.",
+             quality is applied on vid_restart because Off specializes the prepared material \
+             set and planar modes preserve reflection-plane BSP topology. Expensive techniques \
+             fall back to cheaper ones automatically.",
             theme::Reset::Video(ui::VIDEO_ROW_SSR),
             self.video.reflection_quality,
             &REFLECTION_QUALITY,
-            3,
+            4,
         ) {
-            let current = index_of(&REFLECTION_QUALITY, self.video.reflection_quality, 3);
+            let current = index_of(&REFLECTION_QUALITY, self.video.reflection_quality, 4);
             self.video_selected = ui::VIDEO_ROW_SSR;
             self.change_video_setting(target as i32 - current as i32);
         }
@@ -1576,25 +1697,46 @@ impl App {
     }
 
     fn egui_debug_tools(&mut self, ui: &mut egui::Ui) {
-        let supported = self.wireframe_supported;
-        theme::row(
+        self.egui_toggle_row(
             ui,
-            "Wireframe overlay",
-            "Draws triangle edges over the world. Needs an adapter with \
-             non-solid polygon fill.",
-            theme::Reset::Video(ui::VIDEO_ROW_WIREFRAME),
-            |ui| {
+            "Lightmap-only debug view",
+            "Classic r_lightmap debug view: show the baked lightmap/vertex-light contribution without the diffuse texture where available.",
+            ui::VIDEO_ROW_LIGHTMAP_ONLY,
+            self.video.lightmap_only,
+        );
+
+        let supported = self.wireframe_supported;
+        if !supported {
+            theme::hint(
+                ui,
+                "Wireframe categories are unavailable on this adapter (non-solid polygon fill unsupported).",
+                theme::TEXT_DISABLED,
+            );
+        }
+
+        let categories = [
+            (ui::wireframe::MAP, "Map", "BSP/map triangles (excluding promoted ocean clipmaps)."),
+            (ui::wireframe::PLAYERS, "Players", "Player Ghoul2/MD3 geometry, including GPU-skinned surfaces."),
+            (ui::wireframe::ENTITIES, "Entities", "Items, vehicles, model entities and inline BSP brush movers."),
+            (ui::wireframe::EFFECTS, "Effects", "Transient FX/event geometry plus map-authored surface sprites."),
+            (ui::wireframe::GRASS, "Procedural grass", "The actual animated per-blade grass mesh after LOD/wind deformation."),
+            (ui::wireframe::OCEAN, "Ocean", "Promoted ocean clipmap triangles after wave displacement."),
+            (ui::wireframe::DEFORMATION, "Surface deformation", "3D Snowflow/footprint shell geometry after deformation."),
+        ];
+        for (bit, label, help) in categories {
+            theme::row(ui, label, help, theme::Reset::None, |ui| {
                 ui.add_enabled_ui(supported, |ui| {
-                    if theme::switch(ui, self.video.show_wireframe).is_some() {
-                        self.video_selected = ui::VIDEO_ROW_WIREFRAME;
-                        self.change_video_setting(1);
+                    let enabled = self.video.wireframe_mask & bit != 0;
+                    if theme::switch(ui, enabled).is_some() {
+                        self.video.wireframe_mask ^= bit;
+                        self.render_command(crate::renderer::RenderCommand::SetWireframeMask(
+                            self.video.wireframe_mask,
+                        ));
+                        self.mark_config_dirty();
                     }
                 });
-                if !supported {
-                    theme::hint(ui, "unsupported on this adapter", theme::TEXT_DISABLED);
-                }
-            },
-        );
+            });
+        }
 
         const CULL: [(CullDebugMode, &str); 2] = [
             (CullDebugMode::Off, "Off"),
@@ -2943,6 +3085,27 @@ impl App {
 
     // --------------------------------------------------------------- rows --
 
+    pub(super) fn set_world_lighting_quality(&mut self, target: usize) {
+        match target.min(2) {
+            0 => {
+                // Preserve vertex_lighting while disabled so r_fullbright can
+                // be used as a true A/B master without forgetting the chosen
+                // enabled path.
+                self.video.world_lighting = false;
+            }
+            1 => {
+                self.video.world_lighting = true;
+                self.video.vertex_lighting = true;
+            }
+            _ => {
+                self.video.world_lighting = true;
+                self.video.vertex_lighting = false;
+            }
+        }
+        self.sync_classic_world_lighting();
+        self.mark_config_dirty();
+    }
+
     fn egui_toggle_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -3050,6 +3213,29 @@ fn segmented_row<T: Copy + PartialEq>(
             ui.add_space(3.0);
         }
         selected
+    })
+}
+
+/// Ordered options that may have no active value. This is used for quality
+/// presets because changing any preset-owned cvar puts the row into a real
+/// Custom state instead of pretending one of the four presets is still active.
+fn optional_quality_table_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    reset: theme::Reset,
+    current: Option<T>,
+    options: &[(T, &str)],
+) -> Option<usize> {
+    let index = current.and_then(|value| {
+        options
+            .iter()
+            .position(|(candidate, _)| *candidate == value)
+    });
+    let labels: Vec<&str> = options.iter().map(|(_, text)| *text).collect();
+    theme::row(ui, label, tip, reset, |ui| {
+        let width = theme::track_width(ui);
+        theme::quality_meter_optional(ui, index, &labels, width, "Custom")
     })
 }
 
@@ -3187,6 +3373,9 @@ impl App {
                 self.render_command(RenderCommand::SetVsync(self.video.vsync));
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_MAX_FRAME_LATENCY => {
+                self.set_max_frame_latency(defaults.max_frame_latency);
+            }
             ui::VIDEO_ROW_QUALITY_PRESET => self.apply_quality_preset(QualityPreset::Low),
             ui::VIDEO_ROW_FPS_CAP => self.set_fps_cap(defaults.fps_cap),
             ui::VIDEO_ROW_PHYSICS_FPS => self.set_physics_msec(defaults.physics_msec),
@@ -3252,6 +3441,7 @@ impl App {
             }
             ui::VIDEO_ROW_WORLD_LIGHTING => {
                 self.video.world_lighting = defaults.world_lighting;
+                self.video.vertex_lighting = defaults.vertex_lighting;
                 self.sync_classic_world_lighting();
                 self.mark_config_dirty();
             }
@@ -3395,8 +3585,8 @@ impl App {
             ui::VIDEO_ROW_COLOR_LUT => self.set_color_lut(defaults.color_lut),
             ui::VIDEO_ROW_LUT_STRENGTH => self.set_color_lut_strength(defaults.color_lut_strength),
             ui::VIDEO_ROW_WIREFRAME => {
-                self.video.show_wireframe = defaults.show_wireframe;
-                self.render_command(RenderCommand::SetWireframe(self.video.show_wireframe));
+                self.video.wireframe_mask = defaults.wireframe_mask;
+                self.render_command(RenderCommand::SetWireframeMask(self.video.wireframe_mask));
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_CULL_DEBUG => {

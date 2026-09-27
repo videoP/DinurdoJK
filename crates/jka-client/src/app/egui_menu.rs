@@ -124,7 +124,7 @@ impl App {
             && self.overlay == OverlayMode::Console;
         (blocking_download_ui
             || asset_viewer_behind_console
-            || matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::HudEdit | OverlayMode::MapEdit))
+            || matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit))
             && self.video_confirmation.is_none()
             && (blocking_download_ui || self.loading.is_none())
             && !self.video.skip_ui
@@ -171,6 +171,13 @@ impl App {
             let response = state.on_window_event(window, event);
             self.egui_repaint_requested |= response.repaint;
             return response.consumed;
+        }
+
+        // VGS keyboard ownership is the TaystJK ownerdraw hotkey table rather
+        // than egui focus/navigation. Feed every key back to the raw handler;
+        // pointer events still belong to the egui-rendered menu.
+        if self.overlay == OverlayMode::Vgs && matches!(event, WindowEvent::KeyboardInput { .. }) {
+            return false;
         }
 
         // While capturing a bind, the raw event must reach `bind_control_key`
@@ -632,6 +639,10 @@ impl App {
             self.egui_download_dialog(ui);
             return;
         }
+        if self.overlay == OverlayMode::Vgs {
+            self.egui_vgs_menu(ui);
+            return;
+        }
         if self.overlay == OverlayMode::HudEdit {
             self.egui_hud_editor(ui);
             return;
@@ -650,6 +661,52 @@ impl App {
         }
         self.egui_footer(ui);
         self.egui_body(ui);
+    }
+
+    fn egui_vgs_menu(&mut self, root: &mut egui::Ui) {
+        let menu = self.vgs_menu;
+        let mut action = None;
+        let area = egui::Area::new(egui::Id::new("tayst_vgs"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(18.0, 28.0))
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_width(250.0);
+                        theme::page_title(
+                            ui,
+                            "VGS",
+                            if menu == crate::vgs::Menu::Main { "" } else { menu.title() },
+                        );
+                        for item in menu.items() {
+                            if theme::ghost_button(ui, item.label).clicked() {
+                                action = Some(item.action);
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+            });
+
+        // TaystJK's menuDef uses outOfBoundsClick and closes the entire VGS
+        // menu, just like Escape. Preserve that rather than inventing a back
+        // stack for nested groups.
+        let clicked_outside = root.ctx().input(|input| {
+            input.pointer.any_pressed()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|pos| !area.response.rect.contains(pos))
+        });
+
+        if let Some(action) = action {
+            self.activate_vgs_action(action);
+        } else if clicked_outside {
+            self.vgs_menu = crate::vgs::Menu::Main;
+            self.set_overlay(OverlayMode::None);
+        }
     }
 
     fn egui_hud_editor(&mut self, root: &mut egui::Ui) {
@@ -3353,6 +3410,20 @@ impl App {
         self.publish_ui();
     }
 
+    pub(super) fn remembered_in_game_menu_overlay(&mut self) -> OverlayMode {
+        // All top-level destinations share the same remembered selection.
+        // Setup is the one exception in rendering only: its body lives in the
+        // Video overlay, so reopening it must not route through egui_page()'s
+        // normal Game-page switch.
+        if self.menu_selected == TOP_SETUP {
+            return OverlayMode::Video;
+        }
+        if self.menu_selected >= TOP_ITEMS.len() {
+            self.menu_selected = TOP_RESUME;
+        }
+        OverlayMode::Game
+    }
+
     fn egui_setup_tabs(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("jka_setup_tabs")
             .exact_size(theme::TAB_BAR_H)
@@ -3543,12 +3614,7 @@ impl App {
                 "Server and gametype vote actions.",
                 &["Call a map or gametype vote", "Kick and mute votes"],
             ),
-            6 => placeholder(
-                ui,
-                "MOD",
-                "Mod-specific menu slot.",
-                &["Populated by the active mod"],
-            ),
+            6 => self.egui_mod_settings(ui),
             _ => {}
         }
     }
@@ -3807,6 +3873,18 @@ impl App {
             |ui| {
                 if let Some(enabled) = theme::switch(ui, self.video.input_subframe) {
                     self.set_input_subframe(enabled);
+                    self.egui_repaint_requested = true;
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Late-latched view",
+            "cl_input_latelatch. Experimental A/B switch. Requires subframe input; the render thread resamples the newest real view orientation at the latest point that is still coherent with camera-dependent work. No mouse prediction or extra physics ticks.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.input_latelatch) {
+                    self.set_input_latelatch(enabled);
                     self.egui_repaint_requested = true;
                 }
             },

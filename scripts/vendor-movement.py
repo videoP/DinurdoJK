@@ -13,6 +13,9 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = "1a6a643427aa347553e9073dac5570b33337c4d9"
 DEST = ROOT / "crates/jka-movement/vendor/openjk"
+REPOSITORY = "https://github.com/JACoders/OpenJK"
+ARCHIVE = ROOT / "target/openjk-stock.zip"
+PREFIX = "OpenJK-" + REVISION + "/"
 SOURCES = [
     "LICENSE.txt",
     "codemp/game/bg_pmove.c", "codemp/game/bg_slidemove.c",
@@ -29,6 +32,21 @@ SOURCES = [
     "codemp/game/g_client.c", "codemp/game/g_active.c",
 ]
 
+if "--japro" in sys.argv:
+    REVISION = "b35ed06fec41c53644352743c6b199a5d5d500f3"
+    DEST = ROOT / "crates/jka-movement/vendor/japro"
+    REPOSITORY = "https://github.com/taysta/TaystJK"
+    ARCHIVE = ROOT / "target/taystjk-client.zip"
+    PREFIX = "TaystJK-" + REVISION + "/"
+    SOURCES = [
+        "LICENSE.txt", "codemp/cgame/cg_local.h", "codemp/cgame/animtable.h",
+        "codemp/game/bg_pmove.c", "codemp/game/bg_slidemove.c",
+        "codemp/game/bg_panimate.c", "codemp/game/bg_saber.c",
+        "codemp/game/bg_misc.c", "codemp/game/bg_weapons.c",
+        "shared/qcommon/q_math.c", "codemp/qcommon/q_shared.c",
+        "shared/qcommon/q_string.c",
+    ]
+
 
 def main():
     if "--check" in sys.argv:
@@ -37,10 +55,10 @@ def main():
             actual = hashlib.sha256((DEST / item["path"]).read_bytes()).hexdigest()
             if actual != item["sha256"]:
                 raise ValueError("Modified vendor source: " + item["path"])
-        print(f"Verified {len(manifest['files'])} byte-identical OpenJK files at {manifest['revision']}.")
+        print(f"Verified {len(manifest['files'])} byte-identical files at {manifest['revision']}.")
         return
-    with zipfile.ZipFile(ROOT / "target/openjk-stock.zip") as archive:
-        prefix = "OpenJK-" + REVISION + "/"
+    with zipfile.ZipFile(ARCHIVE) as archive:
+        prefix = PREFIX
         available = {n[len(prefix):]: n for n in archive.namelist() if n.startswith(prefix)}
         pending = SOURCES.copy()
         copied = {}
@@ -72,7 +90,7 @@ def main():
                         pending.append(candidate)
                         break
         (DEST / "manifest.json").write_text(json.dumps({
-            "repository": "https://github.com/JACoders/OpenJK",
+            "repository": REPOSITORY,
             "revision": REVISION,
             "files": [{"path": p, "sha256": h} for p, h in sorted(copied.items())],
         }, indent=2) + "\n")

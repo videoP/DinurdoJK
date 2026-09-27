@@ -38,6 +38,7 @@ mod surface_deformation;
 mod steam_audio;
 mod thread_activity;
 mod ui;
+mod vgs;
 mod weather;
 
 use runtime::UserEvent;
@@ -183,7 +184,22 @@ fn main() -> std::process::ExitCode {
     if options.validate {
         let label = options.source.label();
         println!("Validating {label}...");
-        return match scene::prepare_source(&options.base, game_dir.as_deref(), &options.source) {
+        // JKA_AUDIT_LOW=1 mirrors r_reflectionQuality low + r_pbr 0 so the AUTO 4
+        // audit measures the same batch topology the client builds in game.
+        let prepared = match (&options.source, std::env::var_os("JKA_AUDIT_LOW")) {
+            (scene::MapSource::Bsp(name), Some(_)) => scene::prepare_with_options(
+                &options.base,
+                game_dir.as_deref(),
+                name,
+                scene::MapPrepareOptions {
+                    planar_reflections: false,
+                    pbr_materials: false,
+                    ..Default::default()
+                },
+            ),
+            _ => scene::prepare_source(&options.base, game_dir.as_deref(), &options.source),
+        };
+        return match prepared {
             Ok(map) => {
                 println!(
                     "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
@@ -217,6 +233,9 @@ fn main() -> std::process::ExitCode {
                         stats.reconstruction_ms,
                         stats.worker_count,
                     );
+                }
+                for line in scene::auto4_audit_lines(&map) {
+                    println!("{line}");
                 }
                 // Ocean promotion audit: which authored faces become the FFT
                 // water plane. Only an upward-facing horizontal face qualifies;

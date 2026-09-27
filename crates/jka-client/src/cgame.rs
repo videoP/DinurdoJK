@@ -157,6 +157,7 @@ impl ClientInfo {
 }
 
 const MAX_GENTITIES: usize = 1024;
+const MAX_CLIENTS: usize = 32;
 const EF_TELEPORT_BIT: i32 = 1 << 3;
 const SNAPFLAG_SERVERCOUNT: u8 = 1 << 2;
 const DEFAULT_GRAVITY: f32 = 800.0;
@@ -600,11 +601,59 @@ impl ClientGameState {
         Ok(())
     }
 
+    /// TaystJK `EV_VOICECMD_SOUND`: the server only sends the accepted voice
+    /// event.  The cgame turns that event into the teammate chat-box line; it
+    /// is not a separate `chat`/`tchat` server command.
+    fn vgs_chat_notice(&self, event: &PresentationEvent) -> Option<CgameNotice> {
+        if event.event != 75 { // EV_VOICECMD_SOUND
+            return None;
+        }
+
+        let speaker = usize::try_from(event.state.field_i32("groundEntityNum")?).ok()?;
+        if speaker >= MAX_CLIENTS {
+            return None;
+        }
+
+        let sound = self.sound_qpath(event.parm)?;
+        let description = crate::vgs::description_for_sound(&sound)?;
+
+        let snapshot = self.current_snapshot.as_ref()?;
+        let local_client = usize::try_from(snapshot.player_state.field_i32("clientNum")?).ok()?;
+        if local_client >= MAX_CLIENTS {
+            return None;
+        }
+
+        let speaker_info = self.configstring(CS_PLAYERS.checked_add(u16::try_from(speaker).ok()?)?)?;
+        let local_info = self.configstring(CS_PLAYERS.checked_add(u16::try_from(local_client).ok()?)?)?;
+        let speaker_team = info_value(speaker_info, b"t").and_then(parse_i32_ascii)?;
+        let local_team = info_value(local_info, b"t").and_then(parse_i32_ascii)?;
+        if speaker_team != local_team {
+            return None;
+        }
+
+        let speaker_name = info_value(speaker_info, b"n")?;
+        if speaker_name.is_empty() {
+            return None;
+        }
+
+        let mut text = Vec::with_capacity(speaker_name.len() + description.len() + 4);
+        text.extend_from_slice(speaker_name);
+        text.extend_from_slice(b"^7: ");
+        text.extend_from_slice(description.as_bytes());
+        Some(CgameNotice::Chat { team: true, text })
+    }
+
     /// Events are generated on snapshot transitions just like `CG_CheckEvents`,
     /// then drained by the presentation/audio layer.  Keeping them out of the
     /// renderer makes seek/replay and future live networking share one lifecycle.
     pub fn drain_presentation_events(&mut self) -> Vec<PresentationEvent> {
-        self.pending_events.drain(..).collect()
+        let events: Vec<_> = self.pending_events.drain(..).collect();
+        for event in &events {
+            if let Some(notice) = self.vgs_chat_notice(event) {
+                self.notices.push_back(notice);
+            }
+        }
+        events
     }
 
     pub fn drain_event_check_traces(&mut self) -> Vec<EventCheckTrace> {

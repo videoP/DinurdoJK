@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::{
-    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex},
+    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex},
     scene,
 };
 
@@ -202,6 +202,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
     }
     Some(DynamicModelSurface {
         entity_num: flash.entity_num,
+        wireframe_class: DynamicWireframeClass::Effect,
         vertices: Arc::new(vertices),
         indices: Arc::new(indices),
         lighting_origin: None,

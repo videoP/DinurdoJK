@@ -177,10 +177,44 @@ pub struct DrawBatch {
     /// Camera-cluster visibility signature. Bit N is set when this batch may be
     /// visible from BSP cluster N. Empty for sources without compiled PVS.
     pub pvs_signature: Vec<u64>,
+    /// BSP cluster/portal membership for AUTO 4's map-load draw-plan builder.
+    /// Bit N means some geometry in this batch is referenced by cluster N.
+    /// Unlike `pvs_signature` this describes where the geometry belongs, not
+    /// which camera clusters can potentially see it. Empty for representations
+    /// that are not portal-granular.
+    pub portal_signature: Vec<u64>,
     /// Portal-area membership. Bit N means some geometry in this batch belongs
     /// to BSP area N. All-zero means unknown/not-applicable and is therefore
     /// treated conservatively as visible.
     pub area_signature: [u64; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreparedPortalPlanBatchRef {
+    Base(usize),
+    Merged(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPortalMergedVariant {
+    pub representative: usize,
+    pub members: Vec<usize>,
+    pub area_signature: [u64; 4],
+    pub pvs_signature: Vec<u64>,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreparedPortalDrawPlan {
+    pub variants: Vec<PreparedPortalMergedVariant>,
+    /// Unique static-world recipes. `plan_by_cluster` maps every BSP cluster to
+    /// one entry here, so identical PVS rows never duplicate recipe storage.
+    pub plans: Vec<Vec<PreparedPortalPlanBatchRef>>,
+    pub plan_by_cluster: Vec<usize>,
+    pub packed_index_count: usize,
+    pub reused_variant_hits: usize,
+    pub reused_plan_hits: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -382,6 +416,7 @@ pub struct MapLoadTimings {
     pub gi_ms: f64,
     pub ocean_ms: f64,
     pub steam_audio_ms: f64,
+    pub portal_plans_ms: f64,
     pub worker_count: usize,
 }
 
@@ -399,6 +434,10 @@ pub struct MapPrepareOptions {
     /// ordinary opaque geometry; enabling the planar reflection path therefore
     /// requires a map/renderer restart.
     pub planar_reflections: bool,
+    /// Cold-path material specialization for the absolute lowest reflection
+    /// quality. When true, authored tcGen environment stages are omitted while
+    /// preparing materials instead of surviving as legacy sphere-map passes.
+    pub omit_environment_stages: bool,
     /// Source `.map` only: split ordinary opaque material batches into the
     /// Radiant-style 1024-unit spatial grid. This is only profitable when the
     /// renderer can consume those chunks through its GPU-driven indirect path;
@@ -428,6 +467,7 @@ impl Default for MapPrepareOptions {
             gen_normal_maps: false,
             float_lightmap: false,
             planar_reflections: true,
+            omit_environment_stages: false,
             source_spatial_batches: false,
             pbr_materials: true,
             allow_asset_overrides: true,
@@ -802,6 +842,14 @@ pub struct PreparedMap {
     /// Exact PVS-signature sub-batches. They reference subranges of the same
     /// vertex buffer as `batches`, so FULL/AUTO do not duplicate world vertices.
     pub pvs_batches: Vec<DrawBatch>,
+    /// AUTO 4 base batches, split by the BSP clusters/leaves that own the
+    /// geometry. They reference subranges of the same `vertices` buffer and are
+    /// used only to build precomputed per-cluster draw plans.
+    pub portal_batches: Vec<DrawBatch>,
+    /// AUTO 4's immutable per-cluster draw recipes, generated on the map-load
+    /// worker. The renderer only materializes their preselected merged index
+    /// ranges and uploads GPU resources.
+    pub portal_draw_plan: PreparedPortalDrawPlan,
     /// Inline BSP model (`*N`) render vertices at their compiled positions.
     /// Kept apart from `vertices` so static AO/GI/snow never see geometry that
     /// CGame moves at runtime.
@@ -932,10 +980,17 @@ pub struct MaterialDebugEntry {
 
 #[derive(Default)]
 struct Geometry {
-    /// Exact PVS pieces inside one coarse material/lightmap batch. Keeping them
-    /// nested lets OFF/MINIMAL draw one contiguous range while FULL draws the
-    /// subranges, all from the same GPU vertex buffer.
-    by_pvs_signature: BTreeMap<(Vec<u64>, [u64; 4]), Vec<GpuVertex>>,
+    /// Exact PVS pieces inside one coarse material/lightmap batch. Each PVS
+    /// piece is further split by the BSP clusters/leaves that actually own the
+    /// geometry. The nested order keeps the original FULL range contiguous while
+    /// also exposing smaller portal-owned subranges for AUTO 4 without duplicating
+    /// world vertices.
+    by_pvs_signature: BTreeMap<(Vec<u64>, [u64; 4]), PortalGeometry>,
+}
+
+#[derive(Default)]
+struct PortalGeometry {
+    by_portal_signature: BTreeMap<Vec<u64>, Vec<GpuVertex>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1924,6 +1979,42 @@ fn class_for(material: &SurfaceMaterial) -> DrawClass {
     }
 }
 
+/// True when the authored alpha-test stage can never survive its own alpha
+/// cutoff. Texture alpha is normalized to [0, 1], so a constant alpha below
+/// the cutoff remains below it after multiplication by any sampled texel.
+///
+/// Keep this deliberately narrow: it recognizes a mathematically guaranteed
+/// discard, not merely a stage that "looks invisible" for common content.
+fn stage_is_guaranteed_alpha_discard(stage: &MaterialStage) -> bool {
+    matches!(stage.alpha_gen, AlphaGen::Const)
+        && stage.alpha_cutoff > 0.0
+        && stage.opacity < stage.alpha_cutoff
+}
+
+/// Map-load-only render cull for explicit shader geometry whose ordinary
+/// stages are all guaranteed to alpha-discard. The BSP surface itself remains
+/// intact so compile/runtime semantics that consume its triangles first (for
+/// example q3map_surfacelight extraction) are preserved.
+fn material_render_is_guaranteed_discarded(
+    material: &SurfaceMaterial,
+    vertex_lit: bool,
+) -> bool {
+    if !material.explicit
+        || material.sky
+        || material.water
+        || material.planar_reflection
+        || material.grass.is_some()
+        || !material.surface_sprite_effects.is_empty()
+        || material.stages.is_empty()
+    {
+        return false;
+    }
+
+    prepared_stages(material, vertex_lit)
+        .iter()
+        .all(stage_is_guaranteed_alpha_discard)
+}
+
 fn blend_for(stage: &MaterialStage) -> BlendMode {
     stage
         .blend
@@ -2006,6 +2097,7 @@ fn stage_batch(
     material_debug_index: Option<usize>,
     lightmap: Option<usize>,
     pvs_signature: &[u64],
+    portal_signature: &[u64],
     area_signature: [u64; 4],
     fog: [f32; 4],
     fog_is_global: bool,
@@ -2075,6 +2167,7 @@ fn stage_batch(
         reflection_cache_flags: 0,
         reflection_roughness_hint: 1.0,
         pvs_signature: pvs_signature.to_vec(),
+        portal_signature: portal_signature.to_vec(),
         area_signature,
     }
 }
@@ -2087,6 +2180,547 @@ fn pvs_signature(vis: &Visibility, target_clusters: &[usize]) -> Vec<u64> {
         }
     }
     signature
+}
+
+fn portal_signature(vis: &Visibility, target_clusters: &[usize]) -> Vec<u64> {
+    let mut signature = vec![0_u64; vis.clusters.div_ceil(64)];
+    for &cluster in target_clusters {
+        if cluster < vis.clusters {
+            signature[cluster / 64] |= 1_u64 << (cluster % 64);
+        }
+    }
+    signature
+}
+
+const AUTO4_MERGE_MAX_EXTENT: f32 = 4096.0;
+const AUTO4_MERGE_MAX_MEMBERS: usize = 64;
+
+fn portal_batch_visible_from_cluster(source: &DrawBatch, cluster: usize) -> bool {
+    if source.pvs_signature.is_empty() {
+        return true;
+    }
+    source
+        .pvs_signature
+        .get(cluster / 64)
+        .is_some_and(|word| word & (1_u64 << (cluster % 64)) != 0)
+}
+
+fn auto4_merge_safe(source: &DrawBatch) -> bool {
+    matches!(source.pipeline.class, DrawClass::Opaque | DrawClass::Mask)
+        && !source.water
+        && !source.water_primary
+        && source.authored_ocean.is_none()
+        && !source.planar_reflection
+        && !source.planar_environment_candidate
+}
+
+fn auto4_source_bounds(source: &DrawBatch, vertices: &[GpuVertex]) -> ([f32; 3], [f32; 3]) {
+    let start = usize::try_from(source.vertices.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(source.vertices.end)
+        .unwrap_or(usize::MAX)
+        .min(vertices.len());
+    if start >= end {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for vertex in &vertices[start..end] {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(vertex.position[axis]);
+            maximum[axis] = maximum[axis].max(vertex.position[axis]);
+        }
+    }
+    (minimum, maximum)
+}
+
+fn auto4_union_bounds(
+    a_min: [f32; 3],
+    a_max: [f32; 3],
+    b_min: [f32; 3],
+    b_max: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let mut minimum = a_min;
+    let mut maximum = a_max;
+    for axis in 0..3 {
+        minimum[axis] = minimum[axis].min(b_min[axis]);
+        maximum[axis] = maximum[axis].max(b_max[axis]);
+    }
+    (minimum, maximum)
+}
+
+fn auto4_bounds_extent_ok(minimum: [f32; 3], maximum: [f32; 3]) -> bool {
+    (0..3).all(|axis| maximum[axis] - minimum[axis] <= AUTO4_MERGE_MAX_EXTENT)
+}
+
+pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
+    // AUTO 4 and the renderer's multi-draw compactor must use one authoritative
+    // compatibility test: a representative bind group/pipeline is only valid
+    // when every draw-relevant field below matches.
+    if a.planar_reflection
+        || b.planar_reflection
+        || a.planar_environment_candidate
+        || b.planar_environment_candidate
+    {
+        return false;
+    }
+    a.pipeline == b.pipeline
+        && a.texture == b.texture
+        && a.texture_is_lightmap == b.texture_is_lightmap
+        && a.texture_is_white == b.texture_is_white
+        && a.normal_texture == b.normal_texture
+        && a.roughness_texture == b.roughness_texture
+        && a.height_texture == b.height_texture
+        && a.metallic_texture == b.metallic_texture
+        && a.specular_texture == b.specular_texture
+        && a.emissive_texture == b.emissive_texture
+        && a.height_from_alpha == b.height_from_alpha
+        && a.rmo_packed == b.rmo_packed
+        && a.rmo_specular_alpha == b.rmo_specular_alpha
+        && a.normal_scale == b.normal_scale
+        && a.roughness_override == b.roughness_override
+        && a.specular_reflectance == b.specular_reflectance
+        && a.parallax_depth == b.parallax_depth
+        && a.lightmap == b.lightmap
+        && a.modulate_lightmap == b.modulate_lightmap
+        && a.vertex_lit == b.vertex_lit
+        && a.tc_gen == b.tc_gen
+        && a.tc_mods == b.tc_mods
+        && a.rgb_gen == b.rgb_gen
+        && a.alpha_gen == b.alpha_gen
+        && a.color == b.color
+        && a.alpha_cutoff == b.alpha_cutoff
+        && a.fog == b.fog
+        && a.fog_is_global == b.fog_is_global
+        && a.fog_color_override == b.fog_color_override
+        && a.legacy2_fog_in_stage_safe == b.legacy2_fog_in_stage_safe
+        && a.global_fog_post_eligible == b.global_fog_post_eligible
+        && a.skybox == b.skybox
+}
+
+/// Build AUTO 4's immutable cluster -> draw-recipe table while the map is still
+/// on the CPU preparation path. The renderer must not rediscover PVS membership
+/// or compatible groups. `Merged` member lists are canonical recipes: runtime
+/// may physically collapse them lazily, while their base members remain the
+/// immediate no-hitch fallback.
+fn build_prepared_portal_draw_plan<F>(
+    portal_sources: &[DrawBatch],
+    visibility: &Visibility,
+    vertices: &[GpuVertex],
+    mut progress: F,
+) -> PreparedPortalDrawPlan
+where
+    F: FnMut(u32),
+{
+    let cluster_count = visibility.clusters;
+    if cluster_count == 0 || portal_sources.is_empty() {
+        return PreparedPortalDrawPlan::default();
+    }
+
+    #[derive(Debug)]
+    struct Candidate {
+        members: Vec<usize>,
+        bounds_min: [f32; 3],
+        bounds_max: [f32; 3],
+    }
+
+    let bounds = portal_sources
+        .iter()
+        .map(|source| auto4_source_bounds(source, vertices))
+        .collect::<Vec<_>>();
+    let mut variants = Vec::<PreparedPortalMergedVariant>::new();
+    let mut variant_lookup = BTreeMap::<Vec<usize>, usize>::new();
+    let mut unique_plans = Vec::<Vec<PreparedPortalPlanBatchRef>>::new();
+    let mut plan_lookup = BTreeMap::<Vec<PreparedPortalPlanBatchRef>, usize>::new();
+    let mut plan_by_cluster = Vec::with_capacity(cluster_count);
+    let mut packed_index_count = 0usize;
+    let mut reused_variant_hits = 0usize;
+    let mut reused_plan_hits = 0usize;
+    let pvs_words = cluster_count.div_ceil(64);
+    // Keep loading-screen traffic bounded on maps with hundreds/thousands of
+    // clusters while still providing smooth enough progress feedback.
+    let progress_stride = cluster_count.div_ceil(128).max(1);
+
+    for cluster in 0..cluster_count {
+        let mut candidates = Vec::<Candidate>::new();
+        let mut singles = Vec::<usize>::new();
+
+        for (batch_index, source) in portal_sources.iter().enumerate() {
+            if !portal_batch_visible_from_cluster(source, cluster) {
+                continue;
+            }
+            if !auto4_merge_safe(source) {
+                singles.push(batch_index);
+                continue;
+            }
+
+            let (batch_min, batch_max) = bounds[batch_index];
+            let mut matched = false;
+            for candidate in &mut candidates {
+                if candidate.members.len() >= AUTO4_MERGE_MAX_MEMBERS {
+                    continue;
+                }
+                let representative = candidate.members[0];
+                let representative_source = &portal_sources[representative];
+                if representative_source.area_signature != source.area_signature
+                    || !draw_batches_share_state(representative_source, source)
+                {
+                    continue;
+                }
+                let (merged_min, merged_max) = auto4_union_bounds(
+                    candidate.bounds_min,
+                    candidate.bounds_max,
+                    batch_min,
+                    batch_max,
+                );
+                if !auto4_bounds_extent_ok(merged_min, merged_max) {
+                    continue;
+                }
+                candidate.members.push(batch_index);
+                candidate.bounds_min = merged_min;
+                candidate.bounds_max = merged_max;
+                matched = true;
+                break;
+            }
+            if !matched {
+                candidates.push(Candidate {
+                    members: vec![batch_index],
+                    bounds_min: batch_min,
+                    bounds_max: batch_max,
+                });
+            }
+        }
+
+        let mut ordered = Vec::<(usize, PreparedPortalPlanBatchRef)>::new();
+        for batch_index in singles {
+            ordered.push((batch_index, PreparedPortalPlanBatchRef::Base(batch_index)));
+        }
+        for candidate in candidates {
+            let first = candidate.members[0];
+            if candidate.members.len() == 1 {
+                ordered.push((first, PreparedPortalPlanBatchRef::Base(first)));
+                continue;
+            }
+
+            let key = candidate.members.clone();
+            let variant = if let Some(&variant) = variant_lookup.get(&key) {
+                reused_variant_hits = reused_variant_hits.saturating_add(1);
+                if let Some(signature) = variants.get_mut(variant).map(|v| &mut v.pvs_signature) {
+                    if let Some(word) = signature.get_mut(cluster / 64) {
+                        *word |= 1_u64 << (cluster % 64);
+                    }
+                }
+                variant
+            } else {
+                let representative = candidate.members[0];
+                packed_index_count = packed_index_count.saturating_add(
+                    candidate
+                        .members
+                        .iter()
+                        .map(|&member| {
+                            let source = &portal_sources[member];
+                            source.vertices.end.saturating_sub(source.vertices.start) as usize
+                        })
+                        .sum::<usize>(),
+                );
+                let mut pvs_signature = vec![0_u64; pvs_words];
+                pvs_signature[cluster / 64] |= 1_u64 << (cluster % 64);
+                let variant = variants.len();
+                variants.push(PreparedPortalMergedVariant {
+                    representative,
+                    members: candidate.members.clone(),
+                    area_signature: portal_sources[representative].area_signature,
+                    pvs_signature,
+                    bounds_min: candidate.bounds_min,
+                    bounds_max: candidate.bounds_max,
+                });
+                variant_lookup.insert(key, variant);
+                variant
+            };
+            ordered.push((first, PreparedPortalPlanBatchRef::Merged(variant)));
+        }
+        ordered.sort_unstable_by_key(|(first, _)| *first);
+        let refs = ordered
+            .into_iter()
+            .map(|(_, reference)| reference)
+            .collect::<Vec<_>>();
+        let plan_id = if let Some(&plan_id) = plan_lookup.get(&refs) {
+            reused_plan_hits = reused_plan_hits.saturating_add(1);
+            plan_id
+        } else {
+            let plan_id = unique_plans.len();
+            unique_plans.push(refs.clone());
+            plan_lookup.insert(refs, plan_id);
+            plan_id
+        };
+        plan_by_cluster.push(plan_id);
+
+        let completed = cluster + 1;
+        if completed == cluster_count || completed % progress_stride == 0 {
+            progress(u32::try_from(completed).unwrap_or(u32::MAX));
+        }
+    }
+
+    PreparedPortalDrawPlan {
+        variants,
+        plans: unique_plans,
+        plan_by_cluster,
+        packed_index_count,
+        reused_variant_hits,
+        reused_plan_hits,
+    }
+}
+
+/// Offline AUTO 4 audit for `--validate-map`. For every camera cluster it
+/// compares MINIMAL, FULL, the current AUTO 4 recipe and the ideal recipe
+/// (exact PVS-visible FULL pieces rebatched purely by draw-state class), and
+/// attributes every AUTO 4 draw above the ideal to the rule that caused it.
+pub fn auto4_audit_lines(map: &PreparedMap) -> Vec<String> {
+    let plan = &map.portal_draw_plan;
+    let cluster_count = plan.plan_by_cluster.len();
+    if cluster_count == 0 {
+        return vec!["AUTO 4 audit: no compiled PVS / no AUTO 4 plan".into()];
+    }
+    let tris = |batch: &DrawBatch| u64::from(batch.vertices.end.saturating_sub(batch.vertices.start) / 3);
+
+    // Global draw-state class ids, shared by FULL and portal pieces so "ideal"
+    // and "current" are measured against the renderer's own compatibility key.
+    fn classify(batch: &DrawBatch, reps: &mut Vec<DrawBatch>) -> usize {
+        if let Some(id) = reps.iter().position(|rep| draw_batches_share_state(rep, batch)) {
+            id
+        } else {
+            reps.push(batch.clone());
+            reps.len() - 1
+        }
+    }
+    let mut reps = Vec::<DrawBatch>::new();
+    let full_class = map.pvs_batches.iter().map(|b| classify(b, &mut reps)).collect::<Vec<_>>();
+    let portal_class = map.portal_batches.iter().map(|b| classify(b, &mut reps)).collect::<Vec<_>>();
+    let class_count = reps.len();
+    // Relaxed keys for "what if the binding model changed": lightmap page moved
+    // into a texture array (lightmap ignored), and fully bindless materials
+    // (only the fixed-function PipelineKey remains).
+    let mut reps_nolm = Vec::<DrawBatch>::new();
+    let full_class_nolm = map
+        .pvs_batches
+        .iter()
+        .map(|b| {
+            let mut probe = b.clone();
+            probe.lightmap = None;
+            classify(&probe, &mut reps_nolm)
+        })
+        .collect::<Vec<_>>();
+    let mut pipelines = Vec::<PipelineKey>::new();
+    let full_pipeline = map
+        .pvs_batches
+        .iter()
+        .map(|b| {
+            pipelines.iter().position(|p| *p == b.pipeline).unwrap_or_else(|| {
+                pipelines.push(b.pipeline);
+                pipelines.len() - 1
+            })
+        })
+        .collect::<Vec<_>>();
+
+    #[derive(Default, Clone, Copy)]
+    struct Sum {
+        draws: u64,
+        tris: u64,
+        max_draws: u64,
+        max_tris: u64,
+    }
+    impl Sum {
+        fn add(&mut self, draws: u64, tris: u64) {
+            self.draws += draws;
+            self.tris += tris;
+            self.max_draws = self.max_draws.max(draws);
+            self.max_tris = self.max_tris.max(tris);
+        }
+    }
+    let mut minimal = Sum::default();
+    let mut minimal_mergeable = 0u64;
+    let mut full = Sum::default();
+    let mut auto4_warm = Sum::default();
+    let mut auto4_cold = Sum::default();
+    let mut ideal = Sum::default();
+    let mut ideal_nolm = 0u64;
+    let mut ideal_bindless = 0u64;
+    let (mut excess_unmergeable, mut excess_area, mut excess_spatial_cap) = (0u64, 0u64, 0u64);
+    // Ideal recipe memory: unique (class, visible FULL piece set) pairs that
+    // are not "everything in this class", and how many are one contiguous run.
+    let mut ideal_recipes = BTreeSet::<(usize, Vec<usize>)>::new();
+    let class_full_members = {
+        let mut members = vec![Vec::<usize>::new(); class_count];
+        for (index, &class) in full_class.iter().enumerate() {
+            if auto4_merge_safe(&map.pvs_batches[index]) {
+                members[class].push(index);
+            }
+        }
+        members
+    };
+    let mut worst = (0u64, 0usize);
+    let mut rows = Vec::<(usize, [u64; 11])>::new();
+
+    for cluster in 0..cluster_count {
+        let visible = |b: &DrawBatch| portal_batch_visible_from_cluster(b, cluster);
+        // MINIMAL: every coarse batch with any visible piece, full index range.
+        let (mut min_draws, mut min_tris, mut min_unmergeable) = (0u64, 0u64, 0u64);
+        for batch in map.batches.iter().filter(|b| visible(b)) {
+            min_draws += 1;
+            min_tris += tris(batch);
+            if !auto4_merge_safe(batch) {
+                min_unmergeable += 1;
+            }
+        }
+        minimal.add(min_draws, min_tris);
+        minimal_mergeable += min_draws - min_unmergeable;
+
+        // FULL + IDEAL. IDEAL = exact visible FULL pieces; opaque/mask merged by
+        // draw-state class (order-free under depth test), everything else kept
+        // at MINIMAL's one-draw-per-coarse-batch order with only visible pieces.
+        let mut full_by_class = vec![Vec::<usize>::new(); class_count];
+        let mut nolm = BTreeSet::<usize>::new();
+        let mut bindless = BTreeSet::<usize>::new();
+        let (mut full_draws, mut full_tris) = (0u64, 0u64);
+        for (index, batch) in map.pvs_batches.iter().enumerate().filter(|(_, b)| visible(b)) {
+            full_draws += 1;
+            full_tris += tris(batch);
+            if auto4_merge_safe(batch) {
+                full_by_class[full_class[index]].push(index);
+                nolm.insert(full_class_nolm[index]);
+                bindless.insert(full_pipeline[index]);
+            }
+        }
+        full.add(full_draws, full_tris);
+        let merge_classes = full_by_class.iter().filter(|m| !m.is_empty()).count() as u64;
+        let ideal_draws = merge_classes + min_unmergeable;
+        ideal.add(ideal_draws, full_tris);
+        ideal_nolm += nolm.len() as u64 + min_unmergeable;
+        ideal_bindless += bindless.len() as u64 + min_unmergeable;
+        for (class, members) in full_by_class.into_iter().enumerate() {
+            if !members.is_empty() && members != class_full_members[class] {
+                ideal_recipes.insert((class, members));
+            }
+        }
+
+        // Current AUTO 4 recipe for this cluster.
+        let refs = &plan.plans[plan.plan_by_cluster[cluster]];
+        let (mut warm, mut cold, mut a4_tris, mut a4_unmergeable) = (0u64, 0u64, 0u64, 0u64);
+        let mut refs_per_class = vec![0u64; class_count];
+        let mut areas_per_class = vec![BTreeSet::<[u64; 4]>::new(); class_count];
+        for reference in refs {
+            warm += 1;
+            let members: &[usize] = match reference {
+                PreparedPortalPlanBatchRef::Base(index) => std::slice::from_ref(index),
+                PreparedPortalPlanBatchRef::Merged(variant) => &plan.variants[*variant].members,
+            };
+            cold += members.len() as u64;
+            for &member in members {
+                a4_tris += tris(&map.portal_batches[member]);
+            }
+            if !auto4_merge_safe(&map.portal_batches[members[0]]) {
+                a4_unmergeable += 1;
+                continue;
+            }
+            let class = portal_class[members[0]];
+            refs_per_class[class] += 1;
+            for &member in members {
+                areas_per_class[class].insert(map.portal_batches[member].area_signature);
+            }
+        }
+        auto4_warm.add(warm, a4_tris);
+        auto4_cold.add(cold, a4_tris);
+        let row_unmergeable = a4_unmergeable.saturating_sub(min_unmergeable);
+        let (mut row_area, mut row_spatial) = (0u64, 0u64);
+        for class in 0..class_count {
+            let excess = refs_per_class[class].saturating_sub(1);
+            let area_split = (areas_per_class[class].len() as u64).saturating_sub(1).min(excess);
+            row_area += area_split;
+            row_spatial += excess - area_split;
+        }
+        excess_unmergeable += row_unmergeable;
+        excess_area += row_area;
+        excess_spatial_cap += row_spatial;
+        let excess = warm.saturating_sub(ideal_draws);
+        if excess > worst.0 {
+            worst = (excess, cluster);
+        }
+        rows.push((
+            cluster,
+            [min_draws, min_tris, full_draws, full_tris, warm, cold, a4_tris, ideal_draws,
+             row_unmergeable, row_area, row_spatial],
+        ));
+    }
+
+    let n = cluster_count as f64;
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "AUTO 4 audit: {cluster_count} cluster(s), {class_count} draw-state class(es) ({} ignoring lightmap page, {} fixed-function pipelines); {} coarse / {} full / {} portal source batch(es)",
+        reps_nolm.len(),
+        pipelines.len(),
+        map.batches.len(),
+        map.pvs_batches.len(),
+        map.portal_batches.len()
+    ));
+    for (label, sum) in [
+        ("MINIMAL", &minimal),
+        ("FULL", &full),
+        ("AUTO 4 warm", &auto4_warm),
+        ("AUTO 4 cold", &auto4_cold),
+        ("IDEAL (current key)", &ideal),
+    ] {
+        lines.push(format!(
+            "  {label:<20} avg {:7.1} draws / {:9.0} tris   max {:5} draws / {:8} tris",
+            sum.draws as f64 / n,
+            sum.tris as f64 / n,
+            sum.max_draws,
+            sum.max_tris
+        ));
+    }
+    lines.push(format!(
+        "  MINIMAL draw mix avg: {:.1} opaque/mask, {:.1} transparent/sky/water/env",
+        minimal_mergeable as f64 / n,
+        (minimal.draws - minimal_mergeable) as f64 / n,
+    ));
+    lines.push(format!(
+        "  IDEAL with lightmap texture-array avg {:.1} draws; with bindless materials avg {:.1} draws",
+        ideal_nolm as f64 / n,
+        ideal_bindless as f64 / n,
+    ));
+    lines.push(format!(
+        "  AUTO 4 warm excess over IDEAL, avg per cluster: {:.1} transparent/sky/water/env pieces never merged, {:.1} area-signature split, {:.1} spatial 4096u extent / 64-member cap",
+        excess_unmergeable as f64 / n,
+        excess_area as f64 / n,
+        excess_spatial_cap as f64 / n,
+    ));
+    let recipe_indices: u64 = ideal_recipes
+        .iter()
+        .map(|(_, members)| members.iter().map(|&m| tris(&map.pvs_batches[m]) * 3).sum::<u64>())
+        .sum();
+    let single_run = ideal_recipes
+        .iter()
+        .filter(|(_, members)| {
+            members
+                .windows(2)
+                .all(|w| map.pvs_batches[w[0]].vertices.end == map.pvs_batches[w[1]].vertices.start)
+        })
+        .count();
+    lines.push(format!(
+        "  IDEAL recipes needing new index data: {} unique ({} already one contiguous vertex run), eager cost {:.2} MiB",
+        ideal_recipes.len(),
+        single_run,
+        recipe_indices as f64 * 4.0 / (1024.0 * 1024.0)
+    ));
+    rows.sort_by_key(|(_, r)| r[3]);
+    let median = rows[rows.len() / 2];
+    let heaviest = *rows.last().unwrap();
+    let worst_row = *rows.iter().find(|(c, _)| *c == worst.1).unwrap_or(&median);
+    for (label, (cluster, r)) in [("median", median), ("heaviest", heaviest), ("worst-excess", worst_row)] {
+        lines.push(format!(
+            "  {label:<12} cluster {cluster:5}: MINIMAL {}d/{}t  FULL {}d/{}t  AUTO4 warm {}d (cold {}d)/{}t  IDEAL {}d/{}t  excess: {} unmergeable, {} area, {} spatial/cap",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[3], r[8], r[9], r[10]
+        ));
+    }
+    lines
 }
 
 fn external_lightmap_pages(mesh: &jka_assets::bsp::Mesh) -> BTreeSet<usize> {
@@ -3518,6 +4152,7 @@ fn append_material_batches(
     range: Range<u32>,
     lightmap: Option<usize>,
     pvs_signature: &[u64],
+    portal_signature: &[u64],
     area_signature: [u64; 4],
     fog: [f32; 4],
     fog_is_global: bool,
@@ -3547,6 +4182,7 @@ fn append_material_batches(
             material_debug_index,
             lightmap,
             pvs_signature,
+            portal_signature,
             area_signature,
             fog,
             fog_is_global,
@@ -3571,6 +4207,7 @@ fn append_material_batches(
             material_debug_index,
             lightmap,
             pvs_signature,
+            portal_signature,
             area_signature,
             fog,
             fog_is_global,
@@ -3603,6 +4240,7 @@ fn append_material_batches(
                 material_debug_index,
                 lightmap,
                 pvs_signature,
+                portal_signature,
                 area_signature,
                 fog,
                 fog_is_global,
@@ -3632,6 +4270,7 @@ fn append_material_batches(
             material_debug_index,
             lightmap,
             pvs_signature,
+            portal_signature,
             area_signature,
             fog,
             fog_is_global,
@@ -3650,6 +4289,7 @@ fn append_material_batches(
                 material_debug_index,
                 lightmap,
                 pvs_signature,
+                portal_signature,
                 area_signature,
                 fog,
                 fog_is_global,
@@ -3670,6 +4310,7 @@ fn append_material_batches(
             material_debug_index,
             lightmap,
             pvs_signature,
+            portal_signature,
             area_signature,
             fog,
             fog_is_global,
@@ -4261,6 +4902,15 @@ pub fn prepare(root: &Path, game: Option<&Path>, name: &str) -> Result<PreparedM
     prepare_internal(root, game, name, None, MapPrepareOptions::default())
 }
 
+pub fn prepare_with_options(
+    root: &Path,
+    game: Option<&Path>,
+    name: &str,
+    options: MapPrepareOptions,
+) -> Result<PreparedMap, String> {
+    prepare_internal(root, game, name, None, options)
+}
+
 pub fn prepare_with_jobs_options(
     root: &Path,
     game: Option<&Path>,
@@ -4557,7 +5207,11 @@ fn prepare_internal(
         .map(|shader| String::from_utf8_lossy(&shader.name).to_ascii_lowercase())
         .collect();
     if let Some(jobs) = jobs {
-        let requests = materials::primary_texture_requests(&used_shader_names, &library);
+        let requests = materials::primary_texture_requests(
+            &used_shader_names,
+            &library,
+            options.omit_environment_stages,
+        );
         textures.preload(&mut assets, &requests, jobs)?;
     }
     let material_stage = Instant::now();
@@ -4586,6 +5240,7 @@ fn prepare_internal(
                 &mut assets,
                 &mut textures,
                 options.gen_normal_maps,
+                options.omit_environment_stages,
             )
         })
         .collect();
@@ -4671,24 +5326,35 @@ fn prepare_internal(
     }
 
     let geometry_stage = Instant::now();
+    let mut alpha_discard_culled_batches = 0usize;
+    let mut alpha_discard_culled_triangles = 0usize;
+    let mut alpha_discard_culled_vertices = 0usize;
     // One BSP mesh batch -> its material/lightmap group and render vertices.
     // Shared by the world and inline models so a mover's surfaces resolve
     // lightmaps, vertex lighting and fog exactly like the world's.
-    let batch_geometry = |mesh: &jka_assets::bsp::Mesh,
-                          batch_index: usize,
-                          batch: &jka_assets::bsp::DrawBatch|
+    let mut batch_geometry = |mesh: &jka_assets::bsp::Mesh,
+                              batch_index: usize,
+                              batch: &jka_assets::bsp::DrawBatch|
      -> Option<(GroupKey, Vec<GpuVertex>)> {
         let material = &surface_materials[batch.shader];
         if material.hidden {
             return None;
         }
-        let class = class_for(material);
         let surface = &bsp.surfaces[batch.surface];
         let lightmap_slot =
             (0..4).find(|&i| batch.lightmaps[i] >= 0 && batch.lightmap_styles[i] < 254);
         let vertex_lit_slot = (0..4)
             .find(|&i| batch.lightmaps[i] == LIGHTMAP_BY_VERTEX && surface.vertex_styles[i] < 254);
         let vertex_lit = vertex_lit_slot.is_some();
+        if material_render_is_guaranteed_discarded(material, vertex_lit) {
+            alpha_discard_culled_batches += 1;
+            alpha_discard_culled_triangles += batch.indices.len() / 3;
+            // World geometry is expanded to one GPU vertex per source index,
+            // so this is the exact number of render vertices we avoid packing.
+            alpha_discard_culled_vertices += batch.indices.len();
+            return None;
+        }
+        let class = class_for(material);
         let source_lightmap = lightmap_slot
             .filter(|_| !material.sky)
             .map(|i| batch.lightmaps[i] as usize);
@@ -4779,10 +5445,13 @@ fn prepare_internal(
         let Some((key, batch_vertices)) = batch_geometry(&mesh, batch_index, batch) else {
             continue;
         };
-        let signature = bsp
+        let (signature, membership_signature) = bsp
             .visibility
             .as_ref()
-            .map(|vis| pvs_signature(vis, &vis.surface_clusters[batch.surface]))
+            .map(|vis| {
+                let targets = &vis.surface_clusters[batch.surface];
+                (pvs_signature(vis, targets), portal_signature(vis, targets))
+            })
             .unwrap_or_default();
         let area_signature = bsp
             .visibility
@@ -4796,6 +5465,9 @@ fn prepare_internal(
             .by_pvs_signature
             .entry((signature, area_signature))
             .or_default()
+            .by_portal_signature
+            .entry(membership_signature)
+            .or_default()
             .extend_from_slice(&batch_vertices);
     }
 
@@ -4803,6 +5475,7 @@ fn prepare_internal(
     let mut vertices = Vec::new();
     let mut batches = Vec::new();
     let mut pvs_batches = Vec::new();
+    let mut portal_batches = Vec::new();
     for (key, geometry) in groups {
         let material = &surface_materials[key.shader];
         let material_debug_index = bsp.shaders.get(key.shader).and_then(|shader| {
@@ -4817,10 +5490,39 @@ fn prepare_internal(
         let mut coarse_signature = Vec::<u64>::new();
         let mut coarse_area_signature = [0_u64; 4];
 
-        for ((signature, area_signature), piece_vertices) in geometry.by_pvs_signature {
+        for ((signature, area_signature), portal_geometry) in geometry.by_pvs_signature {
             let piece_start =
                 u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
-            vertices.extend_from_slice(&piece_vertices);
+
+            let (fog, fog_is_global) = resolved_bsp_surface_fog(
+                &bsp,
+                &library,
+                material,
+                key.fog_num,
+                global_fog_num,
+                global_fog,
+            );
+            for (portal_signature, portal_vertices) in portal_geometry.by_portal_signature {
+                let portal_start =
+                    u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
+                vertices.extend_from_slice(&portal_vertices);
+                let portal_end =
+                    u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
+                append_material_batches(
+                    &mut portal_batches,
+                    material,
+                    key.shader,
+                    material_debug_index,
+                    key.vertex_lit,
+                    portal_start..portal_end,
+                    key.lightmap,
+                    &signature,
+                    &portal_signature,
+                    area_signature,
+                    fog,
+                    fog_is_global,
+                );
+            }
             let piece_end =
                 u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
 
@@ -4834,14 +5536,6 @@ fn prepare_internal(
                 coarse_area_signature[word] |= area_signature[word];
             }
 
-            let (fog, fog_is_global) = resolved_bsp_surface_fog(
-                &bsp,
-                &library,
-                material,
-                key.fog_num,
-                global_fog_num,
-                global_fog,
-            );
             append_material_batches(
                 &mut pvs_batches,
                 material,
@@ -4851,6 +5545,7 @@ fn prepare_internal(
                 piece_start..piece_end,
                 key.lightmap,
                 &signature,
+                &[],
                 area_signature,
                 fog,
                 fog_is_global,
@@ -4876,6 +5571,7 @@ fn prepare_internal(
             coarse_start..coarse_end,
             key.lightmap,
             &coarse_signature,
+            &[],
             coarse_area_signature,
             fog,
             fog_is_global,
@@ -4934,6 +5630,7 @@ fn prepare_internal(
                     range_start..range_end,
                     key.lightmap,
                     &[],
+                    &[],
                     [0_u64; 4],
                     fog,
                     fog_is_global,
@@ -4964,6 +5661,11 @@ fn prepare_internal(
             inline_models.len(),
             inline_vertices.len(),
             inline_batches.len()
+        );
+    }
+    if alpha_discard_culled_batches > 0 {
+        println!(
+            "{name}: guaranteed alpha-discard render cull: {alpha_discard_culled_batches} BSP batch(es), {alpha_discard_culled_triangles} triangle(s), {alpha_discard_culled_vertices} GPU render vertices omitted; source BSP geometry retained for semantic extraction"
         );
     }
 
@@ -4999,25 +5701,32 @@ fn prepare_internal(
     let reflection_probes = load_reflection_probes(&bsp, &mut assets, name, &mut warnings)?;
     assign_reflection_probes(&mut batches, &vertices, &reflection_probes);
     assign_reflection_probes(&mut pvs_batches, &vertices, &reflection_probes);
+    assign_reflection_probes(&mut portal_batches, &vertices, &reflection_probes);
     assign_reflection_probes(&mut inline_batches, &inline_vertices, &reflection_probes);
     let (portal_anchors, camera_portal_count) = bsp_portal_surface_anchors(&bsp);
     let authored_portal_batch_count;
     if options.planar_reflections {
         assign_planar_reflection_planes(&mut batches, &vertices);
         assign_planar_reflection_planes(&mut pvs_batches, &vertices);
+        assign_planar_reflection_planes(&mut portal_batches, &vertices);
         authored_portal_batch_count = batches
             .iter()
             .filter(|batch| batch.planar_reflection)
             .count();
         retain_authored_planar_mirrors(&mut batches, &portal_anchors);
         retain_authored_planar_mirrors(&mut pvs_batches, &portal_anchors);
+        retain_authored_planar_mirrors(&mut portal_batches, &portal_anchors);
     } else {
         authored_portal_batch_count = 0;
         // Reflection quality is restart-latched specifically so the map can be
         // prepared without per-plane metadata when planar reflections are off.
         // Clear the material-authored eligibility bits as well; otherwise later
         // draw-compaction sees them and still refuses to merge compatible draws.
-        for batch in batches.iter_mut().chain(pvs_batches.iter_mut()) {
+        for batch in batches
+            .iter_mut()
+            .chain(pvs_batches.iter_mut())
+            .chain(portal_batches.iter_mut())
+        {
             batch.planar_reflection = false;
             batch.planar_environment_candidate = false;
             batch.planar_plane = [0.0; 4];
@@ -5025,6 +5734,7 @@ fn prepare_internal(
     }
     cache_reflection_decisions(&mut batches);
     cache_reflection_decisions(&mut pvs_batches);
+    cache_reflection_decisions(&mut portal_batches);
     log_reflection_cache(name, &batches);
     let planar_mirror_batch_count = batches
         .iter()
@@ -5286,14 +5996,68 @@ fn prepare_internal(
     load_timings.texture_decode_ms = texture_stats.decode_ms;
     load_timings.texture_mip_ms = texture_stats.mip_ms;
     load_timings.texture_images = texture_stats.decoded_images;
-    load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
-
     warnings.extend(textures.warnings);
     warnings.sort();
     warnings.dedup();
 
     let authored_oceans = crate::ocean::authoring::AuthoredOcean::from_bsp(&bsp);
-    append_authored_ocean_planes(&authored_oceans, &mut vertices, &mut batches, &mut pvs_batches);
+    append_authored_ocean_planes(
+        &authored_oceans,
+        &mut vertices,
+        &mut batches,
+        &mut pvs_batches,
+        &mut portal_batches,
+    );
+
+    // AUTO 4 is pure CPU map preprocessing. Keep its potentially expensive
+    // per-cluster PVS/group search off the renderer thread and expose it as its
+    // own loading-screen stage. The worker owns these vectors temporarily and
+    // returns them unchanged alongside the immutable draw plan.
+    let visibility = bsp.visibility.clone();
+    let portal_plan_started = Instant::now();
+    let (vertices, portal_batches, visibility, portal_draw_plan) =
+        if visibility.is_some() && !portal_batches.is_empty() {
+            if let Some(jobs) = jobs {
+                let total = u32::try_from(visibility.as_ref().map_or(0, |vis| vis.clusters))
+                    .unwrap_or(u32::MAX)
+                    .max(1);
+                jobs.submit_progress(Task::MapPortalPlans, total, move |progress| {
+                    let plan = build_prepared_portal_draw_plan(
+                        &portal_batches,
+                        visibility.as_ref().expect("visibility checked before AUTO 4 job"),
+                        &vertices,
+                        |completed| progress.set_completed(completed),
+                    );
+                    (vertices, portal_batches, visibility, plan)
+                })?
+                .join()?
+            } else {
+                let plan = build_prepared_portal_draw_plan(
+                    &portal_batches,
+                    visibility.as_ref().expect("visibility checked before AUTO 4 build"),
+                    &vertices,
+                    |_| {},
+                );
+                (vertices, portal_batches, visibility, plan)
+            }
+        } else {
+            (vertices, portal_batches, visibility, PreparedPortalDrawPlan::default())
+        };
+    load_timings.portal_plans_ms = portal_plan_started.elapsed().as_secs_f64() * 1000.0;
+    if !portal_draw_plan.plan_by_cluster.is_empty() {
+        println!(
+            "{name}: AUTO 4 map-worker plans: {} portal base batch(es), {} merged variant(s), {} unique plan(s) for {} cluster(s); {} merged reuse hit(s), {} whole-plan reuse hit(s), {:.1} ms",
+            portal_batches.len(),
+            portal_draw_plan.variants.len(),
+            portal_draw_plan.plans.len(),
+            portal_draw_plan.plan_by_cluster.len(),
+            portal_draw_plan.reused_variant_hits,
+            portal_draw_plan.reused_plan_hits,
+            load_timings.portal_plans_ms,
+        );
+    }
+    load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+
     Ok(PreparedMap {
         authored_oceans,
         movement,
@@ -5303,6 +6067,8 @@ fn prepare_internal(
         vertices,
         batches,
         pvs_batches,
+        portal_batches,
+        portal_draw_plan,
         inline_vertices,
         inline_batches,
         inline_models,
@@ -5315,7 +6081,7 @@ fn prepare_internal(
         steam_audio_acoustic_mesh,
         steam_audio_bake,
         steam_audio_bake_request,
-        visibility: bsp.visibility.clone(),
+        visibility,
         lights,
         source_map_lighting: SourceMapLighting::default(),
         sun,
@@ -5393,8 +6159,11 @@ fn dynamic_light_from_values(
 }
 
 pub(crate) fn append_authored_ocean_planes(
-    oceans: &[crate::ocean::authoring::AuthoredOcean], vertices: &mut Vec<GpuVertex>,
-    batches: &mut Vec<DrawBatch>, pvs_batches: &mut Vec<DrawBatch>,
+    oceans: &[crate::ocean::authoring::AuthoredOcean],
+    vertices: &mut Vec<GpuVertex>,
+    batches: &mut Vec<DrawBatch>,
+    pvs_batches: &mut Vec<DrawBatch>,
+    portal_batches: &mut Vec<DrawBatch>,
 ) {
     let Some(template) = batches.iter().find(|b| b.water_primary).or_else(|| batches.first()).cloned() else { return; };
     // The marker brush is a volume; its top becomes an independently rendered ocean.
@@ -5404,6 +6173,7 @@ pub(crate) fn append_authored_ocean_planes(
     });
     batches.retain(|b| b.authored_ocean.is_none() && !covered(b));
     pvs_batches.retain(|b| b.authored_ocean.is_none() && !covered(b));
+    portal_batches.retain(|b| b.authored_ocean.is_none() && !covered(b));
     for o in oceans {
         let first = vertices.len() as u32;
         let corners = [[o.mins[0],o.height,-o.maxs[1]],[o.maxs[0],o.height,-o.maxs[1]],
@@ -5420,9 +6190,11 @@ pub(crate) fn append_authored_ocean_planes(
         b.lightmap = None; b.modulate_lightmap = false;
         b.tc_mods.clear(); b.color = [1.0;4]; b.alpha_cutoff = 0.0;
         b.pipeline = PipelineKey {class:DrawClass::Transparent,blend:BlendMode::Opaque,cull:CullMode::None,offset:false,depth_write:true,depth_equal:false};
-        b.pvs_signature.clear(); b.area_signature = [0;4];
+        b.pvs_signature.clear(); b.portal_signature.clear(); b.area_signature = [0;4];
         b.planar_reflection = false; b.planar_environment_candidate = false;
-        batches.push(b.clone()); pvs_batches.push(b);
+        batches.push(b.clone());
+        pvs_batches.push(b.clone());
+        portal_batches.push(b);
     }
 }
 
@@ -6892,6 +7664,7 @@ fn prepare_map_document_with_assets_options(
                     assets,
                     &mut textures,
                     options.gen_normal_maps,
+                    options.omit_environment_stages,
                 );
                 let uv_size = material_uv_size(&material, &textures);
                 let index = map_materials.len();
@@ -7016,6 +7789,7 @@ fn prepare_map_document_with_assets_options(
                 None,
                 None,
                 &[],
+                &[],
                 [0_u64; 4],
                 [0.0; 4],
                 false,
@@ -7037,6 +7811,7 @@ fn prepare_map_document_with_assets_options(
                 None,
                 None,
                 None,
+                &[],
                 &[],
                 [0_u64; 4],
                 [0.0; 4],
@@ -7066,6 +7841,7 @@ fn prepare_map_document_with_assets_options(
                 None,
                 None,
                 &[],
+                &[],
                 [0_u64; 4],
                 [0.0; 4],
                 false,
@@ -7080,6 +7856,7 @@ fn prepare_map_document_with_assets_options(
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     [0_u64; 4],
                     [0.0; 4],
@@ -7097,6 +7874,7 @@ fn prepare_map_document_with_assets_options(
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     [0_u64; 4],
                     [0.0; 4],
@@ -7183,6 +7961,8 @@ fn prepare_map_document_with_assets_options(
         vertices,
         batches,
         pvs_batches: Vec::new(),
+        portal_batches: Vec::new(),
+        portal_draw_plan: PreparedPortalDrawPlan::default(),
         inline_vertices: Vec::new(),
         inline_batches: Vec::new(),
         inline_models: Vec::new(),
@@ -7404,6 +8184,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             [0; 4],
             [0.0; 4],
             false,
@@ -7484,6 +8265,67 @@ mod tests {
 
         let stages = prepared_stages(&material, true);
         assert_eq!(stages[0].rgb_gen, RgbGen::Identity);
+    }
+
+    #[test]
+    fn guaranteed_alpha_discard_render_cull_keeps_surface_light_semantics() {
+        let material = SurfaceMaterial {
+            stages: vec![MaterialStage {
+                texture: StageTexture::White,
+                enhancements: Default::default(),
+                blend: None,
+                alpha_cutoff: 0.5,
+                opacity: 0.0,
+                color: [1.0; 3],
+                rgb_gen: RgbGen::Identity,
+                alpha_gen: AlphaGen::Const,
+                tc_gen: TcGen::Base,
+                tc_mods: Vec::new(),
+                depth_write: false,
+                depth_equal: false,
+            }],
+            surface_light: Some(materials::SurfaceLight {
+                value: 750.0,
+                color: [1.0; 3],
+                subdivide: 120.0,
+                inferred_from_emissive: false,
+            }),
+            explicit: true,
+            ..Default::default()
+        };
+
+        assert!(material.surface_light.is_some());
+        assert!(material_render_is_guaranteed_discarded(&material, true));
+    }
+
+    #[test]
+    fn guaranteed_alpha_discard_render_cull_requires_every_stage_to_discard() {
+        let invisible = MaterialStage {
+            texture: StageTexture::White,
+            enhancements: Default::default(),
+            blend: None,
+            alpha_cutoff: 0.5,
+            opacity: 0.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Const,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+        };
+        let visible = MaterialStage {
+            opacity: 1.0,
+            alpha_gen: AlphaGen::Identity,
+            ..invisible.clone()
+        };
+        let material = SurfaceMaterial {
+            stages: vec![invisible, visible],
+            explicit: true,
+            ..Default::default()
+        };
+
+        assert!(!material_render_is_guaranteed_discarded(&material, false));
     }
 
     #[test]

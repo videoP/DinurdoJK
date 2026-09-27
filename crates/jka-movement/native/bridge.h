@@ -95,7 +95,15 @@ typedef struct jka_saber_movement_info_s {
 typedef struct jka_predict_settings_s {
     int32_t pmove_fixed, pmove_msec, pmove_float, gametype;
     int32_t debug_melee, step_slide_fix, no_spec_move, tracemask, no_footsteps;
+    int32_t server_mod, jcinfo, jcinfo2, taystjk_info, dmflags, hook_pull, restricts, plugin_disable;
+    uint32_t legacy_fixes;
 } jka_predict_settings;
+
+typedef struct jka_prediction_entity_s {
+    int32_t number, entity_type, model_index, bolt1, trajectory_type;
+    float origin[3], velocity[3], angular_velocity[3];
+    int32_t legs_anim, torso_anim, saber_move;
+} jka_prediction_entity;
 
 /* Read-only OpenJK presentation queries used by the Rust CGame renderer. */
 int jka_saber_move_trail_length(int move);

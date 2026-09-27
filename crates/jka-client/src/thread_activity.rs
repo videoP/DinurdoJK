@@ -57,6 +57,7 @@ pub enum Task {
     MapOcean = 13,
     MapAcoustics = 14,
     MapAudioBake = 15,
+    MapPortalPlans = 16,
 }
 
 impl Task {
@@ -78,6 +79,7 @@ impl Task {
             Self::MapOcean => "OCEAN MESH",
             Self::MapAcoustics => "ACOUSTICS",
             Self::MapAudioBake => "AUDIO BAKE",
+            Self::MapPortalPlans => "PVS DRAW PLANS",
         }
     }
 
@@ -98,6 +100,7 @@ impl Task {
             13 => Self::MapOcean,
             14 => Self::MapAcoustics,
             15 => Self::MapAudioBake,
+            16 => Self::MapPortalPlans,
             _ => Self::Idle,
         }
     }

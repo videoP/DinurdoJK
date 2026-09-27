@@ -192,10 +192,12 @@ pub struct GrassRenderer {
     map_layout: wgpu::BindGroupLayout,
     shader: wgpu::ShaderModule,
     pipeline: wgpu::RenderPipeline,
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
     prepared_pipeline_layout: wgpu::PipelineLayout,
     prepared_layout: wgpu::BindGroupLayout,
     prepared_shader: wgpu::ShaderModule,
     prepared_pipeline: wgpu::RenderPipeline,
+    prepared_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: wgpu::RenderPipeline,
     bevy_shadow_pipeline: wgpu::RenderPipeline,
     prepare_layout: wgpu::BindGroupLayout,
@@ -546,10 +548,12 @@ impl GrassRenderer {
             map_layout,
             shader,
             pipeline,
+            wireframe_pipeline: None,
             prepared_pipeline_layout,
             prepared_layout,
             prepared_shader,
             prepared_pipeline,
+            prepared_wireframe_pipeline: None,
             shadow_pipeline,
             bevy_shadow_pipeline,
             prepare_layout,
@@ -586,6 +590,8 @@ impl GrassRenderer {
         surface_format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) {
+        self.wireframe_pipeline = None;
+        self.prepared_wireframe_pipeline = None;
         self.pipeline = create_pipeline(
             device,
             &self.pipeline_layout,
@@ -602,6 +608,34 @@ impl GrassRenderer {
             msaa_samples,
             self.legacy_fog_compiled,
         );
+    }
+
+    pub fn ensure_wireframe_pipeline_for_draw(
+        &mut self,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+        prepared: &GrassPreparedDraw,
+    ) {
+        if prepared.gpu_precompute {
+            if self.prepared_wireframe_pipeline.is_none() {
+                self.prepared_wireframe_pipeline = Some(create_prepared_grass_wireframe_pipeline(
+                    device,
+                    &self.prepared_pipeline_layout,
+                    &self.prepared_shader,
+                    surface_format,
+                    msaa_samples,
+                ));
+            }
+        } else if self.wireframe_pipeline.is_none() {
+            self.wireframe_pipeline = Some(create_grass_wireframe_pipeline(
+                device,
+                &self.pipeline_layout,
+                &self.shader,
+                surface_format,
+                msaa_samples,
+            ));
+        }
     }
 
     pub fn update_environment(
@@ -1324,6 +1358,106 @@ impl GrassRenderer {
         stats
     }
 
+    pub fn draw_wireframe<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        camera_bind_group: &'pass wgpu::BindGroup,
+        shadow_bind_group: &'pass wgpu::BindGroup,
+        map: &'pass GrassMapGpu,
+        prepared: &'pass GrassPreparedDraw,
+    ) {
+        if map.blade_count == 0 || prepared.total_visible == 0 {
+            return;
+        }
+
+        pass.set_bind_group(0, camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(2, shadow_bind_group, &[]);
+
+        if prepared.gpu_precompute {
+            let Some(pipeline) = self.prepared_wireframe_pipeline.as_ref() else {
+                return;
+            };
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(3, &map.prepared_bind_group, &[]);
+
+            if prepared.low_total != 0 {
+                pass.set_vertex_buffer(0, self.low_vertex_buffer.slice(..));
+                pass.set_index_buffer(self.low_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..self.low_index_count, 0, 0..prepared.low_total);
+            }
+            if prepared.mid_total != 0 {
+                pass.set_vertex_buffer(0, self.mid_vertex_buffer.slice(..));
+                pass.set_index_buffer(self.mid_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(
+                    0..self.mid_index_count,
+                    0,
+                    prepared.low_total..prepared.low_total + prepared.mid_total,
+                );
+            }
+            if prepared.high_total != 0 {
+                pass.set_vertex_buffer(0, self.high_vertex_buffer.slice(..));
+                pass.set_index_buffer(self.high_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(
+                    0..self.high_index_count,
+                    0,
+                    prepared.low_total + prepared.mid_total
+                        ..prepared.low_total + prepared.mid_total + prepared.high_total,
+                );
+            }
+            return;
+        }
+
+        let Some(pipeline) = self.wireframe_pipeline.as_ref() else {
+            return;
+        };
+        pass.set_pipeline(pipeline);
+        let visible_buffer = prepared
+            .overflow_index_buffer
+            .as_ref()
+            .unwrap_or(&map.visible_index_buffer);
+        let stride = std::mem::size_of::<u32>() as u64;
+        for (chunk_index, chunk_draw) in prepared.chunks.iter().enumerate() {
+            if chunk_draw.low_count == 0 && chunk_draw.mid_count == 0 && chunk_draw.high_count == 0 {
+                continue;
+            }
+            pass.set_bind_group(3, &map.instance_chunks[chunk_index].bind_group, &[]);
+            for (offset, count, vertex_buffer, index_buffer, index_count) in [
+                (
+                    chunk_draw.low_offset,
+                    chunk_draw.low_count,
+                    &self.low_vertex_buffer,
+                    &self.low_index_buffer,
+                    self.low_index_count,
+                ),
+                (
+                    chunk_draw.mid_offset,
+                    chunk_draw.mid_count,
+                    &self.mid_vertex_buffer,
+                    &self.mid_index_buffer,
+                    self.mid_index_count,
+                ),
+                (
+                    chunk_draw.high_offset,
+                    chunk_draw.high_count,
+                    &self.high_vertex_buffer,
+                    &self.high_index_buffer,
+                    self.high_index_count,
+                ),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let begin = u64::from(offset) * stride;
+                let end = begin + u64::from(count) * stride;
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, visible_buffer.slice(begin..end));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..index_count, 0, 0..count);
+            }
+        }
+    }
+
 }
 
 fn source_lod_count_fraction(distance_m: f32) -> f32 {
@@ -1995,6 +2129,87 @@ fn create_grass_shadow_pipeline(
         fragment: None,
         multiview_mask: None,
         cache: None,
+    })
+}
+
+fn create_prepared_grass_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("GodotGrass prepared wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &BLADE_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: msaa_samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader, entry_point: Some("fs_wireframe"), compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState { format: surface_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview_mask: None, cache: None,
+    })
+}
+
+fn create_grass_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("GodotGrass wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &BLADE_ATTRIBUTES },
+                wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Instance, attributes: &VISIBLE_INDEX_ATTRIBUTES },
+            ],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, strip_index_format: None, front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None, polygon_mode: wgpu::PolygonMode::Line, unclipped_depth: false, conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(), bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: msaa_samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader, entry_point: Some("fs_wireframe"), compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState { format: surface_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview_mask: None, cache: None,
     })
 }
 

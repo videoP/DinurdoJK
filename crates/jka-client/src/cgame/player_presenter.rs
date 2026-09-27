@@ -10,7 +10,7 @@ use crate::{
     cgame::{ClientGameState, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER},
     materials::{self, TextureData, Textures},
     renderer::{
-        DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex, Ghoul2GpuBone,
+        DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, Ghoul2GpuBone,
         Ghoul2GpuSkinning, Ghoul2GpuVertex,
     },
     scene,
@@ -297,6 +297,11 @@ pub enum PlayerFxRequest {
         torso_anim: i32,
         saber_in_flight: bool,
         trail_style: i32,
+        /// Number of authored blades on this saber. OpenJK uses one combined
+        /// dynamic light for sabers with 3+ blades instead of one per blade.
+        num_blades: u8,
+        /// Authored OpenJK `noDlight` / SFL2_NO_DLIGHT.
+        no_dlight: bool,
         /// Authored OpenJK noWallMarks/noWallMarks2 for the active blade style.
         no_wall_marks: bool,
     },
@@ -893,6 +898,7 @@ impl PlayerPresenter {
                 };
                 draws.push(DynamicModelSurface {
                     entity_num,
+                    wireframe_class: DynamicWireframeClass::Player,
                     vertices: Arc::clone(&empty_vertices),
                     indices: Arc::clone(&gpu_mesh.indices),
                     lighting_origin: Some(origin),
@@ -966,6 +972,7 @@ impl PlayerPresenter {
             };
             draws.push(DynamicModelSurface {
                 entity_num,
+                wireframe_class: DynamicWireframeClass::Player,
                 vertices: Arc::new(vertices),
                 indices: Arc::clone(&gpu_mesh.indices),
                 lighting_origin: Some(origin),
@@ -1005,6 +1012,7 @@ impl PlayerPresenter {
         };
         DynamicModelSurface {
             entity_num: surface.entity_num,
+            wireframe_class: DynamicWireframeClass::Player,
             vertices,
             indices: Arc::clone(&surface.indices),
             lighting_origin: surface.lighting_origin,
@@ -2033,6 +2041,8 @@ impl PlayerPresenter {
                     torso_anim,
                     in_flight,
                     trail_style,
+                    definition.num_blades as u8,
+                    definition.no_dlight,
                     no_wall_marks,
                 ) {
                     self.fx_requests.push(request);
@@ -2242,6 +2252,8 @@ impl PlayerPresenter {
                 owner.state.field_i32("torsoAnim").unwrap_or(0),
                 true,
                 trail_style,
+                definition.num_blades as u8,
+                definition.no_dlight,
                 no_wall_marks,
             ) {
                 self.fx_requests.push(request);
@@ -3543,6 +3555,8 @@ fn saber_blade_fx_request(
     torso_anim: i32,
     saber_in_flight: bool,
     trail_style: i32,
+    num_blades: u8,
+    no_dlight: bool,
     no_wall_marks: bool,
 ) -> Option<PlayerFxRequest> {
     if length < 0.5 || radius <= 0.0 {
@@ -3562,6 +3576,8 @@ fn saber_blade_fx_request(
         torso_anim,
         saber_in_flight,
         trail_style,
+        num_blades,
+        no_dlight,
         no_wall_marks,
     })
 }

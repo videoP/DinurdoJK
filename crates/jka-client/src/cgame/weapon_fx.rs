@@ -71,6 +71,7 @@ const SABER_MARK_LIFETIME_MS: i32 = 10_000;
 const SABER_MARK_FADE_MS: i32 = 1_000;
 const SABER_GLOW_LIFETIME_MS: i32 = 1_500;
 const SABER_MARK_MAX: usize = 768;
+const MAX_SABER_BLADES: usize = 8;
 
 // Enhanced is deliberately a separate cosmetic material simulation rather than
 // a variation of the stock mark quad. Contact is sampled spatially, heat is
@@ -153,6 +154,21 @@ fn saber_shaders(color: i32) -> (&'static str, &'static str) {
         5 => ("gfx/effects/sabers/purple_glow", "gfx/effects/sabers/purple_line"),
         _ => ("gfx/effects/sabers/blue_glow", "gfx/effects/sabers/blue_line"),
     }
+}
+
+/// OpenJK CG_RGBForSaberColor. Keep this separate from the authored glow
+/// shader lookup because the dynamic-light tint intentionally uses softened
+/// channel values (for example blue = 0.2, 0.4, 1.0).
+fn saber_light_rgb(color: i32) -> Option<[f32; 3]> {
+    Some(match color {
+        0 => [1.0, 0.2, 0.2],
+        1 => [1.0, 0.5, 0.1],
+        2 => [1.0, 1.0, 0.2],
+        3 => [0.2, 1.0, 0.2],
+        4 => [0.2, 0.4, 1.0],
+        5 => [0.9, 0.2, 1.0],
+        _ => return None,
+    })
 }
 
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
@@ -714,6 +730,39 @@ struct SaberTrailKey {
     blade_num: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SaberLightKey {
+    entity_num: u16,
+    saber_num: u8,
+}
+
+/// Per-frame OpenJK CG_DoSaberLight accumulator for sabers with 3+ blades.
+/// Fixed storage avoids a per-frame heap allocation for staff lights.
+#[derive(Clone, Copy, Debug)]
+struct SaberLightAggregate {
+    tips: [[f32; 3]; MAX_SABER_BLADES],
+    count: usize,
+    first_midpoint: [f32; 3],
+    first_rgb: [f32; 3],
+    weighted_rgb: [f32; 3],
+    total_length: f32,
+    diameter: f32,
+}
+
+impl Default for SaberLightAggregate {
+    fn default() -> Self {
+        Self {
+            tips: [[0.0; 3]; MAX_SABER_BLADES],
+            count: 0,
+            first_midpoint: [0.0; 3],
+            first_rgb: [0.0; 3],
+            weighted_rgb: [0.0; 3],
+            total_length: 0.0,
+            diameter: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SaberTrailHistory {
     base: [f32; 3],
@@ -812,6 +861,8 @@ pub struct WeaponFx {
     immediate_draws: Vec<FxDraw>,
     immediate_sounds: Vec<FxSound>,
     immediate_lights: Vec<FxLight>,
+    /// OpenJK combines 3+ blade sabers into one dynamic light per saber.
+    saber_multi_lights: HashMap<SaberLightKey, SaberLightAggregate>,
     modern_sabers: bool,
     saber_marks: SaberMarkMode,
     collision_world: Option<CollisionWorld>,
@@ -847,6 +898,7 @@ impl WeaponFx {
             immediate_draws: Vec::new(),
             immediate_sounds: Vec::new(),
             immediate_lights: Vec::new(),
+            saber_multi_lights: HashMap::new(),
             modern_sabers: false,
             saber_marks: SaberMarkMode::Legacy,
             collision_world: None,
@@ -924,6 +976,7 @@ impl WeaponFx {
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
+        self.saber_multi_lights.clear();
         self.saber_trail_history.clear();
         self.saber_trail_segments.clear();
         self.saber_contact_history.clear();
@@ -938,6 +991,7 @@ impl WeaponFx {
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
+        self.saber_multi_lights.clear();
         if time < self.time {
             self.puffs.clear();
             self.entity_fx.clear();
@@ -1000,6 +1054,7 @@ impl WeaponFx {
         if matches!(self.saber_marks, SaberMarkMode::Enhanced) {
             self.append_enhanced_melt(&mut frame);
         }
+        self.flush_saber_multi_lights();
         frame.draws.append(&mut self.immediate_draws);
         frame.sounds.append(&mut self.immediate_sounds);
         frame.lights.append(&mut self.immediate_lights);
@@ -1053,6 +1108,105 @@ impl WeaponFx {
         let _ = self.play(&name, entity.origin, dir);
     }
 
+    /// OpenJK CG_DoSaber / CG_DoSaberLight dynamic-light submission. Sabers
+    /// with fewer than three blades emit one light per visible blade; staffs
+    /// and other 3+ blade sabers accumulate into one light for the whole saber.
+    fn saber_dynamic_light(
+        &mut self,
+        key: SaberTrailKey,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        visible_length: f32,
+        authored_length: f32,
+        color: i32,
+        num_blades: u8,
+        no_dlight: bool,
+    ) {
+        if no_dlight {
+            return;
+        }
+
+        let direction = normalize3(direction);
+        if num_blades < 3 {
+            if visible_length < 0.5 {
+                return;
+            }
+            // CG_DoSaber initializes rgb to white before CG_RGBForSaberColor.
+            let rgb = saber_light_rgb(color).unwrap_or([1.0; 3]);
+            // OpenJK CG_DoSaber: midpoint of the actually rendered/clipped
+            // blade, radius = length * 1.4 + Q_flrand(0, 1) * 3.
+            let midpoint = madd3(origin, direction, visible_length * 0.5);
+            let radius = visible_length * 1.4 + self.runner_rng.flrand(0.0, 1.0) * 3.0;
+            self.immediate_lights.push(FxLight { origin: midpoint, radius, rgb });
+            return;
+        }
+
+        // OpenJK CG_DoSaberLight reads saberInfo_t blade lengths/bolts rather
+        // than CG_AddSaberBlade's wall-clipped local saberLen. Mirror that for
+        // 3+ blade sabers and combine them once at end_frame.
+        let length = authored_length.max(0.0);
+        if length < 0.5 {
+            return;
+        }
+        // CG_DoSaberLight's rgbs array is zero-initialized before the helper,
+        // so an unknown color remains black there (unlike CG_DoSaber above).
+        let rgb = saber_light_rgb(color).unwrap_or([0.0; 3]);
+        let tip = madd3(origin, direction, length);
+        let light_key = SaberLightKey { entity_num: key.entity_num, saber_num: key.saber_num };
+        let aggregate = self.saber_multi_lights.entry(light_key).or_default();
+        if aggregate.count >= MAX_SABER_BLADES {
+            return;
+        }
+        if aggregate.count == 0 {
+            aggregate.first_midpoint = madd3(origin, direction, length * 0.5);
+            aggregate.first_rgb = rgb;
+        }
+        aggregate.tips[aggregate.count] = tip;
+        aggregate.count += 1;
+        aggregate.total_length += length;
+        for channel in 0..3 {
+            aggregate.weighted_rgb[channel] += rgb[channel] * length;
+        }
+        aggregate.diameter = aggregate.diameter.max(length * 2.0);
+    }
+
+    fn flush_saber_multi_lights(&mut self) {
+        // Drain rather than replace the map so staff-heavy scenes retain the
+        // small allocation across frames instead of churning the heap.
+        let lights = &mut self.immediate_lights;
+        let rng = &mut self.runner_rng;
+        for (_, aggregate) in self.saber_multi_lights.drain() {
+            if aggregate.count == 0 || aggregate.total_length <= 0.0 {
+                continue;
+            }
+
+            let (origin, rgb) = if aggregate.count == 1 {
+                (aggregate.first_midpoint, aggregate.first_rgb)
+            } else {
+                let mut midpoint = [0.0; 3];
+                for tip in &aggregate.tips[..aggregate.count] {
+                    midpoint = add3(midpoint, *tip);
+                }
+                let inv_count = 1.0 / aggregate.count as f32;
+                midpoint = midpoint.map(|component| component * inv_count);
+                let inv_length = 1.0 / aggregate.total_length;
+                let rgb = aggregate.weighted_rgb.map(|component| component * inv_length);
+                (midpoint, rgb)
+            };
+
+            // OpenJK starts with the longest blade diameter, then expands to
+            // the farthest pair of blade tips.
+            let mut diameter = aggregate.diameter;
+            for i in 0..aggregate.count {
+                for j in 0..aggregate.count {
+                    diameter = diameter.max(length3(sub3(aggregate.tips[i], aggregate.tips[j])));
+                }
+            }
+            let radius = diameter + rng.flrand(0.0, 1.0) * 8.0;
+            lights.push(FxLight { origin, radius, rgb });
+        }
+    }
+
     /// Force-power visuals requested by CG_Player.
     pub fn player_fx(&mut self, request: &PlayerFxRequest) {
         match request {
@@ -1073,6 +1227,8 @@ impl WeaponFx {
                 torso_anim,
                 saber_in_flight,
                 trail_style,
+                num_blades,
+                no_dlight,
                 no_wall_marks,
             } => {
                 let key = SaberTrailKey {
@@ -1086,6 +1242,16 @@ impl WeaponFx {
                     *direction,
                     *length,
                     *no_wall_marks,
+                );
+                self.saber_dynamic_light(
+                    key,
+                    *origin,
+                    *direction,
+                    clipped_length,
+                    *length,
+                    *color,
+                    *num_blades,
+                    *no_dlight,
                 );
                 self.saber_trail(
                     key,
@@ -1962,12 +2128,18 @@ mod tests {
             torso_anim: 0,
             saber_in_flight: false,
             trail_style: 0,
+            num_blades: 1,
+            no_dlight: false,
             no_wall_marks: false,
         };
 
         fx.begin_frame(1000);
         fx.player_fx(&blade);
         let classic = fx.end_frame();
+        assert_eq!(classic.lights.len(), 1, "CG_DoSaber emits one dlight for a single blade");
+        assert_eq!(classic.lights[0].origin, [6.0, 2.0, 3.0]);
+        assert_eq!(classic.lights[0].rgb, [1.0, 0.2, 0.2]);
+        assert!(classic.lights[0].radius >= 14.0 && classic.lights[0].radius <= 17.0);
         assert!(classic.draws.iter().any(|draw| matches!(
             draw,
             FxDraw::Sprite { shader, .. } if shader == "gfx/effects/sabers/red_glow"
@@ -1994,6 +2166,81 @@ mod tests {
     }
 
     #[test]
+    fn saber_no_dlight_suppresses_stock_blade_light() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        let blade = PlayerFxRequest::SaberBlade {
+            origin: [0.0; 3],
+            direction: [1.0, 0.0, 0.0],
+            length: 40.0,
+            radius: 3.0,
+            color: 4,
+            entity_alpha: 1.0,
+            entity_num: 3,
+            saber_num: 0,
+            blade_num: 0,
+            saber_move: 0,
+            torso_anim: 0,
+            saber_in_flight: false,
+            trail_style: 0,
+            num_blades: 1,
+            no_dlight: true,
+            no_wall_marks: false,
+        };
+        fx.begin_frame(1000);
+        fx.player_fx(&blade);
+        let frame = fx.end_frame();
+        assert!(frame.lights.is_empty());
+        assert!(!frame.draws.is_empty(), "noDlight must not suppress the blade itself");
+    }
+
+    #[test]
+    fn three_blade_saber_combines_to_one_openjk_light() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(1000);
+        for (blade_num, direction, color) in [
+            (0, [1.0, 0.0, 0.0], 0),
+            (1, [-1.0, 0.0, 0.0], 3),
+            (2, [0.0, 1.0, 0.0], 4),
+        ] {
+            fx.player_fx(&PlayerFxRequest::SaberBlade {
+                origin: [0.0; 3],
+                direction,
+                length: 10.0,
+                radius: 2.0,
+                color,
+                entity_alpha: 1.0,
+                entity_num: 9,
+                saber_num: 0,
+                blade_num,
+                saber_move: 0,
+                torso_anim: 0,
+                saber_in_flight: false,
+                trail_style: 0,
+                num_blades: 3,
+                no_dlight: false,
+                no_wall_marks: false,
+            });
+        }
+        let frame = fx.end_frame();
+        assert_eq!(frame.lights.len(), 1, "OpenJK CG_DoSaberLight emits one staff light");
+        let light = &frame.lights[0];
+        assert!((light.origin[0] - 0.0).abs() < 1e-5);
+        assert!((light.origin[1] - (10.0 / 3.0)).abs() < 1e-5);
+        assert!((light.origin[2] - 0.0).abs() < 1e-5);
+        let expected = [
+            (1.0 + 0.2 + 0.2) / 3.0,
+            (0.2 + 1.0 + 0.4) / 3.0,
+            (0.2 + 0.2 + 1.0) / 3.0,
+        ];
+        for (actual, expected) in light.rgb.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        assert!(light.radius >= 20.0 && light.radius <= 28.0);
+    }
+
+    #[test]
     fn saber_trail_connects_consecutive_blade_samples_with_stock_shader() {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
@@ -2002,7 +2249,8 @@ mod tests {
         let mut blade = PlayerFxRequest::SaberBlade {
             origin: [0.0, 0.0, 0.0], direction: [1.0, 0.0, 0.0], length: 10.0, radius: 2.0,
             color: 4, entity_alpha: 1.0, entity_num: 2, saber_num: 0, blade_num: 0,
-            saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0, no_wall_marks: false,
+            saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
+            num_blades: 1, no_dlight: false, no_wall_marks: false,
         };
         fx.begin_frame(1000);
         fx.player_fx(&blade);

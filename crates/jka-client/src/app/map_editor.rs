@@ -1,6 +1,6 @@
 use crate::{
     camera::Camera,
-    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex},
+    renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex},
     scene,
 };
 use glam::{DVec3, Vec3};
@@ -379,6 +379,7 @@ impl MapEditor {
         }
         (!indices.is_empty()).then(|| DynamicModelSurface {
             entity_num: u16::MAX,
+            wireframe_class: DynamicWireframeClass::Entity,
             vertices: Arc::new(vertices),
             indices: Arc::new(indices),
             lighting_origin: None,

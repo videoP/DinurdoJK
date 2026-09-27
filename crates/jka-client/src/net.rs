@@ -21,6 +21,8 @@ use jka_protocol::{
     session::{set_info_value, ClientSession, ConnectionState, SessionEvent, CMD_BACKUP},
 };
 
+pub mod mod_support;
+
 // ---------------------------------------------------------------- cvars --
 
 /// Archived CVAR_USERINFO / network cvars. Defaults follow OpenJK.
@@ -49,6 +51,8 @@ pub struct NetworkSettings {
     pub allow_legacy_downloads: bool,
     /// Usercmds per second (OpenJK: one per com_maxfps client frame).
     pub command_rate: u32,
+    /// JAPRO userinfo bitfield, also consumed by the native predictor.
+    pub plugin_disable: i32,
 }
 
 impl Default for NetworkSettings {
@@ -73,6 +77,7 @@ impl Default for NetworkSettings {
             allow_http_downloads: true,
             allow_legacy_downloads: true,
             command_rate: 125,
+            plugin_disable: 1536,
         }
     }
 }
@@ -99,6 +104,7 @@ impl NetworkSettings {
             "cl_allowhttpdownload" => u8::from(self.allow_http_downloads).to_string(),
             "cl_allowdownload" => u8::from(self.allow_legacy_downloads).to_string(),
             "cl_commandrate" => self.command_rate.to_string(),
+            "cp_plugindisable" => self.plugin_disable.to_string(),
             _ => return None,
         })
     }
@@ -146,6 +152,7 @@ impl NetworkSettings {
             "cl_allowhttpdownload" => Ok({ self.allow_http_downloads = atoi(value.as_bytes()) != 0; false }),
             "cl_allowdownload" => Ok({ self.allow_legacy_downloads = atoi(value.as_bytes()) != 0; false }),
             "cl_commandrate" => number(15, 1000).map(|v| { self.command_rate = v as u32; false }),
+            "cp_plugindisable" => number(0, i32::MAX as i64).map(|v| { self.plugin_disable = v as i32; true }),
             _ => return None,
         };
         Some(result)
@@ -182,8 +189,18 @@ impl NetworkSettings {
         info
     }
 
+    pub fn userinfo_for_mod(&self, model: &str, server_mod: mod_support::ServerMod) -> Vec<u8> {
+        let mut info = self.userinfo(model);
+        if server_mod == mod_support::ServerMod::Japro {
+            set_info_value(&mut info, b"cjp_client", b"1.4JAPRO");
+            set_info_value(&mut info, b"cp_pluginDisable", self.plugin_disable.to_string().as_bytes());
+        }
+        info
+    }
+
     pub fn write_cfg(&self, out: &mut String) {
         use std::fmt::Write as _;
+        let _ = writeln!(out, "seta cp_pluginDisable \"{}\"", self.plugin_disable);
         let _ = writeln!(out, "seta name \"{}\"", self.name);
         let _ = writeln!(out, "seta rate \"{}\"", self.rate);
         let _ = writeln!(out, "seta snaps \"{}\"", self.snaps);
@@ -650,6 +667,7 @@ impl LiveInput {
 pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>, ps: &PlayerState) -> PredictSettings {
     let server = configstrings.get(&0).map(Vec::as_slice).unwrap_or_default();
     let system = configstrings.get(&1).map(Vec::as_slice).unwrap_or_default();
+    let japro = mod_support::ServerMod::detect(server) == mod_support::ServerMod::Japro;
     let int = |info: &[u8], key: &[u8], default: i32| info_value(info, key).map_or(default, atoi);
     const CONTENTS_SOLID: i32 = 0x1;
     const CONTENTS_PLAYERCLIP: i32 = 0x10;
@@ -668,7 +686,7 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
     }
     PredictSettings {
         pmove_fixed: int(system, b"pmove_fixed", 0),
-        pmove_msec: int(system, b"pmove_msec", 8).clamp(8, 33),
+        pmove_msec: if japro { int(system, b"pmove_msec", 8).clamp(1, 66) } else { int(system, b"pmove_msec", 8).clamp(8, 33) },
         pmove_float: int(system, b"pmove_float", 0),
         gametype: int(server, b"g_gametype", 0),
         debug_melee: int(server, b"g_debugMelee", 0),
@@ -676,6 +694,25 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         no_spec_move: int(server, b"g_noSpecMove", 0),
         tracemask,
         no_footsteps: i32::from(int(server, b"dmflags", 0) & 32 != 0),
+        server_mod: i32::from(japro),
+        jcinfo: if japro { int(server, b"jcinfo", 0) } else { 0 },
+        jcinfo2: if japro { int(server, b"jcinfo2", 0) } else { 0 },
+        taystjk_info: if japro { int(server, b"taystJKinfo", 0) } else { 0 },
+        dmflags: int(server, b"dmflags", 0),
+        hook_pull: if japro { int(server, b"g_hookStrength", 0) } else { 0 },
+        restricts: if japro { int(server, b"restricts", 0) } else { 0 },
+        plugin_disable: 1536,
+        legacy_fixes: if japro {
+            configstrings.get(&36).and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| {
+                    let value = value.trim();
+                    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else if value.starts_with('0') && value.len() > 1 {
+                        u32::from_str_radix(value, 8).ok()
+                    } else { value.parse().ok() }
+                }).unwrap_or(0)
+        } else { 0 },
     }
 }
 
@@ -729,6 +766,7 @@ const EF_TELEPORT_BIT: i32 = 1 << 3;
 pub struct SolidEntity {
     pub number: i32,
     pub generic_enemy_index: i32,
+    pub skip_movement: bool,
     pub clip: EntityClip,
 }
 
@@ -763,6 +801,7 @@ pub fn solid_entities(entities: &[crate::cgame::PresentedEntity]) -> Vec<SolidEn
             Some(SolidEntity {
                 number: i32::from(entity.number),
                 generic_enemy_index: entity.state.field_i32("genericenemyindex").unwrap_or(0),
+                skip_movement: false,
                 clip,
             })
         })
@@ -782,7 +821,7 @@ impl TraceWorld for PredictionWorld<'_> {
         const MAX_GENTITIES: i32 = 1024;
         let mut result = self.world.trace(query);
         for solid in self.solids {
-            if solid.number == query.pass_entity {
+            if solid.skip_movement || solid.number == query.pass_entity {
                 continue;
             }
             // Objects owned by the predicted client never block it.
@@ -897,9 +936,8 @@ impl Predictor {
     /// CG_PredictPlayerState (vanilla, no vehicles/movers yet).
     pub fn predict(&mut self, input: PredictionInput<'_>) -> Result<(), String> {
         let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional } = input;
-        let solids = solid_entities(entities);
+        let mut solids = solid_entities(entities);
         let client_num = snap.player_state.field_i32("clientNum").unwrap_or(0);
-        let mut world = PredictionWorld { world, solids: &solids, client_num };
         // cg.thisFrameTeleport is raised by CG_TransitionSnapshot when the
         // playerstate teleport bit or client number changes.
         let snap_key = (
@@ -945,14 +983,43 @@ impl Predictor {
         let using_next = next.filter(|_| !next_frame_teleport && !self.this_frame_teleport);
         let base = using_next.unwrap_or(snap);
         let base_ps = &base.player_state;
-        let prediction_settings = predict_settings(&session.decoder().configstrings, &snap.player_state);
+        let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
+        prediction_settings.plugin_disable = settings.plugin_disable;
         let native = match &mut self.native {
             Some(native) => {
+                native.configure(&prediction_settings)?;
                 native.set_network(&to_native(base_ps))?;
                 native
             }
             slot => slot.insert(NativePlayerState::from_network(&to_native(base_ps))?),
         };
+
+        native.configure(&prediction_settings)?;
+        if prediction_settings.server_mod == 1 {
+            let prediction_entities: Vec<_> = entities.iter().map(|entity| {
+                let int = |key| entity.state.field_i32(key).unwrap_or(0);
+                let float = |key| entity.state.field_f32(key).unwrap_or(0.0);
+                jka_movement::PredictionEntity {
+                    number: i32::from(entity.number), entity_type: entity.entity_type,
+                    model_index: int("modelindex"), bolt1: int("bolt1"),
+                    trajectory_type: int("pos.trType"),
+                    origin: [float("pos.trBase[0]"), float("pos.trBase[1]"), float("pos.trBase[2]")],
+                    velocity: [float("pos.trDelta[0]"), float("pos.trDelta[1]"), float("pos.trDelta[2]")],
+                    angular_velocity: [float("apos.trDelta[0]"), float("apos.trDelta[1]"), float("apos.trDelta[2]")],
+                    legs_anim: int("legsAnim"), torso_anim: int("torsoAnim"), saber_move: int("saberMove"),
+                }
+            }).collect();
+            native.set_prediction_entities(&prediction_entities)?;
+            let mut skip = [false; 1024];
+            for entity in &prediction_entities {
+                // set_prediction_entities checked the native entity-number bounds.
+                skip[entity.number as usize] = !native.clips_prediction_entity(entity);
+            }
+            for solid in &mut solids {
+                solid.skip_movement = skip[solid.number as usize];
+            }
+        }
+        let mut world = PredictionWorld { world, solids: &solids, client_num };
 
         let mut moved = false;
         let mut command_time = base_ps.field_i32("commandTime").unwrap_or(0);
@@ -1058,6 +1125,7 @@ mod tests {
         let player = SolidEntity {
             number: 7,
             generic_enemy_index: 0,
+            skip_movement: false,
             clip: EntityClip::Box { mins: [-15.0, -15.0, -24.0], maxs: [15.0, 15.0, 40.0], origin: [spawn[0] + 48.0, spawn[1], spawn[2] + 16.0] },
         };
         let solids = [player];
@@ -1068,13 +1136,14 @@ mod tests {
         // The passed entity (ourselves) and owned objects are ignored.
         let ignored = PredictionWorld { world: &mut world, solids: &solids, client_num: 4 }.trace(TraceQuery { pass_entity: 7, ..query });
         assert_eq!(ignored.fraction, 1.0);
-        let owned = [SolidEntity { number: 300, generic_enemy_index: 1024 + 4, clip: player.clip }];
+        let owned = [SolidEntity { number: 300, generic_enemy_index: 1024 + 4, skip_movement: false, clip: player.clip }];
         assert_eq!(PredictionWorld { world: &mut world, solids: &owned, client_num: 4 }.trace(query).fraction, 1.0);
 
         // An inline model translated onto the path blocks like CM_TransformedBoxTrace.
         let mover = [SolidEntity {
             number: 90,
             generic_enemy_index: 0,
+            skip_movement: false,
             clip: EntityClip::InlineModel { index: 1, origin: [0.0; 3], angles: [0.0; 3] },
         }];
         let model_contents = PredictionWorld { world: &mut world, solids: &mover, client_num: 4 }.point_contents(start, 4);
@@ -1238,6 +1307,43 @@ mod tests {
         assert!(text.starts_with("\\name\\Padawan\\rate\\25000\\snaps\\40\\model\\kyle/default"), "{text}");
         assert!(text.ends_with("\\teamtask\\0"), "{text}");
         assert!(jka_protocol::netchan::connect_packet(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn japro_settings_follow_configstrings_and_clear_on_server_change() {
+        let ps = PlayerState::default();
+        let mut config = std::collections::BTreeMap::from([
+            (0, br"\gamename\JaPRO 1.4\jcinfo\123\jcinfo2\8\g_hookStrength\900".to_vec()),
+            (1, br"\pmove_fixed\1\pmove_msec\1".to_vec()),
+            (36, b"0x7".to_vec()),
+        ]);
+        let settings = predict_settings(&config, &ps);
+        assert_eq!((settings.server_mod, settings.jcinfo, settings.jcinfo2), (1, 123, 8));
+        assert_eq!((settings.pmove_msec, settings.hook_pull, settings.legacy_fixes), (1, 900, 7));
+        config.insert(0, br"\gamename\basejka\jcinfo\123".to_vec());
+        let settings = predict_settings(&config, &ps);
+        assert_eq!((settings.server_mod, settings.jcinfo, settings.jcinfo2, settings.legacy_fixes), (0, 0, 0, 0));
+        assert_eq!(settings.pmove_msec, 8);
+        assert_eq!(settings.hook_pull, 0);
+        config.clear();
+        assert_eq!(predict_settings(&config, &ps).server_mod, 0);
+    }
+
+    #[test]
+    fn japro_preferences_are_archived_and_advertised_only_for_japro() {
+        use mod_support::ServerMod;
+        let mut settings = NetworkSettings::default();
+        assert_eq!(settings.set_cvar("cp_pluginDisable", "1048576").unwrap().unwrap(), true);
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Japro);
+        assert_eq!(info_value(&info, b"cjp_client"), Some(b"1.4JAPRO".as_slice()));
+        assert_eq!(info_value(&info, b"cp_pluginDisable"), Some(b"1048576".as_slice()));
+        assert!(jka_protocol::netchan::connect_packet(&info).is_ok());
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"cjp_client"), None);
+        assert_eq!(info_value(&info, b"cp_pluginDisable"), None);
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta cp_pluginDisable \"1048576\""));
     }
 
     #[test]

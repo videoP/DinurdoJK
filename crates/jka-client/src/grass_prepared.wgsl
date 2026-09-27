@@ -522,3 +522,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(apply_grass_legacy_fog(lit, input.world_position), 1.0);
 }
+
+@fragment
+fn fs_wireframe() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}

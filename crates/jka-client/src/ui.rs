@@ -1,5 +1,18 @@
 use bytemuck::{Pod, Zeroable};
 
+/// Bitmask selecting which renderer submission families participate in r_showtris.
+/// A zero mask disables wireframe rendering.
+pub mod wireframe {
+    pub const MAP: u32 = 1 << 0;
+    pub const PLAYERS: u32 = 1 << 1;
+    pub const ENTITIES: u32 = 1 << 2;
+    pub const EFFECTS: u32 = 1 << 3;
+    pub const GRASS: u32 = 1 << 4;
+    pub const OCEAN: u32 = 1 << 5;
+    pub const DEFORMATION: u32 = 1 << 6;
+    pub const ALL: u32 = MAP | PLAYERS | ENTITIES | EFFECTS | GRASS | OCEAN | DEFORMATION;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayMode {
     None,
@@ -7,6 +20,7 @@ pub enum OverlayMode {
     Console,
     Video,
     Game,
+    Vgs,
     HudEdit,
     MapEdit,
 }
@@ -502,6 +516,9 @@ pub enum PvsMode {
     Full,
     #[default]
     Auto,
+    Auto2,
+    Auto3,
+    Auto4,
 }
 
 impl PvsMode {
@@ -511,6 +528,21 @@ impl PvsMode {
             Self::Minimal => "MINIMAL",
             Self::Full => "FULL",
             Self::Auto => "AUTO",
+            Self::Auto2 => "AUTO 2",
+            Self::Auto3 => "AUTO 3",
+            Self::Auto4 => "AUTO 4",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Full => "full",
+            Self::Auto => "auto",
+            Self::Auto2 => "auto2",
+            Self::Auto3 => "auto3",
+            Self::Auto4 => "auto4",
         }
     }
 }
@@ -1224,6 +1256,7 @@ pub const VIDEO_ROW_VERTEX_LIGHTING: usize = 63;
 pub const VIDEO_ROW_LIGHTMAP_ONLY: usize = 64;
 pub const VIDEO_ROW_MAP_LIGHT_SIMULATION: usize = 65;
 pub const VIDEO_ROW_SABER_MARKS: usize = 66;
+pub const VIDEO_ROW_MAX_FRAME_LATENCY: usize = 67;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -1298,7 +1331,10 @@ impl FogMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReflectionQuality {
+    /// No enhanced reflections and no authored tcGen environment stages.
     Off,
+    /// Vanilla/authored tcGen environment stages only; no enhanced reflection path.
+    Legacy,
     Low,
     Medium,
     #[default]
@@ -1307,11 +1343,19 @@ pub enum ReflectionQuality {
 }
 
 impl ReflectionQuality {
-    pub const ALL: [Self; 5] = [Self::Off, Self::Low, Self::Medium, Self::High, Self::Ultra];
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Legacy,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Ultra,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "OFF",
+            Self::Legacy => "LEGACY",
             Self::Low => "LOW",
             Self::Medium => "MEDIUM",
             Self::High => "HIGH",
@@ -1322,6 +1366,7 @@ impl ReflectionQuality {
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Legacy => "legacy",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -1331,7 +1376,8 @@ impl ReflectionQuality {
 
     pub fn from_config(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "0" => Some(Self::Off),
+            "off" | "none" | "0" => Some(Self::Off),
+            "legacy" | "classic" => Some(Self::Legacy),
             "low" | "1" => Some(Self::Low),
             "medium" | "med" | "2" => Some(Self::Medium),
             "high" | "3" => Some(Self::High),
@@ -1340,14 +1386,22 @@ impl ReflectionQuality {
         }
     }
 
+    /// Runtime reflection-technique tier. Off and Legacy deliberately share the
+    /// exact same zero-cost shader/runtime policy; their only difference is the
+    /// map-load material specialization that strips tcGen environment stages in
+    /// Off mode.
     pub fn shader_value(self) -> u32 {
         match self {
-            Self::Off => 0,
+            Self::Off | Self::Legacy => 0,
             Self::Low => 1,
             Self::Medium => 2,
             Self::High => 3,
             Self::Ultra => 4,
         }
+    }
+
+    pub fn omits_environment_stages(self) -> bool {
+        matches!(self, Self::Off)
     }
 
     pub fn ssr_enabled(self) -> bool {
@@ -1356,7 +1410,7 @@ impl ReflectionQuality {
 
     pub fn planar_slot_budget(self) -> usize {
         match self {
-            Self::Off | Self::Low | Self::Medium => 0,
+            Self::Off | Self::Legacy | Self::Low | Self::Medium => 0,
             Self::High => 1,
             Self::Ultra => 4,
         }
@@ -1497,12 +1551,15 @@ pub struct VideoSettings {
     pub fullscreen: FullscreenMode,
     pub renderer_backend: RendererBackend,
     pub vsync: VsyncMode,
+    /// Maximum number of frames the WGPU presentation surface may keep in flight.
+    /// Lower values favor latency; higher values favor throughput.
+    pub max_frame_latency: u32,
     pub msaa_samples: u32,
     pub resolution: [u32; 2],
     pub window_position: Option<[i32; 2]>,
     pub window_maximized: bool,
     pub texture_filter: TextureFilter,
-    pub show_wireframe: bool,
+    pub wireframe_mask: u32,
     pub skip_ui: bool,
     pub pvs_mode: PvsMode,
     pub fps_cap: u32,
@@ -1519,6 +1576,10 @@ pub struct VideoSettings {
     pub ghoul2_batch_draws: Ghoul2BatchMode,
     pub physics_msec: u32,
     pub input_subframe: bool,
+    /// Experimental render-thread late latch. Only effective with
+    /// `cl_input_subframe`; the renderer resamples the newest real view
+    /// orientation at its last coherent camera point for the active path.
+    pub input_latelatch: bool,
     // Client-side visual physics (Rapier integration target). These never replace
     // authoritative JKA/OpenJK player movement or server entity state.
     pub client_physics: bool,
@@ -1672,12 +1733,13 @@ impl Default for VideoSettings {
             fullscreen: FullscreenMode::Windowed,
             renderer_backend: RendererBackend::Vulkan,
             vsync: VsyncMode::Off,
+            max_frame_latency: 3,
             msaa_samples: 1,
             resolution: [1280, 800],
             window_position: None,
             window_maximized: false,
             texture_filter: TextureFilter::Trilinear,
-            show_wireframe: false,
+            wireframe_mask: 0,
             skip_ui: false,
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
@@ -1692,6 +1754,7 @@ impl Default for VideoSettings {
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             physics_msec: 8,
             input_subframe: false,
+            input_latelatch: false,
             client_physics: false,
             client_physics_hz: 60,
             client_physics_max_substeps: 4,
@@ -1822,6 +1885,7 @@ pub struct PerfStats {
     pub cpu_acquire_ms: f64,
     pub cpu_encode_ms: f64,
     pub cpu_submit_ms: f64,
+    pub cpu_present_ms: f64,
     pub dynamic_model_prepare_ms: f64,
     pub dynamic_model_surfaces: u32,
     pub dynamic_model_vertices: u64,
@@ -1862,8 +1926,11 @@ pub struct PerfStats {
     pub cull_area_rejected: u32,
     pub input_event_to_sim_ms: Option<f64>,
     pub input_sim_to_render_ms: Option<f64>,
-    pub input_event_to_present_ms: Option<f64>,
-    pub input_event_to_present_max_ms: Option<f64>,
+    pub input_event_to_latch_ms: Option<f64>,
+    pub input_latch_to_submit_ms: Option<f64>,
+    pub input_latch_to_present_call_ms: Option<f64>,
+    pub input_event_to_present_call_ms: Option<f64>,
+    pub input_event_to_present_call_max_ms: Option<f64>,
     pub input_latency_samples: u32,
 }
 
@@ -2126,7 +2193,7 @@ pub fn build_vertices(
         }
         return out;
     }
-    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit) {
+    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit) {
         build_follow_indicator(&mut out, ui, small_font, width, height);
         build_scoreboard(&mut out, ui, width, height);
     }
@@ -2137,7 +2204,7 @@ pub fn build_vertices(
         OverlayMode::None | OverlayMode::Chat => {}
         OverlayMode::Console => build_console(&mut out, ui, width, height),
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
-        OverlayMode::Video | OverlayMode::Game | OverlayMode::HudEdit | OverlayMode::MapEdit => {}
+        OverlayMode::Video | OverlayMode::Game | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit => {}
     }
     if matches!(ui.mode, OverlayMode::None | OverlayMode::Game | OverlayMode::Video) {
         if let Some(info) = &ui.surface_inspector {
@@ -2155,7 +2222,7 @@ fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> bool {
         && height != 0
         && !ui.video.skip_ui
         && ui.loading.is_none()
-        && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit)
+        && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit)
 }
 
 /// Stable gameplay HUD geometry. This changes when HUD values/settings change,
@@ -2202,7 +2269,7 @@ pub fn build_transient_vertices(
     }
     let gameplay_overlay = matches!(
         ui.mode,
-        OverlayMode::None | OverlayMode::Chat | OverlayMode::HudEdit | OverlayMode::MapEdit
+        OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit
     );
     if gameplay_overlay {
         build_chat_history(out, ui, small_font, width, height);
@@ -3603,7 +3670,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let cpu_h = 78.0;
     let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
     let client_h = 126.0;
-    let input_h = 92.0;
+    let input_h = 108.0;
     let thread_header_h = 28.0;
     let thread_row_h = 32.0;
     let footer_h = if debug_culling { 42.0 } else { 0.0 };
@@ -3649,6 +3716,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         [0.20, 0.78, 0.82, 0.98], // acquire
         [0.72, 0.42, 0.95, 0.98], // encode
         [0.95, 0.58, 0.20, 0.98], // submit
+        [0.94, 0.78, 0.28, 0.98], // present API
         [0.32, 0.36, 0.42, 0.98], // other
     ];
     let wall = p.frame_ms.max(0.000_001);
@@ -3662,8 +3730,12 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         .cpu_submit_ms
         .max(0.0)
         .min((wall - prep - acquire - encode).max(0.0));
-    let other = (wall - prep - acquire - encode - submit).max(0.0);
-    let cpu_segments = [prep, acquire, encode, submit, other];
+    let present = p
+        .cpu_present_ms
+        .max(0.0)
+        .min((wall - prep - acquire - encode - submit).max(0.0));
+    let other = (wall - prep - acquire - encode - submit - present).max(0.0);
+    let cpu_segments = [prep, acquire, encode, submit, present, other];
     let bar_x = x + 12.0;
     let bar_y = y + header_h + 2.0;
     let bar_w = panel_w - 24.0;
@@ -3693,7 +3765,8 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         ("ACQUIRE", acquire, cpu_colors[1]),
         ("ENCODE", encode, cpu_colors[2]),
         ("SUBMIT", submit, cpu_colors[3]),
-        ("OTHER", other, cpu_colors[4]),
+        ("PRESENT", present, cpu_colors[4]),
+        ("OTHER", other, cpu_colors[5]),
     ];
     let cpu_col_w = bar_w / cpu_legend.len() as f32;
     for (i, (label, value, color)) in cpu_legend.into_iter().enumerate() {
@@ -3920,7 +3993,9 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 
     text(
         out,
-        if ui.video.input_subframe {
+        if ui.video.input_subframe && ui.video.input_latelatch {
+            "INPUT LATENCY (MOUSE)   SUBFRAME + LATE-LATCH"
+        } else if ui.video.input_subframe {
             "INPUT LATENCY (MOUSE)   SUBFRAME EVENT-RATE"
         } else {
             "INPUT LATENCY (MOUSE)   CLIENT-TICK"
@@ -3932,11 +4007,12 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         w,
         h,
     );
-    if let (Some(event_to_sim), Some(sim_to_render), Some(event_to_present), Some(present_max)) = (
+
+    if let (Some(event_to_sim), Some(sim_to_render), Some(event_to_present_call), Some(present_call_max)) = (
         p.input_event_to_sim_ms,
         p.input_sim_to_render_ms,
-        p.input_event_to_present_ms,
-        p.input_event_to_present_max_ms,
+        p.input_event_to_present_call_ms,
+        p.input_event_to_present_call_max_ms,
     ) {
         let metric_y = next_y + 22.0;
         let col_w = (panel_w - 24.0) / 3.0;
@@ -3955,7 +4031,11 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         );
         draw_perf_metric(
             out,
-            "SIM>RENDER",
+            if ui.video.input_latelatch {
+                "SIM>LATCH"
+            } else {
+                "SIM>RENDER"
+            },
             &format!("{sim_to_render:.3} MS"),
             x + 12.0 + col_w,
             metric_y,
@@ -3968,30 +4048,54 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         );
         draw_perf_metric(
             out,
-            "EVENT>PRESENT",
-            &format!("{event_to_present:.3} MS"),
+            "EVENT>PRESENT CALL",
+            &format!("{event_to_present_call:.3} MS"),
             x + 12.0 + col_w * 2.0,
             metric_y,
             1.00,
             1.38,
-            [0.96, 0.72, 0.34, 1.0],
+            [0.66, 0.74, 0.90, 1.0],
             body_color,
             w,
             h,
         );
         text(
             out,
-            &format!(
-                "{} SAMPLES / 500 MS   WORST EVENT>PRESENT {:.3} MS   PRESENT CALL ONLY",
-                p.input_latency_samples, present_max
-            ),
+            &if ui.video.input_latelatch {
+                format!(
+                    "{} SAMPLES / 500 MS   WORST PRESENT CALL {:.3} MS",
+                    p.input_latency_samples, present_call_max,
+                )
+            } else {
+                format!(
+                    "{} SAMPLES / 500 MS   WORST PRESENT CALL {:.3} MS   CPU PRESENT RETURN, NOT SCANOUT",
+                    p.input_latency_samples, present_call_max
+                )
+            },
             x + 12.0,
             next_y + 69.0,
-            1.00,
+            0.92,
             muted_color,
             w,
             h,
         );
+        if ui.video.input_latelatch {
+            text(
+                out,
+                &format!(
+                    "EVENT>LATCH {:.3} MS   LATCH>SUBMIT {:.3} MS   LATCH>PRESENT {:.3} MS   PRESENT=CPU RETURN, NOT SCANOUT",
+                    p.input_event_to_latch_ms.unwrap_or(0.0),
+                    p.input_latch_to_submit_ms.unwrap_or(0.0),
+                    p.input_latch_to_present_call_ms.unwrap_or(0.0),
+                ),
+                x + 12.0,
+                next_y + 84.0,
+                0.92,
+                muted_color,
+                w,
+                h,
+            );
+        }
     } else {
         text(
             out,

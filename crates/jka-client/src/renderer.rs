@@ -1,12 +1,12 @@
 use crate::{
-    camera::Camera,
+    camera::{late_latch_third_person_view, Camera, ThirdPersonLateLatchView},
     color_lut,
-    grass::{GrassDrawStats, GrassMapGpu, GrassRenderer},
+    grass::{GrassDrawStats, GrassMapGpu, GrassPreparedDraw, GrassRenderer},
     materials::{BlendFactor, BlendFunc, CullMode, TextureData},
     runtime::{RenderStats, SurfaceInspectorInfo, UserEvent, WorldUploadTimings},
     scene::{
         self, BlendMode, DirectionalSun, DrawBatch, DrawClass, GpuVertex,
-        PipelineKey, PreparedMap,
+        PipelineKey, PreparedMap, PreparedPortalDrawPlan, PreparedPortalPlanBatchRef,
     },
     surface_deformation::{
         SurfaceDeformationGpu, SurfaceDeformationStamp, SNOW_SHELL_CHUNK_SIZE,
@@ -33,7 +33,8 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError, TrySendError},
         Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
@@ -49,10 +50,15 @@ const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 // only a few hundred vertices.
 const UI_DYNAMIC_BUFFER_BYTES: u64 = 512 * 1024;
 const UI_TRANSIENT_BUFFER_BYTES: u64 = 1024 * 1024;
-// AUTO uses a conservative vertex-equivalent cost for an extra draw call. This
-// intentionally biases toward the old coarse batches unless FULL PVS removes a
-// meaningful amount of geometry. The comparison is precomputed per BSP cluster.
+// AUTO and AUTO 2 use a conservative vertex-equivalent cost for an extra draw
+// call. Existing AUTO compares whole BSP clusters; AUTO 2 applies the same cost
+// independently per coarse surface group.
 const AUTO_DRAW_VERTEX_EQUIVALENT: u64 = 8192;
+// AUTO 4 physically collapses repeated portal-plan groups lazily. The GPU index
+// buffer reserves at most this much extra space; LRU eviction keeps custom maps
+// with thousands of clusters from multiplying index memory without bound.
+const AUTO4_COLLAPSE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const AUTO4_COLLAPSE_QUEUE_DEPTH: usize = 8;
 const CLUSTER_X: u32 = 16;
 const CLUSTER_Y: u32 = 9;
 const CLUSTER_Z: u32 = 24;
@@ -169,6 +175,150 @@ pub struct InputLatencySample {
     pub simulation_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ViewLatchMode {
+    #[default]
+    Disabled,
+    /// First-person view: the newest input orientation is the final camera rotation.
+    Direct,
+    /// Ordinary local third person. Target damping/collision were resolved by
+    /// CGame; the renderer may rebuild only the angle-dependent OpenJK orbit math.
+    ThirdPerson(ThirdPersonLateLatchView),
+}
+
+/// Tiny single-writer/multi-reader mailbox for subframe *input* view rotation.
+/// The main thread writes the latest local-player yaw/pitch and mouse timestamp
+/// without taking the RenderSnapshot mutex. The renderer decides how that input
+/// maps onto the final first- or third-person camera via `ViewLatchMode`.
+struct LatestViewState {
+    epoch: Instant,
+    version: AtomicU64,
+    yaw_bits: AtomicU32,
+    pitch_bits: AtomicU32,
+    input_sequence: AtomicU64,
+    event_ns: AtomicU64,
+    simulation_ns: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct LatestViewSample {
+    yaw: f32,
+    pitch: f32,
+    input: Option<InputLatencySample>,
+}
+
+#[derive(Clone, Copy)]
+struct ViewSampleMeasurement {
+    input: InputLatencySample,
+    sampled_at: Instant,
+}
+
+impl LatestViewState {
+    fn new(camera: Camera) -> Self {
+        Self {
+            epoch: Instant::now(),
+            version: AtomicU64::new(0),
+            yaw_bits: AtomicU32::new(camera.yaw.to_bits()),
+            pitch_bits: AtomicU32::new(camera.pitch.to_bits()),
+            input_sequence: AtomicU64::new(0),
+            event_ns: AtomicU64::new(0),
+            simulation_ns: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn instant_ns(&self, instant: Instant) -> Option<u64> {
+        instant.checked_duration_since(self.epoch).map(|elapsed| {
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64
+        })
+    }
+
+    fn publish_rotation(&self, yaw: f32, pitch: f32, input: Option<InputLatencySample>) {
+        // Single writer (winit/main thread): odd marks an in-progress update;
+        // even + Release publishes the complete tuple to the render thread.
+        // AcqRel on the opening RMW keeps the payload stores after the odd
+        // marker; Release on the closing RMW publishes the complete tuple.
+        // That gives the Acquire/Acquire reader a real seqlock boundary rather
+        // than relying on relaxed operations not being reordered.
+        self.version.fetch_add(1, Ordering::AcqRel);
+        self.yaw_bits.store(yaw.to_bits(), Ordering::Relaxed);
+        self.pitch_bits.store(pitch.to_bits(), Ordering::Relaxed);
+        if let Some(sample) = input {
+            if let (Some(event_ns), Some(simulation_ns)) = (
+                self.instant_ns(sample.event_at),
+                self.instant_ns(sample.simulation_at),
+            ) {
+                self.input_sequence.store(sample.sequence, Ordering::Relaxed);
+                self.event_ns.store(event_ns, Ordering::Relaxed);
+                self.simulation_ns.store(simulation_ns, Ordering::Relaxed);
+            }
+        }
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    fn load(&self) -> LatestViewSample {
+        loop {
+            let before = self.version.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let yaw = f32::from_bits(self.yaw_bits.load(Ordering::Relaxed));
+            let pitch = f32::from_bits(self.pitch_bits.load(Ordering::Relaxed));
+            let sequence = self.input_sequence.load(Ordering::Relaxed);
+            let event_ns = self.event_ns.load(Ordering::Relaxed);
+            let simulation_ns = self.simulation_ns.load(Ordering::Relaxed);
+            let after = self.version.load(Ordering::Acquire);
+            if before != after {
+                std::hint::spin_loop();
+                continue;
+            }
+            let input = (sequence != 0).then(|| InputLatencySample {
+                sequence,
+                event_at: self.epoch + Duration::from_nanos(event_ns),
+                simulation_at: self.epoch + Duration::from_nanos(simulation_ns),
+            });
+            return LatestViewSample { yaw, pitch, input };
+        }
+    }
+}
+
+#[inline]
+fn sample_view_rotation(
+    camera: &mut Camera,
+    state: &LatestViewState,
+    mode: ViewLatchMode,
+) -> Option<ViewSampleMeasurement> {
+    if mode == ViewLatchMode::Disabled {
+        return None;
+    }
+    let sample = state.load();
+    match mode {
+        ViewLatchMode::Disabled => unreachable!(),
+        ViewLatchMode::Direct => {
+            camera.yaw = sample.yaw;
+            camera.pitch = sample.pitch;
+        }
+        ViewLatchMode::ThirdPerson(latch) => {
+            // LatestViewState uses renderer conventions (yaw radians, positive
+            // pitch up). The OpenJK camera port consumes native JKA degrees,
+            // where positive pitch points down. This is the newest real input,
+            // never an extrapolated/predicted angle.
+            let view = late_latch_third_person_view(
+                latch,
+                [-sample.pitch.to_degrees(), sample.yaw.to_degrees(), 0.0],
+            );
+            camera.position = Vec3::from_array(scene::render_position(view.origin));
+            camera.yaw = view.angles[1].to_radians();
+            camera.pitch = -view.angles[0].to_radians();
+        }
+    }
+    let sampled_at = Instant::now();
+    sample
+        .input
+        .map(|input| ViewSampleMeasurement { input, sampled_at })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DynamicModelAlphaMode {
     Opaque,
@@ -266,12 +416,31 @@ pub struct Ghoul2GpuSkinning {
     pub color: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicWireframeClass {
+    Player,
+    Entity,
+    Effect,
+}
+
+impl DynamicWireframeClass {
+    #[inline]
+    fn mask_bit(self) -> u32 {
+        match self {
+            Self::Player => ui::wireframe::PLAYERS,
+            Self::Entity => ui::wireframe::ENTITIES,
+            Self::Effect => ui::wireframe::EFFECTS,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DynamicModelSurface {
     /// Presentation identity retained for diagnostics/culling work even though
     /// the current render pass does not branch on it.
     #[allow(dead_code)]
     pub entity_num: u16,
+    pub wireframe_class: DynamicWireframeClass,
     pub vertices: Arc<Vec<DynamicModelVertex>>,
     pub indices: Arc<Vec<u32>>,
     /// JKA-space point used for classic BSP entity-lighting lookup. Effects and
@@ -373,6 +542,11 @@ pub struct TransientLight {
 #[derive(Clone)]
 pub struct RenderSnapshot {
     pub camera: Camera,
+    /// Mapping from latest local-player input orientation to this render camera.
+    pub view_latch: ViewLatchMode,
+    /// Latest local input yaw/pitch in renderer radians. This is deliberately
+    /// separate from `camera`: third-person camera rotation is derived output.
+    pub input_view_rotation: Option<[f32; 2]>,
     pub player_position: Option<Vec3>,
     /// Current server snapshot portal-area mask. Set bits are areas closed off
     /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
@@ -482,9 +656,12 @@ pub struct EguiRenderData {
 pub enum RenderCommand {
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
+    SetMaxFrameLatency(u32),
+    SetInputSubframe(bool),
+    SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
-    SetWireframe(bool),
+    SetWireframeMask(u32),
     SetPvsMode(PvsMode),
     SetFpsCap(u32),
     SetGamma(f32),
@@ -567,6 +744,8 @@ pub enum RenderCommand {
 pub struct RenderThread {
     command_tx: Sender<RenderCommand>,
     latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    latest_view: Arc<LatestViewState>,
+    subframe_view_enabled: AtomicBool,
     join: Option<JoinHandle<()>>,
 }
 
@@ -586,7 +765,15 @@ impl RenderThread {
         // A shared latest snapshot avoids retaining stale mouse samples when input
         // arrives faster than rendering (for example 1000 Hz input at 240-500 FPS).
         let latest_snapshot = Arc::new(Mutex::new(initial.clone()));
+        let mut initial_view_camera = initial.camera;
+        if let Some([yaw, pitch]) = initial.input_view_rotation {
+            initial_view_camera.yaw = yaw;
+            initial_view_camera.pitch = pitch;
+        }
+        let latest_view = Arc::new(LatestViewState::new(initial_view_camera));
+        let initial_subframe_view_enabled = initial_ui.video.input_subframe;
         let render_snapshot = Arc::clone(&latest_snapshot);
+        let render_latest_view = Arc::clone(&latest_view);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = match backend {
             RendererBackend::Vulkan => wgpu::Backends::VULKAN,
@@ -616,6 +803,7 @@ impl RenderThread {
                         proxy,
                         command_rx,
                         render_snapshot,
+                        render_latest_view,
                         initial,
                         initial_ui,
                         base,
@@ -637,18 +825,44 @@ impl RenderThread {
         Ok(Self {
             command_tx,
             latest_snapshot,
+            latest_view,
+            subframe_view_enabled: AtomicBool::new(initial_subframe_view_enabled),
             join: Some(join),
         })
     }
 
     pub fn command(&self, command: RenderCommand) {
+        if let RenderCommand::SetInputSubframe(enabled) = &command {
+            self.subframe_view_enabled.store(*enabled, Ordering::Relaxed);
+        }
         let _ = self.command_tx.send(command);
     }
 
     pub fn publish(&self, snapshot: RenderSnapshot) {
+        if self.subframe_view_enabled.load(Ordering::Relaxed) {
+            // Publish the tiny *input-view* tuple first. In third person the
+            // snapshot camera is derived output and must never overwrite newer
+            // raw player viewangles in the lock-free mailbox.
+            if let Some([yaw, pitch]) = snapshot.input_view_rotation {
+                self.latest_view
+                    .publish_rotation(yaw, pitch, snapshot.input_latency);
+            }
+        }
         match self.latest_snapshot.lock() {
             Ok(mut latest) => *latest = snapshot,
             Err(poisoned) => *poisoned.into_inner() = snapshot,
+        }
+    }
+
+    pub fn publish_subframe_view_rotation(
+        &self,
+        yaw: f32,
+        pitch: f32,
+        input: InputLatencySample,
+    ) {
+        if self.subframe_view_enabled.load(Ordering::Relaxed) {
+            self.latest_view
+                .publish_rotation(yaw, pitch, Some(input));
         }
     }
 
@@ -675,6 +889,7 @@ fn render_thread_main(
     proxy: EventLoopProxy<UserEvent>,
     command_rx: Receiver<RenderCommand>,
     latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    latest_view: Arc<LatestViewState>,
     mut snapshot: RenderSnapshot,
     initial_ui: UiSnapshot,
     base: PathBuf,
@@ -687,6 +902,7 @@ fn render_thread_main(
         surface,
         &base,
         game.as_deref(),
+        initial_ui.video.max_frame_latency,
     )) {
         Ok(renderer) => renderer,
         Err(error) => {
@@ -701,9 +917,11 @@ fn render_thread_main(
     renderer.set_vsync(initial_ui.video.vsync);
     renderer.set_msaa(initial_ui.video.msaa_samples);
     renderer.set_texture_filter(initial_ui.video.texture_filter);
-    renderer.set_wireframe(initial_ui.video.show_wireframe);
+    renderer.set_wireframe_mask(initial_ui.video.wireframe_mask);
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
     let mut fps_cap = initial_ui.video.fps_cap;
+    let mut input_subframe = initial_ui.video.input_subframe;
+    let mut input_latelatch = initial_ui.video.input_subframe && initial_ui.video.input_latelatch;
     renderer.set_gamma(initial_ui.video.gamma);
     renderer
         .surface_deformation
@@ -812,10 +1030,14 @@ fn render_thread_main(
     let mut last_info = FrameInfo::default();
     let mut last_measured_input_sequence = 0_u64;
     let mut input_latency_samples = 0_u64;
+    let mut input_latch_samples = 0_u64;
     let mut input_event_to_sim_sum_ms = 0.0_f64;
     let mut input_sim_to_render_sum_ms = 0.0_f64;
-    let mut input_event_to_present_sum_ms = 0.0_f64;
-    let mut input_event_to_present_max_ms = 0.0_f64;
+    let mut input_event_to_latch_sum_ms = 0.0_f64;
+    let mut input_latch_to_submit_sum_ms = 0.0_f64;
+    let mut input_latch_to_present_call_sum_ms = 0.0_f64;
+    let mut input_event_to_present_call_sum_ms = 0.0_f64;
+    let mut input_event_to_present_call_max_ms = 0.0_f64;
     let mut pending_world_uploaded: Option<(
         u64,
         Instant,
@@ -844,6 +1066,7 @@ fn render_thread_main(
     let mut trace_acquire_ms = 0.0_f64;
     let mut trace_encode_ms = 0.0_f64;
     let mut trace_submit_ms = 0.0_f64;
+    let mut trace_present_ms = 0.0_f64;
     let mut trace_dynamic_model_ms = 0.0_f64;
     let mut trace_grass_cpu_ms = 0.0_f64;
     if perf_trace {
@@ -862,11 +1085,23 @@ fn render_thread_main(
                 match command_rx.try_recv() {
                     Ok(RenderCommand::Resize(size)) => renderer.resize(size),
                     Ok(RenderCommand::SetVsync(vsync)) => renderer.set_vsync(vsync),
+                    Ok(RenderCommand::SetMaxFrameLatency(latency)) => {
+                        renderer.set_max_frame_latency(latency)
+                    }
+                    Ok(RenderCommand::SetInputSubframe(enabled)) => {
+                        input_subframe = enabled;
+                        if !enabled {
+                            input_latelatch = false;
+                        }
+                    }
+                    Ok(RenderCommand::SetInputLateLatch(enabled)) => {
+                        input_latelatch = input_subframe && enabled;
+                    }
                     Ok(RenderCommand::SetMsaa(samples)) => renderer.set_msaa(samples),
                     Ok(RenderCommand::SetTextureFilter(filter)) => {
                         renderer.set_texture_filter(filter)
                     }
-                    Ok(RenderCommand::SetWireframe(enabled)) => renderer.set_wireframe(enabled),
+                    Ok(RenderCommand::SetWireframeMask(mask)) => renderer.set_wireframe_mask(mask),
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
                     Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
@@ -908,6 +1143,7 @@ fn render_thread_main(
                         trace_acquire_ms = 0.0;
                         trace_encode_ms = 0.0;
                         trace_submit_ms = 0.0;
+                        trace_present_ms = 0.0;
                         trace_grass_cpu_ms = 0.0;
                         println!(
                             "JKA perf trace {}",
@@ -1085,8 +1321,23 @@ fn render_thread_main(
         renderer.update_inline_models(snapshot.inline_models.as_deref().map(Vec::as_slice));
 
         let frame_loop_started = Instant::now();
-        let input_latency_sample = snapshot
-            .input_latency
+        // `cl_input_subframe 1` samples the same lock-free latest-view mailbox
+        // at frame start. `cl_input_latelatch 1` defers that exact sample until
+        // the renderer's last coherent camera point, making the A/B comparison
+        // about latch timing rather than about two different input pipelines.
+        let mut frame_camera = snapshot.camera;
+        let frame_start_view_sample = (input_subframe && !input_latelatch)
+            .then(|| {
+                sample_view_rotation(
+                    &mut frame_camera,
+                    latest_view.as_ref(),
+                    snapshot.view_latch,
+                )
+            })
+            .flatten();
+        let input_latency_sample = frame_start_view_sample
+            .map(|measurement| measurement.input)
+            .or(snapshot.input_latency)
             .filter(|sample| sample.sequence != last_measured_input_sequence);
         let render_result = {
             let _activity = crate::thread_activity::activity(
@@ -1094,7 +1345,7 @@ fn render_thread_main(
                 crate::thread_activity::Task::RenderFrame,
             );
             renderer.render(
-                &snapshot.camera,
+                &frame_camera,
                 snapshot.player_position,
                 snapshot.area_mask.as_ref(),
                 snapshot.dynamic_models.as_slice(),
@@ -1103,6 +1354,8 @@ fn render_thread_main(
                 &motion_reference_camera,
                 motion_camera_sample_dt,
                 motion_camera_changed_at.elapsed().as_secs_f32(),
+                snapshot.view_latch,
+                input_latelatch.then_some(latest_view.as_ref()),
             )
         };
         match render_result {
@@ -1118,28 +1371,69 @@ fn render_thread_main(
                     trace_acquire_ms += info.cpu_acquire_ms;
                     trace_encode_ms += info.cpu_encode_ms;
                     trace_submit_ms += info.cpu_submit_ms;
+                    trace_present_ms += info.cpu_present_ms;
                     trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
                     trace_grass_cpu_ms += info.grass.cpu_ms;
                 }
                 last_info = info;
-                if let Some(sample) = input_latency_sample {
+                let late_measurement = input_latelatch
+                    .then_some(last_info.late_latch)
+                    .flatten()
+                    .filter(|measurement| {
+                        measurement.input.sequence != last_measured_input_sequence
+                    });
+                let measured_sample = late_measurement
+                    .map(|measurement| measurement.input)
+                    .or(input_latency_sample);
+                if let Some(sample) = measured_sample {
+                    let render_sample_at = late_measurement
+                        .map(|measurement| measurement.sampled_at)
+                        .or_else(|| {
+                            frame_start_view_sample
+                                .filter(|measurement| measurement.input.sequence == sample.sequence)
+                                .map(|measurement| measurement.sampled_at)
+                        })
+                        .unwrap_or(frame_loop_started);
                     let input_event_to_sim_ms = sample
                         .simulation_at
                         .saturating_duration_since(sample.event_at)
                         .as_secs_f64()
                         * 1000.0;
-                    let input_sim_to_render_ms = frame_loop_started
+                    let input_sim_to_render_ms = render_sample_at
                         .saturating_duration_since(sample.simulation_at)
                         .as_secs_f64()
                         * 1000.0;
-                    let input_event_to_present_ms =
-                        sample.event_at.elapsed().as_secs_f64() * 1000.0;
+                    let present_completed_at = last_info
+                        .present_call_completed_at
+                        .unwrap_or_else(Instant::now);
+                    let input_event_to_present_call_ms = present_completed_at
+                        .saturating_duration_since(sample.event_at)
+                        .as_secs_f64()
+                        * 1000.0;
                     input_latency_samples += 1;
                     input_event_to_sim_sum_ms += input_event_to_sim_ms;
                     input_sim_to_render_sum_ms += input_sim_to_render_ms;
-                    input_event_to_present_sum_ms += input_event_to_present_ms;
-                    input_event_to_present_max_ms =
-                        input_event_to_present_max_ms.max(input_event_to_present_ms);
+                    if let Some(measurement) = late_measurement {
+                        input_latch_samples += 1;
+                        input_event_to_latch_sum_ms += measurement
+                            .sampled_at
+                            .saturating_duration_since(sample.event_at)
+                            .as_secs_f64()
+                            * 1000.0;
+                        if let Some(submit_at) = last_info.submit_call_at {
+                            input_latch_to_submit_sum_ms += submit_at
+                                .saturating_duration_since(measurement.sampled_at)
+                                .as_secs_f64()
+                                * 1000.0;
+                        }
+                        input_latch_to_present_call_sum_ms += present_completed_at
+                            .saturating_duration_since(measurement.sampled_at)
+                            .as_secs_f64()
+                            * 1000.0;
+                    }
+                    input_event_to_present_call_sum_ms += input_event_to_present_call_ms;
+                    input_event_to_present_call_max_ms =
+                        input_event_to_present_call_max_ms.max(input_event_to_present_call_ms);
                     last_measured_input_sequence = sample.sequence;
                 }
                 if let Some((
@@ -1215,6 +1509,7 @@ fn render_thread_main(
                     cpu_acquire_ms: last_info.cpu_acquire_ms,
                     cpu_encode_ms: last_info.cpu_encode_ms,
                     cpu_submit_ms: last_info.cpu_submit_ms,
+                    cpu_present_ms: last_info.cpu_present_ms,
                     dynamic_model_prepare_ms: last_info.dynamic_model_prepare_ms,
                     dynamic_model_surfaces: last_info.dynamic_model_surfaces,
                     dynamic_model_vertices: last_info.dynamic_model_vertices,
@@ -1236,10 +1531,17 @@ fn render_thread_main(
                         .then(|| input_event_to_sim_sum_ms / input_latency_samples as f64),
                     input_sim_to_render_ms: (input_latency_samples != 0)
                         .then(|| input_sim_to_render_sum_ms / input_latency_samples as f64),
-                    input_event_to_present_ms: (input_latency_samples != 0)
-                        .then(|| input_event_to_present_sum_ms / input_latency_samples as f64),
-                    input_event_to_present_max_ms: (input_latency_samples != 0)
-                        .then_some(input_event_to_present_max_ms),
+                    input_event_to_latch_ms: (input_latch_samples != 0)
+                        .then(|| input_event_to_latch_sum_ms / input_latch_samples as f64),
+                    input_latch_to_submit_ms: (input_latch_samples != 0)
+                        .then(|| input_latch_to_submit_sum_ms / input_latch_samples as f64),
+                    input_latch_to_present_call_ms: (input_latch_samples != 0).then(|| {
+                        input_latch_to_present_call_sum_ms / input_latch_samples as f64
+                    }),
+                    input_event_to_present_call_ms: (input_latency_samples != 0)
+                        .then(|| input_event_to_present_call_sum_ms / input_latency_samples as f64),
+                    input_event_to_present_call_max_ms: (input_latency_samples != 0)
+                        .then_some(input_event_to_present_call_max_ms),
                     input_latency_samples: u32::try_from(input_latency_samples).unwrap_or(u32::MAX),
                     msaa_samples: renderer.msaa_samples,
                     vsync: renderer.vsync,
@@ -1252,10 +1554,14 @@ fn render_thread_main(
             stats_started = Instant::now();
             stats_frames = 0;
             input_latency_samples = 0;
+            input_latch_samples = 0;
             input_event_to_sim_sum_ms = 0.0;
             input_sim_to_render_sum_ms = 0.0;
-            input_event_to_present_sum_ms = 0.0;
-            input_event_to_present_max_ms = 0.0;
+            input_event_to_latch_sum_ms = 0.0;
+            input_latch_to_submit_sum_ms = 0.0;
+            input_latch_to_present_call_sum_ms = 0.0;
+            input_event_to_present_call_sum_ms = 0.0;
+            input_event_to_present_call_max_ms = 0.0;
         }
 
         if perf_trace && trace_started.elapsed() >= Duration::from_secs(1) {
@@ -1289,13 +1595,14 @@ fn render_thread_main(
             let grass_total_ms = grass_total_gpu
                 .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
             println!(
-                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit_present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} hotpath=1",
+                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit={:.4}ms present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} hotpath=1",
                 trace_frames as f64 / elapsed,
                 trace_frame_ms / frames,
                 trace_prepare_ms / frames,
                 trace_acquire_ms / frames,
                 trace_encode_ms / frames,
                 trace_submit_ms / frames,
+                trace_present_ms / frames,
                 trace_dynamic_model_ms / frames,
                 last_info.ghoul2_gpu_draw_calls,
                 last_info.ghoul2_gpu_instances,
@@ -1483,6 +1790,7 @@ fn render_thread_main(
             trace_acquire_ms = 0.0;
             trace_encode_ms = 0.0;
             trace_submit_ms = 0.0;
+            trace_present_ms = 0.0;
             trace_dynamic_model_ms = 0.0;
             trace_grass_cpu_ms = 0.0;
         }
@@ -2009,6 +2317,7 @@ struct SurfaceSpriteEffectRenderer {
     texture_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
     pipelines: BTreeMap<Option<BlendFunc>, wgpu::RenderPipeline>,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity_bytes: u64,
@@ -2047,6 +2356,7 @@ impl SurfaceSpriteEffectRenderer {
             texture_layout,
             pipeline_layout,
             shader,
+            wireframe_pipeline: None,
             pipelines: BTreeMap::new(),
             vertex_buffer,
             vertex_capacity_bytes,
@@ -2063,9 +2373,62 @@ impl SurfaceSpriteEffectRenderer {
     ) {
         self.surface_format = surface_format;
         self.samples = samples;
+        self.wireframe_pipeline = None;
         self.pipelines.clear();
         // Pipelines are recreated lazily for only the blend functions the map uses.
         let _ = device;
+    }
+
+    fn ensure_wireframe_pipeline(&mut self, device: &wgpu::Device) {
+        if self.wireframe_pipeline.is_some() {
+            return;
+        }
+        self.wireframe_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("JKA surfaceSprites wireframe pipeline"),
+            layout: Some(&self.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &self.shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SurfaceSpriteEffectVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &SURFACE_SPRITE_EFFECT_ATTRIBUTES,
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Line,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: self.samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.shader,
+                entry_point: Some("fs_wireframe"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        }));
     }
 
     fn create_texture_bind_group(
@@ -2237,6 +2600,26 @@ impl SurfaceSpriteEffectRenderer {
             };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(1, &effect.bind_group, &[]);
+            pass.draw(draw.vertices.clone(), 0..1);
+        }
+    }
+
+    fn draw_wireframe<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        prepared: &PreparedSurfaceSpriteEffects,
+    ) {
+        let Some(pipeline) = self.wireframe_pipeline.as_ref() else {
+            return;
+        };
+        if prepared.draws.is_empty() {
+            return;
+        }
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        for draw in &prepared.draws {
             pass.draw(draw.vertices.clone(), 0..1);
         }
     }
@@ -2478,6 +2861,7 @@ struct Ghoul2PreparedDraw {
     mesh_key: Arc<str>,
     texture_key: Option<Arc<str>>,
     alpha_mode: DynamicModelAlphaMode,
+    wireframe_class: DynamicWireframeClass,
     first_instance: u32,
     instance_count: u32,
 }
@@ -2486,6 +2870,7 @@ struct Ghoul2PendingDraw {
     mesh_key: Arc<str>,
     texture_key: Option<Arc<str>>,
     alpha_mode: DynamicModelAlphaMode,
+    wireframe_class: DynamicWireframeClass,
     uniform: Ghoul2GpuDrawUniform,
     sequence: u32,
     // Adaptive batching starts by hashing a bounded distributed sample.  If
@@ -2539,6 +2924,7 @@ struct DynamicPreparedDraw {
     index_count: u32,
     texture_key: Option<Arc<str>>,
     alpha_mode: DynamicModelAlphaMode,
+    wireframe_class: DynamicWireframeClass,
 }
 
 /// Dynamic indexed-mesh path used by cgame entities. CPU-skinned surfaces use
@@ -2554,6 +2940,7 @@ struct DynamicModelRenderer {
     legacy_fog_compiled: bool,
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
     opaque_pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
@@ -2567,6 +2954,7 @@ struct DynamicModelRenderer {
     skin_layout: wgpu::BindGroupLayout,
     skin_pipeline_layout: wgpu::PipelineLayout,
     skin_shader: wgpu::ShaderModule,
+    skin_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     skin_opaque_pipeline: wgpu::RenderPipeline,
     skin_mask_pipeline: wgpu::RenderPipeline,
     skin_blend_pipeline: wgpu::RenderPipeline,
@@ -2790,6 +3178,7 @@ impl DynamicModelRenderer {
             legacy_fog_compiled: false,
             pipeline_layout,
             shader,
+            wireframe_pipeline: None,
             opaque_pipeline,
             mask_pipeline,
             blend_pipeline,
@@ -2803,6 +3192,7 @@ impl DynamicModelRenderer {
             skin_layout,
             skin_pipeline_layout,
             skin_shader,
+            skin_wireframe_pipeline: None,
             skin_opaque_pipeline,
             skin_mask_pipeline,
             skin_blend_pipeline,
@@ -2909,6 +3299,8 @@ impl DynamicModelRenderer {
         surface_format: wgpu::TextureFormat,
         samples: u32,
     ) {
+        self.wireframe_pipeline = None;
+        self.skin_wireframe_pipeline = None;
         self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
         self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
         self.blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
@@ -3075,6 +3467,7 @@ impl DynamicModelRenderer {
         queue: &wgpu::Queue,
         surfaces: &[DynamicModelSurface],
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
+        separate_wireframe_classes: bool,
     ) {
         self.draws.clear();
         self.skin_draws.clear();
@@ -3186,6 +3579,7 @@ impl DynamicModelRenderer {
                     mesh_key,
                     texture_key,
                     alpha_mode: surface.alpha_mode,
+                    wireframe_class: surface.wireframe_class,
                     uniform,
                     sequence: u32::try_from(skin_pending.len()).unwrap_or(u32::MAX),
                     batch_hash: None,
@@ -3221,6 +3615,7 @@ impl DynamicModelRenderer {
                 index_count: surface.indices.len() as u32,
                 texture_key,
                 alpha_mode: surface.alpha_mode,
+                wireframe_class: surface.wireframe_class,
             });
         }
 
@@ -3251,9 +3646,13 @@ impl DynamicModelRenderer {
                     (true, true) => {
                         let alpha_a = u8::from(matches!(a.alpha_mode, DynamicModelAlphaMode::Mask));
                         let alpha_b = u8::from(matches!(b.alpha_mode, DynamicModelAlphaMode::Mask));
-                        alpha_a
-                            .cmp(&alpha_b)
-                            .then_with(|| a.batch_hash.cmp(&b.batch_hash))
+                        let order = alpha_a.cmp(&alpha_b);
+                        let order = if separate_wireframe_classes {
+                            order.then_with(|| a.wireframe_class.mask_bit().cmp(&b.wireframe_class.mask_bit()))
+                        } else {
+                            order
+                        };
+                        order.then_with(|| a.batch_hash.cmp(&b.batch_hash))
                             .then_with(|| a.mesh_key.as_ref().cmp(b.mesh_key.as_ref()))
                             .then_with(|| a.texture_key.as_deref().cmp(&b.texture_key.as_deref()))
                     }
@@ -3271,6 +3670,8 @@ impl DynamicModelRenderer {
                 while group_end < skin_pending.len() {
                     let next = &skin_pending[group_end];
                     if next.alpha_mode != pending.alpha_mode
+                        || (separate_wireframe_classes
+                            && next.wireframe_class != pending.wireframe_class)
                         || next.mesh_key != pending.mesh_key
                         || next.texture_key != pending.texture_key
                     {
@@ -3297,6 +3698,7 @@ impl DynamicModelRenderer {
                     mesh_key: Arc::clone(&pending.mesh_key),
                     texture_key: pending.texture_key.as_ref().map(Arc::clone),
                     alpha_mode: pending.alpha_mode,
+                    wireframe_class: pending.wireframe_class,
                     first_instance,
                     instance_count: u32::try_from(group_len).unwrap_or(u32::MAX),
                 });
@@ -3308,6 +3710,7 @@ impl DynamicModelRenderer {
                         mesh_key: Arc::clone(&item.mesh_key),
                         texture_key: item.texture_key.as_ref().map(Arc::clone),
                         alpha_mode: item.alpha_mode,
+                        wireframe_class: item.wireframe_class,
                         first_instance,
                         instance_count: 1,
                     });
@@ -3426,6 +3829,85 @@ impl DynamicModelRenderer {
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
         for depth_writing_phase in [true, false] {
             self.draw_phase(pass, camera, depth_writing_phase);
+        }
+    }
+
+    fn ensure_wireframe_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+    ) {
+        if !self.draws.is_empty() && self.wireframe_pipeline.is_none() {
+            self.wireframe_pipeline = Some(create_dynamic_wireframe_pipeline(
+                device,
+                &self.pipeline_layout,
+                &self.shader,
+                surface_format,
+                samples,
+            ));
+        }
+        if !self.skin_draws.is_empty() && self.skin_wireframe_pipeline.is_none() {
+            self.skin_wireframe_pipeline = Some(create_ghoul2_wireframe_pipeline(
+                device,
+                &self.skin_pipeline_layout,
+                &self.skin_shader,
+                surface_format,
+                samples,
+            ));
+        }
+    }
+
+    fn draw_wireframe<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+        mask: u32,
+    ) {
+        if let Some(pipeline) = &self.wireframe_pipeline {
+            let mut bound = false;
+            for draw in self
+                .draws
+                .iter()
+                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0)
+            {
+                if !bound {
+                    pass.set_pipeline(pipeline);
+                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(0, camera, &[]);
+                    bound = true;
+                }
+                pass.draw_indexed(
+                    draw.first_index..draw.first_index.saturating_add(draw.index_count),
+                    0,
+                    0..1,
+                );
+            }
+        }
+
+        if let Some(pipeline) = &self.skin_wireframe_pipeline {
+            let mut bound = false;
+            for draw in self
+                .skin_draws
+                .iter()
+                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0)
+            {
+                let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };
+                if !bound {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, camera, &[]);
+                    pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                    bound = true;
+                }
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(
+                    0..mesh.index_count,
+                    0,
+                    draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
+                );
+            }
         }
     }
 
@@ -4223,9 +4705,13 @@ fn inspector_texture_meta(texture: &TextureData) -> InspectorTextureMeta {
     }
 }
 
+#[derive(Clone)]
 struct WorldBatch {
     source: DrawBatch,
     indexed_range: std::ops::Range<u32>,
+    /// True for a CG_Mover inline BSP model rather than static world geometry.
+    /// Debug-only classification; normal world submission never branches on it.
+    is_inline_entity: bool,
     /// Clipmap index ranges for this promoted water surface, low then high.
     ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
     bind_group: wgpu::BindGroup,
@@ -4256,6 +4742,7 @@ struct SnowShellGpu {
 enum WorldBatchSet {
     Coarse,
     Full,
+    Auto4,
 }
 
 struct WorldDrawGroup {
@@ -4263,6 +4750,184 @@ struct WorldDrawGroup {
     representative_index: usize,
     output_base: u32,
     max_count: u32,
+}
+
+#[derive(Debug)]
+struct Auto4CollapseRequest {
+    variant: usize,
+    members: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct Auto4CollapseResult {
+    variant: usize,
+    indices: Vec<u32>,
+}
+
+struct Auto4CollapseWorker {
+    sender: Option<mpsc::SyncSender<Auto4CollapseRequest>>,
+    receiver: Receiver<Auto4CollapseResult>,
+    cancel: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Auto4CollapseWorker {
+    fn spawn(
+        source_indices: Arc<Vec<u32>>,
+        portal_ranges: Arc<Vec<std::ops::Range<u32>>>,
+    ) -> Result<Self, String> {
+        let (request_tx, request_rx) =
+            mpsc::sync_channel::<Auto4CollapseRequest>(AUTO4_COLLAPSE_QUEUE_DEPTH);
+        let (result_tx, result_rx) = mpsc::channel::<Auto4CollapseResult>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let thread = thread::Builder::new()
+            .name("jka-auto4-collapse".to_owned())
+            .spawn(move || {
+                while !worker_cancel.load(Ordering::Acquire) {
+                    let Ok(request) = request_rx.recv() else {
+                        break;
+                    };
+                    if worker_cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let index_count = request
+                        .members
+                        .iter()
+                        .filter_map(|&member| portal_ranges.get(member))
+                        .map(|range| range.end.saturating_sub(range.start) as usize)
+                        .sum::<usize>();
+                    let mut indices = Vec::with_capacity(index_count);
+                    for &member in &request.members {
+                        if worker_cancel.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let Some(range) = portal_ranges.get(member) else {
+                            continue;
+                        };
+                        let start = range.start as usize;
+                        let end = range.end as usize;
+                        if let Some(slice) = source_indices.get(start..end) {
+                            indices.extend_from_slice(slice);
+                        }
+                    }
+                    if result_tx
+                        .send(Auto4CollapseResult {
+                            variant: request.variant,
+                            indices,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start AUTO 4 collapse worker: {error}"))?;
+        Ok(Self {
+            sender: Some(request_tx),
+            receiver: result_rx,
+            cancel,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Auto4CollapseWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Auto4VariantCacheState {
+    Uncached,
+    Pending,
+    /// Could not fit while every resident group was protected by the current
+    /// plan. Retry only after entering a different cluster to avoid rebuild
+    /// churn on a plan whose working set exceeds the cache.
+    Deferred,
+    /// This one physical group is larger than the entire cache. It always uses
+    /// the exact multi-draw fallback.
+    Uncacheable,
+    Ready {
+        range: std::ops::Range<u32>,
+        last_used_frame: u64,
+    },
+}
+
+struct Auto4CollapseCache {
+    worker: Option<Auto4CollapseWorker>,
+    states: Vec<Auto4VariantCacheState>,
+    capacity_indices: u32,
+    free_ranges: Vec<std::ops::Range<u32>>,
+    used_indices: u32,
+    frame: u64,
+    queued: u64,
+    completed: u64,
+    evictions: u64,
+    oversize: u64,
+    current_cluster: Option<usize>,
+    last_reported_cluster: Option<usize>,
+}
+
+impl Auto4CollapseCache {
+    fn disabled(variant_count: usize) -> Self {
+        Self {
+            worker: None,
+            states: (0..variant_count)
+                .map(|_| Auto4VariantCacheState::Uncached)
+                .collect(),
+            capacity_indices: 0,
+            free_ranges: Vec::new(),
+            used_indices: 0,
+            frame: 0,
+            queued: 0,
+            completed: 0,
+            evictions: 0,
+            oversize: 0,
+            current_cluster: None,
+            last_reported_cluster: None,
+        }
+    }
+
+    fn allocate(&mut self, count: u32) -> Option<std::ops::Range<u32>> {
+        let slot = self
+            .free_ranges
+            .iter()
+            .position(|range| range.end.saturating_sub(range.start) >= count)?;
+        let start = self.free_ranges[slot].start;
+        let end = start.checked_add(count)?;
+        if end == self.free_ranges[slot].end {
+            self.free_ranges.remove(slot);
+        } else {
+            self.free_ranges[slot].start = end;
+        }
+        self.used_indices = self.used_indices.saturating_add(count);
+        Some(start..end)
+    }
+
+    fn release(&mut self, range: std::ops::Range<u32>) {
+        self.used_indices = self
+            .used_indices
+            .saturating_sub(range.end.saturating_sub(range.start));
+        self.free_ranges.push(range);
+        self.free_ranges.sort_unstable_by_key(|range| range.start);
+        let mut merged = Vec::<std::ops::Range<u32>>::with_capacity(self.free_ranges.len());
+        for range in self.free_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if last.end >= range.start {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_ranges = merged;
+    }
 }
 
 struct WorldPipelineVariant {
@@ -4428,12 +5093,39 @@ struct WorldGpu {
     coarse_batches: Vec<WorldBatch>,
     /// Exact PVS-signature sub-batches referencing subranges of the same vertex buffer.
     full_batches: Vec<WorldBatch>,
+    /// Shallow aliases of coarse followed by full batches. AUTO 2 and AUTO 3
+    /// use this one address space so one cluster can mix both representations
+    /// without duplicating any vertex/index/material GPU storage.
+    auto2_batches: Vec<WorldBatch>,
     visibility: Option<jka_assets::bsp::Visibility>,
     coarse_visible_batches_by_cluster: Vec<Vec<usize>>,
     full_visible_batches_by_cluster: Vec<Vec<usize>>,
     /// AUTO selects FULL for clusters where its reduced submitted geometry is
     /// estimated to outweigh the extra draw calls; otherwise it selects MINIMAL.
     auto_use_full_by_cluster: Vec<bool>,
+    /// AUTO 2 applies the same cost model independently to each coarse surface
+    /// group, producing a mixed coarse/full list for every BSP cluster.
+    auto2_visible_batches_by_cluster: Vec<Vec<usize>>,
+    auto2_candidate_batches_by_cluster: Vec<usize>,
+    /// AUTO 3 is the exact-PVS hybrid: a coarse parent is legal only when all
+    /// of its Full children are visible for the camera cluster and all children
+    /// have identical area membership. Otherwise it uses only visible Full
+    /// children, so it cannot re-introduce PVS/areamask-hidden geometry.
+    auto3_visible_batches_by_cluster: Vec<Vec<usize>>,
+    auto3_candidate_batches_by_cluster: Vec<usize>,
+    /// AUTO 4 portal-plan representation. Static portal-owned batches and lazy
+    /// physical-collapse placeholders share this address space; inline mover
+    /// aliases are appended at the end. Cluster recipes are immutable, while
+    /// `auto4_active_plan` swaps a ready collapsed group for its base pieces.
+    auto4_batches: Vec<WorldBatch>,
+    auto4_plan_refs: Vec<Vec<PreparedPortalPlanBatchRef>>,
+    auto4_plan_by_cluster: Vec<usize>,
+    auto4_variant_members: Vec<Vec<usize>>,
+    auto4_variant_base: usize,
+    auto4_active_plan: Vec<usize>,
+    auto4_inline_start: usize,
+    auto4_inline_full_start: usize,
+    auto4_collapse_cache: Auto4CollapseCache,
     coarse_all_batches: Vec<usize>,
     last_cluster: Option<Option<usize>>,
     textures: Vec<GpuImage>,
@@ -6445,6 +7137,10 @@ struct FrameInfo {
     cpu_acquire_ms: f64,
     cpu_encode_ms: f64,
     cpu_submit_ms: f64,
+    cpu_present_ms: f64,
+    submit_call_at: Option<Instant>,
+    present_call_completed_at: Option<Instant>,
+    late_latch: Option<ViewSampleMeasurement>,
     dynamic_model_prepare_ms: f64,
     dynamic_model_surfaces: u32,
     dynamic_model_vertices: u64,
@@ -6587,11 +7283,13 @@ struct Renderer {
     world_shader_lean: wgpu::ShaderModule,
     fast_world_shader: wgpu::ShaderModule,
     wireframe_supported: bool,
-    wireframe_enabled: bool,
+    wireframe_mask: u32,
     pvs_mode: PvsMode,
     wireframe_pipeline_layout: wgpu::PipelineLayout,
     wireframe_shader: wgpu::ShaderModule,
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
+    world_wireframe_pipelines: BTreeMap<WorldShaderVariantKey, wgpu::RenderPipeline>,
+    fast_world_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     surface_inspector_shader: wgpu::ShaderModule,
     surface_inspector_pipeline: wgpu::RenderPipeline,
     inspector_vertex_range: Option<std::ops::Range<u32>>,
@@ -7043,6 +7741,7 @@ impl Renderer {
         surface: wgpu::Surface<'static>,
         base: &Path,
         game: Option<&Path>,
+        desired_maximum_frame_latency: u32,
     ) -> Result<Self, String> {
         let size = window.inner_size();
         let adapter_started = Instant::now();
@@ -7191,7 +7890,7 @@ impl Renderer {
             .ok_or("Surface has no compatible default configuration")?;
         config.format = surface_format;
         config.present_mode = no_vsync_mode(&caps.present_modes);
-        config.desired_maximum_frame_latency = MAX_FRAME_LATENCY;
+        config.desired_maximum_frame_latency = desired_maximum_frame_latency.clamp(1, 3);
         let screenshot_supported = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if screenshot_supported {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
@@ -7718,15 +8417,10 @@ impl Renderer {
                 bind_group_layouts: &[Some(&camera_layout)],
                 immediate_size: 0,
             });
-        let wireframe_pipeline = wireframe_supported.then(|| {
-            create_wireframe_pipeline(
-                &device,
-                &wireframe_pipeline_layout,
-                &wireframe_shader,
-                config.format,
-                msaa_samples,
-            )
-        });
+        // Debug line pipelines are intentionally cold/lazy. Normal gameplay never
+        // creates them, and changing the category mask only compiles a family the
+        // first frame that family is actually requested.
+        let wireframe_pipeline = None;
         let surface_inspector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA surface inspector shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("surface_inspector.wgsl").into()),
@@ -8722,11 +9416,13 @@ impl Renderer {
             world_shader_lean,
             fast_world_shader,
             wireframe_supported,
-            wireframe_enabled: false,
+            wireframe_mask: 0,
             pvs_mode: PvsMode::Auto,
             wireframe_pipeline_layout,
             wireframe_shader,
             wireframe_pipeline,
+            world_wireframe_pipelines: BTreeMap::new(),
+            fast_world_wireframe_pipeline: None,
             surface_inspector_shader,
             surface_inspector_pipeline,
             inspector_vertex_range: None,
@@ -9769,6 +10465,8 @@ impl Renderer {
             reflection_probes,
             coarse_batches,
             full_batches,
+            auto2_batches,
+            auto4_batches,
             ..
         } = world;
         let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
@@ -9776,7 +10474,12 @@ impl Renderer {
                 .and_then(|index| textures.get(index))
                 .unwrap_or(&self.white)
         });
-        for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
+        for batch in coarse_batches
+            .iter_mut()
+            .chain(full_batches.iter_mut())
+            .chain(auto2_batches.iter_mut())
+            .chain(auto4_batches.iter_mut())
+        {
             batch.bind_group = create_world_bind_group(
                 &self.device,
                 &self.surface_layout,
@@ -10435,18 +11138,38 @@ impl Renderer {
         self.update_lighting_settings();
     }
 
+    /// Reconfigure only the presentation surface. Present mode and frame-queue
+    /// changes do not alter render-target formats, sample counts, shaders, or
+    /// pipelines, so keep this cold path deliberately smaller than `reconfigure`.
+    fn reconfigure_presentation_surface(&mut self) {
+        if self.size.width == 0 || self.size.height == 0 {
+            return;
+        }
+        self.surface.configure(&self.device, &self.config);
+    }
+
     fn set_vsync(&mut self, vsync: VsyncMode) {
         if self.vsync == vsync {
             return;
         }
         self.vsync = vsync;
         self.config.present_mode = present_mode_for_vsync(vsync, &self.present_modes);
-        self.reconfigure();
+        self.reconfigure_presentation_surface();
         println!(
             "VSync: {} -> present mode {:?}",
             vsync.label(),
             self.config.present_mode
         );
+    }
+
+    fn set_max_frame_latency(&mut self, latency: u32) {
+        let latency = latency.clamp(1, 3);
+        if self.config.desired_maximum_frame_latency == latency {
+            return;
+        }
+        self.config.desired_maximum_frame_latency = latency;
+        self.reconfigure_presentation_surface();
+        println!("Maximum frame latency: {latency}");
     }
 
     fn set_msaa(&mut self, samples: u32) {
@@ -10505,8 +11228,126 @@ impl Renderer {
         }
     }
 
-    fn set_wireframe(&mut self, enabled: bool) {
-        self.wireframe_enabled = enabled && self.wireframe_supported;
+    fn set_wireframe_mask(&mut self, mask: u32) {
+        self.wireframe_mask = if self.wireframe_supported {
+            mask & ui::wireframe::ALL
+        } else {
+            0
+        };
+    }
+
+    #[inline]
+    fn wireframe_requires_dynamic_class_split(&self) -> bool {
+        if self.wireframe_mask == 0 {
+            return false;
+        }
+        let dynamic_mask = ui::wireframe::PLAYERS | ui::wireframe::ENTITIES | ui::wireframe::EFFECTS;
+        let selected = self.wireframe_mask & dynamic_mask;
+        selected != 0 && selected != dynamic_mask
+    }
+
+    fn ensure_prepared_wireframe_pipelines(
+        &mut self,
+        prepared_grass: Option<&GrassPreparedDraw>,
+        prepared_surface_sprite_effects: Option<&PreparedSurfaceSpriteEffects>,
+    ) {
+        if self.wireframe_mask == 0 {
+            return;
+        }
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        if self.wireframe_mask & ui::wireframe::GRASS != 0 {
+            if let Some(prepared) = prepared_grass {
+                self.grass_renderer.ensure_wireframe_pipeline_for_draw(
+                    &self.device,
+                    scene_format,
+                    samples,
+                    prepared,
+                );
+            }
+        }
+        if self.wireframe_mask & ui::wireframe::EFFECTS != 0
+            && prepared_surface_sprite_effects.is_some()
+        {
+            self.surface_sprite_effect_renderer
+                .ensure_wireframe_pipeline(&self.device);
+        }
+        let dynamic_mask = ui::wireframe::PLAYERS | ui::wireframe::ENTITIES | ui::wireframe::EFFECTS;
+        if self.wireframe_mask & dynamic_mask != 0 {
+            self.dynamic_model_renderer.ensure_wireframe_pipelines(
+                &self.device,
+                scene_format,
+                samples,
+            );
+        }
+    }
+
+    fn ensure_wireframe_pipelines(&mut self) {
+        if self.wireframe_mask == 0 {
+            return;
+        }
+
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        if self.world.is_some()
+            && self.wireframe_mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0
+            && self.wireframe_pipeline.is_none()
+        {
+            self.wireframe_pipeline = Some(create_wireframe_pipeline(
+                &self.device,
+                &self.wireframe_pipeline_layout,
+                &self.wireframe_shader,
+                scene_format,
+                samples,
+            ));
+        }
+
+        let has_deformation = self
+            .world
+            .as_ref()
+            .map_or(false, |world| !world.snow_shell.draws.is_empty());
+        if self.frame_plan.world_path == WorldRenderPath::FastBaseline
+            && self.wireframe_mask & ui::wireframe::DEFORMATION != 0
+            && has_deformation
+            && self.fast_world_wireframe_pipeline.is_none()
+        {
+            self.fast_world_wireframe_pipeline = Some(create_fast_world_wireframe_pipeline(
+                &self.device,
+                &self.fast_world_pipeline_layout,
+                &self.fast_world_shader,
+                scene_format,
+                samples,
+            ));
+        }
+
+        let active_key = self.world.as_ref().map(|world| world.active_pipeline_variant);
+        let has_ocean_clipmap = self.ocean_enabled
+            && self.world.as_ref().map_or(false, |world| {
+                world.coarse_batches.iter().any(|batch| batch.ocean_clipmap.is_some())
+                    || world.full_batches.iter().any(|batch| batch.ocean_clipmap.is_some())
+            });
+        let needs_deformed_world = self.frame_plan.world_path == WorldRenderPath::Advanced
+            && ((self.wireframe_mask & ui::wireframe::OCEAN != 0 && has_ocean_clipmap)
+                || (self.wireframe_mask & ui::wireframe::DEFORMATION != 0 && has_deformation));
+        if needs_deformed_world {
+            if let Some(key) = active_key {
+                if !self.world_wireframe_pipelines.contains_key(&key) {
+                    let (layout, shader) = match key.family() {
+                        WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
+                        WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
+                    };
+                    let pipeline = create_world_wireframe_pipeline(
+                        &self.device,
+                        layout,
+                        shader,
+                        scene_format,
+                        samples,
+                        key,
+                    );
+                    self.world_wireframe_pipelines.insert(key, pipeline);
+                }
+            }
+        }
     }
 
     fn set_pvs_mode(&mut self, mode: PvsMode) {
@@ -13112,15 +13953,11 @@ impl Renderer {
             scene_format,
             samples,
         );
-        self.wireframe_pipeline = self.wireframe_supported.then(|| {
-            create_wireframe_pipeline(
-                &self.device,
-                &self.wireframe_pipeline_layout,
-                &self.wireframe_shader,
-                scene_format,
-                samples,
-            )
-        });
+        // All wireframe pipelines are diagnostic-only and are rebuilt lazily on
+        // demand after a scene-format/MSAA change.
+        self.wireframe_pipeline = None;
+        self.world_wireframe_pipelines.clear();
+        self.fast_world_wireframe_pipeline = None;
         self.surface_inspector_pipeline = create_surface_inspector_pipeline(
             &self.device,
             &self.wireframe_pipeline_layout,
@@ -13592,7 +14429,7 @@ impl Renderer {
         let mut info = FrameInfo::default();
         let prepare_started = Instant::now();
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models, None);
+            .prepare(&self.device, &self.queue, dynamic_models, None, false);
         info.dynamic_model_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) = self.dynamic_model_renderer.ghoul2_draw_stats();
         info.ghoul2_gpu_instances = ghoul2_gpu_instances;
@@ -13668,9 +14505,16 @@ impl Renderer {
         if self.egui_active {
             self.submit_ui_overlay(&frame_view);
         }
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let present_started = Instant::now();
         self.window.pre_present_notify();
         frame.present();
-        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let present_completed_at = Instant::now();
+        info.cpu_present_ms = present_completed_at
+            .saturating_duration_since(present_started)
+            .as_secs_f64()
+            * 1000.0;
+        info.present_call_completed_at = Some(present_completed_at);
         info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         Ok(info)
     }
@@ -13681,32 +14525,53 @@ impl Renderer {
         player_position: Option<Vec3>,
         area_mask: Option<&[u8; 32]>,
         dynamic_models: &[DynamicModelSurface],
+        view_latch: ViewLatchMode,
+        latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
         let frame_started = Instant::now();
-        let view_proj = camera.view_projection(self.config.width, self.config.height);
-        let uniform = CameraUniform {
+        let needs_early_latch = self.world.as_ref().is_some_and(|world| {
+            (self.grass_enabled && world.grass.is_some())
+                || !world.surface_sprite_effects.is_empty()
+        });
+        let mut render_camera = *camera;
+        let mut late_view_sample = if needs_early_latch {
+            latest_view.and_then(|state| {
+                sample_view_rotation(&mut render_camera, state, view_latch)
+            })
+        } else {
+            None
+        };
+        let mut view_proj = render_camera.view_projection(self.config.width, self.config.height);
+        let mut uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos_time: [
-                camera.position.x,
-                camera.position.y,
-                camera.position.z,
+                render_camera.position.x,
+                render_camera.position.y,
+                render_camera.position.z,
                 self.started.elapsed().as_secs_f32(),
             ],
             clip_plane: [0.0; 4],
             render_flags: [0, u32::from(self.static_bsp_ao_enabled), self.classic_world_render_flags(), 0],
-            camera_forward: camera.forward().extend(0.0).to_array(),
+            camera_forward: render_camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
         };
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        let defer_camera_write = latest_view.is_some() && !needs_early_latch;
+        if !defer_camera_write {
+            self.queue
+                .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+        self.ensure_wireframe_pipelines();
 
         let mut info = FrameInfo::default();
         let snow_deform_center = self.surface_deformation.field_center();
         let mut prepared_grass = None;
         let mut prepared_surface_sprite_effects = None;
         if let Some(world) = &mut self.world {
-            update_visibility(world, camera);
+            if needs_early_latch {
+                update_visibility(world, &render_camera);
+                refresh_auto4_lazy_collapse(&self.queue, world, self.pvs_mode);
+            }
             if self.grass_enabled {
                 let pvs_cluster = world.last_cluster.flatten();
                 if let Some(grass) = world.grass.as_ref() {
@@ -13714,7 +14579,7 @@ impl Renderer {
                         &self.device,
                         &self.queue,
                         grass,
-                        camera.position,
+                        render_camera.position,
                         player_position,
                         view_proj,
                         pvs_cluster,
@@ -13736,7 +14601,7 @@ impl Renderer {
                         &self.device,
                         &self.queue,
                         &world.surface_sprite_effects,
-                        camera,
+                        &render_camera,
                         pvs_cluster,
                         uniform.camera_pos_time[3] * 1000.0,
                     ),
@@ -13748,8 +14613,19 @@ impl Renderer {
             .world
             .as_ref()
             .and_then(|world| world.entity_light_grid.as_ref());
+        let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models, entity_light_grid);
+            .prepare(
+                &self.device,
+                &self.queue,
+                dynamic_models,
+                entity_light_grid,
+                split_dynamic_wireframe,
+            );
+        self.ensure_prepared_wireframe_pipelines(
+            prepared_grass.as_ref(),
+            prepared_surface_sprite_effects.as_ref(),
+        );
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();
@@ -13781,6 +14657,32 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut screenshot_readback = self.prepare_screenshot_readback();
+
+        // Last coherent point on the baseline path: everything above is either
+        // camera-independent or (when grass/surface sprites are active) forced
+        // the earlier latch. CPU frustum tests below consume `view_proj`, so
+        // sampling after this point would make culling disagree with the GPU.
+        if !needs_early_latch {
+            if let Some(state) = latest_view {
+                late_view_sample = sample_view_rotation(&mut render_camera, state, view_latch);
+                view_proj = render_camera.view_projection(self.config.width, self.config.height);
+                uniform.view_proj = view_proj.to_cols_array_2d();
+                uniform.camera_pos_time[0] = render_camera.position.x;
+                uniform.camera_pos_time[1] = render_camera.position.y;
+                uniform.camera_pos_time[2] = render_camera.position.z;
+                uniform.camera_forward = render_camera.forward().extend(0.0).to_array();
+                uniform.unjittered_view_proj = view_proj.to_cols_array_2d();
+                uniform.previous_unjittered_view_proj = view_proj.to_cols_array_2d();
+            }
+            if let Some(world) = &mut self.world {
+                update_visibility(world, &render_camera);
+            }
+        }
+        if defer_camera_write {
+            self.queue
+                .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+        info.late_latch = late_view_sample;
 
         let encode_started = Instant::now();
         let mut encoder = self
@@ -13968,20 +14870,84 @@ impl Renderer {
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-            if self.wireframe_enabled {
-                if let Some(pipeline) = &self.wireframe_pipeline {
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    for &batch_index in active.indices {
-                        let batch = &active.batches[batch_index];
-                        if batch.source.pipeline.class != DrawClass::Sky
-                            && (!world.source_map
-                                || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
-                        {
-                            draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
+            if self.wireframe_mask != 0 {
+                let mask = self.wireframe_mask;
+                if mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0 {
+                    if let Some(pipeline) = &self.wireframe_pipeline {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        for &batch_index in active.indices {
+                            let batch = &active.batches[batch_index];
+                            let category_enabled = if batch.is_inline_entity {
+                                mask & ui::wireframe::ENTITIES != 0
+                            } else {
+                                mask & ui::wireframe::MAP != 0
+                            };
+                            if category_enabled
+                                && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
+                                && batch.source.pipeline.class != DrawClass::Sky
+                                && (!world.source_map
+                                    || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                            {
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
                         }
                     }
                 }
+
+                if mask & ui::wireframe::DEFORMATION != 0 {
+                    if let Some(pipeline) = &self.fast_world_wireframe_pipeline {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                        pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+                        for draw in &world.snow_shell.draws {
+                            if !snow_shell_draw_near_center(draw, snow_deform_center)
+                                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+                            {
+                                continue;
+                            }
+                            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
+                                continue;
+                            };
+                            pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                            pass.draw(draw.vertices.clone(), 1..2);
+                        }
+                    }
+                }
+
+                if mask & ui::wireframe::GRASS != 0 {
+                    if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                        self.grass_renderer.draw_wireframe(
+                            &mut pass,
+                            &self.camera_bind_group,
+                            &self.shadow_resources.receiver_bind_group,
+                            grass,
+                            prepared,
+                        );
+                    }
+                }
+
+                if mask & ui::wireframe::EFFECTS != 0 {
+                    if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                        self.surface_sprite_effect_renderer.draw_wireframe(
+                            &mut pass,
+                            &self.camera_bind_group,
+                            prepared,
+                        );
+                    }
+                }
+
+                let dynamic_mask =
+                    ui::wireframe::PLAYERS | ui::wireframe::ENTITIES | ui::wireframe::EFFECTS;
+                if mask & dynamic_mask != 0 {
+                    self.dynamic_model_renderer
+                        .draw_wireframe(&mut pass, &self.camera_bind_group, mask);
+                }
+
+                // Grass/dynamic/deformation overlays all bind their own geometry.
+                // Diagnostics below still address BSP index ranges.
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
             if let Some(vertices) = &self.inspector_vertex_range {
                 if let Some(indices) = inspector_index_range(active.batches, vertices) {
@@ -14087,6 +15053,7 @@ impl Renderer {
         let command_buffer = encoder.finish();
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
+        info.submit_call_at = Some(submit_started);
         let frame_submission = self.queue.submit([command_buffer]);
         if let Some(readback) = screenshot_readback
             .as_mut()
@@ -14107,12 +15074,19 @@ impl Renderer {
         {
             self.submit_screenshot_copy(&frame.texture, readback);
         }
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let present_started = Instant::now();
         self.window.pre_present_notify();
         frame.present();
+        let present_completed_at = Instant::now();
+        info.cpu_present_ms = present_completed_at
+            .saturating_duration_since(present_started)
+            .as_secs_f64()
+            * 1000.0;
+        info.present_call_completed_at = Some(present_completed_at);
         if let Some(readback) = screenshot_readback {
             self.finish_screenshot_readback(readback);
         }
-        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         Ok(info)
     }
@@ -14127,6 +15101,10 @@ impl Renderer {
             inline_models,
             coarse_batches,
             full_batches,
+            auto2_batches,
+            auto4_batches,
+            auto4_inline_start,
+            auto4_inline_full_start,
             vertex_buffer,
             cull_records_buffer,
             ..
@@ -14167,6 +15145,34 @@ impl Renderer {
                     );
                 }
             }
+            // AUTO 2 aliases the same cull records/resources, but it owns a
+            // shallow CPU copy of each WorldBatch so keep mover bounds in sync.
+            let full_offset = coarse_batches.len();
+            for &index in &model.coarse_batches {
+                if let Some(batch) = auto2_batches.get_mut(index) {
+                    batch.bounds_min = minimum;
+                    batch.bounds_max = maximum;
+                }
+            }
+            for &index in &model.full_batches {
+                if let Some(batch) = auto2_batches.get_mut(full_offset + index) {
+                    batch.bounds_min = minimum;
+                    batch.bounds_max = maximum;
+                }
+            }
+            // AUTO 4 keeps static portal-plan geometry first and appends one
+            // shallow copy of the FULL inline-model tail. The cull record itself
+            // is shared with FULL; keep only the CPU bounds alias in sync here.
+            for &full_index in &model.full_batches {
+                let Some(relative) = full_index.checked_sub(*auto4_inline_full_start) else {
+                    continue;
+                };
+                let auto4_index = (*auto4_inline_start).saturating_add(relative);
+                if let Some(batch) = auto4_batches.get_mut(auto4_index) {
+                    batch.bounds_min = minimum;
+                    batch.bounds_max = maximum;
+                }
+            }
         }
     }
 
@@ -14181,6 +15187,8 @@ impl Renderer {
         motion_reference_camera: &Camera,
         motion_camera_sample_dt: f32,
         motion_camera_sample_age: f32,
+        view_latch: ViewLatchMode,
+        latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameInfo::default());
@@ -14226,7 +15234,14 @@ impl Renderer {
             && !self.surface_diag_pending
             && !self.frame_diag_pending
         {
-            return self.render_fast_baseline(camera, player_position, area_mask, dynamic_models);
+            return self.render_fast_baseline(
+                camera,
+                player_position,
+                area_mask,
+                dynamic_models,
+                view_latch,
+                latest_view,
+            );
         }
 
         let frame_started = Instant::now();
@@ -14274,6 +15289,13 @@ impl Renderer {
         } else {
             [0.0, 0.0]
         };
+        // Full/advanced rendering has many camera-derived CPU uniforms and
+        // reflection/visibility decisions. Latch once immediately before the
+        // first of those so every dependent pass sees one coherent view.
+        let mut render_camera = *camera;
+        let late_view_sample = latest_view
+            .and_then(|state| sample_view_rotation(&mut render_camera, state, view_latch));
+        let camera = &render_camera;
         let view_proj = if self.taa_enabled {
             camera.view_projection_jittered(self.config.width, self.config.height, jitter)
         } else {
@@ -14375,6 +15397,7 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        self.ensure_wireframe_pipelines();
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
         }
@@ -14442,6 +15465,7 @@ impl Renderer {
         }
 
         let mut info = FrameInfo::default();
+        info.late_latch = late_view_sample;
         info.gpu_ms = self.gpu_profiler.latest_frame_ms();
         if self.cull_debug_mode != CullDebugMode::Off {
             info.cull_visible = self.cull_diagnostics_readback.latest[0];
@@ -14454,12 +15478,14 @@ impl Renderer {
         let snow_deform_center = self.surface_deformation.field_center();
         if let Some(world) = &mut self.world {
             update_visibility(world, camera);
+            refresh_auto4_lazy_collapse(&self.queue, world, self.pvs_mode);
             let active = active_batch_selection(world, self.pvs_mode);
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             if self.cull_debug_mode != CullDebugMode::Off {
-                info.cull_pvs_rejected =
-                    u32::try_from(active.batches.len().saturating_sub(active.indices.len()))
-                        .unwrap_or(u32::MAX);
+                info.cull_pvs_rejected = u32::try_from(
+                    active.candidate_count.saturating_sub(active.indices.len()),
+                )
+                .unwrap_or(u32::MAX);
                 info.cull_area_rejected = u32::try_from(
                     active
                         .indices
@@ -14958,8 +15984,19 @@ impl Renderer {
             .world
             .as_ref()
             .and_then(|world| world.entity_light_grid.as_ref());
+        let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models, entity_light_grid);
+            .prepare(
+                &self.device,
+                &self.queue,
+                dynamic_models,
+                entity_light_grid,
+                split_dynamic_wireframe,
+            );
+        self.ensure_prepared_wireframe_pipelines(
+            prepared_grass.as_ref(),
+            prepared_surface_sprite_effects.as_ref(),
+        );
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();
@@ -15595,6 +16632,9 @@ impl Renderer {
                                 WorldBatchSet::Full => {
                                     &world.full_batches[group.representative_index]
                                 }
+                                WorldBatchSet::Auto4 => {
+                                    &world.auto4_batches[group.representative_index]
+                                }
                             };
                             if current_pipeline != Some(representative.source.pipeline) {
                                 pass.set_pipeline(
@@ -15864,20 +16904,143 @@ impl Renderer {
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-            if self.wireframe_enabled {
-                if let Some(pipeline) = &self.wireframe_pipeline {
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    for &batch_index in active.indices {
-                        let batch = &active.batches[batch_index];
-                        if batch.source.pipeline.class != DrawClass::Sky
-                            && (!world.source_map
-                                || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
-                        {
-                            draw_world_batch(&mut pass, batch, 0..1, None);
+            if self.wireframe_mask != 0 {
+                let mask = self.wireframe_mask;
+                if mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0 {
+                    if let Some(pipeline) = &self.wireframe_pipeline {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        for &batch_index in active.indices {
+                            let batch = &active.batches[batch_index];
+                            let category_enabled = if batch.is_inline_entity {
+                                mask & ui::wireframe::ENTITIES != 0
+                            } else {
+                                mask & ui::wireframe::MAP != 0
+                            };
+                            if category_enabled
+                                && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
+                                && batch.source.pipeline.class != DrawClass::Sky
+                                && (!world.source_map
+                                    || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                            {
+                                draw_world_batch(&mut pass, batch, 0..1, None);
+                            }
                         }
                     }
                 }
+
+                let variant_key = world.active_pipeline_variant;
+                let variant_family = variant_key.family();
+                if let Some(pipeline) = self.world_wireframe_pipelines.get(&variant_key) {
+                    if mask & ui::wireframe::OCEAN != 0
+                        && self.ocean_enabled
+                        && variant_family == WorldShaderFamily::Enhanced
+                    {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        pass.set_bind_group(2, &world.lighting_bind_group, &[]);
+                        pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                        pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                        pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                        pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        for &batch_index in active.indices {
+                            let batch = &active.batches[batch_index];
+                            if batch.ocean_clipmap.is_none()
+                                || !batch_area_visible(batch, effective_area_mask)
+                                || (world.source_map
+                                    && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                            {
+                                continue;
+                            }
+                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            pass.set_bind_group(
+                                6,
+                                Self::ocean_bind_group_for(
+                                    batch,
+                                    &self.authored_oceans,
+                                    &self.ocean,
+                                    &self.ocean_inert_bind_group,
+                                ),
+                                &[],
+                            );
+                            draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                        }
+                    }
+
+                    if mask & ui::wireframe::DEFORMATION != 0 {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        match variant_family {
+                            WorldShaderFamily::Lean => {
+                                pass.set_bind_group(2, &world.lighting_bind_group_lean, &[]);
+                            }
+                            WorldShaderFamily::Enhanced => {
+                                pass.set_bind_group(2, &world.lighting_bind_group, &[]);
+                                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                            }
+                        }
+                        pass.set_bind_group(3, &self.shadow_resources.receiver_bind_group, &[]);
+                        pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                        pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+                        for draw in &world.snow_shell.draws {
+                            if !snow_shell_draw_near_center(draw, snow_deform_center)
+                                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+                            {
+                                continue;
+                            }
+                            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
+                                continue;
+                            };
+                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            if variant_family == WorldShaderFamily::Enhanced {
+                                pass.set_bind_group(
+                                    6,
+                                    Self::ocean_bind_group_for(
+                                        batch,
+                                        &self.authored_oceans,
+                                        &self.ocean,
+                                        &self.ocean_inert_bind_group,
+                                    ),
+                                    &[],
+                                );
+                            }
+                            pass.draw(draw.vertices.clone(), 1..2);
+                        }
+                    }
+                }
+
+                if mask & ui::wireframe::GRASS != 0 {
+                    if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
+                        self.grass_renderer.draw_wireframe(
+                            &mut pass,
+                            &self.camera_bind_group,
+                            &self.shadow_resources.receiver_bind_group,
+                            grass,
+                            prepared,
+                        );
+                    }
+                }
+
+                if mask & ui::wireframe::EFFECTS != 0 {
+                    if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                        self.surface_sprite_effect_renderer.draw_wireframe(
+                            &mut pass,
+                            &self.camera_bind_group,
+                            prepared,
+                        );
+                    }
+                }
+
+                let dynamic_mask =
+                    ui::wireframe::PLAYERS | ui::wireframe::ENTITIES | ui::wireframe::EFFECTS;
+                if mask & dynamic_mask != 0 {
+                    self.dynamic_model_renderer
+                        .draw_wireframe(&mut pass, &self.camera_bind_group, mask);
+                }
+
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
             if let Some(vertices) = &self.inspector_vertex_range {
                 if let Some(indices) = inspector_index_range(active.batches, vertices) {
@@ -16442,6 +17605,7 @@ impl Renderer {
         let profiler_readback_copy = self.gpu_profiler.encode_readback_copy(&self.device);
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
+        info.submit_call_at = Some(submit_started);
         let frame_submission = if let Some(readback_copy) = profiler_readback_copy {
             self.queue.submit([command_buffer, readback_copy])
         } else {
@@ -16479,8 +17643,16 @@ impl Renderer {
         {
             self.submit_screenshot_copy(&frame.texture, readback);
         }
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let present_started = Instant::now();
         self.window.pre_present_notify();
         frame.present();
+        let present_completed_at = Instant::now();
+        info.cpu_present_ms = present_completed_at
+            .saturating_duration_since(present_started)
+            .as_secs_f64()
+            * 1000.0;
+        info.present_call_completed_at = Some(present_completed_at);
         if let Some(readback) = screenshot_readback {
             self.finish_screenshot_readback(readback);
         }
@@ -16509,7 +17681,6 @@ impl Renderer {
             self.frame_diag_pending = false;
         }
 
-        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         Ok(info)
     }
@@ -16600,6 +17771,87 @@ impl<'a> IndexedGeometryBuilder<'a> {
 
 
 
+
+fn instantiate_portal_draw_plans(
+    plan: &PreparedPortalDrawPlan,
+    portal_batches: &[WorldBatch],
+    full_batches: &[WorldBatch],
+    inline_full_start: usize,
+    cull_records: &mut Vec<GpuCullRecord>,
+    initial_indirect: &mut Vec<DrawIndexedIndirectArgs>,
+) -> (
+    Vec<WorldBatch>,
+    Vec<usize>,
+    usize,
+    usize,
+) {
+    if plan.plan_by_cluster.is_empty() || portal_batches.is_empty() {
+        return (Vec::new(), Vec::new(), 0, 0);
+    }
+
+    let mut batches = portal_batches.to_vec();
+    let variant_base = batches.len();
+    for variant in &plan.variants {
+        let representative = &portal_batches[variant.representative];
+        let mut batch = representative.clone();
+        batch.indexed_range = 0..0;
+        batch.source.pvs_signature = variant.pvs_signature.clone();
+        batch.source.portal_signature.clear();
+        batch.source.area_signature = variant.area_signature;
+        batch.is_inline_entity = false;
+        batch.ocean_clipmap = None;
+        batch.compact_group = None;
+        batch.bounds_min = variant.bounds_min;
+        batch.bounds_max = variant.bounds_max;
+
+        let cull_index = u32::try_from(cull_records.len()).unwrap_or(u32::MAX);
+        let record = GpuCullRecord {
+            minimum: [
+                variant.bounds_min[0],
+                variant.bounds_min[1],
+                variant.bounds_min[2],
+                0.0,
+            ],
+            maximum: [
+                variant.bounds_max[0],
+                variant.bounds_max[1],
+                variant.bounds_max[2],
+                0.0,
+            ],
+            draw: [
+                0,
+                0,
+                u32::from(batch.source.pipeline.class == DrawClass::Sky),
+                0,
+            ],
+            compact: [u32::MAX, 0, 0, 0],
+        };
+        initial_indirect.push(DrawIndexedIndirectArgs {
+            index_count: 0,
+            instance_count: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        });
+        cull_records.push(record);
+        batch.cull_index = cull_index;
+        batches.push(batch);
+    }
+
+    let static_count = batches.len();
+    let auto4_inline_start = batches.len();
+    batches.extend(full_batches[inline_full_start..].iter().cloned());
+
+
+    (
+        batches,
+        plan.plan_by_cluster.clone(),
+        static_count,
+        variant_base,
+    )
+}
+
+
 fn gpu_vertex_key(vertex: &GpuVertex) -> [u32; 15] {
     [
         vertex.position[0].to_bits(),
@@ -16678,6 +17930,7 @@ fn append_static_snow_triangle(
     append_static_snow_triangle(chunks, coarse_batch_index, [ca, bc, triangle[2]], depth + 1);
     append_static_snow_triangle(chunks, coarse_batch_index, [ab, bc, ca], depth + 1);
 }
+
 
 fn create_snow_shell_gpu(
     device: &wgpu::Device,
@@ -16993,6 +18246,8 @@ fn build_world(
         vertices,
         batches: coarse_sources,
         pvs_batches: full_sources,
+        portal_batches: portal_sources,
+        portal_draw_plan,
         textures: texture_data,
         footprint_mark_textures,
         lightmaps: lightmap_data,
@@ -17063,6 +18318,34 @@ fn build_world(
         .iter()
         .map(|source| indexed_builder.batch_range(source))
         .collect::<Vec<_>>();
+    // AUTO 4 portal batches are strict subranges of one FULL PVS piece, so
+    // reuse those index ranges instead of uploading another copy of the base
+    // indices. Only map-load merged variants append new index data.
+    let portal_index_ranges = portal_sources
+        .iter()
+        .map(|source| {
+            full_sources
+                .iter()
+                .zip(&full_index_ranges)
+                .find_map(|(full, range)| {
+                    if source.vertices.start < full.vertices.start
+                        || source.vertices.end > full.vertices.end
+                    {
+                        return None;
+                    }
+                    let offset = source.vertices.start - full.vertices.start;
+                    let count = source.vertices.end - source.vertices.start;
+                    let start = range.start.checked_add(offset)?;
+                    Some(start..start.checked_add(count)?)
+                })
+                .unwrap_or_else(|| indexed_builder.batch_range(source))
+        })
+        .collect::<Vec<_>>();
+    let auto4_portal_index_ranges = Arc::new(portal_index_ranges.clone());
+    // AUTO 4's cluster/PVS grouping was already completed by the map worker.
+    // Physical merged index ranges are deliberately *not* materialized here:
+    // they are built lazily on `jka-auto4-collapse` when a cluster first needs
+    // them, with multi-draw over these portal ranges as the no-hitch fallback.
     // The FFT ocean replaces every promoted water face with one shared
     // camera-centred clipmap, so the authored brush footprint no longer has to
     // be subdivided per map. `build_ocean_meshes` only decides whether the
@@ -17150,11 +18433,47 @@ fn build_world(
         contents: bytemuck::cast_slice(&indexed_builder.vertices),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("JKA static world indices"),
-        contents: bytemuck::cast_slice(&indexed_builder.indices),
-        usage: wgpu::BufferUsages::INDEX,
+    let auto4_source_indices = Arc::new(std::mem::take(&mut indexed_builder.indices));
+    let base_index_count = u32::try_from(auto4_source_indices.len()).unwrap_or(u32::MAX);
+    let base_index_bytes = (auto4_source_indices.len() as u64)
+        .saturating_mul(std::mem::size_of::<u32>() as u64);
+    let requested_auto4_cache_bytes = if portal_draw_plan.variants.is_empty() {
+        0
+    } else {
+        AUTO4_COLLAPSE_CACHE_BYTES
+    };
+    let max_extra_bytes = device
+        .limits()
+        .max_buffer_size
+        .saturating_sub(base_index_bytes)
+        .min(
+            u64::from(u32::MAX.saturating_sub(base_index_count))
+                .saturating_mul(std::mem::size_of::<u32>() as u64),
+        );
+    let auto4_cache_bytes = requested_auto4_cache_bytes
+        .min(max_extra_bytes)
+        / std::mem::size_of::<u32>() as u64
+        * std::mem::size_of::<u32>() as u64;
+    let auto4_cache_indices = u32::try_from(
+        auto4_cache_bytes / std::mem::size_of::<u32>() as u64,
+    )
+    .unwrap_or(0);
+    let index_buffer_size = base_index_bytes
+        .saturating_add(auto4_cache_bytes)
+        .max(std::mem::size_of::<u32>() as u64);
+    let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA static world indices + AUTO 4 collapse cache"),
+        size: index_buffer_size,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
+    if !auto4_source_indices.is_empty() {
+        queue.write_buffer(
+            &index_buffer,
+            0,
+            bytemuck::cast_slice(auto4_source_indices.as_ref()),
+        );
+    }
     let source_vertex_count = vertices.len();
     let indexed_vertex_count = indexed_builder.vertices.len();
     let reused_vertex_count = source_vertex_count.saturating_sub(indexed_vertex_count);
@@ -17390,6 +18709,7 @@ fn build_world(
             cull_records.push(record);
             uploaded.push(WorldBatch {
                 indexed_range: index_range,
+                is_inline_entity: false,
                 ocean_clipmap,
                 source,
                 bind_group,
@@ -17412,6 +18732,11 @@ fn build_world(
     } else {
         Vec::new()
     };
+    let portal_batches = if visibility.is_some() {
+        upload_batches(portal_sources, portal_index_ranges, &vertices)
+    } else {
+        Vec::new()
+    };
     let planar_reflectors = collect_planar_reflectors(&coarse_batches, &vertices);
     // Inline models join both batch sets after the static world, so every
     // static batch index (reflectors, snow, AO) is unchanged. Their empty PVS
@@ -17425,6 +18750,12 @@ fn build_world(
     let inline_full_start = full_batches.len();
     if visibility.is_some() {
         full_batches.extend(upload_batches(inline_batch_sources, inline_index_ranges, &inline_vertices));
+    }
+    for batch in &mut coarse_batches[inline_coarse_start..] {
+        batch.is_inline_entity = true;
+    }
+    for batch in &mut full_batches[inline_full_start..] {
+        batch.is_inline_entity = true;
     }
     // Inline source ranges index `inline_vertices`, not `vertices`. Move them
     // past every world range so world-indexed debug paths (surface inspector
@@ -17454,8 +18785,35 @@ fn build_world(
         })
         .collect::<Vec<_>>();
     upload_timings.batch_bind_groups_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
-    let compact_groups =
+    let mut compact_groups =
         build_draw_compaction_groups(&mut cull_records, &mut coarse_batches, &mut full_batches);
+    let base_compact_draw_capacity = compact_groups
+        .iter()
+        .map(|group| group.max_count)
+        .sum::<u32>();
+
+    let (
+        mut auto4_batches,
+        auto4_plan_by_cluster,
+        auto4_static_batch_count,
+        auto4_variant_base,
+    ) = instantiate_portal_draw_plans(
+        &portal_draw_plan,
+        &portal_batches,
+        &full_batches,
+        inline_full_start,
+        &mut cull_records,
+        &mut initial_indirect,
+    );
+    let auto4_inline_start = auto4_static_batch_count;
+    let auto4_groups = build_auto4_draw_compaction_groups(
+        &mut cull_records,
+        &mut auto4_batches,
+        auto4_static_batch_count,
+        u32::try_from(compact_groups.len()).unwrap_or(u32::MAX),
+        base_compact_draw_capacity,
+    );
+    compact_groups.extend(auto4_groups);
     let compact_draw_capacity = compact_groups
         .iter()
         .map(|group| group.max_count)
@@ -17465,6 +18823,20 @@ fn build_world(
             "GPU draw compaction: {} compatible material group(s), {} candidate draws",
             compact_groups.len(),
             compact_draw_capacity
+        );
+    }
+    if !portal_draw_plan.plan_by_cluster.is_empty() {
+        println!(
+            "AUTO 4 portal plans: {} portal base batch(es), {} unique collapsible group(s), {} unique cluster plan(s) for {} cluster(s); {} group reuse hit(s), {} whole-plan reuse hit(s); full eager collapse would cost {:.2} MiB, lazy cache budget {:.2} MiB",
+            portal_batches.len(),
+            portal_draw_plan.variants.len(),
+            portal_draw_plan.plans.len(),
+            auto4_plan_by_cluster.len(),
+            portal_draw_plan.reused_variant_hits,
+            portal_draw_plan.reused_plan_hits,
+            portal_draw_plan.packed_index_count as f64 * std::mem::size_of::<u32>() as f64
+                / (1024.0 * 1024.0),
+            auto4_cache_bytes as f64 / (1024.0 * 1024.0),
         );
     }
     let cull_started = Instant::now();
@@ -17802,7 +19174,180 @@ fn build_world(
             })
             .collect()
     };
+    let (
+        auto2_visible_batches_by_cluster,
+        auto2_candidate_batches_by_cluster,
+        auto3_visible_batches_by_cluster,
+        auto3_candidate_batches_by_cluster,
+    ) = build_auto2_visibility_tables(
+        &coarse_batches,
+        &full_batches,
+        &coarse_visible_batches_by_cluster,
+        &full_visible_batches_by_cluster,
+    );
+    // Clone only WGPU handles/CPU metadata after compaction assignment. No GPU
+    // geometry, index data, uniforms or textures are duplicated for AUTO 2.
+    let auto2_batches = coarse_batches
+        .iter()
+        .cloned()
+        .chain(full_batches.iter().cloned())
+        .collect::<Vec<_>>();
+
+    if !auto4_plan_by_cluster.is_empty() && !coarse_visible_batches_by_cluster.is_empty() {
+        let plan_stats = |batches: &[WorldBatch], plans: &[Vec<usize>], by_cluster: Option<&[usize]>| {
+            let mut total_batches = 0usize;
+            let mut total_triangles = 0u64;
+            let mut max_batches = 0usize;
+            let mut max_triangles = 0u64;
+            let cluster_count = by_cluster.map_or(plans.len(), |map| map.len()).max(1);
+            for cluster in 0..cluster_count {
+                let plan_id = by_cluster
+                    .and_then(|map| map.get(cluster).copied())
+                    .unwrap_or(cluster);
+                let Some(indices) = plans.get(plan_id) else {
+                    continue;
+                };
+                let triangles = indices
+                    .iter()
+                    .filter_map(|&index| batches.get(index))
+                    .map(|batch| {
+                        u64::from(
+                            batch
+                                .indexed_range
+                                .end
+                                .saturating_sub(batch.indexed_range.start)
+                                / 3,
+                        )
+                    })
+                    .sum::<u64>();
+                total_batches = total_batches.saturating_add(indices.len());
+                total_triangles = total_triangles.saturating_add(triangles);
+                max_batches = max_batches.max(indices.len());
+                max_triangles = max_triangles.max(triangles);
+            }
+            (
+                total_batches as f64 / cluster_count as f64,
+                total_triangles as f64 / cluster_count as f64,
+                max_batches,
+                max_triangles,
+            )
+        };
+        let (minimal_avg_batches, minimal_avg_tris, minimal_max_batches, minimal_max_tris) =
+            plan_stats(
+                &coarse_batches,
+                &coarse_visible_batches_by_cluster,
+                None,
+            );
+        let inline_auto4_batches = full_batches.len().saturating_sub(inline_full_start);
+        let inline_auto4_tris = full_batches[inline_full_start..]
+            .iter()
+            .map(|batch| {
+                u64::from(
+                    batch
+                        .indexed_range
+                        .end
+                        .saturating_sub(batch.indexed_range.start)
+                        / 3,
+                )
+            })
+            .sum::<u64>();
+        let mut auto4_total_batches = 0usize;
+        let mut auto4_total_tris = 0u64;
+        let mut auto4_max_batches = 0usize;
+        let mut auto4_max_tris = 0u64;
+        let auto4_cluster_count = auto4_plan_by_cluster.len().max(1);
+        for cluster in 0..auto4_cluster_count {
+            let Some(&plan_id) = auto4_plan_by_cluster.get(cluster) else {
+                continue;
+            };
+            let Some(refs) = portal_draw_plan.plans.get(plan_id) else {
+                continue;
+            };
+            let mut triangles = inline_auto4_tris;
+            for reference in refs {
+                match *reference {
+                    PreparedPortalPlanBatchRef::Base(index) => {
+                        if let Some(batch) = portal_batches.get(index) {
+                            triangles = triangles.saturating_add(u64::from(
+                                batch
+                                    .indexed_range
+                                    .end
+                                    .saturating_sub(batch.indexed_range.start)
+                                    / 3,
+                            ));
+                        }
+                    }
+                    PreparedPortalPlanBatchRef::Merged(index) => {
+                        if let Some(variant) = portal_draw_plan.variants.get(index) {
+                            for &member in &variant.members {
+                                if let Some(batch) = portal_batches.get(member) {
+                                    triangles = triangles.saturating_add(u64::from(
+                                        batch
+                                            .indexed_range
+                                            .end
+                                            .saturating_sub(batch.indexed_range.start)
+                                            / 3,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let batch_count = refs.len().saturating_add(inline_auto4_batches);
+            auto4_total_batches = auto4_total_batches.saturating_add(batch_count);
+            auto4_total_tris = auto4_total_tris.saturating_add(triangles);
+            auto4_max_batches = auto4_max_batches.max(batch_count);
+            auto4_max_tris = auto4_max_tris.max(triangles);
+        }
+        let auto4_avg_batches = auto4_total_batches as f64 / auto4_cluster_count as f64;
+        let auto4_avg_tris = auto4_total_tris as f64 / auto4_cluster_count as f64;
+        println!(
+            "PVS batch pressure: MINIMAL avg {:.1} batch(es) / {:.0} tris, max {} / {} tris; AUTO 4 avg {:.1} batch(es) / {:.0} tris, max {} / {} tris",
+            minimal_avg_batches,
+            minimal_avg_tris,
+            minimal_max_batches,
+            minimal_max_tris,
+            auto4_avg_batches,
+            auto4_avg_tris,
+            auto4_max_batches,
+            auto4_max_tris,
+        );
+    }
     upload_timings.visibility_tables_ms = visibility_started.elapsed().as_secs_f64() * 1000.0;
+
+    let auto4_variant_members = portal_draw_plan
+        .variants
+        .iter()
+        .map(|variant| variant.members.clone())
+        .collect::<Vec<_>>();
+    let auto4_plan_refs = portal_draw_plan.plans.clone();
+    let mut auto4_collapse_cache =
+        Auto4CollapseCache::disabled(auto4_variant_members.len());
+    auto4_collapse_cache.capacity_indices = auto4_cache_indices;
+    if auto4_cache_indices > 0 && !auto4_variant_members.is_empty() {
+        let cache_end = base_index_count.saturating_add(auto4_cache_indices);
+        auto4_collapse_cache.free_ranges.push(base_index_count..cache_end);
+        match Auto4CollapseWorker::spawn(
+            Arc::clone(&auto4_source_indices),
+            Arc::clone(&auto4_portal_index_ranges),
+        ) {
+            Ok(worker) => {
+                auto4_collapse_cache.worker = Some(worker);
+                println!(
+                    "AUTO 4 lazy physical-collapse cache: {:.2} MiB, {} group(s) build on demand with multi-draw fallback",
+                    auto4_cache_bytes as f64 / (1024.0 * 1024.0),
+                    auto4_variant_members.len(),
+                );
+            }
+            Err(error) => {
+                println!(
+                    "AUTO 4 lazy physical-collapse worker unavailable ({error}); using multi-draw fallback"
+                );
+            }
+        }
+    }
+
     let grass_started = Instant::now();
     let grass = grass_renderer.upload_map(device, &grass_patches);
     upload_timings.grass_upload_ms = grass_started.elapsed().as_secs_f64() * 1000.0;
@@ -17863,10 +19408,24 @@ fn build_world(
             planar_reflectors,
             coarse_batches,
             full_batches,
+            auto2_batches,
             visibility,
             coarse_visible_batches_by_cluster,
             full_visible_batches_by_cluster,
             auto_use_full_by_cluster,
+            auto2_visible_batches_by_cluster,
+            auto2_candidate_batches_by_cluster,
+            auto3_visible_batches_by_cluster,
+            auto3_candidate_batches_by_cluster,
+            auto4_batches,
+            auto4_plan_refs,
+            auto4_plan_by_cluster,
+            auto4_variant_members,
+            auto4_variant_base,
+            auto4_active_plan: Vec::new(),
+            auto4_inline_start,
+            auto4_inline_full_start: inline_full_start,
+            auto4_collapse_cache,
             coarse_all_batches,
             last_cluster: None,
             textures,
@@ -17959,48 +19518,7 @@ fn make_cull_record(
 }
 
 fn same_draw_state(a: &DrawBatch, b: &DrawBatch) -> bool {
-    // Planar-capable surfaces carry a per-surface reflection plane in their
-    // material uniform. Never merge them into a compacted indirect group whose
-    // representative bind group could belong to another plane.
-    if a.planar_reflection
-        || b.planar_reflection
-        || a.planar_environment_candidate
-        || b.planar_environment_candidate
-    {
-        return false;
-    }
-    a.pipeline == b.pipeline
-        && a.texture == b.texture
-        && a.texture_is_lightmap == b.texture_is_lightmap
-        && a.texture_is_white == b.texture_is_white
-        && a.normal_texture == b.normal_texture
-        && a.roughness_texture == b.roughness_texture
-        && a.height_texture == b.height_texture
-        && a.metallic_texture == b.metallic_texture
-        && a.specular_texture == b.specular_texture
-        && a.emissive_texture == b.emissive_texture
-        && a.height_from_alpha == b.height_from_alpha
-        && a.rmo_packed == b.rmo_packed
-        && a.rmo_specular_alpha == b.rmo_specular_alpha
-        && a.normal_scale == b.normal_scale
-        && a.roughness_override == b.roughness_override
-        && a.specular_reflectance == b.specular_reflectance
-        && a.parallax_depth == b.parallax_depth
-        && a.lightmap == b.lightmap
-        && a.modulate_lightmap == b.modulate_lightmap
-        && a.vertex_lit == b.vertex_lit
-        && a.tc_gen == b.tc_gen
-        && a.tc_mods == b.tc_mods
-        && a.rgb_gen == b.rgb_gen
-        && a.alpha_gen == b.alpha_gen
-        && a.color == b.color
-        && a.alpha_cutoff == b.alpha_cutoff
-        && a.fog == b.fog
-        && a.fog_is_global == b.fog_is_global
-        && a.fog_color_override == b.fog_color_override
-        && a.legacy2_fog_in_stage_safe == b.legacy2_fog_in_stage_safe
-        && a.global_fog_post_eligible == b.global_fog_post_eligible
-        && a.skybox == b.skybox
+    scene::draw_batches_share_state(a, b)
 }
 
 fn build_draw_compaction_groups(
@@ -18019,6 +19537,7 @@ fn build_draw_compaction_groups(
         let batches: &[WorldBatch] = match set {
             WorldBatchSet::Coarse => coarse_batches,
             WorldBatchSet::Full => full_batches,
+            WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
         };
         for (batch_index, batch) in batches.iter().enumerate() {
             // Transparent surfaces require their authored ordering, and sky
@@ -18037,6 +19556,7 @@ fn build_draw_compaction_groups(
                 let representative = match group.representative_set {
                     WorldBatchSet::Coarse => &coarse_batches[group.representative_index],
                     WorldBatchSet::Full => &full_batches[group.representative_index],
+                    WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
                 };
                 same_draw_state(&representative.source, &batch.source)
             }) {
@@ -18063,6 +19583,7 @@ fn build_draw_compaction_groups(
             let batch = match set {
                 WorldBatchSet::Coarse => &mut coarse_batches[*batch_index],
                 WorldBatchSet::Full => &mut full_batches[*batch_index],
+                WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
             };
             batch.compact_group = Some(group_index);
             if let Some(record) = records.get_mut(batch.cull_index as usize) {
@@ -18072,6 +19593,57 @@ fn build_draw_compaction_groups(
         groups.push(WorldDrawGroup {
             representative_set: candidate.representative_set,
             representative_index: candidate.representative_index,
+            output_base,
+            max_count,
+        });
+        output_base = output_base.saturating_add(max_count);
+    }
+    groups
+}
+
+fn build_auto4_draw_compaction_groups(
+    records: &mut [GpuCullRecord],
+    batches: &mut [WorldBatch],
+    static_count: usize,
+    group_base: u32,
+    output_base_start: u32,
+) -> Vec<WorldDrawGroup> {
+    // Both sides of the lazy representation must be compactable: base portal
+    // pieces are used while a collapse is pending, and the placeholder variant
+    // becomes active after its contiguous index range is uploaded. They never
+    // coexist for the same recipe entry, so sharing compaction groups is safe.
+    let static_count = static_count.min(batches.len());
+    let mut candidates = Vec::<Vec<usize>>::new();
+    for batch_index in 0..static_count {
+        let batch = &batches[batch_index];
+        if !matches!(batch.source.pipeline.class, DrawClass::Opaque | DrawClass::Mask) {
+            continue;
+        }
+        if let Some(group) = candidates.iter_mut().find(|group| {
+            same_draw_state(&batches[group[0]].source, &batch.source)
+        }) {
+            group.push(batch_index);
+        } else {
+            candidates.push(vec![batch_index]);
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut output_base = output_base_start;
+    for members in candidates.into_iter().filter(|members| members.len() >= 2) {
+        let local_index = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+        let group_index = group_base.saturating_add(local_index);
+        let max_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
+        for &batch_index in &members {
+            let batch = &mut batches[batch_index];
+            batch.compact_group = Some(group_index);
+            if let Some(record) = records.get_mut(batch.cull_index as usize) {
+                record.compact = [group_index, output_base, 1, 0];
+            }
+        }
+        groups.push(WorldDrawGroup {
+            representative_set: WorldBatchSet::Auto4,
+            representative_index: members[0],
             output_base,
             max_count,
         });
@@ -18324,12 +19896,233 @@ fn visible_batches_by_cluster(
     by_cluster
 }
 
+fn estimated_world_batch_cost(batch: &WorldBatch) -> u64 {
+    let vertices = u64::from(batch.source.vertices.end - batch.source.vertices.start);
+    vertices.saturating_add(AUTO_DRAW_VERTEX_EQUIVALENT)
+}
+
 fn estimated_batch_cost(batches: &[WorldBatch], indices: &[usize]) -> u64 {
     indices.iter().fold(0_u64, |cost, &index| {
-        let batch = &batches[index].source;
-        let vertices = u64::from(batch.vertices.end - batch.vertices.start);
-        cost.saturating_add(vertices + AUTO_DRAW_VERTEX_EQUIVALENT)
+        cost.saturating_add(estimated_world_batch_cost(&batches[index]))
     })
+}
+
+/// Build AUTO 2 and AUTO 3 hybrid representations once at map upload.
+/// Existing AUTO makes one coarse-vs-full decision for the whole camera cluster;
+/// AUTO 2 applies the same cost comparison per coarse material/surface group.
+/// AUTO 3 is stricter: it only substitutes the coarse parent when that parent is
+/// visibility-equivalent to Full for the current cluster and for every possible
+/// runtime areamask state.
+///
+/// Returned indices address `coarse_batches` followed by `full_batches`, which
+/// lets the renderer use one ordinary WorldBatch slice in every pass.
+fn build_auto2_visibility_tables(
+    coarse_batches: &[WorldBatch],
+    full_batches: &[WorldBatch],
+    coarse_visible_by_cluster: &[Vec<usize>],
+    full_visible_by_cluster: &[Vec<usize>],
+) -> (Vec<Vec<usize>>, Vec<usize>, Vec<Vec<usize>>, Vec<usize>) {
+    if full_batches.is_empty()
+        || coarse_visible_by_cluster.len() != full_visible_by_cluster.len()
+    {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    struct SurfaceGroup {
+        coarse: std::ops::Range<usize>,
+        full_indices: Vec<usize>,
+        vertex_start: u32,
+        vertex_end: u32,
+        bsp_shader_index: u32,
+    }
+
+    // Multi-stage shader passes sharing one authored geometry range must make
+    // the decision together; mixing stages from coarse and full would break
+    // authored ordering/fog semantics.
+    let mut groups = Vec::<SurfaceGroup>::new();
+    let mut start = 0usize;
+    while start < coarse_batches.len() {
+        let mut end = start + 1;
+        while end < coarse_batches.len()
+            && same_world_surface(&coarse_batches[start], &coarse_batches[end])
+        {
+            end += 1;
+        }
+        groups.push(SurfaceGroup {
+            coarse: start..end,
+            full_indices: Vec::new(),
+            vertex_start: coarse_batches[start].source.vertices.start,
+            vertex_end: coarse_batches[start].source.vertices.end,
+            bsp_shader_index: coarse_batches[start].source.bsp_shader_index,
+        });
+        start = end;
+    }
+
+    // Full pieces are subranges of exactly one coarse geometry range. Index the
+    // parents by shader/range so this mapping is O(n log n), not coarse*full.
+    let mut groups_by_shader = BTreeMap::<u32, Vec<(u32, u32, usize)>>::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        groups_by_shader
+            .entry(group.bsp_shader_index)
+            .or_default()
+            .push((group.vertex_start, group.vertex_end, group_index));
+    }
+    for ranges in groups_by_shader.values_mut() {
+        ranges.sort_unstable_by_key(|entry| entry.0);
+    }
+    for (full_index, batch) in full_batches.iter().enumerate() {
+        let Some(ranges) = groups_by_shader.get(&batch.source.bsp_shader_index) else {
+            continue;
+        };
+        let slot = ranges.partition_point(|entry| entry.0 <= batch.source.vertices.start);
+        if slot == 0 {
+            continue;
+        }
+        let (parent_start, parent_end, group_index) = ranges[slot - 1];
+        if batch.source.vertices.start >= parent_start
+            && batch.source.vertices.end <= parent_end
+        {
+            groups[group_index].full_indices.push(full_index);
+        }
+    }
+
+    let full_offset = coarse_batches.len();
+    let mut auto2_visible = Vec::with_capacity(coarse_visible_by_cluster.len());
+    let mut auto2_candidates = Vec::with_capacity(coarse_visible_by_cluster.len());
+    let mut auto3_visible = Vec::with_capacity(coarse_visible_by_cluster.len());
+    let mut auto3_candidates = Vec::with_capacity(coarse_visible_by_cluster.len());
+    let mut coarse_visible_flags = vec![false; coarse_batches.len()];
+    let mut full_visible_flags = vec![false; full_batches.len()];
+
+    for (coarse_visible, full_visible) in coarse_visible_by_cluster
+        .iter()
+        .zip(full_visible_by_cluster)
+    {
+        for &index in coarse_visible {
+            if let Some(flag) = coarse_visible_flags.get_mut(index) {
+                *flag = true;
+            }
+        }
+        for &index in full_visible {
+            if let Some(flag) = full_visible_flags.get_mut(index) {
+                *flag = true;
+            }
+        }
+
+        let mut selected2 = Vec::<usize>::with_capacity(coarse_visible.len());
+        let mut selected3 = Vec::<usize>::with_capacity(coarse_visible.len());
+        let mut candidate2 = 0usize;
+        let mut candidate3 = 0usize;
+
+        for group in &groups {
+            let coarse_group_visible = group.coarse.clone().any(|index| coarse_visible_flags[index]);
+            if !coarse_group_visible {
+                candidate2 = candidate2.saturating_add(group.coarse.len());
+                candidate3 = candidate3.saturating_add(group.coarse.len());
+                continue;
+            }
+
+            let coarse_cost = group
+                .coarse
+                .clone()
+                .filter(|&index| coarse_visible_flags[index])
+                .fold(0_u64, |cost, index| {
+                    cost.saturating_add(estimated_world_batch_cost(&coarse_batches[index]))
+                });
+            let mut full_cost = 0_u64;
+            let mut visible_full_count = 0usize;
+            for &index in &group.full_indices {
+                if full_visible_flags[index] {
+                    visible_full_count += 1;
+                    full_cost = full_cost
+                        .saturating_add(estimated_world_batch_cost(&full_batches[index]));
+                }
+            }
+
+            // AUTO 2: retain the original per-group cost heuristic exactly.
+            if visible_full_count != 0 && full_cost < coarse_cost {
+                candidate2 = candidate2.saturating_add(group.full_indices.len());
+                selected2.extend(
+                    group
+                        .full_indices
+                        .iter()
+                        .copied()
+                        .filter(|&index| full_visible_flags[index])
+                        .map(|index| full_offset + index),
+                );
+            } else {
+                candidate2 = candidate2.saturating_add(group.coarse.len());
+                selected2.extend(
+                    group
+                        .coarse
+                        .clone()
+                        .filter(|&index| coarse_visible_flags[index]),
+                );
+            }
+
+            // AUTO 3: collapse only if doing so is *exactly* equivalent to Full.
+            // All Full children must be PVS-visible for this camera cluster, and
+            // all of them must have identical area membership. If area membership
+            // differs, an areamask can hide only some children, so using the
+            // coarse OR-mask would re-open hidden portal geometry.
+            let all_full_visible = !group.full_indices.is_empty()
+                && visible_full_count == group.full_indices.len();
+            let same_area_membership = group
+                .full_indices
+                .first()
+                .map(|&first| {
+                    let signature = full_batches[first].source.area_signature;
+                    group.full_indices.iter().all(|&index| {
+                        full_batches[index].source.area_signature == signature
+                    })
+                })
+                .unwrap_or(false);
+
+            if group.full_indices.is_empty() || (all_full_visible && same_area_membership) {
+                // Missing parent mapping falls back conservatively to the coarse
+                // representation rather than dropping geometry.
+                candidate3 = candidate3.saturating_add(group.coarse.len());
+                selected3.extend(
+                    group
+                        .coarse
+                        .clone()
+                        .filter(|&index| coarse_visible_flags[index]),
+                );
+            } else {
+                candidate3 = candidate3.saturating_add(group.full_indices.len());
+                selected3.extend(
+                    group
+                        .full_indices
+                        .iter()
+                        .copied()
+                        .filter(|&index| full_visible_flags[index])
+                        .map(|index| full_offset + index),
+                );
+            }
+        }
+
+        for &index in coarse_visible {
+            if let Some(flag) = coarse_visible_flags.get_mut(index) {
+                *flag = false;
+            }
+        }
+        for &index in full_visible {
+            if let Some(flag) = full_visible_flags.get_mut(index) {
+                *flag = false;
+            }
+        }
+        auto2_visible.push(selected2);
+        auto2_candidates.push(candidate2);
+        auto3_visible.push(selected3);
+        auto3_candidates.push(candidate3);
+    }
+
+    (
+        auto2_visible,
+        auto2_candidates,
+        auto3_visible,
+        auto3_candidates,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18710,6 +20503,8 @@ fn rebuild_world_bind_groups(
     let WorldGpu {
         coarse_batches,
         full_batches,
+        auto2_batches,
+        auto4_batches,
         textures,
         lightmaps,
         deluxemaps,
@@ -18724,7 +20519,12 @@ fn rebuild_world_bind_groups(
             .and_then(|index| textures.get(index))
             .unwrap_or(white)
     });
-    for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
+    for batch in coarse_batches
+        .iter_mut()
+        .chain(full_batches.iter_mut())
+        .chain(auto2_batches.iter_mut())
+        .chain(auto4_batches.iter_mut())
+    {
         batch.bind_group = create_world_bind_group(
             device,
             surface_layout,
@@ -19718,15 +21518,327 @@ fn update_visibility(world: &mut WorldGpu, camera: &Camera) -> Option<usize> {
     cluster
 }
 
+fn auto4_variant_gpu_record(world: &WorldGpu, batch_index: usize) -> Option<GpuCullRecord> {
+    let batch = world.auto4_batches.get(batch_index)?;
+    let compact = batch
+        .compact_group
+        .and_then(|group_index| {
+            world
+                .compact_groups
+                .get(group_index as usize)
+                .map(|group| [group_index, group.output_base, 1, 0])
+        })
+        .unwrap_or([u32::MAX, 0, 0, 0]);
+    Some(GpuCullRecord {
+        minimum: [
+            batch.bounds_min[0],
+            batch.bounds_min[1],
+            batch.bounds_min[2],
+            0.0,
+        ],
+        maximum: [
+            batch.bounds_max[0],
+            batch.bounds_max[1],
+            batch.bounds_max[2],
+            0.0,
+        ],
+        draw: [
+            batch
+                .indexed_range
+                .end
+                .saturating_sub(batch.indexed_range.start),
+            batch.indexed_range.start,
+            u32::from(batch.source.pipeline.class == DrawClass::Sky),
+            0,
+        ],
+        compact,
+    })
+}
+
+fn auto4_upload_variant_record(queue: &wgpu::Queue, world: &WorldGpu, batch_index: usize) {
+    let Some(batch) = world.auto4_batches.get(batch_index) else {
+        return;
+    };
+    let Some(record) = auto4_variant_gpu_record(world, batch_index) else {
+        return;
+    };
+    queue.write_buffer(
+        &world.cull_records_buffer,
+        u64::from(batch.cull_index) * std::mem::size_of::<GpuCullRecord>() as u64,
+        bytemuck::bytes_of(&record),
+    );
+}
+
+fn auto4_evict_lru_variant(
+    queue: &wgpu::Queue,
+    world: &mut WorldGpu,
+    protected: &[bool],
+) -> bool {
+    let victim = world
+        .auto4_collapse_cache
+        .states
+        .iter()
+        .enumerate()
+        .filter_map(|(variant, state)| match state {
+            Auto4VariantCacheState::Ready {
+                last_used_frame, ..
+            } if !protected.get(variant).copied().unwrap_or(false) => {
+                Some((variant, *last_used_frame))
+            }
+            _ => None,
+        })
+        .min_by_key(|(_, last_used_frame)| *last_used_frame)
+        .map(|(variant, _)| variant);
+    let Some(victim) = victim else {
+        return false;
+    };
+    let old = std::mem::replace(
+        &mut world.auto4_collapse_cache.states[victim],
+        Auto4VariantCacheState::Uncached,
+    );
+    let Auto4VariantCacheState::Ready { range, .. } = old else {
+        return false;
+    };
+    world.auto4_collapse_cache.release(range);
+    world.auto4_collapse_cache.evictions =
+        world.auto4_collapse_cache.evictions.saturating_add(1);
+    let batch_index = world.auto4_variant_base.saturating_add(victim);
+    if let Some(batch) = world.auto4_batches.get_mut(batch_index) {
+        batch.indexed_range = 0..0;
+    }
+    auto4_upload_variant_record(queue, world, batch_index);
+    true
+}
+
+fn refresh_auto4_lazy_collapse(queue: &wgpu::Queue, world: &mut WorldGpu, mode: PvsMode) {
+    if mode != PvsMode::Auto4 || world.auto4_plan_refs.is_empty() {
+        return;
+    }
+    let Some(cluster) = world.last_cluster.flatten() else {
+        if !world.auto4_active_plan.is_empty() {
+            world.auto4_active_plan.clear();
+            world.active_selection_key = None;
+        }
+        world.auto4_collapse_cache.current_cluster = None;
+        return;
+    };
+    let Some(&plan_id) = world.auto4_plan_by_cluster.get(cluster) else {
+        world.auto4_active_plan.clear();
+        return;
+    };
+    let Some(plan_refs) = world.auto4_plan_refs.get(plan_id).cloned() else {
+        world.auto4_active_plan.clear();
+        return;
+    };
+
+    world.auto4_collapse_cache.frame = world.auto4_collapse_cache.frame.wrapping_add(1);
+    let frame = world.auto4_collapse_cache.frame;
+    let mut protected = vec![false; world.auto4_variant_members.len()];
+    for reference in &plan_refs {
+        if let PreparedPortalPlanBatchRef::Merged(variant) = *reference {
+            if let Some(flag) = protected.get_mut(variant) {
+                *flag = true;
+            }
+        }
+    }
+
+    let mut completed = Vec::<Auto4CollapseResult>::new();
+    if let Some(worker) = world.auto4_collapse_cache.worker.as_ref() {
+        loop {
+            match worker.receiver.try_recv() {
+                Ok(result) => completed.push(result),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+    let cluster_changed = world.auto4_collapse_cache.current_cluster != Some(cluster);
+    if completed.is_empty() && !cluster_changed {
+        return;
+    }
+    world.auto4_collapse_cache.current_cluster = Some(cluster);
+    if cluster_changed {
+        for reference in &plan_refs {
+            if let PreparedPortalPlanBatchRef::Merged(variant) = *reference {
+                if matches!(
+                    world.auto4_collapse_cache.states.get(variant),
+                    Some(Auto4VariantCacheState::Deferred)
+                ) {
+                    world.auto4_collapse_cache.states[variant] =
+                        Auto4VariantCacheState::Uncached;
+                }
+            }
+        }
+    }
+
+    for result in completed {
+        let variant = result.variant;
+        if !matches!(
+            world.auto4_collapse_cache.states.get(variant),
+            Some(Auto4VariantCacheState::Pending)
+        ) {
+            continue;
+        }
+        let count = u32::try_from(result.indices.len()).unwrap_or(u32::MAX);
+        if count == 0 || count > world.auto4_collapse_cache.capacity_indices {
+            if count > world.auto4_collapse_cache.capacity_indices {
+                world.auto4_collapse_cache.oversize =
+                    world.auto4_collapse_cache.oversize.saturating_add(1);
+                world.auto4_collapse_cache.states[variant] =
+                    Auto4VariantCacheState::Uncacheable;
+            } else {
+                world.auto4_collapse_cache.states[variant] =
+                    Auto4VariantCacheState::Uncached;
+            }
+            continue;
+        }
+
+        let mut range = world.auto4_collapse_cache.allocate(count);
+        while range.is_none() {
+            if !auto4_evict_lru_variant(queue, world, &protected) {
+                break;
+            }
+            range = world.auto4_collapse_cache.allocate(count);
+        }
+        let Some(range) = range else {
+            world.auto4_collapse_cache.states[variant] = Auto4VariantCacheState::Deferred;
+            continue;
+        };
+
+        queue.write_buffer(
+            &world.index_buffer,
+            u64::from(range.start) * std::mem::size_of::<u32>() as u64,
+            bytemuck::cast_slice(&result.indices),
+        );
+        let batch_index = world.auto4_variant_base.saturating_add(variant);
+        if let Some(batch) = world.auto4_batches.get_mut(batch_index) {
+            batch.indexed_range = range.clone();
+        }
+        world.auto4_collapse_cache.states[variant] = Auto4VariantCacheState::Ready {
+            range,
+            last_used_frame: frame,
+        };
+        world.auto4_collapse_cache.completed =
+            world.auto4_collapse_cache.completed.saturating_add(1);
+        auto4_upload_variant_record(queue, world, batch_index);
+    }
+
+    let mut active = Vec::<usize>::new();
+    let mut physical_groups = 0usize;
+    let mut fallback_groups = 0usize;
+    let mut fallback_draws = 0usize;
+    let mut base_draws = 0usize;
+    for reference in &plan_refs {
+        match *reference {
+            PreparedPortalPlanBatchRef::Base(index) => {
+                active.push(index);
+                base_draws = base_draws.saturating_add(1);
+            }
+            PreparedPortalPlanBatchRef::Merged(variant) => {
+                let ready = match world.auto4_collapse_cache.states.get_mut(variant) {
+                    Some(Auto4VariantCacheState::Ready {
+                        last_used_frame, ..
+                    }) => {
+                        *last_used_frame = frame;
+                        true
+                    }
+                    _ => false,
+                };
+                if ready {
+                    active.push(world.auto4_variant_base.saturating_add(variant));
+                    physical_groups = physical_groups.saturating_add(1);
+                    continue;
+                }
+
+                let members = world
+                    .auto4_variant_members
+                    .get(variant)
+                    .cloned()
+                    .unwrap_or_default();
+                fallback_groups = fallback_groups.saturating_add(1);
+                fallback_draws = fallback_draws.saturating_add(members.len());
+                active.extend(members.iter().copied());
+
+                if matches!(
+                    world.auto4_collapse_cache.states.get(variant),
+                    Some(Auto4VariantCacheState::Uncached)
+                ) {
+                    let request = Auto4CollapseRequest { variant, members };
+                    let send_result = world
+                        .auto4_collapse_cache
+                        .worker
+                        .as_ref()
+                        .and_then(|worker| worker.sender.as_ref())
+                        .map(|sender| sender.try_send(request));
+                    match send_result {
+                        Some(Ok(())) => {
+                            world.auto4_collapse_cache.states[variant] =
+                                Auto4VariantCacheState::Pending;
+                            world.auto4_collapse_cache.queued =
+                                world.auto4_collapse_cache.queued.saturating_add(1);
+                        }
+                        Some(Err(TrySendError::Full(_))) => {}
+                        Some(Err(TrySendError::Disconnected(_))) | None => {}
+                    }
+                }
+            }
+        }
+    }
+    active.extend(world.auto4_inline_start..world.auto4_batches.len());
+
+    let active_changed = active != world.auto4_active_plan;
+    if active_changed {
+        world.auto4_active_plan = active;
+        world.active_selection_key = None;
+    }
+
+    let report_cluster_change =
+        world.auto4_collapse_cache.last_reported_cluster != Some(cluster);
+    let report_warmed_plan = active_changed && fallback_groups == 0;
+    if report_cluster_change || report_warmed_plan {
+        world.auto4_collapse_cache.last_reported_cluster = Some(cluster);
+        let ready_count = world
+            .auto4_collapse_cache
+            .states
+            .iter()
+            .filter(|state| matches!(state, Auto4VariantCacheState::Ready { .. }))
+            .count();
+        let pending_count = world
+            .auto4_collapse_cache
+            .states
+            .iter()
+            .filter(|state| matches!(state, Auto4VariantCacheState::Pending))
+            .count();
+        let used_mb = f64::from(world.auto4_collapse_cache.used_indices)
+            * std::mem::size_of::<u32>() as f64
+            / (1024.0 * 1024.0);
+        let capacity_mb = f64::from(world.auto4_collapse_cache.capacity_indices)
+            * std::mem::size_of::<u32>() as f64
+            / (1024.0 * 1024.0);
+        println!(
+            "AUTO 4 lazy plan: cluster {cluster} plan {plan_id}: {physical_groups} physical collapsed draw(s), {fallback_groups} pending/uncached group(s) -> {fallback_draws} underlying draw(s), {base_draws} direct base draw(s); cache {used_mb:.2}/{capacity_mb:.2} MiB, {ready_count} ready, {pending_count} pending, {} queued / {} completed, {} eviction(s), {} oversize group(s)",
+            world.auto4_collapse_cache.queued,
+            world.auto4_collapse_cache.completed,
+            world.auto4_collapse_cache.evictions,
+            world.auto4_collapse_cache.oversize,
+        );
+    }
+}
+
 struct ActiveBatchSelection<'a> {
     batches: &'a [WorldBatch],
     indices: &'a [usize],
+    /// Number of batches in the representation selected for this cluster before
+    /// PVS rejection. This keeps cull diagnostics meaningful for hybrid AUTO
+    /// modes even though their backing slice contains coarse and full aliases.
+    candidate_count: usize,
 }
 
 fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelection<'_> {
     let coarse_all = ActiveBatchSelection {
         batches: &world.coarse_batches,
         indices: &world.coarse_all_batches,
+        candidate_count: world.coarse_batches.len(),
     };
     if mode == PvsMode::Off {
         return coarse_all;
@@ -19744,6 +21856,7 @@ fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelecti
     let coarse = ActiveBatchSelection {
         batches: &world.coarse_batches,
         indices: coarse_visible,
+        candidate_count: world.coarse_batches.len(),
     };
     if mode == PvsMode::Minimal || world.full_batches.is_empty() {
         return coarse;
@@ -19755,6 +21868,7 @@ fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelecti
     let full = ActiveBatchSelection {
         batches: &world.full_batches,
         indices: full_visible,
+        candidate_count: world.full_batches.len(),
     };
     match mode {
         PvsMode::Full => full,
@@ -19768,6 +21882,44 @@ fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelecti
             full
         }
         PvsMode::Auto => coarse,
+        PvsMode::Auto2 => {
+            let Some(indices) = world.auto2_visible_batches_by_cluster.get(cluster) else {
+                return coarse;
+            };
+            ActiveBatchSelection {
+                batches: &world.auto2_batches,
+                indices,
+                candidate_count: world
+                    .auto2_candidate_batches_by_cluster
+                    .get(cluster)
+                    .copied()
+                    .unwrap_or(world.coarse_batches.len()),
+            }
+        }
+        PvsMode::Auto3 => {
+            let Some(indices) = world.auto3_visible_batches_by_cluster.get(cluster) else {
+                return full;
+            };
+            ActiveBatchSelection {
+                batches: &world.auto2_batches,
+                indices,
+                candidate_count: world
+                    .auto3_candidate_batches_by_cluster
+                    .get(cluster)
+                    .copied()
+                    .unwrap_or(world.full_batches.len()),
+            }
+        }
+        PvsMode::Auto4 => {
+            if world.auto4_batches.is_empty() || world.auto4_active_plan.is_empty() {
+                return full;
+            }
+            ActiveBatchSelection {
+                batches: &world.auto4_batches,
+                indices: &world.auto4_active_plan,
+                candidate_count: world.auto4_batches.len(),
+            }
+        }
         PvsMode::Off | PvsMode::Minimal => coarse,
     }
 }
@@ -19903,15 +22055,6 @@ fn supported_msaa(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) 
     }
     result
 }
-
-/// Frames the swapchain may keep in flight.
-///
-/// On DX12 this is also the FAST-vsync throughput ceiling: wgpu presents Mailbox
-/// as `Present(0)` without `DXGI_PRESENT_ALLOW_TEARING`, and a non-tearing
-/// flip-model present is retired at vblank, so no more than this many frames can
-/// retire per refresh. VSync OFF uses Immediate, which does set the tearing flag
-/// and is not bound this way.
-pub const MAX_FRAME_LATENCY: u32 = 3;
 
 fn no_vsync_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     if modes.contains(&wgpu::PresentMode::Immediate) {
@@ -22049,6 +24192,110 @@ fn gpu_blend_factor(factor: BlendFactor) -> wgpu::BlendFactor {
     }
 }
 
+fn create_dynamic_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA dynamic model wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_wireframe"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_ghoul2_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA Ghoul2 wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_wireframe"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_dynamic_model_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -22325,6 +24572,124 @@ fn create_ghoul2_skin_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_world_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    shader_variant: WorldShaderVariantKey,
+) -> wgpu::RenderPipeline {
+    let shader_constants = shader_variant.compilation_constants();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA deformed-world wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &shader_constants,
+                ..Default::default()
+            },
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_wireframe"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &shader_constants,
+                ..Default::default()
+            },
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_fast_world_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA fast deformed-world wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_wireframe"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

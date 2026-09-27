@@ -36,6 +36,8 @@ pub struct ClientPresentationSettings {
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub console_timestamps: bool,
+    /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
+    pub ui_vgs: i32,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
     /// TaystJK-compatible server-browser masters (`sv_master1`..`sv_master5`).
@@ -154,6 +156,7 @@ impl Default for ClientPresentationSettings {
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             console_timestamps: true,
+            ui_vgs: 1,
             network: crate::net::NetworkSettings::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
         }
@@ -266,6 +269,9 @@ pub fn load_client_presentation_settings(
             "con_timestamps" => {
                 settings.console_timestamps =
                     parse_bool(value).unwrap_or(settings.console_timestamps)
+            }
+            "ui_vgs" => {
+                settings.ui_vgs = value.trim().parse::<i32>().unwrap_or(settings.ui_vgs)
             }
             "sv_master1" => settings.master_servers[0] = value.trim().to_owned(),
             "sv_master2" => settings.master_servers[1] = value.trim().to_owned(),
@@ -416,6 +422,13 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_swapinterval" => {
                 settings.vsync = VsyncMode::from_config(value).unwrap_or(settings.vsync)
             }
+            "r_maxframelatency" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    if (1..=3).contains(&value) {
+                        settings.max_frame_latency = value;
+                    }
+                }
+            }
             "r_customwidth" => custom_width = value.parse::<u32>().ok().filter(|v| *v >= 320),
             "r_customheight" => custom_height = value.parse::<u32>().ok().filter(|v| *v >= 240),
             "r_windowx" => window_x = value.parse::<i32>().ok(),
@@ -445,7 +458,11 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                 anisotropy = value.parse::<f32>().ok().filter(|v| v.is_finite());
             }
             "r_showtris" => {
-                settings.show_wireframe = parse_bool(value).unwrap_or(settings.show_wireframe);
+                if let Ok(mask) = value.trim().parse::<u32>() {
+                    settings.wireframe_mask = mask & crate::ui::wireframe::ALL;
+                } else if let Some(enabled) = parse_bool(value) {
+                    settings.wireframe_mask = if enabled { crate::ui::wireframe::MAP } else { 0 };
+                }
             }
             "r_skipui" => {
                 settings.skip_ui = parse_bool(value).unwrap_or(settings.skip_ui);
@@ -494,6 +511,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "cl_input_subframe" => {
                 settings.input_subframe = parse_bool(value).unwrap_or(settings.input_subframe);
+            }
+            "cl_input_latelatch" => {
+                settings.input_latelatch = parse_bool(value).unwrap_or(settings.input_latelatch);
             }
             "r_physics" => {
                 settings.client_physics = parse_bool(value).unwrap_or(settings.client_physics);
@@ -571,6 +591,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     "minimal" | "1" => Some(PvsMode::Minimal),
                     "full" | "2" => Some(PvsMode::Full),
                     "auto" | "3" => Some(PvsMode::Auto),
+                    "auto2" | "4" => Some(PvsMode::Auto2),
+                    "auto3" | "5" => Some(PvsMode::Auto3),
+                    "auto4" | "batched" | "pvsbatched" | "6" => Some(PvsMode::Auto4),
                     _ => pvs_mode,
                 };
             }
@@ -1113,6 +1136,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
         };
     }
     settings.ocean_settings = settings.ocean_settings.sanitize();
+    if !settings.input_subframe {
+        settings.input_latelatch = false;
+    }
     settings
 }
 
@@ -1147,12 +1173,7 @@ pub fn save_video_settings(
     } else {
         settings.msaa_samples
     };
-    let pvs_mode = match settings.pvs_mode {
-        PvsMode::Off => "off",
-        PvsMode::Minimal => "minimal",
-        PvsMode::Full => "full",
-        PvsMode::Auto => "auto",
-    };
+    let pvs_mode = settings.pvs_mode.config_value();
     let window_x = settings
         .window_position
         .map_or_else(|| "auto".to_owned(), |position| position[0].to_string());
@@ -1170,6 +1191,7 @@ seta r_windowMaximized \"{}\"\n\
 seta r_fullscreen \"{}\"\n\
 seta r_backend \"{}\"\n\
 seta r_swapInterval \"{}\"\n\
+seta r_maxFrameLatency \"{}\"\n\
 seta r_ext_multisample \"{}\"\n\
 seta r_textureMode \"{}\"\n\
 seta r_ext_texture_filter_anisotropic \"{}\"\n\
@@ -1188,6 +1210,7 @@ seta com_maxfps \"{}\"\n\
 seta cg_drawFPS \"{}\"\n\
 seta pmove_msec \"{}\"\n\
 seta cl_input_subframe \"{}\"\n\
+seta cl_input_latelatch \"{}\"\n\
 seta r_gamma \"{:.3}\"\n\
 seta r_hdr \"{}\"\n\
 seta r_floatLightmap \"{}\"\n\
@@ -1290,10 +1313,11 @@ seta r_cascadedShadows \"{}\"\n\
         settings.fullscreen.config_value(),
         settings.renderer_backend.config_value(),
         settings.vsync.config_value(),
+        settings.max_frame_latency,
         msaa,
         texture_mode,
         anisotropy,
-        u8::from(settings.show_wireframe),
+        settings.wireframe_mask,
         u8::from(settings.skip_ui),
         u8::from(settings.developer_tools),
         u8::from(settings.perf_trace),
@@ -1308,6 +1332,7 @@ seta r_cascadedShadows \"{}\"\n\
         settings.draw_fps,
         settings.physics_msec,
         u8::from(settings.input_subframe),
+        u8::from(settings.input_latelatch),
         settings.gamma,
         u8::from(settings.hdr),
         u8::from(settings.float_lightmap),
@@ -1486,6 +1511,7 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta cg_strafeHelperActiveColor \"{sr} {sg} {sb} {sa}\"");
     let _ = writeln!(text, "seta cg_strafeHelperInactiveAlpha \"{}\"", presentation.strafe_helper.inactive_alpha);
     let _ = writeln!(text, "seta con_timestamps \"{}\"", u8::from(presentation.console_timestamps));
+    let _ = writeln!(text, "seta ui_vgs \"{}\"", presentation.ui_vgs);
     let _ = writeln!(text, "seta cg_fov \"{:.3}\"", presentation.fov);
     for (index, master) in presentation.master_servers.iter().enumerate() {
         let _ = writeln!(text, "seta sv_master{} \"{}\"", index + 1, master);

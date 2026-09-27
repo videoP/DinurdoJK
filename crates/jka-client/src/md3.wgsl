@@ -103,6 +103,11 @@ fn fogged(color: vec4<f32>, world_position: vec3<f32>, fog_to_black: bool) -> ve
 }
 
 @fragment
+fn fs_wireframe() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+
+@fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     return fogged(lit_color(input.normal, tex) * input.color, input.world_position, false);
