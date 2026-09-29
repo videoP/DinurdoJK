@@ -89,6 +89,18 @@ pub const ENTRIES: &[Entry] = &[
         "Event diagnostics: 1 accepted+status, 2 adds suppressed candidates, 3 adds entity/resource detail.",
     ),
     cvar(
+        "cg_asyncAssets",
+        "1",
+        "0|1",
+        "Runtime asset cache misses (player/saber/weapon Ghoul2 models): 1 load on background workers and keep the previous or default model until ready, 0 old synchronous registration. Developer A/B switch.",
+    ),
+    cvar(
+        "cg_eventWorkers",
+        "0",
+        "0|1",
+        "A/B test event semantic preparation: 0 CGame thread, 1 dedicated worker pool; ordered side effects remain on CGame.",
+    ),
+    cvar(
         "cg_drawCrosshair",
         "1",
         "0..6",
@@ -161,6 +173,7 @@ pub const ENTRIES: &[Entry] = &[
         "Summarize accepted demo events; use 'cg_eventStats clear' to reset counters.",
     ),
     cvar("model", "kyle", "model[/skin]", "Local player model and skin."),
+    cvar("cg_forceModel", "0", "0 | model[/skin] | allyModel,enemyModel", "Client-side forced player models: off, one model for all other players, or separate ally/enemy models."),
     cvar("sensitivity", "5", "float", "TaystJK mouse sensitivity multiplier."),
     cvar("m_yaw", "0.022", "float", "TaystJK horizontal mouse scale."),
     cvar("m_pitch", "0.022", "float", "TaystJK vertical mouse scale."),
@@ -177,7 +190,9 @@ pub const ENTRIES: &[Entry] = &[
         "TaystJK legacy style-0 mouse acceleration; 0 disables it.",
     ),
     cvar("con_timestamps", "1", "0..1", "Prefix console lines with local HH:MM:SS timestamps."),
+    cvar("con_suggest", "1", "0..1", "Live command/cvar filter while typing in the console: Up/Down pick, Tab completes, Esc dismisses."),
     cvar("ui_vgs", "1", "0=off, nonzero=on", "TaystJK: use the jaPRO VGS canned-voice menu."),
+    cvar("r_jumpHeightShade", "0", "0..1", "jaPRO SP physics: tint flat surfaces by jump height while airborne (green = ideal landing, red = deeper, blue = reachable above the jump line)."),
     cvar("s_volume", "0.5", "0..1", "OpenJK game/effects volume."),
     cvar("s_volumeVoice", "1.0", "0..1", "OpenJK voice-channel volume."),
     cvar("s_musicvolume", "0.25", "0..1", "OpenJK background music volume (playback presenter pending)."),
@@ -348,6 +363,11 @@ pub const ENTRIES: &[Entry] = &[
     command("bindlist", "List all current key bindings."),
     command("trace", "Toggle inspection of the world surface under the center crosshair."),
     command("trace_clear", "Clear the pinned surface inspection and triangle highlight."),
+    command("viewpos", "Print the view origin and angles: (x y z) : yaw (pitch p)."),
+    command(
+        "perfsample",
+        "perfsample <seconds> [label]: hold the command buffer, then print the average render FPS.",
+    ),
     command("toggle", "OpenJK-style cvar toggle: toggle <cvar> [value1 value2 ...]."),
     command("messagemode", "Open global chat input."),
     command("voicechat", "Open TaystJK VGS when connected to a jaPRO server and ui_vgs is enabled."),
@@ -428,6 +448,23 @@ pub const ENTRIES: &[Entry] = &[
         "0.5..3.0",
         "Display gamma/brightness adjustment.",
     ),
+    cvar(
+        "r_modelBrightness",
+        "1.000",
+        "0.5..3.0",
+        "Model lighting brightness on the r_gamma scale (like r_ambientScale). Follows r_gamma while r_modelBrightnessLock is 1.",
+    ),
+    cvar("r_modelBrightnessLock", "1", "0..1", "1 links r_modelBrightness to r_gamma; 0 lets it be set independently."),
+    cvar(
+        "r_dynamicLightBrightness",
+        "1.000",
+        "0.5..3.0",
+        "Runtime dynamic light (blasters, sabers, explosions) brightness on the r_gamma scale. Follows r_gamma while r_dynamicLightBrightnessLock is 1.",
+    ),
+    cvar("r_dynamicLightBrightnessLock", "1", "0..1", "1 links r_dynamicLightBrightness to r_gamma; 0 lets it be set independently."),
+    cvar("r_drawTriggers", "0", "0..1", "Draw trigger_* volumes as colored translucent brushes (push green, teleport purple, hurt red, multiple blue, once cyan). Session-only."),
+    cvar("r_drawClipBrushes", "0", "0..1", "Draw clip-only brushes (player clip orange, shot clip magenta, monster/bot clip yellow). Session-only."),
+    cvar("r_drawMapModels", "1", "0..1", "Draw server-placed MD3 map models (misc_model_* props). Brush models and geometry compiled into the BSP are unaffected."),
     cvar("r_hdr", "0", "0..1", "HDR intermediate rendering."),
     latched_cvar("r_floatLightmap", "0", "0..1", "Use FP16 lightmaps while HDR is enabled; prefer Rend2 .hdr companions when present.", LatchScope::MapLoadOrVidRestart),
     cvar("r_autoExposure", "0", "0..1", "Adapt exposure from HDR scene luminance before tone mapping."),
@@ -685,6 +722,8 @@ pub const ENTRIES: &[Entry] = &[
         "off|legacy|vertex|clustered_lite|forward_plus|ray_traced",
         "Dynamic-lighting technique for runtime-authored lights.",
     ),
+    cvar("r_rtSamples", "1", "1|2|4", "Samples per soft RT sun or saber light. Higher values reduce noise and cost more GPU time; point lights use one ray."),
+    cvar("r_rtResolution", "full", "full|half", "RT visibility resolution. Half reuses depth-matched visibility; edges and missing lights trace at full resolution."),
     cvar(
         "r_mapLightSimulation",
         "0",
@@ -698,6 +737,30 @@ pub const ENTRIES: &[Entry] = &[
         "Continuous view-facing saber glow ribbon; 0 keeps the OpenJK-compatible sprite-chain presentation.",
     ),
     cvar(
+        "r_flares",
+        "1",
+        "0..1",
+        "Screen-space saber flare overlay; does not disable authored saber impact FX.",
+    ),
+    cvar(
+        "r_saberImpactFx",
+        "1",
+        "0..1",
+        "Render authored saber hit/block EFX trees; useful for isolated FX performance A/B testing.",
+    ),
+    cvar(
+        "r_fxGeometry",
+        "cpu",
+        "cpu|workers|gpu",
+        "EFX geometry submission path: reference CPU tessellation, threaded CPU tessellation, or GPU-instanced sprites.",
+    ),
+    cvar(
+        "r_fxZeroAlphaDiscard",
+        "0",
+        "0..1",
+        "GPU EFX sprite A/B: discard exactly-zero-alpha source fragments before fog/blending where alpha controls contribution.",
+    ),
+    cvar(
         "r_saberMarks",
         "legacy",
         "off|legacy|enhanced",
@@ -706,7 +769,7 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "r_dynamicShadows",
         "off",
-        "off|blob_stencil|csm|ray_traced",
+        "off|blob|stencil|csm|csm_bevy|ray_traced",
         "Dynamic-shadow mode; CSM uses the current cascaded-shadow path.",
     ),
     cvar(
@@ -830,6 +893,15 @@ pub const ENTRIES: &[Entry] = &[
     command("weapon", "Select a weapon slot: weapon <1..13>."),
     command("weapnext", "Select the next weapon."),
     command("weapprev", "Select the previous weapon."),
+    // cg_consolecmds.c / BG_CycleForce.
+    command("forcenext", "Select the next usable Force power."),
+    command("forceprev", "Select the previous usable Force power."),
+    // TaystJK client-side jaPRO controls.
+    command("flipkick", "TaystJK jaPRO flipkick bind sequence."),
+    cvar("cg_zoomFov", "30.0", "number", "TaystJK held +zoom target field of view."),
+    cvar("cg_fkDuration", "50", "integer", "TaystJK flipkick sequence frame duration."),
+    cvar("cg_fkFirstJumpDuration", "0", "integer", "TaystJK flipkick first jump duration."),
+    cvar("cg_fkSecondJumpDelay", "0", "integer", "TaystJK flipkick second jump delay."),
     // cl_input.cpp generic commands (usercmd generic_cmd).
     command("sv_saberswitch", "Holster/activate lightsaber."),
     command("engage_duel", "Challenge the player you are looking at to a private duel."),
@@ -875,6 +947,12 @@ const fn server_command(name: &'static str, description: &'static str) -> Entry 
 /// OpenJK cg_consolecmds.c `gcmds[]` (vanilla): interpreted by the server's
 /// game module. CG_InitConsoleCommands registers them for completion only.
 pub const SERVER_COMMANDS: &[Entry] = &[
+    // TaystJK gcmds[] jaPRO controls. These are reliable server strings.
+    server_command("amTele", "jaPRO: teleport to the saved teleport mark."),
+    server_command("amTeleMark", "jaPRO: save the current teleport mark."),
+    server_command("engage_fullforceduel", "jaPRO: challenge/accept a full-force duel."),
+    server_command("engage_gunduel", "jaPRO: challenge/accept a gun duel."),
+    server_command("throwflag", "jaPRO: throw the carried team flag when the server permits it."),
     server_command("addbot", "Add a bot: addbot <name> [skill] [team] [delay] [altname]."),
     server_command("callteamvote", "Call a team vote: callteamvote <leader> <client>."),
     server_command("callvote", "Call a vote: callvote <map|map_restart|g_gametype|kick|clientkick|g_doWarmup|timelimit|fraglimit|nextmap> [value]."),
@@ -975,6 +1053,85 @@ pub fn filter_match(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
+/// How a registered name matched the live console query. Lower is better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchTier {
+    Exact,
+    Prefix,
+    Substring,
+    /// Query letters appear in order (`cgfov` finds `cg_fov`).
+    Subsequence,
+    /// Only the description mentions the query.
+    Description,
+}
+
+/// One row of the live console filter.
+#[derive(Debug, Clone, Copy)]
+pub struct Suggestion {
+    pub entry: &'static Entry,
+    pub tier: MatchTier,
+    /// Bit `i` set = byte `i` of `entry.name` matched the query (first 64 bytes).
+    pub mask: u64,
+}
+
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (hay, needle) = (haystack.as_bytes(), needle.as_bytes());
+    needle.is_empty()
+        || hay.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn name_mask(start: usize, len: usize) -> u64 {
+    (start..start + len).filter(|bit| *bit < 64).fold(0, |mask, bit| mask | 1u64 << bit)
+}
+
+fn classify(entry: &'static Entry, query: &str) -> Option<Suggestion> {
+    let name = entry.name.as_bytes();
+    let q = query.as_bytes();
+    let hit = |tier, mask| Some(Suggestion { entry, tier, mask });
+    if name.eq_ignore_ascii_case(q) {
+        return hit(MatchTier::Exact, name_mask(0, name.len()));
+    }
+    if name.len() >= q.len() && name[..q.len()].eq_ignore_ascii_case(q) {
+        return hit(MatchTier::Prefix, name_mask(0, q.len()));
+    }
+    if let Some(start) = name.windows(q.len()).position(|w| w.eq_ignore_ascii_case(q)) {
+        return hit(MatchTier::Substring, name_mask(start, q.len()));
+    }
+    let mut mask = 0u64;
+    let mut wanted = q.iter().map(u8::to_ascii_lowercase);
+    let mut next = wanted.next();
+    for (index, byte) in name.iter().enumerate() {
+        if next == Some(byte.to_ascii_lowercase()) {
+            mask |= name_mask(index, 1);
+            next = wanted.next();
+        }
+    }
+    if next.is_none() && q.len() >= 2 {
+        return hit(MatchTier::Subsequence, mask);
+    }
+    (q.len() >= 3 && contains_ignore_case(entry.description, query))
+        .then(|| Suggestion { entry, tier: MatchTier::Description, mask: 0 })
+}
+
+/// Live-filter the registry for the console popup: best matches first (exact,
+/// prefix, substring, in-order letters, then description hits), shorter names
+/// ahead of longer ones inside a tier. Returns at most `limit` rows plus the
+/// total number of matches.
+pub fn suggest(query: &str, connected: bool, limit: usize) -> (Vec<Suggestion>, usize) {
+    let query = query.trim();
+    if query.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut hits: Vec<Suggestion> = registry(connected).filter_map(|entry| classify(entry, query)).collect();
+    let total = hits.len();
+    hits.sort_by(|a, b| {
+        (a.tier, a.entry.name.len(), a.entry.name.to_ascii_lowercase())
+            .cmp(&(b.tier, b.entry.name.len(), b.entry.name.to_ascii_lowercase()))
+    });
+    hits.truncate(limit);
+    (hits, total)
+}
+
 /// Return the only registered command/cvar matching `prefix`, if exactly one exists.
 /// Exact names should normally be checked with [`find_command`] first so an exact
 /// command wins even when it is also a prefix of another registered name.
@@ -1026,6 +1183,31 @@ mod tests {
     }
 
     #[test]
+    fn suggestions_rank_exact_prefix_substring_then_fuzzy() {
+        let (hits, total) = suggest("cg_fov", false, 8);
+        assert_eq!(hits[0].entry.name, "cg_fov");
+        assert_eq!(hits[0].tier, MatchTier::Exact);
+        assert!(total >= 1);
+
+        let (hits, _) = suggest("fps", false, 24);
+        assert!(hits.iter().any(|hit| hit.entry.name == "com_maxfps" && hit.tier == MatchTier::Substring));
+        let first_substring = hits.iter().position(|hit| hit.tier == MatchTier::Substring).unwrap();
+        assert!(hits[..first_substring].iter().all(|hit| hit.tier < MatchTier::Substring));
+
+        let (hits, _) = suggest("cgfov", false, 8);
+        let fuzzy = hits.iter().find(|hit| hit.entry.name == "cg_fov").expect("cg_fov");
+        assert_eq!(fuzzy.tier, MatchTier::Subsequence);
+        assert_eq!(fuzzy.mask.count_ones(), 5);
+    }
+
+    #[test]
+    fn suggestions_ignore_blank_queries_and_hide_server_commands_offline() {
+        assert!(suggest("   ", false, 8).0.is_empty());
+        assert!(suggest("callvot", false, 8).0.is_empty());
+        assert_eq!(suggest("callvot", true, 8).0[0].entry.name, "callvote");
+    }
+
+    #[test]
     fn every_vanilla_gcmd_is_registered() {
         for name in [
             "addbot", "callteamvote", "callvote", "duelteam", "follow", "follownext", "followprev",
@@ -1036,7 +1218,7 @@ mod tests {
             assert!(is_server_command(name), "{name}");
         }
         assert!(is_server_command("vgs_cmd"));
-        assert_eq!(SERVER_COMMANDS.len(), 30);
+        assert_eq!(SERVER_COMMANDS.len(), 35);
     }
 
     #[test]
@@ -1052,7 +1234,20 @@ mod tests {
         // The current registry has many r_p* entries. Completion should extend as far
         // as every matching name allows, but no farther.
         assert_eq!(common_prefix("r_p", false).as_deref(), Some("r_p"));
-        assert_eq!(common_prefix("r_plan", false).as_deref(), Some("r_planar"));
+        assert_eq!(common_prefix("r_plan", false).as_deref(), Some("r_planardebug"));
+    }
+
+    #[test]
+    fn fx_ab_cvars_are_registered_for_direct_console_use() {
+        for name in [
+            "r_flares",
+            "r_saberImpactFx",
+            "r_fxGeometry",
+            "r_fxZeroAlphaDiscard",
+        ] {
+            let entry = find(name).unwrap_or_else(|| panic!("missing console cvar {name}"));
+            assert_eq!(entry.kind, EntryKind::Cvar, "{name}");
+        }
     }
 
     #[test]

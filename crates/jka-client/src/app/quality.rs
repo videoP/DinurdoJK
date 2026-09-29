@@ -143,7 +143,7 @@ impl QualityPreset {
                 ("r_genNormalMaps", "0"),
                 ("r_deluxeMapping", "0"),
                 ("r_deluxeSpecular", "0"),
-                ("r_dynamicShadows", "blob_stencil"),
+                ("r_dynamicShadows", "blob"),
                 ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),

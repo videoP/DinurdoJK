@@ -166,10 +166,12 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
     return output;
 }
 
-fn lit_color(normal: vec3<f32>, tex: vec4<f32>) -> vec4<f32> {
+fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
     // BSP LIGHTGRID is already applied above from the per-draw OpenJK probe
     // sample. The previous directional placeholder remains only under
     // irradiance-volume mode until Ghoul2 is bound to the ambient-cube data.
+    // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
+    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y), tex_in.a);
     if (entity_lighting.values.x != 2u) {
         return tex;
     }

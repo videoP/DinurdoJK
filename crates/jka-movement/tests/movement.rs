@@ -125,6 +125,8 @@ fn water_and_spectator_use_original_pmove_branches() {
     let water = tick(&movement, &mut p, &mut world, 127, 0, 0);
     assert_eq!(water.water_level, 3);
     let mut spectator = PlayerState::spawn([0.0, 0.0, 300.0], 0.0, JoinMode::Spectator).unwrap();
+    // OpenJK ClientSpawn mirrors sess.sessionTeam into PERS_TEAM.
+    assert_eq!(spectator.entity_view().team, 3);
     for _ in 0..125 {
         tick(&movement, &mut spectator, &mut world, 127, 0, 0);
     }

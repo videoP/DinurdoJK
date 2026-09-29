@@ -18,6 +18,7 @@ pub struct ControlAction {
 }
 
 pub const CONTROL_ACTIONS: &[ControlAction] = &[
+    // Keep this ordered exactly like the stock JKA Controls menu categories.
     ControlAction { label: "FORWARD", command: "+forward", group: "Movement" },
     ControlAction { label: "BACKPEDAL", command: "+back", group: "Movement" },
     ControlAction { label: "STEP LEFT", command: "+moveleft", group: "Movement" },
@@ -25,19 +26,96 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "JUMP", command: "+moveup", group: "Movement" },
     ControlAction { label: "CROUCH", command: "+movedown", group: "Movement" },
     ControlAction { label: "WALK", command: "+speed", group: "Movement" },
-    ControlAction { label: "PRIMARY ATTACK", command: "+attack", group: "Combat" },
-    ControlAction { label: "ALT ATTACK", command: "+altattack", group: "Combat" },
-    ControlAction { label: "CHAT", command: "messagemode", group: "Communication" },
-    ControlAction { label: "TEAM CHAT", command: "messagemode2", group: "Communication" },
-    ControlAction { label: "VOICE CHAT", command: "voicechat", group: "Communication" },
-    ControlAction { label: "SCORES", command: "+scores", group: "Communication" },
-    ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson", group: "View" },
-    ControlAction { label: "NOCLIP", command: "noclip", group: "Debug" },
-    ControlAction { label: "FORCE SPEED TEST", command: "force_speed", group: "Debug" },
-    ControlAction { label: "FORCE RAGE TEST", command: "force_rage", group: "Debug" },
-    ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Debug" },
-    ControlAction { label: "TRACE", command: "trace", group: "Debug" },
+
+    ControlAction { label: "USE / INTERACT", command: "+use", group: "Interaction" },
+    ControlAction { label: "USE SELECTED ITEM", command: "+button2", group: "Interaction" },
+    ControlAction { label: "USE BACTA", command: "use_bacta", group: "Interaction" },
+    ControlAction { label: "USE SEEKER", command: "use_seeker", group: "Interaction" },
+    ControlAction { label: "USE FORCE FIELD", command: "use_field", group: "Interaction" },
+    ControlAction { label: "USE ELECTROBINOCULARS", command: "use_electrobinoculars", group: "Interaction" },
+    ControlAction { label: "USE SENTRY", command: "use_sentry", group: "Interaction" },
+
+    ControlAction { label: "PRIMARY ATTACK", command: "+attack", group: "Weapons" },
+    ControlAction { label: "ALT ATTACK", command: "+altattack", group: "Weapons" },
+    ControlAction { label: "PREVIOUS WEAPON", command: "weapprev", group: "Weapons" },
+    ControlAction { label: "NEXT WEAPON", command: "weapnext", group: "Weapons" },
+    ControlAction { label: "SABER STYLE", command: "saberAttackCycle", group: "Weapons" },
+    ControlAction { label: "SABER / MELEE", command: "weapon 1", group: "Weapons" },
+    ControlAction { label: "BRYAR PISTOL", command: "weapon 2", group: "Weapons" },
+    ControlAction { label: "BLASTER", command: "weapon 3", group: "Weapons" },
+    ControlAction { label: "DISRUPTOR", command: "weapon 4", group: "Weapons" },
+    ControlAction { label: "BOWCASTER", command: "weapon 5", group: "Weapons" },
+    ControlAction { label: "REPEATER", command: "weapon 6", group: "Weapons" },
+    ControlAction { label: "DEMP 2", command: "weapon 7", group: "Weapons" },
+    ControlAction { label: "FLECHETTE", command: "weapon 8", group: "Weapons" },
+    ControlAction { label: "ROCKET LAUNCHER", command: "weapon 9", group: "Weapons" },
+    ControlAction { label: "EXPLOSIVES", command: "weapon 10", group: "Weapons" },
+    ControlAction { label: "CONCUSSION RIFLE", command: "weapon 13", group: "Weapons" },
+
+    ControlAction { label: "USE SELECTED FORCE", command: "+useforce", group: "Force Powers" },
+    ControlAction { label: "PREVIOUS FORCE POWER", command: "forceprev", group: "Force Powers" },
+    ControlAction { label: "NEXT FORCE POWER", command: "forcenext", group: "Force Powers" },
+    ControlAction { label: "FORCE PUSH", command: "force_throw", group: "Force Powers" },
+    ControlAction { label: "FORCE PULL", command: "force_pull", group: "Force Powers" },
+    ControlAction { label: "FORCE SPEED", command: "force_speed", group: "Force Powers" },
+    ControlAction { label: "FORCE SEEING", command: "force_seeing", group: "Force Powers" },
+    ControlAction { label: "MIND TRICK", command: "force_distract", group: "Force Powers" },
+    ControlAction { label: "FORCE HEAL", command: "force_heal", group: "Force Powers" },
+    ControlAction { label: "FORCE PROTECT", command: "force_protect", group: "Force Powers" },
+    ControlAction { label: "FORCE ABSORB", command: "force_absorb", group: "Force Powers" },
+    ControlAction { label: "FORCE GRIP", command: "+force_grip", group: "Force Powers" },
+    ControlAction { label: "FORCE LIGHTNING", command: "+force_lightning", group: "Force Powers" },
+    ControlAction { label: "FORCE RAGE", command: "force_rage", group: "Force Powers" },
+    ControlAction { label: "FORCE DRAIN", command: "+force_drain", group: "Force Powers" },
+    ControlAction { label: "TEAM HEAL", command: "force_healother", group: "Force Powers" },
+    ControlAction { label: "TEAM ENERGIZE", command: "force_forcepowerother", group: "Force Powers" },
+
+    ControlAction { label: "CHAT", command: "messagemode", group: "Other" },
+    ControlAction { label: "TEAM CHAT", command: "messagemode2", group: "Other" },
+    ControlAction { label: "SCORES", command: "+scores", group: "Other" },
+    ControlAction { label: "ZOOM", command: "zoom", group: "Other" },
+    ControlAction { label: "TAUNT", command: "taunt", group: "Other" },
+    ControlAction { label: "CHALLENGE DUEL", command: "engage_duel", group: "Other" },
+    ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson", group: "Other" },
+    // DinurdoJK-local actions stay available, but do not create extra top-level groups.
+    ControlAction { label: "NOCLIP", command: "noclip", group: "Other" },
+    ControlAction { label: "SURFACE TRACE", command: "trace", group: "Other" },
+    ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Other" },
 ];
+
+/// Commands whose current DinurdoJK implementation is specifically tied to
+/// TaystJK/jaPRO integration. They are intentionally not shown on the Base JKA
+/// Controls page; the MOD page exposes them only while a jaPRO server is active.
+pub const JAPRO_CONTROL_ACTIONS: &[ControlAction] = &[
+    ControlAction { label: "JETPACK", command: "+button12", group: "jaPRO" },
+    ControlAction { label: "DASH", command: "+button13", group: "jaPRO" },
+    ControlAction { label: "THROW FLAG", command: "throwflag", group: "jaPRO" },
+    ControlAction { label: "ZOOM", command: "+zoom", group: "jaPRO" },
+    ControlAction { label: "FULL FORCE CHALLENGE", command: "engage_fullforceduel", group: "jaPRO" },
+    ControlAction { label: "GUN CHALLENGE", command: "engage_gunduel", group: "jaPRO" },
+    ControlAction { label: "TELEPORT MARK", command: "amTeleMark", group: "jaPRO" },
+    ControlAction { label: "TELEPORT", command: "amTele", group: "jaPRO" },
+    ControlAction { label: "NOCLIP", command: "noclip", group: "jaPRO" },
+    ControlAction { label: "FLIPKICK", command: "flipkick", group: "jaPRO" },
+    ControlAction { label: "VOICE CHAT / VGS", command: "voicechat", group: "jaPRO" },
+];
+
+pub fn japro_selection(index: usize) -> usize {
+    CONTROL_ACTIONS.len() + index
+}
+
+pub fn control_action(selection: usize) -> Option<&'static ControlAction> {
+    if let Some(action) = CONTROL_ACTIONS.get(selection) {
+        return Some(action);
+    }
+    JAPRO_CONTROL_ACTIONS.get(selection.saturating_sub(CONTROL_ACTIONS.len()))
+}
+
+pub fn is_japro_selection(selection: usize) -> bool {
+    selection >= CONTROL_ACTIONS.len()
+        && selection < CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()
+}
+
 
 #[derive(Debug, Clone)]
 pub struct Bindings {
@@ -122,12 +200,7 @@ impl Bindings {
                 continue;
             }
             let kept: Vec<_> = split_binding_commands(value)
-                .filter(|part| {
-                    !part
-                        .split_whitespace()
-                        .next()
-                        .is_some_and(|verb| verb.eq_ignore_ascii_case(command))
-                })
+                .filter(|part| !part.trim().eq_ignore_ascii_case(command.trim()))
                 .map(str::to_owned)
                 .collect();
             *value = kept.join("; ");
@@ -196,9 +269,9 @@ fn apply_cfg(bindings: &mut Bindings, text: &str) -> bool {
 }
 
 pub fn binding_contains_command(binding: &str, command: &str) -> bool {
-    binding.split(';').any(|part| {
-        part.trim().split_whitespace().next().is_some_and(|verb| verb.eq_ignore_ascii_case(command))
-    })
+    binding
+        .split(';')
+        .any(|part| part.trim().eq_ignore_ascii_case(command.trim()))
 }
 
 pub fn split_binding_commands(binding: &str) -> impl Iterator<Item = &str> {
@@ -374,5 +447,19 @@ mod tests {
         let bindings = Bindings::default();
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyW)), Some("+forward"));
         assert_eq!(bindings.get(BindKey::Mouse(1)), Some("+attack"));
+    }
+
+    #[test]
+    fn parameterized_controls_match_exact_binding_command() {
+        assert!(binding_contains_command("weapon 1", "weapon 1"));
+        assert!(!binding_contains_command("weapon 13", "weapon 1"));
+        assert!(binding_contains_command("say hi; toggle cg_thirdPerson", "toggle cg_thirdPerson"));
+    }
+
+    #[test]
+    fn japro_controls_have_disjoint_selection_range() {
+        let selection = japro_selection(0);
+        assert!(is_japro_selection(selection));
+        assert_eq!(control_action(selection).map(|action| action.command), Some("voicechat"));
     }
 }

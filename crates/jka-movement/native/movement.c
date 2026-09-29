@@ -257,6 +257,25 @@ void jka_player_knockback(void *player, const float *velocity, int duration) {
     ps->pm_time = duration;
     ps->pm_flags |= PMF_TIME_KNOCKBACK;
 }
+/* OpenJK codemp/game/g_misc.c TeleportPlayer(player, origin, angles, speed)
+ * for the playerState_t owned by this host. The caller supplies the full
+ * view angles (setviewpos passes pitch 0 and roll 0). SetClientViewAngle
+ * stores delta_angles relative to the client's usercmd angles; the Rust host
+ * rebases its usercmd accumulator on the new viewangles afterwards, so a
+ * zero delta is the same final state. Temp events and G_KillBox belong to
+ * the game module and have no equivalent in this single-client host. */
+void jka_player_teleport(void *player, const float *origin, const float *angles, int speed) {
+    playerState_t *ps = &((jka_player *)player)->ps;
+    VectorCopy(origin, ps->origin);
+    ps->origin[2] += 1;
+    AngleVectors(angles, ps->velocity, NULL, NULL);
+    VectorScale(ps->velocity, speed ? speed : 400, ps->velocity);
+    ps->pm_time = 160;
+    ps->pm_flags |= PMF_TIME_KNOCKBACK;
+    VectorClear(ps->delta_angles);
+    VectorCopy(angles, ps->viewangles);
+    ps->eFlags ^= EF_TELEPORT_BIT;
+}
 void jka_player_set_noclip(void *player, int enabled) {
     playerState_t *ps = &((jka_player *)player)->ps;
     if (enabled) {
@@ -265,6 +284,23 @@ void jka_player_set_noclip(void *player, int enabled) {
     } else if (ps->pm_type == PM_NOCLIP) {
         ps->pm_type = PM_NORMAL;
     }
+}
+
+/* Effective playerState result of OpenJK codemp/game/g_cmds.c G_Give(..., "all", ...).
+ * The real game module also owns gentity_t::health; this lightweight host has
+ * only playerState_t, so STAT_HEALTH is updated directly to the value that
+ * ClientThink would publish back to ps after G_Give changes ent->health. */
+void jka_player_give_all(void *player) {
+    playerState_t *ps = &((jka_player *)player)->ps;
+    int i;
+    for (i = 0; i < HI_NUM_HOLDABLE; i++)
+        ps->stats[STAT_HOLDABLE_ITEMS] |= (1 << i);
+    ps->stats[STAT_HEALTH] = ps->stats[STAT_MAX_HEALTH];
+    ps->stats[STAT_ARMOR] = ps->stats[STAT_MAX_HEALTH];
+    ps->fd.forcePower = ps->fd.forcePowerMax;
+    ps->stats[STAT_WEAPONS] = (1 << (LAST_USEABLE_WEAPON + 1)) - (1 << WP_NONE);
+    for (i = AMMO_BLASTER; i < AMMO_MAX; i++)
+        ps->ammo[i] = 999;
 }
 
 static void copy_saber_movement_info(saberInfo_t *out, const jka_saber_movement_info *info) {
@@ -391,11 +427,15 @@ void *jka_player_new(const float *origin, float yaw, int spectator) {
     VectorCopy(origin, ps->origin);
     ps->viewangles[YAW] = yaw;
     ps->pm_type = spectator ? PM_SPECTATOR : PM_NORMAL;
+    /* OpenJK ClientSpawn mirrors sess.sessionTeam into PERS_TEAM.  Free
+     * spectators are a real TEAM_SPECTATOR playerState, not a normal player
+     * whose model is merely hidden by the renderer. */
+    ps->persistant[PERS_TEAM] = spectator ? TEAM_SPECTATOR : TEAM_FREE;
     ps->gravity = DEFAULT_GRAVITY;
     ps->speed = ps->basespeed = spectator ? 400 : 250;
     ps->groundEntityNum = ENTITYNUM_NONE;
     ps->stats[STAT_HEALTH] = ps->stats[STAT_MAX_HEALTH] = 100;
-    ps->stats[STAT_WEAPONS] = (1 << WP_SABER);
+    ps->stats[STAT_WEAPONS] = spectator ? 0 : (1 << WP_SABER);
     /* Stock local FFA starts with a saber; ownership metadata is attached by
      * jka_player_set_saber_movement_info after the player is created. */
     ps->weapon = WP_SABER;

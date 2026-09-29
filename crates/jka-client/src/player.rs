@@ -262,6 +262,24 @@ impl LocalPlayer {
     pub fn toggle_noclip(&mut self) -> Result<bool, String> {
         self.set_noclip(!self.noclip)
     }
+    /// OpenJK `Cmd_SetViewpos_f` -> `TeleportPlayer` on the active state
+    /// (joined player or free spectator). `origin` is in JKA world units.
+    pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
+        let state = match self.mode {
+            JoinMode::Player => self.player.as_mut().expect("joined player"),
+            JoinMode::Spectator => &mut self.spectator,
+        };
+        state.teleport(origin, angles)?;
+        self.reset_view();
+        Ok(())
+    }
+    pub fn give_all(&mut self) -> Result<(), String> {
+        if self.mode != JoinMode::Player {
+            return Err("GIVE REQUIRES JOIN GAME MODE".into());
+        }
+        self.player.as_mut().expect("joined player").give_all();
+        Ok(())
+    }
     pub fn view(&self) -> jka_movement::PlayerView {
         self.state().view()
     }

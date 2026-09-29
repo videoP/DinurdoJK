@@ -63,6 +63,64 @@ impl App {
 
         theme::section(
             ui,
+            "JAPRO CONTROLS",
+            "jaPRO-specific bindings. Base JKA controls remain on the Controls page.",
+        );
+
+        if self.controls_waiting_for_key
+            && crate::keybinds::is_japro_selection(self.controls_selected)
+        {
+            theme::banner(
+                ui,
+                "Press any key, mouse button or wheel direction…  ESC cancels.",
+                theme::WARNING,
+            );
+            ui.add_space(6.0);
+        }
+
+        let mut rebind = None;
+        let mut clear = None;
+        for (index, action) in crate::keybinds::JAPRO_CONTROL_ACTIONS.iter().enumerate() {
+            let selection = crate::keybinds::japro_selection(index);
+            let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
+            let binding = self.bindings.display_for_command(action.command);
+            let tip = format!("Bound to the \"{}\" command.", action.command);
+            theme::row(
+                ui,
+                &super::egui_menu::title_case(action.label),
+                &tip,
+                theme::Reset::None,
+                |ui| {
+                    let (text, color) = if waiting {
+                        ("PRESS A KEY…".to_owned(), theme::WARNING)
+                    } else if binding == "UNBOUND" {
+                        ("Unbound".to_owned(), theme::TEXT_DISABLED)
+                    } else {
+                        (binding.clone(), theme::ACCENT)
+                    };
+                    let response =
+                        super::egui_menu::binding_slot(ui, &text, color, waiting);
+                    if response.clicked() {
+                        rebind = Some(selection);
+                    }
+                    if response.secondary_clicked() {
+                        clear = Some(selection);
+                    }
+                },
+            );
+        }
+
+        if let Some(selection) = rebind {
+            self.controls_selected = selection;
+            self.controls_waiting_for_key = true;
+            self.publish_ui();
+        } else if let Some(selection) = clear {
+            self.controls_selected = selection;
+            self.unbind_selected_control();
+        }
+
+        theme::section(
+            ui,
             "JAPRO MOVEMENT PREFERENCES",
             "Saved locally and sent when you join a JAPRO server. Server rules still apply.",
         );
@@ -99,6 +157,26 @@ impl App {
                 self.push_console_line(error);
             }
         }
+
+        theme::section(ui, "JAPRO HELPERS", "Visual aids for jaPRO movement styles.");
+        theme::row(
+            ui,
+            "Show jump height helper for SP physics mode",
+            "r_jumpHeightShade. While airborne in jaPRO's SP movement style, tints flat surfaces by \
+             where you would land: green just below your jump height (speed kept), fading to red \
+             the lower it is, and dim blue to cyan above it up to your reachable height (speed \
+             halved). Draws nothing in other movement styles.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.jump_height_shade) {
+                    if let Err(error) =
+                        self.set_console_cvar("r_jumpHeightShade", if enabled { "1" } else { "0" })
+                    {
+                        self.push_console_line(error);
+                    }
+                }
+            },
+        );
     }
 
     pub(super) fn egui_game_settings(&mut self, ui: &mut egui::Ui) {
@@ -584,6 +662,30 @@ impl App {
                         let _ = self.set_console_cvar("cg_strafeHelperActiveColor", &value);
                     }
                 });
+
+                theme::section(ui, "CONSOLE", "The ` console. Also switchable from the SUGGEST chip in the console header.");
+                theme::row(
+                    ui,
+                    "Live suggestions",
+                    "con_suggest. Filter commands and cvars as you type: Up/Down pick, Tab completes, Esc hides the list. Off keeps the classic Tab-lists-matches behaviour.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.console_suggest) {
+                            let _ = self.set_console_cvar("con_suggest", if value { "1" } else { "0" });
+                        }
+                    },
+                );
+                theme::row(
+                    ui,
+                    "Timestamps",
+                    "con_timestamps. Prefix console lines with local HH:MM:SS.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.console_timestamps) {
+                            let _ = self.set_console_cvar("con_timestamps", if value { "1" } else { "0" });
+                        }
+                    },
+                );
             });
     }
 
@@ -603,6 +705,10 @@ impl App {
                 "Ghoul2 skinning, authored GLM detail and model submission.",
             ),
             VideoSection::Lighting => ("LIGHTING", "Ambient, dynamic and indirect lighting."),
+            VideoSection::Effects => (
+                "EFFECTS",
+                "Particle effects, saber presentation, flares and impact marks.",
+            ),
             VideoSection::Shadows => ("SHADOWS", "Dynamic and local shadowing."),
             VideoSection::Reflections => (
                 "REFLECTIONS",
@@ -648,6 +754,7 @@ impl App {
                 VideoSection::Visibility => self.egui_visibility(ui),
                 VideoSection::Models => self.egui_models(ui),
                 VideoSection::Lighting => self.egui_lighting(ui),
+                VideoSection::Effects => self.egui_effects(ui),
                 VideoSection::Shadows => self.egui_shadows(ui),
                 VideoSection::Reflections => self.egui_reflections(ui),
                 VideoSection::PostProcessing => self.egui_post_processing(ui),
@@ -899,6 +1006,49 @@ impl App {
                 let readout = format!("{value:.2}");
                 if theme::slider(ui, &mut value, 0.5..=3.0, &readout) {
                     self.set_gamma(value);
+                }
+            },
+        );
+
+        // Both follow the master slider until unlocked; unlocked values sit on
+        // the master's scale, so unlocking never changes the picture.
+        theme::row(
+            ui,
+            "Model brightness",
+            "Brightness of players, NPCs and props, like r_ambientScale. Locked, it              follows the master slider and adds nothing of its own. Unlock it to set              models brighter or darker than the rest of the scene.",
+            theme::Reset::Video(ui::VIDEO_ROW_MODEL_BRIGHTNESS),
+            |ui| {
+                let locked = self.video.model_brightness_locked;
+                let mut value = self.video.model_brightness;
+                let readout = format!("{value:.2}");
+                let changed = ui
+                    .add_enabled_ui(!locked, |ui| theme::slider(ui, &mut value, 0.5..=3.0, &readout))
+                    .inner;
+                ui.add_space(8.0);
+                if let Some(now_locked) = theme::lock_toggle(ui, locked) {
+                    self.set_model_brightness_locked(now_locked);
+                } else if changed {
+                    self.set_model_brightness(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Dynamic light brightness",
+            "Brightness of runtime lights such as blaster bolts, sabers and explosions.              Locked, it follows the master slider and adds nothing of its own. Unlock it              to make dynamic lights stronger or weaker than the rest of the scene.",
+            theme::Reset::Video(ui::VIDEO_ROW_DLIGHT_BRIGHTNESS),
+            |ui| {
+                let locked = self.video.dynamic_light_brightness_locked;
+                let mut value = self.video.dynamic_light_brightness;
+                let readout = format!("{value:.2}");
+                let changed = ui
+                    .add_enabled_ui(!locked, |ui| theme::slider(ui, &mut value, 0.5..=3.0, &readout))
+                    .inner;
+                ui.add_space(8.0);
+                if let Some(now_locked) = theme::lock_toggle(ui, locked) {
+                    self.set_dynamic_light_brightness_locked(now_locked);
+                } else if changed {
+                    self.set_dynamic_light_brightness(value);
                 }
             },
         );
@@ -1222,14 +1372,14 @@ impl App {
                 "Runtime-authored dynamic lights are disabled.",
             ),
             (
-                DynamicLightsMode::Legacy,
-                "Legacy",
-                "Low-cost JKA-style authored dynamic lights with a smooth radial falloff and no shadow pass.",
-            ),
-            (
                 DynamicLightsMode::Vertex,
                 "Vertex",
                 "Cheapest authored dynamic-light path: evaluate runtime lights at BSP vertices and interpolate them. This is separate from static r_vertexLight.",
+            ),
+            (
+                DynamicLightsMode::Legacy,
+                "Legacy",
+                "Low-cost JKA-style authored dynamic lights with a smooth radial falloff and no shadow pass.",
             ),
             (
                 DynamicLightsMode::ClusteredLite,
@@ -1244,7 +1394,7 @@ impl App {
             (
                 DynamicLightsMode::RayTracedHardware,
                 "Ray traced",
-                "Hardware ray-traced local lighting. WIP — currently behaves as Off.",
+                "Direct local lighting with hardware ray-traced shadows, independent of sun shadows. Falls back to Forward+ when RT is unavailable.",
             ),
         ];
         if let Some(target) = mode_row(
@@ -1261,6 +1411,27 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        if self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware
+            || self.video.dynamic_shadows == DynamicShadowsMode::RayTraced {
+            const RT_RESOLUTION: [(bool, &str, &str); 2] = [
+                (true, "Half", "Half width and height for RT visibility. Edges use full-resolution rays where needed."),
+                (false, "Full", "Trace visibility at every shaded pixel. Sharpest result; higher ray cost."),
+            ];
+            if let Some(index) = mode_row(ui, "RT resolution", "Changes ray-traced visibility resolution without changing the scene resolution. Half adds a depth pass and may not be faster in every scene.",
+                theme::Reset::None, self.video.rt_half_resolution, &RT_RESOLUTION) {
+                let _ = self.set_console_cvar("r_rtResolution", if RT_RESOLUTION[index].0 { "half" } else { "full" });
+            }
+            const RT_SAMPLES: [(u32, &str, &str); 3] = [
+                (1, "1", "Current ray budget. Fastest; more visible grain."),
+                (2, "2", "Two samples per soft source. Less grain, higher GPU cost."),
+                (4, "4", "Four samples per soft source. Highest quality and GPU cost."),
+            ];
+            if let Some(index) = mode_row(ui, "RT samples", "Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.",
+                theme::Reset::None, self.video.rt_samples, &RT_SAMPLES) {
+                let _ = self.set_console_cvar("r_rtSamples", &RT_SAMPLES[index].0.to_string());
+            }
+        }
+
         self.egui_toggle_row(
             ui,
             ".map light simulation",
@@ -1268,78 +1439,6 @@ impl App {
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION,
             self.video.map_light_simulation,
         );
-
-        theme::row(
-            ui,
-            "FX FPS",
-            "Fixed sampling rate for continuous projectile/trail EFX. This removes the stock JKA \
-             render-FPS dependency without changing authored EFX count/life/delay values. Drag to \
-             the far-right Legacy JKA endpoint to restore one PlayEffect call per presentation frame. \
-             0 in cg_fxFPS also selects Legacy JKA.",
-            theme::Reset::Video(ui::VIDEO_ROW_FX_FPS),
-            |ui| {
-                const LEGACY_SLIDER_VALUE: f32 = crate::fx::FX_FPS_MAX as f32 + 1.0;
-                let mut slider_value = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
-                    LEGACY_SLIDER_VALUE
-                } else {
-                    self.video.fx_fps.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX) as f32
-                };
-                let readout = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
-                    "Legacy JKA".to_owned()
-                } else {
-                    format!("{} Hz", self.video.fx_fps)
-                };
-                if theme::slider(
-                    ui,
-                    &mut slider_value,
-                    crate::fx::FX_FPS_MIN as f32..=LEGACY_SLIDER_VALUE,
-                    &readout,
-                ) {
-                    let value = if slider_value >= LEGACY_SLIDER_VALUE {
-                        crate::fx::FX_FPS_LEGACY_JKA
-                    } else {
-                        (slider_value.round() as u32)
-                            .clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
-                    };
-                    let _ = self.set_console_cvar("cg_fxFPS", &value.to_string());
-                }
-            },
-        );
-
-        self.egui_toggle_row(
-            ui,
-            "Modern saber rendering",
-            "Uses a continuous view-facing glow ribbon with the stock saber shaders instead of \
-             OpenJK's chain of glow sprites. The authored line/glow textures and exact additive \
-             blend rules are preserved. Off is the OpenJK-compatible presentation.",
-            ui::VIDEO_ROW_MODERN_SABERS,
-            self.video.modern_sabers,
-        );
-
-        const SABER_MARK_OPTIONS: [(ui::SaberMarkMode, &str); 3] = [
-            (ui::SaberMarkMode::Off, "Off"),
-            (ui::SaberMarkMode::Legacy, "Legacy"),
-            (ui::SaberMarkMode::Enhanced, "Enhanced"),
-        ];
-        if let Some(target) = segmented_row(
-            ui,
-            "Saber marks",
-            "Saber/world contact presentation. Legacy follows OpenJK: contact is evaluated once per \
-             presentation frame, the stock burn/glow mark lasts 10 seconds, and saberhitwall audio \
-             uses the original 100 ms debounce. Enhanced is a separate smooth molten-surface effect: \
-             movement lays a spatially sampled curved melt path, while holding the blade in one place \
-             accumulates heat, widens/raises the molten lips, makes the material sag under gravity, \
-             and grows smooth sludge/drips before cooling to a dark scar. cg_fxFPS does not control \
-             saber/world marks. This is presentation-only.",
-            theme::Reset::Video(ui::VIDEO_ROW_SABER_MARKS),
-            self.video.saber_marks,
-            &SABER_MARK_OPTIONS,
-        ) {
-            let current = index_of(&SABER_MARK_OPTIONS, self.video.saber_marks, 1);
-            let next = index_of(&SABER_MARK_OPTIONS, target, current);
-            self.video_selected = ui::VIDEO_ROW_SABER_MARKS;
-            self.change_video_setting(next as i32 - current as i32);
-        }
 
         self.egui_toggle_row(
             ui,
@@ -1382,17 +1481,149 @@ impl App {
         );
     }
 
+    fn egui_effects(&mut self, ui: &mut egui::Ui) {
+        theme::row(
+            ui,
+            "FX FPS",
+            "Fixed sampling rate for continuous projectile/trail EFX. This removes the stock JKA \
+             render-FPS dependency without changing authored EFX count/life/delay values. Drag to \
+             the far-right Legacy JKA endpoint to restore one PlayEffect call per presentation frame. \
+             0 in cg_fxFPS also selects Legacy JKA.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_FPS),
+            |ui| {
+                const LEGACY_SLIDER_VALUE: f32 = crate::fx::FX_FPS_MAX as f32 + 1.0;
+                let mut slider_value = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+                    LEGACY_SLIDER_VALUE
+                } else {
+                    self.video.fx_fps.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX) as f32
+                };
+                let readout = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
+                    "Legacy JKA".to_owned()
+                } else {
+                    format!("{} Hz", self.video.fx_fps)
+                };
+                if theme::slider(
+                    ui,
+                    &mut slider_value,
+                    crate::fx::FX_FPS_MIN as f32..=LEGACY_SLIDER_VALUE,
+                    &readout,
+                ) {
+                    let value = if slider_value >= LEGACY_SLIDER_VALUE {
+                        crate::fx::FX_FPS_LEGACY_JKA
+                    } else {
+                        (slider_value.round() as u32)
+                            .clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
+                    };
+                    let _ = self.set_console_cvar("cg_fxFPS", &value.to_string());
+                }
+            },
+        );
+
+        const FX_GEOMETRY: [(FxGeometryMode, &str); 3] = [
+            (FxGeometryMode::Cpu, "CPU"),
+            (FxGeometryMode::CpuWorkers, "CPU workers"),
+            (FxGeometryMode::Gpu, "GPU"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "FX geometry",
+            "View-dependent EFX geometry. CPU is the exact current reference path. CPU workers uses the same authored particles/materials and exact same CPU geometry, but parallelizes tessellation over Rayon. GPU keeps FX simulation on the dedicated jka-fx CPU thread and moves EFX Particle billboard expansion/submission to compact WGPU instances; non-sprite primitives remain on CPU. Hardware RT lighting/shadows currently fall back to CPU workers for this mode.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_GEOMETRY),
+            self.video.fx_geometry,
+            &FX_GEOMETRY,
+        ) {
+            let current = FxGeometryMode::ALL
+                .iter()
+                .position(|mode| *mode == self.video.fx_geometry)
+                .unwrap_or(0);
+            let next = FxGeometryMode::ALL
+                .iter()
+                .position(|mode| *mode == target)
+                .unwrap_or(current);
+            self.video_selected = ui::VIDEO_ROW_FX_GEOMETRY;
+            self.change_video_setting(next as i32 - current as i32);
+        }
+
+        self.egui_toggle_row(
+            ui,
+            "FX zero-alpha discard",
+            "A/B diagnostic for r_fxGeometry GPU. Discards only fragments whose final source alpha is exactly zero on source-alpha EFX sprite blend modes, before fog/blending. Non-zero-alpha edges are unchanged; GL_ONE/additive-one and modulation modes are intentionally untouched.",
+            ui::VIDEO_ROW_FX_ZERO_ALPHA_DISCARD,
+            self.video.fx_zero_alpha_discard,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Modern saber rendering",
+            "Uses a continuous view-facing glow ribbon with the stock saber shaders instead of \
+             OpenJK's chain of glow sprites. The authored line/glow textures and exact additive \
+             blend rules are preserved. Off is the OpenJK-compatible presentation.",
+            ui::VIDEO_ROW_MODERN_SABERS,
+            self.video.modern_sabers,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Flares",
+            "Screen-space flare overlays such as the OpenJK saber clash flash. Off suppresses only \
+             the flare overlay; saber impact particles, sounds, dynamic lights and marks are unchanged.",
+            ui::VIDEO_ROW_FLARES,
+            self.video.flares,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Saber impact effects",
+            "Authored OpenJK saber hit/block EFX (sparks, smoke and any EFX-owned lights). \
+             Off hides the complete tagged impact-effect tree while leaving saber blades, flares, \
+             sounds and saber marks alone. Existing live impact primitives are retained, so this can \
+             be toggled while a demo is paused to A/B the exact same frozen FX population.",
+            ui::VIDEO_ROW_SABER_IMPACT_FX,
+            self.video.saber_impact_fx,
+        );
+
+        const SABER_MARK_OPTIONS: [(ui::SaberMarkMode, &str); 3] = [
+            (ui::SaberMarkMode::Off, "Off"),
+            (ui::SaberMarkMode::Legacy, "Legacy"),
+            (ui::SaberMarkMode::Enhanced, "Enhanced"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Saber marks",
+            "Saber/world contact presentation. Legacy follows OpenJK: contact is evaluated once per \
+             presentation frame, the stock burn/glow mark lasts 10 seconds, and saberhitwall audio \
+             uses the original 100 ms debounce. Enhanced is a separate smooth molten-surface effect: \
+             movement lays a spatially sampled curved melt path, while holding the blade in one place \
+             accumulates heat, widens/raises the molten lips, makes the material sag under gravity, \
+             and grows smooth sludge/drips before cooling to a dark scar. cg_fxFPS does not control \
+             saber/world marks. This is presentation-only.",
+            theme::Reset::Video(ui::VIDEO_ROW_SABER_MARKS),
+            self.video.saber_marks,
+            &SABER_MARK_OPTIONS,
+        ) {
+            let current = index_of(&SABER_MARK_OPTIONS, self.video.saber_marks, 1);
+            let next = index_of(&SABER_MARK_OPTIONS, target, current);
+            self.video_selected = ui::VIDEO_ROW_SABER_MARKS;
+            self.change_video_setting(next as i32 - current as i32);
+        }
+    }
+
     fn egui_shadows(&mut self, ui: &mut egui::Ui) {
-        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 5] = [
+        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 6] = [
             (
                 DynamicShadowsMode::Off,
                 "Off",
                 "No dynamic shadows cast by players, NPCs or moveable objects.",
             ),
             (
-                DynamicShadowsMode::BlobStencilLegacy,
-                "Blob / stencil",
-                "Dark circular decals or stencil shadow volumes beneath entities. WIP — currently behaves as Off.",
+                DynamicShadowsMode::Blob,
+                "Blob",
+                "OpenJK cg_shadows 1 drop shadow: the stock markShadow decal projected onto the floor beneath players and NPCs.",
+            ),
+            (
+                DynamicShadowsMode::Stencil,
+                "Stencil",
+                "Legacy stencil shadow volumes. WIP — currently behaves as Off.",
             ),
             (
                 DynamicShadowsMode::CascadedShadowMaps,
@@ -1427,7 +1658,8 @@ impl App {
             "Local light shadows",
             "Adds shadows to local lights. With RT Shadows, uses hard ray-traced \
              shadows for clustered lights, including moving FX lights. Other \
-             shadow modes use cached shadow cubemaps. Requires local lighting.",
+             shadow modes use cached shadow cubemaps. Hardware RT dynamic lighting \
+             always includes local visibility, independently of this toggle.",
             ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS,
             self.video.local_light_shadows,
         );
@@ -1678,6 +1910,14 @@ impl App {
     }
 
     fn egui_models(&mut self, ui: &mut egui::Ui) {
+        self.egui_toggle_row(
+            ui,
+            "Map models",
+            "Draws MD3 props the map's entities place in the world (misc_model_* and              func_static models). Off removes them for a cleaner or faster view. Brush              models such as doors and platforms, and any model geometry already compiled              into the BSP by the map compiler, are always drawn.",
+            ui::VIDEO_ROW_DRAW_MAP_MODELS,
+            self.video.draw_map_models,
+        );
+
         const GHOUL2_SKINNING: [(Ghoul2SkinningMode, &str); 3] = [
             (Ghoul2SkinningMode::Cpu, "CPU"),
             (Ghoul2SkinningMode::CpuWorkers, "CPU workers"),
@@ -1800,6 +2040,21 @@ impl App {
             });
         }
 
+        self.egui_toggle_row(
+            ui,
+            "Draw triggers",
+            "Draws every trigger_* volume as a translucent colored brush with an outline: push green,              teleport purple, hurt red, multiple blue, once cyan, other yellow. Built once per map              and drawn from static buffers in two draws, so it costs nothing while off and very              little while on. Not saved between sessions.",
+            ui::VIDEO_ROW_DRAW_TRIGGERS,
+            self.video.draw_triggers,
+        );
+        self.egui_toggle_row(
+            ui,
+            "Draw clip brushes",
+            "Draws clip-only brushes (invisible collision the compiler leaves out of the render              mesh): player clip orange, shot clip magenta, monster/bot clip yellow. Static buffers,              two draws, no cost while off. Not saved between sessions.",
+            ui::VIDEO_ROW_DRAW_CLIP_BRUSHES,
+            self.video.draw_clip_brushes,
+        );
+
         const CULL: [(CullDebugMode, &str); 2] = [
             (CullDebugMode::Off, "Off"),
             (CullDebugMode::RejectionReasons, "Rejection reasons"),
@@ -1841,6 +2096,17 @@ impl App {
              and it costs frame time itself.",
             ui::VIDEO_ROW_PERF_TRACE,
             self.video.perf_trace,
+        );
+        theme::row(
+            ui,
+            "Event worker queue",
+            "A/B test for client event processing. Off performs the same semantic preparation on the CGame thread. On prepares multi-event receive batches on a dedicated worker pool, then applies all player/audio/FX/presentation side effects in original queue order. Single-event batches intentionally stay inline.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.cg_event_workers) {
+                    let _ = self.set_console_cvar("cg_eventWorkers", if value { "1" } else { "0" });
+                }
+            },
         );
         self.egui_toggle_row(
             ui,
@@ -3442,6 +3708,24 @@ impl App {
             ui::VIDEO_ROW_FPS_CAP => self.set_fps_cap(defaults.fps_cap),
             ui::VIDEO_ROW_PHYSICS_FPS => self.set_physics_msec(defaults.physics_msec),
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(defaults.gamma),
+            ui::VIDEO_ROW_MODEL_BRIGHTNESS => {
+                self.set_model_brightness_locked(defaults.model_brightness_locked)
+            }
+            ui::VIDEO_ROW_DLIGHT_BRIGHTNESS => {
+                self.set_dynamic_light_brightness_locked(defaults.dynamic_light_brightness_locked)
+            }
+            ui::VIDEO_ROW_DRAW_TRIGGERS => {
+                self.video.draw_triggers = defaults.draw_triggers;
+                self.sync_debug_volumes();
+            }
+            ui::VIDEO_ROW_DRAW_CLIP_BRUSHES => {
+                self.video.draw_clip_brushes = defaults.draw_clip_brushes;
+                self.sync_debug_volumes();
+            }
+            ui::VIDEO_ROW_DRAW_MAP_MODELS => {
+                self.video.draw_map_models = defaults.draw_map_models;
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_ANTI_ALIASING => {
                 self.video.msaa_samples = defaults.msaa_samples;
                 self.video.fxaa = defaults.fxaa;
@@ -3538,6 +3822,18 @@ impl App {
                 self.sync_map_light_simulation();
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_FX_GEOMETRY => {
+                self.video.fx_geometry = defaults.fx_geometry;
+                self.mark_config_dirty();
+                self.console_status = format!("FX GEOMETRY: {}", self.video.fx_geometry.label());
+            }
+            ui::VIDEO_ROW_FX_ZERO_ALPHA_DISCARD => {
+                self.video.fx_zero_alpha_discard = defaults.fx_zero_alpha_discard;
+                self.render_command(crate::renderer::RenderCommand::SetFxZeroAlphaDiscard(
+                    self.video.fx_zero_alpha_discard,
+                ));
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_FX_FPS => {
                 self.video.fx_fps = defaults.fx_fps;
                 self.mark_config_dirty();
@@ -3545,6 +3841,17 @@ impl App {
             }
             ui::VIDEO_ROW_MODERN_SABERS => {
                 self.video.modern_sabers = defaults.modern_sabers;
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_FLARES => {
+                self.video.flares = defaults.flares;
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_SABER_IMPACT_FX => {
+                self.video.saber_impact_fx = defaults.saber_impact_fx;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_saber_impact_fx(self.video.saber_impact_fx);
+                }
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_SABER_MARKS => {

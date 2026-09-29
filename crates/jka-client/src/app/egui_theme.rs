@@ -338,6 +338,53 @@ pub(super) fn switch(ui: &mut egui::Ui, on: bool) -> Option<bool> {
     response.clicked().then_some(!on)
 }
 
+/// Small padlock toggle drawn with the painter (no font dependency). Closed
+/// means the value is linked to another control; open means it is independent.
+/// Returns the new locked state when clicked.
+pub(super) fn lock_toggle(ui: &mut egui::Ui, locked: bool) -> Option<bool> {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let painter = ui.painter().clone();
+    let fill = match (locked, response.hovered()) {
+        (true, false) => CONTROL,
+        (true, true) => CONTROL_HOVER,
+        (false, false) => CONTROL_SELECTED,
+        (false, true) => CONTROL_SELECTED_HOVER,
+    };
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(1.0_f32, if locked { LINE } else { ACCENT }),
+        egui::StrokeKind::Inside,
+    );
+    let color = if locked { TEXT_DIM } else { ACCENT };
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    let center_x = rect.center().x;
+    let body = egui::Rect::from_min_size(
+        egui::pos2(center_x - 5.0, rect.center().y - 1.0),
+        egui::vec2(10.0, 7.0),
+    );
+    painter.rect_filled(body, egui::CornerRadius::ZERO, color);
+    // Shackle: two posts and a top bar. The open padlock lifts and shifts the
+    // right post so the shackle visibly detaches from the body.
+    let top = body.top() - 5.0;
+    let left_x = center_x - 3.0;
+    let right_x = center_x + 3.0;
+    painter.line_segment([egui::pos2(left_x, body.top()), egui::pos2(left_x, top)], stroke);
+    painter.line_segment([egui::pos2(left_x, top), egui::pos2(right_x, top)], stroke);
+    if locked {
+        painter.line_segment([egui::pos2(right_x, top), egui::pos2(right_x, body.top())], stroke);
+    } else {
+        painter.line_segment([egui::pos2(right_x, top), egui::pos2(right_x, top + 2.5)], stroke);
+    }
+    let response = response.on_hover_text(if locked {
+        "Locked: follows the master brightness slider. Click to adjust independently."
+    } else {
+        "Unlocked: adjusted independently. Click to link to the master slider again."
+    });
+    response.clicked().then_some(!locked)
+}
+
 /// Segmented quality meter: the bar fills up to the chosen level so the cost
 /// ordering of the options is visible at a glance. Clicking or dragging a
 /// segment selects it.

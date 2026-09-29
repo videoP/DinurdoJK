@@ -253,7 +253,7 @@ pub(crate) struct FroxelUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceFogUniform {
+pub(crate) struct SurfaceFogUniform {
     color_depth: [f32; 4],
     // x: this surface uses the BSP global fog; y: OpenJK stage fog-color
     // override (0 none, 1 black, 2 white); z: Legacy 2 can use the normal
@@ -498,34 +498,30 @@ impl FogSystem {
     }
 }
 
-pub(crate) fn create_surface_fog_buffer(
-    device: &wgpu::Device,
+/// The per-surface fog uniform. Callers pack these into a shared buffer.
+pub(crate) fn surface_fog_uniform(
     color_depth: [f32; 4],
     is_global: bool,
     color_override: FogColorOverride,
     legacy2_in_stage_safe: bool,
     global_post_eligible: bool,
-) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("JKA surface fog uniform"),
-        contents: bytemuck::bytes_of(&SurfaceFogUniform {
-            // Keep the BSP surface's actual fog assignment. OpenJK's
-            // main-world loader does not replace every fogNum=-1 surface with
-            // globalFog; it uses the compiled dsurface fog index.
-            color_depth,
-            flags: [
-                if is_global { 1.0 } else { 0.0 },
-                match color_override {
-                    FogColorOverride::None => 0.0,
-                    FogColorOverride::Black => 1.0,
-                    FogColorOverride::White => 2.0,
-                },
-                if legacy2_in_stage_safe { 1.0 } else { 0.0 },
-                if global_post_eligible { 1.0 } else { 0.0 },
-            ],
-        }),
-        usage: wgpu::BufferUsages::UNIFORM,
-    })
+) -> SurfaceFogUniform {
+    SurfaceFogUniform {
+        // Keep the BSP surface's actual fog assignment. OpenJK's
+        // main-world loader does not replace every fogNum=-1 surface with
+        // globalFog; it uses the compiled dsurface fog index.
+        color_depth,
+        flags: [
+            if is_global { 1.0 } else { 0.0 },
+            match color_override {
+                FogColorOverride::None => 0.0,
+                FogColorOverride::Black => 1.0,
+                FogColorOverride::White => 2.0,
+            },
+            if legacy2_in_stage_safe { 1.0 } else { 0.0 },
+            if global_post_eligible { 1.0 } else { 0.0 },
+        ],
+    }
 }
 
 fn legacy_srgb_channel_to_linear(value: f32) -> f32 {

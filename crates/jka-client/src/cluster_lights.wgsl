@@ -52,7 +52,10 @@ fn projected_uv(world: vec3<f32>) -> vec3<f32> {
 
 fn light_overlaps_tile(light: PointLight, tile_x: u32, tile_y: u32) -> bool {
     let center = light.position_radius.xyz;
-    let radius = light.position_radius.w;
+    var radius = light.position_radius.w;
+    if (light.emitter.w < -0.5 && light.shadow.w >= 0.5) {
+        radius += length(light.emitter.xyz);
+    }
     let to_light = center - camera.camera_pos_time.xyz;
     if (length(to_light) <= radius) {
         return true;
@@ -134,7 +137,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 continue;
             }
         }
-        let radius = light.position_radius.w;
+        // A segment may illuminate receivers beyond the midpoint sphere.
+        // Enclose every sampled point's influence sphere in the cluster bounds.
+        var radius = light.position_radius.w;
+        if (light.emitter.w < -0.5 && light.shadow.w >= 0.5) {
+            radius += length(light.emitter.xyz);
+        }
         let distance_to_light = distance(camera.camera_pos_time.xyz, light.position_radius.xyz);
         if (distance_to_light + radius < z_min || distance_to_light - radius > z_max) {
             continue;

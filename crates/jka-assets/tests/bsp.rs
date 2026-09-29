@@ -116,6 +116,11 @@ fn quadratic_patch_reaches_analytic_midpoint_and_preserves_attributes() {
     let mesh = map.world_mesh(2).unwrap();
     assert_eq!(mesh.vertices.len(), 9);
     assert_eq!(mesh.indices.len(), 24);
+    // OpenJK r_subdivisions=4 semantics keep this 3x3 control patch as one
+    // shared 3x3 grid. The old fixed n=4 path inflated it to 25 verts/96 indices.
+    let default_mesh = map.world_mesh(4).unwrap();
+    assert_eq!(default_mesh.vertices.len(), 9);
+    assert_eq!(default_mesh.indices.len(), 24);
     // Center control is z=4 with Bernstein weight 1/4 at u=v=1/2.
     assert_eq!(mesh.vertices[4].position, [1.0, 1.0, 1.0]);
     assert_eq!(mesh.vertices[4].normal, [0.0, 0.0, 1.0]);

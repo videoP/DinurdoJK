@@ -9,6 +9,7 @@ macro_rules! eprintln {
 }
 
 mod app;
+mod asset_jobs;
 mod audio;
 mod camera;
 mod cgame;
@@ -20,6 +21,7 @@ mod console;
 mod download;
 mod fx;
 mod grass;
+mod jump_shade;
 mod keybinds;
 mod lightmap_atlas;
 mod logging;

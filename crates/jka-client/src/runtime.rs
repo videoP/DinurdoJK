@@ -24,6 +24,7 @@ pub struct RenderStats {
     pub gpu_cull_ms: Option<f64>,
     pub gpu_cluster_ms: Option<f64>,
     pub gpu_world_ms: Option<f64>,
+    pub gpu_fx_sprites_ms: Option<f64>,
     pub gpu_post_ms: Option<f64>,
     pub gpu_ui_ms: Option<f64>,
     pub cull_visible: u32,

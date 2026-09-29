@@ -124,7 +124,12 @@ impl Default for SaberBladeDefinition {
 
 #[derive(Debug, Clone)]
 pub struct SaberDefinition {
+    /// Saber block identifier used by saber1/saber2.
     pub name: String,
+    /// Authored menu/display name (`name` inside the .sab block).
+    pub proper_name: String,
+    /// Authored saberType used by the stock UI to separate single/staff modes.
+    pub saber_type: String,
     pub model: String,
     pub custom_skin: Option<String>,
     pub num_blades: usize,
@@ -159,12 +164,29 @@ pub struct SaberDefinition {
     /// `swingSound1..3`: optional authored replacements used by EV_SABER_ATTACK.
     /// OpenJK falls back to saberhup1..8 unless swingSound1 is present.
     pub swing_sounds: [Option<String>; 3],
+    /// OpenJK saber impact overrides consumed by EV_SABER_HIT / EV_SABER_BLOCK.
+    pub hit_sounds: [Option<String>; 3],
+    pub hit2_sounds: [Option<String>; 3],
+    pub block_sounds: [Option<String>; 3],
+    pub block2_sounds: [Option<String>; 3],
+    pub block_effect: Option<String>,
+    pub block_effect2: Option<String>,
+    pub hit_person_effect: Option<String>,
+    pub hit_person_effect2: Option<String>,
+    pub hit_other_effect: Option<String>,
+    pub hit_other_effect2: Option<String>,
+    /// SFL2_NO_CLASH_FLARE / SFL2_NO_CLASH_FLARE2.  MP CG_EntityEvent
+    /// intentionally checks the primary flag for EV_SABER_BLOCK.
+    pub no_clash_flare: bool,
+    pub no_clash_flare2: bool,
 }
 
 impl SaberDefinition {
     pub fn openjk_default(name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
+            proper_name: name.clone(),
+            saber_type: "SABER_SINGLE".to_owned(),
             name,
             model: DEFAULT_SABER_MODEL.to_owned(),
             custom_skin: None,
@@ -188,6 +210,18 @@ impl SaberDefinition {
             // OpenJK MP WP_SaberSetDefaults.
             sound_loop: "sound/weapons/saber/saberhum3.wav".to_owned(),
             swing_sounds: [None, None, None],
+            hit_sounds: [None, None, None],
+            hit2_sounds: [None, None, None],
+            block_sounds: [None, None, None],
+            block2_sounds: [None, None, None],
+            block_effect: None,
+            block_effect2: None,
+            hit_person_effect: None,
+            hit_person_effect2: None,
+            hit_other_effect: None,
+            hit_other_effect2: None,
+            no_clash_flare: false,
+            no_clash_flare2: false,
         }
     }
 
@@ -217,6 +251,13 @@ impl SaberDefinitions {
 
     pub fn len(&self) -> usize {
         self.definitions.len()
+    }
+
+    /// Visible saber definitions in the active VFS, in deterministic key order.
+    /// Profile/menu code uses the parsed definitions rather than re-parsing
+    /// ext_data/sabers so preview and gameplay always resolve the same hilt.
+    pub fn iter(&self) -> impl Iterator<Item = &SaberDefinition> {
+        self.definitions.values()
     }
 }
 
@@ -405,6 +446,20 @@ fn parse_saber_file(
                         }
                     }
                 }
+                "name" => {
+                    if let Some(value) = parser.token(false)? {
+                        if !value.is_empty() {
+                            definition.proper_name = value;
+                        }
+                    }
+                }
+                "sabertype" => {
+                    if let Some(value) = parser.token(false)? {
+                        if !value.is_empty() {
+                            definition.saber_type = value;
+                        }
+                    }
+                }
                 "sabermodel" => {
                     if let Some(value) = parser.token(false)? {
                         if !value.is_empty() {
@@ -481,6 +536,59 @@ fn parse_saber_file(
                         }
                     }
                     parser.skip_rest_of_line();
+                }
+                _ if lower.starts_with("hitsound") => {
+                    if let Ok(index) = lower["hitsound".len()..].parse::<usize>() {
+                        if (1..=3).contains(&index) {
+                            definition.hit_sounds[index - 1] = parse_optional_qpath(&mut parser)?;
+                            continue;
+                        }
+                    }
+                    parser.skip_rest_of_line();
+                }
+                _ if lower.starts_with("hit2sound") => {
+                    if let Ok(index) = lower["hit2sound".len()..].parse::<usize>() {
+                        if (1..=3).contains(&index) {
+                            definition.hit2_sounds[index - 1] = parse_optional_qpath(&mut parser)?;
+                            continue;
+                        }
+                    }
+                    parser.skip_rest_of_line();
+                }
+                _ if lower.starts_with("blocksound") => {
+                    if let Ok(index) = lower["blocksound".len()..].parse::<usize>() {
+                        if (1..=3).contains(&index) {
+                            definition.block_sounds[index - 1] = parse_optional_qpath(&mut parser)?;
+                            continue;
+                        }
+                    }
+                    parser.skip_rest_of_line();
+                }
+                _ if lower.starts_with("block2sound") => {
+                    if let Ok(index) = lower["block2sound".len()..].parse::<usize>() {
+                        if (1..=3).contains(&index) {
+                            definition.block2_sounds[index - 1] = parse_optional_qpath(&mut parser)?;
+                            continue;
+                        }
+                    }
+                    parser.skip_rest_of_line();
+                }
+                "blockeffect" => definition.block_effect = parse_optional_qpath(&mut parser)?,
+                "blockeffect2" => definition.block_effect2 = parse_optional_qpath(&mut parser)?,
+                "hitpersoneffect" => definition.hit_person_effect = parse_optional_qpath(&mut parser)?,
+                "hitpersoneffect2" => definition.hit_person_effect2 = parse_optional_qpath(&mut parser)?,
+                "hitothereffect" => definition.hit_other_effect = parse_optional_qpath(&mut parser)?,
+                "hitothereffect2" => definition.hit_other_effect2 = parse_optional_qpath(&mut parser)?,
+                "noclashflare" | "noclashflare2" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Ok(value) = value.parse::<i32>() {
+                            if lower == "noclashflare2" {
+                                definition.no_clash_flare2 = value != 0;
+                            } else {
+                                definition.no_clash_flare = value != 0;
+                            }
+                        }
+                    }
                 }
                 "returndamage" => {
                     if let Some(value) = parser.token(false)? {
@@ -571,6 +679,16 @@ fn parse_saber_file(
         definitions.entry(key).or_insert(definition);
     }
     Ok(())
+}
+
+fn parse_optional_qpath(parser: &mut ComParser<'_>) -> Result<Option<String>, String> {
+    Ok(parser.token(false)?.and_then(|value| {
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(value.replace('\\', "/"))
+        }
+    }))
 }
 
 /// Small safe equivalent of the COM_ParseExt behavior needed by `.sab` files.
@@ -718,6 +836,18 @@ mod tests {
                     swingSound1 "sound\weapons\custom\swing1.wav"
                     swingSound2 sound/weapons/custom/swing2.wav
                     swingSound3 none
+                    hitSound1 sound/weapons/custom/hit1.wav
+                    hit2Sound2 sound/weapons/custom/hit2_2.wav
+                    blockSound3 sound/weapons/custom/block3.wav
+                    block2Sound1 sound/weapons/custom/block2_1.wav
+                    blockEffect saber/custom_block.efx
+                    blockEffect2 saber/custom_block2.efx
+                    hitPersonEffect saber/custom_person.efx
+                    hitPersonEffect2 saber/custom_person2.efx
+                    hitOtherEffect saber/custom_other.efx
+                    hitOtherEffect2 saber/custom_other2.efx
+                    noClashFlare 1
+                    noClashFlare2 1
                     saberColor2 green
                     saberColor purple
                     saberColor2 Yellow
@@ -758,6 +888,18 @@ mod tests {
         assert_eq!(def.swing_sounds[0].as_deref(), Some("sound/weapons/custom/swing1.wav"));
         assert_eq!(def.swing_sounds[1].as_deref(), Some("sound/weapons/custom/swing2.wav"));
         assert!(def.swing_sounds[2].is_none());
+        assert_eq!(def.hit_sounds[0].as_deref(), Some("sound/weapons/custom/hit1.wav"));
+        assert_eq!(def.hit2_sounds[1].as_deref(), Some("sound/weapons/custom/hit2_2.wav"));
+        assert_eq!(def.block_sounds[2].as_deref(), Some("sound/weapons/custom/block3.wav"));
+        assert_eq!(def.block2_sounds[0].as_deref(), Some("sound/weapons/custom/block2_1.wav"));
+        assert_eq!(def.block_effect.as_deref(), Some("saber/custom_block.efx"));
+        assert_eq!(def.block_effect2.as_deref(), Some("saber/custom_block2.efx"));
+        assert_eq!(def.hit_person_effect.as_deref(), Some("saber/custom_person.efx"));
+        assert_eq!(def.hit_person_effect2.as_deref(), Some("saber/custom_person2.efx"));
+        assert_eq!(def.hit_other_effect.as_deref(), Some("saber/custom_other.efx"));
+        assert_eq!(def.hit_other_effect2.as_deref(), Some("saber/custom_other2.efx"));
+        assert!(def.no_clash_flare);
+        assert!(def.no_clash_flare2);
         // File order: saberColor after saberColor2 resets it, the later one wins.
         assert_eq!((def.blade(0).color, def.blade(1).color), (SABER_PURPLE, 2));
         assert_eq!(defs.get("defaultish").unwrap().blade(0).color, SABER_RED);

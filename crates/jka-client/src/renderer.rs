@@ -1,7 +1,14 @@
+#[path = "renderer_rt_models.rs"]
+mod rt_models;
+#[path = "renderer_rt_resolution.rs"]
+mod rt_resolution;
+
 use crate::{
     camera::{late_latch_third_person_view, Camera, ThirdPersonLateLatchView},
     color_lut,
+    fx::draw::FxBlend,
     grass::{GrassDrawStats, GrassMapGpu, GrassPreparedDraw, GrassRenderer},
+    jump_shade::JumpShadeState,
     materials::{BlendFactor, BlendFunc, CullMode, TextureData},
     runtime::{RenderStats, SurfaceInspectorInfo, UserEvent, WorldUploadTimings},
     scene::{
@@ -34,7 +41,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError, TrySendError},
+        mpsc::{self, Receiver, Sender, TryRecvError},
         Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
@@ -50,15 +57,16 @@ const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 // only a few hundred vertices.
 const UI_DYNAMIC_BUFFER_BYTES: u64 = 512 * 1024;
 const UI_TRANSIENT_BUFFER_BYTES: u64 = 1024 * 1024;
+const SCREEN_FX_BUFFER_BYTES: u64 = 64 * 1024;
 // AUTO and AUTO 2 use a conservative vertex-equivalent cost for an extra draw
 // call. Existing AUTO compares whole BSP clusters; AUTO 2 applies the same cost
 // independently per coarse surface group.
 const AUTO_DRAW_VERTEX_EQUIVALENT: u64 = 8192;
-// AUTO 4 physically collapses repeated portal-plan groups lazily. The GPU index
-// buffer reserves at most this much extra space; LRU eviction keeps custom maps
-// with thousands of clusters from multiplying index memory without bound.
+// AUTO 4 physically collapses non-contiguous per-cluster recipes lazily. The GPU
+// index buffer reserves at most this much extra space; LRU eviction keeps custom
+// maps with thousands of clusters from multiplying index memory without bound.
 const AUTO4_COLLAPSE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
-const AUTO4_COLLAPSE_QUEUE_DEPTH: usize = 8;
+const AUTO4_COLLAPSE_QUEUE_DEPTH: usize = 64;
 const CLUSTER_X: u32 = 16;
 const CLUSTER_Y: u32 = 9;
 const CLUSTER_Z: u32 = 24;
@@ -130,6 +138,8 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     3 => Float32x4,
     4 => Float32
 ];
+const LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![6 => Uint32];
 const UI_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
@@ -528,6 +538,24 @@ impl RayTracedRigidInstance {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct FxGpuSpriteInstance {
+    /// Render-space center. W is padding for 16-byte instance attributes.
+    pub origin: [f32; 4],
+    /// Render-space half-extent vector after JKA billboard rotation.
+    pub left: [f32; 4],
+    /// Render-space half-extent vector after JKA billboard rotation.
+    pub up: [f32; 4],
+    /// Final per-stage shaderRGBA after rgbGen/alphaGen.
+    pub color: [f32; 4],
+}
+
+#[derive(Clone)]
+pub struct FxGpuSprites {
+    pub instances: Arc<Vec<FxGpuSpriteInstance>>,
+}
+
 #[derive(Clone)]
 pub struct DynamicModelSurface {
     /// Presentation identity retained for diagnostics/culling work and dynamic
@@ -550,18 +578,27 @@ pub struct DynamicModelSurface {
     pub rt_skinned_key: Option<Arc<str>>,
     /// Present only for r_ghoul2Skinning gpu. CPU geometry keeps this None.
     pub ghoul2_gpu: Option<Ghoul2GpuSkinning>,
+    /// Instanced RT_SPRITE path used by r_fxGeometry gpu. Non-sprite EFX and
+    /// the CPU reference modes leave this unset.
+    pub fx_gpu_sprites: Option<FxGpuSprites>,
     pub texture: Option<Arc<TextureData>>,
     pub alpha_mode: DynamicModelAlphaMode,
 }
 
 impl DynamicModelSurface {
     pub fn vertex_count(&self) -> usize {
+        if let Some(sprites) = self.fx_gpu_sprites.as_ref() {
+            return sprites.instances.len().saturating_mul(4);
+        }
         self.ghoul2_gpu
             .as_ref()
             .map_or(self.vertices.len(), |skin| skin.vertices.len())
     }
 
     pub fn index_count(&self) -> usize {
+        if let Some(sprites) = self.fx_gpu_sprites.as_ref() {
+            return sprites.instances.len().saturating_mul(6);
+        }
         self.ghoul2_gpu
             .as_ref()
             .map_or(self.indices.len(), |skin| skin.indices.len())
@@ -629,11 +666,33 @@ pub struct ClientFramePerf {
     pub snapshot_ms: f64,
     pub audio_ms: f64,
     pub events_ms: f64,
+    /// Side-effect-free event semantic preparation. Included in `events_ms`.
+    pub event_prepare_ms: f64,
+    pub event_worker_jobs: u32,
+    pub event_worker_threads: u32,
+    pub event_worker_parallel: bool,
+    /// Uncached direct SFX codec work staged from event batches.
+    pub event_sound_decode_ms: f64,
+    pub event_sound_decode_jobs: u32,
+    pub event_sound_decode_parallel: bool,
     pub entity_present_ms: f64,
     pub player_present_ms: f64,
     pub followed_player_ms: f64,
     pub fx_ms: f64,
     pub fx_tessellate_ms: f64,
+    pub fx_draws: u32,
+    pub fx_sprites: u32,
+    pub fx_oriented_quads: u32,
+    pub fx_lines: u32,
+    pub fx_quads: u32,
+    pub fx_meshes: u32,
+    pub fx_cylinders: u32,
+    pub fx_render_surfaces: u32,
+    pub fx_cpu_geom_surfaces: u32,
+    pub fx_cpu_vertices: u64,
+    pub fx_cpu_indices: u64,
+    pub fx_gpu_sprite_batches: u32,
+    pub fx_gpu_sprite_instances: u32,
     pub ghoul2_pose_ms: f64,
     pub ghoul2_motion_pose_ms: f64,
     pub ghoul2_skin_ms: f64,
@@ -652,12 +711,37 @@ pub struct ClientFramePerf {
     pub dynamic_indices: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LegacyDlightPerfStats {
+    transient_count: usize,
+    saber_sources: usize,
+    authored_fx_sources: usize,
+    saber_mark_sources: usize,
+    radius_sum: f64,
+    radius_max: f32,
+    surfaces_total: usize,
+    surfaces_eligible: usize,
+    surfaces_touched: usize,
+    candidate_pairs: u64,
+    saber_pairs: u64,
+    authored_fx_pairs: u64,
+    saber_mark_pairs: u64,
+    max_candidates_per_surface: u32,
+    surface_buckets: [u32; 6],
+    max_surfaces_per_light: u32,
+    total_surfaces_per_light: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TransientLight {
+    /// Diagnostic-only provenance copied from the CGame/FX submission.
+    pub kind: crate::fx::system::FxLightKind,
     pub position: [f32; 3],
     pub color: [f32; 3],
     pub radius: f32,
     pub intensity: f32,
+    pub segment: Option<[[f32; 3]; 2]>,
+    pub blade_segments: Option<Arc<[crate::fx::system::FxLightSegment]>>,
 }
 
 #[derive(Clone)]
@@ -677,6 +761,8 @@ pub struct RenderSnapshot {
     /// These stay separate from map-static lights so moving flashes do not
     /// churn the cached local-shadow selection.
     pub transient_lights: Arc<Vec<TransientLight>>,
+    /// Authored CGame screen-space stages, in 640x480 virtual coordinates.
+    pub screen_fx: Arc<Vec<crate::fx::draw::ScreenFxDraw>>,
     /// `None`: no CGame owns the scene (solo/offline), so inline models keep
     /// their compiled pose. `Some`: exactly the movers in the current
     /// snapshot are drawn, as OpenJK only draws bmodels CGame submits.
@@ -689,6 +775,8 @@ pub struct RenderSnapshot {
     /// queue, so high-rate HUD updates never clone console/menu state.
     pub hud: Option<ui::HudState>,
     pub movement_hud: ui::MovementHudState,
+    /// jaPRO SP-physics jump-height helper. `Off` costs nothing in the world shader.
+    pub jump_shade: JumpShadeState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -786,9 +874,15 @@ pub enum RenderCommand {
     SetDetailTexture { path: String, game: Option<PathBuf> },
     SetDetailTextureFade { enabled: bool, distance: f32 },
     SetWireframeMask(u32),
+    /// Trigger-volume / clip-brush debug overlays (session-only).
+    SetDebugVolumes { triggers: bool, clips: bool },
     SetPvsMode(PvsMode),
     SetFpsCap(u32),
     SetGamma(f32),
+    /// Effective extra multiplier for lit dynamic-model colour (1.0 = neutral).
+    SetModelBrightness(f32),
+    /// Effective multiplier for runtime (transient) dynamic-light intensity.
+    SetDynamicLightBrightness(f32),
     SetPostEffects(PostEffects),
     SetFootprintMode(FootprintMode),
     SetGrassEnabled(bool),
@@ -801,12 +895,15 @@ pub enum RenderCommand {
     SetOceanTime(f32),
     SetPerfTrace(bool),
     SetGpuTimings(bool),
+    SetFxZeroAlphaDiscard(bool),
     SetGhoul2BatchDraws(Ghoul2BatchMode),
     SetGpuVisibility {
         gpu_driven: bool,
         hiz_occlusion: bool,
     },
     SetDynamicLighting(DynamicLightsMode),
+    SetRtSamples(u32),
+    SetRtHalfResolution(bool),
     SetMapLightSimulation(bool),
     SetClassicWorldLighting { fullbright: bool, vertex_light: bool, lightmap_only: bool },
     SetEmissiveAreaLights(bool),
@@ -1043,6 +1140,9 @@ fn render_thread_main(
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
     );
     renderer.set_vsync(initial_ui.video.vsync);
+    renderer
+        .dynamic_model_renderer
+        .set_fx_zero_alpha_discard(initial_ui.video.fx_zero_alpha_discard);
     renderer.set_msaa(initial_ui.video.msaa_samples);
     renderer.set_texture_filter(initial_ui.video.texture_filter);
     renderer.set_detail_textures(initial_ui.video.detail_textures);
@@ -1051,11 +1151,15 @@ fn render_thread_main(
         initial_ui.video.detail_texture_fade_distance,
     );
     renderer.set_wireframe_mask(initial_ui.video.wireframe_mask);
+    renderer.debug_volumes.triggers_enabled = initial_ui.video.draw_triggers;
+    renderer.debug_volumes.clips_enabled = initial_ui.video.draw_clip_brushes;
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
     let mut fps_cap = initial_ui.video.fps_cap;
     let mut input_subframe = initial_ui.video.input_subframe;
     let mut input_latelatch = initial_ui.video.input_subframe && initial_ui.video.input_latelatch;
     renderer.set_gamma(initial_ui.video.gamma);
+    renderer.set_model_brightness(initial_ui.video.effective_model_brightness());
+    renderer.set_dynamic_light_brightness(initial_ui.video.effective_dynamic_light_brightness());
     renderer
         .surface_deformation
         .set_mode(&renderer.queue, initial_ui.video.footprints);
@@ -1133,6 +1237,8 @@ fn render_thread_main(
     renderer.set_ghoul2_batch_draws(initial_ui.video.ghoul2_batch_draws);
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
+    renderer.set_rt_samples(initial_ui.video.rt_samples);
+    renderer.set_rt_half_resolution(initial_ui.video.rt_half_resolution);
     renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
     renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
     renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
@@ -1149,6 +1255,8 @@ fn render_thread_main(
     let mut perf_trace = initial_ui.video.perf_trace;
     renderer.set_ui(initial_ui);
     renderer.set_dynamic_hud(snapshot.hud, snapshot.movement_hud);
+    renderer.set_jump_shade(snapshot.jump_shade);
+    renderer.set_screen_fx(&snapshot.screen_fx);
     println!(
         "[RENDER INIT] ready after applying video state {:.1} ms total",
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
@@ -1244,9 +1352,17 @@ fn render_thread_main(
                         renderer.set_detail_texture_fade(enabled, distance)
                     }
                     Ok(RenderCommand::SetWireframeMask(mask)) => renderer.set_wireframe_mask(mask),
+                    Ok(RenderCommand::SetDebugVolumes { triggers, clips }) => {
+                        renderer.debug_volumes.triggers_enabled = triggers;
+                        renderer.debug_volumes.clips_enabled = clips;
+                    }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
                     Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
+                    Ok(RenderCommand::SetModelBrightness(scale)) => renderer.set_model_brightness(scale),
+                    Ok(RenderCommand::SetDynamicLightBrightness(scale)) => {
+                        renderer.set_dynamic_light_brightness(scale)
+                    }
                     Ok(RenderCommand::SetPostEffects(settings)) => {
                         renderer.set_post_effects(settings)
                     }
@@ -1295,6 +1411,9 @@ fn render_thread_main(
                     Ok(RenderCommand::SetGpuTimings(enabled)) => {
                         renderer.set_gpu_timings(enabled)
                     }
+                    Ok(RenderCommand::SetFxZeroAlphaDiscard(enabled)) => {
+                        renderer.dynamic_model_renderer.set_fx_zero_alpha_discard(enabled);
+                    }
                     Ok(RenderCommand::SetGhoul2BatchDraws(mode)) => {
                         renderer.set_ghoul2_batch_draws(mode)
                     }
@@ -1307,6 +1426,8 @@ fn render_thread_main(
                     Ok(RenderCommand::SetDynamicLighting(mode)) => {
                         renderer.set_dynamic_lighting(mode);
                     }
+                    Ok(RenderCommand::SetRtSamples(samples)) => renderer.set_rt_samples(samples),
+                    Ok(RenderCommand::SetRtHalfResolution(enabled)) => renderer.set_rt_half_resolution(enabled),
                     Ok(RenderCommand::SetMapLightSimulation(enabled)) => {
                         renderer.set_map_light_simulation(enabled);
                     }
@@ -1448,6 +1569,8 @@ fn render_thread_main(
             // HUD input/velocity/health are mailbox state just like the camera:
             // update only the tiny hot vertex buffer when they actually change.
             renderer.set_dynamic_hud(next.hud, next.movement_hud);
+            renderer.set_jump_shade(next.jump_shade);
+            renderer.set_screen_fx(&next.screen_fx);
             snapshot = next;
         }
 
@@ -1602,6 +1725,10 @@ fn render_thread_main(
                         bsp_stats,
                     });
                 }
+
+                // Slow levelshot VFS/decode work happens only after a visible
+                // unknown-map frame has completed present().
+                renderer.resolve_pending_ui_levelshot();
             }
             Err(RenderError::Lost | RenderError::Outdated) => renderer.reconfigure(),
             Err(RenderError::Timeout) => {}
@@ -1662,6 +1789,15 @@ fn render_thread_main(
                     gpu_cull_ms: gpu_pass(GpuPass::Cull),
                     gpu_cluster_ms: gpu_pass(GpuPass::Cluster),
                     gpu_world_ms: gpu_pass(GpuPass::World),
+                    gpu_fx_sprites_ms: match (
+                        gpu_pass(GpuPass::FxSpritesOpaque),
+                        gpu_pass(GpuPass::FxSpritesTranslucent),
+                    ) {
+                        (Some(opaque), Some(translucent)) => Some(opaque + translucent),
+                        (Some(opaque), None) => Some(opaque),
+                        (None, Some(translucent)) => Some(translucent),
+                        (None, None) => None,
+                    },
                     gpu_post_ms: gpu_pass(GpuPass::Post),
                     gpu_ui_ms: gpu_pass(GpuPass::Ui),
                     cull_visible: last_info.cull_visible,
@@ -1727,6 +1863,17 @@ fn render_thread_main(
             };
             let dynamic_model_ms = dynamic_model_gpu
                 .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
+            let fx_sprite_gpu = match (
+                gpu_value(GpuPass::FxSpritesOpaque),
+                gpu_value(GpuPass::FxSpritesTranslucent),
+            ) {
+                (Some(opaque), Some(translucent)) => Some(opaque + translucent),
+                (Some(opaque), None) => Some(opaque),
+                (None, Some(translucent)) => Some(translucent),
+                (None, None) => None,
+            };
+            let fx_sprite_ms = fx_sprite_gpu
+                .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
             let grass_prepare_gpu = gpu_value(GpuPass::GrassPrepare);
             let grass_draw_gpu = gpu_value(GpuPass::Grass);
             let grass_total_gpu = match (grass_prepare_gpu, grass_draw_gpu) {
@@ -1737,7 +1884,7 @@ fn render_thread_main(
             let grass_total_ms = grass_total_gpu
                 .map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
             println!(
-                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit={:.4}ms present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} hotpath=1",
+                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit={:.4}ms present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} world_batches[pvs={} frustum_reject={} encoded={} multidraw_groups={} multidraw_batches={}] hotpath=1",
                 trace_frames as f64 / elapsed,
                 trace_frame_ms / frames,
                 trace_prepare_ms / frames,
@@ -1749,14 +1896,26 @@ fn render_thread_main(
                 last_info.ghoul2_gpu_draw_calls,
                 last_info.ghoul2_gpu_instances,
                 renderer.dynamic_model_renderer.ghoul2_batch_draws.config_value(),
+                last_info.world_pvs_batches,
+                last_info.world_frustum_rejected,
+                last_info.world_encoded_batches,
+                last_info.world_multidraw_groups,
+                last_info.world_multidraw_batches,
             );
             let client = snapshot.client_perf;
             println!(
-                "[JKA CLIENT PERF] total={:.4}ms snapshot={:.4}ms audio={:.4}ms events={:.4}ms entities={:.4}ms players={:.4}ms followed={:.4}ms fx={:.4}ms fx_tess={:.4}ms g2_mode={} g2_pose={:.4}ms/{} motion={:.4}ms/{} g2_skin={:.4}ms g2_bolt={:.4}ms/{} surfaces={} verts={} cull={}/{} lod=[{},{},{},{}] dyn[surfaces={} verts={} indices={}]",
+                "[JKA CLIENT PERF] total={:.4}ms snapshot={:.4}ms audio={:.4}ms events={:.4}ms event_prep={:.4}ms jobs={} pool_threads={} parallel={} event_decode={:.4}ms decode_jobs={} decode_parallel={} entities={:.4}ms players={:.4}ms followed={:.4}ms fx={:.4}ms fx_tess={:.4}ms g2_mode={} g2_pose={:.4}ms/{} motion={:.4}ms/{} g2_skin={:.4}ms g2_bolt={:.4}ms/{} surfaces={} verts={} cull={}/{} lod=[{},{},{},{}] dyn[surfaces={} verts={} indices={}]",
                 client.total_ms,
                 client.snapshot_ms,
                 client.audio_ms,
                 client.events_ms,
+                client.event_prepare_ms,
+                client.event_worker_jobs,
+                client.event_worker_threads,
+                client.event_worker_parallel,
+                client.event_sound_decode_ms,
+                client.event_sound_decode_jobs,
+                client.event_sound_decode_parallel,
                 client.entity_present_ms,
                 client.player_present_ms,
                 client.followed_player_ms,
@@ -1783,11 +1942,82 @@ fn render_thread_main(
                 client.dynamic_indices,
             );
             println!(
-                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dyn_models={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
+                "[JKA FX PERF] draws={} sprite={} oriented={} line={} quad={} mesh={} cylinder={} output[surfaces={} cpu_surfaces={} cpu_verts={} cpu_indices={} gpu_sprite_batches={} gpu_sprite_instances={}] zero_alpha_discard={} gpu_sprites={}ms",
+                client.fx_draws,
+                client.fx_sprites,
+                client.fx_oriented_quads,
+                client.fx_lines,
+                client.fx_quads,
+                client.fx_meshes,
+                client.fx_cylinders,
+                client.fx_render_surfaces,
+                client.fx_cpu_geom_surfaces,
+                client.fx_cpu_vertices,
+                client.fx_cpu_indices,
+                client.fx_gpu_sprite_batches,
+                client.fx_gpu_sprite_instances,
+                u8::from(renderer.dynamic_model_renderer.fx_zero_alpha_discard),
+                fx_sprite_ms,
+            );
+            let dlight = renderer.legacy_dlight_perf_stats();
+            if renderer.dynamic_lights_mode == DynamicLightsMode::Legacy {
+                let avg_radius = if dlight.transient_count == 0 {
+                    0.0
+                } else {
+                    dlight.radius_sum / dlight.transient_count as f64
+                };
+                let avg_candidates = if dlight.surfaces_touched == 0 {
+                    0.0
+                } else {
+                    dlight.candidate_pairs as f64 / dlight.surfaces_touched as f64
+                };
+                let mask_density = if dlight.surfaces_eligible == 0 || dlight.transient_count == 0 {
+                    0.0
+                } else {
+                    100.0 * dlight.candidate_pairs as f64
+                        / (dlight.surfaces_eligible * dlight.transient_count) as f64
+                };
+                let avg_surfaces_per_light = if dlight.transient_count == 0 {
+                    0.0
+                } else {
+                    dlight.total_surfaces_per_light as f64 / dlight.transient_count as f64
+                };
+                println!(
+                    "[JKA DLIGHT PERF] transient={} sources[saber={} fx={} saber_mark={}] radius[avg={:.2} max={:.2}] surfaces[total={} eligible={} touched={}] pairs={} mask_density={:.2}% candidates_per_touched[avg={:.2} max={}] buckets[0={} 1={} 2-4={} 5-8={} 9-16={} 17+={}] pairs_by_source[saber={} fx={} saber_mark={}] surfaces_per_light[avg={:.2} max={}]",
+                    dlight.transient_count,
+                    dlight.saber_sources,
+                    dlight.authored_fx_sources,
+                    dlight.saber_mark_sources,
+                    avg_radius,
+                    dlight.radius_max,
+                    dlight.surfaces_total,
+                    dlight.surfaces_eligible,
+                    dlight.surfaces_touched,
+                    dlight.candidate_pairs,
+                    mask_density,
+                    avg_candidates,
+                    dlight.max_candidates_per_surface,
+                    dlight.surface_buckets[0],
+                    dlight.surface_buckets[1],
+                    dlight.surface_buckets[2],
+                    dlight.surface_buckets[3],
+                    dlight.surface_buckets[4],
+                    dlight.surface_buckets[5],
+                    dlight.saber_pairs,
+                    dlight.authored_fx_pairs,
+                    dlight.saber_mark_pairs,
+                    avg_surfaces_per_light,
+                    dlight.max_surfaces_per_light,
+                );
+            }
+            println!(
+                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
+                gpu_ms(GpuPass::LegacyDlights),
                 dynamic_model_ms,
+                fx_sprite_ms,
                 gpu_ms(GpuPass::OceanOptics),
                 grass_total_ms,
                 gpu_ms(GpuPass::GrassPrepare),
@@ -1799,13 +2029,15 @@ fn render_thread_main(
                 gpu_ms(GpuPass::Cluster),
                 gpu_ms(GpuPass::Ui),
             );
-            if renderer.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+            if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
                     println!(
-                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays=up_to_1_per_receiver local_rays={} (budget_per_light_evaluation; not_measured)",
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
                     gpu_ms(GpuPass::RtBuild),
                     gpu_ms(GpuPass::RtSkin),
                     gpu_ms(GpuPass::RtAcceleration),
+                    gpu_ms(GpuPass::RtVisibility),
+                    if renderer.rt_reduced_shadows { "quarter" } else { "full" },
                     rt.geometry_count,
                     rt.triangle_count,
                     rt.masked_geometry_count,
@@ -1820,7 +2052,8 @@ fn render_thread_main(
                     rt.alpha_textures.len(),
                     rt.alpha_texels.len(),
                         rt.alpha_buffers_generation,
-                        if renderer.local_light_shadows_enabled { "up_to_1_per_clustered_light" } else { "0" },
+                        if renderer.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun) { renderer.rt_samples } else { 0 },
+                        if renderer.ray_traced_local_shadows_active() { format!("up_to_{}_per_segment_1_per_point", renderer.rt_samples) } else { "0".into() },
                     );
                 }
             }
@@ -2003,6 +2236,9 @@ struct CameraUniform {
     // Keep these at the end so shaders that only consume the historical prefix remain valid.
     unjittered_view_proj: [[f32; 4]; 4],
     previous_unjittered_view_proj: [[f32; 4]; 4],
+    // Jump-height helper (jump_shade.rs): jump-line floor Y, reachable apex Y, gradient
+    // range, strength. Zero strength disables the tint; only the main world camera sets it.
+    jump_shade: [f32; 4],
 }
 
 #[repr(C)]
@@ -2318,9 +2554,46 @@ struct DrawIndexedIndirectArgs {
 struct GpuPointLight {
     position_radius: [f32; 4],
     color_intensity: [f32; 4],
-    // xyz: q3map surface-emitter normal. w: 0=point, 1=one-sided, 2=two-sided.
+    // xyz: area normal, or RT segment half-vector when w=-1.
+    // w: -1=segment, 0=point, 1=one-sided area, 2=two-sided area.
     emitter: [f32; 4],
     shadow: [f32; 4], // x: cubemap slot + 1, 0 means unshadowed
+}
+
+fn transient_light_gpu(light: &TransientLight, intensity_scale: f32, segment_enabled: bool) -> GpuPointLight {
+    let mut result = GpuPointLight {
+        position_radius: [light.position[0], light.position[1], light.position[2], light.radius.max(0.0)],
+        color_intensity: [light.color[0], light.color[1], light.color[2], light.intensity.max(0.0) * intensity_scale],
+        emitter: [0.0; 4],
+        shadow: [0.0, 0.0, 0.0, 1.0],
+    };
+    if segment_enabled {
+        if let Some([start, end]) = light.segment.filter(|ends| ends.iter().flatten().all(|v| v.is_finite())) {
+            let half = (Vec3::from_array(end) - Vec3::from_array(start)) * 0.5;
+            let midpoint = Vec3::from_array(start) + half;
+            if half.is_finite() && midpoint.is_finite() && half.length_squared() > 1e-8 {
+                result.position_radius[..3].copy_from_slice(&midpoint.to_array());
+                result.emitter = [half.x, half.y, half.z, -1.0];
+            }
+        }
+    }
+    result
+}
+
+fn transient_light_samples(light: &TransientLight, rt: bool) -> impl Iterator<Item = TransientLight> + '_ {
+    let blades = light.blade_segments.as_deref().filter(|blades| rt && !blades.is_empty());
+    let count = blades.map_or(1, |blades| blades.len());
+    (0..count).map(move |index| {
+        let mut sample = light.clone();
+        if let Some(blades) = blades {
+            let blade = blades[index];
+            sample.segment = Some(blade.endpoints);
+            sample.color = blade.rgb;
+            sample.intensity *= blade.weight;
+            sample.blade_segments = None;
+        }
+        sample
+    })
 }
 
 #[repr(C)]
@@ -2329,7 +2602,7 @@ struct LightingSettings {
     values: [u32; 4],        // enabled, light count, viewport width, viewport height
     local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, transient-light start
     feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode (0/1/2), reflection quality
-    map_ambient: [f32; 4],   // xyz q3map2 ambient RGB; w reserved
+    map_ambient: [f32; 4],   // xyz q3map2 ambient RGB; w RT sample count (1, 2, 4)
     map_minlight: [f32; 4],  // source-.map q3map2 minlight RGB, normalized; w reserved
 }
 
@@ -2587,6 +2860,8 @@ struct RayTracedSkinnedBlas {
 /// unchanged until Ray Traced Shadows is selected, preserving the renderer's
 /// lazy-pipeline/zero-overhead-off principle.
 struct RayTracedShadowResources {
+    sun_shadow_history: rt_resolution::RtSunShadowHistory,
+    model_receivers: Option<rt_models::RtModelReceivers>,
     receiver_layout: wgpu::BindGroupLayout,
     world_pipeline_layout: wgpu::PipelineLayout,
     world_pipeline_layout_lean: wgpu::PipelineLayout,
@@ -3037,6 +3312,24 @@ struct LocalShadowResources {
 struct GpuImage {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+struct PendingUiLevelshot {
+    key: String,
+    map_name: String,
+    game: Option<PathBuf>,
+}
+
+struct ScreenFxTexture {
+    _image: GpuImage,
+    bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone)]
+struct ScreenFxBatch {
+    range: std::ops::Range<u32>,
+    blend: FxBlend,
+    texture_key: Option<String>,
 }
 
 const AUTO_DETAIL_ENABLED_BIT: u8 = 0x80;
@@ -3552,6 +3845,7 @@ impl SurfaceSpriteEffectRenderer {
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        effects: &'a [SurfaceSpriteEffectGpu],
         prepared: &PreparedSurfaceSpriteEffects,
     ) {
         let Some(pipeline) = self.wireframe_pipeline.as_ref() else {
@@ -3564,6 +3858,14 @@ impl SurfaceSpriteEffectRenderer {
         pass.set_bind_group(0, camera_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         for draw in &prepared.draws {
+            // The wireframe shader does not sample the sprite texture, but this
+            // pipeline intentionally shares the normal surfaceSprites pipeline
+            // layout. WGPU therefore still requires bind-group slot 1 to be
+            // layout-compatible at draw time. Explicitly bind the emitter's
+            // surfaceSprites group so stale dynamic-model/world bindings can
+            // never leak across debug overlay draws.
+            let effect = &effects[draw.emitter];
+            pass.set_bind_group(1, &effect.bind_group, &[]);
             pass.draw(draw.vertices.clone(), 0..1);
         }
     }
@@ -3772,6 +4074,13 @@ const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex
     3 => Float32x4
 ];
 
+const FX_GPU_SPRITE_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x4,
+    1 => Float32x4,
+    2 => Float32x4,
+    3 => Float32x4
+];
+
 const GHOUL2_GPU_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     0 => Float32x3,
     1 => Float32x3,
@@ -3877,6 +4186,7 @@ struct DynamicEntityLightingUniform {
     // BSP lightgrid is applied during dynamic-model preparation (CPU vertices)
     // or in the Ghoul2 vertex shader (GPU skinning); mode 2 retains the legacy
     // placeholder until dynamic models sample the actual irradiance volume.
+    // y: f32 bits of the model brightness multiplier (Setup > Video > Models).
     values: [u32; 4],
     // Self-applied Legacy fog, see md3.wgsl apply_self_legacy_fog.
     legacy_fog: EntityLegacyFog,
@@ -3893,19 +4203,27 @@ pub(crate) struct EntityLegacyFog {
 }
 
 impl DynamicEntityLightingUniform {
-    fn new(mode: EntityAmbientLightingMode, legacy_fog: EntityLegacyFog) -> Self {
+    fn new(mode: EntityAmbientLightingMode, legacy_fog: EntityLegacyFog, brightness: f32) -> Self {
         let value = match mode {
             EntityAmbientLightingMode::Off => 0,
             EntityAmbientLightingMode::BspLightgridClassic => 1,
             EntityAmbientLightingMode::BevyIrradianceVolume => 2,
         };
-        Self { values: [value, 0, 0, 0], legacy_fog }
+        Self { values: [value, brightness.to_bits(), 0, 0], legacy_fog }
     }
 }
 
 struct DynamicGpuTexture {
     _image: GpuImage,
     bind_group: wgpu::BindGroup,
+}
+
+struct FxGpuSpritePreparedDraw {
+    first_instance: u32,
+    instance_count: u32,
+    texture_key: Option<Arc<str>>,
+    alpha_mode: DynamicModelAlphaMode,
+    wireframe_class: DynamicWireframeClass,
 }
 
 struct DynamicPreparedDraw {
@@ -3922,9 +4240,12 @@ struct DynamicPreparedDraw {
 /// cached here and upload only final CPU-evaluated bones plus per-draw transforms.
 /// The renderer still knows nothing about demo/network provenance or JKA state.
 struct DynamicModelRenderer {
+    rt_raw_color_buffer: Option<wgpu::Buffer>,
+    scratch_raw_colors: Vec<[f32; 4]>,
     texture_layout: wgpu::BindGroupLayout,
     entity_lighting_buffer: wgpu::Buffer,
     entity_ambient_lighting: EntityAmbientLightingMode,
+    model_brightness: f32,
     entity_legacy_fog: EntityLegacyFog,
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
     legacy_fog_compiled: bool,
@@ -3941,6 +4262,21 @@ struct DynamicModelRenderer {
     modulate_pipeline: wgpu::RenderPipeline,
     modulate2x_pipeline: wgpu::RenderPipeline,
     darken_pipeline: wgpu::RenderPipeline,
+    fx_sprite_shader: Option<wgpu::ShaderModule>,
+    fx_sprite_surface_format: wgpu::TextureFormat,
+    fx_sprite_samples: u32,
+    fx_sprite_wireframe_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_opaque_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_mask_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_blend_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_mask_blend_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_additive_one_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_additive_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_blend_unlit_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_modulate_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_modulate2x_pipeline: Option<wgpu::RenderPipeline>,
+    fx_sprite_darken_pipeline: Option<wgpu::RenderPipeline>,
+    fx_zero_alpha_discard: bool,
     skin_layout: wgpu::BindGroupLayout,
     skin_pipeline_layout: wgpu::PipelineLayout,
     skin_shader: wgpu::ShaderModule,
@@ -3970,6 +4306,10 @@ struct DynamicModelRenderer {
     vertex_capacity: u64,
     index_capacity: u64,
     draws: Vec<DynamicPreparedDraw>,
+    fx_sprite_instance_buffer: wgpu::Buffer,
+    fx_sprite_instance_capacity: u64,
+    fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
+    scratch_fx_sprite_instances: Vec<FxGpuSpriteInstance>,
     ghoul2_meshes: HashMap<Arc<str>, Ghoul2GpuMesh>,
     skin_bone_buffer: wgpu::Buffer,
     skin_draw_buffer: wgpu::Buffer,
@@ -4020,6 +4360,7 @@ impl DynamicModelRenderer {
             contents: bytemuck::bytes_of(&DynamicEntityLightingUniform::new(
                 EntityAmbientLightingMode::Off,
                 EntityLegacyFog::default(),
+                1.0,
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -4100,6 +4441,13 @@ impl DynamicModelRenderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let fx_sprite_instance_capacity = 4096;
+        let fx_sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA GPU FX sprite instance buffer"),
+            size: fx_sprite_instance_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let skin_bone_capacity = 4096;
         let skin_draw_capacity = 4096;
         let skin_bone_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4168,6 +4516,7 @@ impl DynamicModelRenderer {
             texture_layout,
             entity_lighting_buffer,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
+            model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
             legacy_fog_compiled: false,
             pipeline_layout,
@@ -4183,6 +4532,21 @@ impl DynamicModelRenderer {
             modulate_pipeline,
             modulate2x_pipeline,
             darken_pipeline,
+            fx_sprite_shader: None,
+            fx_sprite_surface_format: surface_format,
+            fx_sprite_samples: samples,
+            fx_sprite_wireframe_pipeline: None,
+            fx_sprite_opaque_pipeline: None,
+            fx_sprite_mask_pipeline: None,
+            fx_sprite_blend_pipeline: None,
+            fx_sprite_mask_blend_pipeline: None,
+            fx_sprite_additive_one_pipeline: None,
+            fx_sprite_additive_pipeline: None,
+            fx_sprite_blend_unlit_pipeline: None,
+            fx_sprite_modulate_pipeline: None,
+            fx_sprite_modulate2x_pipeline: None,
+            fx_sprite_darken_pipeline: None,
+            fx_zero_alpha_discard: false,
             skin_layout,
             skin_pipeline_layout,
             skin_shader,
@@ -4210,6 +4574,10 @@ impl DynamicModelRenderer {
             vertex_capacity,
             index_capacity,
             draws: Vec::new(),
+            fx_sprite_instance_buffer,
+            fx_sprite_instance_capacity,
+            fx_sprite_draws: Vec::new(),
+            scratch_fx_sprite_instances: Vec::new(),
             ghoul2_meshes: HashMap::new(),
             skin_bone_buffer,
             skin_draw_buffer,
@@ -4221,6 +4589,8 @@ impl DynamicModelRenderer {
             ghoul2_input_instances: 0,
             ghoul2_encoded_draws: 0,
             scratch_vertices: Vec::new(),
+            scratch_raw_colors: Vec::new(),
+            rt_raw_color_buffer: None,
             scratch_indices: Vec::new(),
             scratch_bones: Vec::new(),
             scratch_draw_data: Vec::new(),
@@ -4470,6 +4840,9 @@ impl DynamicModelRenderer {
         samples: u32,
     ) {
         self.wireframe_pipeline = None;
+        self.fx_sprite_wireframe_pipeline = None;
+        self.fx_sprite_surface_format = surface_format;
+        self.fx_sprite_samples = samples;
         self.skin_wireframe_pipeline = None;
         self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
         self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
@@ -4481,6 +4854,16 @@ impl DynamicModelRenderer {
         self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate, self.legacy_fog_compiled);
         self.modulate2x_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, self.legacy_fog_compiled);
         self.darken_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Darken, self.legacy_fog_compiled);
+        self.fx_sprite_opaque_pipeline = None;
+        self.fx_sprite_mask_pipeline = None;
+        self.fx_sprite_blend_pipeline = None;
+        self.fx_sprite_mask_blend_pipeline = None;
+        self.fx_sprite_additive_one_pipeline = None;
+        self.fx_sprite_additive_pipeline = None;
+        self.fx_sprite_blend_unlit_pipeline = None;
+        self.fx_sprite_modulate_pipeline = None;
+        self.fx_sprite_modulate2x_pipeline = None;
+        self.fx_sprite_darken_pipeline = None;
         self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
         self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
         self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
@@ -4515,6 +4898,81 @@ impl DynamicModelRenderer {
             label: Some("JKA dynamic model index buffer"),
             size: self.index_capacity,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    fn set_fx_zero_alpha_discard(&mut self, enabled: bool) {
+        if self.fx_zero_alpha_discard == enabled {
+            return;
+        }
+        self.fx_zero_alpha_discard = enabled;
+        // Pipelines are lazy; invalidate only source-alpha variants whose
+        // fragment entry point actually changes for this A/B. GL_ONE, mask and
+        // modulation variants stay hot and are not needlessly recompiled.
+        self.fx_sprite_blend_pipeline = None;
+        self.fx_sprite_additive_pipeline = None;
+        self.fx_sprite_blend_unlit_pipeline = None;
+    }
+
+    fn ensure_fx_sprite_pipeline(&mut self, device: &wgpu::Device, alpha_mode: DynamicModelAlphaMode) {
+        let ready = match alpha_mode {
+            DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.is_some(),
+            DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.is_some(),
+            DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.is_some(),
+            DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.is_some(),
+            DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.is_some(),
+            DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.is_some(),
+            DynamicModelAlphaMode::BlendUnlit => self.fx_sprite_blend_unlit_pipeline.is_some(),
+            DynamicModelAlphaMode::Modulate => self.fx_sprite_modulate_pipeline.is_some(),
+            DynamicModelAlphaMode::Modulate2x => self.fx_sprite_modulate2x_pipeline.is_some(),
+            DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline.is_some(),
+        };
+        if ready {
+            return;
+        }
+        if self.fx_sprite_shader.is_none() {
+            self.fx_sprite_shader = Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("JKA GPU FX sprite shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("fx_sprite.wgsl").into()),
+            }));
+        }
+        let pipeline = {
+            let shader = self.fx_sprite_shader.as_ref().expect("FX sprite shader created");
+            create_fx_sprite_pipeline(
+                device,
+                &self.pipeline_layout,
+                shader,
+                self.fx_sprite_surface_format,
+                self.fx_sprite_samples,
+                alpha_mode,
+                self.legacy_fog_compiled,
+                self.fx_zero_alpha_discard,
+            )
+        };
+        match alpha_mode {
+            DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::BlendUnlit => self.fx_sprite_blend_unlit_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Modulate => self.fx_sprite_modulate_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Modulate2x => self.fx_sprite_modulate2x_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline = Some(pipeline),
+        }
+    }
+
+    fn ensure_fx_sprite_instance_capacity(&mut self, device: &wgpu::Device, required: u64) {
+        if required <= self.fx_sprite_instance_capacity {
+            return;
+        }
+        self.fx_sprite_instance_capacity = required.next_power_of_two().max(4096);
+        self.fx_sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA GPU FX sprite instance buffer"),
+            size: self.fx_sprite_instance_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
     }
@@ -4628,8 +5086,18 @@ impl DynamicModelRenderer {
             bytemuck::bytes_of(&DynamicEntityLightingUniform::new(
                 self.entity_ambient_lighting,
                 self.entity_legacy_fog,
+                self.model_brightness,
             )),
         );
+    }
+
+    fn set_model_brightness(&mut self, queue: &wgpu::Queue, brightness: f32) {
+        let brightness = if brightness.is_finite() { brightness.max(0.0) } else { 1.0 };
+        if (self.model_brightness - brightness).abs() < f32::EPSILON {
+            return;
+        }
+        self.model_brightness = brightness;
+        self.write_entity_lighting(queue);
     }
 
     fn prepare_rt_skinned(
@@ -4638,9 +5106,13 @@ impl DynamicModelRenderer {
         queue: &wgpu::Queue,
         surfaces: &[DynamicModelSurface],
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
+        rt_receivers: bool,
     ) {
         self.ensure_rt_skinning_resources(device);
+        let mut raw_colors = std::mem::take(&mut self.scratch_raw_colors);
+        raw_colors.clear();
         self.draws.clear();
+        self.fx_sprite_draws.clear();
         self.skin_draws.clear();
         self.frame_texture_keys.clear();
         self.ghoul2_input_instances = 0;
@@ -4753,6 +5225,9 @@ impl DynamicModelRenderer {
                     vertices.len().saturating_add(skin.vertices.len()),
                     DynamicModelVertex::zeroed(),
                 );
+                if rt_receivers {
+                    raw_colors.resize(vertices.len(), skin.color);
+                }
                 indices.extend_from_slice(skin.indices.as_slice());
 
                 let pose_key = Arc::as_ptr(&skin.bones) as usize;
@@ -4824,6 +5299,9 @@ impl DynamicModelRenderer {
             }
             let base_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
             let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+            if rt_receivers {
+                raw_colors.extend(surface.vertices.iter().map(|vertex| vertex.color));
+            }
             if let Some(light) = classic_light {
                 for source in surface.vertices.iter() {
                     let normal = Vec3::from_array(source.normal).normalize_or_zero();
@@ -4893,6 +5371,21 @@ impl DynamicModelRenderer {
         rt_casters = deduped;
 
         self.ghoul2_encoded_draws = visible_gpu_draws;
+        if rt_receivers && !raw_colors.is_empty() {
+            debug_assert_eq!(raw_colors.len(), vertices.len());
+            let bytes = bytemuck::cast_slice(raw_colors.as_slice());
+            let size = bytes.len() as u64;
+            if self.rt_raw_color_buffer.as_ref().is_none_or(|buffer| buffer.size() < size) {
+                self.rt_raw_color_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("RT model original material colors"),
+                    size: size.next_power_of_two().max(16),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            queue.write_buffer(self.rt_raw_color_buffer.as_ref().unwrap(), 0, bytes);
+        }
+        self.scratch_raw_colors = raw_colors;
         let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
         let index_bytes = bytemuck::cast_slice(indices.as_slice());
         let bone_bytes = bytemuck::cast_slice(bones.as_slice());
@@ -4963,13 +5456,15 @@ impl DynamicModelRenderer {
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
         separate_wireframe_classes: bool,
         ray_traced_shadows: bool,
+        rt_receivers: bool,
     ) {
         self.rt_prepared = false;
         if ray_traced_shadows {
-            self.prepare_rt_skinned(device, queue, surfaces, classic_grid);
+            self.prepare_rt_skinned(device, queue, surfaces, classic_grid, rt_receivers);
             return;
         }
         self.draws.clear();
+        self.fx_sprite_draws.clear();
         self.skin_draws.clear();
         self.frame_texture_keys.clear();
         self.ghoul2_input_instances = 0;
@@ -4980,12 +5475,12 @@ impl DynamicModelRenderer {
 
         let total_vertices = surfaces
             .iter()
-            .filter(|surface| surface.ghoul2_gpu.is_none())
+            .filter(|surface| surface.ghoul2_gpu.is_none() && surface.fx_gpu_sprites.is_none())
             .map(|surface| surface.vertices.len())
             .sum();
         let total_indices = surfaces
             .iter()
-            .filter(|surface| surface.ghoul2_gpu.is_none())
+            .filter(|surface| surface.ghoul2_gpu.is_none() && surface.fx_gpu_sprites.is_none())
             .map(|surface| surface.indices.len())
             .sum();
         let mut vertices = std::mem::take(&mut self.scratch_vertices);
@@ -4994,6 +5489,8 @@ impl DynamicModelRenderer {
         let mut indices = std::mem::take(&mut self.scratch_indices);
         indices.clear();
         indices.reserve(total_indices);
+        let mut fx_sprite_instances = std::mem::take(&mut self.scratch_fx_sprite_instances);
+        fx_sprite_instances.clear();
         let mut bones = std::mem::take(&mut self.scratch_bones);
         bones.clear();
         let mut gpu_draw_data = std::mem::take(&mut self.scratch_draw_data);
@@ -5008,6 +5505,21 @@ impl DynamicModelRenderer {
 
         for surface in surfaces {
             let texture_key = self.ensure_texture(device, queue, surface.texture.as_ref());
+            if let Some(sprites) = surface.fx_gpu_sprites.as_ref() {
+                if sprites.instances.is_empty() {
+                    continue;
+                }
+                let first_instance = u32::try_from(fx_sprite_instances.len()).unwrap_or(u32::MAX);
+                fx_sprite_instances.extend_from_slice(sprites.instances.as_slice());
+                self.fx_sprite_draws.push(FxGpuSpritePreparedDraw {
+                    first_instance,
+                    instance_count: u32::try_from(sprites.instances.len()).unwrap_or(u32::MAX),
+                    texture_key,
+                    alpha_mode: surface.alpha_mode,
+                    wireframe_class: surface.wireframe_class,
+                });
+                continue;
+            }
             let classic_light = if self.entity_ambient_lighting
                 == EntityAmbientLightingMode::BspLightgridClassic
                 && !matches!(
@@ -5232,6 +5744,19 @@ impl DynamicModelRenderer {
             queue.write_buffer(&self.index_buffer, 0, index_bytes);
         }
 
+        if !self.fx_sprite_draws.is_empty() {
+            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
+                if self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == alpha_mode) {
+                    self.ensure_fx_sprite_pipeline(device, alpha_mode);
+                }
+            }
+        }
+        let fx_sprite_bytes = bytemuck::cast_slice(fx_sprite_instances.as_slice());
+        self.ensure_fx_sprite_instance_capacity(device, fx_sprite_bytes.len() as u64);
+        if !fx_sprite_bytes.is_empty() {
+            queue.write_buffer(&self.fx_sprite_instance_buffer, 0, fx_sprite_bytes);
+        }
+
         let bone_bytes = bytemuck::cast_slice(bones.as_slice());
         let draw_bytes = bytemuck::cast_slice(gpu_draw_data.as_slice());
         self.ensure_skin_capacity(device, bone_bytes.len() as u64, draw_bytes.len() as u64);
@@ -5244,6 +5769,7 @@ impl DynamicModelRenderer {
 
         self.scratch_vertices = vertices;
         self.scratch_indices = indices;
+        self.scratch_fx_sprite_instances = fx_sprite_instances;
         self.scratch_bones = bones;
         self.scratch_draw_data = gpu_draw_data;
         self.scratch_bone_offsets = bone_offsets;
@@ -5264,6 +5790,8 @@ impl DynamicModelRenderer {
         pass: &mut wgpu::RenderPass<'a>,
         camera: &'a wgpu::BindGroup,
         depth_writing_phase: bool,
+        rt_receivers: Option<(&'a rt_models::RtModelReceivers, &'a wgpu::BindGroup)>,
+        mut gpu_profiler: Option<&mut GpuProfiler>,
     ) {
         // Match the renderer-wide opaque-before-blended contract across both
         // dynamic geometry backends. The phase split is also used by water:
@@ -5292,6 +5820,21 @@ impl DynamicModelRenderer {
                     DynamicModelAlphaMode::Modulate2x => &self.modulate2x_pipeline,
                     DynamicModelAlphaMode::Darken => &self.darken_pipeline,
                 };
+                let pipeline = if let Some((models, scene)) = rt_receivers.filter(|_| self.rt_prepared) {
+                    let receiver_pipeline = match alpha_mode {
+                        DynamicModelAlphaMode::Opaque => Some(&models.opaque),
+                        DynamicModelAlphaMode::Mask => Some(&models.mask),
+                        DynamicModelAlphaMode::Blend => Some(&models.blend),
+                        DynamicModelAlphaMode::MaskBlend => Some(&models.mask_blend),
+                        _ => None,
+                    };
+                    if let Some(receiver_pipeline) = receiver_pipeline {
+                        pass.set_vertex_buffer(1, self.rt_raw_color_buffer.as_ref().expect("RT receiver colors prepared").slice(..));
+                        pass.set_bind_group(2, &models.lights, &[]);
+                        pass.set_bind_group(3, scene, &[]);
+                        receiver_pipeline
+                    } else { pipeline }
+                } else { pipeline };
                 pass.set_pipeline(pipeline);
                 for draw in self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
                     let bind_group = draw.texture_key.as_ref().and_then(|key| self.textures.get(key)).map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
@@ -5302,6 +5845,60 @@ impl DynamicModelRenderer {
                         0..1,
                     );
                 }
+            }
+        }
+
+        let has_fx_sprites_in_phase = self.fx_sprite_draws.iter().any(|draw|
+            dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
+        );
+        if has_fx_sprites_in_phase {
+            let timed_pass = if depth_writing_phase {
+                GpuPass::FxSpritesOpaque
+            } else {
+                GpuPass::FxSpritesTranslucent
+            };
+            if let Some(profiler) = gpu_profiler.as_deref_mut() {
+                profiler.write_render_pass_timestamp(pass, timed_pass, false);
+            }
+            pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+            pass.set_bind_group(0, camera, &[]);
+            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
+                .into_iter()
+                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+                // FX sprite pipelines are intentionally lazy.  Only visit alpha
+                // modes that actually have sprite draws this frame; otherwise a
+                // missing (correctly-unbuilt) pipeline would be mistaken for an
+                // error when GPU FX is enabled.
+                .filter(|mode| self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == *mode))
+            {
+                let pipeline = match alpha_mode {
+                    DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::BlendUnlit => self.fx_sprite_blend_unlit_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Modulate => self.fx_sprite_modulate_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Modulate2x => self.fx_sprite_modulate2x_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                    DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline.as_ref().expect("FX sprite pipeline prepared for active alpha mode"),
+                };
+                pass.set_pipeline(pipeline);
+                for draw in self.fx_sprite_draws.iter().filter(|draw| draw.alpha_mode == alpha_mode) {
+                    let bind_group = draw
+                        .texture_key
+                        .as_ref()
+                        .and_then(|key| self.textures.get(key))
+                        .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                    pass.set_bind_group(1, bind_group, &[]);
+                    pass.draw(
+                        0..6,
+                        draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
+                    );
+                }
+            }
+            if let Some(profiler) = gpu_profiler.as_deref_mut() {
+                profiler.write_render_pass_timestamp(pass, timed_pass, true);
             }
         }
 
@@ -5343,7 +5940,7 @@ impl DynamicModelRenderer {
 
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
         for depth_writing_phase in [true, false] {
-            self.draw_phase(pass, camera, depth_writing_phase);
+            self.draw_phase(pass, camera, depth_writing_phase, None, None);
         }
     }
 
@@ -5358,6 +5955,15 @@ impl DynamicModelRenderer {
                 device,
                 &self.pipeline_layout,
                 &self.shader,
+                surface_format,
+                samples,
+            ));
+        }
+        if !self.fx_sprite_draws.is_empty() && self.fx_sprite_wireframe_pipeline.is_none() {
+            self.fx_sprite_wireframe_pipeline = Some(create_fx_sprite_wireframe_pipeline(
+                device,
+                &self.pipeline_layout,
+                self.fx_sprite_shader.as_ref().expect("FX sprite shader created"),
                 surface_format,
                 samples,
             ));
@@ -5392,12 +5998,38 @@ impl DynamicModelRenderer {
                     pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                     pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(0, camera, &[]);
+                    // Keep slot 1 layout-compatible even though fs_wireframe does
+                    // not sample it. Debug overlays share the normal model
+                    // pipeline layout, so relying on whatever another overlay
+                    // left bound here is invalid in WGPU.
+                    pass.set_bind_group(1, &self.fallback_bind_group, &[]);
                     bound = true;
                 }
                 pass.draw_indexed(
                     draw.first_index..draw.first_index.saturating_add(draw.index_count),
                     draw.base_vertex,
                     0..1,
+                );
+            }
+        }
+
+        if let Some(pipeline) = &self.fx_sprite_wireframe_pipeline {
+            let mut bound = false;
+            for draw in self
+                .fx_sprite_draws
+                .iter()
+                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0)
+            {
+                if !bound {
+                    pass.set_pipeline(pipeline);
+                    pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+                    pass.set_bind_group(0, camera, &[]);
+                    pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                    bound = true;
+                }
+                pass.draw(
+                    0..6,
+                    draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
                 );
             }
         }
@@ -5413,6 +6045,7 @@ impl DynamicModelRenderer {
                 if !bound {
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, camera, &[]);
+                    pass.set_bind_group(1, &self.fallback_bind_group, &[]);
                     pass.set_bind_group(2, &self.skin_bind_group, &[]);
                     bound = true;
                 }
@@ -5547,8 +6180,10 @@ struct WorldShaderVariantKey {
     local_shadows: bool,
     cascaded_shadows: bool,
     ray_traced_shadows: bool,
+    ray_traced_sun: bool,
     planar_reflections: bool,
     legacy_fog: bool,
+    jump_shade: bool,
     ocean: bool,
     detail_texture_mode: u32,
 }
@@ -5620,6 +6255,7 @@ impl WorldShaderVariantKey {
             ("ENABLE_OCEAN", f64::from(u8::from(self.ocean))),
             ("DETAIL_TEXTURE_MODE", f64::from(self.detail_texture_mode)),
             ("ENABLE_LEGACY_FOG", f64::from(u8::from(self.legacy_fog))),
+            ("ENABLE_JUMP_SHADE", f64::from(u8::from(self.jump_shade))),
         ];
         // The stock BSP shaders intentionally do not declare the experimental
         // ray-query override. Only the lazily-created RT shader receives it, so
@@ -5627,6 +6263,7 @@ impl WorldShaderVariantKey {
         // as it was before hardware RT support existed.
         if self.ray_traced_shadows {
             constants.push(("ENABLE_RAY_TRACED_SHADOWS", 1.0));
+            constants.push(("ENABLE_RAY_TRACED_SUN", f64::from(u8::from(self.ray_traced_sun))));
         }
         constants
     }
@@ -5688,13 +6325,16 @@ impl WorldShaderVariantKey {
             enabled.push("sun-shadow");
         }
         if self.ray_traced_shadows {
-            enabled.push("rt-shadow");
+            enabled.push(if self.ray_traced_sun { "rt-shadow" } else { "rt-local" });
         }
         if self.planar_reflections {
             enabled.push("planar");
         }
         if self.legacy_fog {
             enabled.push("legacy-fog");
+        }
+        if self.jump_shade {
+            enabled.push("jump-shade");
         }
         if self.ocean {
             enabled.push("ocean");
@@ -5722,7 +6362,7 @@ struct FramePlan {
     use_clustered_lighting: bool,
 }
 
-const GPU_PASS_COUNT: usize = 16;
+const GPU_PASS_COUNT: usize = 20;
 const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 const GPU_PROFILER_SLOTS: usize = 3;
 const CULL_DIAGNOSTIC_READBACK_SLOTS: usize = 3;
@@ -5756,6 +6396,15 @@ enum GpuPass {
     // Sub-intervals of RtBuild; exclude from the frame-time fallback sum.
     RtSkin = 14,
     RtAcceleration = 15,
+    RtVisibility = 16,
+    // Sub-timings inside dynamic models for GPU-instanced EFX sprites. Keep
+    // opaque/depth-writing and translucent phases separate because the ocean
+    // path can split them into distinct render passes.
+    FxSpritesOpaque = 17,
+    FxSpritesTranslucent = 18,
+    // Sub-timing inside World: OpenJK-style additive projected-light redraw of
+    // only BSP triangle runs carrying a non-zero Legacy dlight surface mask.
+    LegacyDlights = 19,
 }
 
 impl GpuPass {
@@ -5799,6 +6448,7 @@ impl GpuTiming {
             GpuPass::Cluster,
             GpuPass::GrassPrepare,
             GpuPass::RtBuild,
+            GpuPass::RtVisibility,
             GpuPass::World,
             GpuPass::Post,
             GpuPass::Ui,
@@ -6251,9 +6901,88 @@ fn inspector_texture_meta(texture: &TextureData) -> InspectorTextureMeta {
 }
 
 #[derive(Clone)]
+struct LegacyDlightRun {
+    surface_id: u32,
+    indexed_range: std::ops::Range<u32>,
+}
+
+/// A slice of a shared uniform buffer. Every world batch owns two small
+/// uniform blocks; as separate buffers those are ~30,000 allocations on a big
+/// map, and DX12 pads each to a 64 KiB resource (out of memory). Batches share
+/// `UniformArena` chunks and bind their slice by offset instead.
+#[derive(Clone)]
+struct UniformSlot {
+    buffer: wgpu::Buffer,
+    offset: u64,
+    size: u64,
+}
+
+impl UniformSlot {
+    fn binding(&self) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.buffer,
+            offset: self.offset,
+            size: wgpu::BufferSize::new(self.size),
+        })
+    }
+}
+
+/// Hands out fixed-size, offset-aligned `UniformSlot`s from chunked buffers.
+struct UniformArena {
+    label: &'static str,
+    stride: u64,
+    chunk: Option<(wgpu::Buffer, u64)>,
+    chunk_bytes: u64,
+}
+
+impl UniformArena {
+    const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+
+    fn new(device: &wgpu::Device, label: &'static str, uniform_size: u64) -> Self {
+        let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(1);
+        Self {
+            label,
+            stride: uniform_size.div_ceil(alignment) * alignment,
+            chunk: None,
+            chunk_bytes: Self::CHUNK_BYTES.max(uniform_size.div_ceil(alignment) * alignment),
+        }
+    }
+
+    fn push(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, contents: &[u8]) -> UniformSlot {
+        let needs_chunk = self
+            .chunk
+            .as_ref()
+            .is_none_or(|(_, used)| used + self.stride > self.chunk_bytes);
+        if needs_chunk {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: self.chunk_bytes,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.chunk = Some((buffer, 0));
+        }
+        let (buffer, used) = self.chunk.as_mut().expect("chunk was just created");
+        let offset = *used;
+        *used += self.stride;
+        queue.write_buffer(buffer, offset, contents);
+        UniformSlot {
+            buffer: buffer.clone(),
+            offset,
+            size: contents.len() as u64,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct WorldBatch {
     source: DrawBatch,
     indexed_range: std::ops::Range<u32>,
+    /// Contiguous authored-BSP surface runs inside `indexed_range`. Legacy
+    /// projected lights use these to redraw only triangles belonging to a
+    /// surface whose OpenJK-style dlight mask is non-zero. Inline BSP models
+    /// intentionally leave this empty and use their existing all-light fallback.
+    legacy_dlight_runs: Vec<LegacyDlightRun>,
     /// True for a CG_Mover inline BSP model rather than static world geometry.
     /// Debug-only classification; normal world submission never branches on it.
     is_inline_entity: bool,
@@ -6261,10 +6990,14 @@ struct WorldBatch {
     ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
     bind_group: wgpu::BindGroup,
     fast_bind_group: wgpu::BindGroup,
-    _material_buffer: wgpu::Buffer,
-    _fog_buffer: wgpu::Buffer,
+    _material_buffer: UniformSlot,
+    _fog_buffer: UniformSlot,
     cull_index: u32,
     compact_group: Option<u32>,
+    /// Draw-state class shared by mover (inline model) batches, or `u32::MAX`.
+    /// Movers change every frame, so instead of load-time compaction groups the
+    /// visible members of one class are packed into a single multi-draw.
+    inline_group: u32,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
 }
@@ -6280,6 +7013,7 @@ struct SnowShellGpu {
     // Static map-load tessellation, spatially chunked. Runtime footsteps never
     // rebuild this buffer; the persistent Snowflow field moves vertices on GPU.
     vertex_buffer: wgpu::Buffer,
+    legacy_dlight_surface_id_buffer: wgpu::Buffer,
     draws: Vec<SnowShellDraw>,
 }
 
@@ -6287,7 +7021,6 @@ struct SnowShellGpu {
 enum WorldBatchSet {
     Coarse,
     Full,
-    Auto4,
 }
 
 struct WorldDrawGroup {
@@ -6297,15 +7030,16 @@ struct WorldDrawGroup {
     max_count: u32,
 }
 
+/// Concatenate one AUTO 4 geometry's FULL piece index ranges.
 #[derive(Debug)]
 struct Auto4CollapseRequest {
-    variant: usize,
+    geometry: usize,
     members: Vec<usize>,
 }
 
 #[derive(Debug)]
 struct Auto4CollapseResult {
-    variant: usize,
+    geometry: usize,
     indices: Vec<u32>,
 }
 
@@ -6319,7 +7053,7 @@ struct Auto4CollapseWorker {
 impl Auto4CollapseWorker {
     fn spawn(
         source_indices: Arc<Vec<u32>>,
-        portal_ranges: Arc<Vec<std::ops::Range<u32>>>,
+        piece_ranges: Arc<Vec<std::ops::Range<u32>>>,
     ) -> Result<Self, String> {
         let (request_tx, request_rx) =
             mpsc::sync_channel::<Auto4CollapseRequest>(AUTO4_COLLAPSE_QUEUE_DEPTH);
@@ -6339,26 +7073,21 @@ impl Auto4CollapseWorker {
                     let index_count = request
                         .members
                         .iter()
-                        .filter_map(|&member| portal_ranges.get(member))
+                        .filter_map(|&member| piece_ranges.get(member))
                         .map(|range| range.end.saturating_sub(range.start) as usize)
                         .sum::<usize>();
                     let mut indices = Vec::with_capacity(index_count);
                     for &member in &request.members {
-                        if worker_cancel.load(Ordering::Acquire) {
-                            return;
-                        }
-                        let Some(range) = portal_ranges.get(member) else {
+                        let Some(range) = piece_ranges.get(member) else {
                             continue;
                         };
-                        let start = range.start as usize;
-                        let end = range.end as usize;
-                        if let Some(slice) = source_indices.get(start..end) {
+                        if let Some(slice) = source_indices.get(range.start as usize..range.end as usize) {
                             indices.extend_from_slice(slice);
                         }
                     }
                     if result_tx
                         .send(Auto4CollapseResult {
-                            variant: request.variant,
+                            geometry: request.geometry,
                             indices,
                         })
                         .is_err()
@@ -6387,16 +7116,19 @@ impl Drop for Auto4CollapseWorker {
     }
 }
 
+/// Residency of one AUTO 4 physical geometry (shared by every stage recipe
+/// that draws the same FULL piece ranges).
 #[derive(Debug)]
-enum Auto4VariantCacheState {
+enum Auto4GeometryState {
+    /// FULL's existing index data already holds this recipe as one run.
+    Static,
     Uncached,
     Pending,
-    /// Could not fit while every resident group was protected by the current
-    /// plan. Retry only after entering a different cluster to avoid rebuild
-    /// churn on a plan whose working set exceeds the cache.
+    /// Could not fit while every resident geometry was protected by the
+    /// current plan. Retry only after entering a different cluster to avoid
+    /// rebuild churn on a plan whose working set exceeds the cache.
     Deferred,
-    /// This one physical group is larger than the entire cache. It always uses
-    /// the exact multi-draw fallback.
+    /// Larger than the entire cache; always drawn as its FULL pieces.
     Uncacheable,
     Ready {
         range: std::ops::Range<u32>,
@@ -6404,9 +7136,19 @@ enum Auto4VariantCacheState {
     },
 }
 
+/// Per-plan submission statistics, logged when `r_cullDebug` is active.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Auto4PlanStats {
+    physical_draws: usize,
+    fallback_recipes: usize,
+    fallback_draws: usize,
+    area_split_recipes: usize,
+    base_draws: usize,
+}
+
 struct Auto4CollapseCache {
     worker: Option<Auto4CollapseWorker>,
-    states: Vec<Auto4VariantCacheState>,
+    states: Vec<Auto4GeometryState>,
     capacity_indices: u32,
     free_ranges: Vec<std::ops::Range<u32>>,
     used_indices: u32,
@@ -6416,16 +7158,19 @@ struct Auto4CollapseCache {
     evictions: u64,
     oversize: u64,
     current_cluster: Option<usize>,
-    last_reported_cluster: Option<usize>,
+    current_area_mask: Option<[u8; 32]>,
+    /// Geometries referenced by the current plan; reused scratch so eviction
+    /// never allocates.
+    protected: Vec<bool>,
+    stats: Auto4PlanStats,
 }
 
 impl Auto4CollapseCache {
-    fn disabled(variant_count: usize) -> Self {
+    fn new(states: Vec<Auto4GeometryState>) -> Self {
+        let geometry_count = states.len();
         Self {
             worker: None,
-            states: (0..variant_count)
-                .map(|_| Auto4VariantCacheState::Uncached)
-                .collect(),
+            states,
             capacity_indices: 0,
             free_ranges: Vec::new(),
             used_indices: 0,
@@ -6435,7 +7180,9 @@ impl Auto4CollapseCache {
             evictions: 0,
             oversize: 0,
             current_cluster: None,
-            last_reported_cluster: None,
+            current_area_mask: None,
+            protected: vec![false; geometry_count],
+            stats: Auto4PlanStats::default(),
         }
     }
 
@@ -6477,6 +7224,10 @@ impl Auto4CollapseCache {
 
 struct WorldPipelineVariant {
     pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    /// OpenJK-style projected-light redraw. The normal world material pipelines
+    /// compile with Legacy dlights disabled; only touched BSP triangles enter
+    /// these additive depth-equal pipelines.
+    legacy_dlight_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     // OpenJK r_drawfog 1, and r_drawfog 2 local brush fog, redraw the final
     // material result with a dedicated SRC_ALPHA/ONE_MINUS_SRC_ALPHA fog pass.
     // Keyed by the authored material pipeline so the draw loop can switch to
@@ -6548,6 +7299,10 @@ struct PlanarReflectionView {
     camera_forward: Vec3,
     cluster: Option<usize>,
     coarse_batch_index: usize,
+    /// `view_proj` narrowed to the screen rectangle covered by the visible
+    /// coplanar reflectors. The reflected camera shares the main camera's clip
+    /// space, so geometry outside this rectangle can never be sampled.
+    cull_view_proj: Mat4,
 }
 
 struct PlanarReflectionResources {
@@ -6616,6 +7371,16 @@ struct WorldGpu {
     active_cull_indices_buffer: wgpu::Buffer,
     compact_indirect_buffer: wgpu::Buffer,
     compact_count_buffer: wgpu::Buffer,
+    /// Planar reflection passes pack their visible compact-group members here
+    /// (every slot of one frame, back to back) and draw each group with one
+    /// CPU-counted multi-draw.
+    reflection_compact_indirect_buffer: wgpu::Buffer,
+    reflection_compact_capacity: u32,
+    /// Mover multi-draw arguments: one `inline_indirect_capacity` region for
+    /// the main pass followed by one per planar reflection slot.
+    inline_indirect_buffer: wgpu::Buffer,
+    inline_indirect_capacity: u32,
+    inline_group_count: usize,
     cull_debug_reason_buffer: wgpu::Buffer,
     cull_debug_count_buffer: wgpu::Buffer,
     cull_debug_bind_group: wgpu::BindGroup,
@@ -6626,6 +7391,15 @@ struct WorldGpu {
     compact_groups: Vec<WorldDrawGroup>,
     light_buffer: wgpu::Buffer,
     _cluster_buffer: wgpu::Buffer,
+    legacy_dlight_surface_id_buffer: wgpu::Buffer,
+    legacy_dlight_surface_mask_buffer: wgpu::Buffer,
+    /// Mirrors the GPU surface-mask buffer so the isolated Legacy dlight pass
+    /// can submit only touched triangle runs instead of rasterizing every BSP
+    /// surface just to discover a zero mask in the fragment shader.
+    legacy_dlight_surface_masks_cpu: Mutex<Vec<u32>>,
+    /// CPU copy used only by the Trace/surface-inspector diagnostic.
+    legacy_dlight_triangle_surfaces: Vec<u32>,
+    legacy_dlight_surfaces: Vec<scene::LegacyDlightSurface>,
     dynamic_lights: Vec<scene::DynamicLight>,
     cluster_compute_bind_group: wgpu::BindGroup,
     lighting_bind_group: wgpu::BindGroup,
@@ -6670,15 +7444,22 @@ struct WorldGpu {
     /// children, so it cannot re-introduce PVS/areamask-hidden geometry.
     auto3_visible_batches_by_cluster: Vec<Vec<usize>>,
     auto3_candidate_batches_by_cluster: Vec<usize>,
-    /// AUTO 4 portal-plan representation. Static portal-owned batches and lazy
-    /// physical-collapse placeholders share this address space; inline mover
-    /// aliases are appended at the end. Cluster recipes are immutable, while
-    /// `auto4_active_plan` swaps a ready collapsed group for its base pieces.
+    /// AUTO 4 representation. `[0, auto4_variant_base)` is a shallow alias of
+    /// `full_batches` (same indices, cull records and compaction groups, used
+    /// as the exact cold fallback); `[auto4_variant_base, ..)` holds one batch
+    /// per collapsed recipe (visible FULL pieces of one MINIMAL batch).
     auto4_batches: Vec<WorldBatch>,
     auto4_plan_refs: Vec<Vec<PreparedPortalPlanBatchRef>>,
     auto4_plan_by_cluster: Vec<usize>,
     auto4_variant_members: Vec<Vec<usize>>,
+    auto4_variant_geometry: Vec<usize>,
+    auto4_variant_area_mixed: Vec<bool>,
+    auto4_geometry_members: Vec<Vec<usize>>,
+    auto4_geometry_variants: Vec<Vec<usize>>,
     auto4_variant_base: usize,
+    /// FULL pieces drawn in every cluster: pieces appended after the plan was
+    /// built (no PVS) followed by the inline mover tail.
+    auto4_always_start: usize,
     auto4_active_plan: Vec<usize>,
     auto4_inline_start: usize,
     auto4_inline_full_start: usize,
@@ -8715,6 +9496,14 @@ struct FrameInfo {
     cull_hiz_rejected: u32,
     cull_pvs_rejected: u32,
     cull_area_rejected: u32,
+    /// CPU-side world submission counts for the main camera. These remain
+    /// useful when GPU-driven culling is disabled, which is exactly where
+    /// OpenJK-style BSP/PVS + frustum rejection prevents command-encoder blowup.
+    world_pvs_batches: u32,
+    world_frustum_rejected: u32,
+    world_encoded_batches: u32,
+    world_multidraw_groups: u32,
+    world_multidraw_batches: u32,
     grass: GrassDrawStats,
 }
 
@@ -8859,16 +9648,33 @@ struct Renderer {
     world_wireframe_pipelines: BTreeMap<WorldShaderVariantKey, wgpu::RenderPipeline>,
     fast_world_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     surface_inspector_shader: wgpu::ShaderModule,
-    surface_inspector_pipeline: wgpu::RenderPipeline,
+    surface_inspector_pipeline: Option<wgpu::RenderPipeline>,
+    debug_volumes: DebugVolumeRenderer,
+    debug_volume_shader: wgpu::ShaderModule,
     inspector_vertex_range: Option<std::ops::Range<u32>>,
     ui_pipeline: wgpu::RenderPipeline,
+    screen_fx_shader: wgpu::ShaderModule,
+    screen_fx_texture_layout: wgpu::BindGroupLayout,
+    screen_fx_pipeline_layout: wgpu::PipelineLayout,
+    screen_fx_sampler: wgpu::Sampler,
+    screen_fx_white_bind_group: wgpu::BindGroup,
+    screen_fx_pipelines: HashMap<FxBlend, wgpu::RenderPipeline>,
+    screen_fx_textures: HashMap<String, ScreenFxTexture>,
+    screen_fx_vertex_buffer: wgpu::Buffer,
+    screen_fx_vertex_count: u32,
+    screen_fx_batches: Vec<ScreenFxBatch>,
     ui_texture_layout: wgpu::BindGroupLayout,
     ui_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
     _ui_splash: GpuImage,
+    /// OpenJK MP fallback (`menu/art/unknownmap_mp`) uploaded once with the
+    /// renderer so entering a load screen never waits on filesystem/image I/O.
+    _ui_unknown_map: GpuImage,
+    ui_unknown_map_size: Option<[u32; 2]>,
     ui_splash_size: Option<[u32; 2]>,
     ui_loading_image_key: Option<String>,
+    ui_pending_levelshot: Option<PendingUiLevelshot>,
     ui_small_font_metrics: Option<ui::ProportionalFont>,
     _ui_font_sampler: wgpu::Sampler,
     ui_vertex_buffer: wgpu::Buffer,
@@ -8906,6 +9712,7 @@ struct Renderer {
     sky_sampler: wgpu::Sampler,
     texture_filter: TextureFilter,
     detail_textures_mode: DetailTextureMode,
+    jump_shade: JumpShadeState,
     detail_texture_fade: bool,
     detail_texture_fade_distance: f32,
     gamma: f32,
@@ -8991,15 +9798,32 @@ struct Renderer {
     indirect_supported: bool,
     gpu_compaction_supported: bool,
     compact_group_scratch: Vec<bool>,
+    // CPU-culling counterpart to the GPU compactor. These retained vectors let
+    // the ordinary PVS + frustum path pack same-state visible draws into the
+    // existing indirect buffer without per-frame allocation churn.
+    cpu_compact_indirect_scratch: Vec<DrawIndexedIndirectArgs>,
+    cpu_compact_count_scratch: Vec<u32>,
+    reflection_compact_scratch: Vec<DrawIndexedIndirectArgs>,
+    /// Per compact group for the current reflection slot: (first packed
+    /// entry, entry count). A drawn group's count is reset to 0.
+    reflection_compact_groups: Vec<(u32, u32)>,
+    /// Retained scratch for grouping visible mover batches into multi-draws.
+    inline_visible_scratch: Vec<usize>,
+    inline_pose_scratch: Vec<Option<InlineModelInstance>>,
+    inline_draw_scratch: InlineDrawScratch,
     gpu_driven_enabled: bool,
     hiz_occlusion_enabled: bool,
     dynamic_lights_mode: DynamicLightsMode,
+    rt_samples: u32,
+    rt_reduced_shadows: bool,
     clustered_lighting_enabled: bool,
     map_light_simulation_enabled: bool,
     classic_fullbright: bool,
     classic_vertex_light: bool,
     classic_lightmap_only: bool,
     transient_lights: Vec<TransientLight>,
+    /// Setup > Video brightness multiplier applied to runtime dynamic lights.
+    dynamic_light_brightness: f32,
     emissive_area_lights_enabled: bool,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
@@ -9039,7 +9863,7 @@ struct Renderer {
     cull_debug_layout: wgpu::BindGroupLayout,
     cull_debug_pipeline_layout: wgpu::PipelineLayout,
     cull_debug_shader: wgpu::ShaderModule,
-    cull_debug_pipeline: wgpu::RenderPipeline,
+    cull_debug_pipeline: Option<wgpu::RenderPipeline>,
     cluster_compute_layout: wgpu::BindGroupLayout,
     cluster_compute_pipeline: wgpu::ComputePipeline,
     lighting_layout: wgpu::BindGroupLayout,
@@ -9058,7 +9882,7 @@ struct Renderer {
     post_shader: wgpu::ShaderModule,
     post_pipeline_layout: wgpu::PipelineLayout,
     post_pipeline: wgpu::RenderPipeline,
-    taa_post_pipeline: wgpu::RenderPipeline,
+    taa_post_pipeline: Option<wgpu::RenderPipeline>,
     cloud_march_pipeline: wgpu::RenderPipeline,
     cloud_resolve_pipeline: wgpu::RenderPipeline,
     cloud_resolve_layout: wgpu::BindGroupLayout,
@@ -9538,6 +10362,7 @@ impl Renderer {
                 camera_forward: [0.0, 0.0, -1.0, 0.0],
                 unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                 previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                jump_shade: [0.0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -9553,6 +10378,7 @@ impl Renderer {
                         camera_forward: [0.0, 0.0, -1.0, 0.0],
                         unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                         previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                        jump_shade: [0.0; 4],
                     }),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 })
@@ -9752,6 +10578,7 @@ impl Renderer {
                     texture_3d_entry_stages(7, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                     sampler_entry_stages(8, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                     uniform_entry(9, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    storage_buffer_entry(16, true, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 ],
             });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -9772,6 +10599,7 @@ impl Renderer {
                 uniform_entry(12, wgpu::ShaderStages::FRAGMENT),
                 texture_3d_entry(13),
                 uniform_entry(14, wgpu::ShaderStages::FRAGMENT),
+                storage_buffer_entry(16, true, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let shadow_receiver_layout =
@@ -10032,17 +10860,16 @@ impl Renderer {
         // creates them, and changing the category mask only compiles a family the
         // first frame that family is actually requested.
         let wireframe_pipeline = None;
+        let debug_volume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA trigger/clip debug volume shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("volume_debug.wgsl").into()),
+        });
         let surface_inspector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA surface inspector shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("surface_inspector.wgsl").into()),
         });
-        let surface_inspector_pipeline = create_surface_inspector_pipeline(
-            &device,
-            &wireframe_pipeline_layout,
-            &surface_inspector_shader,
-            config.format,
-            msaa_samples,
-        );
+        // Diagnostic-only: compiled by ensure_lazy_scene_pipelines on first use.
+        let surface_inspector_pipeline = None;
 
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA UI shader"),
@@ -10064,6 +10891,40 @@ impl Renderer {
         });
         let ui_pipeline =
             create_ui_pipeline(&device, &ui_pipeline_layout, &ui_shader, config.format);
+        // CGame screen-space effects (for example CG_SaberClashFlare) must use
+        // their authored JKA shader stage/blend, not the normal alpha-only HUD
+        // pipeline. Pipelines are compiled lazily on the first requested blend.
+        let screen_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA CGame screen FX shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("screen_fx.wgsl").into()),
+        });
+        let screen_fx_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("JKA CGame screen FX texture layout"),
+                entries: &[texture_entry(0), sampler_entry(1)],
+            });
+        let screen_fx_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA CGame screen FX pipeline layout"),
+                bind_group_layouts: &[Some(&screen_fx_texture_layout)],
+                immediate_size: 0,
+            });
+        let screen_fx_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA CGame screen FX sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let screen_fx_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA CGame screen FX vertices"),
+            size: SCREEN_FX_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let ui_font_data = load_ui_font_texture(base, game);
         let ui_font = upload_texture(&device, &queue, &ui_font_data);
         let (ui_small_font_data, ui_small_font_metrics) =
@@ -10071,6 +10932,11 @@ impl Renderer {
         let ui_small_font = upload_texture(&device, &queue, &ui_small_font_data);
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
         let ui_splash = upload_texture(&device, &queue, &ui_splash_data);
+        // Keep the MP unknown-map art resident from renderer startup. Map-load UI
+        // can bind this immediately, present it once, and only then resolve the
+        // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
+        let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game);
+        let ui_unknown_map = upload_texture(&device, &queue, &ui_unknown_map_data);
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA UI font sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -10179,6 +11045,20 @@ impl Renderer {
                 srgb: true,
             },
         );
+        let screen_fx_white_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA CGame screen FX white bind group"),
+            layout: &screen_fx_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&screen_fx_sampler),
+                },
+            ],
+        });
         let missing = upload_texture(&device, &queue, &missing_texture_data);
         let dynamic_model_renderer = DynamicModelRenderer::new(
             &device,
@@ -10245,13 +11125,8 @@ impl Renderer {
         });
         let post_pipeline =
             create_post_pipeline(&device, &post_pipeline_layout, &post_shader, config.format);
-        let taa_post_pipeline = create_taa_post_pipeline(
-            &device,
-            &post_pipeline_layout,
-            &post_shader,
-            config.format,
-            config.format,
-        );
+        // Only used while TAA is enabled; compiled by ensure_lazy_scene_pipelines.
+        let taa_post_pipeline = None;
         // The resolve pass reads the march output. It gets its own bind group
         // so the march pipeline layout never mentions the texture it renders
         // into, which wgpu rejects outright.
@@ -10948,13 +11823,8 @@ impl Renderer {
                 bind_group_layouts: &[Some(&camera_layout), Some(&cull_debug_layout)],
                 immediate_size: 0,
             });
-        let cull_debug_pipeline = create_cull_debug_pipeline(
-            &device,
-            &cull_debug_pipeline_layout,
-            &cull_debug_shader,
-            config.format,
-            msaa_samples,
-        );
+        // Diagnostic-only: compiled by ensure_lazy_scene_pipelines on first use.
+        let cull_debug_pipeline = None;
         let cull_diagnostics_readback = CullDiagnosticsReadback::new(&device);
 
         // Weather owns persistent precipitation GPU state. The haze binding is
@@ -11042,15 +11912,30 @@ impl Renderer {
             fast_world_wireframe_pipeline: None,
             surface_inspector_shader,
             surface_inspector_pipeline,
+            debug_volumes: DebugVolumeRenderer::default(),
+            debug_volume_shader,
             inspector_vertex_range: None,
             ui_pipeline,
+            screen_fx_shader,
+            screen_fx_texture_layout,
+            screen_fx_pipeline_layout,
+            screen_fx_sampler,
+            screen_fx_white_bind_group,
+            screen_fx_pipelines: HashMap::new(),
+            screen_fx_textures: HashMap::new(),
+            screen_fx_vertex_buffer,
+            screen_fx_vertex_count: 0,
+            screen_fx_batches: Vec::new(),
             ui_texture_layout,
             ui_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
             _ui_splash: ui_splash,
+            _ui_unknown_map: ui_unknown_map,
+            ui_unknown_map_size,
             ui_splash_size,
             ui_loading_image_key: None,
+            ui_pending_levelshot: None,
             ui_small_font_metrics,
             _ui_font_sampler: ui_font_sampler,
             ui_vertex_buffer,
@@ -11085,6 +11970,7 @@ impl Renderer {
             sky_sampler,
             texture_filter,
             detail_textures_mode: DetailTextureMode::Off,
+            jump_shade: JumpShadeState::Off,
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
             gamma,
@@ -11168,15 +12054,25 @@ impl Renderer {
             indirect_supported,
             gpu_compaction_supported,
             compact_group_scratch: Vec::new(),
+            cpu_compact_indirect_scratch: Vec::new(),
+            cpu_compact_count_scratch: Vec::new(),
+            reflection_compact_scratch: Vec::new(),
+            reflection_compact_groups: Vec::new(),
+            inline_visible_scratch: Vec::new(),
+            inline_pose_scratch: Vec::new(),
+            inline_draw_scratch: InlineDrawScratch::default(),
             gpu_driven_enabled: false,
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
+            rt_samples: 1,
+            rt_reduced_shadows: false,
             clustered_lighting_enabled: false,
             map_light_simulation_enabled: false,
             classic_fullbright: false,
             classic_vertex_light: false,
             classic_lightmap_only: false,
             transient_lights: Vec::new(),
+            dynamic_light_brightness: 1.0,
             emissive_area_lights_enabled: false,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
@@ -11497,26 +12393,95 @@ impl Renderer {
     fn sync_ui_loading_background(&mut self) {
         let request = self.ui_state.loading.as_ref().and_then(|loading| {
             let stem = loading_levelshot_stem(&loading.map_name)?;
-            Some((stem, loading.active_game_dir.as_deref().map(Path::new)))
+            Some((stem, loading.active_game_dir.as_ref().map(PathBuf::from)))
         });
         let desired_key = request.as_ref().map(|(stem, game)| {
             format!(
                 "{}\n{}",
-                game.map(|path| path.display().to_string()).unwrap_or_default(),
+                game.as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
                 stem
             )
         });
         if self.ui_loading_image_key == desired_key {
             return;
         }
-        let (data, size) = match request {
-            Some((ref stem, game)) => {
-                load_ui_loading_texture(&self.base, game, Some(stem.as_str()))
-            }
-            None => load_ui_loading_texture(&self.base, None, None),
+
+        self.ui_loading_image_key = desired_key.clone();
+        self.ui_pending_levelshot = None;
+
+        let Some((map_name, game)) = request else {
+            // Binding 3 is not drawn outside the retained loading screen. Avoid
+            // hitting the VFS just to restore menu/splash when loading ends.
+            return;
         };
+        let key = desired_key.expect("loading request must have a key");
+
+        // First present the already-resident OpenJK MP unknown-map art. The real
+        // levelshot is deliberately resolved only after this frame reaches present().
+        self.ui_splash_size = self.ui_unknown_map_size;
+        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA UI font bind group"),
+            layout: &self.ui_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_unknown_map.view),
+                },
+            ],
+        });
+        self.ui_pending_levelshot = Some(PendingUiLevelshot { key, map_name, game });
+    }
+
+    /// Resolve the real map levelshot only after at least one fallback frame has
+    /// already reached `present()`. If disk/decode is slow, the compositor keeps
+    /// showing `unknownmap_mp` instead of exposing the renderer clear color.
+    fn resolve_pending_ui_levelshot(&mut self) {
+        // The startup splash deliberately owns the very first presented frame.
+        // Do not consume a queued map levelshot until the actual loading UI
+        // (and therefore unknownmap_mp) has itself reached present() once.
+        if self.ui_state.startup_splash || self.ui_state.loading.is_none() {
+            return;
+        }
+        let Some(pending) = self.ui_pending_levelshot.take() else {
+            return;
+        };
+        if self.ui_loading_image_key.as_deref() != Some(pending.key.as_str()) {
+            return;
+        }
+
+        let path = format!("levelshots/{}", pending.map_name);
+        let Some(data) = try_load_texture_asset(
+            &self.base,
+            pending.game.as_deref(),
+            &path,
+            true,
+            false,
+            true,
+            "UI levelshot",
+        ) else {
+            eprintln!(
+                "UI levelshot: no image resolved for {path}; keeping menu/art/unknownmap_mp"
+            );
+            return;
+        };
+
+        let size = [data.width, data.height];
         let image = upload_texture(&self.device, &self.queue, &data);
-        self.ui_splash_size = size;
+        self.ui_splash_size = Some(size);
         self._ui_splash = image;
         self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA UI font bind group"),
@@ -11540,7 +12505,112 @@ impl Renderer {
                 },
             ],
         });
-        self.ui_loading_image_key = desired_key;
+        // Cover-mode geometry depends on the source dimensions.
+        self.rebuild_retained_ui();
+    }
+
+    fn ensure_screen_fx_pipeline(&mut self, blend: FxBlend) {
+        if self.screen_fx_pipelines.contains_key(&blend) {
+            return;
+        }
+        let pipeline = create_screen_fx_pipeline(
+            &self.device,
+            &self.screen_fx_pipeline_layout,
+            &self.screen_fx_shader,
+            self.config.format,
+            blend,
+        );
+        self.screen_fx_pipelines.insert(blend, pipeline);
+    }
+
+    fn ensure_screen_fx_texture(&mut self, texture: &Arc<TextureData>) -> String {
+        let key = format!(
+            "{}|{}|{}x{}|{}",
+            texture.label,
+            texture.source.as_ref().map_or_else(String::new, |path| path.display().to_string()),
+            texture.width,
+            texture.height,
+            texture.mip_level_count,
+        );
+        if !self.screen_fx_textures.contains_key(&key) {
+            let image = upload_texture(&self.device, &self.queue, texture);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JKA CGame screen FX bind group"),
+                layout: &self.screen_fx_texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&image.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.screen_fx_sampler),
+                    },
+                ],
+            });
+            self.screen_fx_textures.insert(
+                key.clone(),
+                ScreenFxTexture { _image: image, bind_group },
+            );
+        }
+        key
+    }
+
+    fn set_screen_fx(&mut self, draws: &[crate::fx::draw::ScreenFxDraw]) {
+        self.screen_fx_batches.clear();
+        self.screen_fx_vertex_count = 0;
+        if draws.is_empty() {
+            return;
+        }
+
+        let max_vertices = SCREEN_FX_BUFFER_BYTES as usize / std::mem::size_of::<UiVertex>();
+        let mut vertices = Vec::with_capacity((draws.len() * 6).min(max_vertices));
+        for draw in draws {
+            if vertices.len().saturating_add(6) > max_vertices {
+                break;
+            }
+            self.ensure_screen_fx_pipeline(draw.material.blend);
+            let texture_key = draw
+                .material
+                .texture
+                .as_ref()
+                .map(|texture| self.ensure_screen_fx_texture(texture));
+
+            let [x, y, w, h] = draw.rect;
+            let x0 = x / 640.0 * 2.0 - 1.0;
+            let x1 = (x + w) / 640.0 * 2.0 - 1.0;
+            let y0 = 1.0 - y / 480.0 * 2.0;
+            let y1 = 1.0 - (y + h) / 480.0 * 2.0;
+            let color = draw.material.float_vertex_color(draw.color);
+            let vertex = |position, uv| UiVertex {
+                position,
+                uv,
+                color,
+                textured: 1.0,
+            };
+            let start = vertices.len() as u32;
+            vertices.extend_from_slice(&[
+                vertex([x0, y0], [0.0, 0.0]),
+                vertex([x0, y1], [0.0, 1.0]),
+                vertex([x1, y1], [1.0, 1.0]),
+                vertex([x0, y0], [0.0, 0.0]),
+                vertex([x1, y1], [1.0, 1.0]),
+                vertex([x1, y0], [1.0, 0.0]),
+            ]);
+            self.screen_fx_batches.push(ScreenFxBatch {
+                range: start..start + 6,
+                blend: draw.material.blend,
+                texture_key,
+            });
+        }
+        self.screen_fx_vertex_count = vertices.len() as u32;
+        if !vertices.is_empty() {
+            self.queue.write_buffer(
+                &self.screen_fx_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&vertices),
+            );
+        }
     }
 
     fn set_dynamic_hud(&mut self, hud: Option<ui::HudState>, movement_hud: ui::MovementHudState) {
@@ -11756,11 +12826,40 @@ impl Renderer {
         }
     }
 
+    fn draw_screen_fx_batches<'a>(
+        pass: &mut wgpu::RenderPass<'a>,
+        vertex_buffer: &'a wgpu::Buffer,
+        vertex_count: u32,
+        batches: &'a [ScreenFxBatch],
+        pipelines: &'a HashMap<FxBlend, wgpu::RenderPipeline>,
+        textures: &'a HashMap<String, ScreenFxTexture>,
+        white_bind_group: &'a wgpu::BindGroup,
+    ) {
+        if vertex_count == 0 {
+            return;
+        }
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        for batch in batches {
+            let Some(pipeline) = pipelines.get(&batch.blend) else {
+                continue;
+            };
+            let bind_group = batch
+                .texture_key
+                .as_ref()
+                .and_then(|key| textures.get(key))
+                .map_or(white_bind_group, |texture| &texture.bind_group);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(batch.range.clone(), 0..1);
+        }
+    }
+
     /// With a menu open this runs *after* egui so the readout stays on top of
     /// the menu instead of being covered by it: these are status displays the
     /// player is usually watching while changing a setting.
     fn submit_ui_overlay(&self, frame_view: &wgpu::TextureView) {
-        if self.ui_vertex_count == 0
+        if self.screen_fx_vertex_count == 0
+            && self.ui_vertex_count == 0
             && self.ui_dynamic_vertex_count == 0
             && self.ui_transient_vertex_count == 0
         {
@@ -11788,6 +12887,19 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // OpenJK draws CG_SaberClashFlare in CG_Draw2D before the ordinary
+            // HUD status elements. Keep that ordering and its authored shader
+            // blend, while leaving retained UI/console on top.
+            Self::draw_screen_fx_batches(
+                &mut pass,
+                &self.screen_fx_vertex_buffer,
+                self.screen_fx_vertex_count,
+                &self.screen_fx_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
+            );
+
             Self::draw_ui_batches(
                 &mut pass,
                 &self.ui_pipeline,
@@ -12087,7 +13199,6 @@ impl Renderer {
             coarse_batches,
             full_batches,
             auto2_batches,
-            auto4_batches,
             ..
         } = world;
         let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
@@ -12099,7 +13210,6 @@ impl Renderer {
             .iter_mut()
             .chain(full_batches.iter_mut())
             .chain(auto2_batches.iter_mut())
-            .chain(auto4_batches.iter_mut())
         {
             let detail_texture = detail_texture_for_source(
                 &batch.source,
@@ -12156,6 +13266,7 @@ impl Renderer {
                 self.surface_deformation.field_sampler(),
             );
         }
+        sync_auto4_bind_groups(world);
     }
 
     fn restore_static_ao_lightmaps(&mut self) {
@@ -12385,6 +13496,7 @@ impl Renderer {
         // A new world must not inherit transient RE_AddLightToScene submissions
         // from the previous map. The next CGame snapshot will repopulate them.
         self.transient_lights.clear();
+        self.debug_volumes.set_map(Arc::clone(&map.debug_volumes));
         // Start the pure-CPU weather heightfield solve immediately so it overlaps
         // GPU/world upload. First rain enable should normally only upload the
         // already-computed field instead of stalling the render thread.
@@ -12440,12 +13552,12 @@ impl Renderer {
         // lazily compile/switch to the dedicated RT pipeline variant.
         let mut initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
         initial_shader_variant.ray_traced_shadows = false;
+        initial_shader_variant.ray_traced_sun = false;
         let detail_texture_by_base = build_auto_detail_by_base_texture(
             map.textures.len(),
             map.batches
                 .iter()
                 .chain(map.pvs_batches.iter())
-                .chain(map.portal_batches.iter())
                 .chain(map.inline_batches.iter()),
         );
         if self.detail_textures_mode != DetailTextureMode::Off {
@@ -12463,8 +13575,6 @@ impl Renderer {
             world_pipeline_layout,
             world_shader,
             initial_shader_variant,
-            &self.fast_world_pipeline_layout,
-            &self.fast_world_shader,
             self.scene_format(),
             self.msaa_samples,
             self.ray_tracing_supported,
@@ -12530,7 +13640,7 @@ impl Renderer {
             &self.weather.rain.gpu.wind_noise_sampler,
         ));
         self.world = Some(world);
-        if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+        if self.hardware_rt_requested() {
             self.ensure_ray_traced_shadow_resources();
         }
         // build_world allocates the fixed-capacity storage with every authored
@@ -12653,11 +13763,15 @@ impl Renderer {
                     && planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
             })
         });
-        let scale_divisor = match self.reflection_quality {
-            ReflectionQuality::Ultra => PLANAR_AUTHORED_SCALE_DIVISOR,
-            ReflectionQuality::High if has_authored => PLANAR_AUTHORED_SCALE_DIVISOR,
-            ReflectionQuality::High => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
-            _ => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
+        let scale_divisor = if has_authored {
+            // A JKA-authored portal is a real mirror, so do not demote it to the
+            // quarter-resolution environment-promotion pool at Legacy/Low/Medium.
+            PLANAR_AUTHORED_SCALE_DIVISOR
+        } else {
+            match self.reflection_quality {
+                ReflectionQuality::Ultra => PLANAR_AUTHORED_SCALE_DIVISOR,
+                _ => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
+            }
         };
         let (width, height) = if active {
             (
@@ -12702,6 +13816,7 @@ impl Renderer {
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
+        self.invalidate_rt_sun_shadow_depth();
         self.size = size;
         if size.width == 0 || size.height == 0 {
             return;
@@ -12750,6 +13865,7 @@ impl Renderer {
     }
 
     fn reconfigure(&mut self) {
+        self.invalidate_rt_sun_shadow_depth();
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
@@ -12989,6 +14105,17 @@ impl Renderer {
         );
     }
 
+    fn set_jump_shade(&mut self, state: JumpShadeState) {
+        let engaged_changed = self.jump_shade.engaged() != state.engaged();
+        self.jump_shade = state;
+        if engaged_changed {
+            // Compiles (once, then cached) the world variant that carries the tint,
+            // and routes off the fast baseline shader, which does not have it.
+            self.rebuild_frame_plan();
+            self.activate_world_pipeline_variant();
+        }
+    }
+
     fn set_detail_texture(&mut self, _path: &str, game: Option<&Path>) {
         // The image choice is permanently AUTO. A game/mod change invalidates
         // only the cached DT_* images; do not repopulate them until a loaded
@@ -13089,6 +14216,14 @@ impl Renderer {
     }
 
     fn ensure_wireframe_pipelines(&mut self) {
+        let scene_format = self.scene_format();
+        self.debug_volumes.ensure(
+            &self.device,
+            &self.wireframe_pipeline_layout,
+            &self.debug_volume_shader,
+            scene_format,
+            self.msaa_samples,
+        );
         if self.wireframe_mask == 0 {
             return;
         }
@@ -13533,6 +14668,7 @@ impl Renderer {
 {}", world_shader_lean_source, include_str!("surface_deformation.wgsl")).into(),
             ),
         });
+        let sun_shadow_history = rt_resolution::RtSunShadowHistory::new(&self.device);
         let receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
             &self.device,
             &receiver_layout,
@@ -13555,6 +14691,7 @@ impl Renderer {
             &alpha_material_buffer,
             &alpha_texture_buffer,
             &alpha_texel_buffer,
+            &sun_shadow_history,
         );
 
         let static_mask_geometry_count = static_mask_blas.as_ref().map_or(0, |mask| mask.sizes.len());
@@ -13563,6 +14700,8 @@ impl Renderer {
         let masked_triangle_count = static_mask_triangle_count + inline_mask_triangle_count;
 
         self.ray_traced_shadows = Some(RayTracedShadowResources {
+            sun_shadow_history,
+            model_receivers: None,
             receiver_layout,
             world_pipeline_layout,
             world_pipeline_layout_lean,
@@ -13676,6 +14815,7 @@ impl Renderer {
             &rt.alpha_material_buffer,
             &rt.alpha_texture_buffer,
             &rt.alpha_texel_buffer,
+            &rt.sun_shadow_history,
         );
         self.ray_traced_shadows = Some(rt);
     }
@@ -13691,7 +14831,7 @@ impl Renderer {
         dynamic_models: &[DynamicModelSurface],
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        if self.cascaded_shadow_mode != DynamicShadowsMode::RayTraced {
+        if !self.hardware_rt_requested() {
             return;
         }
         if self.ray_traced_shadows.is_none() && !self.ensure_ray_traced_shadow_resources() {
@@ -14211,6 +15351,7 @@ impl Renderer {
                 &rt.alpha_material_buffer,
                 &rt.alpha_texture_buffer,
                 &rt.alpha_texel_buffer,
+                &rt.sun_shadow_history,
             );
         }
     }
@@ -14448,10 +15589,12 @@ impl Renderer {
         self.reflection_quality = effects.reflection_quality;
         self.reflection_debug_enabled = effects.reflection_debug;
         self.ssr_enabled = self.reflection_quality.ssr_enabled();
-        self.planar_reflection_mode = if self.reflection_quality.planar_slot_budget() > 0 {
+        self.planar_reflection_mode = if self.reflection_quality == ReflectionQuality::Off {
+            PlanarReflectionMode::Off
+        } else if self.reflection_quality.promotes_environment_planars() {
             PlanarReflectionMode::Environment
         } else {
-            PlanarReflectionMode::Off
+            PlanarReflectionMode::Authored
         };
         self.chromatic_aberration_strength = effects.chromatic_aberration.max(0.0);
         self.vignette_enabled = effects.vignette;
@@ -14616,8 +15759,18 @@ impl Renderer {
     }
 
     fn ray_traced_local_shadows_active(&self) -> bool {
-        self.local_light_shadows_enabled
-            && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_shadows)
+        self.world.as_ref().is_some_and(|world| {
+            world.active_pipeline_variant.ray_traced_shadows && world.active_pipeline_variant.local_shadows
+        })
+    }
+
+    fn hardware_rt_requested(&self) -> bool {
+        self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+            || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
+    }
+
+    fn hardware_rt_active(&self) -> bool {
+        self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_shadows)
     }
 
     fn update_local_shadow_selection(&mut self, camera: &Camera) {
@@ -14811,6 +15964,7 @@ impl Renderer {
                         &[],
                     );
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
@@ -14921,15 +16075,20 @@ impl Renderer {
             // A local-shadow shader path is useless without a direct local-light
             // source. Normalize it out of the key so toggling shadows alone does
             // not create a redundant pipeline permutation.
-            local_shadows: self.local_light_shadows_enabled && shadowable_local_lights,
+            local_shadows: (self.local_light_shadows_enabled
+                || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware) && shadowable_local_lights,
             cascaded_shadows: self.cascaded_shadows_enabled,
-            ray_traced_shadows: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+            ray_traced_shadows: self.hardware_rt_requested() && self.ray_tracing_supported,
+            ray_traced_sun: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
                 && self.ray_tracing_supported,
             planar_reflections: self.planar_reflection.active,
             // MAP/DEFAULT is a no-op on maps with no authored fog. FogSystem owns
             // the current map's authored-fog state and decides whether the legacy
             // JKA fragment path is actually required.
             legacy_fog: self.weather.fog.legacy_effective(),
+            // Only while SP physics with the helper is engaged; the tint itself is
+            // further gated by the camera uniform so jumps never respecialize.
+            jump_shade: self.jump_shade.engaged(),
             ocean: self.ocean_enabled,
             detail_texture_mode: self.detail_textures_mode.shader_mode(),
         }
@@ -14945,6 +16104,7 @@ impl Renderer {
             // Preserve a valid raster pipeline if the adapter exposes the feature
             // but this particular map exceeds an acceleration-structure limit.
             key.ray_traced_shadows = false;
+            key.ray_traced_sun = false;
         }
         let Some(current_key) = self
             .world
@@ -14993,7 +16153,13 @@ impl Renderer {
             "Renderer pipeline cache: miss {} -> compiling lazily",
             key.short_label()
         );
-        let (pipelines, fog_pass_pipelines, reflection_pipelines, reflection_fog_pass_pipelines) = {
+        let (
+            pipelines,
+            legacy_dlight_pipelines,
+            fog_pass_pipelines,
+            reflection_pipelines,
+            reflection_fog_pass_pipelines,
+        ) = {
             let Some(world) = self.world.as_ref() else {
                 return;
             };
@@ -15007,6 +16173,19 @@ impl Renderer {
                 key.legacy_fog,
                 Some(key),
             );
+            let legacy_dlight_pipelines = if key.legacy_dlights {
+                create_legacy_dlight_pass_pipelines(
+                    &self.device,
+                    layout,
+                    shader,
+                    scene_format,
+                    samples,
+                    &world.coarse_batches,
+                    key,
+                )
+            } else {
+                BTreeMap::new()
+            };
             let fog_pass_pipelines = if key.legacy_fog {
                 create_legacy_fog_pass_pipelines(
                     &self.device,
@@ -15049,6 +16228,7 @@ impl Renderer {
                 };
             (
                 pipelines,
+                legacy_dlight_pipelines,
                 fog_pass_pipelines,
                 reflection_pipelines,
                 reflection_fog_pass_pipelines,
@@ -15060,6 +16240,7 @@ impl Renderer {
                 key,
                 WorldPipelineVariant {
                     pipelines,
+                    legacy_dlight_pipelines,
                     fog_pass_pipelines,
                     reflection_pipelines,
                     reflection_fog_pass_pipelines,
@@ -15191,11 +16372,28 @@ impl Renderer {
         self.dynamic_model_renderer.set_ghoul2_batch_draws(mode);
     }
 
+    fn set_rt_samples(&mut self, samples: u32) {
+        let samples = if matches!(samples, 1 | 2 | 4) { samples } else { 1 };
+        if self.rt_samples == samples { return; }
+        self.rt_samples = samples;
+        if self.hardware_rt_requested() {
+            self.update_lighting_settings();
+            self.history_valid = false;
+        }
+    }
+
+    fn set_rt_half_resolution(&mut self, enabled: bool) {
+        if self.rt_reduced_shadows == enabled { return; }
+        self.rt_reduced_shadows = enabled;
+        self.history_valid = false;
+        self.rebuild_frame_plan();
+    }
+
     fn set_dynamic_lighting(&mut self, mode: DynamicLightsMode) {
         self.dynamic_lights_mode = mode;
-        // Keep the old boolean as a derived implementation detail for the full
-        // Forward+ path only. Legacy/Vertex/Clustered Lite are separate runtime-light modes.
-        self.clustered_lighting_enabled = matches!(mode, DynamicLightsMode::PerPixelForwardPlus);
+        // Direct RT lighting shares Forward+ light selection and radiometry;
+        // only visibility changes. Legacy/Vertex/Clustered Lite stay separate.
+        self.clustered_lighting_enabled = matches!(mode, DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware);
         if let Some(world) = &mut self.world {
             world.local_shadows.selection_position = None;
         }
@@ -15203,6 +16401,13 @@ impl Renderer {
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+        if mode == DynamicLightsMode::RayTracedHardware {
+            println!("Hardware RT Lighting: {}", if self.hardware_rt_active() {
+                "direct local-light visibility active; sun shadows remain independently selected"
+            } else {
+                "RT unavailable for this adapter/map; using Forward+ lighting"
+            });
+        }
     }
 
     fn classic_world_render_flags(&self) -> u32 {
@@ -15261,6 +16466,20 @@ impl Renderer {
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+    }
+
+    fn set_model_brightness(&mut self, brightness: f32) {
+        self.dynamic_model_renderer
+            .set_model_brightness(&self.queue, brightness);
+    }
+
+    fn set_dynamic_light_brightness(&mut self, brightness: f32) {
+        let brightness = if brightness.is_finite() { brightness.max(0.0) } else { 1.0 };
+        if (self.dynamic_light_brightness - brightness).abs() < f32::EPSILON {
+            return;
+        }
+        self.dynamic_light_brightness = brightness;
+        self.upload_light_buffer();
     }
 
     fn set_entity_ambient_lighting(&mut self, mode: EntityAmbientLightingMode) {
@@ -15665,6 +16884,16 @@ impl Renderer {
             source.planar_reflection, source.planar_environment_candidate, source.reflection_probe,
         ));
         lines.push(format!(
+            "REFLECTION POLICY: quality={}    planar_mode={}    tcGen environment={}",
+            self.reflection_quality.label(),
+            self.planar_reflection_mode.label(),
+            if self.reflection_quality.omits_environment_stages() {
+                "STRIPPED (absolute OFF)"
+            } else {
+                "PRESERVED"
+            },
+        ));
+        lines.push(format!(
             "BOUNDS MIN: {:.1}, {:.1}, {:.1}",
             batch.bounds_min[0], batch.bounds_min[1], batch.bounds_min[2]
         ));
@@ -15727,6 +16956,39 @@ impl Renderer {
                 u8::from(shader_key.clustered_lite_dlights),
                 u8::from(self.classic_vertex_light),
             ));
+            if self.dynamic_lights_mode == DynamicLightsMode::Legacy {
+                let source_triangle = triangle_start / 3;
+                if let Some(&surface_index) = world
+                    .legacy_dlight_triangle_surfaces
+                    .get(source_triangle as usize)
+                {
+                    if let Some(surface) = world
+                        .legacy_dlight_surfaces
+                        .get(surface_index as usize)
+                    {
+                        let transient_count = self.active_transient_light_count().min(32);
+                        let mask = legacy_dlight_surface_mask(
+                            surface,
+                            &self.transient_lights,
+                            transient_count,
+                        );
+                        let kind = match surface.cull_kind {
+                            0 => "REJECT",
+                            1 => "BOUNDS+FACE-PLANE",
+                            2 => "BOUNDS",
+                            _ => "UNKNOWN",
+                        };
+                        lines.push(format!(
+                            "LEGACY OPENJK CULL: surface={} kind={} candidate_lights={}/{} mask=0x{:08x}",
+                            surface_index,
+                            kind,
+                            mask.count_ones(),
+                            transient_count,
+                            mask,
+                        ));
+                    }
+                }
+            }
 
             let primary_light = self
                 .transient_lights
@@ -15838,7 +17100,7 @@ impl Renderer {
             for image in &entry.image_sources {
                 lines.push(image.clone());
             }
-            for detail in entry.lines.iter().take(5) {
+            for detail in &entry.lines {
                 lines.push(detail.clone());
             }
         } else if has_bsp_shader {
@@ -16004,6 +17266,7 @@ impl Renderer {
 
     fn set_cascaded_shadows(&mut self, mode: DynamicShadowsMode) {
         self.cascaded_shadow_mode = mode;
+        self.update_lighting_settings();
         self.cascaded_shadows_enabled = matches!(
             mode,
             DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
@@ -16013,10 +17276,11 @@ impl Renderer {
             if active {
                 if let Some(rt) = self.ray_traced_shadows.as_ref() {
                     println!(
-                        "RT Shadows: active - hardware ray queries, {} BLAS geometries / {} static opaque BSP triangles; soft directional emitter {:.2} deg, 1 spp{}",
+                        "RT Shadows: active - hardware ray queries, {} BLAS geometries / {} static opaque BSP triangles; soft directional emitter {:.2} deg, {} spp{}",
                         rt.geometry_count,
                         rt.triangle_count,
                         RT_SUN_ANGULAR_DIAMETER_RADIANS.to_degrees(),
+                        self.rt_samples,
                         if self.taa_enabled { " + temporal TAA" } else { " (stable spatial sample)" }
                     );
                 }
@@ -16305,10 +17569,11 @@ impl Renderer {
             && !self.local_light_shadows_enabled
             && !self.pbr_enabled
             && !self.cascaded_shadows_enabled
-            && !(self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced && self.ray_traced_shadows.is_some())
+            && !(self.hardware_rt_requested() && self.ray_traced_shadows.is_some())
             && self.cull_debug_mode == CullDebugMode::Off
             && !self.planar_reflection.active
-            && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off;
+            && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+            && !self.jump_shade.engaged();
         self.frame_plan = FramePlan {
             world_path: if fast_baseline {
                 WorldRenderPath::FastBaseline
@@ -16323,6 +17588,7 @@ impl Renderer {
             // vignette, but vignette alone does not force an offscreen scene copy.
             gamma_only_post: (gamma_enabled || lut_enabled) && !full_post_effects,
             needs_linear_depth: self.ssao_enabled
+                || (self.rt_reduced_shadows && self.hardware_rt_requested() && self.ray_tracing_supported)
                 || self.taa_enabled
                 || self.contact_shadows_enabled
                 || fog_enabled
@@ -16345,7 +17611,7 @@ impl Renderer {
         };
     }
 
-    fn clustered_lite_dlights_enabled(&self) -> bool {
+    fn transient_dlight_clusters_enabled(&self) -> bool {
         self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite
     }
 
@@ -16357,6 +17623,7 @@ impl Renderer {
                     | DynamicLightsMode::Vertex
                     | DynamicLightsMode::ClusteredLite
                     | DynamicLightsMode::PerPixelForwardPlus
+                    | DynamicLightsMode::RayTracedHardware
             )
     }
 
@@ -16387,13 +17654,91 @@ impl Renderer {
             return 0;
         }
         self.transient_lights
-            .len()
+            .iter()
+            .map(|light| if self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware {
+                light.blade_segments.as_ref().map_or(1, |blades| blades.len().max(1))
+            } else { 1 })
+            .sum::<usize>()
             .min(MAX_DYNAMIC_LIGHTS.saturating_sub(self.active_static_light_count()))
     }
 
     fn active_light_count(&self) -> u32 {
         u32::try_from(self.active_static_light_count() + self.active_transient_light_count())
             .unwrap_or(0)
+    }
+
+    /// Perf-trace mirror of the exact Legacy BSP surface masks uploaded to the GPU.
+    /// This intentionally does no new culling and changes no rendering behavior; it
+    /// only tells us how broad the current OpenJK-style coarse masks actually are.
+    fn legacy_dlight_perf_stats(&self) -> LegacyDlightPerfStats {
+        let mut stats = LegacyDlightPerfStats::default();
+        if self.dynamic_lights_mode != DynamicLightsMode::Legacy {
+            return stats;
+        }
+        let Some(world) = self.world.as_ref() else {
+            return stats;
+        };
+        let transient_count = self.active_transient_light_count().min(32).min(self.transient_lights.len());
+        stats.transient_count = transient_count;
+        stats.surfaces_total = world.legacy_dlight_surfaces.len();
+        if transient_count == 0 {
+            return stats;
+        }
+
+        let lights = &self.transient_lights[..transient_count];
+        let mut surfaces_per_light = vec![0u32; transient_count];
+        for light in lights {
+            stats.radius_sum += f64::from(light.radius.max(0.0));
+            stats.radius_max = stats.radius_max.max(light.radius.max(0.0));
+            match light.kind {
+                crate::fx::system::FxLightKind::Saber => stats.saber_sources += 1,
+                crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_sources += 1,
+                crate::fx::system::FxLightKind::AuthoredEffect => stats.authored_fx_sources += 1,
+            }
+        }
+
+        for surface in &world.legacy_dlight_surfaces {
+            if surface.cull_kind == 0 {
+                stats.surface_buckets[0] += 1;
+                continue;
+            }
+            stats.surfaces_eligible += 1;
+            let mask = legacy_dlight_surface_mask(surface, lights, transient_count);
+            let count = mask.count_ones();
+            stats.candidate_pairs += u64::from(count);
+            stats.max_candidates_per_surface = stats.max_candidates_per_surface.max(count);
+            if count == 0 {
+                stats.surface_buckets[0] += 1;
+            } else {
+                stats.surfaces_touched += 1;
+                let bucket = match count {
+                    1 => 1,
+                    2..=4 => 2,
+                    5..=8 => 3,
+                    9..=16 => 4,
+                    _ => 5,
+                };
+                stats.surface_buckets[bucket] += 1;
+            }
+
+            let mut bits = mask;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(per_light) = surfaces_per_light.get_mut(bit) {
+                    *per_light += 1;
+                }
+                match lights[bit].kind {
+                    crate::fx::system::FxLightKind::Saber => stats.saber_pairs += 1,
+                    crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_pairs += 1,
+                    crate::fx::system::FxLightKind::AuthoredEffect => stats.authored_fx_pairs += 1,
+                }
+            }
+        }
+
+        stats.max_surfaces_per_light = surfaces_per_light.iter().copied().max().unwrap_or(0);
+        stats.total_surfaces_per_light = surfaces_per_light.iter().map(|&v| u64::from(v)).sum();
+        stats
     }
 
     fn set_transient_lights(&mut self, lights: &[TransientLight]) {
@@ -16404,6 +17749,28 @@ impl Renderer {
         self.transient_lights.extend_from_slice(lights);
         self.upload_light_buffer();
         self.update_lighting_settings();
+    }
+
+    fn update_legacy_dlight_surface_masks(&self) {
+        if self.dynamic_lights_mode != DynamicLightsMode::Legacy {
+            return;
+        }
+        let Some(world) = self.world.as_ref() else { return; };
+        if world.legacy_dlight_surfaces.is_empty() { return; }
+
+        let transient_count = self.active_transient_light_count().min(32);
+        let mut masks = vec![0u32; world.legacy_dlight_surfaces.len().max(1)];
+        for (surface_index, surface) in world.legacy_dlight_surfaces.iter().enumerate() {
+            masks[surface_index] = legacy_dlight_surface_mask(
+                surface,
+                &self.transient_lights,
+                transient_count,
+            );
+        }
+        self.queue.write_buffer(&world.legacy_dlight_surface_mask_buffer, 0, bytemuck::cast_slice(&masks));
+        if let Ok(mut cpu_masks) = world.legacy_dlight_surface_masks_cpu.lock() {
+            *cpu_masks = masks;
+        }
     }
 
     fn upload_light_buffer(&self) {
@@ -16492,35 +17859,19 @@ impl Renderer {
             // authored FX `Light {}` primitives. Full Forward+ intentionally
             // gives those runtime FX lights 2x source intensity; static map and
             // emissive-area lights above keep their authored intensity.
-            let transient_intensity_scale = if self.dynamic_lights_mode
-                == DynamicLightsMode::PerPixelForwardPlus
-            {
-                2.0
-            } else {
-                1.0
-            };
+            let transient_intensity_scale = self.dynamic_light_brightness
+                * if matches!(self.dynamic_lights_mode,
+                    DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware) {
+                    2.0
+                } else {
+                    1.0
+                };
             gpu_lights.extend(
                 self.transient_lights
                     .iter()
+                    .flat_map(|light| transient_light_samples(light, self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware))
                     .take(remaining)
-                    .map(|light| GpuPointLight {
-                        position_radius: [
-                            light.position[0],
-                            light.position[1],
-                            light.position[2],
-                            light.radius.max(0.0),
-                        ],
-                        color_intensity: [
-                            light.color[0],
-                            light.color[1],
-                            light.color[2],
-                            light.intensity.max(0.0) * transient_intensity_scale,
-                        ],
-                        emitter: [0.0; 4],
-                        // shadow.w marks transient/runtime lights for the lightweight
-                        // runtime modes. They never enter the local cubemap cache.
-                        shadow: [0.0, 0.0, 0.0, 1.0],
-                    }),
+                    .map(|light| transient_light_gpu(&light, transient_intensity_scale, self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)),
             );
         }
         if gpu_lights.is_empty() {
@@ -16575,11 +17926,11 @@ impl Renderer {
                             .as_ref()
                             .is_some_and(|world| world.voxel_probe_gi.enabled),
                 ),
-                // Used by cluster/froxel consumers: full Forward+ or Clustered Lite
-                // has valid runtime point-light lists.
+                // Used by cluster/froxel consumers. Clustered Lite builds transient-only
+                // lists. Legacy uses OpenJK-style BSP surface dlight masks instead.
                 if self.point_lighting_enabled() {
                     1
-                } else if self.clustered_lite_dlights_enabled() {
+                } else if self.transient_dlight_clusters_enabled() {
                     2
                 } else {
                     0
@@ -16590,7 +17941,7 @@ impl Renderer {
                 source_map_lighting.ambient[0],
                 source_map_lighting.ambient[1],
                 source_map_lighting.ambient[2],
-                0.0,
+                self.rt_samples as f32,
             ],
             map_minlight: [
                 source_map_lighting.minlight[0],
@@ -16600,15 +17951,16 @@ impl Renderer {
             ],
         };
         let settings_bytes = bytemuck::bytes_of(&settings);
-        // BSP/multiplayer keeps the original 48-byte common lighting upload.
-        // q3map2 ambient/minlight live only in lazy source-map shader variants.
-        let upload_bytes = if source_map_world {
+        // Ordinary BSP keeps its common upload. RT reads its sample count from
+        // existing ambient padding; the uniform buffer ABI is unchanged.
+        let upload_bytes = if source_map_world || self.hardware_rt_requested() {
             settings_bytes
         } else {
             &settings_bytes[..48]
         };
         self.queue
             .write_buffer(&self.lighting_settings_buffer, 0, upload_bytes);
+        self.update_legacy_dlight_surface_masks();
     }
 
     fn scene_format(&self) -> wgpu::TextureFormat {
@@ -16633,6 +17985,7 @@ impl Renderer {
         let mut key = self.world_shader_variant_key();
         if key.ray_traced_shadows && !self.ensure_ray_traced_shadow_resources() {
             key.ray_traced_shadows = false;
+            key.ray_traced_sun = false;
         }
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
@@ -16652,10 +18005,10 @@ impl Renderer {
         };
         let (
             pipelines,
+            legacy_dlight_pipelines,
             fog_pass_pipelines,
             reflection_pipelines,
             reflection_fog_pass_pipelines,
-            fast_pipelines,
         ) = {
             let Some(world) = self.world.as_ref() else {
                 return;
@@ -16670,6 +18023,19 @@ impl Renderer {
                 key.legacy_fog,
                 Some(key),
             );
+            let legacy_dlight_pipelines = if key.legacy_dlights {
+                create_legacy_dlight_pass_pipelines(
+                    &self.device,
+                    layout,
+                    shader,
+                    scene_format,
+                    samples,
+                    &world.coarse_batches,
+                    key,
+                )
+            } else {
+                BTreeMap::new()
+            };
             let fog_pass_pipelines = if key.legacy_fog {
                 create_legacy_fog_pass_pipelines(
                     &self.device,
@@ -16710,22 +18076,12 @@ impl Renderer {
                 } else {
                     BTreeMap::new()
                 };
-            let fast_pipelines = create_world_pipelines(
-                &self.device,
-                &self.fast_world_pipeline_layout,
-                &self.fast_world_shader,
-                scene_format,
-                samples,
-                &world.coarse_batches,
-                false,
-                None,
-            );
             (
                 pipelines,
+                legacy_dlight_pipelines,
                 fog_pass_pipelines,
                 reflection_pipelines,
                 reflection_fog_pass_pipelines,
-                fast_pipelines,
             )
         };
 
@@ -16735,14 +18091,43 @@ impl Renderer {
                 key,
                 WorldPipelineVariant {
                     pipelines,
+                    legacy_dlight_pipelines,
                     fog_pass_pipelines,
                     reflection_pipelines,
                     reflection_fog_pass_pipelines,
                 },
             );
             world.active_pipeline_variant = key;
-            world.fast_pipelines = fast_pipelines;
+            // MSAA/scene-format changed: drop the fast set, it is recompiled on
+            // demand the next time the frame plan selects FastBaseline.
+            world.fast_pipelines.clear();
         }
+    }
+
+    /// The known-fast baseline pipelines only serve `WorldRenderPath::FastBaseline`.
+    /// They are compiled the first frame that path runs instead of alongside every
+    /// advanced variant at map load and on every scene rebuild.
+    fn ensure_fast_world_pipelines(&mut self) {
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+        if !world.fast_pipelines.is_empty() {
+            return;
+        }
+        println!("Renderer pipeline cache: compiling fast-baseline world pipelines lazily");
+        let pipelines = create_world_pipelines(
+            &self.device,
+            &self.fast_world_pipeline_layout,
+            &self.fast_world_shader,
+            scene_format,
+            samples,
+            &world.coarse_batches,
+            false,
+            None,
+        );
+        world.fast_pipelines = pipelines;
     }
 
     /// Queue the scene rebuild instead of running it inline.
@@ -16764,6 +18149,7 @@ impl Renderer {
     }
 
     fn rebuild_scene_targets_and_pipelines(&mut self) {
+        self.invalidate_rt_sun_shadow_depth();
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
         self.targets = create_targets(
@@ -16815,13 +18201,10 @@ impl Renderer {
             );
         }
         self.rebuild_planar_reflection_resources();
-        self.taa_post_pipeline = create_taa_post_pipeline(
-            &self.device,
-            &self.post_pipeline_layout,
-            &self.post_shader,
-            self.config.format,
-            scene_format,
-        );
+        // TAA resolve and diagnostic pipelines depend on the scene target
+        // format/MSAA; drop them and let ensure_lazy_scene_pipelines recompile
+        // only the ones the current settings actually use.
+        self.taa_post_pipeline = None;
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
         self.rebuild_gpu_visibility_resources();
@@ -16839,25 +18222,51 @@ impl Renderer {
         self.update_post_uniform();
         self.update_lighting_settings();
         self.rebuild_world_pipelines();
-        self.cull_debug_pipeline = create_cull_debug_pipeline(
-            &self.device,
-            &self.cull_debug_pipeline_layout,
-            &self.cull_debug_shader,
-            scene_format,
-            samples,
-        );
+        self.cull_debug_pipeline = None;
         // All wireframe pipelines are diagnostic-only and are rebuilt lazily on
         // demand after a scene-format/MSAA change.
         self.wireframe_pipeline = None;
         self.world_wireframe_pipelines.clear();
         self.fast_world_wireframe_pipeline = None;
-        self.surface_inspector_pipeline = create_surface_inspector_pipeline(
-            &self.device,
-            &self.wireframe_pipeline_layout,
-            &self.surface_inspector_shader,
-            scene_format,
-            samples,
-        );
+        self.debug_volumes.clear_pipelines();
+        self.surface_inspector_pipeline = None;
+    }
+
+    /// Compiles the pipelines that are only needed while TAA, the surface
+    /// inspector, or the cull-rejection overlay are active. Runs on the cold
+    /// pre-frame path so the frame recorder can borrow them immutably.
+    fn ensure_lazy_scene_pipelines(&mut self) {
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        if self.taa_enabled && self.taa_post_pipeline.is_none() {
+            self.taa_post_pipeline = Some(create_taa_post_pipeline(
+                &self.device,
+                &self.post_pipeline_layout,
+                &self.post_shader,
+                self.config.format,
+                scene_format,
+            ));
+        }
+        if self.inspector_vertex_range.is_some() && self.surface_inspector_pipeline.is_none() {
+            self.surface_inspector_pipeline = Some(create_surface_inspector_pipeline(
+                &self.device,
+                &self.wireframe_pipeline_layout,
+                &self.surface_inspector_shader,
+                scene_format,
+                samples,
+            ));
+        }
+        if self.cull_debug_mode == CullDebugMode::RejectionReasons
+            && self.cull_debug_pipeline.is_none()
+        {
+            self.cull_debug_pipeline = Some(create_cull_debug_pipeline(
+                &self.device,
+                &self.cull_debug_pipeline_layout,
+                &self.cull_debug_shader,
+                scene_format,
+                samples,
+            ));
+        }
     }
 
     fn update_post_uniform(&self) {
@@ -17316,13 +18725,14 @@ impl Renderer {
             camera_forward: camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
+            jump_shade: [0.0; 4],
         };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
 
         let mut info = FrameInfo::default();
         let prepare_started = Instant::now();
         self.dynamic_model_renderer
-            .prepare(&self.device, &self.queue, dynamic_models, None, false, false);
+            .prepare(&self.device, &self.queue, dynamic_models, None, false, false, false);
         info.dynamic_model_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) = self.dynamic_model_renderer.ghoul2_draw_stats();
         info.ghoul2_gpu_instances = ghoul2_gpu_instances;
@@ -17448,6 +18858,7 @@ impl Renderer {
             camera_forward: render_camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
+            jump_shade: [0.0; 4],
         };
         let defer_camera_write = latest_view.is_some() && !needs_early_latch;
         if !defer_camera_write {
@@ -17463,7 +18874,14 @@ impl Renderer {
         if let Some(world) = &mut self.world {
             if needs_early_latch {
                 update_visibility(world, &render_camera);
-                refresh_auto4_lazy_collapse(&self.queue, world, self.pvs_mode);
+                let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
+                refresh_auto4_lazy_collapse(
+                    &self.queue,
+                    world,
+                    self.pvs_mode,
+                    auto4_area_mask,
+                    self.cull_debug_mode != CullDebugMode::Off,
+                );
             }
             if self.grass_enabled {
                 let pvs_cluster = world.last_cluster.flatten();
@@ -17514,6 +18932,7 @@ impl Renderer {
                 dynamic_models,
                 entity_light_grid,
                 split_dynamic_wireframe,
+                false,
                 false,
             );
         self.ensure_prepared_wireframe_pipelines(
@@ -17570,6 +18989,16 @@ impl Renderer {
             }
             if let Some(world) = &mut self.world {
                 update_visibility(world, &render_camera);
+                // The cluster may have changed: AUTO 4 must select that
+                // cluster's plan before the draw loop reads it.
+                let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
+                refresh_auto4_lazy_collapse(
+                    &self.queue,
+                    world,
+                    self.pvs_mode,
+                    auto4_area_mask,
+                    self.cull_debug_mode != CullDebugMode::Off,
+                );
             }
         }
         if defer_camera_write {
@@ -17620,6 +19049,11 @@ impl Renderer {
             } else {
                 (scene_output, None)
             };
+
+            let active = active_batch_selection(world, self.pvs_mode);
+            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -17645,9 +19079,8 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            let active = active_batch_selection(world, self.pvs_mode);
-            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             let mut current_pipeline = None;
             let mut grass_drawn = false;
             let mut snow_shell_drawn = false;
@@ -17655,12 +19088,17 @@ impl Renderer {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
                 if self.ocean_enabled && batch.source.water { continue; }
-                if world.source_map
-                    && batch.source.pipeline.class != DrawClass::Sky
+                // OpenJK does not stop at PVS: R_RecursiveWorldNode frustum-culls
+                // BSP node bounds before adding leaf surfaces. Compiled BSP worlds
+                // need the same second-stage rejection. The old source_map guard
+                // accidentally disabled it for normal .bsp maps.
+                if batch.source.pipeline.class != DrawClass::Sky
                     && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                 {
+                    info.world_frustum_rejected = info.world_frustum_rejected.saturating_add(1);
                     continue;
                 }
+                info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
                 if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
                     if !snow_shell_drawn {
                         draw_snow_shell_fast(&mut pass, world, view_proj, snow_deform_center, &mut current_pipeline);
@@ -17687,6 +19125,7 @@ impl Renderer {
                                 true,
                             );
                             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                             pass.set_index_buffer(
                                 world.index_buffer.slice(..),
                                 wgpu::IndexFormat::Uint32,
@@ -17728,6 +19167,7 @@ impl Renderer {
                         true,
                     );
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
                 }
@@ -17762,6 +19202,7 @@ impl Renderer {
             // debug) addresses BSP/world index ranges, so restore the world geometry
             // bindings unconditionally before any of those debug draws run.
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
             if self.wireframe_mask != 0 {
@@ -17780,8 +19221,7 @@ impl Renderer {
                             if category_enabled
                                 && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
                                 && batch.source.pipeline.class != DrawClass::Sky
-                                && (!world.source_map
-                                    || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                                && aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                             {
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
@@ -17794,6 +19234,7 @@ impl Renderer {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
                         pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
                         for draw in &world.snow_shell.draws {
                             if !snow_shell_draw_near_center(draw, snow_deform_center)
                                 || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
@@ -17826,6 +19267,7 @@ impl Renderer {
                         self.surface_sprite_effect_renderer.draw_wireframe(
                             &mut pass,
                             &self.camera_bind_group,
+                            &world.surface_sprite_effects,
                             prepared,
                         );
                     }
@@ -17841,11 +19283,20 @@ impl Renderer {
                 // Grass/dynamic/deformation overlays all bind their own geometry.
                 // Diagnostics below still address BSP index ranges.
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
-            if let Some(vertices) = &self.inspector_vertex_range {
+            if self.debug_volumes.draw(&mut pass, &self.camera_bind_group) {
+                // The overlay bound its own buffers; the inspector below addresses BSP ranges.
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            if let (Some(vertices), Some(pipeline)) =
+                (&self.inspector_vertex_range, self.surface_inspector_pipeline.as_ref())
+            {
                 if let Some(indices) = inspector_index_range(active.batches, vertices) {
-                    pass.set_pipeline(&self.surface_inspector_pipeline);
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     pass.draw_indexed(indices, 0, 0..1);
                 }
@@ -17895,7 +19346,8 @@ impl Renderer {
         // frame, so the readout ends up above it rather than beneath.
         if !menu_backdrop_active
             && !self.egui_active
-            && (self.ui_vertex_count != 0
+            && (self.screen_fx_vertex_count != 0
+                || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
                 || self.ui_transient_vertex_count != 0)
         {
@@ -17915,6 +19367,15 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            Self::draw_screen_fx_batches(
+                &mut pass,
+                &self.screen_fx_vertex_buffer,
+                self.screen_fx_vertex_count,
+                &self.screen_fx_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
+            );
             Self::draw_ui_batches(
                 &mut pass,
                 &self.ui_pipeline,
@@ -18005,10 +19466,23 @@ impl Renderer {
         } = world;
         let stride = std::mem::size_of::<GpuVertex>() as u64;
         let record_stride = std::mem::size_of::<GpuCullRecord>() as u64;
+        // Index the snapshot by model number once (first instance wins, as the
+        // previous linear search did) instead of scanning it for every model.
+        let poses = &mut self.inline_pose_scratch;
+        poses.clear();
+        if let Some(list) = instances {
+            let slots = inline_models.iter().map(|model| model.model as usize + 1).max().unwrap_or(0);
+            poses.resize(slots, None);
+            for instance in list {
+                if let Some(slot) = poses.get_mut(instance.model as usize) {
+                    slot.get_or_insert(*instance);
+                }
+            }
+        }
         for model in inline_models.iter_mut() {
             let target = match instances {
                 None => Some(InlineModelInstance::compiled(model.model)),
-                Some(list) => list.iter().find(|instance| instance.model == model.model).copied(),
+                Some(_) => poses.get(model.model as usize).copied().flatten(),
             };
             if model.uploaded == Some(target) {
                 continue;
@@ -18117,6 +19591,7 @@ impl Renderer {
         // Snowflow state advances only when new brushes/window movement/relaxation
         // require it. This is deliberately before the fast-path early return.
         self.surface_deformation.prepare_frame(&self.device, &self.queue);
+        self.ensure_lazy_scene_pipelines();
 
         // Pipeline/render-plan selection happens only when settings change. The
         // hot frame path can therefore jump directly into the known-fast renderer
@@ -18128,6 +19603,7 @@ impl Renderer {
             && !self.surface_diag_pending
             && !self.frame_diag_pending
         {
+            self.ensure_fast_world_pipelines();
             return self.render_fast_baseline(
                 camera,
                 player_position,
@@ -18288,10 +19764,12 @@ impl Renderer {
             camera_forward: camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: unjittered_view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: previous_unjittered_view_proj.to_cols_array_2d(),
+            jump_shade: self.jump_shade.uniform(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         self.ensure_wireframe_pipelines();
+        self.prepare_rt_sun_shadow(view_proj);
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
         }
@@ -18387,7 +19865,14 @@ impl Renderer {
         let snow_deform_center = self.surface_deformation.field_center();
         if let Some(world) = &mut self.world {
             update_visibility(world, camera);
-            refresh_auto4_lazy_collapse(&self.queue, world, self.pvs_mode);
+            let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
+            refresh_auto4_lazy_collapse(
+                &self.queue,
+                world,
+                self.pvs_mode,
+                auto4_area_mask,
+                self.cull_debug_mode != CullDebugMode::Off,
+            );
             let active = active_batch_selection(world, self.pvs_mode);
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             if self.cull_debug_mode != CullDebugMode::Off {
@@ -18579,6 +20064,7 @@ impl Renderer {
                     camera_forward: view.camera_forward.extend(0.0).to_array(),
                     unjittered_view_proj: view.view_proj.to_cols_array_2d(),
                     previous_unjittered_view_proj: view.view_proj.to_cols_array_2d(),
+                    jump_shade: [0.0; 4],
                 };
                 self.queue.write_buffer(
                     &self.planar_camera_buffers[slot],
@@ -18616,12 +20102,13 @@ impl Renderer {
         // Ghoul2 is compute-skinned once into the shared raster/BLAS buffer; the
         // ordinary RT-off vertex-shader skinning path remains unchanged.
         let dynamic_prepare_started = Instant::now();
+        self.ensure_rt_model_receivers();
         let entity_light_grid = self
             .world
             .as_ref()
             .and_then(|world| world.entity_light_grid.as_ref());
         let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
-        let ray_traced_shadows = self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced;
+        let ray_traced_shadows = self.hardware_rt_active();
         self.dynamic_model_renderer
             .prepare(
                 &self.device,
@@ -18630,6 +20117,7 @@ impl Renderer {
                 entity_light_grid,
                 split_dynamic_wireframe,
                 ray_traced_shadows,
+                ray_traced_shadows && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
             );
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
@@ -18735,7 +20223,7 @@ impl Renderer {
         // structures consume the shared skinned vertex buffer. The following
         // dynamic-caster build then reconstructs deforming BLASes/TLAS before
         // the first ray-querying world pass.
-        if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
+        if self.hardware_rt_active() {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::RtBuild, false);
             self.gpu_profiler
@@ -18851,6 +20339,7 @@ impl Renderer {
                         sky_pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_sky_pipeline } else { &self.shadow_resources.sky_pipeline });
                         sky_pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
                         sky_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        sky_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                         sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         for batch in &world.coarse_batches {
                             if batch.source.pipeline.class != DrawClass::Sky {
@@ -18878,6 +20367,7 @@ impl Renderer {
                     pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_pipeline } else { &self.shadow_resources.pipeline });
                     pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
@@ -19005,14 +20495,14 @@ impl Renderer {
                 let active = active_batch_selection(world, self.pvs_mode);
                 let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 let mut mask_pipeline_active = false;
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
                     if !batch_area_visible(batch, effective_area_mask) { continue; }
                     if self.ocean_enabled && batch.source.water { continue; }
-                    if world.source_map
-                        && batch.source.pipeline.class != DrawClass::Sky
+                    if batch.source.pipeline.class != DrawClass::Sky
                         && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                     {
                         continue;
@@ -19141,6 +20631,8 @@ impl Renderer {
             }
         }
 
+        self.encode_rt_sun_shadow(&mut encoder);
+
         if self.weather.fog.volumetric_effective() || self.weather.rain.enabled {
             if let Some(world) = &self.world {
                 if let Some(bind_group) = &world.froxel_bind_group {
@@ -19163,6 +20655,17 @@ impl Renderer {
             let active_pipeline_variant = &world.pipeline_variants[&world.active_pipeline_variant];
             let planar_binding_test =
                 self.planar_reflection_debug_mode == PlanarReflectionDebugMode::BindingTest;
+            // Same conditions as the main pass's CPU compaction: single-surface,
+            // single-state opaque/masked batches in a compact group share one
+            // representative bind group, so they can be drawn as one multi-draw.
+            let use_reflection_compaction = !planar_binding_test
+                && !self.ocean_enabled
+                && self.gpu_compaction_supported
+                && !world.compact_groups.is_empty();
+            let use_reflection_inline_grouping =
+                !planar_binding_test && !self.ocean_enabled && self.gpu_compaction_supported;
+            let ocean_enabled = self.ocean_enabled;
+            let mut reflection_packed = 0_u32;
             for (slot, reflection_view) in planar_views.iter().enumerate() {
                 let Some(reflection_view) = reflection_view else {
                     continue;
@@ -19184,6 +20687,95 @@ impl Renderer {
                 } else {
                     area_mask
                 };
+                // Omit this reflector's own geometry. Other reflective planes
+                // render through the recursion-disabled path.
+                let selected_range = world.coarse_batches[reflection_view.coarse_batch_index]
+                    .source
+                    .vertices
+                    .clone();
+                let reflection_visible = |batch: &WorldBatch| {
+                    let sky = batch.source.pipeline.class == DrawClass::Sky;
+                    batch_area_visible(batch, reflection_area_mask)
+                        && !(ocean_enabled && batch.source.water)
+                        // The reflection shader discards every fragment behind
+                        // the mirror plane (OpenJK's portal clip plane), so a
+                        // batch wholly behind it cannot contribute a pixel.
+                        && (sky || !aabb_behind_plane(batch.bounds_min, batch.bounds_max, reflection_view.plane))
+                        && batch.source.vertices != selected_range
+                        && (sky
+                            || aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                reflection_view.cull_view_proj,
+                            ))
+                };
+                let compact_group_of = |position: usize, batch: &WorldBatch| {
+                    let group = batch.compact_group? as usize;
+                    let same_surface_neighbour = (position > 0
+                        && same_world_surface(batch, &world.coarse_batches[indices[position - 1]]))
+                        || indices.get(position + 1).is_some_and(|&next| {
+                            same_world_surface(batch, &world.coarse_batches[next])
+                        });
+                    (!batch.is_inline_entity
+                        && batch.source.pipeline.class != DrawClass::Sky
+                        && !same_surface_neighbour)
+                        .then_some(group)
+                };
+                self.reflection_compact_groups.clear();
+                if use_reflection_compaction {
+                    self.reflection_compact_groups.resize(world.compact_groups.len(), (0, 0));
+                    // Two passes keep each group's members contiguous: count,
+                    // assign packed offsets, then fill.
+                    let mut members = 0_u32;
+                    for (position, &batch_index) in indices.iter().enumerate() {
+                        let batch = &world.coarse_batches[batch_index];
+                        if let Some(group) = compact_group_of(position, batch) {
+                            if reflection_visible(batch) {
+                                self.reflection_compact_groups[group].1 += 1;
+                                members += 1;
+                            }
+                        }
+                    }
+                    if reflection_packed.saturating_add(members) > world.reflection_compact_capacity {
+                        self.reflection_compact_groups.clear();
+                    } else {
+                        let mut next = reflection_packed;
+                        for entry in &mut self.reflection_compact_groups {
+                            entry.0 = next;
+                            next += entry.1;
+                            entry.1 = 0;
+                        }
+                        self.reflection_compact_scratch.clear();
+                        self.reflection_compact_scratch
+                            .resize(members as usize, DrawIndexedIndirectArgs::zeroed());
+                        for (position, &batch_index) in indices.iter().enumerate() {
+                            let batch = &world.coarse_batches[batch_index];
+                            let Some(group) = compact_group_of(position, batch) else { continue };
+                            if !reflection_visible(batch) {
+                                continue;
+                            }
+                            let entry = &mut self.reflection_compact_groups[group];
+                            let packed = (entry.0 + entry.1 - reflection_packed) as usize;
+                            self.reflection_compact_scratch[packed] = DrawIndexedIndirectArgs {
+                                index_count: batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                                instance_count: 1,
+                                first_index: batch.indexed_range.start,
+                                base_vertex: 0,
+                                first_instance: 0,
+                            };
+                            entry.1 += 1;
+                        }
+                        if members != 0 {
+                            self.queue.write_buffer(
+                                &world.reflection_compact_indirect_buffer,
+                                u64::from(reflection_packed)
+                                    * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                bytemuck::cast_slice(&self.reflection_compact_scratch),
+                            );
+                        }
+                        reflection_packed += members;
+                    }
+                }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("JKA planar reflection"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -19246,29 +20838,58 @@ impl Renderer {
                     pass.set_bind_group(6, ocean_bind_group, &[]);
                 }
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 let mut current_pipeline = None;
+                // Movers are grouped per draw state exactly like the main pass.
+                let inline_grouping = use_reflection_inline_grouping && world.inline_group_count != 0;
+                let mut inline_visible = std::mem::take(&mut self.inline_visible_scratch);
+                inline_visible.clear();
                 if !planar_binding_test {
                     for (reflection_pos, &batch_index) in indices.iter().enumerate() {
                         let batch = &world.coarse_batches[batch_index];
-                        if !batch_area_visible(batch, reflection_area_mask) { continue; }
-                        if self.ocean_enabled && batch.source.water { continue; }
-                        // Omit this reflector's own geometry. Other reflective
-                        // planes render through the recursion-disabled path.
-                        let selected_range = &world.coarse_batches
-                            [reflection_view.coarse_batch_index]
-                            .source
-                            .vertices;
-                        if &batch.source.vertices == selected_range {
+                        if !reflection_visible(batch) {
                             continue;
                         }
-                        if batch.source.pipeline.class != DrawClass::Sky
-                            && !aabb_intersects_clip_frustum(
-                                batch.bounds_min,
-                                batch.bounds_max,
-                                reflection_view.view_proj,
-                            )
+                        if inline_grouping
+                            && batch.is_inline_entity
+                            && batch.inline_group != u32::MAX
+                            && !inline_batch_needs_fog(&self.weather.fog, batch)
                         {
+                            inline_visible.push(batch_index);
+                            continue;
+                        }
+                        if let Some(group) = compact_group_of(reflection_pos, batch)
+                            .filter(|_| !self.reflection_compact_groups.is_empty())
+                        {
+                            // Members share this batch's pipeline state; the
+                            // group's representative owns the shared bind group.
+                            let (first, count) = self.reflection_compact_groups[group];
+                            if count != 0 {
+                                let compact = &world.compact_groups[group];
+                                let representative = match compact.representative_set {
+                                    WorldBatchSet::Coarse => &world.coarse_batches[compact.representative_index],
+                                    WorldBatchSet::Full => &world.full_batches[compact.representative_index],
+                                };
+                                if current_pipeline != Some(representative.source.pipeline) {
+                                    let Some(pipeline) = active_pipeline_variant
+                                        .reflection_pipelines
+                                        .get(&representative.source.pipeline)
+                                    else {
+                                        continue;
+                                    };
+                                    pass.set_pipeline(pipeline);
+                                    current_pipeline = Some(representative.source.pipeline);
+                                }
+                                pass.set_bind_group(1, &representative.bind_group, &[]);
+                                if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(representative, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
+                                pass.multi_draw_indexed_indirect(
+                                    &world.reflection_compact_indirect_buffer,
+                                    u64::from(first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                    count,
+                                );
+                                self.reflection_compact_groups[group].1 = 0;
+                            }
                             continue;
                         }
                         if current_pipeline != Some(batch.source.pipeline) {
@@ -19331,6 +20952,53 @@ impl Renderer {
                         }
                     }
                 }
+                if !inline_visible.is_empty() {
+                    let region_base = world.inline_indirect_capacity * (slot as u32 + 1);
+                    let packed = pack_inline_draws(
+                        &self.queue,
+                        &world.coarse_batches,
+                        &inline_visible,
+                        &mut self.inline_draw_scratch,
+                        world.inline_group_count,
+                        &world.inline_indirect_buffer,
+                        region_base,
+                        world.inline_indirect_capacity,
+                    );
+                    let scratch = &self.inline_draw_scratch;
+                    // Unpacked fallback: one run per batch, in list order.
+                    let fallback: Vec<(u32, u32)> = if packed {
+                        Vec::new()
+                    } else {
+                        (0..inline_visible.len() as u32).map(|position| (position, 1)).collect()
+                    };
+                    let runs: &[(u32, u32)] = if packed { &scratch.runs } else { &fallback };
+                    for &(first, count) in runs {
+                        let position = if packed { scratch.order[first as usize] } else { first };
+                        let batch = &world.coarse_batches[inline_visible[position as usize]];
+                        if current_pipeline != Some(batch.source.pipeline) {
+                            let Some(pipeline) = active_pipeline_variant
+                                .reflection_pipelines
+                                .get(&batch.source.pipeline)
+                            else {
+                                continue;
+                            };
+                            pass.set_pipeline(pipeline);
+                            current_pipeline = Some(batch.source.pipeline);
+                        }
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
+                        if count == 1 {
+                            pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                        } else {
+                            pass.multi_draw_indexed_indirect(
+                                &world.inline_indirect_buffer,
+                                u64::from(region_base + first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                count,
+                            );
+                        }
+                    }
+                }
+                self.inline_visible_scratch = inline_visible;
             }
         }
 
@@ -19389,6 +21057,87 @@ impl Renderer {
             } else {
                 (scene_output, None)
             };
+            let active = active_batch_selection(world, self.pvs_mode);
+            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
+
+            // OpenJK batches visible drawsurfs by shader/fog state after BSP/PVS
+            // visibility has been resolved. Mirror that submission property on
+            // the normal CPU-culling path with our existing same-state groups:
+            // retain per-batch frustum precision, then pack only safe, single-
+            // stage opaque/masked survivors into indirect multi-draws. Authored
+            // multi-stage and transparent ordering remains on the conservative
+            // per-draw path.
+            let use_cpu_compaction = !self.gpu_driven_enabled
+                && !self.ocean_enabled
+                && self.gpu_compaction_supported
+                && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                && !world.compact_groups.is_empty();
+            if use_cpu_compaction {
+                let compact_capacity = world
+                    .compact_groups
+                    .iter()
+                    .map(|group| group.output_base.saturating_add(group.max_count))
+                    .max()
+                    .unwrap_or(0) as usize;
+                self.cpu_compact_indirect_scratch.resize(
+                    compact_capacity.max(1),
+                    DrawIndexedIndirectArgs::zeroed(),
+                );
+                self.cpu_compact_count_scratch.resize(world.compact_groups.len().max(1), 0);
+                self.cpu_compact_count_scratch.fill(0);
+
+                for (active_pos, &batch_index) in active.indices.iter().enumerate() {
+                    let batch = &active.batches[batch_index];
+                    let Some(group_index) = batch.compact_group.map(|value| value as usize) else {
+                        continue;
+                    };
+                    if batch.is_inline_entity
+                        || !batch_area_visible(batch, effective_area_mask)
+                        || batch.source.pipeline.class == DrawClass::Sky
+                        || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    {
+                        continue;
+                    }
+                    let previous_same = active_pos > 0
+                        && same_world_surface(batch, &active.batches[active.indices[active_pos - 1]]);
+                    let next_same = active.indices.get(active_pos + 1).is_some_and(|&next_index| {
+                        same_world_surface(batch, &active.batches[next_index])
+                    });
+                    if previous_same || next_same {
+                        continue;
+                    }
+                    let Some(group) = world.compact_groups.get(group_index) else { continue; };
+                    let count = self.cpu_compact_count_scratch[group_index];
+                    if count >= group.max_count {
+                        continue;
+                    }
+                    let output = group.output_base.saturating_add(count) as usize;
+                    let Some(slot) = self.cpu_compact_indirect_scratch.get_mut(output) else { continue; };
+                    *slot = DrawIndexedIndirectArgs {
+                        index_count: batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                        instance_count: 1,
+                        first_index: batch.indexed_range.start,
+                        base_vertex: 0,
+                        first_instance: 0,
+                    };
+                    self.cpu_compact_count_scratch[group_index] = count.saturating_add(1);
+                }
+
+                if compact_capacity != 0 {
+                    self.queue.write_buffer(
+                        &world.compact_indirect_buffer,
+                        0,
+                        bytemuck::cast_slice(&self.cpu_compact_indirect_scratch[..compact_capacity]),
+                    );
+                    self.queue.write_buffer(
+                        &world.compact_count_buffer,
+                        0,
+                        bytemuck::cast_slice(&self.cpu_compact_count_scratch[..world.compact_groups.len()]),
+                    );
+                }
+            }
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -19434,9 +21183,8 @@ impl Renderer {
                 pass.set_bind_group(6, ocean_bind_group, &[]);
             }
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            let active = active_batch_selection(world, self.pvs_mode);
-            let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             let mut current_pipeline = None;
             let mut grass_drawn = false;
             let mut snow_shell_drawn = false;
@@ -19458,26 +21206,46 @@ impl Renderer {
             };
             let use_compaction = self.gpu_driven_enabled
                 && !self.ocean_enabled
+                // Compact groups share one representative material bind group.
+                // Legacy carries a per-draw source-triangle base in that bind
+                // group, so compacting different source ranges would alias the
+                // OpenJK-style surface dlight masks. Keep Legacy correct until
+                // compaction has an explicit per-draw metadata index.
+                && self.dynamic_lights_mode != DynamicLightsMode::Legacy
                 && self.gpu_compaction_supported
                 && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
                 && !separate_legacy_fog_pass
                 && !world.compact_groups.is_empty();
             compact_group_drawn.clear();
             compact_group_drawn.resize(world.compact_groups.len(), false);
+            // Movers are drawn after the world/grass as one multi-draw per draw
+            // state (see `plan_inline_runs`); GPU-driven culling, the ocean,
+            // underwater optics and planar debug views keep the ordered path.
+            let inline_grouping = !self.gpu_driven_enabled
+                && !self.ocean_enabled
+                && self.gpu_compaction_supported
+                && optical_volumes.is_none()
+                && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                && world.inline_group_count != 0;
+            let mut inline_visible = std::mem::take(&mut self.inline_visible_scratch);
+            inline_visible.clear();
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
                 if self.ocean_enabled && batch.source.water { continue; }
-                // When GPU-driven culling is disabled, reject source-map batches
-                // with useful local bounds before recording WGPU state/draw commands.
-                // Global material batches simply intersect and retain the old cheap path.
-                if world.source_map
-                    && !self.gpu_driven_enabled
+                // OpenJK performs view-frustum rejection after PVS marking.
+                // Do the CPU equivalent whenever indirect GPU culling is off.
+                // This must apply to compiled BSP maps too; limiting it to the
+                // direct source-.map path made large-PVS maps encode thousands
+                // of off-camera draws.
+                if !self.gpu_driven_enabled
                     && batch.source.pipeline.class != DrawClass::Sky
                     && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                 {
+                    info.world_frustum_rejected = info.world_frustum_rejected.saturating_add(1);
                     continue;
                 }
+                info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
                 if let Some(volumes) = &optical_volumes {
                     let optical = self.ocean_settings.optics;
                     let wave_margin = self.authored_ocean_definitions.iter().map(|a| a.waves.amplitude)
@@ -19485,6 +21253,14 @@ impl Renderer {
                     if batch.source.pipeline.class != DrawClass::Sky
                         && crate::ocean::optics::cull_submerged(camera.position.to_array(), batch.bounds_min, batch.bounds_max,
                             volumes, optical.absorption_distance() * optical.underwater_cull, wave_margin) { continue; }
+                }
+                if inline_grouping
+                    && batch.is_inline_entity
+                    && batch.inline_group != u32::MAX
+                    && !inline_batch_needs_fog(&self.weather.fog, batch)
+                {
+                    inline_visible.push(batch_index);
+                    continue;
                 }
                 if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
                     if !snow_shell_drawn {
@@ -19518,6 +21294,7 @@ impl Renderer {
                                 true,
                             );
                             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                             pass.set_index_buffer(
                                 world.index_buffer.slice(..),
                                 wgpu::IndexFormat::Uint32,
@@ -19570,6 +21347,87 @@ impl Renderer {
                         continue;
                     }
                 }
+                if use_cpu_compaction {
+                    if let Some(group_index) = batch.compact_group {
+                        let group_index = group_index as usize;
+                        let previous_same = active_pos > 0
+                            && same_world_surface(batch, &active.batches[active.indices[active_pos - 1]]);
+                        let next_is_same_surface = active.indices.get(active_pos + 1).is_some_and(|&next_index| {
+                            same_world_surface(batch, &active.batches[next_index])
+                        });
+                        let cpu_compactable = !batch.is_inline_entity
+                            && !previous_same
+                            && !next_is_same_surface
+                            && self.cpu_compact_count_scratch
+                                .get(group_index)
+                                .copied()
+                                .unwrap_or(0) != 0;
+                        if cpu_compactable {
+                            if !compact_group_drawn[group_index] {
+                                let group = &world.compact_groups[group_index];
+                                let representative = match group.representative_set {
+                                    WorldBatchSet::Coarse => &world.coarse_batches[group.representative_index],
+                                    WorldBatchSet::Full => &world.full_batches[group.representative_index],
+                                };
+                                if current_pipeline != Some(representative.source.pipeline) {
+                                    pass.set_pipeline(
+                                        &active_pipeline_variant.pipelines[&representative.source.pipeline],
+                                    );
+                                    current_pipeline = Some(representative.source.pipeline);
+                                }
+                                pass.set_bind_group(1, &representative.bind_group, &[]);
+                                pass.multi_draw_indexed_indirect_count(
+                                    &world.compact_indirect_buffer,
+                                    u64::from(group.output_base)
+                                        * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                    &world.compact_count_buffer,
+                                    group_index as u64 * std::mem::size_of::<u32>() as u64,
+                                    group.max_count,
+                                );
+                                let compacted_count = self.cpu_compact_count_scratch[group_index];
+                                info.world_multidraw_groups = info.world_multidraw_groups.saturating_add(1);
+                                info.world_multidraw_batches = info
+                                    .world_multidraw_batches
+                                    .saturating_add(compacted_count);
+
+                                // A single-stage surface can carry its Legacy fog
+                                // redraw as the same multi-draw immediately after
+                                // the material pass. This preserves OpenJK's
+                                // material-then-fog ordering without disabling
+                                // batching for an entire foggy map.
+                                let needs_group_fog = batch.source.pipeline.class != DrawClass::Sky
+                                    && self.weather.fog.legacy_uses_separate_pass(
+                                        batch.source.fog_is_global,
+                                        batch.source.legacy2_fog_in_stage_safe,
+                                        batch.source.global_fog_post_eligible,
+                                    )
+                                    && (batch.source.fog[3] > 0.001
+                                        || self.weather.fog.legacy_drawfog_value() == 1);
+                                if needs_group_fog {
+                                    if let Some(fog_pipeline) = active_pipeline_variant
+                                        .fog_pass_pipelines
+                                        .get(&(batch.source.pipeline, batch.source.pipeline.depth_write))
+                                    {
+                                        pass.set_pipeline(fog_pipeline);
+                                        pass.set_bind_group(1, &representative.bind_group, &[]);
+                                        pass.multi_draw_indexed_indirect_count(
+                                            &world.compact_indirect_buffer,
+                                            u64::from(group.output_base)
+                                                * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                            &world.compact_count_buffer,
+                                            group_index as u64 * std::mem::size_of::<u32>() as u64,
+                                            group.max_count,
+                                        );
+                                        current_pipeline = None;
+                                    }
+                                }
+                                compact_group_drawn[group_index] = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 if use_compaction {
                     if let Some(group_index) = batch.compact_group {
                         let group_index = group_index as usize;
@@ -19581,9 +21439,6 @@ impl Renderer {
                                 }
                                 WorldBatchSet::Full => {
                                     &world.full_batches[group.representative_index]
-                                }
-                                WorldBatchSet::Auto4 => {
-                                    &world.auto4_batches[group.representative_index]
                                 }
                             };
                             if current_pipeline != Some(representative.source.pipeline) {
@@ -19716,6 +21571,7 @@ impl Renderer {
                         true,
                     );
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     // Keep the parent world pass in a valid state even when grass is
                     // the final opaque draw. This also protects later debug/wireframe
@@ -19742,6 +21598,168 @@ impl Renderer {
                     }
                 }
             }
+            if !inline_visible.is_empty() {
+                let packed = pack_inline_draws(
+                    &self.queue,
+                    active.batches,
+                    &inline_visible,
+                    &mut self.inline_draw_scratch,
+                    world.inline_group_count,
+                    &world.inline_indirect_buffer,
+                    0,
+                    world.inline_indirect_capacity,
+                );
+                let scratch = &self.inline_draw_scratch;
+                if packed {
+                    for &(first, count) in &scratch.runs {
+                        let batch = &active.batches[inline_visible[scratch.order[first as usize] as usize]];
+                        if current_pipeline != Some(batch.source.pipeline) {
+                            pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
+                            current_pipeline = Some(batch.source.pipeline);
+                        }
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        if enhanced_world_shader {
+                            pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                        }
+                        if count == 1 {
+                            pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                        } else {
+                            pass.multi_draw_indexed_indirect(
+                                &world.inline_indirect_buffer,
+                                u64::from(first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                count,
+                            );
+                        }
+                        info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
+                    }
+                } else {
+                    for &batch_index in &inline_visible {
+                        let batch = &active.batches[batch_index];
+                        if current_pipeline != Some(batch.source.pipeline) {
+                            pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
+                            current_pipeline = Some(batch.source.pipeline);
+                        }
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        if enhanced_world_shader {
+                            pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                        }
+                        pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                        info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
+                    }
+                }
+            }
+            self.inline_visible_scratch = inline_visible;
+            // OpenJK projects legacy dynamic lights as another rendering pass
+            // after the authored material stages. The normal BSP pipelines above
+            // compile with ENABLE_LEGACY_DLIGHTS=false; redraw only authored
+            // surface runs whose CPU mirror of the dlight mask is non-zero.
+            if world.active_pipeline_variant.legacy_dlights
+                && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                && !active_pipeline_variant.legacy_dlight_pipelines.is_empty()
+            {
+                if let Ok(surface_masks) = world.legacy_dlight_surface_masks_cpu.lock() {
+                    if surface_masks.iter().any(|&mask| mask != 0) {
+                        self.gpu_profiler.write_render_pass_timestamp(
+                            &mut pass,
+                            GpuPass::LegacyDlights,
+                            false,
+                        );
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        pass.set_bind_group(
+                            2,
+                            if enhanced_world_shader {
+                                &world.lighting_bind_group
+                            } else {
+                                &world.lighting_bind_group_lean
+                            },
+                            &[],
+                        );
+                        pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                        pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                        if enhanced_world_shader {
+                            pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                        }
+                        pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                        let dlight_active = legacy_dlight_batch_selection(world, self.pvs_mode);
+                        let mut current_dlight_pipeline = None;
+                        for &batch_index in dlight_active.indices {
+                            let batch = &dlight_active.batches[batch_index];
+                            if !legacy_dlight_receives(&batch.source)
+                                || !batch_area_visible(batch, effective_area_mask)
+                                || (self.ocean_enabled && batch.source.water)
+                                || !aabb_intersects_clip_frustum(
+                                    batch.bounds_min,
+                                    batch.bounds_max,
+                                    view_proj,
+                                )
+                            {
+                                continue;
+                            }
+                            let Some(dlight_pipeline) = active_pipeline_variant
+                                .legacy_dlight_pipelines
+                                .get(&batch.source.pipeline)
+                            else {
+                                continue;
+                            };
+
+                            let has_touched_run = batch.is_inline_entity
+                                || batch.legacy_dlight_runs.iter().any(|run| {
+                                    run.surface_id != u32::MAX
+                                        && surface_masks
+                                            .get(run.surface_id as usize)
+                                            .is_some_and(|&mask| mask != 0)
+                                });
+                            if !has_touched_run {
+                                continue;
+                            }
+
+                            if current_dlight_pipeline != Some(batch.source.pipeline) {
+                                pass.set_pipeline(dlight_pipeline);
+                                current_dlight_pipeline = Some(batch.source.pipeline);
+                            }
+                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            if enhanced_world_shader {
+                                pass.set_bind_group(
+                                    6,
+                                    Self::ocean_bind_group_for(
+                                        batch,
+                                        &self.authored_oceans,
+                                        &self.ocean,
+                                        &self.ocean_inert_bind_group,
+                                    ),
+                                    &[],
+                                );
+                            }
+
+                            if batch.is_inline_entity {
+                                // Inline BSP models use the existing conservative
+                                // unknown-surface fallback (all transient dlights).
+                                pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                            } else {
+                                for run in &batch.legacy_dlight_runs {
+                                    if run.surface_id == u32::MAX
+                                        || !surface_masks
+                                            .get(run.surface_id as usize)
+                                            .is_some_and(|&mask| mask != 0)
+                                    {
+                                        continue;
+                                    }
+                                    pass.draw_indexed(run.indexed_range.clone(), 0, 0..1);
+                                }
+                            }
+                        }
+                        self.gpu_profiler.write_render_pass_timestamp(
+                            &mut pass,
+                            GpuPass::LegacyDlights,
+                            true,
+                        );
+                    }
+                }
+            }
+
             if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
                 self.surface_sprite_effect_renderer.draw(
                     &mut pass,
@@ -19763,10 +21781,20 @@ impl Renderer {
                 // opaque water pass overwrites them because they do not write
                 // depth themselves.
                 self.dynamic_model_renderer
-                    .draw_phase(&mut pass, &self.camera_bind_group, true);
+                    .draw_phase(&mut pass, &self.camera_bind_group, true,
+                        self.ray_traced_shadows.as_ref().filter(|_| self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)
+                            .and_then(|rt| rt.model_receivers.as_ref().map(|models| (models, &rt.receiver_bind_group))),
+                        Some(&mut self.gpu_profiler));
             } else {
-                self.dynamic_model_renderer
-                    .draw(&mut pass, &self.camera_bind_group);
+                for depth_writing_phase in [true, false] {
+                    self.dynamic_model_renderer.draw_phase(
+                        &mut pass,
+                        &self.camera_bind_group,
+                        depth_writing_phase,
+                        None,
+                        Some(&mut self.gpu_profiler),
+                    );
+                }
             }
             self.gpu_profiler.write_render_pass_timestamp(
                 &mut pass,
@@ -19812,12 +21840,12 @@ impl Renderer {
                 pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                 pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
                     if batch.ocean_clipmap.is_none() || !batch_area_visible(batch, effective_area_mask) { continue; }
-                    if world.source_map
-                        && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    if !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                     {
                         continue;
                     }
@@ -19839,7 +21867,10 @@ impl Renderer {
                     false,
                 );
                 self.dynamic_model_renderer
-                    .draw_phase(&mut pass, &self.camera_bind_group, false);
+                    .draw_phase(&mut pass, &self.camera_bind_group, false,
+                        self.ray_traced_shadows.as_ref().filter(|_| self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)
+                            .and_then(|rt| rt.model_receivers.as_ref().map(|models| (models, &rt.receiver_bind_group))),
+                        Some(&mut self.gpu_profiler));
                 self.gpu_profiler.write_render_pass_timestamp(
                     &mut pass,
                     GpuPass::DynamicModelsTranslucent,
@@ -19852,6 +21883,7 @@ impl Renderer {
             // debug) addresses BSP/world index ranges, so restore the world geometry
             // bindings unconditionally before any of those debug draws run.
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
             if self.wireframe_mask != 0 {
@@ -19870,8 +21902,7 @@ impl Renderer {
                             if category_enabled
                                 && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
                                 && batch.source.pipeline.class != DrawClass::Sky
-                                && (!world.source_map
-                                    || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                                && aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                             {
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
@@ -19893,13 +21924,13 @@ impl Renderer {
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                         pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                         pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                         pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
                             if batch.ocean_clipmap.is_none()
                                 || !batch_area_visible(batch, effective_area_mask)
-                                || (world.source_map
-                                    && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj))
+                                || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                             {
                                 continue;
                             }
@@ -19933,6 +21964,7 @@ impl Renderer {
                         pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                         pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
                         for draw in &world.snow_shell.draws {
                             if !snow_shell_draw_near_center(draw, snow_deform_center)
                                 || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
@@ -19977,6 +22009,7 @@ impl Renderer {
                         self.surface_sprite_effect_renderer.draw_wireframe(
                             &mut pass,
                             &self.camera_bind_group,
+                            &world.surface_sprite_effects,
                             prepared,
                         );
                     }
@@ -19990,17 +22023,28 @@ impl Renderer {
                 }
 
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
-            if let Some(vertices) = &self.inspector_vertex_range {
+            if self.debug_volumes.draw(&mut pass, &self.camera_bind_group) {
+                // The overlay bound its own buffers; the inspector below addresses BSP ranges.
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            if let (Some(vertices), Some(pipeline)) =
+                (&self.inspector_vertex_range, self.surface_inspector_pipeline.as_ref())
+            {
                 if let Some(indices) = inspector_index_range(active.batches, vertices) {
-                    pass.set_pipeline(&self.surface_inspector_pipeline);
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     pass.draw_indexed(indices, 0, 0..1);
                 }
             }
-            if self.cull_debug_mode == CullDebugMode::RejectionReasons {
-                pass.set_pipeline(&self.cull_debug_pipeline);
+            if let (CullDebugMode::RejectionReasons, Some(cull_debug_pipeline)) =
+                (self.cull_debug_mode, self.cull_debug_pipeline.as_ref())
+            {
+                pass.set_pipeline(cull_debug_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &world.cull_debug_bind_group, &[]);
                 // Draw the entire PVS representation, not merely its active
@@ -20332,7 +22376,9 @@ impl Renderer {
         }
 
         if plan.use_post {
-            if self.taa_enabled {
+            if let (true, Some(taa_post_pipeline)) =
+                (self.taa_enabled, self.taa_post_pipeline.as_ref())
+            {
                 // Persist the *resolved* temporal color, not the raw jittered
                 // scene. Ping-pong history avoids sampling and writing the same
                 // texture while keeping TAA inside the existing fullscreen pass.
@@ -20365,7 +22411,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.taa_post_pipeline);
+                pass.set_pipeline(taa_post_pipeline);
                 pass.set_bind_group(
                     0,
                     &self.post_bind_groups[self.history_read_index][self.ssao_history_read_index]
@@ -20490,7 +22536,8 @@ impl Renderer {
         // frame, so the readout ends up above it rather than beneath.
         if !menu_backdrop_active
             && !self.egui_active
-            && (self.ui_vertex_count != 0
+            && (self.screen_fx_vertex_count != 0
+                || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
                 || self.ui_transient_vertex_count != 0)
         {
@@ -20512,6 +22559,15 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            Self::draw_screen_fx_batches(
+                &mut pass,
+                &self.screen_fx_vertex_buffer,
+                self.screen_fx_vertex_count,
+                &self.screen_fx_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
+            );
             Self::draw_ui_batches(
                 &mut pass,
                 &self.ui_pipeline,
@@ -20638,18 +22694,25 @@ impl Renderer {
 
 struct IndexedGeometryBuilder<'a> {
     source: &'a [GpuVertex],
+    source_triangle_surfaces: &'a [u32],
     vertices: Vec<GpuVertex>,
-    lookup: BTreeMap<[u32; 15], u32>,
+    legacy_dlight_surface_ids: Vec<u32>,
+    // A shared geometric vertex may belong to different authored BSP surfaces.
+    // Keep those identities distinct so the Legacy-only flat surface-id stream
+    // remains exact without enlarging GpuVertex for every renderer mode.
+    lookup: BTreeMap<([u32; 15], u32), u32>,
     indices: Vec<u32>,
     cache: BTreeMap<(u32, u32, u32), std::ops::Range<u32>>,
     source_to_index: Vec<Option<u32>>,
 }
 
 impl<'a> IndexedGeometryBuilder<'a> {
-    fn new(source: &'a [GpuVertex]) -> Self {
+    fn new(source: &'a [GpuVertex], source_triangle_surfaces: &'a [u32]) -> Self {
         Self {
             source,
+            source_triangle_surfaces,
             vertices: Vec::new(),
+            legacy_dlight_surface_ids: Vec::new(),
             lookup: BTreeMap::new(),
             indices: Vec::new(),
             cache: BTreeMap::new(),
@@ -20657,13 +22720,14 @@ impl<'a> IndexedGeometryBuilder<'a> {
         }
     }
 
-    fn intern(&mut self, vertex: GpuVertex) -> u32 {
-        let key = gpu_vertex_key(&vertex);
+    fn intern(&mut self, vertex: GpuVertex, surface_id: u32) -> u32 {
+        let key = (gpu_vertex_key(&vertex), surface_id);
         if let Some(&index) = self.lookup.get(&key) {
             return index;
         }
         let index = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
         self.vertices.push(vertex);
+        self.legacy_dlight_surface_ids.push(surface_id);
         self.lookup.insert(key, index);
         index
     }
@@ -20685,6 +22749,8 @@ impl<'a> IndexedGeometryBuilder<'a> {
     ) -> std::ops::Range<u32> {
         let vertex_base = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
         self.vertices.extend_from_slice(vertices);
+        self.legacy_dlight_surface_ids
+            .extend(std::iter::repeat(u32::MAX).take(vertices.len()));
         let start = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
         self.indices
             .extend(indices.iter().map(|index| vertex_base.saturating_add(*index)));
@@ -20705,8 +22771,13 @@ impl<'a> IndexedGeometryBuilder<'a> {
         {
             values.reserve(slice.len());
             for (offset, &vertex) in slice.iter().enumerate() {
-                let index = self.intern(vertex);
                 let source_index = start + offset;
+                let surface_id = self
+                    .source_triangle_surfaces
+                    .get(source_index / 3)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                let index = self.intern(vertex, surface_id);
                 if let Some(slot) = self.source_to_index.get_mut(source_index) {
                     *slot = Some(index);
                 }
@@ -20722,31 +22793,79 @@ impl<'a> IndexedGeometryBuilder<'a> {
 
 
 
+struct Auto4Instance {
+    batches: Vec<WorldBatch>,
+    variant_base: usize,
+    always_start: usize,
+    variant_members: Vec<Vec<usize>>,
+    variant_geometry: Vec<usize>,
+    variant_area_mixed: Vec<bool>,
+    geometry_members: Vec<Vec<usize>>,
+    geometry_variants: Vec<Vec<usize>>,
+    geometry_states: Vec<Auto4GeometryState>,
+}
+
+/// Instantiate AUTO 4's map-worker recipes against the uploaded FULL pieces.
+/// FULL batches are aliased as-is (they are the exact cold fallback); every
+/// recipe gets one batch with FULL's bind state and its own cull record.
+/// Recipes whose pieces are already one run in FULL's index data draw from
+/// that run immediately and never touch the collapse cache.
 fn instantiate_portal_draw_plans(
     plan: &PreparedPortalDrawPlan,
-    portal_batches: &[WorldBatch],
     full_batches: &[WorldBatch],
     inline_full_start: usize,
     cull_records: &mut Vec<GpuCullRecord>,
     initial_indirect: &mut Vec<DrawIndexedIndirectArgs>,
-) -> (
-    Vec<WorldBatch>,
-    Vec<usize>,
-    usize,
-    usize,
-) {
-    if plan.plan_by_cluster.is_empty() || portal_batches.is_empty() {
-        return (Vec::new(), Vec::new(), 0, 0);
+) -> Option<Auto4Instance> {
+    if plan.plan_by_cluster.is_empty() || full_batches.is_empty() {
+        return None;
     }
+    let piece_count = plan.piece_count.min(inline_full_start);
+    let world_piece = |member: usize| member < piece_count;
 
-    let mut batches = portal_batches.to_vec();
+    let geometry_ranges = plan
+        .geometries
+        .iter()
+        .map(|geometry| {
+            let mut run: Option<std::ops::Range<u32>> = None;
+            for &member in &geometry.members {
+                if !world_piece(member) {
+                    return None;
+                }
+                let range = &full_batches[member].indexed_range;
+                match &mut run {
+                    None => run = Some(range.clone()),
+                    Some(run) if run.end == range.start => run.end = range.end,
+                    Some(_) => return None,
+                }
+            }
+            run
+        })
+        .collect::<Vec<_>>();
+    let geometry_states = geometry_ranges
+        .iter()
+        .map(|range| {
+            if range.is_some() {
+                Auto4GeometryState::Static
+            } else {
+                Auto4GeometryState::Uncached
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut batches = full_batches.to_vec();
     let variant_base = batches.len();
-    for variant in &plan.variants {
-        let representative = &portal_batches[variant.representative];
-        let mut batch = representative.clone();
-        batch.indexed_range = 0..0;
-        batch.source.pvs_signature = variant.pvs_signature.clone();
-        batch.source.portal_signature.clear();
+    let mut geometry_variants = vec![Vec::new(); plan.geometries.len()];
+    for (index, variant) in plan.variants.iter().enumerate() {
+        geometry_variants[variant.geometry].push(index);
+        let representative = if world_piece(variant.representative) {
+            variant.representative
+        } else {
+            0
+        };
+        let mut batch = full_batches[representative].clone();
+        batch.indexed_range = geometry_ranges[variant.geometry].clone().unwrap_or(0..0);
+        batch.source.pvs_signature.clear();
         batch.source.area_signature = variant.area_signature;
         batch.is_inline_entity = false;
         batch.ocean_clipmap = None;
@@ -20754,53 +22873,82 @@ fn instantiate_portal_draw_plans(
         batch.bounds_min = variant.bounds_min;
         batch.bounds_max = variant.bounds_max;
 
+        let index_count = batch.indexed_range.end.saturating_sub(batch.indexed_range.start);
         let cull_index = u32::try_from(cull_records.len()).unwrap_or(u32::MAX);
-        let record = GpuCullRecord {
-            minimum: [
-                variant.bounds_min[0],
-                variant.bounds_min[1],
-                variant.bounds_min[2],
-                0.0,
-            ],
-            maximum: [
-                variant.bounds_max[0],
-                variant.bounds_max[1],
-                variant.bounds_max[2],
-                0.0,
-            ],
+        cull_records.push(GpuCullRecord {
+            minimum: [variant.bounds_min[0], variant.bounds_min[1], variant.bounds_min[2], 0.0],
+            maximum: [variant.bounds_max[0], variant.bounds_max[1], variant.bounds_max[2], 0.0],
             draw: [
-                0,
-                0,
+                index_count,
+                batch.indexed_range.start,
                 u32::from(batch.source.pipeline.class == DrawClass::Sky),
                 0,
             ],
             compact: [u32::MAX, 0, 0, 0],
-        };
+        });
         initial_indirect.push(DrawIndexedIndirectArgs {
-            index_count: 0,
+            index_count,
             instance_count: 1,
-            first_index: 0,
+            first_index: batch.indexed_range.start,
             base_vertex: 0,
             first_instance: 0,
         });
-        cull_records.push(record);
         batch.cull_index = cull_index;
         batches.push(batch);
     }
 
-    let static_count = batches.len();
-    let auto4_inline_start = batches.len();
-    batches.extend(full_batches[inline_full_start..].iter().cloned());
-
-
-    (
+    Some(Auto4Instance {
         batches,
-        plan.plan_by_cluster.clone(),
-        static_count,
         variant_base,
-    )
+        always_start: piece_count,
+        variant_members: plan.variants.iter().map(|variant| variant.members.clone()).collect(),
+        variant_geometry: plan.variants.iter().map(|variant| variant.geometry).collect(),
+        variant_area_mixed: plan.variants.iter().map(|variant| variant.area_mixed).collect(),
+        geometry_members: plan.geometries.iter().map(|geometry| geometry.members.clone()).collect(),
+        geometry_variants,
+        geometry_states,
+    })
 }
 
+
+fn legacy_dlight_runs_for_batch(
+    source: &DrawBatch,
+    indexed_range: &std::ops::Range<u32>,
+    triangle_surfaces: Option<&[u32]>,
+) -> Vec<LegacyDlightRun> {
+    let Some(triangle_surfaces) = triangle_surfaces else {
+        return Vec::new();
+    };
+    let source_start = source.vertices.start as usize;
+    let source_count = source.vertices.end.saturating_sub(source.vertices.start) as usize;
+    if source_count < 3 || indexed_range.end.saturating_sub(indexed_range.start) as usize != source_count {
+        return Vec::new();
+    }
+
+    let mut runs = Vec::<LegacyDlightRun>::new();
+    for local_start in (0..source_count).step_by(3) {
+        let source_vertex = source_start.saturating_add(local_start);
+        let surface_id = triangle_surfaces
+            .get(source_vertex / 3)
+            .copied()
+            .unwrap_or(u32::MAX);
+        let first_index = indexed_range
+            .start
+            .saturating_add(u32::try_from(local_start).unwrap_or(u32::MAX));
+        let end_index = first_index.saturating_add(3);
+        if let Some(last) = runs.last_mut() {
+            if last.surface_id == surface_id && last.indexed_range.end == first_index {
+                last.indexed_range.end = end_index;
+                continue;
+            }
+        }
+        runs.push(LegacyDlightRun {
+            surface_id,
+            indexed_range: first_index..end_index,
+        });
+    }
+    runs
+}
 
 fn gpu_vertex_key(vertex: &GpuVertex) -> [u32; 15] {
     [
@@ -20936,11 +23084,17 @@ fn create_snow_shell_gpu(
         contents: if packed.is_empty() { &[0u8][..] } else { bytemuck::cast_slice(&packed) },
         usage: wgpu::BufferUsages::VERTEX,
     });
+    let snow_surface_ids = vec![u32::MAX; packed.len().max(1)];
+    let legacy_dlight_surface_id_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA Snowflow Legacy dlight surface-id fallback"),
+        contents: bytemuck::cast_slice(&snow_surface_ids),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
     println!(
         "Snowflow overlay: {} static chunks, {} vertices ({:.1} MiB), {:.1}u lattice",
         draws.len(), packed.len(), bytes as f64 / (1024.0 * 1024.0), SNOW_SHELL_TESSELLATION
     );
-    SnowShellGpu { vertex_buffer, draws }
+    SnowShellGpu { vertex_buffer, legacy_dlight_surface_id_buffer, draws }
 }
 
 fn snow_shell_draw_near_center(draw: &SnowShellDraw, center: Vec2) -> bool {
@@ -20959,6 +23113,7 @@ fn draw_snow_shell_fast<'a>(
 ) {
     if world.snow_shell.draws.is_empty() { return; }
     pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
     for draw in &world.snow_shell.draws {
         if !snow_shell_draw_near_center(draw, deform_center)
             || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
@@ -20972,6 +23127,7 @@ fn draw_snow_shell_fast<'a>(
         pass.draw(draw.vertices.clone(), 1..2);
     }
     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
     *current_pipeline = None;
 }
@@ -20986,6 +23142,7 @@ fn draw_snow_shell<'a>(
 ) {
     if world.snow_shell.draws.is_empty() { return; }
     pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
     for draw in &world.snow_shell.draws {
         if !snow_shell_draw_near_center(draw, deform_center)
             || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
@@ -20999,6 +23156,7 @@ fn draw_snow_shell<'a>(
         pass.draw(draw.vertices.clone(), 1..2);
     }
     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
     *current_pipeline = None;
 }
@@ -21051,6 +23209,133 @@ fn is_upward_water_face(source: &DrawBatch, vertices: &[GpuVertex]) -> bool {
 /// Promoted water draws the shared camera-centred ocean clipmap in place of its
 /// authored brush face. The clipmap is one mesh for the whole world, so the
 /// range comes from the renderer rather than from per-batch state.
+/// Legacy fog redraws follow each surface's final stage, so a mover batch that
+/// needs one keeps the ordered per-batch path.
+fn inline_batch_needs_fog(fog: &weather::FogSystem, batch: &WorldBatch) -> bool {
+    fog.legacy_uses_separate_pass(
+        batch.source.fog_is_global,
+        batch.source.legacy2_fog_in_stage_safe,
+        batch.source.global_fog_post_eligible,
+    ) && (batch.source.fog[3] > 0.001 || fog.legacy_drawfog_value() == 1)
+}
+
+/// Retained scratch for `plan_inline_runs` / `pack_inline_draws`.
+#[derive(Default)]
+struct InlineDrawScratch {
+    group_offsets: Vec<u32>,
+    group_order: Vec<u32>,
+    done: Vec<bool>,
+    /// Visible positions in draw order.
+    order: Vec<u32>,
+    /// `(first index into order, count)` of each multi-draw.
+    runs: Vec<(u32, u32)>,
+    args: Vec<DrawIndexedIndirectArgs>,
+}
+
+/// Orders the visible mover batches into runs that each share one draw state.
+///
+/// `group_of[p]` is the state class of visible batch `p` and `continues[p]` is
+/// true when `p` is a later stage of the same surface as `p - 1`. A run is
+/// emitted at its first member and pulls in every later member of the class,
+/// except a member whose previous stage has not been drawn yet: it waits for a
+/// later run. That keeps every surface's stages in authored order (an opaque
+/// base must precede the depth-equal stage layered on it) while still merging
+/// the same stage of different surfaces, like OpenJK's per-shader batches.
+fn plan_inline_runs(
+    group_of: &[u32],
+    continues: &[bool],
+    group_count: usize,
+    scratch: &mut InlineDrawScratch,
+) {
+    let n = group_of.len();
+    scratch.group_offsets.clear();
+    scratch.group_offsets.resize(group_count + 1, 0);
+    for &group in group_of {
+        scratch.group_offsets[group as usize + 1] += 1;
+    }
+    for group in 0..group_count {
+        scratch.group_offsets[group + 1] += scratch.group_offsets[group];
+    }
+    scratch.group_order.clear();
+    scratch.group_order.resize(n, 0);
+    // Counting sort by class; positions stay ascending inside a class.
+    let mut cursor = scratch.group_offsets.clone();
+    for (position, &group) in group_of.iter().enumerate() {
+        scratch.group_order[cursor[group as usize] as usize] = position as u32;
+        cursor[group as usize] += 1;
+    }
+    scratch.done.clear();
+    scratch.done.resize(n, false);
+    scratch.order.clear();
+    scratch.runs.clear();
+    for position in 0..n {
+        if scratch.done[position] {
+            continue;
+        }
+        let group = group_of[position] as usize;
+        let first = scratch.order.len() as u32;
+        let members = scratch.group_offsets[group] as usize..scratch.group_offsets[group + 1] as usize;
+        for slot in members {
+            let member = scratch.group_order[slot] as usize;
+            if scratch.done[member] || (continues[member] && !scratch.done[member - 1]) {
+                continue;
+            }
+            scratch.done[member] = true;
+            scratch.order.push(member as u32);
+        }
+        scratch.runs.push((first, scratch.order.len() as u32 - first));
+    }
+}
+
+/// Plans and packs the visible mover batches: the indirect arguments of every
+/// run are contiguous in `buffer` from `region_base`, in run order. Returns
+/// false when the region is too small (callers then draw batch by batch).
+#[allow(clippy::too_many_arguments)]
+fn pack_inline_draws(
+    queue: &wgpu::Queue,
+    batches: &[WorldBatch],
+    visible: &[usize],
+    scratch: &mut InlineDrawScratch,
+    group_count: usize,
+    buffer: &wgpu::Buffer,
+    region_base: u32,
+    region_capacity: u32,
+) -> bool {
+    if visible.len() > region_capacity as usize {
+        return false;
+    }
+    let group_of: Vec<u32> = visible.iter().map(|&index| batches[index].inline_group).collect();
+    let continues: Vec<bool> = visible
+        .iter()
+        .enumerate()
+        .map(|(position, &index)| {
+            position > 0 && same_world_surface(&batches[index], &batches[visible[position - 1]])
+        })
+        .collect();
+    plan_inline_runs(&group_of, &continues, group_count, scratch);
+    let mut args = std::mem::take(&mut scratch.args);
+    args.clear();
+    args.extend(scratch.order.iter().map(|&position| {
+        let batch = &batches[visible[position as usize]];
+        DrawIndexedIndirectArgs {
+            index_count: batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+            instance_count: 1,
+            first_index: batch.indexed_range.start,
+            base_vertex: 0,
+            first_instance: 0,
+        }
+    }));
+    if !args.is_empty() {
+        queue.write_buffer(
+            buffer,
+            u64::from(region_base) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+            bytemuck::cast_slice(&args),
+        );
+    }
+    scratch.args = args;
+    true
+}
+
 fn draw_world_batch<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     batch: &WorldBatch,
@@ -21161,8 +23446,6 @@ fn build_world(
     pipeline_layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     shader_variant: WorldShaderVariantKey,
-    fast_pipeline_layout: &wgpu::PipelineLayout,
-    fast_shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
     ray_tracing_supported: bool,
@@ -21199,9 +23482,10 @@ fn build_world(
     let source_map = map.map_file_stats.is_some();
     let PreparedMap {
         vertices,
+        legacy_dlight_triangle_surfaces,
+        legacy_dlight_surfaces,
         batches: coarse_sources,
         pvs_batches: full_sources,
-        portal_batches: portal_sources,
         portal_draw_plan,
         textures: texture_data,
         footprint_mark_textures,
@@ -21264,7 +23548,7 @@ fn build_world(
     let mut upload_timings = WorldUploadTimings::default();
 
     let vertex_started = Instant::now();
-    let mut indexed_builder = IndexedGeometryBuilder::new(&vertices);
+    let mut indexed_builder = IndexedGeometryBuilder::new(&vertices, &legacy_dlight_triangle_surfaces);
     let coarse_index_ranges = coarse_sources
         .iter()
         .map(|source| indexed_builder.batch_range(source))
@@ -21273,34 +23557,10 @@ fn build_world(
         .iter()
         .map(|source| indexed_builder.batch_range(source))
         .collect::<Vec<_>>();
-    // AUTO 4 portal batches are strict subranges of one FULL PVS piece, so
-    // reuse those index ranges instead of uploading another copy of the base
-    // indices. Only map-load merged variants append new index data.
-    let portal_index_ranges = portal_sources
-        .iter()
-        .map(|source| {
-            full_sources
-                .iter()
-                .zip(&full_index_ranges)
-                .find_map(|(full, range)| {
-                    if source.vertices.start < full.vertices.start
-                        || source.vertices.end > full.vertices.end
-                    {
-                        return None;
-                    }
-                    let offset = source.vertices.start - full.vertices.start;
-                    let count = source.vertices.end - source.vertices.start;
-                    let start = range.start.checked_add(offset)?;
-                    Some(start..start.checked_add(count)?)
-                })
-                .unwrap_or_else(|| indexed_builder.batch_range(source))
-        })
-        .collect::<Vec<_>>();
-    let auto4_portal_index_ranges = Arc::new(portal_index_ranges.clone());
-    // AUTO 4's cluster/PVS grouping was already completed by the map worker.
-    // Physical merged index ranges are deliberately *not* materialized here:
-    // they are built lazily on `jka-auto4-collapse` when a cluster first needs
-    // them, with multi-draw over these portal ranges as the no-hitch fallback.
+    // AUTO 4 recipes concatenate FULL piece index ranges. The map worker only
+    // decided which pieces each recipe holds; non-contiguous recipes are built
+    // lazily on `jka-auto4-collapse`, drawing their FULL pieces meanwhile.
+    let auto4_piece_ranges = Arc::new(full_index_ranges.clone());
     // The FFT ocean replaces every promoted water face with one shared
     // camera-centred clipmap, so the authored brush footprint no longer has to
     // be subdivided per map. `build_ocean_meshes` only decides whether the
@@ -21371,7 +23631,10 @@ fn build_world(
     for model in &inline_model_sources {
         let gpu_start = u32::try_from(indexed_builder.vertices.len()).unwrap_or(u32::MAX);
         let source = model.vertices.start as usize..model.vertices.end as usize;
+        let inline_count = source.end.saturating_sub(source.start);
         indexed_builder.vertices.extend_from_slice(&inline_vertices[source]);
+        indexed_builder.legacy_dlight_surface_ids
+            .extend(std::iter::repeat(u32::MAX).take(inline_count));
         for batch_index in model.batches.clone() {
             let batch = &inline_batch_sources[batch_index];
             let indices = batch
@@ -21392,15 +23655,24 @@ fn build_world(
         contents: bytemuck::cast_slice(&indexed_builder.vertices),
         usage: world_vertex_usage,
     });
+    let legacy_surface_ids = if indexed_builder.legacy_dlight_surface_ids.is_empty() {
+        vec![u32::MAX]
+    } else {
+        indexed_builder.legacy_dlight_surface_ids.clone()
+    };
+    let legacy_dlight_surface_id_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA Legacy dlight BSP surface ids"),
+        contents: bytemuck::cast_slice(&legacy_surface_ids),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
     let auto4_source_indices = Arc::new(std::mem::take(&mut indexed_builder.indices));
     let base_index_count = u32::try_from(auto4_source_indices.len()).unwrap_or(u32::MAX);
     let base_index_bytes = (auto4_source_indices.len() as u64)
         .saturating_mul(std::mem::size_of::<u32>() as u64);
-    let requested_auto4_cache_bytes = if portal_draw_plan.variants.is_empty() {
-        0
-    } else {
-        AUTO4_COLLAPSE_CACHE_BYTES
-    };
+    // Never reserve more than building every non-contiguous recipe would need.
+    let requested_auto4_cache_bytes = (portal_draw_plan.packed_index_count as u64)
+        .saturating_mul(std::mem::size_of::<u32>() as u64)
+        .min(AUTO4_COLLAPSE_CACHE_BYTES);
     let max_extra_bytes = device
         .limits()
         .max_buffer_size
@@ -21567,10 +23839,21 @@ fn build_world(
 
     let mut cull_records = Vec::<GpuCullRecord>::new();
     let mut initial_indirect = Vec::<DrawIndexedIndirectArgs>::new();
+    let mut material_arena = UniformArena::new(
+        device,
+        "JKA material uniforms",
+        std::mem::size_of::<MaterialUniform>() as u64,
+    );
+    let mut fog_arena = UniformArena::new(
+        device,
+        "JKA surface fog uniforms",
+        std::mem::size_of::<weather::fog::SurfaceFogUniform>() as u64,
+    );
     let mut upload_batches = |
         sources: Vec<DrawBatch>,
         index_ranges: Vec<std::ops::Range<u32>>,
         source_vertices: &[GpuVertex],
+        triangle_surfaces: Option<&[u32]>,
     | {
         let mut uploaded = Vec::with_capacity(sources.len());
         for (mut source, index_range) in sources.into_iter().zip(index_ranges) {
@@ -21599,19 +23882,16 @@ fn build_world(
                 &source,
                 (detail_auto_word & AUTO_DETAIL_ENABLED_BIT) != 0,
             );
-            let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("JKA material uniform"),
-                contents: bytemuck::bytes_of(&material_uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let fog_buffer = weather::fog::create_surface_fog_buffer(
-                device,
+            let material_buffer =
+                material_arena.push(device, queue, bytemuck::bytes_of(&material_uniform));
+            let fog_uniform = weather::fog::surface_fog_uniform(
                 source.fog,
                 source.fog_is_global,
                 source.fog_color_override,
                 source.legacy2_fog_in_stage_safe,
                 source.global_fog_post_eligible,
             );
+            let fog_buffer = fog_arena.push(device, queue, bytemuck::bytes_of(&fog_uniform));
             let selected_detail_texture = detail_texture_for_source(
                 &source,
                 detail_texture,
@@ -21685,9 +23965,13 @@ fn build_world(
                 bounds_max[1] += 256.0;
             }
             cull_records.push(record);
+            let legacy_dlight_runs =
+                legacy_dlight_runs_for_batch(&source, &index_range, triangle_surfaces);
             uploaded.push(WorldBatch {
                 indexed_range: index_range,
+                legacy_dlight_runs,
                 is_inline_entity: false,
+                inline_group: u32::MAX,
                 ocean_clipmap,
                 source,
                 bind_group,
@@ -21704,14 +23988,9 @@ fn build_world(
     };
 
     let batch_started = Instant::now();
-    let mut coarse_batches = upload_batches(coarse_sources, coarse_index_ranges, &vertices);
+    let mut coarse_batches = upload_batches(coarse_sources, coarse_index_ranges, &vertices, Some(&legacy_dlight_triangle_surfaces));
     let mut full_batches = if visibility.is_some() {
-        upload_batches(full_sources, full_index_ranges, &vertices)
-    } else {
-        Vec::new()
-    };
-    let portal_batches = if visibility.is_some() {
-        upload_batches(portal_sources, portal_index_ranges, &vertices)
+        upload_batches(full_sources, full_index_ranges, &vertices, Some(&legacy_dlight_triangle_surfaces))
     } else {
         Vec::new()
     };
@@ -21845,10 +24124,16 @@ fn build_world(
         inline_batch_sources.clone(),
         inline_index_ranges.clone(),
         &inline_vertices,
+        None,
     ));
     let inline_full_start = full_batches.len();
     if visibility.is_some() {
-        full_batches.extend(upload_batches(inline_batch_sources, inline_index_ranges, &inline_vertices));
+        full_batches.extend(upload_batches(
+            inline_batch_sources,
+            inline_index_ranges,
+            &inline_vertices,
+            None,
+        ));
     }
     for batch in &mut coarse_batches[inline_coarse_start..] {
         batch.is_inline_entity = true;
@@ -21856,6 +24141,25 @@ fn build_world(
     for batch in &mut full_batches[inline_full_start..] {
         batch.is_inline_entity = true;
     }
+    let mut inline_group_states = Vec::<DrawBatch>::new();
+    for batch in coarse_batches[inline_coarse_start..]
+        .iter_mut()
+        .chain(full_batches[inline_full_start..].iter_mut())
+    {
+        let group = inline_group_states
+            .iter()
+            .position(|state| same_draw_state(state, &batch.source))
+            .unwrap_or_else(|| {
+                inline_group_states.push(batch.source.clone());
+                inline_group_states.len() - 1
+            });
+        batch.inline_group = u32::try_from(group).unwrap_or(u32::MAX);
+    }
+    let inline_group_count = inline_group_states.len();
+    let inline_indirect_capacity = u32::try_from(
+        (coarse_batches.len() - inline_coarse_start).max(full_batches.len() - inline_full_start).max(1),
+    )
+    .unwrap_or(u32::MAX);
     // Inline source ranges index `inline_vertices`, not `vertices`. Move them
     // past every world range so world-indexed debug paths (surface inspector
     // picking/highlight) skip them instead of aliasing a world surface.
@@ -21888,35 +24192,22 @@ fn build_world(
         })
         .collect::<Vec<_>>();
     upload_timings.batch_bind_groups_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
-    let mut compact_groups =
+    let compact_groups =
         build_draw_compaction_groups(&mut cull_records, &mut coarse_batches, &mut full_batches);
-    let base_compact_draw_capacity = compact_groups
-        .iter()
-        .map(|group| group.max_count)
-        .sum::<u32>();
-
-    let (
-        mut auto4_batches,
-        auto4_plan_by_cluster,
-        auto4_static_batch_count,
-        auto4_variant_base,
-    ) = instantiate_portal_draw_plans(
-        &portal_draw_plan,
-        &portal_batches,
-        &full_batches,
-        inline_full_start,
-        &mut cull_records,
-        &mut initial_indirect,
-    );
-    let auto4_inline_start = auto4_static_batch_count;
-    let auto4_groups = build_auto4_draw_compaction_groups(
-        &mut cull_records,
-        &mut auto4_batches,
-        auto4_static_batch_count,
-        u32::try_from(compact_groups.len()).unwrap_or(u32::MAX),
-        base_compact_draw_capacity,
-    );
-    compact_groups.extend(auto4_groups);
+    // Recipe batches are deliberately not compacted: a warm plan draws each
+    // recipe as one real indexed draw. Their FULL fallback pieces keep FULL's
+    // compaction groups.
+    let auto4 = if visibility.is_some() {
+        instantiate_portal_draw_plans(
+            &portal_draw_plan,
+            &full_batches,
+            inline_full_start,
+            &mut cull_records,
+            &mut initial_indirect,
+        )
+    } else {
+        None
+    };
     let compact_draw_capacity = compact_groups
         .iter()
         .map(|group| group.max_count)
@@ -21930,11 +24221,17 @@ fn build_world(
     }
     if !portal_draw_plan.plan_by_cluster.is_empty() {
         println!(
-            "AUTO 4 portal plans: {} portal base batch(es), {} unique collapsible group(s), {} unique cluster plan(s) for {} cluster(s); {} group reuse hit(s), {} whole-plan reuse hit(s); full eager collapse would cost {:.2} MiB, lazy cache budget {:.2} MiB",
-            portal_batches.len(),
+            "AUTO 4 plans: {} FULL piece(s), {} recipe(s) over {} geometr(ies) ({} drawn from existing indices), {} unique cluster plan(s) for {} cluster(s); {} recipe reuse hit(s), {} whole-plan reuse hit(s); full eager collapse would cost {:.2} MiB, lazy cache budget {:.2} MiB",
+            portal_draw_plan.piece_count,
             portal_draw_plan.variants.len(),
+            portal_draw_plan.geometries.len(),
+            auto4.as_ref().map_or(0, |auto4| auto4
+                .geometry_states
+                .iter()
+                .filter(|state| matches!(state, Auto4GeometryState::Static))
+                .count()),
             portal_draw_plan.plans.len(),
-            auto4_plan_by_cluster.len(),
+            portal_draw_plan.plan_by_cluster.len(),
             portal_draw_plan.reused_variant_hits,
             portal_draw_plan.reused_plan_hits,
             portal_draw_plan.packed_index_count as f64 * std::mem::size_of::<u32>() as f64
@@ -21980,7 +24277,26 @@ fn build_world(
     let compact_indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA compacted indirect draw arguments"),
         contents: bytemuck::cast_slice(&compact_indirect),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST,
+    });
+    let reflection_compact_capacity =
+        compact_draw_capacity.saturating_mul(PLANAR_REFLECTION_SLOTS as u32).max(1);
+    let reflection_compact_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA planar reflection compacted indirect draw arguments"),
+        size: u64::from(reflection_compact_capacity)
+            * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+        usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let inline_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA mover multi-draw arguments"),
+        size: u64::from(inline_indirect_capacity)
+            * (PLANAR_REFLECTION_SLOTS as u64 + 1)
+            * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+        usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
     let compact_counts = vec![0_u32; compact_groups.len().max(1)];
     let compact_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -22048,6 +24364,18 @@ fn build_world(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
+    let legacy_triangle_surfaces = if legacy_dlight_triangle_surfaces.is_empty() {
+        vec![u32::MAX]
+    } else {
+        legacy_dlight_triangle_surfaces.clone()
+    };
+    let initial_legacy_masks = vec![0u32; legacy_dlight_surfaces.len().max(1)];
+    let legacy_dlight_surface_mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA Legacy dlight surface masks"),
+        contents: bytemuck::cast_slice(&initial_legacy_masks),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
     let cluster_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA clustered-light compute bind group"),
         layout: cluster_compute_layout,
@@ -22130,6 +24458,10 @@ fn build_world(
                 binding: 14,
                 resource: static_light_grid_gpu.irradiance_volume_uniform_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -22177,6 +24509,10 @@ fn build_world(
                 binding: 9,
                 resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
+            },
         ],
     });
     upload_timings.lighting_resources_ms = lighting_started.elapsed().as_secs_f64() * 1000.0;
@@ -22192,6 +24528,19 @@ fn build_world(
         legacy_fog,
         Some(shader_variant),
     );
+    let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
+        create_legacy_dlight_pass_pipelines(
+            device,
+            pipeline_layout,
+            shader,
+            surface_format,
+            msaa_samples,
+            &coarse_batches,
+            shader_variant,
+        )
+    } else {
+        BTreeMap::new()
+    };
     let fog_pass_pipelines = if legacy_fog {
         create_legacy_fog_pass_pipelines(
             device,
@@ -22205,16 +24554,9 @@ fn build_world(
     } else {
         BTreeMap::new()
     };
-    let fast_pipelines = create_world_pipelines(
-        device,
-        fast_pipeline_layout,
-        fast_shader,
-        surface_format,
-        msaa_samples,
-        &coarse_batches,
-        false,
-        None,
-    );
+    // The known-fast baseline pipelines are compiled on first use by
+    // `ensure_fast_world_pipelines`; most sessions never leave the advanced path.
+    let fast_pipelines = BTreeMap::new();
     let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
     {
         BTreeMap::new()
@@ -22247,6 +24589,7 @@ fn build_world(
         shader_variant,
         WorldPipelineVariant {
             pipelines,
+            legacy_dlight_pipelines,
             fog_pass_pipelines,
             reflection_pipelines,
             reflection_fog_pass_pipelines,
@@ -22296,7 +24639,7 @@ fn build_world(
         .chain(full_batches.iter().cloned())
         .collect::<Vec<_>>();
 
-    if !auto4_plan_by_cluster.is_empty() && !coarse_visible_batches_by_cluster.is_empty() {
+    if let (Some(auto4), false) = (&auto4, coarse_visible_batches_by_cluster.is_empty()) {
         let plan_stats = |batches: &[WorldBatch], plans: &[Vec<usize>], by_cluster: Option<&[usize]>| {
             let mut total_batches = 0usize;
             let mut total_triangles = 0u64;
@@ -22341,63 +24684,33 @@ fn build_world(
                 &coarse_visible_batches_by_cluster,
                 None,
             );
-        let inline_auto4_batches = full_batches.len().saturating_sub(inline_full_start);
-        let inline_auto4_tris = full_batches[inline_full_start..]
-            .iter()
-            .map(|batch| {
-                u64::from(
-                    batch
-                        .indexed_range
-                        .end
-                        .saturating_sub(batch.indexed_range.start)
-                        / 3,
-                )
+        let piece_tris = |index: usize| {
+            full_batches.get(index).map_or(0, |batch| {
+                u64::from(batch.indexed_range.end.saturating_sub(batch.indexed_range.start) / 3)
             })
-            .sum::<u64>();
+        };
+        let always_batches = auto4.variant_base.saturating_sub(auto4.always_start);
+        let always_tris = (auto4.always_start..auto4.variant_base).map(piece_tris).sum::<u64>();
         let mut auto4_total_batches = 0usize;
         let mut auto4_total_tris = 0u64;
         let mut auto4_max_batches = 0usize;
         let mut auto4_max_tris = 0u64;
-        let auto4_cluster_count = auto4_plan_by_cluster.len().max(1);
-        for cluster in 0..auto4_cluster_count {
-            let Some(&plan_id) = auto4_plan_by_cluster.get(cluster) else {
-                continue;
-            };
+        let auto4_cluster_count = portal_draw_plan.plan_by_cluster.len().max(1);
+        for &plan_id in &portal_draw_plan.plan_by_cluster {
             let Some(refs) = portal_draw_plan.plans.get(plan_id) else {
                 continue;
             };
-            let mut triangles = inline_auto4_tris;
+            let mut triangles = always_tris;
             for reference in refs {
-                match *reference {
-                    PreparedPortalPlanBatchRef::Base(index) => {
-                        if let Some(batch) = portal_batches.get(index) {
-                            triangles = triangles.saturating_add(u64::from(
-                                batch
-                                    .indexed_range
-                                    .end
-                                    .saturating_sub(batch.indexed_range.start)
-                                    / 3,
-                            ));
-                        }
-                    }
-                    PreparedPortalPlanBatchRef::Merged(index) => {
-                        if let Some(variant) = portal_draw_plan.variants.get(index) {
-                            for &member in &variant.members {
-                                if let Some(batch) = portal_batches.get(member) {
-                                    triangles = triangles.saturating_add(u64::from(
-                                        batch
-                                            .indexed_range
-                                            .end
-                                            .saturating_sub(batch.indexed_range.start)
-                                            / 3,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+                triangles += match *reference {
+                    PreparedPortalPlanBatchRef::Base(index) => piece_tris(index),
+                    PreparedPortalPlanBatchRef::Merged(variant) => auto4.variant_members[variant]
+                        .iter()
+                        .map(|&member| piece_tris(member))
+                        .sum(),
+                };
             }
-            let batch_count = refs.len().saturating_add(inline_auto4_batches);
+            let batch_count = refs.len().saturating_add(always_batches);
             auto4_total_batches = auto4_total_batches.saturating_add(batch_count);
             auto4_total_tris = auto4_total_tris.saturating_add(triangles);
             auto4_max_batches = auto4_max_batches.max(batch_count);
@@ -22419,33 +24732,57 @@ fn build_world(
     }
     upload_timings.visibility_tables_ms = visibility_started.elapsed().as_secs_f64() * 1000.0;
 
-    let auto4_variant_members = portal_draw_plan
-        .variants
+    let Auto4Instance {
+        batches: auto4_batches,
+        variant_base: auto4_variant_base,
+        always_start: auto4_always_start,
+        variant_members: auto4_variant_members,
+        variant_geometry: auto4_variant_geometry,
+        variant_area_mixed: auto4_variant_area_mixed,
+        geometry_members: auto4_geometry_members,
+        geometry_variants: auto4_geometry_variants,
+        geometry_states: auto4_geometry_states,
+    } = auto4.unwrap_or(Auto4Instance {
+        batches: Vec::new(),
+        variant_base: 0,
+        always_start: 0,
+        variant_members: Vec::new(),
+        variant_geometry: Vec::new(),
+        variant_area_mixed: Vec::new(),
+        geometry_members: Vec::new(),
+        geometry_variants: Vec::new(),
+        geometry_states: Vec::new(),
+    });
+    let auto4_plan_refs = if auto4_batches.is_empty() {
+        Vec::new()
+    } else {
+        portal_draw_plan.plans.clone()
+    };
+    let auto4_plan_by_cluster = portal_draw_plan.plan_by_cluster.clone();
+    let lazy_geometries = auto4_geometry_states
         .iter()
-        .map(|variant| variant.members.clone())
-        .collect::<Vec<_>>();
-    let auto4_plan_refs = portal_draw_plan.plans.clone();
-    let mut auto4_collapse_cache =
-        Auto4CollapseCache::disabled(auto4_variant_members.len());
+        .filter(|state| matches!(state, Auto4GeometryState::Uncached))
+        .count();
+    let mut auto4_collapse_cache = Auto4CollapseCache::new(auto4_geometry_states);
     auto4_collapse_cache.capacity_indices = auto4_cache_indices;
-    if auto4_cache_indices > 0 && !auto4_variant_members.is_empty() {
+    if auto4_cache_indices > 0 && lazy_geometries > 0 {
         let cache_end = base_index_count.saturating_add(auto4_cache_indices);
         auto4_collapse_cache.free_ranges.push(base_index_count..cache_end);
         match Auto4CollapseWorker::spawn(
             Arc::clone(&auto4_source_indices),
-            Arc::clone(&auto4_portal_index_ranges),
+            Arc::clone(&auto4_piece_ranges),
         ) {
             Ok(worker) => {
                 auto4_collapse_cache.worker = Some(worker);
                 println!(
-                    "AUTO 4 lazy physical-collapse cache: {:.2} MiB, {} group(s) build on demand with multi-draw fallback",
+                    "AUTO 4 lazy physical-collapse cache: {:.2} MiB, {} geometr(ies) build on demand with FULL-piece fallback",
                     auto4_cache_bytes as f64 / (1024.0 * 1024.0),
-                    auto4_variant_members.len(),
+                    lazy_geometries,
                 );
             }
             Err(error) => {
                 println!(
-                    "AUTO 4 lazy physical-collapse worker unavailable ({error}); using multi-draw fallback"
+                    "AUTO 4 lazy physical-collapse worker unavailable ({error}); non-contiguous recipes draw their FULL pieces"
                 );
             }
         }
@@ -22484,6 +24821,11 @@ fn build_world(
             active_cull_indices_buffer,
             compact_indirect_buffer,
             compact_count_buffer,
+            reflection_compact_indirect_buffer,
+            reflection_compact_capacity,
+            inline_indirect_buffer,
+            inline_indirect_capacity,
+            inline_group_count,
             cull_debug_reason_buffer,
             cull_debug_count_buffer,
             cull_debug_bind_group,
@@ -22494,6 +24836,11 @@ fn build_world(
             compact_groups,
             light_buffer,
             _cluster_buffer: cluster_buffer,
+            legacy_dlight_surface_id_buffer,
+            legacy_dlight_surface_mask_buffer,
+            legacy_dlight_surface_masks_cpu: Mutex::new(initial_legacy_masks),
+            legacy_dlight_triangle_surfaces: legacy_triangle_surfaces,
+            legacy_dlight_surfaces,
             dynamic_lights,
             cluster_compute_bind_group,
             lighting_bind_group,
@@ -22527,9 +24874,15 @@ fn build_world(
             auto4_plan_refs,
             auto4_plan_by_cluster,
             auto4_variant_members,
+            auto4_variant_geometry,
+            auto4_variant_area_mixed,
+            auto4_geometry_members,
+            auto4_geometry_variants,
             auto4_variant_base,
+            auto4_always_start,
             auto4_active_plan: Vec::new(),
-            auto4_inline_start,
+            // FULL aliases keep FULL's indices, so inline movers map 1:1.
+            auto4_inline_start: inline_full_start,
             auto4_inline_full_start: inline_full_start,
             auto4_collapse_cache,
             coarse_all_batches,
@@ -22644,7 +24997,6 @@ fn build_draw_compaction_groups(
         let batches: &[WorldBatch] = match set {
             WorldBatchSet::Coarse => coarse_batches,
             WorldBatchSet::Full => full_batches,
-            WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
         };
         for (batch_index, batch) in batches.iter().enumerate() {
             // Transparent surfaces require their authored ordering, and sky
@@ -22663,7 +25015,6 @@ fn build_draw_compaction_groups(
                 let representative = match group.representative_set {
                     WorldBatchSet::Coarse => &coarse_batches[group.representative_index],
                     WorldBatchSet::Full => &full_batches[group.representative_index],
-                    WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
                 };
                 same_draw_state(&representative.source, &batch.source)
             }) {
@@ -22690,7 +25041,6 @@ fn build_draw_compaction_groups(
             let batch = match set {
                 WorldBatchSet::Coarse => &mut coarse_batches[*batch_index],
                 WorldBatchSet::Full => &mut full_batches[*batch_index],
-                WorldBatchSet::Auto4 => unreachable!("AUTO 4 uses its dedicated compaction builder"),
             };
             batch.compact_group = Some(group_index);
             if let Some(record) = records.get_mut(batch.cull_index as usize) {
@@ -22700,57 +25050,6 @@ fn build_draw_compaction_groups(
         groups.push(WorldDrawGroup {
             representative_set: candidate.representative_set,
             representative_index: candidate.representative_index,
-            output_base,
-            max_count,
-        });
-        output_base = output_base.saturating_add(max_count);
-    }
-    groups
-}
-
-fn build_auto4_draw_compaction_groups(
-    records: &mut [GpuCullRecord],
-    batches: &mut [WorldBatch],
-    static_count: usize,
-    group_base: u32,
-    output_base_start: u32,
-) -> Vec<WorldDrawGroup> {
-    // Both sides of the lazy representation must be compactable: base portal
-    // pieces are used while a collapse is pending, and the placeholder variant
-    // becomes active after its contiguous index range is uploaded. They never
-    // coexist for the same recipe entry, so sharing compaction groups is safe.
-    let static_count = static_count.min(batches.len());
-    let mut candidates = Vec::<Vec<usize>>::new();
-    for batch_index in 0..static_count {
-        let batch = &batches[batch_index];
-        if !matches!(batch.source.pipeline.class, DrawClass::Opaque | DrawClass::Mask) {
-            continue;
-        }
-        if let Some(group) = candidates.iter_mut().find(|group| {
-            same_draw_state(&batches[group[0]].source, &batch.source)
-        }) {
-            group.push(batch_index);
-        } else {
-            candidates.push(vec![batch_index]);
-        }
-    }
-
-    let mut groups = Vec::new();
-    let mut output_base = output_base_start;
-    for members in candidates.into_iter().filter(|members| members.len() >= 2) {
-        let local_index = u32::try_from(groups.len()).unwrap_or(u32::MAX);
-        let group_index = group_base.saturating_add(local_index);
-        let max_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
-        for &batch_index in &members {
-            let batch = &mut batches[batch_index];
-            batch.compact_group = Some(group_index);
-            if let Some(record) = records.get_mut(batch.cull_index as usize) {
-                record.compact = [group_index, output_base, 1, 0];
-            }
-        }
-        groups.push(WorldDrawGroup {
-            representative_set: WorldBatchSet::Auto4,
-            representative_index: members[0],
             output_base,
             max_count,
         });
@@ -22840,6 +25139,56 @@ fn vertex_dlight_cpu(
             * 0.70;
     }
     result
+}
+
+fn legacy_dlight_surface_mask(
+    surface: &scene::LegacyDlightSurface,
+    lights: &[TransientLight],
+    transient_count: usize,
+) -> u32 {
+    let transient_count = transient_count.min(32).min(lights.len());
+    if transient_count == 0 || surface.cull_kind == 0 {
+        return 0;
+    }
+
+    let minimum = Vec3::from_array(surface.bounds_min);
+    let maximum = Vec3::from_array(surface.bounds_max);
+    let normal = Vec3::new(surface.plane[0], surface.plane[1], surface.plane[2]);
+    let planar = surface.cull_kind == 1 && normal.length_squared() > 1.0e-10;
+    let mut bits = 0u32;
+
+    for (light_index, light) in lights.iter().take(transient_count).enumerate() {
+        let position = Vec3::from_array(light.position);
+        let radius = light.radius.max(0.0);
+
+        // OpenJK reaches R_DlightSurface with dlightBits already reduced by BSP
+        // traversal. Preserve that early spatial rejection in the batched WGPU
+        // path with a conservative surface-bounds test. Like R_DlightGrid, this
+        // is radius-box overlap rather than a tighter sphere/AABB distance test.
+        if position.x - radius > maximum.x
+            || position.x + radius < minimum.x
+            || position.y - radius > maximum.y
+            || position.y + radius < minimum.y
+            || position.z - radius > maximum.z
+            || position.z + radius < minimum.z
+        {
+            continue;
+        }
+
+        // OpenJK R_DlightFace then rejects planar faces whose plane lies wholly
+        // outside the light radius. Patch/triangle surfaces remain conservative
+        // after the bounds test, matching the source renderer's intent.
+        if planar {
+            let distance = (normal.dot(position) - surface.plane[3]).abs();
+            if distance > radius {
+                continue;
+            }
+        }
+
+        bits |= 1u32 << light_index;
+    }
+
+    bits
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -23248,7 +25597,7 @@ fn create_fast_world_bind_group(
     fallback_skybox: Option<[usize; 6]>,
     footprint_marks: &[&GpuImage; 2],
     source: &DrawBatch,
-    material_buffer: &wgpu::Buffer,
+    material_buffer: &UniformSlot,
     surface_deformation_buffer: &wgpu::Buffer,
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
@@ -23308,7 +25657,7 @@ fn create_fast_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: material_buffer.as_entire_binding(),
+                resource: material_buffer.binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
@@ -23383,8 +25732,8 @@ fn create_world_bind_group(
     footprint_marks: &[&GpuImage; 2],
     reflection_probes: &ReflectionProbeGpuSet,
     source: &DrawBatch,
-    material_buffer: &wgpu::Buffer,
-    fog_buffer: &wgpu::Buffer,
+    material_buffer: &UniformSlot,
+    fog_buffer: &UniformSlot,
     surface_deformation_buffer: &wgpu::Buffer,
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
@@ -23498,7 +25847,7 @@ fn create_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: material_buffer.as_entire_binding(),
+                resource: material_buffer.binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
@@ -23542,7 +25891,7 @@ fn create_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 15,
-                resource: fog_buffer.as_entire_binding(),
+                resource: fog_buffer.binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 16,
@@ -23591,6 +25940,31 @@ fn create_world_bind_group(
     })
 }
 
+/// AUTO 4 batches share FULL's GPU resources: the first `auto4_variant_base`
+/// entries alias FULL 1:1 and each recipe uses its representative piece's
+/// bind state. Copy handles instead of creating a bind group per recipe.
+fn sync_auto4_bind_groups(world: &mut WorldGpu) {
+    let WorldGpu {
+        full_batches,
+        auto4_batches,
+        auto4_variant_members,
+        auto4_variant_base,
+        ..
+    } = world;
+    for (index, batch) in auto4_batches.iter_mut().enumerate() {
+        let source = match index.checked_sub(*auto4_variant_base) {
+            None => Some(index),
+            Some(variant) => auto4_variant_members
+                .get(variant)
+                .and_then(|members| members.first().copied()),
+        };
+        if let Some(full) = source.and_then(|source| full_batches.get(source)) {
+            batch.bind_group = full.bind_group.clone();
+            batch.fast_bind_group = full.fast_bind_group.clone();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rebuild_world_bind_groups(
     device: &wgpu::Device,
@@ -23617,7 +25991,6 @@ fn rebuild_world_bind_groups(
         coarse_batches,
         full_batches,
         auto2_batches,
-        auto4_batches,
         textures,
         lightmaps,
         deluxemaps,
@@ -23637,7 +26010,6 @@ fn rebuild_world_bind_groups(
         .iter_mut()
         .chain(full_batches.iter_mut())
         .chain(auto2_batches.iter_mut())
-        .chain(auto4_batches.iter_mut())
     {
         let selected_detail_texture = detail_texture_for_source(
             &batch.source,
@@ -23694,6 +26066,7 @@ fn rebuild_world_bind_groups(
             deformation_field_sampler,
         );
     }
+    sync_auto4_bind_groups(world);
 }
 
 fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> MaterialUniform {
@@ -23893,6 +26266,13 @@ fn create_world_pipelines(
     legacy_fog: bool,
     shader_variant: Option<WorldShaderVariantKey>,
 ) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
+    // OpenJK projects Legacy dlights in a separate additive pass. Keep the base
+    // material variant free of the dlight loop even when the user selected
+    // Legacy; the dedicated pass below compiles the original key.
+    let base_shader_variant = shader_variant.map(|mut key| {
+        key.legacy_dlights = false;
+        key
+    });
     let mut pipelines = BTreeMap::new();
     for batch in batches {
         pipelines.entry(batch.source.pipeline).or_insert_with(|| {
@@ -23905,13 +26285,56 @@ fn create_world_pipelines(
                 msaa_samples,
                 legacy_fog,
                 false,
-                shader_variant,
+                base_shader_variant,
+                false,
             )
         });
     }
     if shader_variant.is_some_and(|key| key.ocean) {
         pipelines.insert(ocean_pipeline_key(), create_world_pipeline(device, layout, shader,
-            surface_format, ocean_pipeline_key(), msaa_samples, false, false, shader_variant));
+            surface_format, ocean_pipeline_key(), msaa_samples, false, false, base_shader_variant, false));
+    }
+    pipelines
+}
+
+fn legacy_dlight_receives(source: &DrawBatch) -> bool {
+    !source.texture_is_lightmap
+        && source.pipeline.class != DrawClass::Sky
+        && source.pipeline.blend == BlendMode::Opaque
+}
+
+fn create_legacy_dlight_pass_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    batches: &[WorldBatch],
+    shader_variant: WorldShaderVariantKey,
+) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
+    let mut pipelines = BTreeMap::new();
+    for batch in batches {
+        if !legacy_dlight_receives(&batch.source) {
+            continue;
+        }
+        let original = batch.source.pipeline;
+        pipelines.entry(original).or_insert_with(|| {
+            let mut dlight_key = original;
+            dlight_key.depth_write = false;
+            dlight_key.depth_equal = true;
+            create_world_pipeline(
+                device,
+                layout,
+                shader,
+                surface_format,
+                dlight_key,
+                msaa_samples,
+                false,
+                false,
+                Some(shader_variant),
+                true,
+            )
+        });
     }
     pipelines
 }
@@ -23971,6 +26394,7 @@ fn create_legacy_fog_pass_pipelines(
                         true,
                         true,
                         shader_variant,
+                        false,
                     )
                 });
         }
@@ -24013,6 +26437,7 @@ fn create_reflection_pipelines(
                 legacy_fog,
                 false,
                 Some(shader_variant),
+                false,
             )
         });
     }
@@ -24062,6 +26487,7 @@ fn create_reflection_fog_pass_pipelines(
                         true,
                         true,
                         Some(shader_variant),
+                        false,
                     )
                 });
         }
@@ -24073,7 +26499,7 @@ fn create_reflection_fog_pass_pipelines(
 fn planar_reflector_enabled(mode: PlanarReflectionMode, kind: PlanarReflectorKind) -> bool {
     match mode {
         PlanarReflectionMode::Off => false,
-        PlanarReflectionMode::Authored => kind != PlanarReflectorKind::Environment,
+        PlanarReflectionMode::Authored => kind == PlanarReflectorKind::Authored,
         PlanarReflectionMode::Environment => true,
     }
 }
@@ -24362,12 +26788,24 @@ fn clip_planar_polygon_to_viewport(
     (current_count >= 3).then_some((current, current_count))
 }
 
+#[cfg(test)]
 fn projected_planar_importance(
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
     plane: [f32; 4],
     view_proj: Mat4,
 ) -> Option<(bool, f32)> {
+    projected_planar_ndc_rect(bounds_min, bounds_max, plane, view_proj)
+        .map(|(ndc_min, ndc_max)| planar_importance_from_ndc_rect(ndc_min, ndc_max))
+}
+
+/// Viewport-clipped NDC bounds of the reflector's plane polygon.
+fn projected_planar_ndc_rect(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    plane: [f32; 4],
+    view_proj: Mat4,
+) -> Option<(Vec2, Vec2)> {
     // AABB-corner projection is not sufficient for large floors/lakes: when the
     // camera is over the middle of the plane, every distant corner can be behind
     // the eye or off-screen even though the reflector fills the viewport. Build
@@ -24401,7 +26839,11 @@ fn projected_planar_importance(
     if extent.x <= 0.0 || extent.y <= 0.0 {
         return None;
     }
+    Some((ndc_min, ndc_max))
+}
 
+fn planar_importance_from_ndc_rect(ndc_min: Vec2, ndc_max: Vec2) -> (bool, f32) {
+    let extent = (ndc_max - ndc_min).max(Vec2::ZERO);
     // NDC spans two units per axis, so divide by four for a 0..1 viewport
     // coverage estimate. Prefer a reflector covering the crosshair/centre;
     // otherwise attenuate candidates toward the screen edge.
@@ -24410,7 +26852,23 @@ fn projected_planar_importance(
         ndc_min.x <= 0.0 && ndc_max.x >= 0.0 && ndc_min.y <= 0.0 && ndc_max.y >= 0.0;
     let centre = (ndc_min + ndc_max) * 0.5;
     let centre_weight = 1.0 / (1.0 + centre.length_squared() * 3.0);
-    Some((contains_centre, coverage * centre_weight))
+    (contains_centre, coverage * centre_weight)
+}
+
+/// Clip-space scale/offset that maps the NDC rectangle onto the full viewport,
+/// so a frustum test against `narrow * view_proj` rejects anything outside it.
+fn ndc_rect_narrowing(ndc_min: Vec2, ndc_max: Vec2) -> Mat4 {
+    // A small margin keeps edge pixels (and filtering) conservative.
+    let ndc_min = (ndc_min - Vec2::splat(0.02)).max(Vec2::splat(-1.0));
+    let ndc_max = (ndc_max + Vec2::splat(0.02)).min(Vec2::splat(1.0));
+    let scale = Vec2::splat(2.0) / (ndc_max - ndc_min).max(Vec2::splat(1e-4));
+    let centre = (ndc_min + ndc_max) * 0.5;
+    Mat4::from_cols(
+        glam::Vec4::new(scale.x, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, scale.y, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, 1.0, 0.0),
+        glam::Vec4::new(-scale.x * centre.x, -scale.y * centre.y, 0.0, 1.0),
+    )
 }
 
 fn planar_planes_equivalent(a: [f32; 4], b: [f32; 4]) -> bool {
@@ -24455,8 +26913,9 @@ fn select_planar_reflection_views(
     };
     let effective_area_mask = effective_area_mask(world, pvs_mode, area_mask);
 
-    // priority, crosshair coverage, screen score, representative reflector, oriented plane
-    let mut candidates: Vec<(u8, bool, f32, PlanarReflector, [f32; 4])> = Vec::new();
+    // priority, crosshair coverage, screen score, representative reflector,
+    // oriented plane, union NDC rectangle of its visible coplanar pieces
+    let mut candidates: Vec<(u8, bool, f32, PlanarReflector, [f32; 4], (Vec2, Vec2))> = Vec::new();
     for reflector in &world.planar_reflectors {
         if (reflector.kind == PlanarReflectorKind::Ocean && !ocean_enabled)
             || !planar_reflector_enabled(planar_mode, reflector.kind)
@@ -24486,24 +26945,26 @@ fn select_planar_reflection_views(
             normal = -normal;
             plane = [-plane[0], -plane[1], -plane[2], -plane[3]];
         }
-        let Some((contains_centre, screen_importance)) =
-            projected_planar_importance(
-                reflector.bounds_min,
-                reflector.bounds_max,
-                plane,
-                main_view_proj,
-            )
-        else {
+        let Some(ndc_rect) = projected_planar_ndc_rect(
+            reflector.bounds_min,
+            reflector.bounds_max,
+            plane,
+            main_view_proj,
+        ) else {
             continue;
         };
-        let minimum_screen_importance = match reflection_quality {
-            ReflectionQuality::High => {
-                if reflector.kind == PlanarReflectorKind::Authored { 0.004 } else { 0.015 }
+        let (contains_centre, screen_importance) = planar_importance_from_ndc_rect(ndc_rect.0, ndc_rect.1);
+        let minimum_screen_importance = if reflector.kind == PlanarReflectorKind::Authored {
+            // Authored `portal` mirrors are baseline JKA content. If their plane
+            // is actually visible, keep them eligible regardless of enhanced
+            // reflection quality. The slot budget still limits total cost.
+            0.0
+        } else {
+            match reflection_quality {
+                ReflectionQuality::High => 0.015,
+                ReflectionQuality::Ultra => 0.002,
+                _ => 1.0,
             }
-            ReflectionQuality::Ultra => {
-                if reflector.kind == PlanarReflectorKind::Authored { 0.0005 } else { 0.002 }
-            }
-            _ => 1.0,
         };
         if screen_importance < minimum_screen_importance {
             continue;
@@ -24537,7 +26998,7 @@ fn select_planar_reflection_views(
         let tie_break = reflector.area / (distance * distance + 4096.0);
         let score = screen_importance * roughness_weight * authored_weight * centre_weight
             + tie_break * 1e-6;
-        let candidate = (priority, contains_centre, score, *reflector, plane);
+        let candidate = (priority, contains_centre, score, *reflector, plane, ndc_rect);
 
         // Coplanar pieces share one reflected camera/texture layer. Keep the
         // strongest representative for PVS selection, but do not spend another
@@ -24547,9 +27008,11 @@ fn select_planar_reflection_views(
             .find(|existing| planar_planes_equivalent(existing.4, plane))
         {
             let candidate_is_better = score > existing.2;
+            let union = (existing.5 .0.min(ndc_rect.0), existing.5 .1.max(ndc_rect.1));
             if candidate_is_better {
                 *existing = candidate;
             }
+            existing.5 = union;
         } else {
             candidates.push(candidate);
         }
@@ -24605,7 +27068,7 @@ fn select_planar_reflection_views(
     }
 
     let mut views = [None; PLANAR_REFLECTION_SLOTS];
-    for (slot, (_, _, _, reflector, plane)) in ordered.into_iter().enumerate() {
+    for (slot, (_, _, _, reflector, plane, ndc_rect)) in ordered.into_iter().enumerate() {
         let plane_normal = Vec3::new(plane[0], plane[1], plane[2]).normalize_or_zero();
         let reflected_position = reflect_point_across_plane(camera.position, plane);
         let reflected_forward = (camera.forward()
@@ -24629,6 +27092,7 @@ fn select_planar_reflection_views(
             camera_forward: reflected_forward,
             cluster,
             coarse_batch_index: reflector.coarse_batch_index,
+            cull_view_proj: ndc_rect_narrowing(ndc_rect.0, ndc_rect.1) * reflected_view_proj,
         });
     }
     views
@@ -24643,49 +27107,21 @@ fn update_visibility(world: &mut WorldGpu, camera: &Camera) -> Option<usize> {
     cluster
 }
 
-fn auto4_variant_gpu_record(world: &WorldGpu, batch_index: usize) -> Option<GpuCullRecord> {
-    let batch = world.auto4_batches.get(batch_index)?;
-    let compact = batch
-        .compact_group
-        .and_then(|group_index| {
-            world
-                .compact_groups
-                .get(group_index as usize)
-                .map(|group| [group_index, group.output_base, 1, 0])
-        })
-        .unwrap_or([u32::MAX, 0, 0, 0]);
-    Some(GpuCullRecord {
-        minimum: [
-            batch.bounds_min[0],
-            batch.bounds_min[1],
-            batch.bounds_min[2],
-            0.0,
-        ],
-        maximum: [
-            batch.bounds_max[0],
-            batch.bounds_max[1],
-            batch.bounds_max[2],
-            0.0,
-        ],
-        draw: [
-            batch
-                .indexed_range
-                .end
-                .saturating_sub(batch.indexed_range.start),
-            batch.indexed_range.start,
-            u32::from(batch.source.pipeline.class == DrawClass::Sky),
-            0,
-        ],
-        compact,
-    })
-}
-
 fn auto4_upload_variant_record(queue: &wgpu::Queue, world: &WorldGpu, batch_index: usize) {
     let Some(batch) = world.auto4_batches.get(batch_index) else {
         return;
     };
-    let Some(record) = auto4_variant_gpu_record(world, batch_index) else {
-        return;
+    // Recipe batches are never compacted: each one is a single real draw.
+    let record = GpuCullRecord {
+        minimum: [batch.bounds_min[0], batch.bounds_min[1], batch.bounds_min[2], 0.0],
+        maximum: [batch.bounds_max[0], batch.bounds_max[1], batch.bounds_max[2], 0.0],
+        draw: [
+            batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+            batch.indexed_range.start,
+            u32::from(batch.source.pipeline.class == DrawClass::Sky),
+            0,
+        ],
+        compact: [u32::MAX, 0, 0, 0],
     };
     queue.write_buffer(
         &world.cull_records_buffer,
@@ -24694,52 +27130,138 @@ fn auto4_upload_variant_record(queue: &wgpu::Queue, world: &WorldGpu, batch_inde
     );
 }
 
-fn auto4_evict_lru_variant(
+/// Point every recipe that draws `geometry` at `range` (empty = not resident).
+fn auto4_set_geometry_range(
     queue: &wgpu::Queue,
     world: &mut WorldGpu,
-    protected: &[bool],
-) -> bool {
-    let victim = world
-        .auto4_collapse_cache
+    geometry: usize,
+    range: std::ops::Range<u32>,
+) {
+    let variants = std::mem::take(&mut world.auto4_geometry_variants[geometry]);
+    for &variant in &variants {
+        let batch_index = world.auto4_variant_base.saturating_add(variant);
+        if let Some(batch) = world.auto4_batches.get_mut(batch_index) {
+            batch.indexed_range = range.clone();
+        }
+        auto4_upload_variant_record(queue, world, batch_index);
+    }
+    world.auto4_geometry_variants[geometry] = variants;
+}
+
+/// Flag the geometries referenced by `plan_id` so eviction keeps them.
+fn auto4_mark_protected(world: &mut WorldGpu, plan_id: usize) {
+    let cache = &mut world.auto4_collapse_cache;
+    cache.protected.fill(false);
+    let Some(refs) = world.auto4_plan_refs.get(plan_id) else {
+        return;
+    };
+    for reference in refs {
+        if let PreparedPortalPlanBatchRef::Merged(variant) = *reference {
+            if let Some(&geometry) = world.auto4_variant_geometry.get(variant) {
+                cache.protected[geometry] = true;
+            }
+        }
+    }
+}
+
+fn auto4_evict_lru_geometry(queue: &wgpu::Queue, world: &mut WorldGpu) -> bool {
+    let cache = &world.auto4_collapse_cache;
+    let victim = cache
         .states
         .iter()
         .enumerate()
-        .filter_map(|(variant, state)| match state {
-            Auto4VariantCacheState::Ready {
-                last_used_frame, ..
-            } if !protected.get(variant).copied().unwrap_or(false) => {
-                Some((variant, *last_used_frame))
+        .filter_map(|(geometry, state)| match state {
+            Auto4GeometryState::Ready { last_used_frame, .. } if !cache.protected[geometry] => {
+                Some((geometry, *last_used_frame))
             }
             _ => None,
         })
         .min_by_key(|(_, last_used_frame)| *last_used_frame)
-        .map(|(variant, _)| variant);
+        .map(|(geometry, _)| geometry);
     let Some(victim) = victim else {
         return false;
     };
     let old = std::mem::replace(
         &mut world.auto4_collapse_cache.states[victim],
-        Auto4VariantCacheState::Uncached,
+        Auto4GeometryState::Uncached,
     );
-    let Auto4VariantCacheState::Ready { range, .. } = old else {
+    let Auto4GeometryState::Ready { range, .. } = old else {
         return false;
     };
     world.auto4_collapse_cache.release(range);
-    world.auto4_collapse_cache.evictions =
-        world.auto4_collapse_cache.evictions.saturating_add(1);
-    let batch_index = world.auto4_variant_base.saturating_add(victim);
-    if let Some(batch) = world.auto4_batches.get_mut(batch_index) {
-        batch.indexed_range = 0..0;
-    }
-    auto4_upload_variant_record(queue, world, batch_index);
+    world.auto4_collapse_cache.evictions = world.auto4_collapse_cache.evictions.saturating_add(1);
+    auto4_set_geometry_range(queue, world, victim, 0..0);
     true
 }
 
-fn refresh_auto4_lazy_collapse(queue: &wgpu::Queue, world: &mut WorldGpu, mode: PvsMode) {
+/// Upload one finished physical collapse and switch its recipes to it.
+fn auto4_accept_collapse(
+    queue: &wgpu::Queue,
+    world: &mut WorldGpu,
+    result: Auto4CollapseResult,
+    plan_id: usize,
+) {
+    let geometry = result.geometry;
+    if !matches!(
+        world.auto4_collapse_cache.states.get(geometry),
+        Some(Auto4GeometryState::Pending)
+    ) {
+        return;
+    }
+    let count = u32::try_from(result.indices.len()).unwrap_or(u32::MAX);
+    if count == 0 || count > world.auto4_collapse_cache.capacity_indices {
+        if count != 0 {
+            world.auto4_collapse_cache.oversize = world.auto4_collapse_cache.oversize.saturating_add(1);
+        }
+        world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Uncacheable;
+        return;
+    }
+    let mut range = world.auto4_collapse_cache.allocate(count);
+    if range.is_none() {
+        auto4_mark_protected(world, plan_id);
+        while range.is_none() {
+            if !auto4_evict_lru_geometry(queue, world) {
+                break;
+            }
+            range = world.auto4_collapse_cache.allocate(count);
+        }
+    }
+    let Some(range) = range else {
+        world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Deferred;
+        return;
+    };
+    queue.write_buffer(
+        &world.index_buffer,
+        u64::from(range.start) * std::mem::size_of::<u32>() as u64,
+        bytemuck::cast_slice(&result.indices),
+    );
+    world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Ready {
+        range: range.clone(),
+        last_used_frame: world.auto4_collapse_cache.frame,
+    };
+    world.auto4_collapse_cache.completed = world.auto4_collapse_cache.completed.saturating_add(1);
+    auto4_set_geometry_range(queue, world, geometry, range);
+}
+
+/// Select the current cluster's AUTO 4 plan. Steady state is one channel poll
+/// and two comparisons; the active list is rebuilt only when the cluster, the
+/// areaportal mask, or a finished background collapse changes it.
+fn refresh_auto4_lazy_collapse(
+    queue: &wgpu::Queue,
+    world: &mut WorldGpu,
+    mode: PvsMode,
+    area_mask: Option<[u8; 32]>,
+    log: bool,
+) {
     if mode != PvsMode::Auto4 || world.auto4_plan_refs.is_empty() {
         return;
     }
-    let Some(cluster) = world.last_cluster.flatten() else {
+    let plan_id = world
+        .last_cluster
+        .flatten()
+        .and_then(|cluster| world.auto4_plan_by_cluster.get(cluster).copied())
+        .filter(|&plan_id| plan_id < world.auto4_plan_refs.len());
+    let Some(plan_id) = plan_id else {
         if !world.auto4_active_plan.is_empty() {
             world.auto4_active_plan.clear();
             world.active_selection_key = None;
@@ -24747,205 +27269,137 @@ fn refresh_auto4_lazy_collapse(queue: &wgpu::Queue, world: &mut WorldGpu, mode: 
         world.auto4_collapse_cache.current_cluster = None;
         return;
     };
-    let Some(&plan_id) = world.auto4_plan_by_cluster.get(cluster) else {
-        world.auto4_active_plan.clear();
-        return;
-    };
-    let Some(plan_refs) = world.auto4_plan_refs.get(plan_id).cloned() else {
-        world.auto4_active_plan.clear();
-        return;
-    };
+    let cluster = world.last_cluster.flatten().unwrap_or_default();
 
-    world.auto4_collapse_cache.frame = world.auto4_collapse_cache.frame.wrapping_add(1);
-    let frame = world.auto4_collapse_cache.frame;
-    let mut protected = vec![false; world.auto4_variant_members.len()];
-    for reference in &plan_refs {
-        if let PreparedPortalPlanBatchRef::Merged(variant) = *reference {
-            if let Some(flag) = protected.get_mut(variant) {
-                *flag = true;
-            }
-        }
-    }
-
-    let mut completed = Vec::<Auto4CollapseResult>::new();
-    if let Some(worker) = world.auto4_collapse_cache.worker.as_ref() {
-        loop {
-            match worker.receiver.try_recv() {
-                Ok(result) => completed.push(result),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    }
     let cluster_changed = world.auto4_collapse_cache.current_cluster != Some(cluster);
-    if completed.is_empty() && !cluster_changed {
+    let mut changed = cluster_changed || world.auto4_collapse_cache.current_area_mask != area_mask;
+    loop {
+        let result = match world
+            .auto4_collapse_cache
+            .worker
+            .as_ref()
+            .map(|worker| worker.receiver.try_recv())
+        {
+            Some(Ok(result)) => result,
+            _ => break,
+        };
+        auto4_accept_collapse(queue, world, result, plan_id);
+        changed = true;
+    }
+    if !changed {
         return;
     }
     world.auto4_collapse_cache.current_cluster = Some(cluster);
-    if cluster_changed {
-        for reference in &plan_refs {
-            if let PreparedPortalPlanBatchRef::Merged(variant) = *reference {
-                if matches!(
-                    world.auto4_collapse_cache.states.get(variant),
-                    Some(Auto4VariantCacheState::Deferred)
-                ) {
-                    world.auto4_collapse_cache.states[variant] =
-                        Auto4VariantCacheState::Uncached;
-                }
-            }
-        }
-    }
+    world.auto4_collapse_cache.current_area_mask = area_mask;
+    // LRU clock: advances per plan change, not per frame.
+    world.auto4_collapse_cache.frame = world.auto4_collapse_cache.frame.wrapping_add(1);
+    let frame = world.auto4_collapse_cache.frame;
 
-    for result in completed {
-        let variant = result.variant;
-        if !matches!(
-            world.auto4_collapse_cache.states.get(variant),
-            Some(Auto4VariantCacheState::Pending)
-        ) {
-            continue;
-        }
-        let count = u32::try_from(result.indices.len()).unwrap_or(u32::MAX);
-        if count == 0 || count > world.auto4_collapse_cache.capacity_indices {
-            if count > world.auto4_collapse_cache.capacity_indices {
-                world.auto4_collapse_cache.oversize =
-                    world.auto4_collapse_cache.oversize.saturating_add(1);
-                world.auto4_collapse_cache.states[variant] =
-                    Auto4VariantCacheState::Uncacheable;
-            } else {
-                world.auto4_collapse_cache.states[variant] =
-                    Auto4VariantCacheState::Uncached;
-            }
-            continue;
-        }
-
-        let mut range = world.auto4_collapse_cache.allocate(count);
-        while range.is_none() {
-            if !auto4_evict_lru_variant(queue, world, &protected) {
-                break;
-            }
-            range = world.auto4_collapse_cache.allocate(count);
-        }
-        let Some(range) = range else {
-            world.auto4_collapse_cache.states[variant] = Auto4VariantCacheState::Deferred;
-            continue;
-        };
-
-        queue.write_buffer(
-            &world.index_buffer,
-            u64::from(range.start) * std::mem::size_of::<u32>() as u64,
-            bytemuck::cast_slice(&result.indices),
-        );
-        let batch_index = world.auto4_variant_base.saturating_add(variant);
-        if let Some(batch) = world.auto4_batches.get_mut(batch_index) {
-            batch.indexed_range = range.clone();
-        }
-        world.auto4_collapse_cache.states[variant] = Auto4VariantCacheState::Ready {
-            range,
-            last_used_frame: frame,
-        };
-        world.auto4_collapse_cache.completed =
-            world.auto4_collapse_cache.completed.saturating_add(1);
-        auto4_upload_variant_record(queue, world, batch_index);
-    }
-
-    let mut active = Vec::<usize>::new();
-    let mut physical_groups = 0usize;
-    let mut fallback_groups = 0usize;
-    let mut fallback_draws = 0usize;
-    let mut base_draws = 0usize;
-    for reference in &plan_refs {
-        match *reference {
+    let refs = std::mem::take(&mut world.auto4_plan_refs[plan_id]);
+    let variant_base = world.auto4_variant_base;
+    let mut active = Vec::with_capacity(refs.len() + variant_base.saturating_sub(world.auto4_always_start));
+    let mut stats = Auto4PlanStats::default();
+    for reference in &refs {
+        let variant = match *reference {
             PreparedPortalPlanBatchRef::Base(index) => {
-                active.push(index);
-                base_draws = base_draws.saturating_add(1);
+                if index < variant_base {
+                    active.push(index);
+                    stats.base_draws += 1;
+                }
+                continue;
             }
-            PreparedPortalPlanBatchRef::Merged(variant) => {
-                let ready = match world.auto4_collapse_cache.states.get_mut(variant) {
-                    Some(Auto4VariantCacheState::Ready {
-                        last_used_frame, ..
-                    }) => {
-                        *last_used_frame = frame;
-                        true
-                    }
-                    _ => false,
-                };
-                if ready {
-                    active.push(world.auto4_variant_base.saturating_add(variant));
-                    physical_groups = physical_groups.saturating_add(1);
-                    continue;
-                }
+            PreparedPortalPlanBatchRef::Merged(variant) => variant,
+        };
+        let (Some(members), Some(&geometry)) = (
+            world.auto4_variant_members.get(variant),
+            world.auto4_variant_geometry.get(variant),
+        ) else {
+            continue;
+        };
+        let world_members = members.iter().copied().filter(|&member| member < variant_base);
 
-                let members = world
-                    .auto4_variant_members
-                    .get(variant)
-                    .cloned()
-                    .unwrap_or_default();
-                fallback_groups = fallback_groups.saturating_add(1);
-                fallback_draws = fallback_draws.saturating_add(members.len());
-                active.extend(members.iter().copied());
+        // A closed areaportal that hides only part of a mixed-area recipe:
+        // draw its exact pieces (each area-filtered) until the mask changes.
+        let area_split = area_mask.is_some()
+            && world.auto4_variant_area_mixed.get(variant).copied().unwrap_or(false)
+            && members.iter().any(|&member| {
+                world
+                    .full_batches
+                    .get(member)
+                    .is_some_and(|batch| !batch_area_visible(batch, area_mask.as_ref()))
+            });
+        if area_split {
+            active.extend(world_members);
+            stats.area_split_recipes += 1;
+            stats.fallback_draws += members.len();
+            continue;
+        }
 
-                if matches!(
-                    world.auto4_collapse_cache.states.get(variant),
-                    Some(Auto4VariantCacheState::Uncached)
-                ) {
-                    let request = Auto4CollapseRequest { variant, members };
-                    let send_result = world
-                        .auto4_collapse_cache
-                        .worker
-                        .as_ref()
-                        .and_then(|worker| worker.sender.as_ref())
-                        .map(|sender| sender.try_send(request));
-                    match send_result {
-                        Some(Ok(())) => {
-                            world.auto4_collapse_cache.states[variant] =
-                                Auto4VariantCacheState::Pending;
-                            world.auto4_collapse_cache.queued =
-                                world.auto4_collapse_cache.queued.saturating_add(1);
-                        }
-                        Some(Err(TrySendError::Full(_))) => {}
-                        Some(Err(TrySendError::Disconnected(_))) | None => {}
-                    }
-                }
+        if cluster_changed
+            && matches!(world.auto4_collapse_cache.states[geometry], Auto4GeometryState::Deferred)
+        {
+            world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Uncached;
+        }
+        match &mut world.auto4_collapse_cache.states[geometry] {
+            Auto4GeometryState::Static => {
+                active.push(variant_base + variant);
+                stats.physical_draws += 1;
+                continue;
+            }
+            Auto4GeometryState::Ready { last_used_frame, .. } => {
+                *last_used_frame = frame;
+                active.push(variant_base + variant);
+                stats.physical_draws += 1;
+                continue;
+            }
+            _ => {}
+        }
+        active.extend(world_members);
+        stats.fallback_recipes += 1;
+        stats.fallback_draws += members.len();
+        if matches!(world.auto4_collapse_cache.states[geometry], Auto4GeometryState::Uncached) {
+            let request = Auto4CollapseRequest {
+                geometry,
+                members: world.auto4_geometry_members[geometry].clone(),
+            };
+            let sent = world
+                .auto4_collapse_cache
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.sender.as_ref())
+                .is_some_and(|sender| sender.try_send(request).is_ok());
+            if sent {
+                world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Pending;
+                world.auto4_collapse_cache.queued = world.auto4_collapse_cache.queued.saturating_add(1);
             }
         }
     }
-    active.extend(world.auto4_inline_start..world.auto4_batches.len());
+    world.auto4_plan_refs[plan_id] = refs;
+    active.extend(world.auto4_always_start..variant_base);
 
-    let active_changed = active != world.auto4_active_plan;
-    if active_changed {
+    if active != world.auto4_active_plan {
         world.auto4_active_plan = active;
         world.active_selection_key = None;
     }
-
-    let report_cluster_change =
-        world.auto4_collapse_cache.last_reported_cluster != Some(cluster);
-    let report_warmed_plan = active_changed && fallback_groups == 0;
-    if report_cluster_change || report_warmed_plan {
-        world.auto4_collapse_cache.last_reported_cluster = Some(cluster);
-        let ready_count = world
-            .auto4_collapse_cache
-            .states
-            .iter()
-            .filter(|state| matches!(state, Auto4VariantCacheState::Ready { .. }))
-            .count();
-        let pending_count = world
-            .auto4_collapse_cache
-            .states
-            .iter()
-            .filter(|state| matches!(state, Auto4VariantCacheState::Pending))
-            .count();
-        let used_mb = f64::from(world.auto4_collapse_cache.used_indices)
-            * std::mem::size_of::<u32>() as f64
-            / (1024.0 * 1024.0);
-        let capacity_mb = f64::from(world.auto4_collapse_cache.capacity_indices)
-            * std::mem::size_of::<u32>() as f64
-            / (1024.0 * 1024.0);
+    let stats_changed = stats != world.auto4_collapse_cache.stats;
+    world.auto4_collapse_cache.stats = stats;
+    if log && (cluster_changed || stats_changed) {
+        let cache = &world.auto4_collapse_cache;
+        let mib = |indices: u32| f64::from(indices) * 4.0 / (1024.0 * 1024.0);
         println!(
-            "AUTO 4 lazy plan: cluster {cluster} plan {plan_id}: {physical_groups} physical collapsed draw(s), {fallback_groups} pending/uncached group(s) -> {fallback_draws} underlying draw(s), {base_draws} direct base draw(s); cache {used_mb:.2}/{capacity_mb:.2} MiB, {ready_count} ready, {pending_count} pending, {} queued / {} completed, {} eviction(s), {} oversize group(s)",
-            world.auto4_collapse_cache.queued,
-            world.auto4_collapse_cache.completed,
-            world.auto4_collapse_cache.evictions,
-            world.auto4_collapse_cache.oversize,
+            "AUTO 4 plan: cluster {cluster} plan {plan_id}: {} real draw(s) [{} recipe + {} single-piece], {} cold recipe(s) + {} area-split recipe(s) -> {} FULL piece draw(s); cache {:.2}/{:.2} MiB, {} queued / {} completed, {} eviction(s), {} oversize",
+            stats.physical_draws + stats.base_draws,
+            stats.physical_draws,
+            stats.base_draws,
+            stats.fallback_recipes,
+            stats.area_split_recipes,
+            stats.fallback_draws,
+            mib(cache.used_indices),
+            mib(cache.capacity_indices),
+            cache.queued,
+            cache.completed,
+            cache.evictions,
+            cache.oversize,
         );
     }
 }
@@ -25046,6 +27500,34 @@ fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelecti
             }
         }
         PvsMode::Off | PvsMode::Minimal => coarse,
+    }
+}
+
+fn legacy_dlight_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelection<'_> {
+    let coarse_all = ActiveBatchSelection {
+        batches: &world.coarse_batches,
+        indices: &world.coarse_all_batches,
+        candidate_count: world.coarse_batches.len(),
+    };
+    if mode == PvsMode::Off {
+        return coarse_all;
+    }
+    let Some(cluster) = world.last_cluster.flatten() else {
+        return coarse_all;
+    };
+    let Some(indices) = world.coarse_visible_batches_by_cluster.get(cluster) else {
+        return coarse_all;
+    };
+    // Always use the conservative coarse/PVS representation for this redraw.
+    // AUTO/FULL/AUTO4 may reorganize or physically collapse index ranges, but
+    // depth-EQUAL guarantees that extra conservative triangles cannot light a
+    // pixel the material pass did not actually write. This keeps the dlight
+    // pass independent of visibility batching while submitting only the small
+    // authored surface runs whose masks are non-zero.
+    ActiveBatchSelection {
+        batches: &world.coarse_batches,
+        indices,
+        candidate_count: world.coarse_batches.len(),
     }
 }
 
@@ -27020,8 +29502,9 @@ fn load_ui_loading_texture(
             return (data, Some(size));
         }
         eprintln!(
-            "UI levelshot: no image resolved for {path}; falling back to menu/splash"
+            "UI levelshot: no image resolved for {path}; falling back to menu/art/unknownmap_mp"
         );
+        return load_ui_unknown_map_texture(base, game);
     }
 
     if let Some(data) = try_load_texture_asset(
@@ -27034,6 +29517,53 @@ fn load_ui_loading_texture(
     (
         TextureData {
             label: "JKA missing splash".into(),
+            source: None,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: true,
+            srgb: true,
+        },
+        None,
+    )
+}
+
+fn load_ui_unknown_map_texture(
+    base: &Path,
+    game: Option<&Path>,
+) -> (TextureData, Option<[u32; 2]>) {
+    if let Some(data) = try_load_texture_asset(
+        base,
+        game,
+        "menu/art/unknownmap_mp",
+        true,
+        false,
+        true,
+        "UI unknown map",
+    ) {
+        let size = [data.width, data.height];
+        return (data, Some(size));
+    }
+
+    // Last-resort compatibility for incomplete/custom data installs.
+    if let Some(data) = try_load_texture_asset(
+        base,
+        game,
+        "menu/splash",
+        true,
+        false,
+        true,
+        "UI splash fallback",
+    ) {
+        let size = [data.width, data.height];
+        return (data, Some(size));
+    }
+
+    (
+        TextureData {
+            label: "JKA missing unknown-map fallback".into(),
             source: None,
             width: 1,
             height: 1,
@@ -27432,6 +29962,198 @@ fn create_ghoul2_wireframe_pipeline(
     })
 }
 
+fn fx_sprite_blend(alpha_mode: DynamicModelAlphaMode) -> Option<wgpu::BlendState> {
+    match alpha_mode {
+        DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Blend
+        | DynamicModelAlphaMode::MaskBlend
+        | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
+        DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        DynamicModelAlphaMode::Modulate2x => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::DstAlpha,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        DynamicModelAlphaMode::Darken => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        _ => None,
+    }
+}
+
+fn create_fx_sprite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
+    zero_alpha_discard: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(match alpha_mode {
+            DynamicModelAlphaMode::Opaque => "JKA GPU FX sprite opaque pipeline",
+            DynamicModelAlphaMode::Mask => "JKA GPU FX sprite alpha-test pipeline",
+            DynamicModelAlphaMode::Blend => "JKA GPU FX sprite blend pipeline",
+            DynamicModelAlphaMode::MaskBlend => "JKA GPU FX sprite alpha-test forced-alpha pipeline",
+            DynamicModelAlphaMode::AdditiveOne => "JKA GPU FX sprite GL_ONE GL_ONE pipeline",
+            DynamicModelAlphaMode::Additive => "JKA GPU FX sprite src-alpha additive pipeline",
+            DynamicModelAlphaMode::BlendUnlit => "JKA GPU FX sprite alpha-blend pipeline",
+            DynamicModelAlphaMode::Modulate => "JKA GPU FX sprite modulate pipeline",
+            DynamicModelAlphaMode::Modulate2x => "JKA GPU FX sprite modulate2x pipeline",
+            DynamicModelAlphaMode::Darken => "JKA GPU FX sprite darken pipeline",
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(match alpha_mode {
+                DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::AdditiveOne | DynamicModelAlphaMode::Modulate => "fs_unlit_fog_black",
+                DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::Blend | DynamicModelAlphaMode::BlendUnlit
+                    if zero_alpha_discard => "fs_unlit_zero_alpha",
+                DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::Modulate2x
+                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                _ => "fs_main",
+            }),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                ..Default::default()
+            },
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: fx_sprite_blend(alpha_mode),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_fx_sprite_wireframe_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA GPU FX sprite wireframe pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_wireframe"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_dynamic_model_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -27441,6 +30163,31 @@ fn create_dynamic_model_pipeline(
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
 ) -> wgpu::RenderPipeline {
+    create_dynamic_model_pipeline_inner(device, layout, shader, surface_format, samples, alpha_mode, legacy_fog, false)
+}
+
+fn create_dynamic_model_pipeline_inner(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
+    rt_receiver: bool,
+) -> wgpu::RenderPipeline {
+    let vertex_layouts = [
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+        },
+        wgpu::VertexBufferLayout {
+            array_stride: 16,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![4 => Float32x4],
+        },
+    ];
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -27519,11 +30266,7 @@ fn create_dynamic_model_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
-            }],
+            buffers: &vertex_layouts[..if rt_receiver { 2 } else { 1 }],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -27844,8 +30587,25 @@ fn create_world_pipeline(
     legacy_fog: bool,
     fog_pass: bool,
     shader_variant: Option<WorldShaderVariantKey>,
+    legacy_dlight_pass: bool,
 ) -> wgpu::RenderPipeline {
-    let blend = match key.blend {
+    let blend = if legacy_dlight_pass {
+        Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            // The projected-light redraw contributes RGB only. Preserve the
+            // alpha produced by the authored material/fog passes.
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        })
+    } else {
+        match key.blend {
         BlendMode::Opaque => None,
         BlendMode::Custom(src, dst) => {
             let component = wgpu::BlendComponent {
@@ -27858,6 +30618,7 @@ fn create_world_pipeline(
                 alpha: component,
             })
         }
+    }
     };
     let color_write = wgpu::ColorWrites::ALL;
     let shader_constants = shader_variant.map(WorldShaderVariantKey::compilation_constants);
@@ -27870,7 +30631,7 @@ fn create_world_pipeline(
         constants
             .iter()
             .copied()
-            .filter(|(name, _)| *name != "ENABLE_RAY_TRACED_SHADOWS")
+            .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
             .collect::<Vec<_>>()
     });
     let vertex_compilation_options = match vertex_shader_constants.as_ref() {
@@ -27887,18 +30648,36 @@ fn create_world_pipeline(
         },
         None => Default::default(),
     };
+    let legacy_dlight_vertex_stream = shader_variant.is_some_and(|variant| variant.legacy_dlights);
+    let base_vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &VERTEX_ATTRIBUTES,
+    };
+    let legacy_surface_id_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES,
+    };
+    let vertex_buffers = if legacy_dlight_vertex_stream {
+        vec![base_vertex_layout, legacy_surface_id_layout]
+    } else {
+        vec![base_vertex_layout]
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(if fog_pass { "JKA BSP legacy fog-pass pipeline" } else { "JKA BSP pipeline" }),
+        label: Some(if legacy_dlight_pass {
+            "JKA BSP Legacy projected-dlight pass pipeline"
+        } else if fog_pass {
+            "JKA BSP legacy fog-pass pipeline"
+        } else {
+            "JKA BSP pipeline"
+        }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(if legacy_dlight_vertex_stream { "vs_main_legacy" } else { "vs_main" }),
             compilation_options: vertex_compilation_options,
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRIBUTES,
-            }],
+            buffers: &vertex_buffers,
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -27915,8 +30694,8 @@ fn create_world_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(key.depth_write),
-            depth_compare: Some(if key.depth_equal {
+            depth_write_enabled: Some(if legacy_dlight_pass { false } else { key.depth_write }),
+            depth_compare: Some(if legacy_dlight_pass || key.depth_equal {
                 wgpu::CompareFunction::Equal
             } else {
                 camera_depth_compare()
@@ -27938,7 +30717,9 @@ fn create_world_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if fog_pass {
+            entry_point: Some(if legacy_dlight_pass {
+                "fs_legacy_dlight_pass"
+            } else if fog_pass {
                 "fs_legacy_fog_pass"
             } else if key.class == DrawClass::Sky {
                 "fs_sky"
@@ -28467,6 +31248,16 @@ fn aabb_intersects_sphere(
     squared_distance <= radius * radius
 }
 
+/// True when every point of the box is more than one unit on the negative
+/// side of `plane` (n·p + d < 0), i.e. fully discarded by a clip plane.
+fn aabb_behind_plane(minimum: [f32; 3], maximum: [f32; 3], plane: [f32; 4]) -> bool {
+    // The box corner furthest along the plane normal.
+    let farthest: f32 = (0..3)
+        .map(|axis| plane[axis] * if plane[axis] >= 0.0 { maximum[axis] } else { minimum[axis] })
+        .sum();
+    farthest + plane[3] < -1.0
+}
+
 fn aabb_intersects_clip_frustum(minimum: [f32; 3], maximum: [f32; 3], view_proj: Mat4) -> bool {
     let corners = [
         Vec3::new(minimum[0], minimum[1], minimum[2]),
@@ -28496,6 +31287,35 @@ fn aabb_intersects_clip_frustum(minimum: [f32; 3], maximum: [f32; 3], view_proj:
 /// every JKA lighting/material rule with the normal shader; sun and local-light
 /// visibility are replaced. The stock WGSL is still what all raster modes
 /// compile.
+/// Wrap the full light evaluation so attenuation, BRDF and visibility use the
+/// same sample. In particular, `continue` must reject only the current sample.
+fn rt_sampled_light_loops(source: &str) -> Result<String, String> {
+    const LOOP: &str = "for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {";
+    const LIGHT: &str = "let light = dynamic_lights[cluster.indices[i]];";
+    let mut result = source.to_owned();
+    let starts = source.match_indices(LOOP).map(|(start, _)| start).collect::<Vec<_>>();
+    if starts.is_empty() { return Err("RT light loops not found".into()); }
+    for start in starts.into_iter().rev() {
+        let body = start + LOOP.len();
+        let mut depth = 1;
+        let end = source[body..].char_indices().find_map(|(offset, c)| {
+            if c == '{' { depth += 1; }
+            if c == '}' { depth -= 1; }
+            (depth == 0).then_some(body + offset)
+        }).ok_or("unterminated RT light loop")?;
+        let original = &source[body..end];
+        if original.matches(LIGHT).count() != 1 { return Err("RT light lookup anchor changed".into()); }
+        // Local lights are always traced directly (never cached): they are
+        // already gated by real cluster membership, so most receivers pay
+        // nothing for lights that aren't nearby. Only the per-sample area-light
+        // loop (independent of caching) is introduced here.
+        let sampled = original.replace(LIGHT,
+            "let light = rt_sample_local_emitter(rt_source, input, cluster.indices[i], rt_sample_index, rt_count);");
+        result.replace_range(start..end, &format!("{LOOP}\n        let rt_source = dynamic_lights[cluster.indices[i]];\n        let rt_count = rt_local_sample_count(rt_source);\n        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{{sampled}\n        }}\n    "));
+    }
+    Ok(result)
+}
+
 fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
     const BINDING: &str = "@group(3) @binding(7) var sky_admission_texture: texture_depth_2d_array;";
     const CASCADE_FN: &str = "fn cascaded_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {";
@@ -28521,7 +31341,7 @@ fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
     let mut source = format!("enable wgpu_ray_query;\n{base}");
     source = source.replacen(
         "override ENABLE_CASCADED_SHADOWS: bool = false;",
-        "override ENABLE_CASCADED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SHADOWS: bool = false;",
+        "override ENABLE_CASCADED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SUN: bool = false;",
         1,
     );
     source = source.replacen(
@@ -28552,6 +31372,41 @@ fn rt_rand_vec2f(state: ptr<function, u32>) -> vec2<f32> {
     return vec2<f32>(rt_rand_f(state), rt_rand_f(state));
 }
 
+fn rt_sample_count() -> u32 {
+    return u32(clamp(lighting_settings.map_ambient.w, 1.0, 4.0));
+}
+
+fn rt_local_sample_count(light: PointLight) -> u32 {
+    // Point lights and q3map metadata need one visibility query, regardless of quality.
+    return select(1u, rt_sample_count(), light.emitter.w < -0.5 && light.shadow.w >= 0.5);
+}
+
+fn rt_sample_local_emitter(light: PointLight, input: VertexOut, light_index: u32, sample_index: u32, sample_count: u32) -> PointLight {
+    // Negative emitter.w also encodes authored q3map angle attenuation. Only
+    // transient lights may use it as a finite-emitter marker.
+    if (light.emitter.w >= -0.5 || light.shadow.w < 0.5) {
+        return light;
+    }
+    // Uniform line-source integration: use a normalized distribution along the
+    // authored visible blade, preserving the existing total light strength.
+    // The entire lighting evaluation (distance, BRDF and visibility) consumes
+    // this same sample. Sampling only visibility would leave a point-light BRDF.
+    let pixel = vec2<u32>(max(input.clip_position.xy, vec2<f32>(0.0)));
+    let width = max(lighting_settings.values.z, 1u);
+    var rng = (pixel.x + pixel.y * width) ^ (light_index * 2246822519u) ^ (camera.render_flags.w * 3266489917u);
+    rng ^= sample_index * 668265263u;
+    // One jittered sample per equal interval (PBRT stratified sampling).
+    let sample_t = (f32(sample_index) + rt_rand_f(&rng)) / f32(sample_count);
+    var sampled = light;
+    sampled.position_radius = vec4<f32>(
+        light.position_radius.xyz + light.emitter.xyz * (2.0 * sample_t - 1.0),
+        light.position_radius.w
+    );
+    sampled.emitter = vec4<f32>(0.0);
+    sampled.color_intensity = vec4<f32>(light.color_intensity.rgb / f32(sample_count), light.color_intensity.a);
+    return sampled;
+}
+
 fn rt_copysign(a: f32, b: f32) -> f32 {
     return bitcast<f32>((bitcast<u32>(a) & 0x7fffffffu) | (bitcast<u32>(b) & 0x80000000u));
 }
@@ -28569,10 +31424,16 @@ fn rt_sample_directional_emitter(
     direction_to_light: vec3<f32>,
     cos_theta_max: f32,
     rng: ptr<function, u32>,
+    sample_index: u32,
+    sample_count: u32,
 ) -> vec3<f32> {
     // Bevy Solari: sample uniformly in solid angle inside the directional
     // light's cone, then rotate that local +Z cone onto the light direction.
-    let random = rt_rand_vec2f(rng);
+    var random = rt_rand_vec2f(rng);
+    let columns = select(1u, 2u, sample_count > 1u);
+    let rows = max(sample_count / columns, 1u);
+    random = (vec2<f32>(f32(sample_index % columns), f32(sample_index / columns)) + random)
+        / vec2<f32>(f32(columns), f32(rows));
     let cos_theta = (1.0 - random.x) + random.x * cos_theta_max;
     let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
     let phi = random.y * 6.28318530717958647692;
@@ -28782,6 +31643,15 @@ fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f3
     if (emitter_visibility(light, direction) <= 0.0) {
         return 1.0;
     }
+    return rt_trace_local_visibility(light, world_position, normal);
+}
+
+fn rt_trace_local_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let delta = light.position_radius.xyz - world_position;
+    let distance_squared = dot(delta, delta);
+    let radius = max(light.position_radius.w, 0.0);
+    if (distance_squared <= 1e-8 || distance_squared >= radius * radius) { return 1.0; }
+    let direction = delta * inverseSqrt(distance_squared);
     let surface_normal = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
     let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction) >= 0.0);
     // Limit the offset near an emitter, and recompute the direction from the
@@ -28796,7 +31666,14 @@ fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f3
 }
 
 fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
-    if (!ENABLE_RAY_TRACED_SHADOWS || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) {
+    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) { return 1.0; }
+    let cached = rt_cached_sun_visibility(input);
+    if (cached >= 0.0) { return cached; }
+    return rt_uncached_sun_visibility(input, normal);
+}
+
+fn rt_uncached_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
+    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) {
         return 1.0;
     }
 
@@ -28824,15 +31701,20 @@ fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
     let pixel_index = px + py * viewport_width;
     var rng = pixel_index + camera.render_flags.w;
     let cos_theta_max = clamp(shadow_settings.bevy_params.x, 0.0, 1.0);
-    let sampled_direction = rt_sample_directional_emitter(direction_to_light, cos_theta_max, &rng);
-    return rt_trace_shadow_visibility(origin, sampled_direction, 1000000.0);
+    let samples = rt_sample_count();
+    var visibility = 0.0;
+    for (var sample_index = 0u; sample_index < samples; sample_index += 1u) {
+        let sampled_direction = rt_sample_directional_emitter(direction_to_light, cos_theta_max, &rng, sample_index, samples);
+        visibility += rt_trace_shadow_visibility(origin, sampled_direction, 1000000.0);
+    }
+    return visibility / f32(samples);
 }
 
 "#;
     source = source.replacen(
         CASCADE_FN,
         &format!(
-            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
+            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
         ),
         1,
     );
@@ -28855,11 +31737,20 @@ fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
         1,
     );
 
+    // Sample before radius rejection and BRDF evaluation in every clustered
+    // receiver path (legacy, PBR and ocean). Stock shaders keep point lighting.
+    const CLUSTER_LIGHT: &str = "let light = dynamic_lights[cluster.indices[i]];";
+    if source.matches(CLUSTER_LIGHT).count() < 2 {
+        return Err("clustered emitter sampling anchors not found".to_string());
+    }
+    source = rt_sampled_light_loops(&source)?;
+    source.push_str(include_str!("rt_resolution_read.wgsl"));
+
     // The enhanced ocean path has one outer guard that bypasses the common
     // visibility helper. Let the RT variant enter that same authoritative path.
     source = source.replace(
         "ENABLE_CASCADED_SHADOWS && shadow_settings.light_direction_enabled.w > 0.5",
-        "(ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SHADOWS) && shadow_settings.light_direction_enabled.w > 0.5",
+        "(ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && shadow_settings.light_direction_enabled.w > 0.5",
     );
     Ok(source)
 }
@@ -28891,6 +31782,7 @@ fn rt_alpha_storage_entries() -> [wgpu::BindGroupLayoutEntry; 6] {
 
 fn create_ray_traced_shadow_receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let alpha_entries = rt_alpha_storage_entries();
+    let cache_entries = rt_resolution::receiver_entries();
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("JKA hardware ray-traced sun/weather receiver layout"),
         entries: &[
@@ -28920,6 +31812,8 @@ fn create_ray_traced_shadow_receiver_layout(device: &wgpu::Device) -> wgpu::Bind
             alpha_entries[3],
             alpha_entries[4],
             alpha_entries[5],
+            cache_entries[0],
+            cache_entries[1],
         ],
     })
 }
@@ -28943,6 +31837,7 @@ fn create_ray_traced_shadow_receiver_bind_group(
     alpha_material_buffer: &wgpu::Buffer,
     alpha_texture_buffer: &wgpu::Buffer,
     alpha_texel_buffer: &wgpu::Buffer,
+    sun_shadow_history: &rt_resolution::RtSunShadowHistory,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
@@ -28963,6 +31858,8 @@ fn create_ray_traced_shadow_receiver_bind_group(
             wgpu::BindGroupEntry { binding: 12, resource: alpha_material_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: alpha_texture_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: alpha_texel_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: sun_shadow_history.flags_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&sun_shadow_history.published) },
         ],
     })
 }
@@ -30584,6 +33481,219 @@ fn create_wireframe_pipeline(
     })
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DebugVolumeVertex {
+    position: [f32; 3],
+    color: [u8; 4],
+}
+
+const DEBUG_VOLUME_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
+
+struct DebugVolumeMeshGpu {
+    vertices: wgpu::Buffer,
+    triangles: wgpu::Buffer,
+    triangle_count: u32,
+    lines: wgpu::Buffer,
+    line_count: u32,
+}
+
+/// Setup > Video > Debug & tools "Draw triggers" / "Draw clip brushes".
+///
+/// The brush volumes are triangulated once at map load (jka_assets
+/// `Bsp::debug_volumes`) and uploaded only the first time a category is
+/// enabled. Drawing is then at most one fill and one outline draw per enabled
+/// category from static buffers: no per-frame CPU work and no per-entity
+/// refEntity submission. Everything is skipped while both toggles are off.
+#[derive(Default)]
+struct DebugVolumeRenderer {
+    cpu: Arc<jka_assets::bsp::DebugVolumes>,
+    triggers_enabled: bool,
+    clips_enabled: bool,
+    triggers: Option<DebugVolumeMeshGpu>,
+    clips: Option<DebugVolumeMeshGpu>,
+    fill_pipeline: Option<wgpu::RenderPipeline>,
+    line_pipeline: Option<wgpu::RenderPipeline>,
+}
+
+impl DebugVolumeRenderer {
+    fn any_enabled(&self) -> bool {
+        self.triggers_enabled || self.clips_enabled
+    }
+
+    fn set_map(&mut self, volumes: Arc<jka_assets::bsp::DebugVolumes>) {
+        self.cpu = volumes;
+        self.triggers = None;
+        self.clips = None;
+    }
+
+    fn clear_pipelines(&mut self) {
+        self.fill_pipeline = None;
+        self.line_pipeline = None;
+    }
+
+    fn upload(
+        device: &wgpu::Device,
+        mesh: &jka_assets::bsp::DebugVolumeMesh,
+        label: &str,
+    ) -> Option<DebugVolumeMeshGpu> {
+        if mesh.is_empty() {
+            return None;
+        }
+        let vertices = mesh
+            .positions
+            .iter()
+            .zip(&mesh.colors)
+            .map(|(&position, &color)| DebugVolumeVertex {
+                position: scene::render_position(position),
+                color,
+            })
+            .collect::<Vec<_>>();
+        let make = |name: &str, contents: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("JKA debug volume {label} {name}")),
+                contents,
+                usage,
+            })
+        };
+        Some(DebugVolumeMeshGpu {
+            vertices: make("vertices", bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX),
+            triangles: make(
+                "triangles",
+                bytemuck::cast_slice(&mesh.triangle_indices),
+                wgpu::BufferUsages::INDEX,
+            ),
+            triangle_count: mesh.triangle_indices.len() as u32,
+            lines: make("lines", bytemuck::cast_slice(&mesh.line_indices), wgpu::BufferUsages::INDEX),
+            line_count: mesh.line_indices.len() as u32,
+        })
+    }
+
+    fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        surface_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) {
+        if !self.any_enabled() {
+            return;
+        }
+        if self.triggers_enabled && self.triggers.is_none() {
+            self.triggers = Self::upload(device, &self.cpu.triggers, "triggers");
+        }
+        if self.clips_enabled && self.clips.is_none() {
+            self.clips = Self::upload(device, &self.cpu.clips, "clips");
+        }
+        if self.fill_pipeline.is_none() {
+            self.fill_pipeline = Some(create_debug_volume_pipeline(
+                device, layout, shader, surface_format, msaa_samples, false,
+            ));
+        }
+        if self.line_pipeline.is_none() {
+            self.line_pipeline = Some(create_debug_volume_pipeline(
+                device, layout, shader, surface_format, msaa_samples, true,
+            ));
+        }
+    }
+
+    /// Returns true when it bound its own vertex/index buffers, so the caller
+    /// must restore the world geometry bindings before addressing BSP ranges.
+    fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+    ) -> bool {
+        let (Some(fill), Some(line)) = (&self.fill_pipeline, &self.line_pipeline) else {
+            return false;
+        };
+        let meshes = [
+            self.triggers.as_ref().filter(|_| self.triggers_enabled),
+            self.clips.as_ref().filter(|_| self.clips_enabled),
+        ];
+        let mut drew = false;
+        for mesh in meshes.into_iter().flatten() {
+            pass.set_bind_group(0, camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_pipeline(fill);
+            pass.set_index_buffer(mesh.triangles.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.triangle_count, 0, 0..1);
+            pass.set_pipeline(line);
+            pass.set_index_buffer(mesh.lines.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.line_count, 0, 0..1);
+            drew = true;
+        }
+        drew
+    }
+}
+
+fn create_debug_volume_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    outline: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if outline {
+            "JKA debug volume outline pipeline"
+        } else {
+            "JKA debug volume fill pipeline"
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<DebugVolumeVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &DEBUG_VOLUME_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: if outline {
+                wgpu::PrimitiveTopology::LineList
+            } else {
+                wgpu::PrimitiveTopology::TriangleList
+            },
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        // The shader pulls clip z toward the camera; wgpu forbids depth bias on lines.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if outline { "fs_line" } else { "fs_fill" }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_surface_inspector_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -30639,6 +33749,100 @@ fn create_surface_inspector_pipeline(
     })
 }
 
+fn create_screen_fx_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    blend: FxBlend,
+) -> wgpu::RenderPipeline {
+    let blend_state = match blend {
+        FxBlend::Add => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        FxBlend::AddAlpha => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        FxBlend::Alpha => Some(wgpu::BlendState::ALPHA_BLENDING),
+        FxBlend::Modulate => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        FxBlend::Modulate2x => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::DstAlpha,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+        FxBlend::Darken => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        }),
+        FxBlend::Opaque => None,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA CGame screen FX pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &UI_VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: blend_state,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_ui_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -30676,8 +33880,142 @@ fn create_ui_pipeline(
     })
 }
 #[cfg(test)]
+mod inline_run_tests {
+    use super::*;
+
+    /// Runs the planner and returns each run as its list of visible positions.
+    fn plan(group_of: &[u32], continues: &[bool], groups: usize) -> Vec<Vec<u32>> {
+        let mut scratch = InlineDrawScratch::default();
+        plan_inline_runs(group_of, continues, groups, &mut scratch);
+        scratch
+            .runs
+            .iter()
+            .map(|&(first, count)| scratch.order[first as usize..(first + count) as usize].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn same_stage_of_different_surfaces_merges_into_one_run() {
+        // Three single-stage surfaces of one state, separated by another state.
+        let runs = plan(&[0, 1, 0, 0], &[false; 4], 2);
+        assert_eq!(runs, vec![vec![0, 2, 3], vec![1]]);
+    }
+
+    #[test]
+    fn stages_of_one_surface_never_draw_out_of_order() {
+        // Y is a lone stage of state 1; X is stage 0 (state 0) then stage 1
+        // (state 1). Merging state 1 at Y would draw X's second stage first.
+        let runs = plan(&[1, 0, 1], &[false, false, true], 2);
+        assert_eq!(runs, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn matching_stages_of_several_surfaces_stay_stage_major() {
+        // Two surfaces, each state 0 then state 1: one run per stage.
+        let runs = plan(&[0, 1, 0, 1], &[false, true, false, true], 2);
+        assert_eq!(runs, vec![vec![0, 2], vec![1, 3]]);
+    }
+
+    #[test]
+    fn every_batch_is_drawn_exactly_once_in_a_valid_order() {
+        // Pseudo-random layouts: each position appears once, and no stage is
+        // drawn before the earlier stage of its surface.
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..200 {
+            let n = 1 + (next() % 40) as usize;
+            let groups = 1 + (next() % 5) as usize;
+            let group_of: Vec<u32> = (0..n).map(|_| next() % groups as u32).collect();
+            let continues: Vec<bool> = (0..n).map(|position| position > 0 && next() % 3 == 0).collect();
+            let mut scratch = InlineDrawScratch::default();
+            plan_inline_runs(&group_of, &continues, groups, &mut scratch);
+            let mut drawn_at = vec![usize::MAX; n];
+            for (rank, &position) in scratch.order.iter().enumerate() {
+                assert_eq!(drawn_at[position as usize], usize::MAX, "drawn twice");
+                drawn_at[position as usize] = rank;
+            }
+            assert!(drawn_at.iter().all(|&rank| rank != usize::MAX), "a batch was dropped");
+            for position in 1..n {
+                if continues[position] {
+                    assert!(drawn_at[position - 1] < drawn_at[position], "stage drawn before its predecessor");
+                }
+            }
+            let run_total: u32 = scratch.runs.iter().map(|&(_, count)| count).sum();
+            assert_eq!(run_total as usize, n);
+            // Every run holds a single state.
+            for &(first, count) in &scratch.runs {
+                let states: std::collections::BTreeSet<u32> = scratch.order[first as usize..(first + count) as usize]
+                    .iter()
+                    .map(|&position| group_of[position as usize])
+                    .collect();
+                assert_eq!(states.len(), 1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod shader_tests {
     use super::*;
+
+    #[test]
+    fn rt_segment_light_preserves_power_and_point_mode() {
+        let mut light = TransientLight {
+            kind: crate::fx::system::FxLightKind::AuthoredEffect,
+            position: [5.0, 2.0, 3.0], color: [1.0, 0.2, 0.1], radius: 14.0, intensity: 1.0,
+            segment: Some([[0.0, 2.0, 3.0], [10.0, 2.0, 3.0]]),
+            blade_segments: None,
+        };
+        let point = transient_light_gpu(&light, 2.0, false);
+        let segment = transient_light_gpu(&light, 2.0, true);
+        assert_eq!(point.emitter, [0.0; 4]);
+        assert_eq!(segment.emitter, [5.0, 0.0, 0.0, -1.0]);
+        assert_eq!(segment.color_intensity, point.color_intensity);
+        assert_eq!(segment.position_radius, point.position_radius);
+        // Cluster radius is influence radius plus half-length; it encloses all
+        // endpoint influence spheres rather than incorrectly culling the tips.
+        let center = Vec3::from_slice(&segment.position_radius[..3]);
+        let half = Vec3::from_slice(&segment.emitter[..3]);
+        let cluster_radius = segment.position_radius[3] + half.length();
+        for endpoint in light.segment.unwrap() {
+            assert!(Vec3::from_array(endpoint).distance(center) + light.radius <= cluster_radius);
+        }
+        light.segment = Some([[f32::NAN, 0.0, 0.0], [0.0; 3]]);
+        assert_eq!(transient_light_gpu(&light, 2.0, true).emitter, [0.0; 4]);
+        light.segment = Some([[1.0; 3]; 2]);
+        assert_eq!(transient_light_gpu(&light, 2.0, true).emitter, [0.0; 4]);
+    }
+
+    #[test]
+    fn rt_multiblade_expansion_conserves_aggregate_power() {
+        use crate::fx::system::FxLightSegment;
+        let light = TransientLight {
+            kind: crate::fx::system::FxLightKind::AuthoredEffect,
+            position: [0.0; 3], radius: 80.0, color: [0.25, 0.0, 0.75], intensity: 2.0,
+            segment: None,
+            blade_segments: Some(vec![
+                FxLightSegment { endpoints: [[0.0; 3], [10.0, 0.0, 0.0]], rgb: [1.0, 0.0, 0.0], weight: 0.25 },
+                FxLightSegment { endpoints: [[0.0; 3], [0.0, 30.0, 0.0]], rgb: [0.0, 0.0, 1.0], weight: 0.75 },
+            ].into()),
+        };
+        let point = transient_light_gpu(&light, 2.0, false);
+        let blades = transient_light_samples(&light, true).map(|sample| transient_light_gpu(&sample, 2.0, true)).collect::<Vec<_>>();
+        assert_eq!(blades.len(), 2);
+        for channel in 0..3 {
+            let sum: f32 = blades.iter().map(|blade| blade.color_intensity[channel] * blade.color_intensity[3]).sum();
+            assert!((sum - point.color_intensity[channel] * point.color_intensity[3]).abs() < 1e-6);
+        }
+        assert_eq!(blades[0].position_radius, [5.0, 0.0, 0.0, 80.0]);
+        assert_eq!(blades[1].position_radius, [0.0, 15.0, 0.0, 80.0]);
+        assert!(blades.iter().all(|blade| blade.emitter[3] == -1.0 && blade.shadow[3] == 1.0));
+        let fallback = transient_light_samples(&light, false).collect::<Vec<_>>();
+        assert_eq!(fallback, [light]);
+    }
 
     #[test]
     fn rt_empty_alpha_tables_satisfy_shader_binding_sizes() {
@@ -30746,6 +34084,38 @@ mod shader_tests {
     }
 
     #[test]
+    fn jump_shade_world_variants_specialize_and_validate() {
+        use wgpu::naga;
+        for (name, base) in [
+            ("bsp", include_str!("bsp.wgsl")),
+            ("bsp_lean", include_str!("bsp_lean.wgsl")),
+        ] {
+            let source = format!("{base}\n{}", include_str!("surface_deformation.wgsl"));
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            for enabled in [0.0, 1.0] {
+                let constants = [("ENABLE_JUMP_SHADE".into(), enabled)].into_iter().collect();
+                let (specialized, specialized_info) =
+                    naga::back::pipeline_constants::process_overrides(&module, &info, None, &constants)
+                        .unwrap_or_else(|e| panic!("{name} jump shade {enabled}: {e:?}"));
+                naga::back::spv::write_vec(
+                    &specialized,
+                    &specialized_info,
+                    &naga::back::spv::Options { lang_version: (1, 4), ..Default::default() },
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{name} jump shade {enabled}: {e:?}"));
+            }
+        }
+    }
+
+    #[test]
     fn rt_shader_variants_specialize_and_emit_spirv() {
         use wgpu::naga;
         for base in [include_str!("bsp.wgsl"), include_str!("bsp_lean.wgsl")] {
@@ -30756,9 +34126,16 @@ mod shader_tests {
             ).validate(&module).unwrap();
             // Exercise both lighting branches with local shadows enabled. The
             // sun-only permutation verifies the independent local-shadow switch.
-            for (pbr, local) in [(0.0, 1.0), (1.0, 1.0), (0.0, 0.0)] {
+            for (pbr, local, sun, cascades) in [
+                (0.0, 1.0, 1.0, 0.0), (1.0, 1.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0), // Sun only.
+                (0.0, 1.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0), // Local only.
+                (0.0, 1.0, 0.0, 1.0), (1.0, 1.0, 0.0, 1.0), // Raster sun + RT local.
+            ] {
                 let constants = [
                     ("ENABLE_RAY_TRACED_SHADOWS".into(), 1.0),
+                    ("ENABLE_RAY_TRACED_SUN".into(), sun),
+                    ("ENABLE_CASCADED_SHADOWS".into(), cascades),
                     ("ENABLE_LOCAL_SHADOWS".into(), local),
                     ("ENABLE_POINT_LIGHTS".into(), 1.0),
                     ("ENABLE_PBR".into(), pbr),

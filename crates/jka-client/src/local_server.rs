@@ -6,6 +6,8 @@
 //! server produces after netchan decoding.  CGame/presentation therefore sees
 //! local and remote play through the same boundary.
 
+mod movers;
+
 use std::{
     collections::{BTreeMap, HashSet},
     ops::{Deref, DerefMut},
@@ -18,9 +20,9 @@ use jka_assets::saber::{SaberDefinition, SaberDefinitions};
 
 use crate::{
     camera::Camera,
-    cgame::{ClientInfo, CS_EFFECTS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
+    cgame::{ClientInfo, CS_EFFECTS, CS_MODELS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
     player::{LocalPlayer, MouseInputSettings},
-    scene::{MapFxRunner, SpawnPoint},
+    scene::{MapBrushEntity, MapFxRunner, SpawnPoint},
     surface_deformation::SurfaceDeformationStamp,
 };
 use jka_movement::{
@@ -50,12 +52,18 @@ pub struct LocalServer {
     configstrings: BTreeMap<u16, Vec<u8>>,
     map_effects: Vec<String>,
     map_entities: Vec<EntityState>,
+    /// func_trains that move; `entity` indexes `map_entities`.
+    trains: Vec<movers::Train>,
+    /// `model2` names published as CS_MODELS entries 1..
+    map_models: Vec<String>,
     next_message_num: i32,
     /// Offset maps Pmove's commandTime into a monotonic server timeline. Pmove
     /// player states legitimately reset commandTime on join/respawn; snapshot
     /// serverTime must never run backwards across those state transitions.
     player_time_offset: i64,
     last_snapshot_time: Option<i32>,
+    /// Point -> portal area lookup for SV_BuildClientSnapshot's areamask.
+    areas: Option<jka_assets::bsp::AreaLocator>,
 }
 
 impl LocalServer {
@@ -67,20 +75,46 @@ impl LocalServer {
         client_info: &ClientInfo,
         saber_movement: [SaberMovementInfo; 2],
         fx_runners: &[MapFxRunner],
+        brush_entities: &[MapBrushEntity],
+        areas: Option<jka_assets::bsp::AreaLocator>,
     ) -> Result<Self, String> {
         let mut player = LocalPlayer::new(movement, world, spawn)?;
         player.set_saber_movement_info(saber_movement)?;
         let map_name = normalize_map_name(map_name);
-        let (map_effects, map_entities) = build_map_fx_entities(fx_runners);
+        let (map_effects, mut map_entities) = build_map_fx_entities(fx_runners);
+        let movers = movers::build_brush_mover_entities(
+            brush_entities,
+            LOCAL_MAP_ENTITY_BASE.saturating_add(map_entities.len() as u16),
+            MAX_GENTITIES,
+        );
+        if !movers.entities.is_empty() {
+            println!(
+                "LOCAL SERVER MOVERS: {} of {} brush entities spawned as ET_MOVER ({} moving train(s), {} model2)",
+                movers.entities.len(),
+                brush_entities.len(),
+                movers.trains.len(),
+                movers.models.len()
+            );
+        }
+        let mover_base = map_entities.len();
+        let mut trains = movers.trains;
+        for train in &mut trains {
+            train.entity += mover_base;
+        }
+        let map_models = movers.models;
+        map_entities.extend(movers.entities);
         let mut server = Self {
             player,
             map_name,
             configstrings: BTreeMap::new(),
             map_effects,
             map_entities,
+            trains,
+            map_models,
             next_message_num: 1,
             player_time_offset: 0,
             last_snapshot_time: None,
+            areas,
         };
         server.rebuild_gamestate(client_info);
         Ok(server)
@@ -122,7 +156,7 @@ impl LocalServer {
         self.configstrings.insert(
             CS_SERVERINFO,
             format!(
-                "\\mapname\\{}\\g_gametype\\0\\sv_hostname\\DinurdoJK Local",
+                "\\mapname\\{}\\g_gametype\\0\\g_maxForceRank\\7\\g_forcePowerDisable\\0\\g_weaponDisable\\0\\g_duelWeaponDisable\\0\\g_forceBasedTeams\\0\\sv_hostname\\DinurdoJK Local",
                 clean_info_value(&self.map_name)
             )
             .into_bytes(),
@@ -131,6 +165,11 @@ impl LocalServer {
             CS_SYSTEMINFO,
             b"\\sv_serverid\\1\\sv_pure\\0".to_vec(),
         );
+        for (slot, model) in self.map_models.iter().enumerate() {
+            let Ok(slot) = u16::try_from(slot + 1) else { break };
+            self.configstrings
+                .insert(CS_MODELS + slot, model.as_bytes().to_vec());
+        }
         for (slot, effect) in self.map_effects.iter().enumerate() {
             let Ok(slot) = u16::try_from(slot + 1) else { break };
             self.configstrings
@@ -162,6 +201,12 @@ impl LocalServer {
             return None;
         }
 
+        for train in &mut self.trains {
+            if let Some(state) = self.map_entities.get_mut(train.entity) {
+                train.advance(state, server_time);
+            }
+        }
+
         let network = self.player.network_state();
         let mut player_state = ProtocolPlayerState::default();
         player_state.fields = network.fields;
@@ -181,7 +226,7 @@ impl LocalServer {
             delta_num,
             snap_flags: 0,
             server_command_num: 0,
-            area_mask: [0; 32],
+            area_mask: self.area_mask(),
             player_state,
             vehicle_player_state: None,
             // The local client is represented by playerState exactly like the
@@ -190,6 +235,24 @@ impl LocalServer {
             // need a special Solo Game presentation path.
             entities: self.map_entities.clone(),
         })
+    }
+
+    /// SV_BuildClientSnapshot: CM_WriteAreaBits for the area holding the
+    /// view origin, inverted onto the wire (a set bit hides an area). Every
+    /// areaportal starts closed (cm.areaPortals is zeroed at load) and only a
+    /// mover opening moves it; the shim's movers never open, so the flood
+    /// reaches the viewer's own area alone. A view in solid (area -1) sees
+    /// every area, as in CM_WriteAreaBits.
+    fn area_mask(&self) -> [u8; 32] {
+        let Some(areas) = &self.areas else {
+            return [0; 32];
+        };
+        let Some(area) = areas.area_at(self.player.view().eye_origin()).filter(|&area| area < 256) else {
+            return [0; 32];
+        };
+        let mut mask = [0xff; 32];
+        mask[area / 8] &= !(1 << (area % 8));
+        mask
     }
 
     pub fn update(
@@ -209,6 +272,16 @@ impl LocalServer {
 
     pub fn view(&self) -> PlayerView {
         self.player.view()
+    }
+
+    /// `fd.saberAnimLevel` (playerState field 23 in the protocol-26 schema).
+    pub fn saber_style(&self) -> i32 {
+        const SABER_ANIM_LEVEL_FIELD: usize = 23;
+        self.player
+            .network_state()
+            .fields
+            .get(SABER_ANIM_LEVEL_FIELD)
+            .map_or(0, |bits| *bits as i32)
     }
 
     pub fn entity_view(&self) -> PlayerEntityView {
@@ -281,6 +354,14 @@ impl LocalServer {
 
     pub fn toggle_noclip(&mut self) -> Result<bool, String> {
         self.player.toggle_noclip()
+    }
+
+    pub fn give_all(&mut self) -> Result<(), String> {
+        self.player.give_all()
+    }
+
+    pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
+        self.player.teleport(origin, angles)
     }
 
     pub fn apply_mouse_look_timed(&mut self, mouse: (f64, f64), elapsed: Duration) {

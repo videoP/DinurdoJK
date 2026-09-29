@@ -184,6 +184,19 @@ fn add_relative(base: usize, relative: i32, limit: usize, what: &str) -> Result<
         .ok_or_else(|| format!("Ghoul2 {what} offset outside file"))
 }
 
+/// Read only the GLM animation-skeleton reference from the MDXM header.
+/// Profile discovery uses this to reject vehicles without decoding every LOD,
+/// surface and weight in every installed player model.
+pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
+    if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
+        return Err("expected Ghoul2 GLM/MDXM file".into());
+    }
+    if i32_at(data, 4, "GLM version")? != MDXM_VERSION {
+        return Err(format!("expected GLM version {MDXM_VERSION}"));
+    }
+    Ok(cstr(bytes_at(data, 72, 64, "GLM animation name")?))
+}
+
 /// Parse a Ghoul2 GLM/MDXM version 6 mesh.
 pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
@@ -194,7 +207,7 @@ pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     }
 
     let name = cstr(bytes_at(data, 8, 64, "GLM name")?);
-    let anim_name = cstr(bytes_at(data, 72, 64, "GLM animation name")?);
+    let anim_name = glm_animation_name(data)?;
     let num_bones = bounded_count(i32_at(data, 140, "GLM bone count")?, 4096, "GLM bone count")?;
     let num_lods = bounded_count(i32_at(data, 144, "GLM LOD count")?, 64, "GLM LOD count")?;
     let ofs_lods = usize_i32(i32_at(data, 148, "GLM LOD offset")?, "GLM LOD offset")?;

@@ -115,6 +115,10 @@ pub struct HudState {
     pub force_power: i32,
     pub force_power_max: i32,
     pub ammo: Option<i32>,
+    /// Selected weapon (`weapon_t`); WP_SABER swaps the ammo panel for the saber style.
+    pub weapon: i32,
+    /// `fd.saberAnimLevel` (`saber_styles_t`: 1 fast .. 7 staff), 0 when unknown.
+    pub saber_style: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -155,7 +159,7 @@ impl HudElementId {
         match self {
             Self::Health => "HEALTH",
             Self::Shield => "SHIELD",
-            Self::Ammo => "AMMO",
+            Self::Ammo => "AMMO / STYLE",
             Self::Force => "FORCE",
         }
     }
@@ -465,6 +469,29 @@ pub struct ConsoleSearchMatch {
     pub end_col: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleSuggestKind {
+    Cvar,
+    Command,
+    Server,
+}
+
+/// One row of the console's live command/cvar filter popup.
+#[derive(Debug, Clone)]
+pub struct ConsoleSuggestion {
+    pub name: &'static str,
+    pub kind: ConsoleSuggestKind,
+    /// Bit `i` set = byte `i` of `name` matched what was typed.
+    pub mask: u64,
+    /// Current cvar value (empty for commands or unknown values).
+    pub value: String,
+    /// The value differs from the registered default.
+    pub modified: bool,
+    pub default_value: &'static str,
+    pub range: &'static str,
+    pub description: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConsoleSize {
     #[default]
@@ -591,18 +618,6 @@ pub enum PvsMode {
 }
 
 impl PvsMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "OFF",
-            Self::Minimal => "MINIMAL",
-            Self::Full => "FULL",
-            Self::Auto => "AUTO",
-            Self::Auto2 => "AUTO 2",
-            Self::Auto3 => "AUTO 3",
-            Self::Auto4 => "AUTO 4",
-        }
-    }
-
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -612,6 +627,48 @@ impl PvsMode {
             Self::Auto2 => "auto2",
             Self::Auto3 => "auto3",
             Self::Auto4 => "auto4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FxGeometryMode {
+    /// Current reference path: expand view-facing FX geometry on the presentation thread.
+    #[default]
+    Cpu,
+    /// Preserve the exact same geometry/material semantics while parallelizing
+    /// per-material FX expansion over the persistent Rayon worker pool.
+    CpuWorkers,
+    /// Keep OpenJK FX simulation on CPU, but submit billboard Particle sprites
+    /// as compact WGPU instances instead of rebuilding quad vertices/indices.
+    Gpu,
+}
+
+impl FxGeometryMode {
+    pub const ALL: [Self; 3] = [Self::Cpu, Self::CpuWorkers, Self::Gpu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::CpuWorkers => "CPU WORKERS",
+            Self::Gpu => "GPU",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::CpuWorkers => "workers",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "0" => Some(Self::Cpu),
+            "workers" | "cpu_workers" | "cpu-workers" | "1" => Some(Self::CpuWorkers),
+            "gpu" | "2" => Some(Self::Gpu),
+            _ => None,
         }
     }
 }
@@ -870,23 +927,12 @@ pub enum DynamicLightsMode {
 impl DynamicLightsMode {
     pub const ALL: [Self; 6] = [
         Self::Off,
-        Self::Legacy,
         Self::Vertex,
+        Self::Legacy,
         Self::ClusteredLite,
         Self::PerPixelForwardPlus,
         Self::RayTracedHardware,
     ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "OFF",
-            Self::Legacy => "LEGACY",
-            Self::Vertex => "VERTEX",
-            Self::ClusteredLite => "CLUSTERED LITE",
-            Self::PerPixelForwardPlus => "PER-PIXEL (FORWARD+)",
-            Self::RayTracedHardware => "RAY TRACED (HARDWARE) [WIP]",
-        }
-    }
 
     pub fn config_value(self) -> &'static str {
         match self {
@@ -952,35 +998,28 @@ impl SunVisibilityMode {
 pub enum DynamicShadowsMode {
     #[default]
     Off,
-    BlobStencilLegacy,
+    Blob,
+    Stencil,
     CascadedShadowMaps,
     CascadedShadowMapsBevy,
     RayTraced,
 }
 
 impl DynamicShadowsMode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Off,
-        Self::BlobStencilLegacy,
+        Self::Blob,
+        Self::Stencil,
         Self::CascadedShadowMaps,
         Self::CascadedShadowMapsBevy,
         Self::RayTraced,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "OFF",
-            Self::BlobStencilLegacy => "BLOB / STENCIL (LEGACY) [WIP]",
-            Self::CascadedShadowMaps => "CASCADED SHADOW MAPS (CSM)",
-            Self::CascadedShadowMapsBevy => "CASCADED SHADOW MAPS (BEVY)",
-            Self::RayTraced => "RAY TRACED SHADOWS",
-        }
-    }
-
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::BlobStencilLegacy => "blob_stencil",
+            Self::Blob => "blob",
+            Self::Stencil => "stencil",
             Self::CascadedShadowMaps => "csm",
             Self::CascadedShadowMapsBevy => "csm_bevy",
             Self::RayTraced => "ray_traced",
@@ -990,7 +1029,12 @@ impl DynamicShadowsMode {
     pub fn from_config(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" | "0" => Some(Self::Off),
-            "blob" | "stencil" | "blob_stencil" | "1" => Some(Self::BlobStencilLegacy),
+            // `blob_stencil` was the old combined placeholder. Preserve old
+            // configs by migrating it to the now-functional OpenJK blob mode.
+            "blob" | "blob_stencil" | "1" => Some(Self::Blob),
+            "stencil" | "stencil_legacy" => Some(Self::Stencil),
+            // Keep the old numeric aliases stable so archived configs do not
+            // silently shift when Stencil gets its own menu slot.
             "csm" | "cascaded" | "cascaded_shadow_maps" | "2" => Some(Self::CascadedShadowMaps),
             "csm_bevy" | "bevy_csm" | "cascaded_shadow_maps_bevy" => Some(Self::CascadedShadowMapsBevy),
             "ray_traced" | "raytraced" | "3" | "4" => Some(Self::RayTraced),
@@ -1327,6 +1371,15 @@ pub const VIDEO_ROW_MAP_LIGHT_SIMULATION: usize = 65;
 pub const VIDEO_ROW_SABER_MARKS: usize = 66;
 pub const VIDEO_ROW_MAX_FRAME_LATENCY: usize = 67;
 pub const VIDEO_ROW_DETAIL_TEXTURES: usize = 68;
+pub const VIDEO_ROW_FLARES: usize = 69;
+pub const VIDEO_ROW_SABER_IMPACT_FX: usize = 70;
+pub const VIDEO_ROW_FX_GEOMETRY: usize = 71;
+pub const VIDEO_ROW_FX_ZERO_ALPHA_DISCARD: usize = 72;
+pub const VIDEO_ROW_DRAW_MAP_MODELS: usize = 73;
+pub const VIDEO_ROW_MODEL_BRIGHTNESS: usize = 74;
+pub const VIDEO_ROW_DLIGHT_BRIGHTNESS: usize = 75;
+pub const VIDEO_ROW_DRAW_TRIGGERS: usize = 76;
+pub const VIDEO_ROW_DRAW_CLIP_BRUSHES: usize = 77;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -1403,7 +1456,8 @@ impl FogMode {
 pub enum ReflectionQuality {
     /// No enhanced reflections and no authored tcGen environment stages.
     Off,
-    /// Vanilla/authored tcGen environment stages only; no enhanced reflection path.
+    /// Vanilla/authored tcGen environment stages and JKA portal mirrors only;
+    /// no promoted environment-planar reflection path.
     Legacy,
     Low,
     Medium,
@@ -1456,10 +1510,10 @@ impl ReflectionQuality {
         }
     }
 
-    /// Runtime reflection-technique tier. Off and Legacy deliberately share the
-    /// exact same zero-cost shader/runtime policy; their only difference is the
-    /// map-load material specialization that strips tcGen environment stages in
-    /// Off mode.
+    /// Runtime reflection-technique tier. Off is the explicit compatibility-breaking
+    /// "strip reflections" mode. Legacy preserves authored JKA reflection behavior
+    /// (tcGen environment stages and portal mirrors) without promoting arbitrary
+    /// environment-mapped surfaces into enhanced planar reflections.
     pub fn shader_value(self) -> u32 {
         match self {
             Self::Off | Self::Legacy => 0,
@@ -1480,10 +1534,17 @@ impl ReflectionQuality {
 
     pub fn planar_slot_budget(self) -> usize {
         match self {
-            Self::Off | Self::Legacy | Self::Low | Self::Medium => 0,
-            Self::High => 1,
+            Self::Off => 0,
+            // Authored JKA `portal` mirrors are part of the legacy material
+            // contract, not an enhanced reflection feature. Keep one baseline
+            // planar slot available from Legacy upward.
+            Self::Legacy | Self::Low | Self::Medium | Self::High => 1,
             Self::Ultra => 4,
         }
+    }
+
+    pub fn promotes_environment_planars(self) -> bool {
+        matches!(self, Self::High | Self::Ultra)
     }
 }
 
@@ -1641,6 +1702,22 @@ pub struct VideoSettings {
     /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
     /// render-frame-driven behavior; non-zero values are fixed Hz.
     pub fx_fps: u32,
+    /// View-dependent EFX geometry expansion path. FX simulation itself already
+    /// runs on the dedicated `jka-fx` worker; this controls the later sprite/line
+    /// tessellation step against the final camera.
+    pub fx_geometry: FxGeometryMode,
+    /// A/B diagnostic for GPU-instanced EFX sprites. When enabled, fragments
+    /// whose final source alpha is exactly zero are discarded before fog/blend.
+    /// This preserves non-zero-alpha edges and is intentionally limited to
+    /// source-alpha sprite blend modes.
+    pub fx_zero_alpha_discard: bool,
+    /// Server-placed MD3 map props (misc_model_* / func_static models). Inline
+    /// BSP brush models and geometry compiled into the BSP are unaffected.
+    pub draw_map_models: bool,
+    /// Debug overlays for trigger volumes and clip/collision-only brushes.
+    /// Session-only: never written to the config.
+    pub draw_triggers: bool,
+    pub draw_clip_brushes: bool,
     pub draw_fps: u8,
     pub developer_tools: bool,
     pub perf_trace: bool,
@@ -1681,6 +1758,13 @@ pub struct VideoSettings {
     pub physics_debug_draw: bool,
     pub physics_stats: bool,
     pub gamma: f32,
+    /// Model lighting brightness on the same scale as `gamma`. While
+    /// `model_brightness_locked` it tracks the master slider and adds nothing.
+    pub model_brightness: f32,
+    pub model_brightness_locked: bool,
+    /// Dynamic (runtime) light brightness, same scale and lock rules.
+    pub dynamic_light_brightness: f32,
+    pub dynamic_light_brightness_locked: bool,
     pub hdr: bool,
     pub float_lightmap: bool,
     pub tone_mapping: bool,
@@ -1771,6 +1855,8 @@ pub struct VideoSettings {
     pub hiz_occlusion: bool,
     pub entity_ambient_lighting: EntityAmbientLightingMode,
     pub dynamic_lights: DynamicLightsMode,
+    pub rt_samples: u32,
+    pub rt_half_resolution: bool,
     /// Source `.map` only: approximate a compiled lighting pass from authored light entities.
     pub map_light_simulation: bool,
     /// Classic world-lighting master. False corresponds to vanilla r_fullbright 1.
@@ -1782,6 +1868,12 @@ pub struct VideoSettings {
     /// Optional continuous-ribbon saber presentation. False keeps the OpenJK-style
     /// RT_SABER_GLOW sprite chain + RT_LINE core.
     pub modern_sabers: bool,
+    /// Screen-space flare overlays such as the OpenJK saber clash flash.
+    /// This does not disable the underlying impact FX, sounds, or marks.
+    pub flares: bool,
+    /// Authored saber-hit/block EFX presentation. The FX system retains tagged
+    /// live primitives so this can be A/B toggled on a paused demo frame.
+    pub saber_impact_fx: bool,
     /// Saber/world contact presentation. Legacy mirrors OpenJK's sparks, burn/glow
     /// marks and contact sound; Enhanced adds a hotter molten pass and drips.
     pub saber_marks: SaberMarkMode,
@@ -1805,6 +1897,42 @@ pub struct VideoSettings {
     pub planar_reflection_debug: PlanarReflectionDebugMode,
 }
 
+impl VideoSettings {
+    /// Extra linear multiplier for model lighting. Locked (the default) leaves the
+    /// master gamma as the only brightness control; unlocked, the slider value is
+    /// expressed on the master's scale, so unlocking never changes the picture.
+    pub fn effective_model_brightness(&self) -> f32 {
+        Self::relative_brightness(self.model_brightness_locked, self.model_brightness, self.gamma)
+    }
+
+    /// Same rule as [`Self::effective_model_brightness`] for runtime dynamic lights.
+    pub fn effective_dynamic_light_brightness(&self) -> f32 {
+        Self::relative_brightness(
+            self.dynamic_light_brightness_locked,
+            self.dynamic_light_brightness,
+            self.gamma,
+        )
+    }
+
+    fn relative_brightness(locked: bool, value: f32, gamma: f32) -> f32 {
+        if locked {
+            1.0
+        } else {
+            (value / gamma.max(0.01)).clamp(0.0, 6.0)
+        }
+    }
+
+    /// Master slider moved: linked brightness sliders follow it.
+    pub fn sync_linked_brightness(&mut self) {
+        if self.model_brightness_locked {
+            self.model_brightness = self.gamma;
+        }
+        if self.dynamic_light_brightness_locked {
+            self.dynamic_light_brightness = self.gamma;
+        }
+    }
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
@@ -1825,6 +1953,11 @@ impl Default for VideoSettings {
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
             fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_geometry: FxGeometryMode::Cpu,
+            fx_zero_alpha_discard: false,
+            draw_map_models: true,
+            draw_triggers: false,
+            draw_clip_brushes: false,
             draw_fps: 1,
             developer_tools: false,
             perf_trace: false,
@@ -1858,6 +1991,10 @@ impl Default for VideoSettings {
             physics_debug_draw: false,
             physics_stats: false,
             gamma: 1.0,
+            model_brightness: 1.0,
+            model_brightness_locked: true,
+            dynamic_light_brightness: 1.0,
+            dynamic_light_brightness_locked: true,
             hdr: false,
             float_lightmap: false,
             tone_mapping: false,
@@ -1937,11 +2074,15 @@ impl Default for VideoSettings {
             hiz_occlusion: false,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             dynamic_lights: DynamicLightsMode::Off,
+            rt_samples: 1,
+            rt_half_resolution: false,
             map_light_simulation: false,
             world_lighting: true,
             vertex_lighting: false,
             lightmap_only: false,
             modern_sabers: false,
+            flares: true,
+            saber_impact_fx: true,
             saber_marks: SaberMarkMode::Legacy,
             pbr: true,
             allow_asset_overrides: true,
@@ -1976,11 +2117,31 @@ pub struct PerfStats {
     pub client_snapshot_ms: f64,
     pub client_audio_ms: f64,
     pub client_events_ms: f64,
+    pub client_event_prepare_ms: f64,
+    pub client_event_worker_jobs: u32,
+    pub client_event_worker_threads: u32,
+    pub client_event_worker_parallel: bool,
+    pub client_event_sound_decode_ms: f64,
+    pub client_event_sound_decode_jobs: u32,
+    pub client_event_sound_decode_parallel: bool,
     pub client_entity_present_ms: f64,
     pub client_player_present_ms: f64,
     pub client_followed_player_ms: f64,
     pub client_fx_ms: f64,
     pub client_fx_tessellate_ms: f64,
+    pub client_fx_draws: u32,
+    pub client_fx_sprites: u32,
+    pub client_fx_oriented_quads: u32,
+    pub client_fx_lines: u32,
+    pub client_fx_quads: u32,
+    pub client_fx_meshes: u32,
+    pub client_fx_cylinders: u32,
+    pub client_fx_render_surfaces: u32,
+    pub client_fx_cpu_geom_surfaces: u32,
+    pub client_fx_cpu_vertices: u64,
+    pub client_fx_cpu_indices: u64,
+    pub client_fx_gpu_sprite_batches: u32,
+    pub client_fx_gpu_sprite_instances: u32,
     pub ghoul2_pose_ms: f64,
     pub ghoul2_motion_pose_ms: f64,
     pub ghoul2_skin_ms: f64,
@@ -1999,6 +2160,7 @@ pub struct PerfStats {
     pub gpu_cull_ms: Option<f64>,
     pub gpu_cluster_ms: Option<f64>,
     pub gpu_world_ms: Option<f64>,
+    pub gpu_fx_sprites_ms: Option<f64>,
     pub gpu_post_ms: Option<f64>,
     pub gpu_ui_ms: Option<f64>,
     pub cull_visible: u32,
@@ -2047,8 +2209,8 @@ pub struct MapLoadingBar {
 pub struct MapLoadingUi {
     pub map_name: String,
     /// Active fs_game/search directory for this load, if any. The renderer uses
-    /// it to resolve mod-provided levelshots before falling back to the generic
-    /// splash image.
+    /// it to resolve mod-provided levelshots after first presenting OpenJK MP's
+    /// resident `menu/art/unknownmap_mp` fallback.
     pub active_game_dir: Option<String>,
     pub preparation_finished: bool,
     pub bars: Vec<MapLoadingBar>,
@@ -2072,6 +2234,18 @@ pub struct UiSnapshot {
     pub console_search_index: Option<usize>,
     pub console_search_matches: Vec<ConsoleSearchMatch>,
     pub console_search_active: Option<ConsoleSearchMatch>,
+    /// Total retained log lines and how many the view is scrolled up from the newest.
+    pub console_total_lines: usize,
+    pub console_scrolled: usize,
+    pub console_suggest_enabled: bool,
+    pub console_suggestions: Vec<ConsoleSuggestion>,
+    pub console_suggest_total: usize,
+    /// Highlighted row (row 0 while nothing has been explicitly picked).
+    pub console_suggest_selected: usize,
+    /// Single-entry argument hint shown while typing after a complete name.
+    pub console_suggest_hint: bool,
+    /// Pointer is over the header `?` button.
+    pub console_help_hover: bool,
     pub chat_mode: ChatMode,
     pub chat_input: String,
     pub chat_lines: Vec<UiChatLine>,
@@ -2089,6 +2263,10 @@ pub struct UiSnapshot {
     pub perf: PerfStats,
     pub threads: [ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
     pub surface_inspector: Option<crate::runtime::SurfaceInspectorInfo>,
+    /// One deliberately presented frame of the preloaded static splash before
+    /// startup kicks the first map request. This prevents the first visible WGPU
+    /// frame from being an empty/no-world clear.
+    pub startup_splash: bool,
     pub loading: Option<MapLoadingUi>,
     pub static_ao_progress: Option<MapLoadingBar>,
 }
@@ -2110,6 +2288,14 @@ impl Default for UiSnapshot {
             console_search_index: None,
             console_search_matches: Vec::new(),
             console_search_active: None,
+            console_total_lines: 0,
+            console_scrolled: 0,
+            console_suggest_enabled: true,
+            console_suggestions: Vec::new(),
+            console_suggest_total: 0,
+            console_suggest_selected: 0,
+            console_suggest_hint: false,
+            console_help_hover: false,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_lines: Vec::new(),
@@ -2127,6 +2313,7 @@ impl Default for UiSnapshot {
             perf: PerfStats::default(),
             threads: [ThreadPerfStats::default(); crate::thread_activity::SLOT_COUNT],
             surface_inspector: None,
+            startup_splash: false,
             loading: None,
             static_ao_progress: None,
         }
@@ -2265,6 +2452,10 @@ pub fn build_vertices(
         return Vec::new();
     }
     let mut out = Vec::with_capacity(16_384);
+    if ui.startup_splash {
+        build_splash_background(&mut out, width, height, splash_size);
+        return out;
+    }
     if let Some(loading) = &ui.loading {
         build_loading_screen(&mut out, loading, width, height, splash_size);
         // Keep the console usable during background map preparation/upload.
@@ -2795,58 +2986,103 @@ fn build_reflection_debug_legend(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u3
     }
 }
 
+const LOAD_CYAN: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
+const LOAD_MAGENTA: [f32; 4] = [1.0, 0.30, 0.56, 1.0];
+const LOAD_AMBER: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
+const LOAD_DONE: [f32; 4] = [0.30, 0.85, 0.66, 1.0];
+const LOAD_LABEL: [f32; 4] = [0.62, 0.72, 0.84, 1.0];
+const LOAD_FAINT: [f32; 4] = [0.38, 0.46, 0.58, 1.0];
+
+/// Neon edge (cyan to magenta) with a soft glow on `glow_dir` (+1 below, -1 above).
+#[allow(clippy::too_many_arguments)]
+fn neon_edge(out: &mut Vec<UiVertex>, x: f32, y: f32, width: f32, thickness: f32, glow_dir: f32, w: u32, h: u32) {
+    let l = with_alpha(LOAD_CYAN, 0.95);
+    let r = with_alpha(LOAD_MAGENTA, 0.95);
+    rect_gradient(out, x, y, width, thickness, l, r, l, r, w, h);
+    let mut offset = if glow_dir > 0.0 { thickness } else { 0.0 };
+    for (height, alpha) in [(3.0, 0.16), (4.0, 0.07), (6.0, 0.025)] {
+        let gl = with_alpha(LOAD_CYAN, alpha);
+        let gr = with_alpha(LOAD_MAGENTA, alpha);
+        let top = if glow_dir > 0.0 { y + offset } else { y - offset - height };
+        rect_gradient(out, x, top, width, height, gl, gr, gl, gr, w, h);
+        offset += height;
+    }
+}
+
+/// Thin progress track: dim rail, gradient fill from `from` to `to`.
+#[allow(clippy::too_many_arguments)]
+fn progress_track(
+    out: &mut Vec<UiVertex>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    fraction: f32,
+    from: [f32; 4],
+    to: [f32; 4],
+    w: u32,
+    h: u32,
+) {
+    rect(out, x, y, width, height, [0.05, 0.08, 0.14, 0.96], w, h);
+    let fill = width * fraction.clamp(0.0, 1.0);
+    if fill > 0.5 {
+        rect_gradient(out, x, y, fill, height, from, to, from, to, w, h);
+        let edge = 2.0_f32.min(fill);
+        rect(out, x + fill - edge, y, edge, height, lighten(to, 0.55), w, h);
+    }
+}
+
+fn loading_fraction(bar: &MapLoadingBar) -> f32 {
+    if bar.total > 0 {
+        (bar.completed as f32 / bar.total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn build_background_progress(out: &mut Vec<UiVertex>, progress: &MapLoadingBar, w: u32, h: u32) {
     let panel_w = 320.0;
     let panel_h = 44.0;
     let x = (w as f32 - panel_w - 18.0).max(8.0);
     let y = (h as f32 - panel_h - 18.0).max(8.0);
-    rect(out, x, y, panel_w, panel_h, [0.015, 0.020, 0.028, 0.90], w, h);
-    let fraction = if progress.total > 0 {
-        (progress.completed as f32 / progress.total as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    text(
+    rect_gradient(
         out,
-        progress.label,
-        x + 12.0,
-        y + 7.0,
-        1.2,
-        [0.82, 0.88, 0.94, 1.0],
+        x,
+        y,
+        panel_w,
+        panel_h,
+        HUD_INK_TOP,
+        HUD_INK_TOP,
+        HUD_INK_BOTTOM,
+        HUD_INK_BOTTOM,
         w,
         h,
     );
-    let bar_x = x + 104.0;
-    let bar_y = y + 11.0;
-    let bar_w = panel_w - 154.0;
-    rect(out, bar_x, bar_y, bar_w, 10.0, [0.08, 0.10, 0.13, 0.96], w, h);
-    if fraction > 0.0 {
-        rect(
-            out,
-            bar_x,
-            bar_y,
-            bar_w * fraction,
-            10.0,
-            [0.39, 0.62, 0.84, 1.0],
-            w,
-            h,
-        );
-    }
-    text(
+    rect(out, x, y, panel_w, panel_h, [0.0, 0.0, 0.0, 0.10], w, h);
+    let l = with_alpha(LOAD_CYAN, 0.9);
+    let r = with_alpha(LOAD_MAGENTA, 0.9);
+    rect_gradient(out, x, y, panel_w, 1.5, l, r, l, r, w, h);
+    let fraction = loading_fraction(progress);
+    text(out, progress.label, x + 12.0, y + 9.0, 1.1, LOAD_LABEL, w, h);
+    let percent = format!("{}%", (fraction * 100.0).round() as u32);
+    let percent_w = percent.len() as f32 * 6.0 * 1.3;
+    text(out, &percent, x + panel_w - 12.0 - percent_w, y + 8.0, 1.3, HUD_VALUE, w, h);
+    progress_track(
         out,
-        &format!("{}%", (fraction * 100.0).round() as u32),
-        x + panel_w - 42.0,
-        y + 7.0,
-        1.15,
-        [0.68, 0.73, 0.80, 1.0],
+        x + 12.0,
+        y + 29.0,
+        panel_w - 24.0,
+        5.0,
+        fraction,
+        with_alpha(LOAD_CYAN, 0.55),
+        LOAD_CYAN,
         w,
         h,
     );
 }
 
-fn build_loading_screen(
+fn build_splash_background(
     out: &mut Vec<UiVertex>,
-    loading: &MapLoadingUi,
     w: u32,
     h: u32,
     splash_size: Option<[u32; 2]>,
@@ -2874,73 +3110,105 @@ fn build_loading_screen(
             h,
         );
     }
+}
 
-    let panel_w = (w as f32 - 48.0).clamp(360.0, 760.0);
-    let row_h = 31.0;
-    let visible_bar_count = loading
+fn build_loading_screen(
+    out: &mut Vec<UiVertex>,
+    loading: &MapLoadingUi,
+    w: u32,
+    h: u32,
+    splash_size: Option<[u32; 2]>,
+) {
+    build_splash_background(out, w, h, splash_size);
+
+    // Darken the lower half so the panel reads over any splash artwork.
+    let fade_h = h as f32 * 0.55;
+    let clear = [0.0, 0.0, 0.02, 0.0];
+    let dark = [0.0, 0.0, 0.02, 0.80];
+    rect_gradient(out, 0.0, h as f32 - fade_h, w as f32, fade_h, clear, clear, dark, dark, w, h);
+
+    let visible: Vec<&MapLoadingBar> = loading
         .bars
         .iter()
         .filter(|bar| !(bar.skipped || (loading.preparation_finished && bar.total == 0)))
-        .count();
-    let panel_h = 84.0 + visible_bar_count as f32 * row_h + 26.0;
+        .collect();
+    let overall = if visible.is_empty() {
+        0.0
+    } else {
+        visible.iter().map(|bar| loading_fraction(bar)).sum::<f32>() / visible.len() as f32
+    };
+
+    let panel_w = (w as f32 - 48.0).clamp(360.0, 760.0);
+    let row_h = 27.0;
+    let rows_y = 82.0;
+    let panel_h = rows_y + visible.len() as f32 * row_h + 20.0;
     let x = (w as f32 - panel_w) * 0.5;
     let y = (h as f32 - panel_h - 34.0).max(24.0);
-    rect(out, x, y, panel_w, panel_h, [0.015, 0.020, 0.028, 0.88], w, h);
-    rect(out, x, y, 4.0, panel_h, [0.39, 0.62, 0.84, 1.0], w, h);
+    rect_gradient(
+        out,
+        x,
+        y,
+        panel_w,
+        panel_h,
+        [0.012, 0.016, 0.038, 0.92],
+        [0.012, 0.016, 0.038, 0.92],
+        [0.022, 0.028, 0.064, 0.94],
+        [0.022, 0.028, 0.064, 0.94],
+        w,
+        h,
+    );
+    neon_edge(out, x, y, panel_w, 2.0, -1.0, w, h);
 
+    // Header: kicker, map name, overall percentage.
+    text(out, "LOADING", x + 22.0, y + 15.0, 1.1, LOAD_CYAN, w, h);
     text(
         out,
-        &format!("LOADING {}", loading.map_name.to_ascii_uppercase()),
+        &loading.map_name.to_ascii_uppercase(),
         x + 22.0,
-        y + 18.0,
-        2.0,
+        y + 29.0,
+        2.2,
         [0.95, 0.97, 1.0, 1.0],
+        w,
+        h,
+    );
+    let percent = format!("{}%", (overall * 100.0).round() as u32);
+    let percent_w = percent.len() as f32 * 6.0 * 2.2;
+    text(out, &percent, x + panel_w - 22.0 - percent_w, y + 29.0, 2.2, LOAD_AMBER, w, h);
+    progress_track(
+        out,
+        x + 22.0,
+        y + 58.0,
+        panel_w - 44.0,
+        6.0,
+        overall,
+        LOAD_CYAN,
+        LOAD_MAGENTA,
         w,
         h,
     );
 
     let bar_x = x + 174.0;
     let bar_w = panel_w - 270.0;
-    for (index, bar) in loading
-        .bars
-        .iter()
-        .filter(|bar| !(bar.skipped || (loading.preparation_finished && bar.total == 0)))
-        .enumerate()
-    {
-        let row_y = y + 58.0 + index as f32 * row_h;
+    for (index, bar) in visible.iter().enumerate() {
+        let row_y = y + rows_y + index as f32 * row_h;
         let done = bar.total > 0 && bar.completed >= bar.total;
-        let fraction = if bar.total > 0 {
-            (bar.completed as f32 / bar.total as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let fraction = loading_fraction(bar);
         text(
             out,
             bar.label,
             x + 22.0,
-            row_y + 5.0,
-            1.35,
-            [0.78, 0.84, 0.91, 1.0],
+            row_y + 4.0,
+            1.25,
+            if bar.total == 0 { LOAD_FAINT } else { LOAD_LABEL },
             w,
             h,
         );
-        rect(out, bar_x, row_y + 5.0, bar_w, 12.0, [0.08, 0.10, 0.13, 0.96], w, h);
-        if fraction > 0.0 {
-            rect(
-                out,
-                bar_x,
-                row_y + 5.0,
-                bar_w * fraction,
-                12.0,
-                if done {
-                    [0.36, 0.72, 0.48, 1.0]
-                } else {
-                    [0.39, 0.62, 0.84, 1.0]
-                },
-                w,
-                h,
-            );
-        }
+        let (from, to) = if done {
+            (with_alpha(LOAD_DONE, 0.6), LOAD_DONE)
+        } else {
+            (with_alpha(LOAD_CYAN, 0.5), LOAD_CYAN)
+        };
+        progress_track(out, bar_x, row_y + 6.0, bar_w, 6.0, fraction, from, to, w, h);
         let status = if bar.total == 0 {
             "WAIT".to_string()
         } else if done {
@@ -2952,12 +3220,14 @@ fn build_loading_screen(
             out,
             &status,
             x + panel_w - 76.0,
-            row_y + 5.0,
-            1.25,
+            row_y + 4.0,
+            1.2,
             if done {
-                [0.55, 0.88, 0.64, 1.0]
+                LOAD_DONE
+            } else if bar.total == 0 {
+                LOAD_FAINT
             } else {
-                [0.68, 0.73, 0.80, 1.0]
+                LOAD_LABEL
             },
             w,
             h,
@@ -3033,6 +3303,41 @@ fn build_surface_inspector(
     }
 }
 
+// Night-Tokyo palette shared with the console: indigo ink, cyan/magenta neon,
+// tungsten amber. HUD accents pick one role per panel.
+const HUD_INK_TOP: [f32; 4] = [0.010, 0.014, 0.032, 0.84];
+const HUD_INK_BOTTOM: [f32; 4] = [0.020, 0.026, 0.058, 0.80];
+const HUD_LABEL: [f32; 4] = [0.56, 0.66, 0.79, 1.0];
+const HUD_VALUE: [f32; 4] = [0.96, 0.98, 1.0, 1.0];
+const HUD_HEALTH: [f32; 4] = [1.0, 0.30, 0.52, 1.0];
+const HUD_HEALTH_LOW: [f32; 4] = [1.0, 0.16, 0.20, 1.0];
+const HUD_SHIELD: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
+const HUD_FORCE: [f32; 4] = [0.52, 0.60, 1.0, 1.0];
+const HUD_AMMO: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
+
+fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
+    [
+        color[0] + (1.0 - color[0]) * amount,
+        color[1] + (1.0 - color[1]) * amount,
+        color[2] + (1.0 - color[2]) * amount,
+        color[3],
+    ]
+}
+
+/// OpenJK `saber_styles_t` as shown on the HUD: name, accent, lit segments (of 3).
+fn saber_style_display(style: i32) -> (&'static str, [f32; 4], u32) {
+    match style {
+        1 => ("FAST", [0.35, 0.72, 1.0, 1.0], 1),
+        2 => ("MEDIUM", [1.0, 0.85, 0.30, 1.0], 2),
+        3 => ("STRONG", [1.0, 0.28, 0.36, 1.0], 3),
+        4 => ("DESANN", [1.0, 0.30, 0.36, 1.0], 3),
+        5 => ("TAVION", [0.75, 0.45, 1.0, 1.0], 3),
+        6 => ("DUAL", [0.40, 1.0, 0.65, 1.0], 3),
+        7 => ("STAFF", [1.0, 0.58, 0.25, 1.0], 3),
+        _ => ("--", HUD_LABEL, 0),
+    }
+}
+
 fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let Some(hud) = ui.hud else {
         return;
@@ -3040,17 +3345,15 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 
     let health_layout = ui.hud_layout.health;
     let health = hud_element_rect(HudElementId::Health, health_layout, w, h);
+    let low_health = hud.health > 0 && hud.health * 4 <= hud.max_health.max(1);
     hud_meter(
         out,
-        health.x,
-        health.y,
-        health.width,
-        health.height,
+        health,
         health_layout.scale,
         "HEALTH",
         hud.health,
         hud.max_health.max(1),
-        [0.92, 0.28, 0.25, 0.95],
+        if low_health { HUD_HEALTH_LOW } else { HUD_HEALTH },
         w,
         h,
     );
@@ -3059,51 +3362,90 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let shield = hud_element_rect(HudElementId::Shield, shield_layout, w, h);
     hud_meter(
         out,
-        shield.x,
-        shield.y,
-        shield.width,
-        shield.height,
+        shield,
         shield_layout.scale,
         "SHIELD",
         hud.armor,
         hud.max_health.max(1),
-        [0.30, 0.58, 1.0, 0.95],
+        HUD_SHIELD,
         w,
         h,
     );
 
+    // The ammo slot doubles as the saber-style readout while the saber is out.
     let ammo_layout = ui.hud_layout.ammo;
     let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, w, h);
-    let ammo_text = hud
-        .ammo
-        .map_or_else(|| "--".to_owned(), |value| value.max(0).to_string());
-    hud_value_panel(
-        out,
-        ammo.x,
-        ammo.y,
-        ammo.width,
-        ammo.height,
-        ammo_layout.scale,
-        "AMMO",
-        &ammo_text,
-        [0.96, 0.78, 0.30, 0.95],
-        w,
-        h,
-    );
+    if hud.weapon == HUD_WP_SABER {
+        hud_style_panel(out, ammo, ammo_layout.scale, hud.saber_style, w, h);
+    } else {
+        let ammo_text = hud
+            .ammo
+            .map_or_else(|| "--".to_owned(), |value| value.max(0).to_string());
+        hud_value_panel(out, ammo, ammo_layout.scale, "AMMO", &ammo_text, HUD_AMMO, w, h);
+    }
 
     let force_layout = ui.hud_layout.force;
     let force = hud_element_rect(HudElementId::Force, force_layout, w, h);
     hud_meter(
         out,
-        force.x,
-        force.y,
-        force.width,
-        force.height,
+        force,
         force_layout.scale,
         "FORCE",
         hud.force_power,
         hud.force_power_max.max(1),
-        [0.38, 0.82, 1.0, 0.95],
+        HUD_FORCE,
+        w,
+        h,
+    );
+}
+
+/// `WP_SABER` in OpenJK's `weapon_t`.
+const HUD_WP_SABER: i32 = 3;
+
+/// Panel backing shared by every HUD readout: ink gradient, an accent notch on
+/// the left edge and a faint accent hairline along the top.
+fn hud_frame(out: &mut Vec<UiVertex>, rect_: HudRect, scale: f32, accent: [f32; 4], w: u32, h: u32) {
+    let s = scale.clamp(0.5, 2.0);
+    rect_gradient(
+        out,
+        rect_.x,
+        rect_.y,
+        rect_.width,
+        rect_.height,
+        HUD_INK_TOP,
+        HUD_INK_TOP,
+        HUD_INK_BOTTOM,
+        HUD_INK_BOTTOM,
+        w,
+        h,
+    );
+    rect(out, rect_.x, rect_.y, rect_.width, 1.0, with_alpha(accent, 0.22), w, h);
+    rect(out, rect_.x, rect_.y, 3.0 * s, rect_.height, with_alpha(accent, 0.95), w, h);
+}
+
+/// Label top-left and value top-right, in the shared HUD type sizes.
+#[allow(clippy::too_many_arguments)]
+fn hud_texts(
+    out: &mut Vec<UiVertex>,
+    rect_: HudRect,
+    scale: f32,
+    label: &str,
+    value: &str,
+    value_color: [f32; 4],
+    w: u32,
+    h: u32,
+) {
+    let s = scale.clamp(0.5, 2.0);
+    text(out, label, rect_.x + 10.0 * s, rect_.y + 5.5 * s, 1.15 * s, HUD_LABEL, w, h);
+    let value_scale = 1.6 * s;
+    let value_width = value.len() as f32 * 6.0 * value_scale;
+    text(
+        out,
+        value,
+        rect_.x + rect_.width - value_width - 8.0 * s,
+        rect_.y + 4.0 * s,
+        value_scale,
+        value_color,
         w,
         h,
     );
@@ -3112,10 +3454,7 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 #[allow(clippy::too_many_arguments)]
 fn hud_meter(
     out: &mut Vec<UiVertex>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect_: HudRect,
     scale: f32,
     label: &str,
     value: i32,
@@ -3124,50 +3463,52 @@ fn hud_meter(
     w: u32,
     h: u32,
 ) {
-    let scale = scale.clamp(0.5, 2.0);
-    rect(out, x, y, width, height, [0.01, 0.018, 0.028, 0.76], w, h);
+    let s = scale.clamp(0.5, 2.0);
+    hud_frame(out, rect_, scale, accent, w, h);
     let fraction = (value.max(0) as f32 / maximum.max(1) as f32).clamp(0.0, 1.0);
-    rect(
-        out,
-        x + 2.0 * scale,
-        y + height - 4.0 * scale,
-        (width - 4.0 * scale) * fraction,
-        2.0 * scale,
-        accent,
-        w,
-        h,
-    );
-    text(
-        out,
-        label,
-        x + 8.0 * scale,
-        y + 6.0 * scale,
-        1.35 * scale,
-        [0.72, 0.78, 0.84, 1.0],
-        w,
-        h,
-    );
-    let value_text = value.max(0).to_string();
-    let value_width = value_text.len() as f32 * 8.1 * scale;
-    text(
-        out,
-        &value_text,
-        x + width - value_width - 8.0 * scale,
-        y + 5.0 * scale,
-        1.55 * scale,
-        [0.96, 0.98, 1.0, 1.0],
-        w,
-        h,
-    );
+    let track_x = rect_.x + 10.0 * s;
+    let track_w = rect_.width - 18.0 * s;
+    let track_y = rect_.y + rect_.height - 6.0 * s;
+    let track_h = 3.0 * s;
+    rect(out, track_x, track_y, track_w, track_h, with_alpha(accent, 0.16), w, h);
+    let fill_w = track_w * fraction;
+    if fill_w > 0.5 {
+        let dim = with_alpha(accent, 0.55);
+        rect_gradient(out, track_x, track_y, fill_w, track_h, dim, accent, dim, accent, w, h);
+        // Bright leading edge.
+        let edge = (2.0 * s).min(fill_w);
+        rect(
+            out,
+            track_x + fill_w - edge,
+            track_y,
+            edge,
+            track_h,
+            lighten(accent, 0.55),
+            w,
+            h,
+        );
+    }
+    // Quarter ticks read as a scale without adding text.
+    for quarter in 1..4 {
+        rect(
+            out,
+            track_x + track_w * quarter as f32 / 4.0 - 0.5,
+            track_y,
+            1.0_f32.max(0.6 * s),
+            track_h,
+            [0.0, 0.0, 0.02, 0.6],
+            w,
+            h,
+        );
+    }
+    let value_color = if accent == HUD_HEALTH_LOW { [1.0, 0.62, 0.66, 1.0] } else { HUD_VALUE };
+    hud_texts(out, rect_, scale, label, &value.max(0).to_string(), value_color, w, h);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn hud_value_panel(
     out: &mut Vec<UiVertex>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect_: HudRect,
     scale: f32,
     label: &str,
     value: &str,
@@ -3175,39 +3516,43 @@ fn hud_value_panel(
     w: u32,
     h: u32,
 ) {
-    let scale = scale.clamp(0.5, 2.0);
-    rect(out, x, y, width, height, [0.01, 0.018, 0.028, 0.76], w, h);
+    let s = scale.clamp(0.5, 2.0);
+    hud_frame(out, rect_, scale, accent, w, h);
     rect(
         out,
-        x + 2.0 * scale,
-        y + height - 4.0 * scale,
-        width - 4.0 * scale,
-        2.0 * scale,
-        accent,
+        rect_.x + 10.0 * s,
+        rect_.y + rect_.height - 6.0 * s,
+        rect_.width - 18.0 * s,
+        3.0 * s,
+        with_alpha(accent, 0.34),
         w,
         h,
     );
-    text(
-        out,
-        label,
-        x + 8.0 * scale,
-        y + 6.0 * scale,
-        1.35 * scale,
-        [0.72, 0.78, 0.84, 1.0],
-        w,
-        h,
-    );
-    let value_width = value.len() as f32 * 8.1 * scale;
-    text(
-        out,
-        value,
-        x + width - value_width - 8.0 * scale,
-        y + 5.0 * scale,
-        1.55 * scale,
-        [0.96, 0.98, 1.0, 1.0],
-        w,
-        h,
-    );
+    hud_texts(out, rect_, scale, label, value, HUD_VALUE, w, h);
+}
+
+/// Saber form readout: style name plus three segments that light up with the
+/// form's intensity (fast, medium, strong; the special forms fill all three).
+fn hud_style_panel(out: &mut Vec<UiVertex>, rect_: HudRect, scale: f32, style: i32, w: u32, h: u32) {
+    let s = scale.clamp(0.5, 2.0);
+    let (name, accent, lit) = saber_style_display(style);
+    hud_frame(out, rect_, scale, accent, w, h);
+    let track_x = rect_.x + 10.0 * s;
+    let track_w = rect_.width - 18.0 * s;
+    let track_y = rect_.y + rect_.height - 6.0 * s;
+    let track_h = 3.0 * s;
+    let gap = 3.0 * s;
+    let segment_w = (track_w - 2.0 * gap) / 3.0;
+    for index in 0..3u32 {
+        let segment_x = track_x + index as f32 * (segment_w + gap);
+        if index < lit {
+            let dim = with_alpha(accent, 0.6);
+            rect_gradient(out, segment_x, track_y, segment_w, track_h, dim, accent, dim, accent, w, h);
+        } else {
+            rect(out, segment_x, track_y, segment_w, track_h, with_alpha(accent, 0.16), w, h);
+        }
+    }
+    hud_texts(out, rect_, scale, "STYLE", name, lighten(accent, 0.25), w, h);
 }
 
 const CHATBOX_Y: f32 = 425.0;
@@ -3710,6 +4055,16 @@ fn compact_thread_name(name: &'static str) -> &'static str {
         "WORKER 5" => "W5",
         "WORKER 6" => "W6",
         "WORKER 7" => "W7",
+        "EVENT 0" => "E0",
+        "EVENT 1" => "E1",
+        "EVENT 2" => "E2",
+        "EVENT 3" => "E3",
+        "EVENT 4" => "E4",
+        "EVENT 5" => "E5",
+        "EVENT 6" => "E6",
+        "EVENT 7" => "E7",
+        "ASSET 0" => "A0",
+        "ASSET 1" => "A1",
         _ => name,
     }
 }
@@ -3751,10 +4106,15 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let header_h = 38.0;
     let cpu_h = 78.0;
     let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
-    let client_h = 126.0;
+    let client_h = 161.0;
     let input_h = 108.0;
     let thread_header_h = 28.0;
     let thread_row_h = 32.0;
+    let thread_two_columns = ui.threads.len() > 11;
+    // The original profiler has 11 core/map slots. Keep those together in
+    // the left column and put the event-pool and asset-loader slots in the right column.
+    // This preserves the old panel height instead of adding eight more rows.
+    let thread_rows = if thread_two_columns { 11 } else { ui.threads.len() };
     let footer_h = if debug_culling { 42.0 } else { 0.0 };
     let panel_h = 12.0
         + header_h
@@ -3763,7 +4123,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         + client_h
         + input_h
         + thread_header_h
-        + ui.threads.len() as f32 * thread_row_h
+        + thread_rows as f32 * thread_row_h
         + footer_h
         + 18.0;
     rect(out, x, y, panel_w, panel_h, [0.0, 0.0, 0.0, 0.76], w, h);
@@ -4032,6 +4392,26 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     text(
         out,
         &format!(
+            "EVENT PREP {:.3} MS / {} JOBS / {} POOL THREADS / {}   AUDIO DECODE {:.3} MS / {} JOBS / {}",
+            p.client_event_prepare_ms,
+            p.client_event_worker_jobs,
+            p.client_event_worker_threads,
+            if p.client_event_worker_parallel { "WORKERS" } else { "INLINE" },
+            p.client_event_sound_decode_ms,
+            p.client_event_sound_decode_jobs,
+            if p.client_event_sound_decode_parallel { "WORKERS" } else { "INLINE" },
+        ),
+        x + 12.0,
+        next_y + 91.0,
+        0.92,
+        muted_color,
+        w,
+        h,
+    );
+
+    text(
+        out,
+        &format!(
             "G2 {} POSES (MOTION {} / {:.3} MS) / {} BOLTS ({:.3} MS) / {} SURF / {} VERTS   CULL {}/{} LOD [{}/{}/{}/{}]   FX {:.3} + TESS {:.3} MS   DYN REPACK {:.3} MS / {} SURF / {} VERTS / {} INDICES",
             p.ghoul2_pose_evals,
             p.ghoul2_motion_pose_evals,
@@ -4054,8 +4434,35 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
             p.dynamic_model_indices,
         ),
         x + 12.0,
-        next_y + 94.0,
+        next_y + 111.0,
         0.92,
+        muted_color,
+        w,
+        h,
+    );
+
+    text(
+        out,
+        &format!(
+            "FX DRAWS {} [SPR {} ORIENT {} LINE {} QUAD {} MESH {} CYL {}]   OUT {} SURF / CPU {} SURF {} V {} I / GPU {} BATCH {} INST / GPU FX {} MS",
+            p.client_fx_draws,
+            p.client_fx_sprites,
+            p.client_fx_oriented_quads,
+            p.client_fx_lines,
+            p.client_fx_quads,
+            p.client_fx_meshes,
+            p.client_fx_cylinders,
+            p.client_fx_render_surfaces,
+            p.client_fx_cpu_geom_surfaces,
+            p.client_fx_cpu_vertices,
+            p.client_fx_cpu_indices,
+            p.client_fx_gpu_sprite_batches,
+            p.client_fx_gpu_sprite_instances,
+            p.gpu_fx_sprites_ms.map_or_else(|| "--".to_owned(), |ms| format!("{ms:.3}")),
+        ),
+        x + 12.0,
+        next_y + 128.0,
+        0.86,
         muted_color,
         w,
         h,
@@ -4213,9 +4620,20 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         w,
         h,
     );
-    let thread_bar_x = x + 100.0;
-    let thread_bar_w = 320.0;
-    for (row, thread) in ui.threads.into_iter().enumerate() {
+    let thread_column_w = (panel_w - 24.0) * 0.5;
+    for (index, thread) in ui.threads.into_iter().enumerate() {
+        let (column, row) = if thread_two_columns && index >= 11 {
+            (1, index - 11)
+        } else {
+            (0, index)
+        };
+        let column_x = x + 12.0 + column as f32 * thread_column_w;
+        let thread_bar_x = if thread_two_columns {
+            column_x + 72.0
+        } else {
+            x + 100.0
+        };
+        let thread_bar_w = if thread_two_columns { 150.0 } else { 320.0 };
         let ty = next_y + thread_header_h + row as f32 * thread_row_h;
         let name = compact_thread_name(thread.name);
         let (bar_color, task_color) = if thread.active {
@@ -4226,7 +4644,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
             ([0.40, 0.68, 0.92, 1.0], [0.70, 0.84, 0.98, 1.0])
         };
 
-        text(out, name, x + 12.0, ty + 3.0, 1.18, body_color, w, h);
+        text(out, name, column_x, ty + 3.0, 1.18, body_color, w, h);
         rect(
             out,
             thread_bar_x,
@@ -4255,7 +4673,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         text(
             out,
             &format!("{:>5.1}%", thread.busy_percent),
-            thread_bar_x + thread_bar_w + 14.0,
+            thread_bar_x + thread_bar_w + 8.0,
             ty + 3.0,
             1.12,
             body_color,
@@ -4265,7 +4683,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         text(
             out,
             thread.task,
-            thread_bar_x + thread_bar_w + 100.0,
+            thread_bar_x + thread_bar_w + 64.0,
             ty + 3.0,
             1.04,
             task_color,
@@ -4275,7 +4693,7 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     }
 
     if debug_culling {
-        let cy = next_y + thread_header_h + ui.threads.len() as f32 * thread_row_h + 4.0;
+        let cy = next_y + thread_header_h + thread_rows as f32 * thread_row_h + 4.0;
         rect(
             out,
             x + 10.0,
@@ -4325,12 +4743,14 @@ fn console_panel_height(h: u32, size: ConsoleSize) -> f32 {
 
 const CONSOLE_CHAR_WIDTH: f32 = 8.0;
 const CONSOLE_CHAR_HEIGHT: f32 = 16.0;
+/// Top of the first log row, just under the header band.
+const CONSOLE_FIRST_Y: f32 = 52.0;
 
 pub fn console_visible_line_capacity(h: u32, size: ConsoleSize) -> usize {
     let ph = console_panel_height(h, size);
     let input_y = ph - 34.0;
     let line_step = CONSOLE_CHAR_HEIGHT;
-    let first_y = 76.0;
+    let first_y = CONSOLE_FIRST_Y;
     (((input_y - first_y - 8.0) / line_step).floor().max(0.0)) as usize
 }
 
@@ -4344,7 +4764,7 @@ pub fn console_text_hit(
     let ph = console_panel_height(h, size);
     let input_y = ph - 34.0;
     let line_step = CONSOLE_CHAR_HEIGHT as f64;
-    let first_y = 76.0_f64;
+    let first_y = CONSOLE_FIRST_Y as f64;
     let max_lines = console_visible_line_capacity(h, size);
     if x < 20.0 || x > w as f64 - 8.0 || y < first_y || y >= input_y as f64 - 8.0 {
         return None;
@@ -4383,107 +4803,407 @@ fn tail_chars(value: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
+// Console palette: rain-slick Tokyo night. Indigo asphalt for the body, cyan and
+// magenta neon for structure, tungsten amber for anything the user is driving.
+const CON_CYAN: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
+const CON_MAGENTA: [f32; 4] = [1.0, 0.30, 0.56, 1.0];
+const CON_AMBER: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
+const CON_TEXT: [f32; 4] = [0.80, 0.86, 0.93, 1.0];
+const CON_BRIGHT: [f32; 4] = [0.95, 0.97, 1.0, 1.0];
+const CON_DIM: [f32; 4] = [0.50, 0.60, 0.73, 1.0];
+const CON_FAINT: [f32; 4] = [0.32, 0.40, 0.52, 1.0];
+
+const SUGGEST_ROW_H: f32 = 20.0;
+const SUGGEST_MAX_ROWS: usize = 8;
+const SUGGEST_PAD: f32 = 6.0;
+const SUGGEST_DETAIL_H: f32 = 68.0;
+const SUGGEST_FOOTER_H: f32 = 22.0;
+
+fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], alpha]
+}
+
+/// Rectangle with a distinct color at each corner (the UI pipeline
+/// interpolates vertex colors, so this is a free gradient).
+#[allow(clippy::too_many_arguments)]
+fn rect_gradient(
+    out: &mut Vec<UiVertex>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    top_left: [f32; 4],
+    top_right: [f32; 4],
+    bottom_left: [f32; 4],
+    bottom_right: [f32; 4],
+    width: u32,
+    height: u32,
+) {
+    let x0 = x / width.max(1) as f32 * 2.0 - 1.0;
+    let x1 = (x + w) / width.max(1) as f32 * 2.0 - 1.0;
+    let y0 = 1.0 - y / height.max(1) as f32 * 2.0;
+    let y1 = 1.0 - (y + h) / height.max(1) as f32 * 2.0;
+    let v = |position, color| UiVertex {
+        position,
+        uv: [0.0, 0.0],
+        color,
+        textured: 0.0,
+    };
+    out.extend_from_slice(&[
+        v([x0, y0], top_left),
+        v([x0, y1], bottom_left),
+        v([x1, y1], bottom_right),
+        v([x0, y0], top_left),
+        v([x1, y1], bottom_right),
+        v([x1, y0], top_right),
+    ]);
+}
+
+/// Like `console_text` but without `^N` color escapes, for values and
+/// descriptions that must print literally.
+#[allow(clippy::too_many_arguments)]
+fn console_plain(
+    out: &mut Vec<UiVertex>,
+    value: &str,
+    x: f32,
+    y: f32,
+    color: [f32; 4],
+    width: u32,
+    height: u32,
+) {
+    let mut cursor_x = x;
+    for byte in value.bytes() {
+        if byte != b' ' {
+            glyph_quad_sized(
+                out,
+                byte,
+                cursor_x,
+                y,
+                CONSOLE_CHAR_WIDTH,
+                CONSOLE_CHAR_HEIGHT,
+                color,
+                width,
+                height,
+            );
+        }
+        cursor_x += CONSOLE_CHAR_WIDTH;
+    }
+}
+
+/// Truncate to `max_chars`, ending in `..` when cut.
+fn ellipsize(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let keep = max_chars.saturating_sub(2);
+    let mut cut: String = value.chars().take(keep).collect();
+    cut.push_str("..");
+    cut
+}
+
+/// Greedy word wrap into at most `max_lines` lines; the last line is
+/// ellipsized when the text does not fit.
+fn wrap_plain(value: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
+    let max_chars = max_chars.max(8);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut words = value.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        let extra = usize::from(!current.is_empty());
+        if !current.is_empty() && current.chars().count() + extra + word.chars().count() > max_chars {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() == max_lines {
+                let last = lines.last_mut().expect("just pushed");
+                *last = ellipsize(&format!("{last} {word}"), max_chars);
+                return lines;
+            }
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        if words.peek().is_none() {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    lines.truncate(max_lines);
+    lines
+}
+
+/// Colored keycap + dim label pairs, clipped at `max_x`.
+#[allow(clippy::too_many_arguments)]
+fn console_keycaps(
+    out: &mut Vec<UiVertex>,
+    x: f32,
+    y: f32,
+    max_x: f32,
+    items: &[(&str, &str)],
+    w: u32,
+    h: u32,
+) {
+    let mut cursor = x;
+    for (key, label) in items {
+        let need = (key.len() + label.len() + 1) as f32 * CONSOLE_CHAR_WIDTH;
+        if cursor + need > max_x {
+            break;
+        }
+        console_plain(out, key, cursor, y, CON_AMBER, w, h);
+        cursor += (key.len() + 1) as f32 * CONSOLE_CHAR_WIDTH;
+        console_plain(out, label, cursor, y, CON_DIM, w, h);
+        cursor += (label.len() + 3) as f32 * CONSOLE_CHAR_WIDTH;
+    }
+}
+
+/// Tone for the gutter marker of echoed input (amber) and error lines (magenta).
+fn console_line_tone(line: &str) -> Option<[f32; 4]> {
+    let mut rest = line;
+    // Optional `^8[hh:mm:ss]^7 ` timestamp prefix from `con_timestamps`.
+    if let Some(after) = rest.strip_prefix("^8[") {
+        if let Some(index) = after.find("]^7 ") {
+            rest = &after[index + 4..];
+        }
+    }
+    if rest.starts_with("^7] ") || rest.starts_with("] ") {
+        Some(CON_AMBER)
+    } else if rest.starts_with("^1") {
+        Some(CON_MAGENTA)
+    } else {
+        None
+    }
+}
+
+/// Clickable `SUGGEST ON/OFF` chip in the console header: `(x, y, w, h)`.
+pub fn console_suggest_chip_rect(w: u32) -> (f32, f32, f32, f32) {
+    let chip_w = 12.0 * CONSOLE_CHAR_WIDTH + 30.0;
+    (w as f32 - 20.0 - 24.0 - 8.0 - chip_w, 8.0, chip_w, 24.0)
+}
+
+pub fn console_suggest_chip_hit(w: u32, x: f64, y: f64) -> bool {
+    let (cx, cy, cw, ch) = console_suggest_chip_rect(w);
+    x >= cx as f64 && x < (cx + cw) as f64 && y >= cy as f64 && y < (cy + ch) as f64
+}
+
+/// The `?` button in the header's top-right corner: `(x, y, w, h)`.
+pub fn console_help_rect(w: u32) -> (f32, f32, f32, f32) {
+    (w as f32 - 20.0 - 24.0, 8.0, 24.0, 24.0)
+}
+
+pub fn console_help_hit(w: u32, x: f64, y: f64) -> bool {
+    let (bx, by, bw, bh) = console_help_rect(w);
+    x >= bx as f64 && x < (bx + bw) as f64 && y >= by as f64 && y < (by + bh) as f64
+}
+
+/// Where the suggestion popup sits. Shared by drawing and mouse hit-testing.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsoleSuggestGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Index of the first visible suggestion (the list scrolls to keep the selection in view).
+    pub first: usize,
+    pub visible: usize,
+}
+
+pub fn console_suggest_geometry(
+    w: u32,
+    h: u32,
+    size: ConsoleSize,
+    count: usize,
+    selected: usize,
+) -> ConsoleSuggestGeometry {
+    let visible = count.clamp(1, SUGGEST_MAX_ROWS);
+    let total_h = SUGGEST_PAD + visible as f32 * SUGGEST_ROW_H + SUGGEST_DETAIL_H + SUGGEST_FOOTER_H;
+    let ph = console_panel_height(h, size);
+    let input_y = ph - 34.0;
+    // Hang below the panel like a drop-down when there is room, otherwise
+    // (full-height console) float just above the input line.
+    let below = h as f32 - ph >= total_h + 12.0;
+    let y = if below { ph + 8.0 } else { (input_y - 10.0 - total_h).max(4.0) };
+    let first = if count <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible / 2).min(count - visible)
+    };
+    ConsoleSuggestGeometry {
+        x: 12.0,
+        y,
+        w: (w as f32 - 24.0).clamp(240.0, 820.0),
+        h: total_h,
+        first,
+        visible,
+    }
+}
+
+/// Suggestion row under the pointer, as an index into the full suggestion list.
+pub fn console_suggest_hit(
+    w: u32,
+    h: u32,
+    size: ConsoleSize,
+    count: usize,
+    selected: usize,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let g = console_suggest_geometry(w, h, size, count, selected);
+    let rows_y = (g.y + SUGGEST_PAD) as f64;
+    if x < g.x as f64 || x >= (g.x + g.w) as f64 || y < rows_y {
+        return None;
+    }
+    let row = ((y - rows_y) / SUGGEST_ROW_H as f64).floor() as usize;
+    (row < g.visible).then_some(g.first + row)
+}
+
 fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let ph = console_panel_height(h, ui.console_size);
-    rect(out, 0.0, 0.0, w as f32, ph, [0.015, 0.02, 0.03, 0.94], w, h);
-    rect(
+    let wf = w as f32;
+    let input_y = ph - 34.0;
+    let line_step = CONSOLE_CHAR_HEIGHT;
+    let first_y = CONSOLE_FIRST_Y;
+
+    // Body: indigo asphalt, a touch lighter toward the input so the eye lands there.
+    rect_gradient(
         out,
         0.0,
-        ph - 2.0,
-        w as f32,
-        2.0,
-        [0.38, 0.48, 0.62, 0.9],
+        0.0,
+        wf,
+        ph,
+        [0.012, 0.016, 0.036, 0.975],
+        [0.012, 0.016, 0.036, 0.975],
+        [0.024, 0.030, 0.066, 0.965],
+        [0.024, 0.030, 0.066, 0.965],
         w,
         h,
     );
-    text(
+    // Header band and hairline.
+    rect(out, 0.0, 0.0, wf, 40.0, [0.0, 0.0, 0.02, 0.30], w, h);
+    rect(out, 0.0, 40.0, wf, 1.0, with_alpha(CON_CYAN, 0.14), w, h);
+
+    // Neon edge along the bottom of the panel, with a soft glow bleeding onto the world below.
+    let edge_l = with_alpha(CON_CYAN, 0.95);
+    let edge_r = with_alpha(CON_MAGENTA, 0.95);
+    rect_gradient(out, 0.0, ph - 2.0, wf, 2.0, edge_l, edge_r, edge_l, edge_r, w, h);
+    for (dy, height, alpha) in [(0.0, 3.0, 0.17), (3.0, 4.0, 0.07), (7.0, 6.0, 0.025)] {
+        let l = with_alpha(CON_CYAN, alpha);
+        let r = with_alpha(CON_MAGENTA, alpha);
+        rect_gradient(out, 0.0, ph + dy, wf, height, l, r, l, r, w, h);
+    }
+
+    // Title.
+    rect(out, 20.0, 9.0, 3.0, 22.0, CON_MAGENTA, w, h);
+    text(out, "CONSOLE", 32.0, 12.0, 2.0, CON_BRIGHT, w, h);
+    if !ui.console_status.is_empty() && !ui.console_search_open {
+        console_text(out, &ui.console_status, 32.0 + 7.0 * 12.0 + 16.0, 16.0, CON_DIM, w, h);
+    }
+
+    // Header right: line count and the suggestion switch.
+    let (chip_x, chip_y, chip_w, chip_h) = console_suggest_chip_rect(w);
+    rect(out, chip_x, chip_y, chip_w, chip_h, [0.04, 0.07, 0.13, 0.92], w, h);
+    let chip_edge = if ui.console_suggest_enabled { with_alpha(CON_CYAN, 0.45) } else { with_alpha(CON_FAINT, 0.7) };
+    rect_outline(out, chip_x, chip_y, chip_w, chip_h, 1.0, chip_edge, w, h);
+    disc(
         out,
-        "JKA CLIENT CONSOLE",
-        20.0,
-        18.0,
-        3.0,
-        [0.82, 0.90, 1.0, 1.0],
+        chip_x + 13.0,
+        chip_y + chip_h * 0.5,
+        3.5,
+        12,
+        if ui.console_suggest_enabled { CON_CYAN } else { CON_FAINT },
         w,
         h,
     );
+    console_plain(
+        out,
+        if ui.console_suggest_enabled { "SUGGEST ON" } else { "SUGGEST OFF" },
+        chip_x + 24.0,
+        chip_y + 4.0,
+        if ui.console_suggest_enabled { CON_BRIGHT } else { CON_DIM },
+        w,
+        h,
+    );
+    let count_label = format!("{} LINES", ui.console_total_lines);
+    let count_x = chip_x - 14.0 - count_label.len() as f32 * CONSOLE_CHAR_WIDTH;
+    if !ui.console_search_open && count_x > 32.0 + 7.0 * 12.0 + 140.0 {
+        console_plain(out, &count_label, count_x, chip_y + 4.0, CON_FAINT, w, h);
+    }
+
+    // Help button; the shortcut card appears while it is hovered.
+    let (help_x, help_y, help_w, help_h) = console_help_rect(w);
+    rect(
+        out,
+        help_x,
+        help_y,
+        help_w,
+        help_h,
+        if ui.console_help_hover { [0.10, 0.16, 0.26, 0.98] } else { [0.04, 0.07, 0.13, 0.92] },
+        w,
+        h,
+    );
+    rect_outline(
+        out,
+        help_x,
+        help_y,
+        help_w,
+        help_h,
+        1.0,
+        if ui.console_help_hover { with_alpha(CON_AMBER, 0.9) } else { with_alpha(CON_CYAN, 0.45) },
+        w,
+        h,
+    );
+    console_plain(
+        out,
+        "?",
+        help_x + (help_w - CONSOLE_CHAR_WIDTH) * 0.5,
+        help_y + 4.0,
+        if ui.console_help_hover { CON_AMBER } else { CON_DIM },
+        w,
+        h,
+    );
+
+    // The find field lives in the header, in place of the status text.
     if ui.console_search_open {
-        let field_x = 20.0;
-        let field_y = 44.0;
-        let field_w = (w as f32 * 0.48).clamp(300.0, 640.0);
-        rect(
-            out,
-            field_x,
-            field_y,
-            field_w,
-            28.0,
-            [0.025, 0.035, 0.052, 0.98],
-            w,
-            h,
-        );
-        rect(
-            out,
-            field_x,
-            field_y + 26.0,
-            field_w,
-            2.0,
-            [0.90, 0.66, 0.18, 0.95],
-            w,
-            h,
-        );
+        let field_x = 32.0 + 7.0 * 12.0 + 16.0;
+        let field_y = 6.0;
+        let room = (chip_x - 14.0 - field_x).max(160.0);
+        let field_w = (room * 0.62).clamp(160.0, 440.0);
+        rect(out, field_x, field_y, field_w, 28.0, [0.03, 0.05, 0.10, 0.98], w, h);
+        rect(out, field_x, field_y + 26.0, field_w, 2.0, CON_AMBER, w, h);
         let max_query_chars = ((field_w - 72.0) / CONSOLE_CHAR_WIDTH) as usize;
         let query = tail_chars(&ui.console_search_query, max_query_chars.max(1));
-        console_text(
-            out,
-            &format!("FIND: {query}_"),
-            field_x + 8.0,
-            field_y + 6.0,
-            [1.0, 1.0, 1.0, 1.0],
-            w,
-            h,
-        );
+        console_plain(out, "FIND", field_x + 8.0, field_y + 6.0, CON_AMBER, w, h);
+        console_plain(out, &query, field_x + 8.0 + 5.0 * CONSOLE_CHAR_WIDTH, field_y + 6.0, CON_BRIGHT, w, h);
+        let caret_x = field_x + 8.0 + (5 + query.chars().count()) as f32 * CONSOLE_CHAR_WIDTH;
+        rect(out, caret_x, field_y + 5.0, 2.0, 18.0, CON_AMBER, w, h);
 
         let counter = if ui.console_search_query.is_empty() {
             "TYPE TO SEARCH".to_owned()
         } else if ui.console_search_total == 0 {
             "NO MATCHES".to_owned()
-        } else if w < 1100 {
-            format!(
-                "{} / {}   ENTER NEXT   ESC CLOSE",
-                ui.console_search_index.unwrap_or(0) + 1,
-                ui.console_search_total
-            )
         } else {
             format!(
-                "{} / {}   ENTER NEXT   SHIFT+ENTER PREV   ESC CLOSE",
+                "{} / {}",
                 ui.console_search_index.unwrap_or(0) + 1,
                 ui.console_search_total
             )
         };
-        let counter_w = counter.chars().count() as f32 * CONSOLE_CHAR_WIDTH;
-        console_text(
+        console_plain(
             out,
             &counter,
-            (w as f32 - 20.0 - counter_w).max(field_x + field_w + 12.0),
+            field_x + field_w + 12.0,
             field_y + 6.0,
-            [0.86, 0.76, 0.55, 1.0],
-            w,
-            h,
-        );
-    } else {
-        text(
-            out,
-            "LEFT/RIGHT EDIT   CTRL+LEFT/RIGHT WORD   HOME/END   TAB COMPLETE   UP/DOWN HISTORY   CTRL+F FIND",
-            20.0,
-            52.0,
-            2.0,
-            [0.58, 0.70, 0.82, 1.0],
+            if ui.console_search_total == 0 && !ui.console_search_query.is_empty() {
+                CON_MAGENTA
+            } else {
+                CON_AMBER
+            },
             w,
             h,
         );
     }
-    let input_y = ph - 34.0;
-    let line_step = CONSOLE_CHAR_HEIGHT;
-    let first_y = 76.0;
+
+    // Log.
     let max_lines = (((input_y - first_y - 8.0) / line_step).floor().max(0.0)) as usize;
     let history_end = ui.console_lines.len().saturating_sub(ui.console_scroll);
     let history_start = history_end.saturating_sub(max_lines);
@@ -4493,6 +5213,10 @@ fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         .enumerate()
     {
         let absolute_line = history_start + line_index;
+        if let Some(tone) = console_line_tone(line) {
+            rect(out, 0.0, line_y - 2.0, wf, line_step, with_alpha(tone, 0.055), w, h);
+            rect(out, 10.0, line_y - 2.0, 2.0, line_step, with_alpha(tone, 0.85), w, h);
+        }
         if ui.console_search_open {
             for hit in ui
                 .console_search_matches
@@ -4557,49 +5281,300 @@ fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
                         line_y - 2.0,
                         (right_col - left_col) as f32 * char_width,
                         line_step,
-                        [0.20, 0.42, 0.66, 0.62],
+                        [0.08, 0.46, 0.62, 0.55],
                         w,
                         h,
                     );
                 }
             }
         }
-        console_text(out, line, 20.0, line_y, [0.82, 0.84, 0.88, 1.0], w, h);
+        console_text(out, line, 20.0, line_y, CON_TEXT, w, h);
         line_y += line_step;
     }
     if ui.console_lines.is_empty() && !ui.console_status.is_empty() {
-        console_text(
+        console_plain(out, "NO OUTPUT YET", 20.0, first_y, CON_FAINT, w, h);
+    }
+
+    // Scroll position: a thin rail on the right plus a "newer output below" pill.
+    let rail_top = first_y - 2.0;
+    let rail_h = (input_y - 8.0 - rail_top).max(1.0);
+    if max_lines > 0 && ui.console_total_lines > max_lines {
+        let total = ui.console_total_lines as f32;
+        let thumb_h = (rail_h * max_lines as f32 / total).clamp(18.0, rail_h);
+        let travel = rail_h - thumb_h;
+        let max_scroll = (ui.console_total_lines - max_lines) as f32;
+        let from_top = 1.0 - (ui.console_scrolled as f32 / max_scroll).clamp(0.0, 1.0);
+        rect(out, wf - 8.0, rail_top, 2.0, rail_h, with_alpha(CON_CYAN, 0.07), w, h);
+        rect(
             out,
-            &ui.console_status,
-            20.0,
-            first_y,
-            [0.78, 0.82, 0.72, 1.0],
+            wf - 9.0,
+            rail_top + travel * from_top,
+            4.0,
+            thumb_h,
+            with_alpha(if ui.console_scrolled > 0 { CON_MAGENTA } else { CON_CYAN }, 0.55),
             w,
             h,
         );
     }
+    if ui.console_scrolled > 0 {
+        let label = format!("{} NEWER LINES BELOW  PGDN", ui.console_scrolled);
+        let pill_w = label.len() as f32 * CONSOLE_CHAR_WIDTH + 20.0;
+        let pill_x = wf - 24.0 - pill_w;
+        let pill_y = input_y - 34.0;
+        rect(out, pill_x, pill_y, pill_w, 22.0, [0.10, 0.03, 0.08, 0.92], w, h);
+        rect_outline(out, pill_x, pill_y, pill_w, 22.0, 1.0, with_alpha(CON_MAGENTA, 0.7), w, h);
+        console_plain(out, &label, pill_x + 10.0, pill_y + 3.0, CON_MAGENTA, w, h);
+    }
+
+    // Input bar.
+    let bar_y = input_y - 8.0;
+    rect(out, 0.0, bar_y, wf, (ph - 2.0) - bar_y, [0.045, 0.065, 0.125, 0.94], w, h);
+    rect(out, 0.0, bar_y, wf, 1.0, with_alpha(CON_CYAN, 0.18), w, h);
+    console_plain(out, ">", 20.0, input_y, CON_AMBER, w, h);
+    let text_x = 38.0;
     let cursor = ui.console_cursor.min(ui.console_input.len());
     let cursor = if ui.console_input.is_char_boundary(cursor) { cursor } else { ui.console_input.len() };
-    let before = &ui.console_input[..cursor];
-    let after = &ui.console_input[cursor..];
-    console_text(
-        out,
-        &format!("] {before}_{after}"),
-        20.0,
-        input_y,
-        [1.0; 4],
-        w,
-        h,
-    );
+    if ui.console_input.is_empty() {
+        console_plain(
+            out,
+            "type a command or cvar",
+            text_x + 6.0,
+            input_y,
+            CON_FAINT,
+            w,
+            h,
+        );
+    } else {
+        console_text(out, &ui.console_input, text_x, input_y, CON_BRIGHT, w, h);
+        // Ghost completion: the rest of the highlighted suggestion, dimmed.
+        if !ui.console_suggest_hint && cursor == ui.console_input.len() {
+            let typed = ui.console_input.trim_start();
+            if let Some(best) = ui.console_suggestions.get(ui.console_suggest_selected) {
+                let name = best.name;
+                if !typed.contains(char::is_whitespace)
+                    && name.len() > typed.len()
+                    && name.as_bytes()[..typed.len()].eq_ignore_ascii_case(typed.as_bytes())
+                {
+                    let end_x = text_x + visible_text_len(&ui.console_input) as f32 * CONSOLE_CHAR_WIDTH;
+                    console_plain(out, &name[typed.len()..], end_x, input_y, with_alpha(CON_CYAN, 0.42), w, h);
+                }
+            }
+        }
+    }
+    let caret_x = text_x + visible_text_len(&ui.console_input[..cursor]) as f32 * CONSOLE_CHAR_WIDTH;
+    rect(out, caret_x, input_y - 1.0, 2.0, CONSOLE_CHAR_HEIGHT + 2.0, CON_AMBER, w, h);
+
+    if !ui.console_suggestions.is_empty() && !ui.console_search_open {
+        build_console_suggestions(out, ui, w, h);
+    }
+    if ui.console_help_hover {
+        build_console_help(out, w, h);
+    }
 }
 
+/// Shortcut card shown while the header `?` is hovered.
+fn build_console_help(out: &mut Vec<UiVertex>, w: u32, h: u32) {
+    // Empty key = section heading.
+    const ROWS: &[(&str, &str)] = &[
+        ("", "TYPING"),
+        ("TAB", "complete, or extend shared prefix"),
+        ("UP / DOWN", "pick suggestion (history if none)"),
+        ("ENTER", "run; fills a picked suggestion"),
+        ("ESC", "hide list, then close console"),
+        ("CLICK", "pick a suggestion"),
+        ("", "EDITING"),
+        ("LEFT / RIGHT", "move caret (CTRL = by word)"),
+        ("HOME / END", "start / end of line"),
+        ("CTRL+V", "paste"),
+        ("", "LOG"),
+        ("CTRL+F", "find (ENTER next, SHIFT+ENTER prev)"),
+        ("PGUP / PGDN", "scroll"),
+        ("DRAG", "select; 2x click word, 3x line"),
+        ("CTRL+A / C", "select all / copy selection"),
+        ("", "CONSOLE"),
+        ("~", "open / close"),
+        ("SHIFT+~", "half height"),
+        ("CTRL+~", "full height"),
+    ];
+    const ROW_H: f32 = 18.0;
+    let key_col = 14.0 * CONSOLE_CHAR_WIDTH;
+    let card_w = (key_col + 36.0 * CONSOLE_CHAR_WIDTH + 28.0).min(w as f32 - 24.0);
+    let card_h = ROWS.len() as f32 * ROW_H + 20.0;
+    let x = w as f32 - 20.0 - card_w;
+    let y = 44.0;
+    rect(out, x + 3.0, y + 5.0, card_w, card_h, [0.0, 0.0, 0.0, 0.40], w, h);
+    rect(out, x, y, card_w, card_h, [0.020, 0.028, 0.056, 0.99], w, h);
+    let edge_l = with_alpha(CON_CYAN, 0.6);
+    let edge_r = with_alpha(CON_MAGENTA, 0.6);
+    rect_gradient(out, x, y, card_w, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
+    rect_gradient(out, x, y + card_h - 1.0, card_w, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
+    rect(out, x, y, 1.0, card_h, edge_l, w, h);
+    rect(out, x + card_w - 1.0, y, 1.0, card_h, edge_r, w, h);
+    let label_chars = ((card_w - 28.0 - key_col) / CONSOLE_CHAR_WIDTH) as usize;
+    for (i, (key, label)) in ROWS.iter().enumerate() {
+        let ry = y + 10.0 + i as f32 * ROW_H;
+        if key.is_empty() {
+            console_plain(out, label, x + 14.0, ry, CON_CYAN, w, h);
+            let rule_x = x + 14.0 + (label.len() as f32 + 1.0) * CONSOLE_CHAR_WIDTH;
+            rect(out, rule_x, ry + 8.0, x + card_w - 14.0 - rule_x, 1.0, with_alpha(CON_CYAN, 0.16), w, h);
+        } else {
+            console_plain(out, key, x + 14.0, ry, CON_AMBER, w, h);
+            console_plain(out, &ellipsize(label, label_chars), x + 14.0 + key_col, ry, CON_TEXT, w, h);
+        }
+    }
+}
 
+fn build_console_suggestions(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let count = ui.console_suggestions.len();
+    let selected = ui.console_suggest_selected.min(count - 1);
+    let hint = ui.console_suggest_hint;
+    let g = console_suggest_geometry(w, h, ui.console_size, count, selected);
+    let (x, y, pw) = (g.x, g.y, g.w);
+    let inner_chars = ((pw - 28.0) / CONSOLE_CHAR_WIDTH) as usize;
 
+    // Lift off the console/world, then the card itself.
+    rect(out, x + 3.0, y + 5.0, pw, g.h, [0.0, 0.0, 0.0, 0.38], w, h);
+    rect(out, x, y, pw, g.h, [0.020, 0.028, 0.056, 0.985], w, h);
+    let edge_l = with_alpha(CON_CYAN, 0.55);
+    let edge_r = with_alpha(CON_MAGENTA, 0.55);
+    rect_gradient(out, x, y, pw, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
+    rect_gradient(out, x, y + g.h - 1.0, pw, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
+    rect(out, x, y, 1.0, g.h, with_alpha(CON_CYAN, 0.55), w, h);
+    rect(out, x + pw - 1.0, y, 1.0, g.h, with_alpha(CON_MAGENTA, 0.55), w, h);
 
+    let rows_y = y + SUGGEST_PAD;
+    for row in 0..g.visible {
+        let index = g.first + row;
+        let Some(item) = ui.console_suggestions.get(index) else { break };
+        let ry = rows_y + row as f32 * SUGGEST_ROW_H;
+        let is_selected = !hint && index == selected;
+        if is_selected {
+            rect_gradient(
+                out,
+                x + 1.0,
+                ry,
+                pw - 2.0,
+                SUGGEST_ROW_H,
+                [0.06, 0.26, 0.36, 0.85],
+                [0.06, 0.16, 0.30, 0.55],
+                [0.06, 0.26, 0.36, 0.85],
+                [0.06, 0.16, 0.30, 0.55],
+                w,
+                h,
+            );
+            rect(out, x + 1.0, ry, 3.0, SUGGEST_ROW_H, CON_CYAN, w, h);
+        }
+        let text_y = ry + (SUGGEST_ROW_H - CONSOLE_CHAR_HEIGHT) * 0.5;
+        let (badge, badge_color) = match item.kind {
+            ConsoleSuggestKind::Cvar => ("VAR", CON_CYAN),
+            ConsoleSuggestKind::Command => ("CMD", CON_AMBER),
+            ConsoleSuggestKind::Server => ("SRV", CON_MAGENTA),
+        };
+        console_plain(out, badge, x + 14.0, text_y, with_alpha(badge_color, if is_selected { 1.0 } else { 0.72 }), w, h);
 
+        // Name, with the characters the query matched picked out in amber.
+        let name_x = x + 14.0 + 4.0 * CONSOLE_CHAR_WIDTH;
+        let value_room = if item.kind == ConsoleSuggestKind::Cvar { 22 } else { 0 };
+        let name_room = inner_chars.saturating_sub(4 + value_room + 1).max(8);
+        for (i, byte) in item.name.bytes().take(name_room).enumerate() {
+            let matched = i < 64 && item.mask >> i & 1 == 1;
+            let color = if matched {
+                CON_AMBER
+            } else if is_selected {
+                CON_BRIGHT
+            } else {
+                CON_TEXT
+            };
+            glyph_quad_sized(
+                out,
+                byte,
+                name_x + i as f32 * CONSOLE_CHAR_WIDTH,
+                text_y,
+                CONSOLE_CHAR_WIDTH,
+                CONSOLE_CHAR_HEIGHT,
+                color,
+                w,
+                h,
+            );
+            if matched {
+                rect(
+                    out,
+                    name_x + i as f32 * CONSOLE_CHAR_WIDTH,
+                    text_y + CONSOLE_CHAR_HEIGHT - 1.0,
+                    CONSOLE_CHAR_WIDTH,
+                    1.0,
+                    with_alpha(CON_AMBER, 0.6),
+                    w,
+                    h,
+                );
+            }
+        }
 
+        if item.kind == ConsoleSuggestKind::Cvar && !item.value.is_empty() {
+            let value = ellipsize(&item.value, value_room);
+            let vx = x + pw - 14.0 - value.chars().count() as f32 * CONSOLE_CHAR_WIDTH;
+            let color = if item.modified { CON_AMBER } else { with_alpha(CON_CYAN, 0.62) };
+            console_plain(out, &value, vx, text_y, color, w, h);
+        }
+    }
 
+    // Detail card for the highlighted entry.
+    let detail_y = rows_y + g.visible as f32 * SUGGEST_ROW_H + 2.0;
+    rect(out, x + 10.0, detail_y, pw - 20.0, 1.0, with_alpha(CON_CYAN, 0.16), w, h);
+    if let Some(item) = ui.console_suggestions.get(selected) {
+        let lines = wrap_plain(item.description, inner_chars, 2);
+        for (i, line) in lines.iter().enumerate() {
+            console_plain(out, line, x + 14.0, detail_y + 6.0 + i as f32 * 18.0, CON_TEXT, w, h);
+        }
+        let meta_y = detail_y + 6.0 + 2.0 * 18.0 + 3.0;
+        let mut mx = x + 14.0;
+        let mut meta = |label: &str, value: &str, color: [f32; 4], out: &mut Vec<UiVertex>| {
+            if value.is_empty() || mx > x + pw - 40.0 {
+                return;
+            }
+            let room = ((x + pw - 14.0 - mx) / CONSOLE_CHAR_WIDTH) as usize;
+            let value = ellipsize(value, room.saturating_sub(label.len() + 1).max(4));
+            console_plain(out, label, mx, meta_y, CON_FAINT, w, h);
+            mx += (label.len() + 1) as f32 * CONSOLE_CHAR_WIDTH;
+            console_plain(out, &value, mx, meta_y, color, w, h);
+            mx += (value.chars().count() + 3) as f32 * CONSOLE_CHAR_WIDTH;
+        };
+        match item.kind {
+            ConsoleSuggestKind::Cvar => {
+                meta("DEFAULT", item.default_value, CON_DIM, out);
+                meta("RANGE", item.range, CON_DIM, out);
+            }
+            ConsoleSuggestKind::Command => meta("COMMAND", "runs locally", CON_DIM, out),
+            ConsoleSuggestKind::Server => meta("SERVER COMMAND", "sent to the server", CON_DIM, out),
+        }
+    }
 
+    // Footer: match count and keys.
+    let footer_y = y + g.h - SUGGEST_FOOTER_H;
+    rect(out, x + 1.0, footer_y, pw - 2.0, SUGGEST_FOOTER_H - 1.0, [0.0, 0.0, 0.02, 0.35], w, h);
+    let summary = if hint {
+        "ARGUMENT HINT".to_owned()
+    } else if ui.console_suggest_total > count {
+        format!("{} OF {} MATCHES", selected + 1, ui.console_suggest_total)
+    } else {
+        format!("{} OF {} MATCHES", selected + 1, count)
+    };
+    console_plain(out, &summary, x + 14.0, footer_y + 3.0, CON_CYAN, w, h);
+    let keys_x = x + 14.0 + (summary.len() + 3) as f32 * CONSOLE_CHAR_WIDTH;
+    if hint {
+        console_keycaps(out, keys_x, footer_y + 3.0, x + pw - 8.0, &[("ENTER", "run")], w, h);
+    } else {
+        console_keycaps(
+            out,
+            keys_x,
+            footer_y + 3.0,
+            x + pw - 8.0,
+            &[("TAB", "complete"), ("UP/DOWN", "select"), ("CLICK", "pick"), ("ESC", "hide")],
+            w,
+            h,
+        );
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn text(

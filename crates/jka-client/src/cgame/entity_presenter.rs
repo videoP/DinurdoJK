@@ -75,6 +75,9 @@ pub struct EntityPresenter {
     /// True only while the renderer is actually using hardware RT shadows.
     /// Keep RT source metadata completely off the ordinary raster presentation path.
     rt_rigid_casters_enabled: bool,
+    /// r_drawMapModels: server-placed MD3 props (ET_GENERAL / non-inline
+    /// ET_MOVER). Inline BSP brush movers are never affected.
+    draw_map_models: bool,
 }
 
 impl EntityPresenter {
@@ -100,7 +103,12 @@ impl EntityPresenter {
             logged_unsupported: HashSet::new(),
             fx_materials: HashMap::new(),
             rt_rigid_casters_enabled: false,
+            draw_map_models: true,
         })
+    }
+
+    pub fn set_draw_map_models(&mut self, enabled: bool) {
+        self.draw_map_models = enabled;
     }
 
     /// `ghoul2` draws Ghoul2 world models (weapon items) through the shared
@@ -196,6 +204,12 @@ impl EntityPresenter {
         game: &ClientGameState,
         draws: &mut Vec<DynamicModelSurface>,
     ) {
+        // Holocrons are gameplay pickups that share this path, not map props.
+        if !self.draw_map_models
+            && !matches!(entity.presentation_kind(), EntityPresentationKind::Holocron)
+        {
+            return;
+        }
         if entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0 {
             return;
         }
@@ -240,7 +254,7 @@ impl EntityPresenter {
                     });
                 }
             }
-        } else {
+        } else if self.draw_map_models {
             self.present_model_index(entity, game, model_index, draws);
         }
 
@@ -248,7 +262,7 @@ impl EntityPresenter {
         // transform.  Supporting it here also exercises CS_MODELS lookup without
         // pretending inline BSP models are ordinary registered model qpaths.
         let model_index2 = entity.state.field_i32("modelindex2").unwrap_or(0);
-        if model_index2 > 0 {
+        if model_index2 > 0 && self.draw_map_models {
             self.present_model_index(entity, game, model_index2, draws);
         }
     }
@@ -373,6 +387,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
+                fx_gpu_sprites: None,
                 texture,
                 alpha_mode: blend_for_alpha(alpha_mode, submission.rgba[3]),
             });
@@ -461,6 +476,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
+                fx_gpu_sprites: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if color[3] < 1.0 {
                     match surface_asset.alpha_mode {
@@ -532,6 +548,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
+                fx_gpu_sprites: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if rgba[3] < 1.0 {
                     match surface_asset.alpha_mode {
@@ -611,6 +628,18 @@ impl EntityPresenter {
         use crate::fx::draw::{FxBlend, FxMaterial};
         use jka_assets::shader::{AlphaGen, RgbGen};
         let key = shader_name.replace('\\', "/").to_ascii_lowercase();
+        // Engine-built material: untextured vertex-colour additive (enhanced
+        // saber melt glow). Not an authored shader, so it never hits the loaders.
+        if key == "$melt_glow" {
+            return vec![FxMaterial {
+                texture: None,
+                blend: FxBlend::Add,
+                rgb_vertex: true,
+                alpha_vertex: false,
+                rgb_const: [1.0; 3],
+                alpha_const: 1.0,
+            }];
+        }
         if let Some(materials) = self.fx_materials.get(&key) {
             return materials.clone();
         }
@@ -835,7 +864,7 @@ mod tests {
     #[test]
     #[ignore = "diagnostic: requires JKA_TEST_BASE; DEMO selects demos/<name>.dm_26 (default TEST)"]
     fn demo_entity_profile() {
-        use jka_protocol::{demo::DemoReader, server::{Decoder, Event}};
+        use jka_protocol::{demo::DemoReader, entity_event::{EntityEvent, EV_EVENT_BITS}, server::{Decoder, Event}};
         use std::collections::BTreeMap;
         let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
         let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
@@ -870,8 +899,8 @@ mod tests {
                                 *events.entry(et - super::super::ET_EVENTS).or_insert(0) += 1;
                                 continue;
                             }
-                            let ev = state.field_i32("event").unwrap_or(0) & !0x300;
-                            if ev != 0 { *events.entry(ev).or_insert(0) += 1; }
+                            let ev = state.field_i32("event").unwrap_or(0) & !EV_EVENT_BITS;
+                            if ev != EntityEvent::EV_NONE.as_i32() { *events.entry(ev).or_insert(0) += 1; }
                             let mi = state.field_i32("modelindex").unwrap_or(0);
                             let key = match et {
                                 2 => format!("ITEM modelindex={mi}"),
@@ -891,8 +920,8 @@ mod tests {
                             };
                             *keys.entry(key).or_insert(0) += 1;
                         }
-                        let pev = snapshot.player_state.field_i32("externalEvent").unwrap_or(0) & !0x300;
-                        if pev != 0 { *events.entry(pev).or_insert(0) += 1; }
+                        let pev = snapshot.player_state.field_i32("externalEvent").unwrap_or(0) & !EV_EVENT_BITS;
+                        if pev != EntityEvent::EV_NONE.as_i32() { *events.entry(pev).or_insert(0) += 1; }
                     }
                     _ => {}
                 }
@@ -900,9 +929,9 @@ mod tests {
         }
         println!("PROFILE snapshots={snapshots} types={types:?}");
         for (key, count) in &keys { println!("PROFILE {count:>6} {key}"); }
-        let names = crate::cgame::event_debug::EVENT_NAMES;
         for (event, count) in &events {
-            println!("PROFILE event {event:>3} {:<28} x{count}", names.get(*event as usize).copied().unwrap_or("?"));
+            let name = EntityEvent::from_i32(*event).map(EntityEvent::name).unwrap_or("?");
+            println!("PROFILE event {event:>3} {name:<28} x{count}");
         }
     }
 
@@ -917,6 +946,7 @@ mod tests {
         let bytes = assets.read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().unwrap().bytes;
         let mut presenter = EntityPresenter::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap(), false).unwrap();
         let mut ghoul2 = PlayerPresenter::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap(), false).unwrap();
+        ghoul2.set_async_loading(false);
         let mut weapon_fx = WeaponFx::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap());
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
@@ -978,6 +1008,7 @@ mod tests {
         let bytes = open().read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().unwrap().bytes;
         let mut presenter = EntityPresenter::new(open(), false).unwrap();
         let mut ghoul2 = PlayerPresenter::new(open(), false).unwrap();
+        ghoul2.set_async_loading(false);
         let mut weapon_fx = WeaponFx::new(open());
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
@@ -1008,7 +1039,7 @@ mod tests {
                         let entities = game.present_entities(snapshot.server_time).unwrap();
                         for event in game.drain_presentation_events() {
                             if let Some(super::super::event_presenter::EventDispatchResult::Handled("FX_MISSILE_IMPACT")) =
-                                weapon_fx.entity_event(&event, &game)
+                                weapon_fx.entity_event(&event, &game, &[])
                             {
                                 impact_events += 1;
                             }
@@ -1056,6 +1087,7 @@ mod tests {
             .bytes;
         let mut presenter = EntityPresenter::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap(), false).unwrap();
         let mut ghoul2 = PlayerPresenter::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap(), false).unwrap();
+        ghoul2.set_async_loading(false);
         let mut weapon_fx = WeaponFx::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap());
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();

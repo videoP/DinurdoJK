@@ -49,11 +49,13 @@ fn vs_main(input: VertexIn) -> VertexOut {
     return output;
 }
 
-fn lit_color(normal: vec3<f32>, tex: vec4<f32>) -> vec4<f32> {
+fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
     // BSP LIGHTGRID is pre-applied to the transient vertex colors while the
     // CPU packs each dynamic surface. Preserve the previous fragment-lighting
     // placeholder only for irradiance-volume mode until dynamic models sample
     // the actual ambient-cube data.
+    // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
+    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y), tex_in.a);
     if (entity_lighting.values.x != 2u) {
         return tex;
     }

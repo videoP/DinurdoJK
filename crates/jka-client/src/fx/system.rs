@@ -26,6 +26,16 @@ const TRAIL_RATE: i32 = 12;
 
 type Axis = [[f32; 3]; 3];
 
+/// Presentation ownership for a spawned FX tree. Child/death/emitter effects
+/// inherit the root class so runtime A/B switches suppress the authored tree
+/// without guessing from shader names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FxClass {
+    #[default]
+    General,
+    SaberImpact,
+}
+
 /// Effect ids a primitive refers to, resolved once at registration.
 #[derive(Clone, Debug, Default)]
 struct Links {
@@ -46,11 +56,13 @@ struct Scheduled {
     primitive: usize,
     origin: [f32; 3],
     axis: Axis,
+    class: FxClass,
 }
 
 /// One live primitive (CParticle/CLine/CTail/... state).
 #[derive(Clone, Debug)]
 struct Primitive {
+    class: FxClass,
     kind: PrimType,
     flags: u32,
     time_start: i32,
@@ -105,16 +117,50 @@ pub enum FxDraw {
         indices: Vec<u32>,
         shader: String,
     },
+    /// Lit, alpha-blended relief mesh with real normals and no texture (vertex
+    /// colour only). `lighting_origin` picks the BSP light-grid sample. Used by
+    /// the enhanced saber melt so raised slag is shaded by the scene lights.
+    LitMesh {
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        rgba: Vec<[u8; 4]>,
+        indices: Vec<u32>,
+        lighting_origin: [f32; 3],
+    },
     /// RT_CYLINDER: `start_radius` ring at start, `end_radius` ring at end.
     Cylinder { start: [f32; 3], end: [f32; 3], axis: [f32; 3], start_radius: f32, end_radius: f32, rgba: [u8; 4], shader: String },
+}
+
+/// Origin class for RE_AddLightToScene-style transient lights.  This is
+/// diagnostic metadata only; it must not affect authored light behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FxLightKind {
+    /// Authored `Light {}` primitive from an .efx file.
+    #[default]
+    AuthoredEffect,
+    /// CG_DoSaber / CG_DoSaberLight blade light.
+    Saber,
+    /// DinurdoJK enhanced saber-mark heat light.
+    SaberMark,
 }
 
 /// RE_AddLightToScene from an FX light primitive.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxLight {
+    pub kind: FxLightKind,
     pub origin: [f32; 3],
     pub radius: f32,
     pub rgb: [f32; 3],
+    /// Optional rendered blade endpoints in JKA space. Legacy modes use origin.
+    pub segment: Option<[[f32; 3]; 2]>,
+    pub blade_segments: Option<std::sync::Arc<[FxLightSegment]>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FxLightSegment {
+    pub endpoints: [[f32; 3]; 2],
+    pub rgb: [f32; 3],
+    pub weight: f32,
 }
 
 /// A Sound primitive (S_StartSound at `origin`, CHAN_AUTO).
@@ -149,7 +195,7 @@ pub struct FxSystem {
     active: Vec<Primitive>,
     sounds: Vec<FxSound>,
     /// FxRunner PlayEffect calls made while creating a primitive.
-    runner_queue: Vec<(EffectId, [f32; 3], Axis)>,
+    runner_queue: Vec<(EffectId, [f32; 3], Axis, FxClass)>,
     time: i32,
     old_time: i32,
     frame_time: i32,
@@ -281,12 +327,26 @@ impl FxSystem {
 
     /// CFxScheduler::PlayEffect(id, origin, forward).
     pub fn play_effect_dir(&mut self, id: EffectId, origin: [f32; 3], forward: [f32; 3]) {
+        self.play_effect_dir_class(id, origin, forward, FxClass::General);
+    }
+
+    pub fn play_effect_dir_class(
+        &mut self,
+        id: EffectId,
+        origin: [f32; 3],
+        forward: [f32; 3],
+        class: FxClass,
+    ) {
         let (right, up) = make_normal_vectors(forward);
-        self.play_effect(id, origin, [forward, right, up]);
+        self.play_effect_class(id, origin, [forward, right, up], class);
     }
 
     /// CFxScheduler::PlayEffect(id, origin, axis) for unbolted effects.
     pub fn play_effect(&mut self, id: EffectId, origin: [f32; 3], axis: Axis) {
+        self.play_effect_class(id, origin, axis, FxClass::General);
+    }
+
+    fn play_effect_class(&mut self, id: EffectId, origin: [f32; 3], axis: Axis, class: FxClass) {
         let Some(effect) = (id as usize).checked_sub(1).and_then(|index| self.effects.get(index)) else {
             return;
         };
@@ -318,22 +378,36 @@ impl FxSystem {
                     self.effects[(id - 1) as usize].template.primitives[index].spawn_delay.get(&mut self.rng) as i32
                 };
                 if delay < 1 {
-                    self.create_effect(id, index, origin, axis, -delay);
+                    self.create_effect(id, index, origin, axis, -delay, class);
                 } else if self.scheduled.len() < MAX_SCHEDULED {
-                    self.scheduled.push(Scheduled { start_time: self.time + delay, effect: id, primitive: index, origin, axis });
+                    self.scheduled.push(Scheduled {
+                        start_time: self.time + delay,
+                        effect: id,
+                        primitive: index,
+                        origin,
+                        axis,
+                        class,
+                    });
                 } else {
                     self.dropped += 1;
                 }
             }
         }
-        while let Some((id, origin, axis)) = self.runner_queue.pop() {
-            self.play_effect(id, origin, axis);
+        while let Some((id, origin, axis, class)) = self.runner_queue.pop() {
+            self.play_effect_class(id, origin, axis, class);
         }
     }
 
     /// AddScheduledEffects + FX_Add: spawn due primitives, simulate every live
     /// primitive for this frame and return what it submits.
     pub fn frame(&mut self) -> FxFrame {
+        self.frame_with_visibility(true)
+    }
+
+    /// Simulate the normal OpenJK FX frame while optionally suppressing the
+    /// rendered output of saber-impact trees. The simulation is intentionally
+    /// retained so a paused demo can toggle the same frozen population off/on.
+    pub fn frame_with_visibility(&mut self, saber_impact_fx: bool) -> FxFrame {
         let now = self.time;
         let mut due = Vec::new();
         self.scheduled.retain(|scheduled| {
@@ -345,7 +419,14 @@ impl FxSystem {
             }
         });
         for scheduled in due {
-            self.create_effect(scheduled.effect, scheduled.primitive, scheduled.origin, scheduled.axis, 0);
+            self.create_effect(
+                scheduled.effect,
+                scheduled.primitive,
+                scheduled.origin,
+                scheduled.axis,
+                0,
+                scheduled.class,
+            );
         }
 
         let mut out = FxFrame { sounds: std::mem::take(&mut self.sounds), ..FxFrame::default() };
@@ -358,20 +439,21 @@ impl FxSystem {
                 if prim.flags & FX_DEATH_RUNS_FX != 0 && prim.flags & FX_KILL_ON_IMPACT == 0 && prim.death_fx != 0 {
                     // CParticle::Die: death effect in a random direction.
                     let dir = normalize([rng.flrand(-1.0, 1.0), rng.flrand(-1.0, 1.0), rng.flrand(-1.0, 1.0)]);
-                    deaths.push((prim.death_fx, prim.origin, dir));
+                    deaths.push((prim.death_fx, prim.origin, dir, prim.class));
                 }
                 return false;
             }
-            update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits)
+            let visible = saber_impact_fx || prim.class != FxClass::SaberImpact;
+            update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible)
         });
-        for (id, origin, dir) in deaths {
-            self.play_effect_dir(id, origin, dir);
+        for (id, origin, dir, class) in deaths {
+            self.play_effect_dir_class(id, origin, dir, class);
         }
-        for (id, origin, axis) in emits {
-            self.play_effect(id, origin, axis);
+        for (id, origin, axis, class) in emits {
+            self.play_effect_class(id, origin, axis, class);
         }
-        while let Some((id, origin, axis)) = self.runner_queue.pop() {
-            self.play_effect(id, origin, axis);
+        while let Some((id, origin, axis, class)) = self.runner_queue.pop() {
+            self.play_effect_class(id, origin, axis, class);
         }
         // Death/emitter effects spawned above are drawn from next frame on,
         // like OpenJK's FX_Add iterating a list that grows behind it.
@@ -379,7 +461,15 @@ impl FxSystem {
     }
 
     /// CFxScheduler::CreateEffect.
-    fn create_effect(&mut self, id: EffectId, index: usize, origin: [f32; 3], axis: Axis, late_time: i32) {
+    fn create_effect(
+        &mut self,
+        id: EffectId,
+        index: usize,
+        origin: [f32; 3],
+        axis: Axis,
+        late_time: i32,
+        class: FxClass,
+    ) {
         // FX_Add* refuse new primitives while paused (mFrameTime < 1).
         if self.frame_time < 1 {
             return;
@@ -488,7 +578,7 @@ impl FxSystem {
             PrimType::FxRunner => {
                 let target = pick(&links.play, rng);
                 if target != 0 {
-                    self.runner_queue.push((target, org, ax));
+                    self.runner_queue.push((target, org, ax, class));
                 }
                 return;
             }
@@ -523,6 +613,7 @@ impl FxSystem {
         let alpha = (fx.alpha_start.get(rng), fx.alpha_end.get(rng), parm(fx.alpha_parm.get(rng), FX_ALPHA_SHIFT));
         let rgb_parm = parm(fx.rgb_parm.get(rng), FX_RGB_SHIFT);
         let primitive = Primitive {
+            class,
             kind: fx.kind,
             flags,
             time_start: time,
@@ -570,7 +661,8 @@ fn update_primitive(
     frame_time: i32,
     rng: &mut Rng,
     out: &mut FxFrame,
-    emits: &mut Vec<(EffectId, [f32; 3], Axis)>,
+    emits: &mut Vec<(EffectId, [f32; 3], Axis, FxClass)>,
+    visible: bool,
 ) -> bool {
     if prim.time_start > time {
         return false;
@@ -585,7 +677,6 @@ fn update_primitive(
         prim.vel = add(prim.vel, scale(prim.accel, real_time));
         prim.origin = add(prim.origin, scale(prim.vel, real_time));
     }
-    let shader = prim.shader.clone().unwrap_or_default();
     let percent = |parm: f32, start: f32, end: f32, shift: u32, rng: &mut Rng| -> f32 {
         let perc = interpolation(prim.flags >> shift, parm, prim.time_start, prim.time_end, time, rng);
         start * perc + end * (1.0 - perc)
@@ -611,7 +702,7 @@ fn update_primitive(
                     if distance_squared(org, prim.old_origin) >= step {
                         step = prim.density + rng.flrand(-prim.variance, prim.variance);
                         step *= step;
-                        emits.push((prim.emitter_fx, org, prim.axis));
+                        emits.push((prim.emitter_fx, org, prim.axis, prim.class));
                         prim.old_origin = org;
                         prim.old_velocity = v;
                         dif = 0;
@@ -624,52 +715,65 @@ fn update_primitive(
         PrimType::Light => {
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgb = rgb_at(prim, time, rng);
-            out.lights.push(FxLight { origin: prim.origin, radius, rgb });
+            if visible {
+                out.lights.push(FxLight { kind: FxLightKind::AuthoredEffect, origin: prim.origin, radius, rgb, segment: None, blade_segments: None });
+            }
         }
         _ => {
+            let shader = prim.shader.clone().unwrap_or_default();
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgba = rgba_at(prim, time, rng);
             match prim.kind {
                 PrimType::Particle => {
                     rotate(prim, frame_time);
-                    out.draws.push(FxDraw::Sprite { origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
+                    if visible {
+                        out.draws.push(FxDraw::Sprite { origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
+                    }
                 }
                 PrimType::OrientedParticle => {
                     rotate(prim, frame_time);
-                    let (right, up) = make_normal_vectors(prim.normal);
-                    out.draws.push(FxDraw::OrientedQuad {
-                        origin: prim.origin,
-                        axis: [prim.normal, right, up],
-                        radius,
-                        rotation: prim.rotation,
-                        rgba,
-                        shader,
-                    });
+                    if visible {
+                        let (right, up) = make_normal_vectors(prim.normal);
+                        out.draws.push(FxDraw::OrientedQuad {
+                            origin: prim.origin,
+                            axis: [prim.normal, right, up],
+                            radius,
+                            rotation: prim.rotation,
+                            rgba,
+                            shader,
+                        });
+                    }
                 }
                 PrimType::Line | PrimType::Electricity => {
-                    out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader });
+                    if visible {
+                        out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader });
+                    }
                 }
                 PrimType::Tail => {
                     let length = percent(prim.length.2, prim.length.0, prim.length.1, FX_LENGTH_SHIFT, rng);
                     // CTail::CalcNewEndpoint: extend back along the last motion.
                     let back = normalize(sub(prim.old_origin, prim.origin));
                     let end = add(prim.origin, scale(back, length));
-                    out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader });
+                    if visible {
+                        out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader });
+                    }
                 }
                 PrimType::Cylinder => {
                     let size2 = percent(prim.size2.2, prim.size2.0, prim.size2.1, FX_SIZE2_SHIFT, rng);
                     let length = percent(prim.length.2, prim.length.0, prim.length.1, FX_LENGTH_SHIFT, rng);
                     let axis = prim.axis[0];
-                    out.draws.push(FxDraw::Cylinder {
-                        start: prim.origin,
-                        end: add(prim.origin, scale(axis, length)),
-                        axis,
-                        // RB_SurfaceCylinder: size2 ring at origin, size1 at oldorigin.
-                        start_radius: size2,
-                        end_radius: radius,
-                        rgba,
-                        shader,
-                    });
+                    if visible {
+                        out.draws.push(FxDraw::Cylinder {
+                            start: prim.origin,
+                            end: add(prim.origin, scale(axis, length)),
+                            axis,
+                            // RB_SurfaceCylinder: size2 ring at origin, size1 at oldorigin.
+                            start_radius: size2,
+                            end_radius: radius,
+                            rgba,
+                            shader,
+                        });
+                    }
                 }
                 _ => {}
             }

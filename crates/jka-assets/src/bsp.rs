@@ -5,7 +5,7 @@ use std::ops::Range;
 mod collision;
 mod visibility;
 pub use collision::{CollisionLeaf, CollisionNode, CollisionTree};
-pub use visibility::Visibility;
+pub use visibility::{AreaLocator, Visibility};
 
 /// Maximum accepted RBSP size. Large community maps can legitimately exceed 128 MiB
 /// (especially with embedded lightmaps), while keeping a finite cap still protects
@@ -19,8 +19,9 @@ pub const CONTENTS_SOLID: u32 = 0x0000_0001;
 pub const CONTENTS_TERRAIN: u32 = 0x0000_1000;
 pub const SURF_SKY: u32 = 0x0000_2000;
 pub const SURF_NODRAW: u32 = 0x0020_0000;
+pub const SURF_NODLIGHT: u32 = 0x0080_0000;
 const HEADER_BYTES: usize = 152;
-const MAX_MESH_VERTICES: usize = 1_048_576;
+const MAX_MESH_VERTICES: usize = 2_097_152;
 const MAX_MESH_INDICES: usize = 6_291_456;
 const MAX_ACOUSTIC_VERTICES: usize = 4_194_304;
 const MAX_ACOUSTIC_TRIANGLES: usize = 8_388_608;
@@ -508,8 +509,9 @@ impl Bsp {
             .collect()
     }
 
-    /// Geometry for a development renderer. Fixed patch subdivision is visual only;
-    /// this does not implement OpenJK patch collision or its adaptive LOD/stitching.
+    /// Geometry for the renderer. Patch control grids are pre-tessellated with
+    /// OpenJK's curvature-error subdivision rule (`r_subdivisions` semantics).
+    /// Runtime distance LOD/stitching is not represented by this flattened mesh.
     pub fn world_mesh(&self, patch_subdivisions: usize) -> Result<Mesh> {
         let mut mesh = Mesh {
             vertices: Vec::new(),
@@ -707,39 +709,53 @@ impl Bsp {
             if surface.kind == SurfaceKind::Patch {
                 let [width, height] = surface.patch_size;
                 let controls = &self.vertices[surface.vertices.clone()];
-                let n = patch_subdivisions;
-                for y in (0..height - 2).step_by(2) {
-                    for x in (0..width - 2).step_by(2) {
-                        mesh.reserve((n + 1) * (n + 1), n * n * 6)?;
-                        let base = mesh.vertices.len() as u32;
-                        for v in 0..=n {
-                            for u in 0..=n {
-                                mesh.vertices.push(render_vertex(
-                                    patch_vertex(
-                                        controls,
-                                        width,
-                                        x,
-                                        y,
-                                        u as f32 / n as f32,
-                                        v as f32 / n as f32,
-                                    ),
-                                    surface,
-                                ));
-                            }
-                        }
-                        for v in 0..n {
-                            for u in 0..n {
-                                let a = base + (v * (n + 1) + u) as u32;
-                                let b = a + 1;
-                                let c = a + (n + 1) as u32;
-                                // Same control-grid winding as the OpenJK surface tessellator.
-                                mesh.indices.extend_from_slice(&[a, c, b, b, c, c + 1]);
-                            }
-                        }
+                let grid = subdivide_patch_to_grid(
+                    width,
+                    height,
+                    controls,
+                    patch_subdivisions as f32,
+                )?;
+                let index_count = (grid.width - 1)
+                    .checked_mul(grid.height - 1)
+                    .and_then(|quads| quads.checked_mul(6))
+                    .ok_or_else(|| invalid("patch index count overflow"))?;
+                mesh.reserve_with_context(
+                    grid.vertices.len(),
+                    index_count,
+                    &format!(
+                        "surface {surface_index} Patch shader={} controls={}x{} -> grid={}x{}",
+                        surface.shader, width, height, grid.width, grid.height
+                    ),
+                )?;
+                let base = u32::try_from(mesh.vertices.len())
+                    .map_err(|_| invalid("tessellated mesh vertex index overflow"))?;
+                mesh.vertices.extend(
+                    grid.vertices
+                        .iter()
+                        .copied()
+                        .map(|vertex| render_vertex(vertex, surface)),
+                );
+                for y in 0..grid.height - 1 {
+                    for x in 0..grid.width - 1 {
+                        let a = base + (y * grid.width + x) as u32;
+                        let b = a + 1;
+                        let c = a + grid.width as u32;
+                        // OpenJK RB_SurfaceGrid winding: top-left, bottom-left, top-right.
+                        mesh.indices.extend_from_slice(&[a, c, b, b, c, c + 1]);
                     }
                 }
             } else {
-                mesh.reserve(surface.vertices.len(), surface.indices.len())?;
+                mesh.reserve_with_context(
+                    surface.vertices.len(),
+                    surface.indices.len(),
+                    &format!(
+                        "surface {surface_index} {:?} shader={} source_vertices={} source_indices={}",
+                        surface.kind,
+                        surface.shader,
+                        surface.vertices.len(),
+                        surface.indices.len()
+                    ),
+                )?;
                 let base = mesh.vertices.len() as u32;
                 mesh.vertices.extend(
                     self.vertices[surface.vertices.clone()]
@@ -760,6 +776,147 @@ impl Bsp {
                     lightmap_styles: surface.lightmap_styles,
                     indices: start..mesh.indices.len(),
                 });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// CONTENTS_PLAYERCLIP / MONSTERCLIP / BOTCLIP / SHOTCLIP.
+pub const CONTENTS_CLIP_MASK: u32 = 0x0000_00f0;
+
+/// Flat brush-volume geometry for debug overlays, in BSP (JKA) coordinates.
+/// Vertices are not shared between faces; each face is a triangle fan plus a
+/// closed outline loop so the renderer needs exactly two static draws.
+#[derive(Debug, Clone, Default)]
+pub struct DebugVolumeMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub colors: Vec<[u8; 4]>,
+    pub triangle_indices: Vec<u32>,
+    pub line_indices: Vec<u32>,
+}
+
+impl DebugVolumeMesh {
+    pub fn is_empty(&self) -> bool {
+        self.triangle_indices.is_empty()
+    }
+
+    fn push_polygon(&mut self, polygon: &[[f32; 3]], color: [u8; 4]) {
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(polygon);
+        self.colors.extend(std::iter::repeat(color).take(polygon.len()));
+        let count = polygon.len() as u32;
+        for i in 1..count - 1 {
+            self.triangle_indices.extend_from_slice(&[base, base + i, base + i + 1]);
+        }
+        for i in 0..count {
+            self.line_indices.extend_from_slice(&[base + i, base + (i + 1) % count]);
+        }
+    }
+}
+
+/// Trigger volumes and clip-only brushes of one map.
+#[derive(Debug, Clone, Default)]
+pub struct DebugVolumes {
+    pub triggers: DebugVolumeMesh,
+    pub clips: DebugVolumeMesh,
+}
+
+fn trigger_color(classname: &[u8]) -> [u8; 4] {
+    match classname {
+        b"trigger_push" => [64, 255, 96, 255],
+        b"trigger_teleport" => [190, 96, 255, 255],
+        b"trigger_hurt" => [255, 64, 64, 255],
+        b"trigger_multiple" => [64, 160, 255, 255],
+        b"trigger_once" => [64, 255, 255, 255],
+        b"trigger_always" => [170, 170, 170, 255],
+        _ => [255, 220, 64, 255],
+    }
+}
+
+fn clip_color(contents: u32) -> [u8; 4] {
+    if contents & 0x10 != 0 {
+        [255, 140, 40, 255] // player clip
+    } else if contents & 0x80 != 0 {
+        [255, 64, 200, 255] // shot clip
+    } else {
+        [255, 240, 80, 255] // monster / bot clip
+    }
+}
+
+impl Bsp {
+    /// Builds the trigger-volume and clip-brush overlay meshes once per map.
+    ///
+    /// Triggers are the brush models of entities whose classname starts with
+    /// `trigger_`; clip brushes are any brush whose contents carry a clip flag.
+    /// Only those brushes are triangulated, so the cost scales with the
+    /// handful of clip/trigger brushes rather than the whole map.
+    pub fn debug_volumes(&self) -> Result<DebugVolumes> {
+        let world = self
+            .models
+            .first()
+            .ok_or_else(|| invalid("RBSP has no world model"))?;
+        let extent = world
+            .mins
+            .iter()
+            .chain(world.maxs.iter())
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max)
+            .max(1024.0)
+            * 2.0;
+        let mut volumes = DebugVolumes::default();
+
+        for entity in &self.entities {
+            let Some(classname) = entity.get(b"classname") else { continue };
+            if !classname.starts_with(b"trigger_") {
+                continue;
+            }
+            let Some(model) = entity
+                .get(b"model")
+                .and_then(|value| value.strip_prefix(b"*"))
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .filter(|&index| index > 0)
+                .and_then(|index| self.models.get(index))
+            else {
+                continue;
+            };
+            let color = trigger_color(classname);
+            for brush_index in model.brushes.clone() {
+                self.append_brush_debug_volume(&mut volumes.triggers, brush_index, extent, color)?;
+            }
+        }
+
+        for (brush_index, brush) in self.brushes.iter().enumerate() {
+            let Some(shader) = self.shaders.get(brush.shader) else { continue };
+            if shader.contents & CONTENTS_CLIP_MASK == 0 || shader.contents & CONTENTS_TERRAIN != 0 {
+                continue;
+            }
+            self.append_brush_debug_volume(
+                &mut volumes.clips,
+                brush_index,
+                extent,
+                clip_color(shader.contents),
+            )?;
+        }
+        Ok(volumes)
+    }
+
+    fn append_brush_debug_volume(
+        &self,
+        mesh: &mut DebugVolumeMesh,
+        brush_index: usize,
+        extent: f32,
+        color: [u8; 4],
+    ) -> Result<()> {
+        let brush = self
+            .brushes
+            .get(brush_index)
+            .ok_or_else(|| invalid("brush index out of range"))?;
+        for side_index in brush.sides.clone() {
+            let polygon = brush_side_polygon(self, brush, side_index, extent)?;
+            if polygon.len() >= 3 {
+                mesh.push_polygon(&polygon, color);
             }
         }
         Ok(())
@@ -894,13 +1051,21 @@ impl AcousticMesh {
 }
 
 impl Mesh {
-    fn reserve(&mut self, vertices: usize, indices: usize) -> Result<()> {
-        if vertices > MAX_MESH_VERTICES - self.vertices.len()
-            || indices > MAX_MESH_INDICES - self.indices.len()
-        {
-            return Err(invalid(
-                "tessellated mesh exceeds development memory budget",
-            ));
+    fn reserve_with_context(&mut self, vertices: usize, indices: usize, context: &str) -> Result<()> {
+        let current_vertices = self.vertices.len();
+        let current_indices = self.indices.len();
+        let vertex_overflow = vertices > MAX_MESH_VERTICES - current_vertices;
+        let index_overflow = indices > MAX_MESH_INDICES - current_indices;
+        if vertex_overflow || index_overflow {
+            return Err(invalid(format!(
+                "tessellated mesh exceeds development memory budget ({context}; current={current_vertices} vertices/{current_indices} indices; add={vertices} vertices/{indices} indices; limits={MAX_MESH_VERTICES} vertices/{MAX_MESH_INDICES} indices; exceeded={})",
+                match (vertex_overflow, index_overflow) {
+                    (true, true) => "vertices+indices",
+                    (true, false) => "vertices",
+                    (false, true) => "indices",
+                    (false, false) => unreachable!(),
+                }
+            )));
         }
         self.vertices.reserve(vertices);
         self.indices.reserve(indices);
@@ -924,6 +1089,285 @@ fn render_vertex(mut vertex: Vertex, surface: &Surface) -> Vertex {
         }
     }
     vertex
+}
+
+
+#[derive(Debug)]
+struct PatchGrid {
+    width: usize,
+    height: usize,
+    vertices: Vec<Vertex>,
+}
+
+const OPENJK_MAX_GRID_SIZE: usize = 65;
+
+/// Port of OpenJK `R_SubdividePatchToGrid`'s load-time tessellation.
+///
+/// OpenJK treats `r_subdivisions` as a maximum geometric deviation in map
+/// units, inserts control columns/rows only when the quadratic curve exceeds
+/// that error, then removes collinear controls and places the remaining points
+/// on the curve. The optional final transpose in OpenJK only improves legacy
+/// triangle-strip length, so it is intentionally omitted for our triangle-list
+/// renderer.
+fn subdivide_patch_to_grid(
+    width: usize,
+    height: usize,
+    controls: &[Vertex],
+    subdivision_error: f32,
+) -> Result<PatchGrid> {
+    if width < 3
+        || height < 3
+        || width > 31
+        || height > 31
+        || width % 2 == 0
+        || height % 2 == 0
+        || controls.len() != width * height
+        || !subdivision_error.is_finite()
+        || subdivision_error < 0.0
+    {
+        return Err(invalid("invalid quadratic patch control grid"));
+    }
+
+    let mut ctrl: Vec<Vec<Vertex>> = controls
+        .chunks_exact(width)
+        .map(|row| row.to_vec())
+        .collect();
+    let mut grid_width = width;
+    let mut grid_height = height;
+    let mut error_table = [
+        vec![0.0_f32; OPENJK_MAX_GRID_SIZE],
+        vec![0.0_f32; OPENJK_MAX_GRID_SIZE],
+    ];
+
+    for dir in 0..2 {
+        error_table[dir].fill(0.0);
+        let mut column = 0usize;
+        while column + 2 < grid_width {
+            let mut max_len_sq = 0.0_f32;
+            for row in ctrl.iter().take(grid_height) {
+                let p0 = row[column].position;
+                let p1 = row[column + 1].position;
+                let p2 = row[column + 2].position;
+                let curve_mid: [f32; 3] = std::array::from_fn(|axis| {
+                    (p0[axis] + 2.0 * p1[axis] + p2[axis]) * 0.25
+                });
+                let from_start: [f32; 3] =
+                    std::array::from_fn(|axis| curve_mid[axis] - p0[axis]);
+                let line = normalize3(std::array::from_fn(|axis| p2[axis] - p0[axis]));
+                let projection = dot3(from_start, line);
+                let perpendicular: [f32; 3] = std::array::from_fn(|axis| {
+                    from_start[axis] - line[axis] * projection
+                });
+                max_len_sq = max_len_sq.max(dot3(perpendicular, perpendicular));
+            }
+
+            let max_len = max_len_sq.sqrt();
+            if max_len < 0.1 {
+                error_table[dir][column + 1] = 999.0;
+                column += 2;
+                continue;
+            }
+            if grid_width + 2 > OPENJK_MAX_GRID_SIZE {
+                error_table[dir][column + 1] = 1.0 / max_len;
+                column += 2;
+                continue;
+            }
+            if max_len <= subdivision_error {
+                error_table[dir][column + 1] = 1.0 / max_len;
+                column += 2;
+                continue;
+            }
+
+            error_table[dir][column + 2] = 1.0 / max_len;
+            for row in ctrl.iter_mut().take(grid_height) {
+                let previous = lerp_draw_vertex(row[column], row[column + 1]);
+                let next = lerp_draw_vertex(row[column + 1], row[column + 2]);
+                let mid = lerp_draw_vertex(previous, next);
+                row.splice(column + 1..column + 2, [previous, mid, next]);
+            }
+            grid_width += 2;
+            // OpenJK backs up and rechecks the same quadratic span after insertion.
+        }
+
+        ctrl = transpose_patch_grid(&ctrl, grid_width, grid_height);
+        std::mem::swap(&mut grid_width, &mut grid_height);
+    }
+
+    put_patch_points_on_curve(&mut ctrl, grid_width, grid_height);
+
+    // Cull control rows/columns OpenJK marked as completely collinear.
+    let mut column = 1usize;
+    while column + 1 < grid_width {
+        if error_table[0][column] == 999.0 {
+            for row in ctrl.iter_mut().take(grid_height) {
+                row.remove(column);
+            }
+            for index in column + 1..grid_width {
+                error_table[0][index - 1] = error_table[0][index];
+            }
+            grid_width -= 1;
+        }
+        column += 1;
+    }
+    let mut row = 1usize;
+    while row + 1 < grid_height {
+        if error_table[1][row] == 999.0 {
+            ctrl.remove(row);
+            for index in row + 1..grid_height {
+                error_table[1][index - 1] = error_table[1][index];
+            }
+            grid_height -= 1;
+        }
+        row += 1;
+    }
+
+    make_patch_normals(&mut ctrl, grid_width, grid_height);
+
+    let mut vertices = Vec::with_capacity(grid_width * grid_height);
+    for row in ctrl.into_iter().take(grid_height) {
+        vertices.extend(row.into_iter().take(grid_width));
+    }
+    Ok(PatchGrid {
+        width: grid_width,
+        height: grid_height,
+        vertices,
+    })
+}
+
+fn lerp_draw_vertex(a: Vertex, b: Vertex) -> Vertex {
+    let mut out = a;
+    out.position = std::array::from_fn(|axis| 0.5 * (a.position[axis] + b.position[axis]));
+    out.texcoord = std::array::from_fn(|axis| 0.5 * (a.texcoord[axis] + b.texcoord[axis]));
+    out.normal = std::array::from_fn(|axis| 0.5 * (a.normal[axis] + b.normal[axis]));
+    for slot in 0..4 {
+        out.lightmap_uv[slot] = std::array::from_fn(|axis| {
+            0.5 * (a.lightmap_uv[slot][axis] + b.lightmap_uv[slot][axis])
+        });
+        out.color[slot] = std::array::from_fn(|channel| {
+            ((u16::from(a.color[slot][channel]) + u16::from(b.color[slot][channel])) >> 1) as u8
+        });
+    }
+    out
+}
+
+fn transpose_patch_grid(ctrl: &[Vec<Vertex>], width: usize, height: usize) -> Vec<Vec<Vertex>> {
+    let mut transposed = Vec::with_capacity(width);
+    for x in 0..width {
+        let mut row = Vec::with_capacity(height);
+        for source_row in ctrl.iter().take(height) {
+            row.push(source_row[x]);
+        }
+        transposed.push(row);
+    }
+    transposed
+}
+
+fn put_patch_points_on_curve(ctrl: &mut [Vec<Vertex>], width: usize, height: usize) {
+    for x in 0..width {
+        for y in (1..height - 1).step_by(2) {
+            let current = ctrl[y][x];
+            let previous = lerp_draw_vertex(current, ctrl[y + 1][x]);
+            let next = lerp_draw_vertex(current, ctrl[y - 1][x]);
+            ctrl[y][x] = lerp_draw_vertex(previous, next);
+        }
+    }
+    for y in 0..height {
+        for x in (1..width - 1).step_by(2) {
+            let current = ctrl[y][x];
+            let previous = lerp_draw_vertex(current, ctrl[y][x + 1]);
+            let next = lerp_draw_vertex(current, ctrl[y][x - 1]);
+            ctrl[y][x] = lerp_draw_vertex(previous, next);
+        }
+    }
+}
+
+fn make_patch_normals(ctrl: &mut [Vec<Vertex>], width: usize, height: usize) {
+    const NEIGHBORS: [[isize; 2]; 8] = [
+        [0, 1],
+        [1, 1],
+        [1, 0],
+        [1, -1],
+        [0, -1],
+        [-1, -1],
+        [-1, 0],
+        [-1, 1],
+    ];
+
+    let wrap_width = (0..height).all(|y| {
+        let delta: [f32; 3] = std::array::from_fn(|axis| {
+            ctrl[y][0].position[axis] - ctrl[y][width - 1].position[axis]
+        });
+        dot3(delta, delta) <= 1.0
+    });
+    let wrap_height = (0..width).all(|x| {
+        let delta: [f32; 3] = std::array::from_fn(|axis| {
+            ctrl[0][x].position[axis] - ctrl[height - 1][x].position[axis]
+        });
+        dot3(delta, delta) <= 1.0
+    });
+
+    let positions: Vec<Vec<[f32; 3]>> = ctrl
+        .iter()
+        .take(height)
+        .map(|row| row.iter().take(width).map(|vertex| vertex.position).collect())
+        .collect();
+
+    for x in 0..width {
+        for y in 0..height {
+            let base = positions[y][x];
+            let mut around = [[0.0_f32; 3]; 8];
+            let mut good = [false; 8];
+
+            for (neighbor_index, [dx, dy]) in NEIGHBORS.into_iter().enumerate() {
+                for distance in 1..=3isize {
+                    let mut nx = x as isize + dx * distance;
+                    let mut ny = y as isize + dy * distance;
+                    if wrap_width {
+                        if nx < 0 {
+                            nx = width as isize - 1 + nx;
+                        } else if nx >= width as isize {
+                            nx = 1 + nx - width as isize;
+                        }
+                    }
+                    if wrap_height {
+                        if ny < 0 {
+                            ny = height as isize - 1 + ny;
+                        } else if ny >= height as isize {
+                            ny = 1 + ny - height as isize;
+                        }
+                    }
+                    if nx < 0 || nx >= width as isize || ny < 0 || ny >= height as isize {
+                        break;
+                    }
+                    let delta: [f32; 3] = std::array::from_fn(|axis| {
+                        positions[ny as usize][nx as usize][axis] - base[axis]
+                    });
+                    let normalized = normalize3(delta);
+                    if dot3(normalized, normalized) == 0.0 {
+                        continue;
+                    }
+                    good[neighbor_index] = true;
+                    around[neighbor_index] = normalized;
+                    break;
+                }
+            }
+
+            let mut sum = [0.0_f32; 3];
+            for index in 0..8 {
+                if !good[index] || !good[(index + 1) & 7] {
+                    continue;
+                }
+                let normal = normalize3(cross3(around[(index + 1) & 7], around[index]));
+                if dot3(normal, normal) == 0.0 {
+                    continue;
+                }
+                for axis in 0..3 {
+                    sum[axis] += normal[axis];
+                }
+            }
+            ctrl[y][x].normal = normalize3(sum);
+        }
+    }
 }
 
 fn patch_vertex(controls: &[Vertex], width: usize, x: usize, y: usize, u: f32, v: f32) -> Vertex {
@@ -1196,6 +1640,38 @@ mod acoustic_tests {
             lightmaps: Vec::new(),
             light_grid: None,
         }
+    }
+
+    #[test]
+    fn debug_volumes_pick_clip_brushes_and_trigger_models() {
+        // PLAYERCLIP cube: six quads, 12 triangles, 24 outline segments.
+        let bsp = cube_bsp(0, 0x10);
+        let volumes = bsp.debug_volumes().expect("clip cube");
+        assert_eq!(volumes.clips.positions.len(), 24);
+        assert_eq!(volumes.clips.triangle_indices.len(), 12 * 3);
+        assert_eq!(volumes.clips.line_indices.len(), 24 * 2);
+        assert!(volumes.triggers.is_empty());
+
+        // Solid brushes without a clip flag are not clip volumes.
+        assert!(cube_bsp(0, CONTENTS_SOLID).debug_volumes().unwrap().clips.is_empty());
+
+        // A trigger_* entity pointing at *1 draws that model's brushes.
+        let mut bsp = cube_bsp(0, 0);
+        bsp.models.push(Model {
+            mins: [-1.0; 3],
+            maxs: [1.0; 3],
+            surfaces: 0..0,
+            brushes: 0..1,
+        });
+        bsp.entities.push(Entity {
+            properties: vec![
+                (b"classname".to_vec(), b"trigger_push".to_vec()),
+                (b"model".to_vec(), b"*1".to_vec()),
+            ],
+        });
+        let volumes = bsp.debug_volumes().expect("trigger cube");
+        assert_eq!(volumes.triggers.triangle_indices.len(), 12 * 3);
+        assert_eq!(volumes.triggers.colors[0], [64, 255, 96, 255]);
     }
 
     #[test]

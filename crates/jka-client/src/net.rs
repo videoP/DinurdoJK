@@ -444,6 +444,9 @@ pub struct LiveInput {
 pub struct CommandButtons<'a> {
     /// Lowercased `+command` names currently held.
     pub active: &'a HashSet<String>,
+    /// TaystJK CG_DoAsync flipkick injection. Kept separate from physical
+    /// bindings so a synthetic -moveup cannot erase a genuinely held jump key.
+    pub forced_moveup: bool,
     /// Any key held outside menus (BUTTON_ANY).
     pub any_key: bool,
     /// cl_run 1 semantics: +speed walks.
@@ -517,7 +520,9 @@ impl LiveInput {
             cmd.buttons |= BUTTON_ANY;
         }
         // CL_KeyMove with cl_run 1.
-        let held = |name: &str| buttons.active.contains(name);
+        let held = |name: &str| {
+            buttons.active.contains(name) || (name == "+moveup" && buttons.forced_moveup)
+        };
         let movespeed: i32 = if held("+speed") {
             cmd.buttons |= BUTTON_WALKING;
             64
@@ -608,6 +613,47 @@ impl LiveInput {
             }
         }
         self.weapon_select = original;
+    }
+
+    /// OpenJK BG_CycleForce, used by CG_NextForcePower_f / CG_PrevForcePower_f.
+    pub fn cycle_force(&mut self, ps: &PlayerState, forward: bool) {
+        // codemp/game/bg_misc.c forcePowerSorted[] -- keep OpenJK's authored order.
+        const FORCE_POWER_SORTED: [i32; 18] = [5, 0, 10, 9, 11, 1, 2, 3, 4, 14, 7, 13, 8, 6, 12, 15, 16, 17];
+        const FP_LEVITATION: i32 = 1;
+        const FP_SABER_OFFENSE: i32 = 15;
+        const FP_SABER_DEFENSE: i32 = 16;
+        const FP_SABERTHROW: i32 = 17;
+
+        let selected = i32::from(self.force_select);
+        if !(0..FORCE_POWER_SORTED.len() as i32).contains(&selected) {
+            return;
+        }
+        let Some(start) = FORCE_POWER_SORTED.iter().position(|&power| power == selected) else {
+            return;
+        };
+        let known = ps.field_i32("fd.forcePowersKnown").unwrap_or(0);
+        let mut index = start;
+        loop {
+            index = if forward {
+                (index + 1) % FORCE_POWER_SORTED.len()
+            } else if index == 0 {
+                FORCE_POWER_SORTED.len() - 1
+            } else {
+                index - 1
+            };
+            if index == start {
+                return;
+            }
+            let power = FORCE_POWER_SORTED[index];
+            if known & (1 << power) == 0 || power == selected {
+                continue;
+            }
+            if matches!(power, FP_LEVITATION | FP_SABER_OFFENSE | FP_SABER_DEFENSE | FP_SABERTHROW) {
+                continue;
+            }
+            self.force_select = power as u8;
+            return;
+        }
     }
 
     /// Vanilla CG_Weapon_f. Returns true when it turned into sv_saberswitch.
@@ -1244,7 +1290,7 @@ mod tests {
                 if std::env::var_os("JKA_LIVE_NOJUMP").is_none() && t.fract() < 0.15 {
                     held.insert("+moveup".into());
                 }
-                let buttons = CommandButtons { active: &held, any_key: true, talking: false };
+                let buttons = CommandButtons { active: &held, forced_moveup: false, any_key: true, talking: false };
                 if last_command.is_none_or(|last| last.elapsed().as_millis() >= command_ms) {
                     last_command = Some(std::time::Instant::now());
                     let cmd = input.create_cmd(&buttons);
@@ -1376,13 +1422,13 @@ mod tests {
         input.view_angles = [10.0, -90.0, 0.0];
         input.note_pressed("+attack");
         let active: HashSet<String> = ["+forward", "+moveleft", "+speed", "+altattack"].into_iter().map(String::from).collect();
-        let cmd = input.create_cmd(&CommandButtons { active: &active, any_key: true, talking: false });
+        let cmd = input.create_cmd(&CommandButtons { active: &active, forced_moveup: false, any_key: true, talking: false });
         assert_eq!(cmd.forward_move, 64);
         assert_eq!(cmd.right_move, -64);
         assert_eq!(cmd.buttons & (1 | 128 | BUTTON_WALKING | BUTTON_ANY), 1 | 128 | BUTTON_WALKING | BUTTON_ANY);
         assert_eq!(cmd.angles[1], jka_movement::angle_to_short(270.0));
         // wasPressed is consumed by one command.
-        let cmd = input.create_cmd(&CommandButtons { active: &HashSet::new(), any_key: false, talking: false });
+        let cmd = input.create_cmd(&CommandButtons { active: &HashSet::new(), forced_moveup: false, any_key: false, talking: false });
         assert_eq!(cmd.buttons, 0);
         assert_eq!(cmd.forward_move, 0);
     }
@@ -1392,7 +1438,7 @@ mod tests {
         let mut input = LiveInput::default();
         input.queue_generic_command(generic_command("force_throw").unwrap());
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
         assert_eq!(input.create_cmd(&buttons).generic_command, 5);
         assert_eq!(input.create_cmd(&buttons).generic_command, 0);
     }

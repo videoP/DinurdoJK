@@ -23,6 +23,10 @@ extern void stock_jka_player_knockback(void *player, const float *velocity, int 
 extern void japro_jka_player_knockback(void *player, const float *velocity, int duration);
 extern void stock_jka_player_set_noclip(void *player, int enabled);
 extern void japro_jka_player_set_noclip(void *player, int enabled);
+extern void stock_jka_player_teleport(void *player, const float *origin, const float *angles, int speed);
+extern void japro_jka_player_teleport(void *player, const float *origin, const float *angles, int speed);
+extern void stock_jka_player_give_all(void *player);
+extern void japro_jka_player_give_all(void *player);
 extern int stock_jka_player_set_saber_movement_info(void *player, int saber_num, const jka_saber_movement_info *info);
 extern int japro_jka_player_set_saber_movement_info(void *player, int saber_num, const jka_saber_movement_info *info);
 extern void stock_jka_player_offline_force_tick(void *player, int time, int requested_power);
@@ -139,6 +143,24 @@ void jka_player_set_noclip(void *player, int enabled) {
         return;
     }
     stock_jka_player_set_noclip(p->base, enabled);
+}
+
+void jka_player_teleport(void *player, const float *origin, const float *angles, int speed) {
+    mod_player *p = player;
+    if (is_japro(p)) {
+        japro_jka_player_teleport(p->japro, origin, angles, speed);
+        return;
+    }
+    stock_jka_player_teleport(p->base, origin, angles, speed);
+}
+
+void jka_player_give_all(void *player) {
+    mod_player *p = player;
+    if (is_japro(p)) {
+        japro_jka_player_give_all(p->japro);
+        return;
+    }
+    stock_jka_player_give_all(p->base);
 }
 
 int jka_player_set_saber_movement_info(void *player, int saber_num, const jka_saber_movement_info *info) {

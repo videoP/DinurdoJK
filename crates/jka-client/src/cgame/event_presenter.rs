@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use jka_protocol::entity_event::EntityEvent;
+
 use crate::{
     renderer::{DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex},
     scene,
@@ -56,81 +58,88 @@ struct EventFlash {
     color: [f32; 3],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedEventVisual {
+    result: EventDispatchResult,
+    flash: Option<PreparedFlash>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedFlash {
+    duration_ms: i32,
+    radius: f32,
+    color: [f32; 3],
+}
+
+pub(crate) fn prepare_event_visual(
+    event: &PresentationEvent,
+    game: &ClientGameState,
+) -> PreparedEventVisual {
+    let (result, flash) = match event.event {
+        EntityEvent::EV_SABER_ATTACK => (EventDispatchResult::Partial("SABER_ATTACK_NO_AUDIO"), None),
+        // OpenJK EV_SABER_HIT / BLOCK / CLASHFLARE are handled by WeaponFx
+        // using the authored .efx path plus CG_SaberClashFlare. Do not fall
+        // back to the old hand-made crossed-billboard flash.
+        EntityEvent::EV_SABER_HIT
+        | EntityEvent::EV_SABER_BLOCK
+        | EntityEvent::EV_SABER_CLASHFLARE => (EventDispatchResult::Unhandled, None),
+        EntityEvent::EV_SABER_UNHOLSTER => (EventDispatchResult::Partial("SABER_UNHOLSTER_NO_AUDIO"), None),
+        EntityEvent::EV_SHIELD_HIT => (
+            EventDispatchResult::Handled("SHIELD_HIT_FLASH"),
+            Some(PreparedFlash { duration_ms: 120, radius: 13.0, color: [0.25, 0.55, 1.0] }),
+        ),
+        EntityEvent::EV_GENERAL_SOUND | EntityEvent::EV_GLOBAL_SOUND | EntityEvent::EV_ENTITY_SOUND => {
+            let result = if game.sound_qpath(event.parm).is_some() {
+                EventDispatchResult::Partial("SOUND_NO_AUDIO_BACKEND")
+            } else {
+                EventDispatchResult::Partial("SOUND_RESOURCE_MISSING")
+            };
+            (result, None)
+        }
+        EntityEvent::EV_GLOBAL_TEAM_SOUND => (EventDispatchResult::Partial("GLOBAL_TEAM_SOUND_PENDING"), None),
+        EntityEvent::EV_PREDEFSOUND => (EventDispatchResult::Partial("PREDEFINED_SOUND_NO_AUDIO_BACKEND"), None),
+        EntityEvent::EV_PLAY_EFFECT => (EventDispatchResult::Partial("EFFECT_RUNTIME_PENDING"), None),
+        EntityEvent::EV_PLAY_EFFECT_ID | EntityEvent::EV_PLAY_PORTAL_EFFECT_ID => {
+            let result = if game.effect_qpath(event.parm).is_some() {
+                EventDispatchResult::Partial("EFFECT_RUNTIME_PENDING")
+            } else {
+                EventDispatchResult::Partial("EFFECT_RESOURCE_MISSING")
+            };
+            (result, None)
+        }
+        EntityEvent::EV_ITEM_PICKUP | EntityEvent::EV_ITEM_RESPAWN | EntityEvent::EV_ITEM_POP => {
+            (EventDispatchResult::Partial("ITEM_PRESENTATION_PENDING"), None)
+        }
+        EntityEvent::EV_FOOTSTEP
+        | EntityEvent::EV_FOOTSTEP_METAL
+        | EntityEvent::EV_FOOTSPLASH
+        | EntityEvent::EV_FOOTWADE
+        | EntityEvent::EV_SWIM
+        | EntityEvent::EV_STEP_4
+        | EntityEvent::EV_FALL
+        | EntityEvent::EV_JUMP
+        | EntityEvent::EV_PAIN => (EventDispatchResult::Partial("MOVEMENT_DAMAGE_NO_AUDIO"), None),
+        EntityEvent::EV_FORCE_DRAINED => (EventDispatchResult::Partial("FORCE_DRAIN_FX_PENDING"), None),
+        _ => (EventDispatchResult::Unhandled, None),
+    };
+    PreparedEventVisual { result, flash }
+}
+
 #[derive(Default)]
 pub struct EventPresenter {
     flashes: Vec<EventFlash>,
 }
 
 impl EventPresenter {
-    pub fn dispatch(
+    pub(crate) fn dispatch_prepared(
         &mut self,
         event: &PresentationEvent,
-        game: &ClientGameState,
+        prepared: PreparedEventVisual,
     ) -> EventDispatchResult {
-        match event.event {
-            // EV_SABER_ATTACK: the persistent blade/hilt is player-state driven.
-            // OpenJK also selects swing audio here; audio is the remaining part.
-            29 => EventDispatchResult::Partial("SABER_ATTACK_NO_AUDIO"),
-            30 => {
-                self.flash(event, 95, 9.0, [1.0, 0.78, 0.28]);
-                EventDispatchResult::Handled("SABER_HIT_FLASH")
-            }
-            31 => {
-                self.flash(event, 90, 11.0, [0.75, 0.88, 1.0]);
-                EventDispatchResult::Handled("SABER_BLOCK_FLASH")
-            }
-            // EV_SABER_CLASHFLARE: short clash flash at the authored event origin.
-            32 => {
-                self.flash(event, 85, 12.0, [0.90, 0.92, 1.0]);
-                EventDispatchResult::Handled("SABER_CLASH_FLASH")
-            }
-            // EV_SABER_UNHOLSTER is mostly persistent player/saber state plus sound.
-            33 => EventDispatchResult::Partial("SABER_UNHOLSTER_NO_AUDIO"),
-            // EV_SHIELD_HIT
-            110 => {
-                self.flash(event, 120, 13.0, [0.25, 0.55, 1.0]);
-                EventDispatchResult::Handled("SHIELD_HIT_FLASH")
-            }
-
-            // Configstring-backed sound events.  Resolution is performed here
-            // so cg_debugEvents distinguishes "we know exactly what to play"
-            // from an event that still lacks semantic handling.
-            76 | 77 | 79 => {
-                if game.sound_qpath(event.parm).is_some() {
-                    EventDispatchResult::Partial("SOUND_NO_AUDIO_BACKEND")
-                } else {
-                    EventDispatchResult::Partial("SOUND_RESOURCE_MISSING")
-                }
-            }
-            78 => EventDispatchResult::Partial("GLOBAL_TEAM_SOUND_PENDING"),
-            // EV_PREDEFSOUND uses eventParm as a predefined enum rather than
-            // CS_SOUNDS, but still requires the future audio backend.
-            40 => EventDispatchResult::Partial("PREDEFINED_SOUND_NO_AUDIO_BACKEND"),
-
-            // Effects are semantically decoded now, but the general .efx runtime
-            // is a separate subsystem.  Keep them visible in cg_debugEvents.
-            68 => EventDispatchResult::Partial("EFFECT_RUNTIME_PENDING"),
-            69 | 70 => {
-                if game.effect_qpath(event.parm).is_some() {
-                    EventDispatchResult::Partial("EFFECT_RUNTIME_PENDING")
-                } else {
-                    EventDispatchResult::Partial("EFFECT_RESOURCE_MISSING")
-                }
-            }
-
-            // Item state/geometry is not yet presentation-complete.
-            22 | 62 | 63 => EventDispatchResult::Partial("ITEM_PRESENTATION_PENDING"),
-
-            // Movement/damage cases currently have visual state already but the
-            // event-specific JKA audio/camera feedback is not implemented yet.
-            2 | 3 | 4 | 5 | 6 | 7 | 11 | 16 | 89 => {
-                EventDispatchResult::Partial("MOVEMENT_DAMAGE_NO_AUDIO")
-            }
-            // Force drained has source/target semantics that should be ported as
-            // a real Force effect rather than approximated as an arbitrary flash.
-            96 => EventDispatchResult::Partial("FORCE_DRAIN_FX_PENDING"),
-            _ => EventDispatchResult::Unhandled,
+        if let Some(flash) = prepared.flash {
+            self.flash(event, flash.duration_ms, flash.radius, flash.color);
         }
+        prepared.result
     }
 
     fn flash(&mut self, event: &PresentationEvent, duration_ms: i32, radius: f32, color: [f32; 3]) {
@@ -210,6 +219,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         rt_rigid: None,
         rt_skinned_key: None,
         ghoul2_gpu: None,
+        fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Additive,
     })

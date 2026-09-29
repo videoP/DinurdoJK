@@ -496,6 +496,12 @@ impl Camera {
         self.cg_fov = cg_fov.clamp(MIN_CG_FOV, MAX_CG_FOV);
     }
 
+    /// CGame-only presentation override used by TaystJK's held +zoom. Unlike
+    /// archived cg_fov, TaystJK permits the temporary zoom FOV up to 176.
+    pub fn set_presentation_fov(&mut self, cg_fov: f32) {
+        self.cg_fov = cg_fov.clamp(1.0, 176.0);
+    }
+
     pub fn cg_fov(&self) -> f32 {
         self.cg_fov
     }

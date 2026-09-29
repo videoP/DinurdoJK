@@ -4,6 +4,9 @@ struct Camera {
     clip_plane: vec4<f32>,
     render_flags: vec4<u32>,
     camera_forward: vec4<f32>,
+    unjittered_view_proj: mat4x4<f32>,
+    previous_unjittered_view_proj: mat4x4<f32>,
+    jump_shade: vec4<f32>,
 };
 struct Material {
     header: vec4<u32>,
@@ -38,7 +41,7 @@ struct LightingSettings {
     values: vec4<u32>, // enabled, light count, viewport width, viewport height
     local_shadows: vec4<u32>, // enabled, shadowed count, cubemap size, reserved
     feature_flags: vec4<u32>, // emissive area lights, voxel/probe GI, point/entity lights, reflection quality
-    map_ambient: vec4<f32>, // xyz q3map2 ambient RGB; w reserved
+    map_ambient: vec4<f32>, // xyz q3map2 ambient RGB; w RT sample count
     map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; unused by compute/fog consumers
 };
 struct PbrSettings {
@@ -153,6 +156,8 @@ override ENABLE_PLANAR_REFLECTIONS: bool = false;
 override ENABLE_OCEAN: bool = false;
 // Legacy fog pipeline variant (WorldShaderVariantKey::legacy_fog).
 override ENABLE_LEGACY_FOG: bool = false;
+// jaPRO SP-physics jump-height helper variant (WorldShaderVariantKey::jump_shade).
+override ENABLE_JUMP_SHADE: bool = false;
 override DETAIL_TEXTURE_MODE: u32 = 0u;
 // PBR optimization switches. These remain pipeline-specialized so each option
 // can be benchmarked independently without paying a runtime branch in the hot path.
@@ -203,6 +208,7 @@ override PBR_VERTEX_LIGHTGRID: bool = false;
 @group(2) @binding(12) var<uniform> voxel_gi: VoxelProbeGiSettings;
 @group(2) @binding(13) var irradiance_volume: texture_3d<f32>;
 @group(2) @binding(14) var<uniform> irradiance_volume_info: IrradianceVolumeSettings;
+@group(2) @binding(16) var<storage, read> legacy_dlight_surface_masks: array<u32>;
 @group(3) @binding(0) var shadow_texture: texture_depth_2d_array;
 @group(3) @binding(1) var shadow_sampler: sampler_comparison;
 @group(3) @binding(2) var<uniform> shadow_settings: ShadowSettings;
@@ -248,6 +254,7 @@ struct VertexOut {
     @location(11) pbr_lightgrid_direction: vec4<f32>,
     @location(12) pbr_lightgrid_lighting: vec4<f32>,
     @location(13) vertex_dlight: vec3<f32>,
+    @location(14) @interpolate(flat) legacy_dlight_bits: u32,
 };
 
 fn generated_uv(input: VertexIn) -> vec2<f32> {
@@ -495,7 +502,7 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
     return result;
 }
 
-@vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: u32) -> VertexOut {
     var output: VertexOut;
     let allow_shell = camera.render_flags.x == 0u;
     let ocean_vertex = is_ocean_vertex(input);
@@ -533,7 +540,36 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
     let vertex_lightgrid = sample_vertex_static_lightgrid(world_position);
     output.pbr_lightgrid_direction = vertex_lightgrid.direction;
     output.pbr_lightgrid_lighting = vertex_lightgrid.lighting;
+    // Legacy dlight membership is constant for an authored BSP surface. Resolve
+    // the storage-buffer lookup once per vertex and pass the resulting bitmask
+    // flat to the fragment shader instead of reading the mask buffer for every
+    // world fragment. Unknown/procedural geometry preserves the conservative
+    // all-lights fallback used by the previous path.
+    var legacy_dlight_bits = 0u;
+    if (ENABLE_LEGACY_DLIGHTS) {
+        legacy_dlight_bits = 0xffffffffu;
+        if (instance_index == 0u && legacy_dlight_surface_id != 0xffffffffu) {
+            if (legacy_dlight_surface_id < arrayLength(&legacy_dlight_surface_masks)) {
+                legacy_dlight_bits = legacy_dlight_surface_masks[legacy_dlight_surface_id];
+            } else {
+                legacy_dlight_bits = 0u;
+            }
+        }
+    }
+    output.legacy_dlight_bits = legacy_dlight_bits;
     return output;
+}
+
+@vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return world_vertex(input, instance_index, 0xffffffffu);
+}
+
+@vertex fn vs_main_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return world_vertex(input, instance_index, legacy_dlight_surface_id);
 }
 
 fn geometric_frame(input: VertexOut) -> mat3x3<f32> {
@@ -969,9 +1005,23 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
         return result;
     }
 
-    // JKA-style triangle-plane response with a smooth radial blob. This keeps
-    // authored runtime lights cheap and stable without the old 16x16 lookup or
-    // an extra redraw pass.
+    let transient_start = min(lighting_settings.local_shadows.w, lighting_settings.values.y);
+    let transient_count = min(lighting_settings.values.y - transient_start, 32u);
+    if (transient_count == 0u) { return result; }
+
+    // OpenJK prunes runtime dlights at BSP-surface granularity before the
+    // expensive projected-light work. Surface identity arrives as a normal flat
+    // vertex attribute so this remains portable on backends without WGSL
+    // primitive_index support. Unknown/procedural geometry keeps the conservative
+    // all-lights fallback.
+    // The authored-surface mask was fetched in the vertex stage and arrives
+    // flat, so unlit surfaces avoid a storage-buffer read in every fragment.
+    let dlight_bits = input.legacy_dlight_bits;
+    if (dlight_bits == 0u) { return result; }
+
+    // Preserve the existing Legacy/JKA projected-light response exactly. The
+    // surface mask only removes lights that OpenJK-style coarse culling proved
+    // cannot touch this surface; it does not change the per-triangle light math.
     let dp_x = dpdx(input.world_position);
     let dp_y = dpdy(input.world_position);
     let plane_cross = cross(dp_x, dp_y);
@@ -982,10 +1032,9 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
         plane_normal = -plane_normal;
     }
 
-    let start = min(lighting_settings.local_shadows.w, lighting_settings.values.y);
-    let end = min(lighting_settings.values.y, start + 32u);
-    for (var i = start; i < end; i += 1u) {
-        let light = dynamic_lights[i];
+    for (var bit = 0u; bit < transient_count; bit += 1u) {
+        if ((dlight_bits & (1u << bit)) == 0u) { continue; }
+        let light = dynamic_lights[transient_start + bit];
         if (light.shadow.w < 0.5) { continue; }
 
         let radius = max(light.position_radius.w, 1.0);
@@ -1008,6 +1057,133 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
             * 0.225;
     }
     return result;
+}
+
+// OpenJK ProjectDlightTexture2 projects a small radial dlight image onto the
+// receiving triangle after the normal material stages. DinurdoJK keeps the
+// same operation in a dedicated depth-equal pass, but evaluates the projection
+// directly instead of re-running the entire material shader twice.
+//
+// This is the exact procedural fallback generated by OpenJK's
+// R_CreateDlightImage when gfx/2d/dlight is unavailable: a 16x16 centered
+// inverse-square blob, sampled with the same clamp + linear-filter semantics.
+fn openjk_dlight_fallback_texel(coord: vec2<i32>) -> f32 {
+    let x = f32(clamp(coord.x, 0, 15));
+    let y = f32(clamp(coord.y, 0, 15));
+    let dx = 7.5 - x;
+    let dy = 7.5 - y;
+    let distance_sq = max(dx * dx + dy * dy, 1.0e-6);
+    var value = 4000.0 / distance_sq;
+    if (value > 255.0) {
+        value = 255.0;
+    } else if (value < 75.0) {
+        value = 0.0;
+    }
+    return value * (1.0 / 255.0);
+}
+
+fn sample_openjk_dlight_fallback(uv: vec2<f32>) -> f32 {
+    let clamped_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    // OpenGL/WebGPU normalized linear sampling addresses texel centers at
+    // (n + 0.5) / size. Reconstruct that filtering explicitly so this helper
+    // does not require another sampled-texture binding in the hot world layout.
+    let texel = clamped_uv * 16.0 - vec2<f32>(0.5);
+    let base = vec2<i32>(i32(floor(texel.x)), i32(floor(texel.y)));
+    let frac_part = fract(texel);
+    let a = openjk_dlight_fallback_texel(base);
+    let b = openjk_dlight_fallback_texel(base + vec2<i32>(1, 0));
+    let c = openjk_dlight_fallback_texel(base + vec2<i32>(0, 1));
+    let d = openjk_dlight_fallback_texel(base + vec2<i32>(1, 1));
+    return mix(mix(a, b, frac_part.x), mix(c, d, frac_part.x), frac_part.y);
+}
+
+fn openjk_projected_dlight_contribution(input: VertexOut) -> vec3<f32> {
+    if (!ENABLE_LEGACY_DLIGHTS || camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
+        return vec3<f32>(0.0);
+    }
+
+    let transient_start = min(lighting_settings.local_shadows.w, lighting_settings.values.y);
+    let transient_count = min(lighting_settings.values.y - transient_start, 32u);
+    let dlight_bits = input.legacy_dlight_bits;
+    if (transient_count == 0u || dlight_bits == 0u) {
+        return vec3<f32>(0.0);
+    }
+
+    // ProjectDlightTexture2 derives a plane per triangle, rejects back-facing
+    // triangles, and projects the radial dlight image into that plane. Fragment
+    // derivatives recover the same constant triangle plane without rebuilding
+    // the authored material shader.
+    let dp_x = dpdx(input.world_position);
+    let dp_y = dpdy(input.world_position);
+    let plane_cross = cross(dp_x, dp_y);
+    let plane_len_sq = dot(plane_cross, plane_cross);
+    if (plane_len_sq < 1.0e-10) {
+        return vec3<f32>(0.0);
+    }
+    var plane_normal = plane_cross * inverseSqrt(plane_len_sq);
+    if (dot(plane_normal, input.world_normal) < 0.0) {
+        plane_normal = -plane_normal;
+    }
+
+    // ProjectDlightTexture2 modulates its projected blob by the usable diffuse
+    // stage when one is present. DinurdoJK's isolated pass is already issued
+    // from the opaque receiver batch, so binding 0 is that stage's image and
+    // input.uv carries the stage's generated/authored coordinates.
+    let diffuse = textureSample(base_texture, base_sampler, input.uv).rgb;
+    var contribution = vec3<f32>(0.0);
+
+    for (var bit = 0u; bit < transient_count; bit += 1u) {
+        if ((dlight_bits & (1u << bit)) == 0u) {
+            continue;
+        }
+        let light = dynamic_lights[transient_start + bit];
+        if (light.shadow.w < 0.5) {
+            continue;
+        }
+
+        let radius = max(light.position_radius.w, 1.0);
+        let radius_sq = radius * radius;
+        let to_light = light.position_radius.xyz - input.world_position;
+        let plane_distance = dot(plane_normal, to_light);
+        // OpenJK rejects backfaces and triangles whose plane is outside radius.
+        if (plane_distance <= 0.0 || plane_distance >= radius) {
+            continue;
+        }
+
+        let projected_radius_sq = radius_sq - plane_distance * plane_distance;
+        if (projected_radius_sq <= 1.0e-6) {
+            continue;
+        }
+        let planar = to_light - plane_normal * plane_distance;
+        let planar_distance = length(planar);
+        let projected_radius = sqrt(projected_radius_sq);
+        if (planar_distance >= projected_radius) {
+            continue;
+        }
+
+        // ProjectDlightTexture2 uses fac = 0.5 / projected_radius and centers
+        // the dlight texture at (0.5, 0.5). The fallback image is radial, so its
+        // orientation in the triangle plane is immaterial; only radius matters.
+        let projected_texel_radius = 0.5 * planar_distance / projected_radius;
+        let dlight_image = sample_openjk_dlight_fallback(
+            vec2<f32>(0.5 + projected_texel_radius, 0.5)
+        );
+        if (dlight_image <= 0.0) {
+            continue;
+        }
+
+        let plane_modulate = 1.0 - (plane_distance * plane_distance) / radius_sq;
+        // Preserve DinurdoJK's existing Legacy source-strength calibration while
+        // replacing only the expensive full-material subtraction. The spatial
+        // projection and triangle-plane attenuation above are OpenJK's.
+        contribution += diffuse
+            * light.color_intensity.rgb
+            * light.color_intensity.a
+            * plane_modulate
+            * dlight_image
+            * 0.225;
+    }
+    return contribution;
 }
 
 struct WeatherSurfaceResponse {
@@ -1877,6 +2053,54 @@ fn openjk_global_fog_alpha(forward_normalized: f32) -> f32 {
     let a0 = openjk_fog_texel_alpha(x0);
     let a1 = openjk_fog_texel_alpha(x0 + 1.0);
     return mix(a0, a1, frac_x);
+}
+
+// jaPRO SP-physics jump-height helper (jump_shade.rs). World Y is JKA Z, so heights
+// compare directly. camera.jump_shade: x jump-line floor height, y highest reachable
+// floor height, z gradient range below the line, w strength (0 while grounded).
+// Compiled out unless the pipeline variant carries ENABLE_JUMP_SHADE.
+fn apply_jump_shade(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
+    if (!ENABLE_JUMP_SHADE || camera.jump_shade.w <= 0.0
+        || (material.header.z & MATERIAL_OPAQUE_STAGE) == 0u) {
+        return color;
+    }
+    // Only tint surfaces flat enough to land on. The facet slope comes from
+    // world-position derivatives so bad smoothed vertex normals cannot mislabel
+    // walls as floors; 0.71 is JKA's minimum walkable normal Z.
+    let facet = cross(dpdx(world_position), dpdy(world_position));
+    if (abs(facet.y) <= 0.71 * length(facet)) {
+        return color;
+    }
+    let line = camera.jump_shade.x;
+    var tint: vec3<f32>;
+    var strength = camera.jump_shade.w;
+    if (world_position.y < line) {
+        // Landing below the jump line keeps speed: green at the line (ideal),
+        // through yellow to red over the gradient range, then alternating
+        // red/pink 16-unit bands so deeper drops still read.
+        let depth = line - world_position.y;
+        let range = camera.jump_shade.z;
+        if (depth <= range) {
+            let t = depth / range;
+            tint = vec3<f32>(min(t * 2.0, 1.0), min((1.0 - t) * 2.0, 1.0), 0.0);
+        } else if ((i32(floor((depth - range) / 16.0)) & 1) == 0) {
+            tint = vec3<f32>(1.0, 0.0, 0.0);
+        } else {
+            tint = vec3<f32>(1.0, 0.45, 0.75);
+        }
+    } else {
+        // At or above the line but still reachable: the speed-penalty zone. Dim
+        // blue brightening to cyan at the apex, the highest floor you can reach.
+        let above_start = line + 1.0;
+        let apex = camera.jump_shade.y;
+        if (world_position.y <= above_start || world_position.y > apex) {
+            return color;
+        }
+        let u = clamp((world_position.y - above_start) / max(apex - above_start, 1.0), 0.0, 1.0);
+        tint = mix(vec3<f32>(0.0, 0.0, 0.35), vec3<f32>(0.0, 0.7, 0.9), u);
+        strength = strength * 0.85;
+    }
+    return vec4<f32>(mix(color.rgb, tint, strength), color.a);
 }
 
 fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
@@ -2909,6 +3133,32 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     );
 }
 
+@fragment fn fs_legacy_dlight_pass(
+    input: VertexOut,
+    @builtin(front_facing) _front: bool,
+) -> @location(0) vec4<f32> {
+    if (input.legacy_dlight_bits == 0u || (material.header.z & 4u) == 0u || camera.render_flags.x != 0u) {
+        discard;
+    }
+
+    // OpenJK performs this as a purpose-built projected-light redraw after the
+    // authored material stages. Do not call shade_surface here: the previous
+    // lit-minus-unlit implementation evaluated the complete world material
+    // twice for every dlight fragment and dominated GPU time.
+    var contribution = openjk_projected_dlight_contribution(input);
+    if (dot(contribution, contribution) <= 1.0e-12) {
+        discard;
+    }
+
+    // Separate Legacy fog has already been composited into the base world pass.
+    // The old inline dlight lived underneath it, so attenuate this late additive
+    // redraw by the same transmittance without re-running any material stages.
+    if (ENABLE_LEGACY_FOG) {
+        contribution *= 1.0 - legacy_separate_fog(input.world_position).a;
+    }
+    return vec4<f32>(contribution, 0.0);
+}
+
 @fragment fn fs_main(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     if (surface_deformation_should_discard(
         input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
@@ -2916,7 +3166,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     )) {
         discard;
     }
-    return shade_surface(input, front);
+    return apply_jump_shade(shade_surface(input, front), input.world_position);
 }
 
 @fragment fn fs_main_legacy_fog(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
@@ -2926,7 +3176,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     )) {
         discard;
     }
-    return apply_legacy_fog(shade_surface(input, front), input.world_position);
+    let shaded = apply_jump_shade(shade_surface(input, front), input.world_position);
+    return apply_legacy_fog(shaded, input.world_position);
 }
 
 @fragment fn fs_legacy_fog_pass(input: VertexOut, @builtin(front_facing) _front: bool) -> @location(0) vec4<f32> {

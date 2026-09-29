@@ -387,6 +387,7 @@ impl MapEditor {
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
+            fx_gpu_sprites: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,
         })
@@ -622,6 +623,7 @@ fn serialize_plane_prefix(style: BrushStyle, face: &MapFace) -> String {
     )
 }
 
+#[cfg(test)]
 fn replace_face_plane(
     original: &str,
     style: BrushStyle,

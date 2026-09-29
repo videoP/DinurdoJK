@@ -103,6 +103,9 @@ pub struct AssetSearchPath {
     /// callers deliberately fall through one package without changing global
     /// JKA search-path semantics.
     providers: BTreeMap<String, Vec<Provider>>,
+    /// Directories this search path was opened from (highest priority first),
+    /// so background readers can open an equivalent independent view.
+    search_dirs: Vec<PathBuf>,
 }
 
 impl AssetSearchPath {
@@ -131,11 +134,18 @@ impl AssetSearchPath {
             index: BTreeMap::new(),
             allow_asset_overrides: true,
             providers: BTreeMap::new(),
+            search_dirs: Vec::new(),
         };
         for dir in dirs {
+            result.search_dirs.push(dir.as_ref().to_path_buf());
             result.mount_directory(dir.as_ref())?;
         }
         Ok(result)
+    }
+
+    /// Directories this search path was opened from, highest priority first.
+    pub fn search_dirs(&self) -> &[PathBuf] {
+        &self.search_dirs
     }
 
     fn mount_directory(&mut self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

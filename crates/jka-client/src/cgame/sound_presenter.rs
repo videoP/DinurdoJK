@@ -1,10 +1,14 @@
 //! CG_EntityEvent sound semantics, separated from the device/mixer implementation.
-use crate::audio::{AudioBackend, AudioInfo, Listener, LoopRequest, SoundAssets, SoundOrigin, SoundRequest};
+use crate::audio::{
+    AudioBackend, AudioInfo, Listener, LoopRequest, SoundAssets, SoundDecodeJob,
+    SoundDecodeResult, SoundOrigin, SoundRequest,
+};
 use crate::steam_audio::SteamAudioBakeData;
+use jka_protocol::entity_event::EntityEvent;
 use jka_assets::{
     bsp::AcousticMesh,
     pk3::AssetSearchPath,
-    saber::{load_saber_definitions, SaberDefinitions},
+    saber::{load_saber_definitions, SaberDefinition, SaberDefinitions},
     siege::SiegeClassVisual,
 };
 use std::{collections::{HashMap, HashSet}, sync::Arc};
@@ -22,6 +26,27 @@ const MAX_SOUND_CONFIG_BYTES: usize = 4096;
 struct CustomSoundProfile {
     sound_dir: String,
     female: bool,
+}
+
+pub(crate) type PreparedSoundEvent = Result<Option<SoundRequest>, &'static str>;
+
+pub(crate) fn prepare_sound_event(
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+    saber_definitions: &SaberDefinitions,
+) -> PreparedSoundEvent {
+    match event.event {
+        EntityEvent::EV_SABER_ATTACK => {
+            saber_attack_request(saber_definitions, event, game, siege_classes).map(Some)
+        }
+        EntityEvent::EV_SABER_HIT
+        | EntityEvent::EV_SABER_BLOCK
+        | EntityEvent::EV_SABER_CLASHFLARE => {
+            saber_impact_request(saber_definitions, event, game, siege_classes)
+        }
+        _ => sound_request(event, game),
+    }
 }
 
 pub struct SoundPresenter {
@@ -63,6 +88,10 @@ impl SoundPresenter {
     /// OpenJK `cgs.inlineModelMidpoints` for the loaded BSP.
     pub fn set_inline_model_midpoints(&mut self, midpoints: Arc<[[f32; 3]]>) {
         self.inline_model_midpoints = midpoints;
+    }
+
+    pub(crate) fn saber_definitions(&self) -> &SaberDefinitions {
+        &self.saber_definitions
     }
 
     /// This frame's looping sounds, as CGame submits them from CG_AddCEntity:
@@ -172,18 +201,49 @@ impl SoundPresenter {
     pub fn info(&self) -> Option<AudioInfo> { self.backend.as_ref().map(AudioBackend::info) }
     pub fn source_rate_summary(&self) -> String { self.assets.sample_rate_summary() }
 
-    pub fn dispatch(
+    /// Stage direct (non-custom `*voice`) SFX referenced by an already-pure
+    /// event preparation batch. VFS reads stay here on the owner thread; the
+    /// returned compressed bytes can be decoded safely by event workers.
+    pub(crate) fn stage_prepared_asset_decodes<'a, I>(&mut self, sounds: I) -> Vec<SoundDecodeJob>
+    where
+        I: IntoIterator<Item = &'a PreparedSoundEvent>,
+    {
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for prepared in sounds {
+            let Ok(Some(request)) = prepared else { continue };
+            if request.qpath.starts_with('*') {
+                // Custom player/NPC sounds need profile/VFS fallback resolution
+                // and remain in ordered SoundPresenter dispatch for now.
+                continue;
+            }
+            let key = request.qpath.replace('\\', "/").to_ascii_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(job) = self.assets.stage_decode(&request.qpath) {
+                jobs.push(job);
+            }
+        }
+        jobs
+    }
+
+    pub(crate) fn queue_predecoded_assets<I>(&mut self, results: I)
+    where
+        I: IntoIterator<Item = SoundDecodeResult>,
+    {
+        self.assets.queue_predecoded(results);
+    }
+
+    pub(crate) fn dispatch_prepared(
         &mut self,
         event: &PresentationEvent,
         game: &ClientGameState,
         siege_classes: &[SiegeClassVisual],
         now: i32,
+        prepared: PreparedSoundEvent,
     ) -> Option<EventDispatchResult> {
-        let mut request = match if event.event == 29 {
-            self.saber_attack_request(event, game, siege_classes).map(Some)
-        } else {
-            sound_request(event, game)
-        } {
+        let mut request = match prepared {
             Ok(Some(request)) => request,
             Ok(None) => return None,
             Err(reason) => return Some(EventDispatchResult::Partial(reason)),
@@ -215,13 +275,13 @@ impl SoundPresenter {
                 // custom jump exertion over roll1.wav. Keep those two-source
                 // cases instead of collapsing CG_EntityEvent to one sound.
                 let companion = match event.event {
-                    11 if event.parm > 44 => Some(SoundRequest {
+                    EntityEvent::EV_FALL if event.parm > 44 => Some(SoundRequest {
                         qpath: "*land1.wav".to_owned(),
                         entity: request.entity,
                         channel: 3, // CHAN_VOICE
                         origin: SoundOrigin::Entity(event.position),
                     }),
-                    17 => Some(SoundRequest {
+                    EntityEvent::EV_ROLL => Some(SoundRequest {
                         qpath: "*jump1.wav".to_owned(),
                         entity: request.entity,
                         channel: 3, // CHAN_VOICE
@@ -253,7 +313,7 @@ impl SoundPresenter {
                     registered.map(|sound| (extra, sound))
                 });
 
-                let radio_request = if event.event == 75 {
+                let radio_request = if event.event == EntityEvent::EV_VOICECMD_SOUND {
                     let local_client = game
                         .current_snapshot()
                         .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"))
@@ -289,9 +349,9 @@ impl SoundPresenter {
                 // Absorb-hit also needs a visual team-power effect. Voice commands
                 // now have both the in-world CHAN_VOICE and teammate radio copy;
                 // their localized chat caption is a separate UI feature.
-                Some(if event.event == 40 && event.parm == 3 {
+                Some(if event.event == EntityEvent::EV_PREDEFSOUND && event.parm == 3 {
                     EventDispatchResult::Partial("SOUND_PLAYED_FX_PENDING")
-                } else if event.event == 75 {
+                } else if event.event == EntityEvent::EV_VOICECMD_SOUND {
                     EventDispatchResult::Partial("VOICE_SOUND_PLAYED_CHAT_TEXT_PENDING")
                 } else {
                     EventDispatchResult::Handled("SOUND_PLAYED")
@@ -302,41 +362,6 @@ impl SoundPresenter {
                 Some(EventDispatchResult::Partial("SOUND_ASSET_UNAVAILABLE"))
             }
         }
-    }
-
-    /// OpenJK EV_SABER_ATTACK: use saber[0].swingSound1..3 when authored,
-    /// otherwise one of the stock saberhup1..8 sounds on CHAN_WEAPON.
-    fn saber_attack_request(
-        &self,
-        event: &PresentationEvent,
-        game: &ClientGameState,
-        siege_classes: &[SiegeClassVisual],
-    ) -> Result<SoundRequest, &'static str> {
-        let info = if event.state.field_i32("eType").unwrap_or(ET_PLAYER) == ET_NPC {
-            game.npc_client_info(&event.state).ok()
-        } else {
-            game.client_info(usize::from(event.entity_num), siege_classes)
-        };
-        let variant3 = event_variant(event, 3);
-        let qpath = info
-            .as_ref()
-            .and_then(|info| self.saber_definitions.get(&info.saber_name))
-            .filter(|definition| definition.swing_sounds[0].is_some())
-            .and_then(|definition| {
-                definition.swing_sounds[variant3]
-                    .clone()
-                    .or_else(|| definition.swing_sounds[0].clone())
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "sound/weapons/saber/saberhup{}.wav",
-                    event_variant(event, 8) + 1
-                )
-            });
-        let origin = super::entity_vec3(&event.state, "pos.trBase")
-            .map(SoundOrigin::Fixed)
-            .unwrap_or(SoundOrigin::Fixed(event.position));
-        Ok(SoundRequest { qpath, entity: event.entity_num, channel: 2, origin }) // CHAN_WEAPON
     }
 
     /// OpenJK CG_CustomSound/CG_LoadCISounds behavior for protocol sounds whose
@@ -451,11 +476,167 @@ impl SoundPresenter {
 
 }
 
+fn impact_saber_definition(
+    saber_definitions: &SaberDefinitions,
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+) -> Option<(SaberDefinition, bool)> {
+    let owner = event.state.field_i32("otherEntityNum2")?;
+    if !(0..1023).contains(&owner) {
+        return None;
+    }
+    let owner = u16::try_from(owner).ok()?;
+    let info = game
+        .entity_state(owner)
+        .and_then(|state| {
+            if state.field_i32("eType").unwrap_or(0) == ET_NPC {
+                game.npc_client_info(state).ok()
+            } else {
+                game.client_info(usize::from(owner), siege_classes)
+            }
+        })
+        .or_else(|| game.client_info(usize::from(owner), siege_classes))?;
+    let saber_num = event.state.field_i32("weapon").unwrap_or(0);
+    let saber_name = match saber_num {
+        0 => &info.saber_name,
+        1 => &info.saber2_name,
+        _ => return None,
+    };
+    let definition = saber_definitions.get(saber_name)?.clone();
+    let blade_num = event.state.field_i32("legsAnim").unwrap_or(0).max(0) as usize;
+    let second_style = definition.blade_style2_start > 0
+        && blade_num >= definition.blade_style2_start;
+    Some((definition, second_style))
+}
+
+/// OpenJK EV_SABER_HIT / EV_SABER_BLOCK / EV_SABER_CLASHFLARE audio.
+fn saber_impact_request(
+    saber_definitions: &SaberDefinitions,
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+) -> Result<Option<SoundRequest>, &'static str> {
+    let origin = SoundOrigin::Fixed(
+        super::entity_vec3(&event.state, "origin").unwrap_or(event.position),
+    );
+    match event.event {
+        EntityEvent::EV_SABER_HIT => {
+            // OpenJK EV_SABER_HIT only starts hitSound for flesh/special hits.
+            if event.parm == 0 {
+                return Ok(None);
+            }
+            let mut qpath = format!(
+                "sound/weapons/saber/saberhit{}.wav",
+                event_variant(event, 3) + 1
+            );
+            if let Some((definition, second_style)) =
+                impact_saber_definition(saber_definitions, event, game, siege_classes)
+            {
+                let sounds = if second_style {
+                    &definition.hit2_sounds
+                } else {
+                    &definition.hit_sounds
+                };
+                if sounds[0].is_some() {
+                    if let Some(custom) = sounds[event_variant(event, 3)]
+                        .clone()
+                        .or_else(|| sounds[0].clone())
+                    {
+                        qpath = custom;
+                    }
+                }
+            }
+            Ok(Some(SoundRequest {
+                qpath,
+                entity: event.entity_num,
+                channel: 0, // CHAN_AUTO
+                origin,
+            }))
+        }
+        EntityEvent::EV_SABER_BLOCK => {
+            if event.parm == 0 {
+                return Ok(None); // projectile deflect sound is authored by the EFX
+            }
+            let mut qpath = format!(
+                "sound/weapons/saber/saberblock{}.wav",
+                event_variant(event, 9) + 1
+            );
+            if let Some((definition, second_style)) =
+                impact_saber_definition(saber_definitions, event, game, siege_classes)
+            {
+                let sounds = if second_style {
+                    &definition.block2_sounds
+                } else {
+                    &definition.block_sounds
+                };
+                if sounds[0].is_some() {
+                    if let Some(custom) = sounds[event_variant(event, 3)]
+                        .clone()
+                        .or_else(|| sounds[0].clone())
+                    {
+                        qpath = custom;
+                    }
+                }
+            }
+            Ok(Some(SoundRequest {
+                qpath,
+                entity: event.entity_num,
+                channel: 0, // CHAN_AUTO
+                origin,
+            }))
+        }
+        EntityEvent::EV_SABER_CLASHFLARE => Ok(Some(SoundRequest {
+            qpath: format!(
+                "sound/weapons/saber/saberhitwall{}.wav",
+                event_variant(event, 3) + 1
+            ),
+            entity: 1023, // ENTITYNUM_NONE
+            channel: 2,  // CHAN_WEAPON
+            origin,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn saber_attack_request(
+    saber_definitions: &SaberDefinitions,
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+) -> Result<SoundRequest, &'static str> {
+    let info = if event.state.field_i32("eType").unwrap_or(ET_PLAYER) == ET_NPC {
+        game.npc_client_info(&event.state).ok()
+    } else {
+        game.client_info(usize::from(event.entity_num), siege_classes)
+    };
+    let variant3 = event_variant(event, 3);
+    let qpath = info
+        .as_ref()
+        .and_then(|info| saber_definitions.get(&info.saber_name))
+        .filter(|definition| definition.swing_sounds[0].is_some())
+        .and_then(|definition| {
+            definition.swing_sounds[variant3]
+                .clone()
+                .or_else(|| definition.swing_sounds[0].clone())
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "sound/weapons/saber/saberhup{}.wav",
+                event_variant(event, 8) + 1
+            )
+        });
+    let origin = super::entity_vec3(&event.state, "pos.trBase")
+        .map(SoundOrigin::Fixed)
+        .unwrap_or(SoundOrigin::Fixed(event.position));
+    Ok(SoundRequest { qpath, entity: event.entity_num, channel: 2, origin })
+}
+
 fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Option<SoundRequest>, &'static str> {
     let mut entity = event.entity_num;
     let variant4 = event_variant(event, 4) + 1;
     let (qpath, channel, origin) = match event.event {
-        2 => { // EV_FOOTSTEP: eventParm is the Raven material type.
+        EntityEvent::EV_FOOTSTEP => { // eventParm is the Raven material type.
             let stem = match event.parm {
                 17 => "mud_walk",                          // MATERIAL_MUD
                 7 => "dirt_step",                          // MATERIAL_DIRT
@@ -471,20 +652,20 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
             };
             (format!("sound/player/footsteps/{stem}{variant4}.wav"), 6, SoundOrigin::Entity(event.position))
         }
-        3 => (format!("sound/player/footsteps/metal_step{variant4}.wav"), 6, SoundOrigin::Entity(event.position)), // EV_FOOTSTEP_METAL
+        EntityEvent::EV_FOOTSTEP_METAL => (format!("sound/player/footsteps/metal_step{variant4}.wav"), 6, SoundOrigin::Entity(event.position)), // EV_FOOTSTEP_METAL
         // OpenJK maps splash, wade and swim events to FOOTSTEP_SPLASH here.
-        4 | 5 | 6 => (format!("sound/player/footsteps/water_run{variant4}.wav"), 6, SoundOrigin::Entity(event.position)),
-        11 => { // EV_FALL / DoFall. Hard falls also get *land1 via companion above.
+        EntityEvent::EV_FOOTSPLASH | EntityEvent::EV_FOOTWADE | EntityEvent::EV_SWIM => (format!("sound/player/footsteps/water_run{variant4}.wav"), 6, SoundOrigin::Entity(event.position)),
+        EntityEvent::EV_FALL => { // DoFall. Hard falls also get *land1 via companion above.
             let path = if event.parm > 44 { "sound/player/fallsplat.wav" } else { "sound/player/land1.wav" };
             (path.to_owned(), 0, SoundOrigin::Entity(event.position))
         }
-        16 => ("*jump1.wav".to_owned(), 3, SoundOrigin::Entity(event.position)), // EV_JUMP / CHAN_VOICE
-        17 => ("sound/player/roll1.wav".to_owned(), 6, SoundOrigin::Entity(event.position)), // EV_ROLL / CHAN_BODY
-        18 => ("sound/player/watr_in.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
-        19 => ("sound/player/watr_out.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
-        20 => ("sound/player/watr_un.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
-        21 => ("*gasp.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
-        75 => { // EV_VOICECMD_SOUND
+        EntityEvent::EV_JUMP => ("*jump1.wav".to_owned(), 3, SoundOrigin::Entity(event.position)), // EV_JUMP / CHAN_VOICE
+        EntityEvent::EV_ROLL => ("sound/player/roll1.wav".to_owned(), 6, SoundOrigin::Entity(event.position)), // EV_ROLL / CHAN_BODY
+        EntityEvent::EV_WATER_TOUCH => ("sound/player/watr_in.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
+        EntityEvent::EV_WATER_LEAVE => ("sound/player/watr_out.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
+        EntityEvent::EV_WATER_UNDER => ("sound/player/watr_un.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
+        EntityEvent::EV_WATER_CLEAR => ("*gasp.wav".to_owned(), 0, SoundOrigin::Entity(event.position)),
+        EntityEvent::EV_VOICECMD_SOUND => {
             entity = u16::try_from(event.state.field_i32("groundEntityNum").unwrap_or(-1))
                 .ok()
                 .filter(|&number| number < MAX_CLIENTS)
@@ -492,10 +673,10 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
             let path = game.sound_qpath(event.parm).ok_or("SOUND_RESOURCE_MISSING")?;
             (path, 3, SoundOrigin::Entity(event.position)) // CHAN_VOICE
         }
-        76 | 77 | 79 => {
+        EntityEvent::EV_GENERAL_SOUND | EntityEvent::EV_GLOBAL_SOUND | EntityEvent::EV_ENTITY_SOUND => {
             let channel = match event.event {
-                76 => event.state.field_i32("saberEntityNum").unwrap_or(0),
-                77 => 11, // CHAN_MENU1, positioned at the listener's head
+                EntityEvent::EV_GENERAL_SOUND => event.state.field_i32("saberEntityNum").unwrap_or(0),
+                EntityEvent::EV_GLOBAL_SOUND => 11, // CHAN_MENU1, positioned at the listener's head
                 _ => {
                     entity = u16::try_from(event.state.field_i32("clientNum").unwrap_or(-1))
                         .ok().filter(|&n| n < 1024).ok_or("SOUND_INVALID_ENTITY")?;
@@ -505,14 +686,14 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
             if channel >= 50 { return Err("TRACKED_SOUND_LOOP_PENDING"); }
             if channel < 0 { return Err("SOUND_INVALID_CHANNEL"); }
             let path = game.sound_qpath(event.parm).ok_or("SOUND_RESOURCE_MISSING")?;
-            let origin = if event.event == 77 {
+            let origin = if event.event == EntityEvent::EV_GLOBAL_SOUND {
                 entity = game.current_snapshot().and_then(|s| s.player_state.field_i32("clientNum"))
                     .and_then(|n| u16::try_from(n).ok()).unwrap_or(entity);
                 SoundOrigin::Local
             } else { SoundOrigin::Entity(event.position) };
             (path, channel, origin)
         }
-        40 => {
+        EntityEvent::EV_PREDEFSOUND => {
             let path = match event.parm {
                 1 => "protecthit", 2 => "protect", 3 => "absorbhit", 4 => "absorb",
                 5 => "jump", 6 => "grip", _ => return Err("PREDEFINED_SOUND_UNKNOWN"),
@@ -521,7 +702,7 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
             let origin = super::entity_vec3(&event.state, "origin").unwrap_or(event.position);
             (format!("sound/weapons/force/{path}.mp3"), 0, SoundOrigin::Fixed(origin))
         }
-        78 => return Err("GLOBAL_TEAM_SOUND_PENDING"), // enum, never a CS_SOUNDS index
+        EntityEvent::EV_GLOBAL_TEAM_SOUND => return Err("GLOBAL_TEAM_SOUND_PENDING"), // enum, never a CS_SOUNDS index
         _ => return Ok(None),
     };
     Ok(Some(SoundRequest { qpath, entity, channel, origin }))
@@ -634,16 +815,17 @@ mod tests {
     use super::*;
     use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
 
-    fn event(event: i32, parm: i32) -> PresentationEvent {
+    fn event(event: EntityEvent, parm: i32) -> PresentationEvent {
         let mut state = EntityState { number: 3, fields: [0; ENTITY_FIELDS.len()] };
         if let Some(index) = ENTITY_FIELDS.iter().position(|(name, _)| *name == "eType") {
             state.fields[index] = ET_PLAYER as u32;
         }
         PresentationEvent {
+            receive_sequence: 0,
             source_entity_num: 3,
             entity_num: 3,
             event,
-            raw_event: event,
+            raw_event: event.as_i32(),
             parm,
             position: [1.0, 2.0, 3.0],
             event_only_entity: false,
@@ -673,15 +855,15 @@ mod tests {
     fn movement_events_use_openjk_channels_and_assets() {
         let game = ClientGameState::new();
 
-        let jump = sound_request(&event(16, 0), &game).unwrap().unwrap();
+        let jump = sound_request(&event(EntityEvent::EV_JUMP, 0), &game).unwrap().unwrap();
         assert_eq!(jump.qpath, "*jump1.wav");
         assert_eq!(jump.channel, 3); // CHAN_VOICE
 
-        let hard_fall = sound_request(&event(11, 50), &game).unwrap().unwrap();
+        let hard_fall = sound_request(&event(EntityEvent::EV_FALL, 50), &game).unwrap().unwrap();
         assert_eq!(hard_fall.qpath, "sound/player/fallsplat.wav");
         assert_eq!(hard_fall.channel, 0); // CHAN_AUTO
 
-        let roll = sound_request(&event(17, 0), &game).unwrap().unwrap();
+        let roll = sound_request(&event(EntityEvent::EV_ROLL, 0), &game).unwrap().unwrap();
         assert_eq!(roll.qpath, "sound/player/roll1.wav");
         assert_eq!(roll.channel, 6); // CHAN_BODY
     }
@@ -689,19 +871,19 @@ mod tests {
     #[test]
     fn footstep_material_selects_openjk_pool() {
         let game = ClientGameState::new();
-        let metal = sound_request(&event(2, 3), &game).unwrap().unwrap();
+        let metal = sound_request(&event(EntityEvent::EV_FOOTSTEP, 3), &game).unwrap().unwrap();
         assert!(metal.qpath.starts_with("sound/player/footsteps/metal_step"));
         assert!(metal.qpath.ends_with(".wav"));
         assert_eq!(metal.channel, 6);
 
-        let wood = sound_request(&event(2, 1), &game).unwrap().unwrap();
+        let wood = sound_request(&event(EntityEvent::EV_FOOTSTEP, 1), &game).unwrap().unwrap();
         assert!(wood.qpath.starts_with("sound/player/footsteps/wood_walk"));
         assert_eq!(wood.channel, 6);
     }
 
     #[test]
     fn event_variant_is_stable_for_same_event() {
-        let event = event(29, 7);
+        let event = event(EntityEvent::EV_SABER_ATTACK, 7);
         assert_eq!(event_variant(&event, 8), event_variant(&event, 8));
         assert!(event_variant(&event, 8) < 8);
     }

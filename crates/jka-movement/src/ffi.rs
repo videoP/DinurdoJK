@@ -50,6 +50,8 @@ unsafe extern "C" {
     pub fn jka_player_jump_level(player: *mut c_void, level: i32);
     pub fn jka_player_knockback(player: *mut c_void, velocity: *const f32, duration: i32);
     pub fn jka_player_set_noclip(player: *mut c_void, enabled: i32);
+    pub fn jka_player_teleport(player: *mut c_void, origin: *const f32, angles: *const f32, speed: i32);
+    pub fn jka_player_give_all(player: *mut c_void);
     pub fn jka_player_set_saber_movement_info(
         player: *mut c_void,
         saber_num: i32,

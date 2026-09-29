@@ -16,17 +16,17 @@ use super::*;
 const TOP_ITEMS: [&str; 7] = [
     "GAME", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE", "MOD",
 ];
-const SETUP_TABS: [&str; 6] = ["GAME", "VIDEO", "INPUT", "AUDIO", "NETWORK", "INTERFACE"];
+const SETUP_TABS: [&str; 5] = ["GAME", "VIDEO", "AUDIO", "NETWORK", "INTERFACE"];
 
 const TOP_RESUME: usize = 0;
+const TOP_PROFILE: usize = 2;
 const TOP_CONTROLS: usize = 3;
 const TOP_SETUP: usize = 4;
 
 const SETUP_TAB_VIDEO: usize = 1;
-const SETUP_TAB_INPUT: usize = 2;
-const SETUP_TAB_AUDIO: usize = 3;
-const SETUP_TAB_NETWORK: usize = 4;
-const SETUP_TAB_INTERFACE: usize = 5;
+const SETUP_TAB_AUDIO: usize = 2;
+const SETUP_TAB_NETWORK: usize = 3;
+const SETUP_TAB_INTERFACE: usize = 4;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
 /// label, a full-width meter and its readout: on the Video page the world
@@ -40,7 +40,196 @@ const GUTTER: f32 = 24.0;
 /// Keep the renderer hidden until the frontend BSP is actually ready, then
 /// reveal it gently behind the menu. This also replaces the renderer's empty
 /// world/fog clear color with intentional black during startup.
-const FRONTEND_SCENE_FADE_IN_SECS: f32 = 2.0;
+const FRONTEND_SCENE_FADE_IN_SECS: f32 = 4.0;
+
+const PROFILE_SECTIONS: [&str; 4] = ["IDENTITY", "MODEL", "FORCE", "SABER"];
+const PROFILE_IDENTITY: usize = 0;
+const PROFILE_MODEL: usize = 1;
+const PROFILE_FORCE: usize = 2;
+const PROFILE_SABER: usize = 3;
+
+// OpenJK bg_misc.c / TaystJK ui_force.c. Keep Profile force editing on the
+// protocol-26 rank-side-18digits representation rather than inventing a new
+// loadout format.
+const FORCE_MASTERY_POINTS: [i32; 8] = [0, 5, 10, 20, 30, 50, 75, 100];
+const FORCE_MASTERY_NAMES: [&str; 8] = [
+    "Uninitiated", "Initiate", "Padawan", "Jedi", "Jedi Adept", "Jedi Guardian",
+    "Jedi Knight", "Jedi Master",
+];
+const FORCE_COSTS: [[i32; 4]; 18] = [
+    [0, 2, 4, 6], [0, 0, 2, 6], [0, 2, 4, 6], [0, 1, 3, 6], [0, 1, 3, 6],
+    [0, 4, 6, 8], [0, 1, 3, 6], [0, 2, 5, 8], [0, 4, 6, 8], [0, 2, 5, 8],
+    [0, 1, 3, 6], [0, 1, 3, 6], [0, 1, 3, 6], [0, 2, 4, 6], [0, 2, 5, 8],
+    [0, 1, 5, 8], [0, 1, 5, 8], [0, 4, 6, 8],
+];
+const FORCE_SIDES: [i32; 18] = [1, 0, 0, 0, 0, 1, 2, 2, 2, 1, 1, 1, 2, 2, 0, 0, 0, 0];
+const FORCE_NAMES: [&str; 18] = [
+    "Heal", "Jump", "Speed", "Push", "Pull", "Mind Trick", "Grip", "Lightning",
+    "Rage", "Protect", "Absorb", "Team Heal", "Team Force", "Drain", "Seeing",
+    "Saber Attack", "Saber Defense", "Saber Throw",
+];
+// Keep neutral powers visually stable at the top, then append only the chosen
+// alignment. This mirrors the stock allocation rules while making the modern
+// editor much easier to scan.
+const FORCE_NEUTRAL_ORDER: [usize; 8] = [1, 2, 3, 4, 14, 15, 16, 17];
+const FORCE_LIGHT_ORDER: [usize; 5] = [0, 5, 9, 10, 11];
+const FORCE_DARK_ORDER: [usize; 5] = [6, 7, 8, 13, 12];
+
+#[derive(Clone, Copy)]
+struct ProfileForceConfig {
+    rank: u8,
+    side: u8,
+    powers: [u8; 18],
+}
+
+impl ProfileForceConfig {
+    fn parse(value: &str) -> Self {
+        let mut out = Self { rank: 7, side: 1, powers: [0; 18] };
+        let mut parts = value.trim().splitn(3, '-');
+        out.rank = parts.next().and_then(|v| v.parse::<u8>().ok()).unwrap_or(7).min(7);
+        out.side = match parts.next().and_then(|v| v.parse::<u8>().ok()).unwrap_or(1) { 2 => 2, _ => 1 };
+        if let Some(powers) = parts.next() {
+            for (index, byte) in powers.bytes().take(18).enumerate() {
+                if byte.is_ascii_digit() {
+                    out.powers[index] = (byte - b'0').min(3);
+                }
+            }
+        }
+        // ui_force.c always gives the player the free first Jump level.
+        out.powers[1] = out.powers[1].max(1);
+        out
+    }
+
+    fn serialize(self) -> String {
+        let powers = self.powers.iter().map(|level| char::from(b'0' + (*level).min(3))).collect::<String>();
+        format!("{}-{}-{powers}", self.rank, self.side)
+    }
+
+    fn budget(self) -> i32 {
+        FORCE_MASTERY_POINTS[self.rank.min(7) as usize]
+    }
+
+    fn used(self, free_saber: bool) -> i32 {
+        let mut total = 0;
+        for (power, &level) in self.powers.iter().enumerate() {
+            for rank in 1..=level.min(3) as usize {
+                if (power == 1 && rank == 1)
+                    || (free_saber && (power == 15 || power == 16) && rank == 1)
+                {
+                    continue;
+                }
+                total += FORCE_COSTS[power][rank];
+            }
+        }
+        total
+    }
+
+    fn normalize(&mut self, max_rank: u8, disabled: u32, gametype: i32, free_saber: bool) {
+        self.rank = self.rank.min(max_rank.min(7));
+        if self.side != 1 && self.side != 2 {
+            self.side = 2;
+        }
+
+        for power in 0..18 {
+            self.powers[power] = self.powers[power].min(3);
+            if self.powers[power] != 0
+                && FORCE_SIDES[power] != 0
+                && FORCE_SIDES[power] != self.side as i32
+            {
+                self.powers[power] = 0;
+            }
+            if self.powers[power] != 0 && disabled & (1u32 << power) != 0 {
+                self.powers[power] = 0;
+            }
+        }
+        if gametype < 6 {
+            self.powers[11] = 0;
+            self.powers[12] = 0;
+        }
+
+        // Port BG_LegalizedForcePowers' over-budget reduction order. It drains
+        // lower-ranked powers first, preserving higher investments, with the
+        // saber attack/defense/throw dependency handled exactly like OpenJK.
+        let allowed = self.budget();
+        let mut used = self.used(free_saber);
+        if used > allowed {
+            let min_saber = u8::from(free_saber);
+            let mut attempted_cycles = 0;
+            let mut power_cycle = 2u8;
+            while used > allowed {
+                for power in 0..18 {
+                    if used <= allowed {
+                        break;
+                    }
+                    if self.powers[power] != 0 && self.powers[power] < power_cycle {
+                        if power == 15
+                            && (self.powers[16] > min_saber || self.powers[17] > 0)
+                        {
+                            let which = if self.powers[17] != 0 { 17 } else { 16 };
+                            while self.powers[which] > 0 && used > allowed {
+                                let level = self.powers[which] as usize;
+                                if self.powers[which] > 1
+                                    || ((which != 15 || !free_saber)
+                                        && (which != 16 || !free_saber))
+                                {
+                                    used -= FORCE_COSTS[which][level];
+                                    self.powers[which] -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            while self.powers[power] > 0 && used > allowed {
+                                let level = self.powers[power] as usize;
+                                if self.powers[power] > 1
+                                    || (power != 1
+                                        && (power != 15 || !free_saber)
+                                        && (power != 16 || !free_saber))
+                                {
+                                    used -= FORCE_COSTS[power][level];
+                                    self.powers[power] -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                power_cycle = power_cycle.saturating_add(1);
+                attempted_cycles += 1;
+                if attempted_cycles > 18 {
+                    break;
+                }
+            }
+            if used > allowed {
+                self.powers = [0; 18];
+            }
+        }
+
+        if free_saber {
+            self.powers[15] = self.powers[15].max(1);
+            self.powers[16] = self.powers[16].max(1);
+        }
+        self.powers[1] = self.powers[1].max(1);
+
+        // BG_LegalizedForcePowers has deliberate special handling for these
+        // three disabled powers (all-force-disabled servers depend on it).
+        if disabled & (1u32 << 1) != 0 {
+            self.powers[1] = 1;
+        }
+        if disabled & (1u32 << 15) != 0 {
+            self.powers[15] = 3;
+        }
+        if disabled & (1u32 << 16) != 0 {
+            self.powers[16] = 3;
+        }
+        if self.powers[15] == 0 {
+            self.powers[16] = 0;
+            self.powers[17] = 0;
+        }
+    }
+}
+
 
 /// One entry in the Video page's left rail. Splitting the old single scrolling
 /// wall of settings into addressable sections is what makes the page skimmable;
@@ -53,6 +242,7 @@ pub(super) enum VideoSection {
     Visibility,
     Models,
     Lighting,
+    Effects,
     Shadows,
     Reflections,
     PostProcessing,
@@ -68,12 +258,13 @@ pub(super) enum VideoSection {
 }
 
 impl VideoSection {
-    const RENDERING: [(Self, &'static str); 12] = [
+    const RENDERING: [(Self, &'static str); 13] = [
         (Self::Display, "Display"),
         (Self::ImageQuality, "Image quality"),
         (Self::Visibility, "Visibility"),
         (Self::Models, "Models"),
         (Self::Lighting, "Lighting"),
+        (Self::Effects, "Effects"),
         (Self::Shadows, "Shadows"),
         (Self::Reflections, "Reflections"),
         (Self::PostProcessing, "Post processing"),
@@ -1171,12 +1362,15 @@ impl App {
         if self.frontend_page == FrontendPage::AssetViewer {
             return;
         }
-        let brightness = self.frontend_cinematic.map_or(0.0, |cinematic| {
-            let t = cinematic.started.elapsed().as_secs_f32() / FRONTEND_SCENE_FADE_IN_SECS;
-            let t = t.clamp(0.0, 1.0);
-            // Smoothstep avoids a visible pop in slope at either end of the fade.
-            t * t * (3.0 - 2.0 * t)
-        });
+        let brightness = self
+            .frontend_cinematic
+            .and_then(|cinematic| cinematic.fade_started)
+            .map_or(0.0, |started| {
+                let t = started.elapsed().as_secs_f32() / FRONTEND_SCENE_FADE_IN_SECS;
+                let t = t.clamp(0.0, 1.0);
+                // Smoothstep avoids a visible pop in slope at either end of the fade.
+                t * t * (3.0 - 2.0 * t)
+            });
         let blackout = 1.0 - brightness;
         if blackout <= 0.001 {
             return;
@@ -3406,6 +3600,9 @@ impl App {
                 return;
             }
         }
+        self.sync_profile_preview_mode(
+            !self.front_end && self.overlay == OverlayMode::Game && self.menu_selected == TOP_PROFILE,
+        );
         self.egui_repaint_requested = true;
         self.publish_ui();
     }
@@ -3537,9 +3734,9 @@ impl App {
                 // The server browser is data-dense and uses a two-pane table/detail
                 // layout, so it owns the full in-game body width. Other pages keep
                 // the compact 720-point column so the live world remains visible.
-                let server_browser_full_width =
-                    self.overlay == OverlayMode::Game && self.menu_selected == 1;
-                let content_w = if server_browser_full_width {
+                let full_width_page = self.overlay == OverlayMode::Game
+                    && matches!(self.menu_selected, 1 | TOP_PROFILE);
+                let content_w = if full_width_page {
                     ui.available_width()
                 } else {
                     ui.available_width().min(CONTENT_MAX_W)
@@ -3555,8 +3752,15 @@ impl App {
                 // captions carry their own halo instead (see `theme::glow_text`).
                 // Every other page sits on the renderer's blurred backdrop,
                 // where a solid panel reads better.
+                let profile_preview_page =
+                    self.overlay == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let frame = if on_video {
                     egui::Frame::new().fill(theme::VIDEO_SCRIM)
+                } else if profile_preview_page {
+                    // The right half is a renderer-owned 3D viewport; do not cover
+                    // it with the normal opaque menu body. The Profile controls
+                    // draw their own surface on the left.
+                    egui::Frame::new().fill(egui::Color32::TRANSPARENT)
                 } else {
                     egui::Frame::new()
                         .fill(theme::PANEL_FILL)
@@ -3585,7 +3789,6 @@ impl App {
             match self.setup_selected {
                 0 => self.egui_game_settings(ui),
                 SETUP_TAB_VIDEO => self.egui_video_page(ui),
-                SETUP_TAB_INPUT => self.egui_input_page(ui),
                 SETUP_TAB_AUDIO => self.egui_audio_page(ui),
                 SETUP_TAB_NETWORK => self.egui_network_page(ui),
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
@@ -3597,16 +3800,7 @@ impl App {
         match self.menu_selected {
             TOP_RESUME => self.egui_resume_page(ui),
             1 => self.egui_server_browser_page(ui),
-            2 => placeholder(
-                ui,
-                "PROFILE",
-                "Player identity and appearance.",
-                &[
-                    "Name and colours",
-                    "Player model and skin",
-                    "Saber hilt and blade colour",
-                ],
-            ),
+            TOP_PROFILE => self.egui_profile_page(ui),
             TOP_CONTROLS => self.egui_controls_page(ui),
             5 => placeholder(
                 ui,
@@ -3620,6 +3814,742 @@ impl App {
     }
 
     // -------------------------------------------------------------- pages --
+
+    fn profile_readout(ui: &mut egui::Ui, label: &str, value: &str) {
+        ui.horizontal(|ui| {
+            ui.set_min_height(22.0);
+            theme::label(ui, theme::plain(label, 11.5, theme::TEXT_FAINT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::label(ui, theme::plain(value, 11.5, theme::TEXT));
+            });
+        });
+    }
+
+    fn profile_model_icon_texture(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &ProfileModelEntry,
+    ) -> Option<egui::TextureHandle> {
+        let key = entry.value.to_ascii_lowercase();
+        if let Some(texture) = self.profile_model_icon_textures.get(&key) {
+            return Some(texture.clone());
+        }
+        let asset = entry.icon.as_ref()?;
+        let image = match image::load_from_memory_with_format(&asset.bytes, asset.format) {
+            Ok(image) => image.into_rgba8(),
+            Err(error) => {
+                eprintln!("Profile icon {} decode failed: {error}", entry.value);
+                return None;
+            }
+        };
+        let size = [image.width() as usize, image.height() as usize];
+        let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+        let texture = ctx.load_texture(
+            format!("profile-model-icon:{}", entry.value),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        self.profile_model_icon_textures.insert(key, texture.clone());
+        Some(texture)
+    }
+
+    fn profile_model_matches_team_filter(entry: &ProfileModelEntry, filter: u8) -> bool {
+        if filter == 0 {
+            return true;
+        }
+        let skin = entry.skin_name.to_ascii_lowercase();
+        let wanted = if filter == 1 { "red" } else { "blue" };
+        skin == wanted
+            || skin.starts_with(&format!("{wanted}_"))
+            || skin.starts_with(&format!("{wanted}-"))
+            || skin.starts_with(wanted)
+            || skin.ends_with(&format!("_{wanted}"))
+            || skin.ends_with(&format!("-{wanted}"))
+    }
+
+    fn profile_saber_label(entry: &ProfileSaberEntry) -> &str {
+        // Stock saber files may use @MENUS_* localization tokens. Until the
+        // string-package browser is wired into egui, the block identifier is a
+        // cleaner fallback than exposing the raw token.
+        if entry.display_name.is_empty() || entry.display_name.starts_with('@') {
+            &entry.name
+        } else {
+            &entry.display_name
+        }
+    }
+
+    fn profile_saber_is_single(entry: &ProfileSaberEntry) -> bool {
+        entry.saber_type.eq_ignore_ascii_case("SABER_SINGLE")
+    }
+
+    fn profile_saber_is_staff(entry: &ProfileSaberEntry) -> bool {
+        entry.saber_type.eq_ignore_ascii_case("SABER_STAFF")
+    }
+
+    fn profile_server_force_limits(&self) -> (u8, u32, i32, bool, Option<u8>) {
+        let info = if let Some(net) = self.net.as_ref() {
+            crate::net::mod_support::server_info(&net.session().decoder().configstrings)
+        } else if let Some(server) = self.local_server.as_ref() {
+            server
+                .configstrings()
+                .get(&crate::cgame::CS_SERVERINFO)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let value = |key: &[u8], fallback: i32| {
+            jka_protocol::commands::info_value(info, key)
+                .map(jka_protocol::commands::atoi)
+                .unwrap_or(fallback)
+        };
+        let max_rank = value(b"g_maxForceRank", 7).clamp(0, 7) as u8;
+        let disabled = value(b"g_forcePowerDisable", 0) as u32;
+        let gametype = value(b"g_gametype", 0);
+
+        // TaystJK UI_HasSetSaberOnly, ported verbatim in behavior. Jedi Master
+        // never grants the free saber; duel modes use g_duelWeaponDisable and
+        // other modes use g_weaponDisable. WP_NONE=0, WP_SABER=3, WP_NUM=19.
+        let free_saber = if gametype == 2 {
+            false
+        } else {
+            let weapon_disable = if matches!(gametype, 3 | 4) {
+                value(b"g_duelWeaponDisable", 0)
+            } else {
+                value(b"g_weaponDisable", 0)
+            } as u32;
+            (0..19).all(|weapon| {
+                weapon == 0 || weapon == 3 || (weapon_disable & (1u32 << weapon)) != 0
+            })
+        };
+
+        // UI_DrawForceSide: force-based teams pin Red to Dark and Blue to Light.
+        let forced_side = if value(b"g_forceBasedTeams", 0) != 0 {
+            self.game_session.as_ref().and_then(|session| {
+                let client_num = session
+                    .current_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"))
+                    .and_then(|client| usize::try_from(client).ok())?;
+                let team = session
+                    .client_game
+                    .client_info(client_num, &session.siege_classes)?
+                    .team;
+                match team {
+                    1 => Some(2), // TEAM_RED -> FORCE_DARKSIDE
+                    2 => Some(1), // TEAM_BLUE -> FORCE_LIGHTSIDE
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+        (max_rank, disabled, gametype, free_saber, forced_side)
+    }
+
+    fn egui_profile_page(&mut self, ui: &mut egui::Ui) {
+        self.ensure_profile_catalog();
+        theme::page_title(
+            ui,
+            "PROFILE",
+            "Protocol-26 player identity, appearance, Force loadout and saber selection.",
+        );
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (index, label) in PROFILE_SECTIONS.iter().enumerate() {
+                if theme::chip(ui, label, self.profile_selected_section == index).clicked() {
+                    self.profile_selected_section = index;
+                    self.profile_preview_key = None;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        let height = ui.available_height().max(280.0);
+        ui.horizontal(|ui| {
+            let controls_w = (ui.available_width() * 0.46).clamp(390.0, 610.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(controls_w, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::PANEL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_min_width((controls_w - 24.0).max(1.0));
+                            ui.set_min_height((height - 24.0).max(1.0));
+                            egui::ScrollArea::vertical()
+                                .id_salt("profile_controls")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| match self.profile_selected_section {
+                                    PROFILE_IDENTITY => self.egui_profile_identity(ui),
+                                    PROFILE_MODEL => self.egui_profile_model(ui),
+                                    PROFILE_FORCE => self.egui_profile_force(ui),
+                                    PROFILE_SABER => self.egui_profile_saber(ui),
+                                    _ => {}
+                                });
+                        });
+                },
+            );
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(14.0);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let saber = self.profile_selected_section == PROFILE_SABER;
+                    theme::section(
+                        ui,
+                        if saber { "SABER PREVIEW" } else { "PLAYER PREVIEW" },
+                        "Drag to rotate · wheel to zoom",
+                    );
+                    let preview_h = ui.available_height().max(220.0);
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), preview_h),
+                        egui::Sense::drag(),
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        egui::CornerRadius::ZERO,
+                        egui::Stroke::new(1.0_f32, theme::LINE),
+                        egui::StrokeKind::Inside,
+                    );
+                    if response.dragged() {
+                        let delta = ui.input(|input| input.pointer.delta());
+                        if delta.x.abs() > f32::EPSILON {
+                            self.profile_preview_yaw =
+                                (self.profile_preview_yaw + delta.x * 0.45).rem_euclid(360.0);
+                            self.profile_preview_key = None;
+                        }
+                    }
+                    if response.hovered() {
+                        let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
+                        if scroll.abs() > f32::EPSILON {
+                            self.profile_preview_zoom = (self.profile_preview_zoom
+                                * (-scroll * 0.0015).exp())
+                                .clamp(0.45, 2.5);
+                            self.profile_preview_key = None;
+                        }
+                    }
+                    self.set_asset_preview_viewport(rect, ui.ctx().pixels_per_point());
+                    let caption = if saber {
+                        &self.network.saber1
+                    } else {
+                        &self.solo_client_info.model_name
+                    };
+                    ui.painter().text(
+                        rect.left_bottom() + egui::vec2(10.0, -10.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        caption,
+                        egui::FontId::proportional(11.5),
+                        theme::TEXT_FAINT,
+                    );
+                },
+            );
+        });
+        // The Profile idle is intentionally capped to ~30 Hz rather than
+        // forcing egui to repaint at the uncapped game/render rate.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        self.update_profile_preview();
+    }
+
+    fn egui_profile_identity(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "IDENTITY", "Userinfo sent to protocol-26 servers");
+        theme::label(ui, theme::plain("NAME", 11.5, theme::TEXT_FAINT));
+        ui.add_space(4.0);
+        let edit = egui::TextEdit::singleline(&mut self.profile_name_input)
+            .desired_width(ui.available_width())
+            .hint_text("Player name");
+        let response = ui.add(edit);
+        let apply_enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        ui.add_space(8.0);
+        if (theme::primary_button(ui, "APPLY NAME").clicked() || apply_enter)
+            && !self.profile_name_input.trim().is_empty()
+        {
+            let value = self.profile_name_input.trim().to_owned();
+            if let Err(error) = self.set_console_cvar("name", &value) {
+                self.console_status = error;
+            }
+        }
+
+        theme::section(ui, "CURRENT LOADOUT", "Uses the same cvars as the stock client");
+        Self::profile_readout(ui, "MODEL", &self.solo_client_info.model_cvar());
+        Self::profile_readout(ui, "PRIMARY SABER", &self.network.saber1);
+        Self::profile_readout(ui, "SECONDARY SABER", &self.network.saber2);
+        Self::profile_readout(ui, "FORCE", &self.network.forcepowers);
+    }
+
+    fn egui_profile_model(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "PLAYER MODEL",
+            "One tile per humanoid model · hover a tile to choose its skin variants",
+        );
+
+        ui.horizontal(|ui| {
+            let filters_width = 154.0;
+            ui.add_sized(
+                [(ui.available_width() - filters_width).max(120.0), 24.0],
+                egui::TextEdit::singleline(&mut self.profile_model_search)
+                    .hint_text("Search model or skin…"),
+            );
+            if theme::chip(ui, "ALL", self.profile_model_team_filter == 0).clicked() {
+                self.profile_model_team_filter = 0;
+            }
+            if theme::chip(ui, "RED", self.profile_model_team_filter == 1).clicked() {
+                self.profile_model_team_filter = 1;
+            }
+            if theme::chip(ui, "BLUE", self.profile_model_team_filter == 2).clicked() {
+                self.profile_model_team_filter = 2;
+            }
+        });
+
+        if let Some(error) = &self.profile_catalog_error {
+            ui.add_space(8.0);
+            theme::banner(ui, error, theme::WARNING);
+        }
+        ui.add_space(10.0);
+
+        let needle = self.profile_model_search.trim().to_ascii_lowercase();
+        let mut models = BTreeMap::<String, Vec<ProfileModelEntry>>::new();
+        for entry in self.profile_models.iter().filter(|entry| {
+            Self::profile_model_matches_team_filter(entry, self.profile_model_team_filter)
+        }) {
+            models.entry(entry.model_name.clone()).or_default().push(entry.clone());
+        }
+        models.retain(|model_name, variants| {
+            if needle.is_empty() || model_name.to_ascii_lowercase().contains(&needle) {
+                true
+            } else {
+                variants.iter().any(|entry| {
+                    entry.skin_name.to_ascii_lowercase().contains(&needle)
+                        || entry.value.to_ascii_lowercase().contains(&needle)
+                })
+            }
+        });
+
+        let current = self.solo_client_info.model_cvar();
+        let current_model = self.solo_client_info.model_name.clone();
+        let ctx = ui.ctx().clone();
+        let tile = egui::vec2(92.0, 116.0);
+        let columns = ((ui.available_width() + 8.0) / (tile.x + 8.0)).floor().max(1.0) as usize;
+        let mut pending_model: Option<String> = None;
+        let mut visible_count = 0usize;
+
+        egui::Grid::new("profile-model-grid")
+            .num_columns(columns)
+            .spacing(egui::vec2(8.0, 10.0))
+            .show(ui, |ui| {
+                for (model_name, mut variants) in models {
+                    variants.sort_by(|a, b| a.skin_name.cmp(&b.skin_name));
+                    let representative = variants
+                        .iter()
+                        .find(|entry| entry.value.eq_ignore_ascii_case(&current))
+                        .or_else(|| variants.iter().find(|entry| entry.skin_name.eq_ignore_ascii_case("default")))
+                        .unwrap_or(&variants[0])
+                        .clone();
+                    let selected_model = model_name.eq_ignore_ascii_case(&current_model);
+                    let (rect, response) = ui.allocate_exact_size(tile, egui::Sense::click());
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::CornerRadius::same(3),
+                        if selected_model { theme::PANEL_FILL } else { egui::Color32::TRANSPARENT },
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(3),
+                        egui::Stroke::new(
+                            if selected_model { 2.0_f32 } else { 1.0_f32 },
+                            if selected_model { theme::ACCENT } else { theme::LINE },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    let image_rect = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(4.0, 4.0),
+                        egui::pos2(rect.max.x - 4.0, rect.max.y - 25.0),
+                    );
+                    if let Some(texture) = self.profile_model_icon_texture(&ctx, &representative) {
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().rect_filled(image_rect, egui::CornerRadius::same(2), theme::PANEL_FILL);
+                        ui.painter().text(
+                            image_rect.center(), egui::Align2::CENTER_CENTER, "NO ICON",
+                            egui::FontId::proportional(9.0), theme::TEXT_FAINT,
+                        );
+                    }
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.max.y - 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        &model_name,
+                        egui::FontId::proportional(10.0),
+                        if selected_model { theme::TEXT } else { theme::TEXT_DIM },
+                    );
+
+                    let response = response.on_hover_ui(|ui| {
+                        ui.set_min_width(220.0);
+                        theme::label(ui, theme::plain(&model_name.to_ascii_uppercase(), 10.5, theme::TEXT_FAINT));
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for entry in &variants {
+                                let variant_size = egui::vec2(60.0, 80.0);
+                                let (vrect, vresponse) = ui.allocate_exact_size(variant_size, egui::Sense::click());
+                                let selected = entry.value.eq_ignore_ascii_case(&current);
+                                ui.painter().rect_stroke(
+                                    vrect,
+                                    egui::CornerRadius::same(2),
+                                    egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, if selected { theme::ACCENT } else { theme::LINE }),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let vimage = egui::Rect::from_min_max(
+                                    vrect.min + egui::vec2(3.0, 3.0),
+                                    egui::pos2(vrect.max.x - 3.0, vrect.max.y - 20.0),
+                                );
+                                if let Some(texture) = self.profile_model_icon_texture(&ctx, entry) {
+                                    ui.painter().image(
+                                        texture.id(), vimage,
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                ui.painter().text(
+                                    egui::pos2(vrect.center().x, vrect.max.y - 9.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    &entry.skin_name,
+                                    egui::FontId::proportional(8.5),
+                                    theme::TEXT_DIM,
+                                );
+                                if vresponse.clicked() {
+                                    pending_model = Some(entry.value.clone());
+                                }
+                            }
+                        });
+                    });
+                    if response.clicked() {
+                        pending_model = Some(representative.value.clone());
+                    }
+
+                    visible_count += 1;
+                    if visible_count % columns == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+
+        if let Some(value) = pending_model {
+            if !value.eq_ignore_ascii_case(&current) {
+                if let Err(error) = self.set_console_cvar("model", &value) {
+                    self.console_status = error;
+                } else {
+                    self.profile_preview_key = None;
+                }
+            }
+        }
+
+        if self.profile_models.is_empty() {
+            theme::banner(ui, "No humanoid models/players/*/model.glm assets were found.", theme::WARNING);
+        } else if visible_count == 0 {
+            theme::label(ui, theme::plain("No models match this filter.", 11.0, theme::TEXT_FAINT));
+        }
+
+        theme::section(
+            ui,
+            "FORCED PLAYER MODELS",
+            "Client-side only · preserves your own selected model",
+        );
+        let parsed = crate::cgame::ForcedPlayerModels::parse(&self.force_model)
+            .ok()
+            .flatten();
+        let mut mode = match &parsed {
+            None => 0u8,
+            Some(models) if models.split => 2,
+            Some(_) => 1,
+        };
+        let own = self.solo_client_info.model_cvar();
+        let mut ally = parsed.as_ref().map(|models| models.ally.clone()).unwrap_or_else(|| own.clone());
+        let mut enemy = parsed.as_ref().map(|models| models.enemy.clone()).unwrap_or_else(|| own.clone());
+
+        ui.horizontal(|ui| {
+            if theme::chip(ui, "OFF", mode == 0).clicked() {
+                mode = 0;
+            }
+            if theme::chip(ui, "ALL", mode == 1).clicked() {
+                if mode == 0 {
+                    ally = own.clone();
+                    enemy = own.clone();
+                } else if mode == 2 {
+                    enemy = ally.clone();
+                }
+                mode = 1;
+            }
+            if theme::chip(ui, "ALLY / ENEMY", mode == 2).clicked() {
+                if mode == 0 {
+                    ally = own.clone();
+                    enemy = own.clone();
+                }
+                mode = 2;
+            }
+        });
+
+        let mut choices = self.profile_models.iter().map(|entry| entry.value.clone()).collect::<Vec<_>>();
+        choices.sort_by_key(|value| value.to_ascii_lowercase());
+        choices.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let model_combo = |ui: &mut egui::Ui, id: &str, label: &str, value: &mut String| {
+            ui.horizontal(|ui| {
+                theme::label(ui, theme::plain(label, 10.5, theme::TEXT_FAINT));
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(value.as_str())
+                    .width((ui.available_width() - 4.0).max(150.0))
+                    .show_ui(ui, |ui| {
+                        for candidate in &choices {
+                            ui.selectable_value(value, candidate.clone(), candidate.as_str());
+                        }
+                    });
+            });
+        };
+        match mode {
+            1 => model_combo(ui, "profile-force-model-all", "MODEL", &mut ally),
+            2 => {
+                model_combo(ui, "profile-force-model-ally", "ALLY", &mut ally);
+                model_combo(ui, "profile-force-model-enemy", "ENEMY", &mut enemy);
+            }
+            _ => {
+                theme::label(
+                    ui,
+                    theme::plain(
+                        "Players use their own advertised models.",
+                        10.5,
+                        theme::TEXT_FAINT,
+                    ),
+                );
+            }
+        }
+
+        let desired = match mode {
+            0 => "0".to_owned(),
+            1 => ally.clone(),
+            _ => format!("{},{}", ally, enemy),
+        };
+        if !desired.eq_ignore_ascii_case(&self.force_model) {
+            if let Err(error) = self.set_console_cvar("cg_forceModel", &desired) {
+                self.console_status = error;
+            }
+        }
+        Self::profile_readout(ui, "CVAR", &self.force_model);
+    }
+
+    fn egui_profile_force(&mut self, ui: &mut egui::Ui) {
+        let (max_rank, disabled, gametype, free_saber, forced_side) =
+            self.profile_server_force_limits();
+        let mut force = ProfileForceConfig::parse(&self.network.forcepowers);
+        force.rank = max_rank;
+        if let Some(side) = forced_side {
+            force.side = side;
+        }
+        force.normalize(max_rank, disabled, gametype, free_saber);
+        let before = force.serialize();
+
+        theme::section(ui, "ALIGNMENT", "Light and Dark powers follow stock JKA restrictions");
+        ui.horizontal(|ui| {
+            let light = theme::chip(ui, "LIGHT", force.side == 1);
+            let dark = theme::chip(ui, "DARK", force.side == 2);
+            if forced_side.is_none() {
+                if light.clicked() { force.side = 1; }
+                if dark.clicked() { force.side = 2; }
+            }
+        });
+        if forced_side.is_some() {
+            theme::label(ui, theme::plain("Side is fixed by g_forceBasedTeams for your current team.", 10.5, theme::TEXT_FAINT));
+        }
+
+        theme::section(ui, "SERVER FORCE BUDGET", "g_maxForceRank controls the available points");
+        force.normalize(max_rank, disabled, gametype, free_saber);
+        let used = force.used(free_saber);
+        let budget = force.budget();
+        Self::profile_readout(
+            ui,
+            "MASTERY",
+            &format!("{} ({max_rank})", FORCE_MASTERY_NAMES[max_rank as usize]),
+        );
+        Self::profile_readout(ui, "POINTS", &format!("{used} / {budget}"));
+
+        theme::section(ui, "FORCE POWERS", "Neutral powers first, then the selected alignment");
+        let aligned = if force.side == 2 { &FORCE_DARK_ORDER[..] } else { &FORCE_LIGHT_ORDER[..] };
+        let order = FORCE_NEUTRAL_ORDER.iter().copied().chain(aligned.iter().copied());
+        let mut clicked_power = None;
+        for power in order {
+            let server_disabled = disabled & (1u32 << power) != 0 && !matches!(power, 1 | 15 | 16);
+            let team_disabled = gametype < 6 && matches!(power, 11 | 12);
+            let saber_dependency = matches!(power, 16 | 17) && force.powers[15] == 0;
+            let locked = server_disabled || team_disabled || saber_dependency;
+            ui.horizontal(|ui| {
+                ui.set_width(ui.available_width());
+                let color = if locked { theme::TEXT_DISABLED } else { theme::TEXT };
+                theme::label(ui, theme::plain(FORCE_NAMES[power], 11.5, color));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let min_level = if power == 1 || (free_saber && matches!(power, 15 | 16)) { 1 } else { 0 };
+                    for level in (min_level..=3).rev() {
+                        let response = theme::chip(ui, &level.to_string(), force.powers[power] == level as u8);
+                        if response.clicked() && !locked && force.powers[power] != level as u8 {
+                            force.powers[power] = level as u8;
+                            clicked_power = Some(power);
+                        }
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        }
+
+        if let Some(power) = clicked_power {
+            // Delay the animation until allocation clicks settle. Repeated level
+            // clicks for one power therefore restart a single preview, not a
+            // full Ghoul2 animation setup on every UI event.
+            self.profile_force_preview_pending = Some((power, Instant::now()));
+        }
+
+        force.normalize(max_rank, disabled, gametype, free_saber);
+        let after = force.serialize();
+        if after != before {
+            if let Err(error) = self.set_console_cvar("forcepowers", &after) {
+                self.console_status = error;
+            } else if self.live_connected() {
+                self.forward_command_to_server("forcechanged");
+            }
+        }
+    }
+
+    fn egui_profile_saber(&mut self, ui: &mut egui::Ui) {
+        let singles = self.profile_sabers
+            .iter()
+            .filter(|entry| Self::profile_saber_is_single(entry))
+            .cloned()
+            .collect::<Vec<_>>();
+        let staffs = self.profile_sabers
+            .iter()
+            .filter(|entry| Self::profile_saber_is_staff(entry))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let current_primary = self.network.saber1.clone();
+        let current_secondary = self.network.saber2.clone();
+        let secondary_active = !current_secondary.is_empty()
+            && !current_secondary.eq_ignore_ascii_case("none")
+            && !current_secondary.eq_ignore_ascii_case("remove");
+        let primary_is_staff = staffs.iter().any(|entry| entry.name.eq_ignore_ascii_case(&current_primary));
+        let mut mode = if secondary_active { 1u8 } else if primary_is_staff { 2u8 } else { 0u8 };
+        let mut primary = current_primary.clone();
+        let mut secondary = current_secondary.clone();
+
+        let default_single = singles
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("single_1"))
+            .or_else(|| singles.first())
+            .map(|entry| entry.name.clone());
+        let default_staff = staffs
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("dual_1"))
+            .or_else(|| staffs.first())
+            .map(|entry| entry.name.clone());
+
+        theme::section(ui, "SABER CONFIGURATION", "Stock saber types, presented as a modern compact selector");
+        ui.horizontal(|ui| {
+            if theme::chip(ui, "SINGLE", mode == 0).clicked() && mode != 0 {
+                mode = 0;
+                if !singles.iter().any(|entry| entry.name.eq_ignore_ascii_case(&primary)) {
+                    if let Some(name) = &default_single { primary = name.clone(); }
+                }
+                secondary = "none".to_owned();
+            }
+            if theme::chip(ui, "DUAL", mode == 1).clicked() && mode != 1 {
+                mode = 1;
+                if !singles.iter().any(|entry| entry.name.eq_ignore_ascii_case(&primary)) {
+                    if let Some(name) = &default_single { primary = name.clone(); }
+                }
+                if !singles.iter().any(|entry| entry.name.eq_ignore_ascii_case(&secondary)) {
+                    secondary = primary.clone();
+                }
+            }
+            if theme::chip(ui, "STAFF", mode == 2).clicked() && mode != 2 {
+                mode = 2;
+                if !staffs.iter().any(|entry| entry.name.eq_ignore_ascii_case(&primary)) {
+                    if let Some(name) = &default_staff { primary = name.clone(); }
+                }
+                secondary = "none".to_owned();
+            }
+        });
+
+        ui.add_space(8.0);
+        let combo = |ui: &mut egui::Ui, id: &str, label: &str, selected: &mut String, entries: &[ProfileSaberEntry]| {
+            ui.horizontal(|ui| {
+                theme::label(ui, theme::plain(label, 11.0, theme::TEXT_FAINT));
+                let selected_text = entries
+                    .iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(selected))
+                    .map(Self::profile_saber_label)
+                    .unwrap_or(selected.as_str())
+                    .to_owned();
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(selected_text)
+                    .width((ui.available_width() - 4.0).max(150.0))
+                    .show_ui(ui, |ui| {
+                        for entry in entries {
+                            ui.selectable_value(selected, entry.name.clone(), Self::profile_saber_label(entry));
+                        }
+                    });
+            });
+        };
+
+        match mode {
+            1 => {
+                combo(ui, "profile-saber-right", "RIGHT HAND", &mut primary, &singles);
+                combo(ui, "profile-saber-left", "LEFT HAND", &mut secondary, &singles);
+            }
+            2 => combo(ui, "profile-saber-staff", "STAFF HILT", &mut primary, &staffs),
+            _ => combo(ui, "profile-saber-single", "HILT", &mut primary, &singles),
+        }
+
+        let desired_secondary = if mode == 1 { secondary.as_str() } else { "none" };
+        if primary != current_primary {
+            if let Err(error) = self.set_console_cvar("saber1", &primary) {
+                self.console_status = error;
+            } else {
+                self.profile_preview_key = None;
+            }
+        }
+        if !desired_secondary.eq_ignore_ascii_case(&current_secondary) {
+            if let Err(error) = self.set_console_cvar("saber2", desired_secondary) {
+                self.console_status = error;
+            } else {
+                self.profile_preview_key = None;
+            }
+        }
+
+        if let Some(entry) = self.profile_sabers.iter().find(|entry| entry.name.eq_ignore_ascii_case(&primary)) {
+            theme::section(ui, "SELECTED", "Parsed directly from ext_data/sabers");
+            Self::profile_readout(ui, "NAME", Self::profile_saber_label(entry));
+            Self::profile_readout(ui, "TYPE", &entry.saber_type);
+            Self::profile_readout(ui, "MODEL", &entry.model);
+            Self::profile_readout(ui, "SKIN", entry.custom_skin.as_deref().unwrap_or("default"));
+            Self::profile_readout(ui, "BLADES", &entry.num_blades.to_string());
+        }
+
+        if self.profile_sabers.is_empty() {
+            theme::banner(ui, "No saber definitions were found.", theme::WARNING);
+        } else if singles.is_empty() {
+            theme::banner(ui, "No SABER_SINGLE definitions were found.", theme::WARNING);
+        } else if mode == 2 && staffs.is_empty() {
+            theme::banner(ui, "No SABER_STAFF definitions were found.", theme::WARNING);
+        }
+    }
 
     fn egui_resume_page(&mut self, ui: &mut egui::Ui) {
         if self.map_editor.is_some() {
@@ -3715,7 +4645,7 @@ impl App {
         });
     }
 
-    fn join_as(&mut self, mode: JoinMode) {
+    pub(super) fn join_as(&mut self, mode: JoinMode) {
         if self.live_connected() {
             let command = match mode {
                 JoinMode::Player => "team free",
@@ -3755,7 +4685,7 @@ impl App {
         theme::page_title(
             ui,
             "CONTROLS",
-            "Click a binding to rebind it.  Right-click clears it.",
+            "Base JKA bindings and mouse input. Click a binding to rebind it; right-click clears it.",
         );
 
         if self.controls_waiting_for_key {
@@ -3799,6 +4729,8 @@ impl App {
                         }
                     });
                 }
+
+                self.egui_mouse_controls(ui);
             });
 
         if let Some(index) = rebind {
@@ -3811,10 +4743,12 @@ impl App {
         }
     }
 
-    fn egui_input_page(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(ui, "INPUT", "Mouse and client input timing.");
-
-        theme::section(ui, "MOUSE", "");
+    fn egui_mouse_controls(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "MOUSE",
+            "Mouse look, raw-input scaling and client-side input latency controls.",
+        );
         macro_rules! mouse_number {
             ($label:literal, $tip:literal, $field:ident, $cvar:literal, $speed:expr, $decimals:expr) => {
                 theme::row(ui, $label, $tip, theme::Reset::None, |ui| {
@@ -3892,7 +4826,7 @@ impl App {
 
         theme::section(
             ui,
-            "ADVANCED LATENCY (A/B)",
+            "MOUSE - ADVANCED LATENCY (A/B)",
             "Windows scheduling experiments. These do not alter JKA movement or networking.",
         );
         theme::row(
@@ -4314,7 +5248,7 @@ impl App {
 
 /// The legacy control table stores SHOUTED labels; the menu reads them back in
 /// sentence case so it matches every other page.
-fn title_case(text: &str) -> String {
+pub(super) fn title_case(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut start_of_word = true;
     for ch in text.chars() {
@@ -4461,7 +5395,7 @@ fn menu_action(ui: &mut egui::Ui, label: &str, detail: &str, enabled: bool) -> b
     enabled && response.clicked()
 }
 
-fn binding_slot(
+pub(super) fn binding_slot(
     ui: &mut egui::Ui,
     text: &str,
     color: egui::Color32,

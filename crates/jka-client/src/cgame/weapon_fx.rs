@@ -5,14 +5,20 @@
 
 use super::{event_presenter::EventDispatchResult, ClientGameState, PresentationEvent, PresentedEntity};
 use super::player_presenter::PlayerFxRequest;
+use super::saber_melt::SaberMelt;
 use crate::{
     fx::{
-        system::{EffectId, FxDraw, FxFrame, FxLight, FxSound, FxStats, FxSystem},
+        system::{EffectId, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem},
         template::Rng,
     },
     ui::SaberMarkMode,
 };
-use jka_assets::pk3::AssetSearchPath;
+use jka_assets::{
+    pk3::AssetSearchPath,
+    saber::{load_saber_definitions, SaberDefinition, SaberDefinitions},
+    siege::SiegeClassVisual,
+};
+use jka_protocol::entity_event::EntityEvent;
 use jka_movement::{CollisionWorld, TraceQuery, TraceWorld, ENTITY_WORLD};
 use std::{
     collections::{HashMap, HashSet},
@@ -44,12 +50,6 @@ const EF_MISSILE_STICK: i32 = 1 << 22;
 const TR_STATIONARY: i32 = 0;
 const TR_INTERPOLATE: i32 = 1;
 
-const EV_PLAY_EFFECT: i32 = 68;
-const EV_PLAY_EFFECT_ID: i32 = 69;
-const EV_PLAY_PORTAL_EFFECT_ID: i32 = 70;
-const EV_MISSILE_HIT: i32 = 85;
-const EV_MISSILE_MISS: i32 = 86;
-const EV_MISSILE_MISS_METAL: i32 = 87;
 
 const MAX_EFX_BYTES: usize = 65536;
 const CONTINUOUS_FX_BACKFILL_MAX_MS: i32 = 250;
@@ -71,18 +71,11 @@ const SABER_MARK_LIFETIME_MS: i32 = 10_000;
 const SABER_MARK_FADE_MS: i32 = 1_000;
 const SABER_GLOW_LIFETIME_MS: i32 = 1_500;
 const SABER_MARK_MAX: usize = 768;
+/// Enhanced mode: minimum spacing of the stock contact spark burst per blade.
+const ENHANCED_SPARK_INTERVAL_MS: i32 = 110;
+/// Enhanced mode: minimum spacing of bubble-pop / droplet-landing sparks.
+const ENHANCED_MELT_SPARK_INTERVAL_MS: i32 = 80;
 const MAX_SABER_BLADES: usize = 8;
-
-// Enhanced is deliberately a separate cosmetic material simulation rather than
-// a variation of the stock mark quad. Contact is sampled spatially, heat is
-// accumulated by dwell time, and a smooth relief mesh is rebuilt while hot.
-const MELT_POINT_SPACING: f32 = 1.25;
-const MELT_HOLD_RADIUS: f32 = 1.8;
-const MELT_STROKE_BREAK_MS: i32 = 140;
-const MELT_COOL_TIME_MS: i32 = 8_000;
-const MELT_SCAR_LIFETIME_MS: i32 = 30_000;
-const MELT_MAX_POINTS_PER_STROKE: usize = 320;
-const MELT_MAX_FINISHED_STROKES: usize = 64;
 
 // Enhanced marks deliberately remain presentation-only. Rapier is a rigid-body
 // solver, not a viscous/soft-body surface solver; using it for attached melt
@@ -112,8 +105,9 @@ enum FxWorkerCommand {
     AdjustTime(i32),
     ResetTime(i32),
     PlayDir { name: String, origin: [f32; 3], dir: [f32; 3] },
+    PlayDirClass { name: String, origin: [f32; 3], dir: [f32; 3], class: FxClass },
     PlayAxis { name: String, origin: [f32; 3], axis: [[f32; 3]; 3] },
-    Frame { reply: mpsc::SyncSender<(FxFrame, FxStats)> },
+    Frame { saber_impact_fx: bool, reply: mpsc::SyncSender<(FxFrame, FxStats)> },
     Shutdown,
 }
 
@@ -137,8 +131,9 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
             FxWorkerCommand::AdjustTime(time) => worker.fx.adjust_time(time),
             FxWorkerCommand::ResetTime(time) => worker.fx.reset_time(time),
             FxWorkerCommand::PlayDir { name, origin, dir } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir(id, origin, dir); } }
+            FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
             FxWorkerCommand::PlayAxis { name, origin, axis } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect(id, origin, axis); } }
-            FxWorkerCommand::Frame { reply } => { let frame = worker.fx.frame(); let _ = reply.send((frame, worker.fx.stats())); }
+            FxWorkerCommand::Frame { saber_impact_fx, reply } => { let frame = worker.fx.frame_with_visibility(saber_impact_fx); let _ = reply.send((frame, worker.fx.stats())); }
             FxWorkerCommand::Shutdown => break,
         }
     }
@@ -186,6 +181,91 @@ fn madd3(origin: [f32; 3], direction: [f32; 3], distance: f32) -> [f32; 3] {
         origin[1] + direction[1] * distance,
         origin[2] + direction[2] * distance,
     ]
+}
+
+/// Profile-only blade geometry using the exact authored OpenJK saber
+/// glow/core shaders. This deliberately skips world contact, marks, trails and
+/// dynamic-light state; those belong to live gameplay, not the isolated menu.
+pub fn profile_saber_blade_draws(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    length: f32,
+    radius: f32,
+    color: i32,
+    entity_alpha: f32,
+    modern_sabers: bool,
+) -> Vec<FxDraw> {
+    if length < 0.5 || radius <= 0.0 {
+        return Vec::new();
+    }
+    let direction = normalize3(direction);
+    let tip = madd3(origin, direction, length);
+    let line_base = madd3(origin, direction, -1.0);
+    let (glow_shader, line_shader) = saber_shaders(color);
+    let intensity = (entity_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let white = [intensity, intensity, intensity, 255];
+    let mut draws = Vec::new();
+
+    if modern_sabers {
+        let soft = (f32::from(intensity) * 0.55).round() as u8;
+        draws.push(FxDraw::Line {
+            start: line_base,
+            end: tip,
+            width: radius * 1.8,
+            rgba: [soft, soft, soft, 255],
+            shader: glow_shader.to_owned(),
+        });
+        draws.push(FxDraw::Line {
+            start: line_base,
+            end: tip,
+            width: radius * 0.95,
+            rgba: white,
+            shader: glow_shader.to_owned(),
+        });
+        draws.push(FxDraw::Sprite {
+            origin,
+            radius: (radius * 1.5).max(5.5),
+            rotation: 0.0,
+            rgba: [soft, soft, soft, 255],
+            shader: glow_shader.to_owned(),
+        });
+        draws.push(FxDraw::Sprite {
+            origin: tip,
+            radius: radius * 0.9,
+            rotation: 0.0,
+            rgba: [soft, soft, soft, 255],
+            shader: glow_shader.to_owned(),
+        });
+    } else {
+        let mut distance = length;
+        let mut glow_radius = radius;
+        while distance > 0.0 {
+            draws.push(FxDraw::Sprite {
+                origin: madd3(origin, direction, distance),
+                radius: glow_radius,
+                rotation: 0.0,
+                rgba: white,
+                shader: glow_shader.to_owned(),
+            });
+            distance -= (glow_radius * 0.65).max(0.05);
+            glow_radius += 0.017;
+        }
+        draws.push(FxDraw::Sprite {
+            origin,
+            radius: 5.5,
+            rotation: 0.0,
+            rgba: white,
+            shader: glow_shader.to_owned(),
+        });
+    }
+    draws.push(FxDraw::Line {
+        start: tip,
+        end: line_base,
+        width: (radius / 3.0).max(0.01),
+        rgba: white,
+        shader: line_shader.to_owned(),
+    });
+    draws
 }
 
 fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -265,353 +345,6 @@ fn saber_mark_ribbon(
         ]
     });
     Some((positions, uvs))
-}
-
-fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    add3(a, scale3(sub3(b, a), t))
-}
-
-fn catmull_rom3(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], t: f32) -> [f32; 3] {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    std::array::from_fn(|i| {
-        0.5 * ((2.0 * p1[i])
-            + (-p0[i] + p2[i]) * t
-            + (2.0 * p0[i] - 5.0 * p1[i] + 4.0 * p2[i] - p3[i]) * t2
-            + (-p0[i] + 3.0 * p1[i] - 3.0 * p2[i] + p3[i]) * t3)
-    })
-}
-
-fn catmull_rom_scalar(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    0.5 * ((2.0 * p1)
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
-}
-
-fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    if (edge1 - edge0).abs() < 1.0e-6 {
-        return if value >= edge1 { 1.0 } else { 0.0 };
-    }
-    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn cooled_heat(point: &MeltPoint, time: i32) -> f32 {
-    let age = time.saturating_sub(point.last_heated_at).max(0) as f32;
-    let remaining = (1.0 - age / MELT_COOL_TIME_MS as f32).clamp(0.0, 1.0);
-    point.heat * remaining.powf(1.55)
-}
-
-fn gravity_on_surface(normal: [f32; 3]) -> [f32; 3] {
-    let gravity = [0.0, 0.0, -1.0];
-    let tangent = sub3(gravity, scale3(normal, dot3(gravity, normal)));
-    if length3(tangent) > 0.15 {
-        normalize3(tangent)
-    } else {
-        [0.0; 3]
-    }
-}
-
-fn smooth_melt_samples(stroke: &MeltStroke, time: i32) -> Vec<MeltRenderSample> {
-    let points = &stroke.points;
-    if points.is_empty() {
-        return Vec::new();
-    }
-    if points.len() == 1 {
-        let point = &points[0];
-        return vec![MeltRenderSample {
-            position: point.position,
-            normal: point.normal,
-            heat: cooled_heat(point, time),
-            dwell_ms: point.dwell_ms,
-            phase: point.phase,
-        }];
-    }
-
-    let mut out = Vec::new();
-    for index in 0..points.len() - 1 {
-        let i0 = index.saturating_sub(1);
-        let i1 = index;
-        let i2 = index + 1;
-        let i3 = (index + 2).min(points.len() - 1);
-        let p0 = &points[i0];
-        let p1 = &points[i1];
-        let p2 = &points[i2];
-        let p3 = &points[i3];
-        let segment_length = length3(sub3(p2.position, p1.position));
-        let steps = ((segment_length / 0.75).ceil() as usize).clamp(1, 8);
-        for step in 0..steps {
-            let t = step as f32 / steps as f32;
-            let normal = normalize3(catmull_rom3(p0.normal, p1.normal, p2.normal, p3.normal, t));
-            let h0 = cooled_heat(p0, time);
-            let h1 = cooled_heat(p1, time);
-            let h2 = cooled_heat(p2, time);
-            let h3 = cooled_heat(p3, time);
-            out.push(MeltRenderSample {
-                position: catmull_rom3(p0.position, p1.position, p2.position, p3.position, t),
-                normal,
-                heat: catmull_rom_scalar(h0, h1, h2, h3, t).max(0.0),
-                dwell_ms: catmull_rom_scalar(p0.dwell_ms, p1.dwell_ms, p2.dwell_ms, p3.dwell_ms, t).max(0.0),
-                phase: catmull_rom_scalar(p0.phase, p1.phase, p2.phase, p3.phase, t),
-            });
-        }
-    }
-    let point = points.last().unwrap();
-    out.push(MeltRenderSample {
-        position: point.position,
-        normal: point.normal,
-        heat: cooled_heat(point, time),
-        dwell_ms: point.dwell_ms,
-        phase: point.phase,
-    });
-    out
-}
-
-#[derive(Clone, Copy)]
-enum MeltLayer {
-    Scar,
-    Relief,
-    Halo,
-    Core,
-    WhiteCore,
-}
-
-fn heat_color(scale: f32, rgb: [f32; 3]) -> [u8; 4] {
-    [
-        (rgb[0] * scale).round().clamp(0.0, 255.0) as u8,
-        (rgb[1] * scale).round().clamp(0.0, 255.0) as u8,
-        (rgb[2] * scale).round().clamp(0.0, 255.0) as u8,
-        255,
-    ]
-}
-
-fn melt_strip_mesh(samples: &[MeltRenderSample], time: i32, layer: MeltLayer) -> Option<FxDraw> {
-    if samples.len() < 2 {
-        return None;
-    }
-    let cross: &[f32] = match layer {
-        MeltLayer::Relief => &[-1.0, -0.58, -0.20, 0.0, 0.20, 0.58, 1.0],
-        _ => &[-1.0, 1.0],
-    };
-    let mut positions = Vec::with_capacity(samples.len() * cross.len());
-    let mut uvs = Vec::with_capacity(positions.capacity());
-    let mut rgba = Vec::with_capacity(positions.capacity());
-    let mut indices = Vec::with_capacity((samples.len() - 1) * (cross.len() - 1) * 6);
-    let mut distance_along = 0.0_f32;
-
-    for (index, sample) in samples.iter().enumerate() {
-        if index > 0 {
-            distance_along += length3(sub3(sample.position, samples[index - 1].position));
-        }
-        let tangent = if index == 0 {
-            sub3(samples[1].position, sample.position)
-        } else if index + 1 == samples.len() {
-            sub3(sample.position, samples[index - 1].position)
-        } else {
-            sub3(samples[index + 1].position, samples[index - 1].position)
-        };
-        let side_raw = cross3(normalize3(tangent), sample.normal);
-        if length3(side_raw) < 1.0e-4 {
-            continue;
-        }
-        let side = normalize3(side_raw);
-        let hot = sample.heat.clamp(0.0, 1.5);
-        let hot01 = (hot / 1.25).clamp(0.0, 1.0);
-        let dwell = (sample.dwell_ms / 1000.0).max(0.0);
-        let mass = dwell.sqrt().min(2.2);
-        let wobble = 1.0 + (sample.phase + time as f32 * 0.0045).sin() * 0.045 * hot01;
-        let width = match layer {
-            MeltLayer::Scar => (0.95 + 0.55 * mass + 0.40 * hot01) * wobble,
-            MeltLayer::Relief => (1.05 + 1.15 * mass + 0.95 * hot01) * wobble,
-            MeltLayer::Halo => (1.55 + 1.45 * mass + 1.90 * hot01) * wobble,
-            MeltLayer::Core => (0.34 + 0.30 * mass + 0.48 * hot01) * wobble,
-            MeltLayer::WhiteCore => (0.12 + 0.15 * mass + 0.24 * hot01) * wobble,
-        };
-        let down = gravity_on_surface(sample.normal);
-        let slump = if down == [0.0; 3] {
-            0.0
-        } else {
-            ((sample.dwell_ms - 260.0).max(0.0) / 1000.0 * 1.45 * hot01).min(6.5)
-        };
-        let center = add3(sample.position, scale3(down, slump));
-
-        for &v in cross {
-            let abs_v = v.abs();
-            let relief = match layer {
-                MeltLayer::Scar => 0.16,
-                MeltLayer::Halo => 0.22,
-                MeltLayer::Core => 0.44 + 0.18 * hot01,
-                MeltLayer::WhiteCore => 0.54 + 0.20 * hot01,
-                MeltLayer::Relief => {
-                    if abs_v < 0.08 {
-                        0.15 + 0.08 * hot01
-                    } else if abs_v < 0.30 {
-                        0.48 + 0.95 * hot01 + 0.16 * mass
-                    } else if abs_v < 0.72 {
-                        0.30 + 0.58 * hot01 + 0.12 * mass
-                    } else {
-                        0.17 + 0.16 * hot01
-                    }
-                }
-            };
-            let position = add3(add3(center, scale3(side, width * v)), scale3(sample.normal, relief));
-            positions.push(position);
-            uvs.push([0.5 + distance_along * 0.065, 0.5 + v * 0.48]);
-            let color = match layer {
-                MeltLayer::Scar => [255; 4],
-                MeltLayer::Halo => heat_color(hot01.powf(0.65), [128.0, 32.0, 2.0]),
-                MeltLayer::Core => heat_color(smoothstep(0.10, 0.95, hot), [255.0, 154.0, 24.0]),
-                MeltLayer::WhiteCore => heat_color(smoothstep(0.62, 1.30, hot), [255.0, 246.0, 205.0]),
-                MeltLayer::Relief => {
-                    let lip = smoothstep(0.10, 0.92, hot);
-                    if abs_v < 0.10 {
-                        heat_color(lip, [210.0, 74.0, 5.0])
-                    } else if abs_v < 0.32 {
-                        heat_color(lip, [255.0, 190.0, 62.0])
-                    } else if abs_v < 0.72 {
-                        heat_color(lip, [238.0, 91.0, 8.0])
-                    } else {
-                        heat_color(lip * 0.65, [150.0, 32.0, 2.0])
-                    }
-                }
-            };
-            rgba.push(color);
-        }
-    }
-
-    if positions.len() != samples.len() * cross.len() {
-        return None;
-    }
-    let columns = cross.len() as u32;
-    for row in 0..(samples.len() as u32 - 1) {
-        for column in 0..columns - 1 {
-            let a = row * columns + column;
-            let b = (row + 1) * columns + column;
-            let c = (row + 1) * columns + column + 1;
-            let d = row * columns + column + 1;
-            indices.extend_from_slice(&[a, b, d, d, b, c]);
-        }
-    }
-    let shader = match layer {
-        MeltLayer::Scar => "gfx/damage/rivetmark",
-        MeltLayer::Relief | MeltLayer::Halo | MeltLayer::Core | MeltLayer::WhiteCore => "gfx/effects/saberDamageGlow",
-    };
-    Some(FxDraw::Mesh { positions, uvs, rgba, indices, shader: shader.to_owned() })
-}
-
-fn melt_blob_mesh(sample: MeltRenderSample, time: i32, hot_layer: bool) -> Option<FxDraw> {
-    let heat = sample.heat.clamp(0.0, 1.5);
-    let hot01 = (heat / 1.25).clamp(0.0, 1.0);
-    let dwell_s = (sample.dwell_ms / 1000.0).max(0.0);
-    if hot_layer && hot01 < 0.02 {
-        return None;
-    }
-    if dwell_s < 0.18 && !hot_layer {
-        return None;
-    }
-    let normal = sample.normal;
-    let down = gravity_on_surface(normal);
-    let right = if down == [0.0; 3] {
-        let trial = cross3(normal, [1.0, 0.0, 0.0]);
-        if length3(trial) > 0.1 { normalize3(trial) } else { normalize3(cross3(normal, [0.0, 1.0, 0.0])) }
-    } else {
-        normalize3(cross3(down, normal))
-    };
-    let down_axis = if down == [0.0; 3] { normalize3(cross3(normal, right)) } else { down };
-    let radius = (0.85 + dwell_s.sqrt() * 1.65 + hot01 * 0.75).min(5.8);
-    let sag = ((sample.dwell_ms - 240.0).max(0.0) / 1000.0 * 1.3 * hot01).min(6.0);
-    let pulse = 1.0 + (sample.phase + time as f32 * 0.004).sin() * 0.04 * hot01;
-    let center = add3(add3(sample.position, scale3(down_axis, sag * 0.38)), scale3(normal, if hot_layer { 0.50 } else { 0.18 }));
-    let segments = 20usize;
-    let mut positions = Vec::with_capacity(segments + 1);
-    let mut uvs = Vec::with_capacity(segments + 1);
-    let mut rgba = Vec::with_capacity(segments + 1);
-    positions.push(add3(center, scale3(normal, if hot_layer { 0.38 + 0.45 * hot01 } else { 0.10 })));
-    uvs.push([0.5, 0.5]);
-    rgba.push(if hot_layer {
-        heat_color(smoothstep(0.18, 1.18, heat), [255.0, 188.0, 66.0])
-    } else {
-        [255; 4]
-    });
-    for index in 0..segments {
-        let angle = std::f32::consts::TAU * index as f32 / segments as f32;
-        let (sin, cos) = angle.sin_cos();
-        let downward = sin.max(0.0);
-        let vertical_scale = 0.72 + downward * (0.65 + 0.55 * hot01 + 0.18 * dwell_s.min(3.0));
-        let radial = add3(scale3(right, cos * radius * pulse), scale3(down_axis, sin * radius * vertical_scale));
-        positions.push(add3(center, add3(radial, scale3(normal, 0.04 + 0.12 * hot01))));
-        uvs.push([0.5 + cos * 0.5, 0.5 + sin * 0.5]);
-        rgba.push(if hot_layer {
-            heat_color(hot01.powf(0.7) * 0.72, [230.0, 78.0, 8.0])
-        } else {
-            [255; 4]
-        });
-    }
-    let mut indices = Vec::with_capacity(segments * 3);
-    for index in 0..segments {
-        let next = (index + 1) % segments;
-        indices.extend_from_slice(&[0, 1 + index as u32, 1 + next as u32]);
-    }
-    Some(FxDraw::Mesh {
-        positions,
-        uvs,
-        rgba,
-        indices,
-        shader: if hot_layer { "gfx/effects/whiteGlow" } else { "gfx/damage/rivetmark" }.to_owned(),
-    })
-}
-
-fn melt_drip_mesh(sample: MeltRenderSample, time: i32) -> Option<FxDraw> {
-    let down = gravity_on_surface(sample.normal);
-    if down == [0.0; 3] || sample.dwell_ms < 650.0 {
-        return None;
-    }
-    let heat = sample.heat.clamp(0.0, 1.5);
-    let hot01 = (heat / 1.25).clamp(0.0, 1.0);
-    if hot01 < 0.04 {
-        return None;
-    }
-    let dwell_s = sample.dwell_ms / 1000.0;
-    let length = ((dwell_s - 0.55) * 1.75 * hot01).clamp(0.0, 8.5);
-    if length < 0.25 {
-        return None;
-    }
-    let right = normalize3(cross3(down, sample.normal));
-    let steps = 9usize;
-    let mut positions = Vec::with_capacity(steps * 2);
-    let mut uvs = Vec::with_capacity(steps * 2);
-    let mut rgba = Vec::with_capacity(steps * 2);
-    let mut indices = Vec::with_capacity((steps - 1) * 6);
-    for step in 0..steps {
-        let t = step as f32 / (steps - 1) as f32;
-        let bend = (sample.phase * 1.7 + t * 3.2 + time as f32 * 0.0015).sin() * 0.16 * hot01 * t;
-        let center = add3(
-            add3(sample.position, scale3(down, length * t)),
-            add3(scale3(right, bend), scale3(sample.normal, 0.38 + 0.16 * hot01)),
-        );
-        let half_width = (0.44 + 0.20 * hot01) * (1.0 - 0.72 * t);
-        let color = heat_color(hot01.powf(0.72) * (1.0 - 0.34 * t), [255.0, 132.0, 18.0]);
-        positions.push(sub3(center, scale3(right, half_width)));
-        positions.push(add3(center, scale3(right, half_width)));
-        uvs.push([t, 0.0]);
-        uvs.push([t, 1.0]);
-        rgba.push(color);
-        rgba.push(color);
-        if step + 1 < steps {
-            let a = (step * 2) as u32;
-            indices.extend_from_slice(&[a, a + 2, a + 1, a + 1, a + 2, a + 3]);
-        }
-    }
-    Some(FxDraw::Mesh {
-        positions,
-        uvs,
-        rgba,
-        indices,
-        shader: "gfx/effects/saberDamageGlow".to_owned(),
-    })
 }
 
 /// The refEntity CG_Missile submits for a model-carrying missile.
@@ -723,6 +456,11 @@ fn play_effect_type(parm: i32) -> Option<&'static str> {
 
 /// cg_localents.c LE_PUFF: a sprite drifting on TR_LINEAR that fades and
 /// grows over its life.
+/// Stable per-blade id for the melt simulation's contact strokes.
+fn melt_stroke_id(key: SaberTrailKey) -> u32 {
+    (u32::from(key.entity_num) << 16) | (u32::from(key.saber_num) << 8) | u32::from(key.blade_num)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SaberTrailKey {
     entity_num: u16,
@@ -740,6 +478,7 @@ struct SaberLightKey {
 /// Fixed storage avoids a per-frame heap allocation for staff lights.
 #[derive(Clone, Copy, Debug)]
 struct SaberLightAggregate {
+    segments: [FxLightSegment; MAX_SABER_BLADES],
     tips: [[f32; 3]; MAX_SABER_BLADES],
     count: usize,
     first_midpoint: [f32; 3],
@@ -752,6 +491,7 @@ struct SaberLightAggregate {
 impl Default for SaberLightAggregate {
     fn default() -> Self {
         Self {
+            segments: [FxLightSegment::default(); MAX_SABER_BLADES],
             tips: [[0.0; 3]; MAX_SABER_BLADES],
             count: 0,
             first_midpoint: [0.0; 3],
@@ -786,6 +526,7 @@ struct SaberContactHistory {
     old_pos: [f32; 3],
     last_time: i32,
     last_sound_time: i32,
+    last_spark_time: i32,
 }
 
 impl Default for SaberContactHistory {
@@ -795,6 +536,7 @@ impl Default for SaberContactHistory {
             old_pos: [0.0; 3],
             last_time: i32::MIN / 2,
             last_sound_time: i32::MIN / 2,
+            last_spark_time: i32::MIN / 2,
         }
     }
 }
@@ -809,31 +551,6 @@ struct SaberWallMark {
 }
 
 #[derive(Clone, Debug)]
-struct MeltPoint {
-    position: [f32; 3],
-    normal: [f32; 3],
-    last_heated_at: i32,
-    heat: f32,
-    dwell_ms: f32,
-    phase: f32,
-}
-
-#[derive(Clone, Debug)]
-struct MeltStroke {
-    points: Vec<MeltPoint>,
-    last_contact_time: i32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MeltRenderSample {
-    position: [f32; 3],
-    normal: [f32; 3],
-    heat: f32,
-    dwell_ms: f32,
-    phase: f32,
-}
-
-#[derive(Clone, Debug)]
 struct Puff {
     start_time: i32,
     end_time: i32,
@@ -845,7 +562,22 @@ struct Puff {
     shader: &'static str,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SaberClashFlareState {
+    flash_time: i32,
+    position: [f32; 3],
+}
+
+/// OpenJK CG_SaberClashFlare output after its visibility trace/projection.
+/// Coordinates remain in the original 640x480 CGame virtual space.
+#[derive(Clone, Copy, Debug)]
+pub struct SaberClashFlare {
+    pub rect: [f32; 4],
+    pub color: [f32; 4],
+}
+
 pub struct WeaponFx {
+    saber_definitions: SaberDefinitions,
     worker_tx: mpsc::Sender<FxWorkerCommand>,
     worker: Option<JoinHandle<()>>,
     cached_stats: FxStats,
@@ -864,18 +596,26 @@ pub struct WeaponFx {
     /// OpenJK combines 3+ blade sabers into one dynamic light per saber.
     saber_multi_lights: HashMap<SaberLightKey, SaberLightAggregate>,
     modern_sabers: bool,
+    rt_lighting: bool,
+    /// Presentation-only A/B switch for authored EV_SABER_HIT /
+    /// saber-on-saber EV_SABER_BLOCK EFX. Existing tagged primitives remain
+    /// alive so a paused demo can hide/show the exact same population.
+    saber_impact_fx: bool,
     saber_marks: SaberMarkMode,
     collision_world: Option<CollisionWorld>,
     saber_contact_history: HashMap<SaberTrailKey, SaberContactHistory>,
     saber_wall_marks: Vec<SaberWallMark>,
-    active_melt_strokes: HashMap<SaberTrailKey, MeltStroke>,
-    finished_melt_strokes: Vec<MeltStroke>,
+    melt: SaberMelt,
+    last_melt_spark_ms: i32,
     /// OpenJK cg_saberTrail: 0=off, 1=normal, 2=high-frequency/special mode.
     /// WGPU currently renders value 2 with the normal authored blur material
     /// rather than the legacy stencil-refraction path.
     saber_trail: i32,
     saber_trail_history: HashMap<SaberTrailKey, SaberTrailHistory>,
     saber_trail_segments: Vec<SaberTrailSegment>,
+    /// OpenJK cg_saberFlashTime / cg_saberFlashPos. This is a 2D CGame flare,
+    /// not an FX world sprite, so it is projected after the final camera is known.
+    saber_clash_flare: Option<SaberClashFlareState>,
     time: i32,
     /// cg.refdef.vieworg / viewaxis[1] of the last rendered view.
     view_origin: [f32; 3],
@@ -883,10 +623,15 @@ pub struct WeaponFx {
 }
 
 impl WeaponFx {
-    pub fn new(assets: AssetSearchPath) -> Self {
+    pub fn new(mut assets: AssetSearchPath) -> Self {
+        let saber_definitions = load_saber_definitions(&mut assets).unwrap_or_else(|error| {
+            eprintln!("FX SABER DEFINITIONS UNAVAILABLE (stock impact FX only): {error}");
+            SaberDefinitions::default()
+        });
         let (worker_tx, rx) = mpsc::channel();
         let worker = thread::Builder::new().name("jka-fx".to_owned()).spawn(move || fx_worker_loop(rx, assets)).expect("failed to start JKA FX worker");
         Self {
+            saber_definitions,
             worker_tx,
             worker: Some(worker),
             cached_stats: FxStats::default(),
@@ -900,15 +645,18 @@ impl WeaponFx {
             immediate_lights: Vec::new(),
             saber_multi_lights: HashMap::new(),
             modern_sabers: false,
+            rt_lighting: false,
+            saber_impact_fx: true,
             saber_marks: SaberMarkMode::Legacy,
             collision_world: None,
             saber_contact_history: HashMap::new(),
             saber_wall_marks: Vec::new(),
-            active_melt_strokes: HashMap::new(),
-            finished_melt_strokes: Vec::new(),
+            melt: SaberMelt::new(),
+            last_melt_spark_ms: i32::MIN / 2,
             saber_trail: 1,
             saber_trail_history: HashMap::new(),
             saber_trail_segments: Vec::new(),
+            saber_clash_flare: None,
             time: 0,
             view_origin: [0.0; 3],
             view_left: [0.0, 1.0, 0.0],
@@ -919,10 +667,22 @@ impl WeaponFx {
         self.cached_stats
     }
 
+    pub(crate) fn saber_definitions(&self) -> &SaberDefinitions {
+        &self.saber_definitions
+    }
+
     /// Select the optional continuous-ribbon saber presentation. The legacy
     /// path remains OpenJK-compatible and is the default.
     pub fn set_modern_sabers(&mut self, enabled: bool) {
         self.modern_sabers = enabled;
+    }
+
+    pub fn set_rt_lighting(&mut self, enabled: bool) {
+        self.rt_lighting = enabled;
+    }
+
+    pub fn set_saber_impact_fx(&mut self, enabled: bool) {
+        self.saber_impact_fx = enabled;
     }
 
     pub fn set_saber_marks(&mut self, mode: SaberMarkMode) {
@@ -933,8 +693,7 @@ impl WeaponFx {
                 self.saber_wall_marks.clear();
             }
             if !matches!(mode, SaberMarkMode::Enhanced) {
-                self.active_melt_strokes.clear();
-                self.finished_melt_strokes.clear();
+                self.melt.clear();
             }
         }
     }
@@ -944,8 +703,7 @@ impl WeaponFx {
         self.collision_world = world;
         self.saber_contact_history.clear();
         self.saber_wall_marks.clear();
-        self.active_melt_strokes.clear();
-        self.finished_melt_strokes.clear();
+        self.melt.clear();
     }
 
     pub fn set_saber_trail(&mut self, value: i32) {
@@ -979,10 +737,10 @@ impl WeaponFx {
         self.saber_multi_lights.clear();
         self.saber_trail_history.clear();
         self.saber_trail_segments.clear();
+        self.saber_clash_flare = None;
         self.saber_contact_history.clear();
         self.saber_wall_marks.clear();
-        self.active_melt_strokes.clear();
-        self.finished_melt_strokes.clear();
+        self.melt.clear();
         self.time = time;
     }
 
@@ -998,10 +756,10 @@ impl WeaponFx {
             self.missile_fx.clear();
             self.saber_trail_history.clear();
             self.saber_trail_segments.clear();
+            self.saber_clash_flare = None;
             self.saber_contact_history.clear();
             self.saber_wall_marks.clear();
-            self.active_melt_strokes.clear();
-            self.finished_melt_strokes.clear();
+            self.melt.clear();
         }
         self.missile_fx.retain(|_, state| {
             time <= state.last_time.saturating_add(CONTINUOUS_FX_BACKFILL_MAX_MS * 4)
@@ -1016,10 +774,72 @@ impl WeaponFx {
         self.view_left = left;
     }
 
+    /// Port of OpenJK codemp/cgame/cg_draw.c CG_SaberClashFlare. The event
+    /// owns only time/position; visibility and projection use the final CGame
+    /// view so third-person/demo cameras match the stock client.
+    pub fn saber_clash_flare(
+        &mut self,
+        view: &crate::fx::draw::FxView,
+        fov_x_degrees: f32,
+        fov_y_degrees: f32,
+    ) -> Option<SaberClashFlare> {
+        const MAX_TIME: i32 = 150;
+        let flare = self.saber_clash_flare?;
+        let t = self.time - flare.flash_time;
+        if t <= 0 || t >= MAX_TIME {
+            return None;
+        }
+
+        let dif = sub3(flare.position, view.origin);
+        let z = dot3(dif, view.axis[0]);
+        // OpenJK first rejects anything behind/at the camera with a slightly
+        // stronger 0.2 forward-dot threshold than the projection's 0.001.
+        if z < 0.2 {
+            return None;
+        }
+
+        let world = self.collision_world.as_mut()?;
+        let trace = world.trace(TraceQuery {
+            start: view.origin,
+            mins: [0.0; 3],
+            maxs: [0.0; 3],
+            end: flare.position,
+            pass_entity: -1,
+            // CG_SaberClashFlare uses CONTENTS_SOLID, not MASK_SOLID.
+            mask: CONTENTS_SOLID,
+        });
+        if trace.fraction < 1.0 {
+            return None;
+        }
+
+        let len = length3(dif);
+        if len > 1200.0 {
+            return None;
+        }
+        let mut v = (1.0 - t as f32 / MAX_TIME as f32)
+            * ((1.0 - len / 800.0) * 2.0 + 0.35);
+        if v < 0.001 {
+            v = 0.001;
+        }
+
+        let px = (fov_x_degrees.to_radians() * 0.5).tan();
+        let py = (fov_y_degrees.to_radians() * 0.5).tan();
+        if px.abs() <= f32::EPSILON || py.abs() <= f32::EPSILON || z <= 0.001 {
+            return None;
+        }
+        let x = 320.0 - dot3(dif, view.axis[1]) * 320.0 / (z * px);
+        let y = 240.0 - dot3(dif, view.axis[2]) * 240.0 / (z * py);
+        let size = v * 600.0;
+        Some(SaberClashFlare {
+            rect: [x - v * 300.0, y - v * 300.0, size, size],
+            color: [0.8, 0.8, 0.8, 1.0],
+        })
+    }
+
     /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
     pub fn end_frame(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
-        let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { reply }).is_ok() {
+        let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { saber_impact_fx: self.saber_impact_fx, reply }).is_ok() {
             match recv.recv() { Ok((frame, stats)) => { self.cached_stats = stats; frame }, Err(_) => FxFrame::default() }
         } else { FxFrame::default() };
         let time = self.time;
@@ -1137,7 +957,12 @@ impl WeaponFx {
             // blade, radius = length * 1.4 + Q_flrand(0, 1) * 3.
             let midpoint = madd3(origin, direction, visible_length * 0.5);
             let radius = visible_length * 1.4 + self.runner_rng.flrand(0.0, 1.0) * 3.0;
-            self.immediate_lights.push(FxLight { origin: midpoint, radius, rgb });
+            self.immediate_lights.push(FxLight {
+                kind: FxLightKind::Saber,
+                origin: midpoint, radius, rgb,
+                segment: Some([origin, madd3(origin, direction, visible_length)]),
+                blade_segments: None,
+            });
             return;
         }
 
@@ -1162,6 +987,13 @@ impl WeaponFx {
             aggregate.first_rgb = rgb;
         }
         aggregate.tips[aggregate.count] = tip;
+        if self.rt_lighting {
+            aggregate.segments[aggregate.count] = FxLightSegment {
+                endpoints: [origin, madd3(origin, direction, visible_length.max(0.0))],
+                rgb,
+                weight: length,
+            };
+        }
         aggregate.count += 1;
         aggregate.total_length += length;
         for channel in 0..3 {
@@ -1203,7 +1035,18 @@ impl WeaponFx {
                 }
             }
             let radius = diameter + rng.flrand(0.0, 1.0) * 8.0;
-            lights.push(FxLight { origin, radius, rgb });
+            let blade_segments = self.rt_lighting.then(|| {
+                aggregate.segments[..aggregate.count].iter().copied().map(|mut blade| {
+                    blade.weight /= aggregate.total_length;
+                    // Clipped/hidden blades emit no RT light; do not redistribute
+                    // their energy to the remaining blades.
+                    if length3(sub3(blade.endpoints[1], blade.endpoints[0])) < 0.5 {
+                        blade.weight = 0.0;
+                    }
+                    blade
+                }).collect::<Vec<_>>().into()
+            });
+            lights.push(FxLight { kind: FxLightKind::Saber, origin, radius, rgb, segment: None, blade_segments });
         }
     }
 
@@ -1289,93 +1132,7 @@ impl WeaponFx {
     }
 
     fn finish_melt_stroke(&mut self, key: SaberTrailKey) {
-        let Some(stroke) = self.active_melt_strokes.remove(&key) else {
-            return;
-        };
-        if !stroke.points.is_empty() {
-            self.finished_melt_strokes.push(stroke);
-            if self.finished_melt_strokes.len() > MELT_MAX_FINISHED_STROKES {
-                let excess = self.finished_melt_strokes.len() - MELT_MAX_FINISHED_STROKES;
-                self.finished_melt_strokes.drain(..excess);
-            }
-        }
-    }
-
-    fn deposit_enhanced_melt(
-        &mut self,
-        key: SaberTrailKey,
-        position: [f32; 3],
-        normal: [f32; 3],
-    ) -> f32 {
-        let now = self.time;
-        let should_break = self.active_melt_strokes.get(&key).is_some_and(|stroke| {
-            let stale = now.saturating_sub(stroke.last_contact_time) > MELT_STROKE_BREAK_MS;
-            let plane_changed = stroke
-                .points
-                .last()
-                .is_some_and(|point| dot3(point.normal, normal) <= 0.45);
-            stale || plane_changed
-        });
-        if should_break {
-            self.finish_melt_stroke(key);
-        }
-
-        let stroke = self.active_melt_strokes.entry(key).or_insert_with(|| MeltStroke {
-            points: Vec::new(),
-            last_contact_time: now,
-        });
-        let dt_ms = now.saturating_sub(stroke.last_contact_time).clamp(0, 50) as f32;
-        stroke.last_contact_time = now;
-
-        if stroke.points.is_empty() {
-            stroke.points.push(MeltPoint {
-                position,
-                normal,
-                last_heated_at: now,
-                heat: 0.48,
-                dwell_ms: dt_ms.max(8.0),
-                phase: (position[0] * 0.071 + position[1] * 0.113 + position[2] * 0.047).sin() * 3.1,
-            });
-            return 0.48;
-        }
-
-        let last = stroke.points.last_mut().unwrap();
-        let distance = length3(sub3(position, last.position));
-
-        if distance <= MELT_HOLD_RADIUS {
-            let cooled = cooled_heat(last, now);
-            last.heat = (cooled + dt_ms * 0.00075).min(1.5);
-            last.dwell_ms = (last.dwell_ms + dt_ms).min(12_000.0);
-            let blend = (0.10 + dt_ms * 0.002).clamp(0.10, 0.24);
-            last.position = lerp3(last.position, position, blend);
-            last.normal = normalize3(lerp3(last.normal, normal, blend));
-            last.last_heated_at = now;
-            return last.heat;
-        }
-
-        let start = last.position;
-        let start_normal = last.normal;
-        let steps = ((distance / MELT_POINT_SPACING).ceil() as usize).clamp(1, 16);
-        let mut newest_heat = 0.52;
-        for step in 1..=steps {
-            if stroke.points.len() >= MELT_MAX_POINTS_PER_STROKE {
-                break;
-            }
-            let t = step as f32 / steps as f32;
-            let point = lerp3(start, position, t);
-            let point_normal = normalize3(lerp3(start_normal, normal, t));
-            let phase = (point[0] * 0.071 + point[1] * 0.113 + point[2] * 0.047).sin() * 3.1;
-            newest_heat = 0.50 + 0.10 * (phase * 1.7).sin().abs();
-            stroke.points.push(MeltPoint {
-                position: point,
-                normal: point_normal,
-                last_heated_at: now,
-                heat: newest_heat,
-                dwell_ms: dt_ms.min(35.0),
-                phase,
-            });
-        }
-        newest_heat
+        self.melt.end_stroke(melt_stroke_id(key));
     }
 
     fn saber_world_contact(
@@ -1427,8 +1184,14 @@ impl WeaponFx {
 
         // OpenJK performs saber/world contact once per presentation frame. The
         // cg_fxFPS knob is for scheduled/continuous .efx emitters, not marks.
+        // Legacy keeps the stock burst every frame. Enhanced lets the melt carry
+        // the scene (glow, bubbling, dripping) and only fires an occasional spark.
         if !no_wall_marks && can_impact {
-            self.play("sparks/spark_nosnd", hit.end, hit_normal);
+            let enhanced = matches!(self.saber_marks, SaberMarkMode::Enhanced);
+            if !enhanced || self.time.saturating_sub(previous.last_spark_time) >= ENHANCED_SPARK_INTERVAL_MS {
+                self.play("sparks/spark_nosnd", hit.end, hit_normal);
+                next.last_spark_time = self.time;
+            }
         }
 
         match self.saber_marks {
@@ -1452,7 +1215,13 @@ impl WeaponFx {
             }
             SaberMarkMode::Enhanced => {
                 if can_mark {
-                    let heat = self.deposit_enhanced_melt(key, hit.end, hit_normal);
+                    let heat = self.melt.contact(
+                        melt_stroke_id(key),
+                        hit.end,
+                        hit_normal,
+                        self.time,
+                        self.collision_world.as_mut(),
+                    );
                     if previous.have_old_pos && self.time.saturating_sub(previous.last_sound_time) >= 100 {
                         let variant = self.runner_rng.irand(1, 3);
                         self.immediate_sounds.push(FxSound {
@@ -1464,7 +1233,10 @@ impl WeaponFx {
                     let flicker = 0.94 + (self.time as f32 * 0.029).sin() * 0.06;
                     let heat01 = (heat / 1.25).clamp(0.0, 1.0);
                     self.immediate_lights.push(FxLight {
+                        kind: FxLightKind::SaberMark,
                         origin: madd3(hit.end, hit_normal, 1.1),
+                        segment: None,
+                        blade_segments: None,
                         radius: 48.0 + 72.0 * heat01,
                         rgb: [1.0 * flicker, (0.24 + 0.24 * heat01) * flicker, (0.025 + 0.055 * heat01) * flicker],
                     });
@@ -1548,83 +1320,15 @@ impl WeaponFx {
 
     fn append_enhanced_melt(&mut self, frame: &mut FxFrame) {
         let time = self.time;
-        let stale_keys = self
-            .active_melt_strokes
-            .iter()
-            .filter_map(|(key, stroke)| {
-                (time.saturating_sub(stroke.last_contact_time) > MELT_STROKE_BREAK_MS).then_some(*key)
-            })
-            .collect::<Vec<_>>();
-        for key in stale_keys {
-            self.finish_melt_stroke(key);
+        let sparks = self.melt.update(time, self.collision_world.as_mut());
+        for spark in sparks {
+            if time.saturating_sub(self.last_melt_spark_ms) < ENHANCED_MELT_SPARK_INTERVAL_MS {
+                break;
+            }
+            self.last_melt_spark_ms = time;
+            self.play("sparks/spark_nosnd", spark.origin, spark.normal);
         }
-        self.finished_melt_strokes.retain(|stroke| {
-            time <= stroke.last_contact_time.saturating_add(MELT_SCAR_LIFETIME_MS)
-        });
-
-        let append = |stroke: &MeltStroke, frame: &mut FxFrame| {
-            let samples = smooth_melt_samples(stroke, time);
-            if samples.is_empty() {
-                return;
-            }
-            // Cooled, darkened substrate first; all hot layers are separate
-            // additive passes on top. This gives a large highlight/shadow range
-            // instead of merely tinting the legacy quad orange.
-            if let Some(draw) = melt_strip_mesh(&samples, time, MeltLayer::Scar) {
-                frame.draws.push(draw);
-            }
-            let hottest = samples.iter().fold(0.0_f32, |max_heat, sample| max_heat.max(sample.heat));
-            // Once a stroke is cold, submit only the persistent scar. Avoid
-            // rebuilding zero-colour additive meshes for old finished strokes.
-            if hottest > 0.015 {
-                if let Some(draw) = melt_strip_mesh(&samples, time, MeltLayer::Halo) {
-                    frame.draws.push(draw);
-                }
-                if let Some(draw) = melt_strip_mesh(&samples, time, MeltLayer::Relief) {
-                    frame.draws.push(draw);
-                }
-                if let Some(draw) = melt_strip_mesh(&samples, time, MeltLayer::Core) {
-                    frame.draws.push(draw);
-                }
-                if hottest > 0.62 {
-                    if let Some(draw) = melt_strip_mesh(&samples, time, MeltLayer::WhiteCore) {
-                        frame.draws.push(draw);
-                    }
-                }
-            }
-
-            // Dwell points become smooth molten pools. The pool grows and sags
-            // under gravity while the blade is held in one place, then the hot
-            // layer shrinks/cools while the dark relief remains much longer.
-            for point in &stroke.points {
-                if point.dwell_ms < 180.0 {
-                    continue;
-                }
-                let sample = MeltRenderSample {
-                    position: point.position,
-                    normal: point.normal,
-                    heat: cooled_heat(point, time),
-                    dwell_ms: point.dwell_ms,
-                    phase: point.phase,
-                };
-                if let Some(draw) = melt_blob_mesh(sample, time, false) {
-                    frame.draws.push(draw);
-                }
-                if let Some(draw) = melt_blob_mesh(sample, time, true) {
-                    frame.draws.push(draw);
-                }
-                if let Some(draw) = melt_drip_mesh(sample, time) {
-                    frame.draws.push(draw);
-                }
-            }
-        };
-
-        for stroke in &self.finished_melt_strokes {
-            append(stroke, frame);
-        }
-        for stroke in self.active_melt_strokes.values() {
-            append(stroke, frame);
-        }
+        self.melt.emit(time, self.view_origin, &mut frame.draws, &mut self.immediate_lights);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1816,6 +1520,17 @@ impl WeaponFx {
             .is_ok()
     }
 
+    fn play_saber_impact(&mut self, name: &str, origin: [f32; 3], dir: [f32; 3]) -> bool {
+        self.worker_tx
+            .send(FxWorkerCommand::PlayDirClass {
+                name: name.to_owned(),
+                origin,
+                dir,
+                class: FxClass::SaberImpact,
+            })
+            .is_ok()
+    }
+
     fn missile_fx_samples(
         &mut self,
         entity_number: u16,
@@ -1944,59 +1659,322 @@ impl WeaponFx {
         Some(MissileModel { qpath, origin: entity.origin, axis })
     }
 
-    /// The FX part of CG_EntityEvent.
-    pub fn entity_event(&mut self, event: &PresentationEvent, game: &ClientGameState) -> Option<EventDispatchResult> {
-        let state = &event.state;
-        match event.event {
-            EV_MISSILE_HIT | EV_MISSILE_MISS | EV_MISSILE_MISS_METAL => {
-                let dir = jka_movement::byte_to_dir(event.parm);
-                let custom = state.field_i32("emplacedOwner").unwrap_or(0);
-                if custom != 0 {
-                    // Hack in OpenJK too: an index to a custom impact effect.
-                    let played = game.effect_qpath(custom).is_some_and(|name| self.play(&name, event.position, dir));
+    /// The FX part of CG_EntityEvent. The semantic decode is deliberately
+    /// split from side effects so the optional event-worker path can prepare
+    /// events off-thread while preserving the exact same ordered application.
+    #[cfg(test)]
+    pub fn entity_event(
+        &mut self,
+        event: &PresentationEvent,
+        game: &ClientGameState,
+        siege_classes: &[SiegeClassVisual],
+    ) -> Option<EventDispatchResult> {
+        let prepared = prepare_entity_event(
+            event,
+            game,
+            siege_classes,
+            &self.saber_definitions,
+        );
+        self.entity_event_prepared(event, &prepared)
+    }
+
+    pub(crate) fn entity_event_prepared(
+        &mut self,
+        event: &PresentationEvent,
+        prepared: &PreparedFxEvent,
+    ) -> Option<EventDispatchResult> {
+        match prepared {
+            PreparedFxEvent::None => None,
+            PreparedFxEvent::SaberHit { effect, count, origin, dir } => {
+                let mut played = false;
+                for _ in 0..*count {
+                    played |= self.play_saber_impact(effect, *origin, *dir);
+                }
+                Some(if played {
+                    EventDispatchResult::Handled("FX_SABER_HIT_OPENJK")
+                } else {
+                    EventDispatchResult::Partial("FX_SABER_HIT_MISSING")
+                })
+            }
+            PreparedFxEvent::SaberBlock {
+                effect,
+                origin,
+                dir,
+                clash_flare,
+            } => {
+                if *clash_flare {
+                    self.saber_clash_flare = Some(SaberClashFlareState {
+                        flash_time: self.time - 50,
+                        position: *origin,
+                    });
+                }
+                let played = self.play_saber_impact(effect, *origin, *dir);
+                Some(if played {
+                    EventDispatchResult::Handled("FX_SABER_BLOCK_OPENJK")
+                } else {
+                    EventDispatchResult::Partial("FX_SABER_BLOCK_MISSING")
+                })
+            }
+            PreparedFxEvent::SaberClashFlare { origin } => {
+                self.saber_clash_flare = Some(SaberClashFlareState {
+                    flash_time: self.time - 50,
+                    position: *origin,
+                });
+                Some(EventDispatchResult::Partial("FX_SABER_CLASH_FLARE_OPENJK"))
+            }
+            PreparedFxEvent::MissileImpact {
+                dir,
+                custom_requested,
+                custom_effect,
+                vehicle_pending,
+                weapon,
+                alt,
+                charge,
+            } => {
+                if *custom_requested {
+                    let played = custom_effect
+                        .as_deref()
+                        .is_some_and(|name| self.play(name, event.position, *dir));
                     return Some(if played { EventDispatchResult::Handled("FX_CUSTOM_IMPACT") } else { EventDispatchResult::Partial("FX_CUSTOM_IMPACT_MISSING") });
                 }
-                if state.field_i32("eFlags").unwrap_or(0) & EF_JETPACK_ACTIVE != 0 && state.field_i32("otherEntityNum2").unwrap_or(0) != 0 {
+                if *vehicle_pending {
                     return Some(EventDispatchResult::Partial("FX_VEHICLE_WEAPON_IMPACT_PENDING"));
                 }
-                let weapon = state.field_i32("weapon").unwrap_or(0);
-                let alt = state.field_i32("eFlags").unwrap_or(0) & EF_ALT_FIRING != 0;
-                let effects = if event.event == EV_MISSILE_HIT {
-                    player_impacts(weapon, alt)
+                let effects = if event.event == EntityEvent::EV_MISSILE_HIT {
+                    player_impacts(*weapon, *alt)
                 } else {
-                    wall_impacts(weapon, alt, if alt { state.field_i32("generic1").unwrap_or(0) } else { 0 })
+                    wall_impacts(*weapon, *alt, *charge)
                 };
                 let mut played = false;
                 for &(name, up) in effects {
-                    played |= self.play(name, event.position, if up { [0.0, 0.0, 1.0] } else { dir });
+                    played |= self.play(name, event.position, if up { [0.0, 0.0, 1.0] } else { *dir });
                 }
                 Some(if played { EventDispatchResult::Handled("FX_MISSILE_IMPACT") } else { EventDispatchResult::Partial("FX_MISSILE_IMPACT_NONE") })
             }
-            EV_PLAY_EFFECT => {
-                let Some(name) = play_effect_type(event.parm) else {
+            PreparedFxEvent::PlayEffect { name, origin, dir } => {
+                let Some(name) = name else {
                     return Some(EventDispatchResult::Partial("FX_PLAY_EFFECT_TYPE_UNKNOWN"));
                 };
-                let mut dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
-                if dir == [0.0; 3] {
-                    dir[1] = 1.0;
-                }
-                let origin = super::entity_vec3(state, "origin").unwrap_or(event.position);
-                Some(if self.play(name, origin, dir) { EventDispatchResult::Handled("FX_PLAY_EFFECT") } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
+                Some(if self.play(name, *origin, *dir) { EventDispatchResult::Handled("FX_PLAY_EFFECT") } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
             }
-            EV_PLAY_EFFECT_ID | EV_PLAY_PORTAL_EFFECT_ID => {
-                let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
-                if dir == [0.0; 3] {
-                    dir[1] = 1.0;
-                }
-                let Some(name) = game.effect_qpath(event.parm) else {
+            PreparedFxEvent::PlayEffectId { name, origin, dir } => {
+                let Some(name) = name.as_deref() else {
                     return Some(EventDispatchResult::Partial("EFFECT_RESOURCE_MISSING"));
                 };
                 // Portal effects belong to the sky-portal scene, which is not
                 // rendered separately; they play in the main scene.
-                Some(if self.play(&name, event.position, dir) { EventDispatchResult::Handled("FX_PLAY_EFFECT_ID") } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
+                Some(if self.play(name, *origin, *dir) { EventDispatchResult::Handled("FX_PLAY_EFFECT_ID") } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
             }
-            _ => None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PreparedFxEvent {
+    None,
+    SaberHit {
+        effect: String,
+        count: usize,
+        origin: [f32; 3],
+        dir: [f32; 3],
+    },
+    SaberBlock {
+        effect: String,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        clash_flare: bool,
+    },
+    SaberClashFlare {
+        origin: [f32; 3],
+    },
+    MissileImpact {
+        dir: [f32; 3],
+        custom_requested: bool,
+        custom_effect: Option<String>,
+        vehicle_pending: bool,
+        weapon: i32,
+        alt: bool,
+        charge: i32,
+    },
+    PlayEffect {
+        name: Option<&'static str>,
+        origin: [f32; 3],
+        dir: [f32; 3],
+    },
+    PlayEffectId {
+        name: Option<String>,
+        origin: [f32; 3],
+        dir: [f32; 3],
+    },
+}
+
+fn impact_saber_definition(
+    saber_definitions: &SaberDefinitions,
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+) -> Option<(SaberDefinition, bool)> {
+    let owner = event.state.field_i32("otherEntityNum2")?;
+    if !(0..1023).contains(&owner) {
+        return None;
+    }
+    let owner = u16::try_from(owner).ok()?;
+    let info = game
+        .entity_state(owner)
+        .and_then(|state| {
+            if state.field_i32("eType").unwrap_or(0) == super::ET_NPC {
+                game.npc_client_info(state).ok()
+            } else {
+                game.client_info(usize::from(owner), siege_classes)
+            }
+        })
+        .or_else(|| game.client_info(usize::from(owner), siege_classes))?;
+    let saber_num = event.state.field_i32("weapon").unwrap_or(0);
+    let saber_name = match saber_num {
+        0 => &info.saber_name,
+        1 => &info.saber2_name,
+        _ => return None,
+    };
+    let definition = saber_definitions.get(saber_name)?.clone();
+    let blade_num = event.state.field_i32("legsAnim").unwrap_or(0).max(0) as usize;
+    let second_style = definition.blade_style2_start > 0
+        && blade_num >= definition.blade_style2_start;
+    Some((definition, second_style))
+}
+
+fn saber_event_direction(event: &PresentationEvent) -> [f32; 3] {
+    let mut dir = super::entity_vec3(&event.state, "angles").unwrap_or([0.0; 3]);
+    if dir == [0.0; 3] {
+        dir[1] = 1.0;
+    }
+    dir
+}
+
+fn saber_event_origin(event: &PresentationEvent) -> [f32; 3] {
+    super::entity_vec3(&event.state, "origin").unwrap_or(event.position)
+}
+
+pub(crate) fn prepare_entity_event(
+    event: &PresentationEvent,
+    game: &ClientGameState,
+    siege_classes: &[SiegeClassVisual],
+    saber_definitions: &SaberDefinitions,
+) -> PreparedFxEvent {
+    let state = &event.state;
+    match event.event {
+        EntityEvent::EV_SABER_HIT => {
+            // OpenJK codemp/cgame/cg_event.c EV_SABER_HIT.
+            let mut hit_person = "saber/blood_sparks_mp.efx".to_owned();
+            let mut hit_person_small = "saber/blood_sparks_25_mp.efx".to_owned();
+            let mut hit_person_mid = "saber/blood_sparks_50_mp.efx".to_owned();
+            let mut hit_other = "saber/saber_cut.efx".to_owned();
+            if let Some((definition, second_style)) =
+                impact_saber_definition(saber_definitions, event, game, siege_classes)
+            {
+                let person = if second_style {
+                    definition.hit_person_effect2.as_ref()
+                } else {
+                    definition.hit_person_effect.as_ref()
+                };
+                if let Some(effect) = person {
+                    hit_person.clone_from(effect);
+                    hit_person_small.clone_from(effect);
+                    hit_person_mid.clone_from(effect);
+                }
+                if let Some(effect) = if second_style {
+                    definition.hit_other_effect2.as_ref()
+                } else {
+                    definition.hit_other_effect.as_ref()
+                } {
+                    hit_other.clone_from(effect);
+                }
+            }
+            let origin = saber_event_origin(event);
+            let dir = saber_event_direction(event);
+            let (effect, count) = match event.parm {
+                16 => (hit_person, 6),
+                3 => (hit_person_small, 1),
+                2 => (hit_person_mid, 1),
+                value if value != 0 => (hit_person, 3),
+                _ => (hit_other, 1),
+            };
+            PreparedFxEvent::SaberHit { effect, count, origin, dir }
+        }
+        EntityEvent::EV_SABER_BLOCK => {
+            // OpenJK: eventParm != 0 is saber-on-saber; zero is a projectile deflect.
+            let origin = saber_event_origin(event);
+            let saber = (event.parm != 0)
+                .then(|| impact_saber_definition(saber_definitions, event, game, siege_classes))
+                .flatten();
+            let mut effect = if event.parm != 0 {
+                "saber/saber_block.efx".to_owned()
+            } else {
+                "blaster/deflect.efx".to_owned()
+            };
+            if event.parm != 0 {
+                if let Some((definition, second_style)) = saber.as_ref() {
+                    if let Some(custom) = if *second_style {
+                        definition.block_effect2.as_ref()
+                    } else {
+                        definition.block_effect.as_ref()
+                    } {
+                        effect.clone_from(custom);
+                    }
+                }
+            }
+            // OpenJK MP checks the selected saber's primary-style
+            // SFL2_NO_CLASH_FLARE flag even when bladeStyle2 is active.
+            let clash_flare = event.parm != 0
+                && !saber
+                    .as_ref()
+                    .is_some_and(|(definition, _)| definition.no_clash_flare);
+            PreparedFxEvent::SaberBlock {
+                effect,
+                origin,
+                dir: saber_event_direction(event),
+                clash_flare,
+            }
+        }
+        EntityEvent::EV_SABER_CLASHFLARE => PreparedFxEvent::SaberClashFlare {
+            origin: saber_event_origin(event),
+        },
+        EntityEvent::EV_MISSILE_HIT | EntityEvent::EV_MISSILE_MISS | EntityEvent::EV_MISSILE_MISS_METAL => {
+            let dir = jka_movement::byte_to_dir(event.parm);
+            let custom = state.field_i32("emplacedOwner").unwrap_or(0);
+            let custom_requested = custom != 0;
+            let custom_effect = if custom_requested { game.effect_qpath(custom) } else { None };
+            let flags = state.field_i32("eFlags").unwrap_or(0);
+            let vehicle_pending = flags & EF_JETPACK_ACTIVE != 0
+                && state.field_i32("otherEntityNum2").unwrap_or(0) != 0;
+            let weapon = state.field_i32("weapon").unwrap_or(0);
+            let alt = flags & EF_ALT_FIRING != 0;
+            let charge = if alt { state.field_i32("generic1").unwrap_or(0) } else { 0 };
+            PreparedFxEvent::MissileImpact {
+                dir,
+                custom_requested,
+                custom_effect,
+                vehicle_pending,
+                weapon,
+                alt,
+                charge,
+            }
+        }
+        EntityEvent::EV_PLAY_EFFECT => {
+            let mut dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
+            if dir == [0.0; 3] { dir[1] = 1.0; }
+            let origin = super::entity_vec3(state, "origin").unwrap_or(event.position);
+            PreparedFxEvent::PlayEffect { name: play_effect_type(event.parm), origin, dir }
+        }
+        EntityEvent::EV_PLAY_EFFECT_ID | EntityEvent::EV_PLAY_PORTAL_EFFECT_ID => {
+            let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
+            if dir == [0.0; 3] { dir[1] = 1.0; }
+            PreparedFxEvent::PlayEffectId {
+                name: game.effect_qpath(event.parm),
+                origin: event.position,
+                dir,
+            }
+        }
+        _ => PreparedFxEvent::None,
     }
 }
 
@@ -2138,6 +2116,7 @@ mod tests {
         let classic = fx.end_frame();
         assert_eq!(classic.lights.len(), 1, "CG_DoSaber emits one dlight for a single blade");
         assert_eq!(classic.lights[0].origin, [6.0, 2.0, 3.0]);
+        assert_eq!(classic.lights[0].segment, Some([[1.0, 2.0, 3.0], [11.0, 2.0, 3.0]]));
         assert_eq!(classic.lights[0].rgb, [1.0, 0.2, 0.2]);
         assert!(classic.lights[0].radius >= 14.0 && classic.lights[0].radius <= 17.0);
         assert!(classic.draws.iter().any(|draw| matches!(
@@ -2238,6 +2217,33 @@ mod tests {
             assert!((*actual - expected).abs() < 1e-5);
         }
         assert!(light.radius >= 20.0 && light.radius <= 28.0);
+        assert!(light.blade_segments.is_none());
+    }
+
+    #[test]
+    fn rt_multiblade_preserves_color_weights_and_clipped_endpoints() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.set_rt_lighting(true);
+        fx.begin_frame(1000);
+        for (blade_num, authored, visible, no_dlight) in [
+            (0, 10.0, 5.0, false), (1, 20.0, 20.0, false),
+            (2, 30.0, 0.0, false), (3, 40.0, 40.0, true),
+        ] {
+            fx.saber_dynamic_light(SaberTrailKey { entity_num: 9, saber_num: 0, blade_num },
+                [0.0; 3], [1.0, 0.0, 0.0], visible, authored, blade_num as i32, 4, no_dlight);
+        }
+        let frame = fx.end_frame();
+        assert_eq!(frame.lights.len(), 1);
+        let segments = frame.lights[0].blade_segments.as_ref().unwrap();
+        assert_eq!(segments.len(), 3, "noDlight blades must never enter the aggregate");
+        assert_eq!(segments[0].endpoints, [[0.0; 3], [5.0, 0.0, 0.0]]);
+        assert!((segments[0].weight - 1.0 / 6.0).abs() < 1e-6);
+        assert!((segments[1].weight - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(segments[2].weight, 0.0, "fully clipped blades emit no light");
+        for (i, segment) in segments.iter().enumerate() {
+            assert_eq!(segment.rgb, saber_light_rgb(i as i32).unwrap());
+        }
     }
 
     #[test]
@@ -2275,35 +2281,6 @@ mod tests {
         fx.begin_frame(1060);
         fx.player_fx(&blade);
         assert!(!fx.end_frame().draws.iter().any(|draw| matches!(draw, FxDraw::Quad { .. })));
-    }
-
-    #[test]
-    fn enhanced_melt_smooths_and_builds_relief_mesh() {
-        let stroke = MeltStroke {
-            last_contact_time: 1200,
-            points: vec![
-                MeltPoint { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], last_heated_at: 1200, heat: 1.2, dwell_ms: 900.0, phase: 0.2 },
-                MeltPoint { position: [4.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], last_heated_at: 1200, heat: 1.0, dwell_ms: 250.0, phase: 0.8 },
-                MeltPoint { position: [8.0, 0.0, 1.5], normal: [0.0, 1.0, 0.0], last_heated_at: 1200, heat: 0.8, dwell_ms: 80.0, phase: 1.4 },
-            ],
-        };
-        let samples = smooth_melt_samples(&stroke, 1200);
-        assert!(samples.len() > stroke.points.len(), "Catmull-Rom path should add smooth intermediate samples");
-        let draw = melt_strip_mesh(&samples, 1200, MeltLayer::Relief).expect("hot stroke should make a relief mesh");
-        let FxDraw::Mesh { positions, indices, shader, .. } = draw else { panic!("relief must be an indexed mesh") };
-        assert_eq!(shader, "gfx/effects/saberDamageGlow");
-        assert!(positions.len() >= samples.len() * 7);
-        assert!(!indices.is_empty());
-    }
-
-    #[test]
-    fn enhanced_heat_cools_by_time_not_frame_count() {
-        let point = MeltPoint {
-            position: [0.0; 3], normal: [0.0, 1.0, 0.0], last_heated_at: 1000, heat: 1.0, dwell_ms: 1000.0, phase: 0.0,
-        };
-        assert!((cooled_heat(&point, 1000) - 1.0).abs() < 1.0e-6);
-        assert!(cooled_heat(&point, 5000) < cooled_heat(&point, 2000));
-        assert_eq!(cooled_heat(&point, 9000), 0.0);
     }
 
     #[test]

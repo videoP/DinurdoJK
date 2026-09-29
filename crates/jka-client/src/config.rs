@@ -4,7 +4,7 @@ use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::ui::{
     CloudRenderResolution, CloudType, ColorLutPreset, DetailTextureMode, DofQuality, DynamicLightsMode,
     DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
-    CrosshairSettings, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
+    CrosshairSettings, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
     MovementKeysSettings, StrafeHelperSettings,
     PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter,
     VideoSettings, VsyncMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_THICKNESS_MAX,
@@ -30,14 +30,26 @@ pub struct ClientPresentationSettings {
     pub mouse: MouseInputSettings,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
     pub fov: f32,
+    /// TaystJK cg_zoomFov: target FOV for the held +zoom bind.
+    pub zoom_fov: f32,
+    /// TaystJK flipkick bind timing, counted in CGame frames.
+    pub fk_duration: i32,
+    pub fk_first_jump_duration: i32,
+    pub fk_second_jump_delay: i32,
     pub model: String,
+    /// DinurdoJK compact forced-player-model cvar: 0=off, model=all other players, ally,enemy=team split.
+    pub force_model: String,
     pub crosshair: CrosshairSettings,
     pub hud_layout: HudLayout,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub console_timestamps: bool,
+    /// con_suggest: live command/cvar filter popup while typing in the console.
+    pub console_suggest: bool,
     /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
     pub ui_vgs: i32,
+    /// r_jumpHeightShade: tint landing surfaces by jump height in jaPRO SP physics.
+    pub jump_height_shade: bool,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
     /// TaystJK-compatible server-browser masters (`sv_master1`..`sv_master5`).
@@ -150,13 +162,20 @@ impl Default for ClientPresentationSettings {
             smoothing: LocalPresentationSettings::default(),
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
+            zoom_fov: 30.0,
+            fk_duration: 50,
+            fk_first_jump_duration: 0,
+            fk_second_jump_delay: 0,
             model: "kyle".to_owned(),
+            force_model: "0".to_owned(),
             crosshair: CrosshairSettings::default(),
             hud_layout: HudLayout::default(),
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             console_timestamps: true,
+            console_suggest: true,
             ui_vgs: 1,
+            jump_height_shade: false,
             network: crate::net::NetworkSettings::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
         }
@@ -201,6 +220,7 @@ pub fn load_client_presentation_settings(
         let finite = || value.parse::<f32>().ok().filter(|number| number.is_finite());
         match name.to_ascii_lowercase().as_str() {
             "model" if !value.trim().is_empty() => settings.model = value.trim().to_owned(),
+            "cg_forcemodel" => settings.force_model = value.trim().to_owned(),
             "cg_drawcrosshair" => {
                 if let Ok(style) = value.trim().parse::<u8>() {
                     settings.crosshair.style = style.min(6);
@@ -270,8 +290,16 @@ pub fn load_client_presentation_settings(
                 settings.console_timestamps =
                     parse_bool(value).unwrap_or(settings.console_timestamps)
             }
+            "con_suggest" => {
+                settings.console_suggest =
+                    parse_bool(value).unwrap_or(settings.console_suggest)
+            }
             "ui_vgs" => {
                 settings.ui_vgs = value.trim().parse::<i32>().unwrap_or(settings.ui_vgs)
+            }
+            "r_jumpheightshade" => {
+                settings.jump_height_shade =
+                    parse_bool(value).unwrap_or(settings.jump_height_shade)
             }
             "sv_master1" => settings.master_servers[0] = value.trim().to_owned(),
             "sv_master2" => settings.master_servers[1] = value.trim().to_owned(),
@@ -293,6 +321,24 @@ pub fn load_client_presentation_settings(
                 settings.fov = finite()
                     .unwrap_or(settings.fov)
                     .clamp(MIN_CG_FOV, MAX_CG_FOV)
+            }
+            "cg_zoomfov" => {
+                settings.zoom_fov = finite().unwrap_or(settings.zoom_fov)
+            }
+            "cg_fkduration" => {
+                settings.fk_duration = value.trim().parse::<i32>().unwrap_or(settings.fk_duration)
+            }
+            "cg_fkfirstjumpduration" => {
+                settings.fk_first_jump_duration = value
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or(settings.fk_first_jump_duration)
+            }
+            "cg_fksecondjumpdelay" => {
+                settings.fk_second_jump_delay = value
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or(settings.fk_second_jump_delay)
             }
             "cg_thirdperson" => {
                 settings.third_person.enabled =
@@ -514,6 +560,14 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "cg_fxfps" => {
                 settings.fx_fps = normalize_fx_fps(value, settings.fx_fps);
+            }
+            "r_fxgeometry" => {
+                settings.fx_geometry =
+                    FxGeometryMode::from_config(value).unwrap_or(settings.fx_geometry);
+            }
+            "r_fxzeroalphadiscard" => {
+                settings.fx_zero_alpha_discard =
+                    parse_bool(value).unwrap_or(settings.fx_zero_alpha_discard);
             }
             "cg_drawfps" => {
                 if let Ok(mode) = value.parse::<u8>() {
@@ -1049,6 +1103,18 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     settings.dynamic_lights = mode;
                 }
             }
+            "r_rtsamples" => {
+                if let Ok(samples @ (1 | 2 | 4)) = value.parse::<u32>() {
+                    settings.rt_samples = samples;
+                }
+            }
+            "r_rtresolution" => {
+                match value.to_ascii_lowercase().as_str() {
+                    "full" | "1" => settings.rt_half_resolution = false,
+                    "half" | "0.5" => settings.rt_half_resolution = true,
+                    _ => {},
+                }
+            }
             "r_maplightsimulation" => {
                 settings.map_light_simulation =
                     parse_bool(value).unwrap_or(settings.map_light_simulation);
@@ -1064,6 +1130,10 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             }
             "r_modernsabers" => {
                 settings.modern_sabers = parse_bool(value).unwrap_or(settings.modern_sabers)
+            }
+            "r_flares" => settings.flares = parse_bool(value).unwrap_or(settings.flares),
+            "r_saberimpactfx" => {
+                settings.saber_impact_fx = parse_bool(value).unwrap_or(settings.saber_impact_fx)
             }
             "r_sabermarks" => {
                 settings.saber_marks = SaberMarkMode::from_config(value).unwrap_or(settings.saber_marks)
@@ -1105,9 +1175,37 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     }
                 }
             }
+            "r_modelbrightness" => {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() {
+                        settings.model_brightness = value.clamp(GAMMA_MIN, GAMMA_MAX);
+                    }
+                }
+            }
+            "r_dynamiclightbrightness" => {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() {
+                        settings.dynamic_light_brightness = value.clamp(GAMMA_MIN, GAMMA_MAX);
+                    }
+                }
+            }
+            "r_modelbrightnesslock" => {
+                settings.model_brightness_locked =
+                    parse_bool(value).unwrap_or(settings.model_brightness_locked);
+            }
+            "r_dynamiclightbrightnesslock" => {
+                settings.dynamic_light_brightness_locked =
+                    parse_bool(value).unwrap_or(settings.dynamic_light_brightness_locked);
+            }
+            "r_drawmapmodels" => {
+                settings.draw_map_models = parse_bool(value).unwrap_or(settings.draw_map_models);
+            }
             _ => {}
         }
     }
+    // Linked brightness sliders always mirror the master, whatever order the
+    // config lines were read in.
+    settings.sync_linked_brightness();
     // r_dynamicLights is the source of truth for all runtime-light techniques.
     if dynamic_shadows_mode_seen {
         settings.cascaded_shadows = matches!(
@@ -1315,6 +1413,8 @@ seta r_entityAmbientLighting \"{}\"\n\
 seta r_dynamicLights \"{}\"\n\
 seta r_mapLightSimulation \"{}\"\n\
 seta r_modernSabers \"{}\"\n\
+seta r_flares \"{}\"\n\
+seta r_saberImpactFx \"{}\"\n\
 seta r_saberMarks \"{}\"\n\
 seta r_pbr \"{}\"\n\
 seta fs_allowAssetOverrides \"{}\"\n\
@@ -1444,6 +1544,8 @@ seta r_cascadedShadows \"{}\"\n\
         settings.dynamic_lights.config_value(),
         u8::from(settings.map_light_simulation),
         u8::from(settings.modern_sabers),
+        u8::from(settings.flares),
+        u8::from(settings.saber_impact_fx),
         settings.saber_marks.config_value(),
         u8::from(settings.pbr),
         u8::from(settings.allow_asset_overrides),
@@ -1458,6 +1560,8 @@ seta r_cascadedShadows \"{}\"\n\
     );
     use std::fmt::Write as _;
     let mut text = text;
+    writeln!(text, "seta r_rtSamples \"{}\"", settings.rt_samples).unwrap();
+    writeln!(text, "seta r_rtResolution \"{}\"", if settings.rt_half_resolution { "half" } else { "full" }).unwrap();
     text.push_str(&format!(
         "seta r_fullbright \"{}\"\nseta r_vertexLight \"{}\"\nseta r_lightmap \"{}\"\n",
         u8::from(!settings.world_lighting),
@@ -1465,6 +1569,13 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.lightmap_only),
     ));
     let _ = writeln!(text, "seta cg_fxFPS \"{}\"", settings.fx_fps);
+    let _ = writeln!(text, "seta r_fxGeometry \"{}\"", settings.fx_geometry.config_value());
+    let _ = writeln!(text, "seta r_fxZeroAlphaDiscard \"{}\"", u8::from(settings.fx_zero_alpha_discard));
+    let _ = writeln!(text, "seta r_drawMapModels \"{}\"", u8::from(settings.draw_map_models));
+    let _ = writeln!(text, "seta r_modelBrightness \"{:.3}\"", settings.model_brightness);
+    let _ = writeln!(text, "seta r_modelBrightnessLock \"{}\"", u8::from(settings.model_brightness_locked));
+    let _ = writeln!(text, "seta r_dynamicLightBrightness \"{:.3}\"", settings.dynamic_light_brightness);
+    let _ = writeln!(text, "seta r_dynamicLightBrightnessLock \"{}\"", u8::from(settings.dynamic_light_brightness_locked));
     text.push_str(&format!(
         "seta r_physics \"{}\"\n\
 seta r_physicsHz \"{}\"\n\
@@ -1508,6 +1619,7 @@ seta r_physicsStats \"{}\"\n",
         u8::from(settings.physics_stats),
     ));
     let _ = writeln!(text, "seta model \"{}\"", presentation.model);
+    let _ = writeln!(text, "seta cg_forceModel \"{}\"", presentation.force_model);
     let _ = writeln!(text, "seta cg_drawCrosshair \"{}\"", presentation.crosshair.style);
     let _ = writeln!(text, "seta cg_crosshairSize \"{:.3}\"", presentation.crosshair.size);
     let [r, g, b, a] = presentation.crosshair.color;
@@ -1537,7 +1649,13 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta cg_strafeHelperActiveColor \"{sr} {sg} {sb} {sa}\"");
     let _ = writeln!(text, "seta cg_strafeHelperInactiveAlpha \"{}\"", presentation.strafe_helper.inactive_alpha);
     let _ = writeln!(text, "seta con_timestamps \"{}\"", u8::from(presentation.console_timestamps));
+    let _ = writeln!(text, "seta con_suggest \"{}\"", u8::from(presentation.console_suggest));
     let _ = writeln!(text, "seta ui_vgs \"{}\"", presentation.ui_vgs);
+    let _ = writeln!(text, "seta r_jumpHeightShade \"{}\"", u8::from(presentation.jump_height_shade));
+    let _ = writeln!(text, "seta cg_zoomFov \"{:.3}\"", presentation.zoom_fov);
+    let _ = writeln!(text, "seta cg_fkDuration \"{}\"", presentation.fk_duration);
+    let _ = writeln!(text, "seta cg_fkFirstJumpDuration \"{}\"", presentation.fk_first_jump_duration);
+    let _ = writeln!(text, "seta cg_fkSecondJumpDelay \"{}\"", presentation.fk_second_jump_delay);
     let _ = writeln!(text, "seta cg_fov \"{:.3}\"", presentation.fov);
     for (index, master) in presentation.master_servers.iter().enumerate() {
         let _ = writeln!(text, "seta sv_master{} \"{}\"", index + 1, master);
@@ -1835,6 +1953,32 @@ mod tests {
     }
 
     #[test]
+    fn rt_samples_survive_config_round_trip_and_reject_invalid_values() {
+        let dir = std::env::temp_dir().join(format!("jka-rt-samples-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.cfg");
+        for samples in [1, 2, 4] {
+            let mut settings = VideoSettings::default();
+            settings.rt_samples = samples;
+            settings.rt_half_resolution = samples != 1;
+            save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
+                &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
+            assert_eq!(load_video_settings(&path, None).rt_samples, samples);
+            assert_eq!(load_video_settings(&path, None).rt_half_resolution, samples != 1);
+        }
+        for value in ["0", "3", "999", "-1", "NaN"] {
+            std::fs::write(&path, format!("seta r_rtSamples \"{value}\"\n")).unwrap();
+            assert_eq!(load_video_settings(&path, None).rt_samples, 1);
+        }
+        for (value, half) in [("full", false), ("half", true), ("1", false), ("0.5", true), ("0.25", false), ("invalid", false)] {
+            std::fs::write(&path, format!("seta r_rtResolution \"{value}\"\n")).unwrap();
+            assert_eq!(load_video_settings(&path, None).rt_half_resolution, half);
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
     fn cloud_tuning_settings_survive_a_config_round_trip() {
         // Every cloud tuning knob has to appear in both the writer and the
         // parser. A knob present in only one silently resets to its default on
@@ -1964,6 +2108,7 @@ mod tests {
             &path,
             concat!(
                 "seta model \"rebel/default\"\n",
+                "seta cg_forceModel \"rebel/default,stormtrooper/default\"\n",
                 "seta sensitivity \"7.25\"\n",
                 "seta m_yaw \"0.031\"\n",
                 "seta m_pitch \"-0.019\"\n",
@@ -1971,6 +2116,7 @@ mod tests {
                 "seta cg_fov \"110\"\n",
                 "seta cg_thirdPerson \"1\"\n",
                 "seta cg_fpls \"0\"\n",
+                "seta r_jumpHeightShade \"1\"\n",
                 "seta cg_saberTrail \"2\"\n",
                 "seta cg_smoothPlayerOrigin \"0\"\n",
                 "seta cg_smoothThirdPersonOrigin \"0\"\n",
@@ -2003,6 +2149,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(loaded.model, "rebel/default");
+        assert_eq!(loaded.force_model, "rebel/default,stormtrooper/default");
         assert!((loaded.mouse.sensitivity - 7.25).abs() < 1e-6);
         assert!((loaded.mouse.yaw - 0.031).abs() < 1e-6);
         assert!((loaded.mouse.pitch + 0.019).abs() < 1e-6);
@@ -2010,6 +2157,7 @@ mod tests {
         assert!((loaded.fov - 110.0).abs() < 1e-6);
         assert!(loaded.third_person.enabled);
         assert!(!loaded.first_person_lightsaber);
+        assert!(loaded.jump_height_shade);
         assert_eq!(loaded.saber_trail, 2);
         assert!(!loaded.smoothing.smooth_player_origin);
         assert!(!loaded.smoothing.smooth_third_person_origin);
@@ -2048,6 +2196,7 @@ mod tests {
         let path = dir.join("test.cfg");
         let mut presentation = ClientPresentationSettings::default();
         presentation.model = "kyle/default".to_owned();
+        presentation.force_model = "rebel/default,stormtrooper/default".to_owned();
         presentation.mouse.sensitivity = 6.5;
         presentation.mouse.yaw = 0.025;
         presentation.mouse.pitch = -0.022;
@@ -2055,6 +2204,7 @@ mod tests {
         presentation.fov = 105.0;
         presentation.third_person.enabled = true;
         presentation.first_person_lightsaber = false;
+        presentation.jump_height_shade = true;
         presentation.saber_trail = 0;
         presentation.smoothing.smooth_player_origin = false;
         presentation.smoothing.smooth_third_person_origin = false;
@@ -2093,6 +2243,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(text.contains("seta model \"kyle/default\""));
+        assert!(text.contains("seta cg_forceModel \"rebel/default,stormtrooper/default\""));
         assert!(text.contains("seta sensitivity \"6.500000\""));
         assert!(text.contains("seta m_yaw \"0.025000\""));
         assert!(text.contains("seta m_pitch \"-0.022000\""));
@@ -2100,6 +2251,7 @@ mod tests {
         assert!(text.contains("seta cg_fov \"105.000\""));
         assert!(text.contains("seta cg_thirdPerson \"1\""));
         assert!(text.contains("seta cg_fpls \"0\""));
+        assert!(text.contains("seta r_jumpHeightShade \"1\""));
         assert!(text.contains("seta cg_saberTrail \"0\""));
         assert!(text.contains("seta cg_fxFPS \"90\""));
         assert!(text.contains("seta cg_smoothPlayerOrigin \"0\""));

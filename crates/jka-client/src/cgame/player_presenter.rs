@@ -7,7 +7,8 @@
 //! network, demo, and local/offline sources use this exact same presentation code.
 
 use crate::{
-    cgame::{ClientGameState, Ghoul2ServerCommand, PresentationEvent, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER},
+    asset_jobs::{self, AssetPriority, AssetRegistry, AssetSource, AssetState, Requested},
+    cgame::{ClientGameState, ForcedPlayerModels, Ghoul2ServerCommand, PresentationEvent, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE},
     materials::{self, TextureData, Textures},
     renderer::{
         DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, Ghoul2GpuBone,
@@ -17,13 +18,14 @@ use crate::{
     ui::Ghoul2SkinningMode,
 };
 use jka_assets::{
-    animation::{load_humanoid_animations, AnimationSet},
+    animation::{animation_index, load_humanoid_animations, AnimationSet},
     ghoul2::{
         model_bolt_matrix, multiply_3x4, openjk_default_gla, parse_gla, parse_glm,
         skin_glm_surface, GlaAnimation, Ghoul2Animator, Ghoul2SkinnedSurface, GlmModel, GlmSurface, Matrix3x4,
-        OPENJK_DEFAULT_GLA_NAME,
+        BONE_ANIM_OVERRIDE_FREEZE, BONE_ANIM_OVERRIDE_LOOP, OPENJK_DEFAULT_GLA_NAME,
     },
     pk3::AssetSearchPath,
+    siege::find_siege_class_visual,
     saber::{
         load_saber_animation_scales, load_saber_definitions, SaberAnimationScales, SaberDefinition,
         SaberDefinitions,
@@ -35,23 +37,42 @@ use jka_assets::{
 use super::player_animation::PlayerAnimationState;
 use super::ragdoll::{PhysicsMapMesh, RagdollConfig, RagdollWorld};
 use super::saber_throw::{blade_angles, SaberThrowState};
-use jka_movement::{bg_g2_player_angles, PlayerAngleEntity, PlayerAngleState, BONE_ANGLES_POSTMULT};
+use jka_movement::{
+    bg_g2_player_angles, CollisionWorld, PlayerAngleEntity, PlayerAngleState, TraceQuery, TraceWorld,
+    BONE_ANGLES_POSTMULT,
+};
+use jka_protocol::entity_event::EntityEvent;
 use glam::Vec3;
 use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
 const EF_TELEPORT_BIT: i32 = 1 << 3;
 const WP_SABER: i32 = 3;
 const WP_BRYAR_PISTOL: i32 = 4;
-const EV_DESTROY_WEAPON_MODEL: i32 = 104;
 const EF_NODRAW: i32 = 1 << 8;
 const EF_DEAD: i32 = 1 << 1;
 const EF_RAG: i32 = 1 << 6;
 const EF2_SHIP_DEATH: i32 = 1 << 7;
+
+// OpenJK MP CG_PlayerShadow / bg_public.h / teams.h values. Blob shadows are
+// deliberately a CGame presentation feature, not part of the CSM/RT paths.
+const PW_CLOAKED: i32 = 11;
+const CLASS_REMOTE: i32 = 39;
+const CLASS_SEEKER: i32 = 41;
+const BLOB_SHADOW_DISTANCE: f32 = 128.0;
+const BLOB_SHADOW_RADIUS: f32 = 24.0;
+const BLOB_SHADOW_DROID_RADIUS: f32 = 8.0;
+const BLOB_SHADOW_MINS: [f32; 3] = [-15.0, -15.0, 0.0];
+const BLOB_SHADOW_MAXS: [f32; 3] = [15.0, 15.0, 2.0];
+const MASK_PLAYERSOLID: i32 = 0x0000_0001 | 0x0000_0010 | 0x0000_0100 | 0x0000_1000;
+// OpenJK gets polygonOffset from the markShadow shader. Dynamic-model effects
+// do not currently carry shader polygonOffset state, so lift the same decal a
+// tiny amount along the hit normal to avoid z-fighting without a new pipeline.
+const BLOB_SHADOW_SURFACE_LIFT: f32 = 0.125;
 
 const MAX_GLM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GLA_BYTES: usize = 128 * 1024 * 1024;
@@ -357,6 +378,10 @@ impl SaberBladeLengthState {
 
 struct EntityPlayerState {
     model_key: String,
+    /// False while `model` is only a stand-in (previous model or default
+    /// fallback) for a requested model that is still loading. A settled state
+    /// with matching requested names lets the per-frame lookup be skipped.
+    model_settled: bool,
     // Cache the resolved model directly on the persistent centity-like state.
     // This avoids rebuilding/lowercasing qpath cache keys and hashing the global
     // model cache for every visible player on every frame.
@@ -757,6 +782,395 @@ fn gpu_bones_from_pose(pose: &[Matrix3x4]) -> Arc<Vec<Ghoul2GpuBone>> {
     )
 }
 
+/// Marker carried by errors that only mean "still loading". Presentation code
+/// treats it as "skip this frame", never as a failure to report.
+const ASSET_PENDING: &str = "asset loading";
+
+fn is_asset_pending(error: &str) -> bool {
+    error.contains(ASSET_PENDING)
+}
+
+/// OpenJK cache key for a player's model + skin registration.
+fn player_model_key(info: &crate::cgame::ClientInfo) -> String {
+    format!("{}|{}", info.model_qpath(), info.skin_qpath()).to_ascii_lowercase()
+}
+
+fn static_model_key(model_qpath: &str, custom_skin: Option<&str>, preview_fallback: bool) -> String {
+    format!(
+        "{}|{}|preview_fallback={}",
+        model_qpath,
+        custom_skin.unwrap_or(""),
+        u8::from(preview_fallback),
+    )
+    .to_ascii_lowercase()
+}
+
+enum ModelLookup {
+    Ready(Arc<PlayerModelAsset>),
+    Pending,
+    Failed(String),
+    Missing,
+}
+
+enum ModelResolution {
+    /// The requested model (or its terminal OpenJK fallback) is available.
+    Ready(Arc<PlayerModelAsset>),
+    /// Requested model still loading; this resident fallback body stands in.
+    Provisional(Arc<PlayerModelAsset>),
+    /// Nothing usable yet; the request is in flight.
+    Loading,
+    Failed(String),
+}
+
+/// Everything a Ghoul2 model registration needs from the outside world. The
+/// synchronous path and the asset workers implement this differently, but
+/// share exactly the same OpenJK registration logic in `build_*`.
+trait ModelSource {
+    fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String>;
+    fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String>;
+    fn load_skin(&mut self, qpath: &str) -> Result<Vec<jka_assets::skin::SkinSurface>, String>;
+    fn resolve_material(&mut self, shader_name: &str) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode);
+}
+
+/// Original behavior: reads and decodes on the calling thread, sharing the
+/// presenter's texture cache.
+struct SyncModelSource<'a> {
+    presenter: &'a mut PlayerPresenter,
+}
+
+impl ModelSource for SyncModelSource<'_> {
+    fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
+        Ok(self
+            .presenter
+            .assets
+            .read(qpath, MAX_GLM_BYTES)
+            .map_err(|error| format!("{qpath}: {error}"))?
+            .ok_or_else(|| format!("missing {qpath}"))?
+            .bytes)
+    }
+
+    fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String> {
+        self.presenter.load_glm_animation(qpath)
+    }
+
+    fn load_skin(&mut self, qpath: &str) -> Result<Vec<jka_assets::skin::SkinSurface>, String> {
+        self.presenter.load_skin_qpath(qpath)
+    }
+
+    fn resolve_material(&mut self, shader_name: &str) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
+        self.presenter.resolve_surface_material(shader_name)
+    }
+}
+
+/// Worker-side caches shared by every asset job of one presenter. Per-key
+/// `OnceLock`s make concurrent jobs that need the same GLA or texture wait for
+/// one decode instead of repeating it (all humanoid players share one GLA).
+struct ModelLoadShared {
+    shaders: Arc<BTreeMap<String, Shader>>,
+    glas: Mutex<HashMap<String, Arc<OnceLock<Result<Arc<GlaAnimation>, String>>>>>,
+    textures: Mutex<HashMap<(String, bool), Arc<OnceLock<Option<Arc<TextureData>>>>>>,
+}
+
+impl ModelLoadShared {
+    fn new(shaders: Arc<BTreeMap<String, Shader>>) -> Self {
+        Self {
+            shaders,
+            glas: Mutex::new(HashMap::new()),
+            textures: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+struct WorkerModelSource<'a> {
+    vfs: &'a mut AssetSearchPath,
+    shared: &'a ModelLoadShared,
+}
+
+impl ModelSource for WorkerModelSource<'_> {
+    fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
+        Ok(self
+            .vfs
+            .read(qpath, MAX_GLM_BYTES)
+            .map_err(|error| format!("{qpath}: {error}"))?
+            .ok_or_else(|| format!("missing {qpath}"))?
+            .bytes)
+    }
+
+    fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String> {
+        let cell = {
+            let mut glas = self.shared.glas.lock().map_err(|_| "GLA cache poisoned".to_owned())?;
+            Arc::clone(glas.entry(qpath.to_ascii_lowercase()).or_default())
+        };
+        let vfs = &mut *self.vfs;
+        cell.get_or_init(|| {
+            if qpath.eq_ignore_ascii_case(OPENJK_DEFAULT_GLA_NAME) {
+                return openjk_default_gla().map(Arc::new);
+            }
+            let bytes = vfs
+                .read(qpath, MAX_GLA_BYTES)
+                .map_err(|error| format!("{qpath}: {error}"))?
+                .ok_or_else(|| format!("missing {qpath}"))?
+                .bytes;
+            parse_gla(&bytes).map(Arc::new)
+        })
+        .clone()
+    }
+
+    fn load_skin(&mut self, qpath: &str) -> Result<Vec<jka_assets::skin::SkinSurface>, String> {
+        let vfs = &mut *self.vfs;
+        load_skin(qpath, |name| {
+            vfs.read(name, MAX_SKIN_BYTES)
+                .map_err(|error| error.to_string())
+                .map(|asset| asset.map(|asset| asset.bytes))
+        })
+    }
+
+    fn resolve_material(&mut self, shader_name: &str) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
+        let (image_name, clamp, alpha_mode) = material_stage(&self.shared.shaders, shader_name);
+        if image_name.eq_ignore_ascii_case("$whiteimage") {
+            return (None, alpha_mode);
+        }
+        let path = image_name.replace('\\', "/").to_ascii_lowercase();
+        let cell = {
+            let Ok(mut textures) = self.shared.textures.lock() else {
+                return (None, alpha_mode);
+            };
+            Arc::clone(textures.entry((path.clone(), clamp)).or_default())
+        };
+        let vfs = &mut *self.vfs;
+        let texture = cell
+            .get_or_init(|| {
+                // A scratch `Textures` reuses the exact decode/extension/
+                // stock-override logic of the synchronous loader.
+                let mut textures = Textures::new();
+                let texture = textures
+                    .load(vfs, &path, clamp)
+                    .map(|index| Arc::new(textures.images.swap_remove(index)));
+                if texture.is_none() {
+                    if let Some(warning) = textures.warnings.last() {
+                        println!("PLAYER TEXTURE WARNING: {warning}");
+                    }
+                }
+                texture
+            })
+            .clone();
+        (texture, alpha_mode)
+    }
+}
+
+/// The primary stage of a JKA shader decides the image, clamping and alpha
+/// mode of a player/Ghoul2 surface.
+fn material_stage<'a>(
+    shaders: &'a BTreeMap<String, Shader>,
+    shader_name: &'a str,
+) -> (&'a str, bool, DynamicModelAlphaMode) {
+    let shader_key = shader_name.replace('\\', "/").to_ascii_lowercase();
+    shaders
+        .get(&shader_key)
+        .and_then(Shader::primary)
+        .map(|stage| {
+            let alpha_mode = if !stage.alpha_test.trim().is_empty() {
+                DynamicModelAlphaMode::Mask
+            } else {
+                crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
+                    .custom_shader_alpha_mode()
+            };
+            (stage.image.as_str(), stage.clamp, alpha_mode)
+        })
+        .unwrap_or((shader_name, false, DynamicModelAlphaMode::Opaque))
+}
+
+/// OpenJK `CG_RegisterClientModelname`: GLM + GLA + skin -> drawable surfaces.
+fn build_player_model(
+    source: &mut dyn ModelSource,
+    info: &crate::cgame::ClientInfo,
+    key: String,
+) -> Result<PlayerModelAsset, String> {
+    let model_qpath = info.model_qpath();
+    let model_bytes = source.read_model(&model_qpath)?;
+    let glm = Arc::new(parse_glm(&model_bytes)?);
+
+    let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
+        glm.anim_name.clone()
+    } else {
+        format!("{}.gla", glm.anim_name)
+    };
+    let gla = source.load_gla(&gla_qpath)?;
+    // OpenJK mdx_format.h: mdxmHeader_t::numBones exists for an
+    // in-game version/safety check to ensure the mesh does not reference
+    // MORE bones than its GLA provides. Equality is not required; weapon
+    // and saber meshes commonly use only a subset of a shared skeleton.
+    if glm.num_bones > gla.skeleton.len() {
+        return Err(format!(
+            "GLM references {} bones but GLA only provides {}",
+            glm.num_bones,
+            gla.skeleton.len()
+        ));
+    }
+
+    let skin_qpath = info.skin_qpath();
+    let skin = match source.load_skin(&skin_qpath) {
+        Ok(skin) => skin,
+        Err(primary_error) => {
+            let fallback = info.default_skin_qpath();
+            println!(
+                "PLAYER SKIN FALLBACK: {skin_qpath}: {primary_error}; trying {fallback}"
+            );
+            source.load_skin(&fallback)?
+        }
+    };
+    let skin_map = skin
+        .into_iter()
+        .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
+        .collect::<HashMap<_, _>>();
+
+    let lod = glm
+        .lods
+        .first()
+        .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
+    let mut surfaces = Vec::with_capacity(lod.surfaces.len());
+    for surface in &lod.surfaces {
+        let hierarchy = glm
+            .hierarchy
+            .get(surface.surface_index)
+            .ok_or_else(|| format!("{model_qpath}: missing hierarchy for surface {}", surface.surface_index))?;
+        let shader_name = skin_map
+            .get(&hierarchy.name.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or(hierarchy.shader.as_str());
+        if shader_name.is_empty() || shader_name.eq_ignore_ascii_case("*off") {
+            continue;
+        }
+        let (texture, alpha_mode) = source.resolve_material(shader_name);
+        surfaces.push(PlayerSurfaceAsset {
+            surface_index: surface.surface_index,
+            texture,
+            alpha_mode,
+            fallback_gray: false,
+            gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
+        });
+    }
+
+    println!(
+        "PLAYER MODEL: {} skin={} surfaces={} gla={} bones={}",
+        model_qpath,
+        skin_qpath,
+        surfaces.len(),
+        gla_qpath,
+        gla.skeleton.len(),
+    );
+
+    Ok(PlayerModelAsset {
+        key,
+        glm,
+        gla,
+        surfaces,
+    })
+}
+
+fn build_static_glm(
+    source: &mut dyn ModelSource,
+    model_qpath: &str,
+    custom_skin: Option<&str>,
+    label: &str,
+    preview_fallback: bool,
+) -> Result<SaberModelAsset, String> {
+    let model_bytes = source.read_model(model_qpath)?;
+    let glm = Arc::new(parse_glm(&model_bytes)?);
+    let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
+        glm.anim_name.clone()
+    } else {
+        format!("{}.gla", glm.anim_name)
+    };
+    let gla = source.load_gla(&gla_qpath)?;
+    // Match OpenJK's MDXM registration rule: the mesh may use fewer
+    // bones than the referenced GLA, it just may not reference beyond it.
+    if glm.num_bones > gla.skeleton.len() {
+        return Err(format!(
+            "GLM references {} bones but GLA only provides {}",
+            glm.num_bones,
+            gla.skeleton.len()
+        ));
+    }
+
+    let skin_map = if let Some(skin_qpath) = custom_skin {
+        match source.load_skin(skin_qpath) {
+            Ok(skin) => skin
+                .into_iter()
+                .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
+                .collect::<HashMap<_, _>>(),
+            Err(error) if preview_fallback => {
+                println!(
+                    "ASSET VIEWER GLM SKIN FALLBACK: model={} skin={} error={}; using embedded shaders/gray fallback",
+                    model_qpath, skin_qpath, error,
+                );
+                HashMap::new()
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        HashMap::new()
+    };
+    let lod = glm
+        .lods
+        .first()
+        .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
+    let mut surfaces = Vec::with_capacity(lod.surfaces.len());
+    for surface in &lod.surfaces {
+        let hierarchy = glm
+            .hierarchy
+            .get(surface.surface_index)
+            .ok_or_else(|| format!("{model_qpath}: missing hierarchy for surface {}", surface.surface_index))?;
+        // Ghoul2 tag surfaces are attachment metadata, not visible hilt geometry.
+        if hierarchy.name.starts_with('*') {
+            continue;
+        }
+        let shader_name = skin_map
+            .get(&hierarchy.name.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or(hierarchy.shader.as_str());
+        if shader_name.eq_ignore_ascii_case("*off") {
+            continue;
+        }
+        let missing_shader = shader_name.is_empty();
+        let shader_name = if missing_shader {
+            if preview_fallback {
+                // Player/NPC GLMs often have no embedded shader refs and
+                // normally rely entirely on model_default.skin. If that
+                // skin is absent/incomplete, keep the geometry inspectable
+                // instead of silently producing zero draw surfaces.
+                "$whiteimage"
+            } else {
+                continue;
+            }
+        } else {
+            shader_name
+        };
+        let (texture, alpha_mode) = source.resolve_material(shader_name);
+        let fallback_gray = preview_fallback
+            && (missing_shader
+                || (!shader_name.eq_ignore_ascii_case("$whiteimage") && texture.is_none()));
+        surfaces.push(PlayerSurfaceAsset {
+            surface_index: surface.surface_index,
+            texture,
+            alpha_mode,
+            fallback_gray,
+            gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
+        });
+    }
+    println!(
+        "GHOUL2 STATIC MODEL REGISTERED: name={} model={} skin={} surfaces={} glmBones={} glaBones={} gla={}",
+        label,
+        model_qpath,
+        custom_skin.unwrap_or("<default>"),
+        surfaces.len(),
+        glm.num_bones,
+        gla.skeleton.len(),
+        gla_qpath,
+    );
+    Ok(SaberModelAsset { glm, gla, surfaces })
+}
+
 /// Asset/runtime state corresponding to the player-model subset of OpenJK cgame.
 /// Models and textures are cached by qpath; animation state is kept per entity,
 /// matching the persistent `centity_t` ownership in the original client.
@@ -768,7 +1182,7 @@ pub struct PlayerPresenter {
     viewer_client: i32,
     viewer_dueling: bool,
     assets: AssetSearchPath,
-    shaders: BTreeMap<String, Shader>,
+    shaders: Arc<BTreeMap<String, Shader>>,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     animations: AnimationSet,
@@ -777,6 +1191,16 @@ pub struct PlayerPresenter {
     vehicle_definitions: VehicleDefinitions,
     models: HashMap<String, Arc<PlayerModelAsset>>,
     saber_models: HashMap<String, Arc<SaberModelAsset>>,
+    /// Asynchronous registration (see `asset_jobs`). These own the pending and
+    /// terminal states of runtime cache misses; `models`/`saber_models` above
+    /// keep the synchronous path's results (previews, `cg_asyncAssets 0`).
+    async_models: AssetRegistry<PlayerModelAsset>,
+    async_static_models: AssetRegistry<SaberModelAsset>,
+    asset_source: Arc<AssetSource>,
+    load_shared: Arc<ModelLoadShared>,
+    /// Per-presenter opt-out of asynchronous registration (tests/tools that
+    /// need results on the very next call). `cg_asyncAssets` is the global switch.
+    async_loading: bool,
     entities: HashMap<u16, EntityPlayerState>,
     /// Broadsword-compatible presentation seam backed by Rapier.
     ragdolls: RagdollWorld,
@@ -803,6 +1227,16 @@ pub struct PlayerPresenter {
     /// When true, camera-culled Ghoul2 models may still be submitted as
     /// shadow-only RT casters. Normal RT-off presentation is unchanged.
     rt_shadow_casters_enabled: bool,
+    /// Map-scoped collision clone used only by OpenJK cg_shadows 1. Like the
+    /// original CM_Trace call this traces static BSP collision, not entities.
+    collision_world: Option<CollisionWorld>,
+    blob_shadows_enabled: bool,
+    blob_shadow_vertices: Vec<DynamicModelVertex>,
+    blob_shadow_indices: Vec<u32>,
+    blob_shadow_texture: Option<Arc<TextureData>>,
+    blob_shadow_alpha_mode: DynamicModelAlphaMode,
+    blob_shadow_texture_resolved: bool,
+    blob_shadow_asset_warned: bool,
     lod_bias: i32,
     skinning_pool: rayon::ThreadPool,
 }
@@ -862,6 +1296,8 @@ impl PlayerPresenter {
         self.thrown_sabers.clear();
         self.body_queue_copies.clear();
         self.saber_blade_lengths.clear();
+        self.blob_shadow_vertices.clear();
+        self.blob_shadow_indices.clear();
         self.ragdolls.reset_dynamic_for_seek();
     }
 
@@ -892,6 +1328,9 @@ impl PlayerPresenter {
         for warning in shader_warnings {
             println!("PLAYER MATERIAL WARNING: {warning}");
         }
+        let asset_source = AssetSource::from_search_path(&assets);
+        let shaders = Arc::new(shaders);
+        let load_shared = Arc::new(ModelLoadShared::new(Arc::clone(&shaders)));
         let worker_count = std::thread::available_parallelism()
             .map_or(4, |count| count.get())
             .saturating_sub(2)
@@ -902,7 +1341,7 @@ impl PlayerPresenter {
             .build()
             .map_err(|error| format!("could not start Ghoul2 skinning workers: {error}"))?;
         println!("Ghoul2 skinning worker pool: {worker_count} thread(s)");
-        Ok(Self {
+        let mut presenter = Self {
             assets,
             shaders,
             textures: Textures::new(),
@@ -913,6 +1352,11 @@ impl PlayerPresenter {
             vehicle_definitions,
             models: HashMap::new(),
             saber_models: HashMap::new(),
+            async_models: AssetRegistry::new("player model"),
+            async_static_models: AssetRegistry::new("ghoul2 model"),
+            asset_source,
+            load_shared,
+            async_loading: true,
             fx_requests: Vec::new(),
             perf: Ghoul2PerfStats::default(),
             viewer_client: -1,
@@ -934,9 +1378,19 @@ impl PlayerPresenter {
             skinning_mode: Ghoul2SkinningMode::Gpu,
             early_frustum_cull: true,
             rt_shadow_casters_enabled: false,
+            collision_world: None,
+            blob_shadows_enabled: false,
+            blob_shadow_vertices: Vec::new(),
+            blob_shadow_indices: Vec::new(),
+            blob_shadow_texture: None,
+            blob_shadow_alpha_mode: DynamicModelAlphaMode::BlendUnlit,
+            blob_shadow_texture_resolved: false,
+            blob_shadow_asset_warned: false,
             lod_bias: 0,
             skinning_pool,
-        })
+        };
+        presenter.prime_default_player_models();
+        Ok(presenter)
     }
 
     /// Force-power effect requests produced since the last call.
@@ -1006,7 +1460,7 @@ impl PlayerPresenter {
 
     /// OpenJK EV_DESTROY_WEAPON_MODEL removes Ghoul2 model index 1 only.
     pub fn apply_entity_event(&mut self, event: &PresentationEvent) {
-        if event.event != EV_DESTROY_WEAPON_MODEL {
+        if event.event != EntityEvent::EV_DESTROY_WEAPON_MODEL {
             return;
         }
         let Ok(target) = u16::try_from(event.parm) else {
@@ -1141,6 +1595,62 @@ impl PlayerPresenter {
         self.rt_shadow_casters_enabled = enabled;
     }
 
+    /// Install the current map collision world for OpenJK-style blob traces.
+    /// This is map-scoped and must not be rebound every frame.
+    pub fn set_collision_world(&mut self, world: Option<CollisionWorld>) {
+        self.collision_world = world;
+        self.blob_shadow_vertices.clear();
+        self.blob_shadow_indices.clear();
+    }
+
+    /// Begin one CG_AddEntities blob-shadow collection pass. All eligible
+    /// players/NPCs are packed into one dynamic surface so the OpenJK visual
+    /// costs one draw rather than one temporary-poly draw per character.
+    pub fn begin_blob_shadow_frame(&mut self, enabled: bool) {
+        self.blob_shadows_enabled = enabled;
+        self.blob_shadow_vertices.clear();
+        self.blob_shadow_indices.clear();
+    }
+
+    /// Finish cg_shadows 1. Keep the stock `markShadow` image *and its authored
+    /// first-stage blend mode*, while batching all blobs into one surface.
+    pub fn finish_blob_shadow_frame(&mut self) -> Option<DynamicModelSurface> {
+        if !self.blob_shadows_enabled || self.blob_shadow_indices.is_empty() {
+            return None;
+        }
+        if !self.blob_shadow_texture_resolved {
+            let (texture, alpha_mode) = self.custom_shader_material("markShadow");
+            self.blob_shadow_texture = texture;
+            self.blob_shadow_alpha_mode = alpha_mode;
+            self.blob_shadow_texture_resolved = true;
+        }
+        let Some(texture) = self.blob_shadow_texture.as_ref().map(Arc::clone) else {
+            if !self.blob_shadow_asset_warned {
+                eprintln!("BLOB SHADOW: OpenJK markShadow material/image was not found; suppressing blob draw");
+                self.blob_shadow_asset_warned = true;
+            }
+            self.blob_shadow_vertices.clear();
+            self.blob_shadow_indices.clear();
+            return None;
+        };
+        Some(DynamicModelSurface {
+            entity_num: u16::MAX,
+            wireframe_class: DynamicWireframeClass::Effect,
+            raster_visible: true,
+            vertices: Arc::new(std::mem::take(&mut self.blob_shadow_vertices)),
+            indices: Arc::new(std::mem::take(&mut self.blob_shadow_indices)),
+            lighting_origin: None,
+            rt_rigid: None,
+            rt_skinned_key: None,
+            ghoul2_gpu: None,
+            fx_gpu_sprites: None,
+            texture: Some(texture),
+            // OpenJK registers `markShadow` as a shader and lets the renderer
+            // honor the shader's authored blendFunc; preserve that here.
+            alpha_mode: self.blob_shadow_alpha_mode,
+        })
+    }
+
     pub fn set_lod_bias(&mut self, lod_bias: i32) {
         // OpenJK's renderer cvar is not range-checked, but its Ghoul2 path
         // takes max(r_lodbias, modelBias). Our current per-model bias is 0,
@@ -1225,6 +1735,7 @@ impl PlayerPresenter {
                         origin,
                         color: surface_rgba,
                     }),
+                    fx_gpu_sprites: None,
                     texture,
                     alpha_mode,
                 });
@@ -1294,6 +1805,7 @@ impl PlayerPresenter {
                 rt_rigid: None,
                 rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.key)),
                 ghoul2_gpu: None,
+                fx_gpu_sprites: None,
                 texture,
                 alpha_mode,
             });
@@ -1337,6 +1849,7 @@ impl PlayerPresenter {
             rt_rigid: surface.rt_rigid.clone(),
             rt_skinned_key: surface.rt_skinned_key.as_ref().map(Arc::clone),
             ghoul2_gpu,
+            fx_gpu_sprites: None,
             texture,
             alpha_mode,
         }
@@ -1361,12 +1874,13 @@ impl PlayerPresenter {
         let resolved = resolve_vehicle_model_request(&self.vehicle_definitions, &requested);
         let model = match resolved {
             Ok((requested_glm, requested_skin, requested_label)) => {
-                match self.load_static_glm(
+                match self.load_static_glm_in_game(
                     &requested_glm,
                     requested_skin.as_deref(),
                     &requested_label,
                 ) {
                     Ok(model) => model,
+                    Err(pending) if is_asset_pending(&pending) => return Ok(Vec::new()),
                     Err(primary_error) => self.vehicle_fallback(
                         entity.number,
                         &requested,
@@ -1449,11 +1963,19 @@ impl PlayerPresenter {
         preserve_entity: Option<u16>,
         hidden_first_person_entity: Option<u16>,
         view: Option<Ghoul2PresentationView>,
+        forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         if let Some(snapshot) = game.current_snapshot() {
             self.viewer_client = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
             self.viewer_dueling = snapshot.player_state.field_i32("duelInProgress").unwrap_or(0) != 0;
         }
+        // Keep the disabled path effectively free: only parse the viewer's
+        // ClientInfo when a force-model override is actually enabled.
+        let viewer_info = forced_models.and_then(|_| {
+            usize::try_from(self.viewer_client)
+                .ok()
+                .and_then(|client| game.client_info(client, siege_classes))
+        });
         let mut draws = Vec::new();
         let mut live_entities = HashSet::new();
         let mut live_ragdolls = HashSet::new();
@@ -1510,6 +2032,9 @@ impl PlayerPresenter {
             {
                 continue;
             }
+            if entity.entity_type != ET_BODY {
+                self.queue_blob_shadow(entity);
+            }
             if entity.entity_type == ET_NPC
                 && entity.state.field_i32("NPC_class").unwrap_or(0) == crate::cgame::CLASS_VEHICLE
             {
@@ -1546,10 +2071,25 @@ impl PlayerPresenter {
                     self.report_player_status(entity.number, format!("clientNum={client_num} submitted=0 reason=invalid-client"));
                     continue;
                 };
-                let Some(info) = game.client_info(client_num, siege_classes) else {
+                let Some(mut info) = game.client_info(client_num, siege_classes) else {
                     self.report_player_status(entity.number, format!("clientNum={client_num} submitted=0 reason=missing-client-info"));
                     continue;
                 };
+                if let Some(forced) = forced_models {
+                    forced.apply_to(&mut info, viewer_info.as_ref());
+                    // TaystJK applies Siege class forcedModel/forcedSkin after
+                    // cg_forceModel, so class-required visuals remain authoritative.
+                    if info.gametype == GT_SIEGE {
+                        if let Some(class) = find_siege_class_visual(siege_classes, &info.siege_class) {
+                            if !class.forced_model.is_empty() {
+                                info.model_name.clone_from(&class.forced_model);
+                            }
+                            if !class.forced_skin.is_empty() {
+                                info.skin_name.clone_from(&class.forced_skin);
+                            }
+                        }
+                    }
+                }
                 (client_num, info)
             };
 
@@ -1620,6 +2160,12 @@ impl PlayerPresenter {
         force_reset: bool,
         submit_geometry: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        if entity.entity_type != ET_BODY
+            && entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW == 0
+            && entity.state.field_i32("eFlags2").unwrap_or(0) & EF2_SHIP_DEATH == 0
+        {
+            self.queue_blob_shadow(entity);
+        }
         self.present_player(
             entity,
             info,
@@ -1643,18 +2189,42 @@ impl PlayerPresenter {
         submit_geometry: bool,
         view: Option<Ghoul2PresentationView>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        self.poll_asset_completions();
         let cached_model = self
             .entities
             .get(&entity.number)
             .filter(|runtime| {
-                runtime.requested_model_name.eq_ignore_ascii_case(&info.model_name)
+                runtime.model_settled
+                    && runtime.requested_model_name.eq_ignore_ascii_case(&info.model_name)
                     && runtime.requested_skin_name.eq_ignore_ascii_case(&info.skin_name)
             })
             .map(|runtime| Arc::clone(&runtime.model));
-        let model = if let Some(model) = cached_model {
-            model
+        let (model, model_settled) = if let Some(model) = cached_model {
+            (model, true)
+        } else if !self.async_loading_enabled() {
+            (self.load_model(info)?, true)
         } else {
-            self.load_model(info)?
+            // Request the real model immediately but never wait for it: keep
+            // the entity's previous model, or the resident default body for a
+            // new player, until the worker finishes; then swap automatically.
+            match self.resolve_player_model_async(info) {
+                ModelResolution::Ready(model) => (model, true),
+                ModelResolution::Provisional(model) => {
+                    match self.entities.get(&entity.number) {
+                        Some(runtime) => (Arc::clone(&runtime.model), false),
+                        None => (model, false),
+                    }
+                }
+                ModelResolution::Loading => match self.entities.get(&entity.number) {
+                    Some(runtime) => (Arc::clone(&runtime.model), false),
+                    None => return Ok(Vec::new()),
+                },
+                ModelResolution::Failed(error) => match self.entities.get(&entity.number) {
+                    // Keep showing the last valid model rather than vanishing.
+                    Some(runtime) => (Arc::clone(&runtime.model), true),
+                    None => return Err(error),
+                },
+            }
         };
 
         // OpenJK loads a client's selected saber definitions/models as part of
@@ -1665,16 +2235,31 @@ impl PlayerPresenter {
         // a weapon that is explicitly present in a snapshot.
         self.register_client_saber_assets(info, entity.number);
 
-        let recreate = self
+        let mut recreate = self
             .entities
             .get(&entity.number)
             .is_none_or(|runtime| runtime.model_key != model.key);
+        if recreate {
+            // A model swap onto the very same skeleton (all humanoid players
+            // share one GLA through the asset workers) keeps the running
+            // animation/angle state instead of restarting the player.
+            if let Some(runtime) = self
+                .entities
+                .get_mut(&entity.number)
+                .filter(|runtime| Arc::ptr_eq(&runtime.model.gla, &model.gla))
+            {
+                runtime.model_key.clone_from(&model.key);
+                runtime.model = Arc::clone(&model);
+                recreate = false;
+            }
+        }
         if recreate {
             let animation = PlayerAnimationState::new(&model.gla, current_time)?;
             self.entities.insert(
                 entity.number,
                 EntityPlayerState {
                     model_key: model.key.clone(),
+                    model_settled,
                     requested_model_name: info.model_name.clone(),
                     requested_skin_name: info.skin_name.clone(),
                     model: Arc::clone(&model),
@@ -1713,6 +2298,14 @@ impl PlayerPresenter {
             .entities
             .get_mut(&entity.number)
             .ok_or_else(|| "player animation state disappeared".to_owned())?;
+        if runtime.model_settled != model_settled
+            || !runtime.requested_model_name.eq_ignore_ascii_case(&info.model_name)
+            || !runtime.requested_skin_name.eq_ignore_ascii_case(&info.skin_name)
+        {
+            runtime.model_settled = model_settled;
+            runtime.requested_model_name.clone_from(&info.model_name);
+            runtime.requested_skin_name.clone_from(&info.skin_name);
+        }
         let previous_e_flags = runtime.last_e_flags;
         let time_rewound = current_time < runtime.last_angle_time;
         // CG_SetInitialSnapshot calls CG_ResetEntity for every entity, and
@@ -2113,7 +2706,7 @@ impl PlayerPresenter {
         let Some(hand_bolt) = model_bolt_matrix_timed(&mut self.perf, &player_model.glm, &player_model.gla, player_pose, "*r_hand")? else {
             return Err(format!("{} has no Ghoul2 *r_hand bolt", player_model.key));
         };
-        let weapon_model = self.load_static_glm(&qpath, None, &qpath)?;
+        let weapon_model = self.load_static_glm_in_game(&qpath, None, &qpath)?;
         let pose_started = Instant::now();
         let pose = Ghoul2Animator::new(&weapon_model.gla).evaluate_pose(&weapon_model.gla, current_time, hand_bolt)?;
         record_pose_eval(&mut self.perf, pose_started);
@@ -2161,12 +2754,13 @@ impl PlayerPresenter {
         &mut self,
         info: &crate::cgame::ClientInfo,
     ) -> Result<Arc<PlayerModelAsset>, String> {
-        let key = format!("{}|{}", info.model_qpath(), info.skin_qpath()).to_ascii_lowercase();
-        if let Some(model) = self.models.get(&key) {
-            return Ok(Arc::clone(model));
-        }
-        if let Some(error) = self.failed_models.get(&key) {
-            return Err(error.clone());
+        let key = player_model_key(info);
+        match self.lookup_model(&key) {
+            ModelLookup::Ready(model) => return Ok(model),
+            ModelLookup::Failed(error) => return Err(error),
+            // Synchronous callers (previews, `cg_asyncAssets 0`) need the
+            // answer now; an in-flight async copy just becomes redundant.
+            ModelLookup::Pending | ModelLookup::Missing => {}
         }
 
         let result = self.load_model_uncached(info, key.clone());
@@ -2189,91 +2783,145 @@ impl PlayerPresenter {
         info: &crate::cgame::ClientInfo,
         key: String,
     ) -> Result<PlayerModelAsset, String> {
-        let model_qpath = info.model_qpath();
-        let model_bytes = self
-            .assets
-            .read(&model_qpath, MAX_GLM_BYTES)
-            .map_err(|error| format!("{model_qpath}: {error}"))?
-            .ok_or_else(|| format!("missing {model_qpath}"))?
-            .bytes;
-        let glm = Arc::new(parse_glm(&model_bytes)?);
+        build_player_model(&mut SyncModelSource { presenter: self }, info, key)
+    }
 
-        let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
-            glm.anim_name.clone()
-        } else {
-            format!("{}.gla", glm.anim_name)
-        };
-        let gla = self.load_glm_animation(&gla_qpath)?;
-        // OpenJK mdx_format.h: mdxmHeader_t::numBones exists for an
-        // in-game version/safety check to ensure the mesh does not reference
-        // MORE bones than its GLA provides. Equality is not required; weapon
-        // and saber meshes commonly use only a subset of a shared skeleton.
-        if glm.num_bones > gla.skeleton.len() {
-            return Err(format!(
-                "GLM references {} bones but GLA only provides {}",
-                glm.num_bones,
-                gla.skeleton.len()
-            ));
+    fn lookup_model(&self, key: &str) -> ModelLookup {
+        if let Some(model) = self.models.get(key) {
+            return ModelLookup::Ready(Arc::clone(model));
         }
+        if let Some(error) = self.failed_models.get(key) {
+            return ModelLookup::Failed(error.clone());
+        }
+        match self.async_models.state(key) {
+            Some(AssetState::Ready(model)) => ModelLookup::Ready(Arc::clone(model)),
+            Some(AssetState::Failed(error)) => ModelLookup::Failed(error.clone()),
+            Some(AssetState::Pending) => ModelLookup::Pending,
+            None => ModelLookup::Missing,
+        }
+    }
 
-        let skin_qpath = info.skin_qpath();
-        let skin = match self.load_skin_qpath(&skin_qpath) {
-            Ok(skin) => skin,
-            Err(primary_error) => {
-                let fallback = info.default_skin_qpath();
-                println!(
-                    "PLAYER SKIN FALLBACK: {skin_qpath}: {primary_error}; trying {fallback}"
-                );
-                self.load_skin_qpath(&fallback)?
+    /// Queue `info`'s model on the asset workers unless it is already known.
+    /// Returns immediately; cache hits and pending requests cost one lookup.
+    fn request_player_model(&mut self, info: &crate::cgame::ClientInfo, key: &str) -> ModelLookup {
+        let lookup = self.lookup_model(key);
+        if !matches!(lookup, ModelLookup::Missing) {
+            if matches!(lookup, ModelLookup::Pending) {
+                self.async_models.note_duplicate();
             }
-        };
-        let skin_map = skin
-            .into_iter()
-            .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-            .collect::<HashMap<_, _>>();
+            return lookup;
+        }
+        let source = Arc::clone(&self.asset_source);
+        let shared = Arc::clone(&self.load_shared);
+        let job_info = info.clone();
+        let job_key = key.to_owned();
+        let requested = self
+            .async_models
+            .request(key, AssetPriority::High, move || {
+                asset_jobs::with_worker_vfs(&source, |vfs| {
+                    build_player_model(
+                        &mut WorkerModelSource { vfs, shared: &shared },
+                        &job_info,
+                        job_key,
+                    )
+                })?
+            });
+        match requested {
+            Requested::Ready(model) => ModelLookup::Ready(model),
+            Requested::Pending => ModelLookup::Pending,
+            Requested::Failed(error) => ModelLookup::Failed(error),
+            Requested::Rejected => ModelLookup::Missing,
+        }
+    }
 
-        let lod = glm
-            .lods
-            .first()
-            .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
-        let mut surfaces = Vec::with_capacity(lod.surfaces.len());
-        for surface in &lod.surfaces {
-            let hierarchy = glm
-                .hierarchy
-                .get(surface.surface_index)
-                .ok_or_else(|| format!("{model_qpath}: missing hierarchy for surface {}", surface.surface_index))?;
-            let shader_name = skin_map
-                .get(&hierarchy.name.to_ascii_lowercase())
-                .map(String::as_str)
-                .unwrap_or(hierarchy.shader.as_str());
-            if shader_name.is_empty() || shader_name.eq_ignore_ascii_case("*off") {
+    fn async_loading_enabled(&self) -> bool {
+        self.async_loading && asset_jobs::async_available()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_async_loading(&mut self, enabled: bool) {
+        self.async_loading = enabled;
+    }
+
+    /// Per-frame bounded drain of finished asset jobs. A no-op (one integer
+    /// compare) whenever nothing is in flight.
+    fn poll_asset_completions(&mut self) {
+        if self.async_models.pending_count() > 0 {
+            self.async_models.drain(16);
+        }
+        if self.async_static_models.pending_count() > 0 {
+            self.async_static_models.drain(16);
+        }
+    }
+
+    /// Warm the fallback bodies OpenJK falls back to on registration failure so
+    /// a brand-new remote player has something to show while their real model
+    /// loads. Runs on the workers; nothing blocks.
+    fn prime_default_player_models(&mut self) {
+        if !self.async_loading_enabled() {
+            return;
+        }
+        for name in ["kyle", "jan"] {
+            let info = crate::cgame::ClientInfo::solo_model(name);
+            let key = player_model_key(&info);
+            self.request_player_model(&info, &key);
+        }
+    }
+
+    /// Model to present for `info` without ever blocking on IO.
+    ///
+    /// The desired key and the cache are distinct: a completion only fills its
+    /// own key, so a stale finish can never overwrite a newer selection, and a
+    /// model finished for one player is reused by every other player.
+    fn resolve_player_model_async(&mut self, info: &crate::cgame::ClientInfo) -> ModelResolution {
+        let key = player_model_key(info);
+        let fallback = info.missing_model_fallback();
+        match self.request_player_model(info, &key) {
+            ModelLookup::Ready(model) => return ModelResolution::Ready(model),
+            ModelLookup::Failed(primary_error) => {
+                // CG_LoadClientInfo failure policy: same as the synchronous path.
+                let fallback_key = player_model_key(&fallback);
+                return match self.request_player_model(&fallback, &fallback_key) {
+                    ModelLookup::Ready(model) => ModelResolution::Ready(model),
+                    ModelLookup::Failed(fallback_error) => ModelResolution::Failed(format!(
+                        "{primary_error}; fallback {}/{} failed: {fallback_error}",
+                        fallback.model_name, fallback.skin_name,
+                    )),
+                    ModelLookup::Pending | ModelLookup::Missing => ModelResolution::Loading,
+                };
+            }
+            ModelLookup::Pending | ModelLookup::Missing => {}
+        }
+        // Not ready yet: show the OpenJK fallback body if it is already
+        // resident (the plain default bodies are primed at creation). Only peek;
+        // never queue extra loads on behalf of a model that is merely pending.
+        let plain = crate::cgame::ClientInfo::solo_model(if info.female { "jan" } else { "kyle" });
+        for candidate in [&fallback, &plain] {
+            let candidate_key = player_model_key(candidate);
+            if candidate_key == key {
                 continue;
             }
-            let (texture, alpha_mode) = self.resolve_surface_material(shader_name);
-            surfaces.push(PlayerSurfaceAsset {
-                surface_index: surface.surface_index,
-                texture,
-                alpha_mode,
-                fallback_gray: false,
-                gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
-            });
+            if let ModelLookup::Ready(model) = self.lookup_model(&candidate_key) {
+                return ModelResolution::Provisional(model);
+            }
         }
+        ModelResolution::Loading
+    }
 
-        println!(
-            "PLAYER MODEL: {} skin={} surfaces={} gla={} bones={}",
-            model_qpath,
-            skin_qpath,
-            surfaces.len(),
-            gla_qpath,
-            gla.skeleton.len(),
-        );
-
-        Ok(PlayerModelAsset {
-            key,
-            glm,
-            gla,
-            surfaces,
-        })
+    /// Discard remembered asset failures and let worker VFS views re-mount
+    /// packages. Call when content may have appeared (download finished,
+    /// `fs_game` change), never per frame.
+    #[allow(dead_code)]
+    pub fn retry_failed_assets(&mut self) {
+        let retried = self.async_models.retry_failed() + self.async_static_models.retry_failed();
+        self.failed_models.clear();
+        self.failed_saber_models.clear();
+        self.asset_source = self.asset_source.refreshed();
+        // Worker-side GLA/texture caches remember failures too.
+        self.load_shared = Arc::new(ModelLoadShared::new(Arc::clone(&self.shaders)));
+        if retried > 0 {
+            println!("[ASSET] retrying {retried} previously failed asset(s)");
+        }
     }
 
     fn register_client_saber_assets(
@@ -2296,13 +2944,16 @@ impl PlayerPresenter {
                 continue;
             }
             let definition = self.saber_definitions.definition_or_default(saber_name);
-            if let Err(error) = self.load_saber_model(&definition) {
+            if let Err(error) = self.load_saber_model_in_game(&definition) {
                 self.report_saber_warning_once(entity_num, &error);
             }
         }
     }
 
     fn report_saber_warning_once(&mut self, entity_num: u16, error: &str) {
+        if is_asset_pending(error) {
+            return;
+        }
         let key = error.to_ascii_lowercase();
         if self.reported_saber_warnings.insert(key) {
             println!("PLAYER SABER WARNING ent={entity_num}: {error}");
@@ -2381,7 +3032,7 @@ impl PlayerPresenter {
             )? else {
                 return Err(format!("{} has no Ghoul2 {} bolt", player_model.key, hand_name));
             };
-            let hilt = self.load_saber_model(&definition)?;
+            let hilt = self.load_saber_model_in_game(&definition)?;
             let mut animator = Ghoul2Animator::new(&hilt.gla);
             let pose_started = Instant::now();
             let hilt_pose = animator.evaluate_pose(&hilt.gla, current_time, hand_bolt)?;
@@ -2628,7 +3279,7 @@ impl PlayerPresenter {
             // like OpenJK's CS_MODELS lookup before G2API_InitGhoul2Model.
             definition.model.clone_from(qpath);
         }
-        let hilt = self.load_saber_model(&definition)?;
+        let hilt = self.load_saber_model_in_game(&definition)?;
         let mut animator = Ghoul2Animator::new(&hilt.gla);
         let pose_started = Instant::now();
         let hilt_pose = animator.evaluate_pose_openjk_root(&hilt.gla, current_time)?;
@@ -2813,7 +3464,7 @@ impl PlayerPresenter {
                 SWOOP,
             );
         }
-        self.load_static_glm(SWOOP, Some(SWOOP_SKIN), SWOOP)
+        self.load_static_glm_in_game(SWOOP, Some(SWOOP_SKIN), SWOOP)
             .map_err(|fallback_error| {
                 format!(
                     "vehicle {requested} ({resolved}) failed ({primary_error}); fallback {SWOOP} failed: {fallback_error}"
@@ -2823,6 +3474,65 @@ impl PlayerPresenter {
 
     fn load_saber_model(&mut self, definition: &SaberDefinition) -> Result<Arc<SaberModelAsset>, String> {
         self.load_static_glm(&definition.model, definition.custom_skin.as_deref(), &definition.name)
+    }
+
+    fn load_saber_model_in_game(&mut self, definition: &SaberDefinition) -> Result<Arc<SaberModelAsset>, String> {
+        self.load_static_glm_in_game(&definition.model, definition.custom_skin.as_deref(), &definition.name)
+    }
+
+    /// Gameplay/presentation registration of a Ghoul2 hilt, weapon or vehicle
+    /// model. Cache hits are one lookup. A miss queues the load on the asset
+    /// workers and returns an `ASSET_PENDING` error, which callers treat as
+    /// "nothing to draw yet"; explicit/preview paths keep `load_static_glm`.
+    fn load_static_glm_in_game(
+        &mut self,
+        model_qpath: &str,
+        custom_skin: Option<&str>,
+        label: &str,
+    ) -> Result<Arc<SaberModelAsset>, String> {
+        if !self.async_loading_enabled() {
+            return self.load_static_glm(model_qpath, custom_skin, label);
+        }
+        let key = static_model_key(model_qpath, custom_skin, false);
+        if let Some(model) = self.saber_models.get(&key) {
+            return Ok(Arc::clone(model));
+        }
+        if self.failed_saber_models.contains(&key) {
+            return Err(format!("Ghoul2 model {model_qpath} failed registration earlier"));
+        }
+        match self.async_static_models.state(&key) {
+            Some(AssetState::Ready(model)) => return Ok(Arc::clone(model)),
+            Some(AssetState::Failed(error)) => return Err(error.clone()),
+            Some(AssetState::Pending) => {
+                self.async_static_models.note_duplicate();
+                return Err(format!("Ghoul2 model {model_qpath}: {ASSET_PENDING}"));
+            }
+            None => {}
+        }
+        let source = Arc::clone(&self.asset_source);
+        let shared = Arc::clone(&self.load_shared);
+        let job_qpath = model_qpath.to_owned();
+        let job_skin = custom_skin.map(str::to_owned);
+        let job_label = label.to_owned();
+        match self
+            .async_static_models
+            .request(&key, AssetPriority::High, move || {
+                asset_jobs::with_worker_vfs(&source, |vfs| {
+                    build_static_glm(
+                        &mut WorkerModelSource { vfs, shared: &shared },
+                        &job_qpath,
+                        job_skin.as_deref(),
+                        &job_label,
+                        false,
+                    )
+                })?
+            }) {
+            Requested::Ready(model) => Ok(model),
+            Requested::Failed(error) => Err(error),
+            Requested::Pending | Requested::Rejected => {
+                Err(format!("Ghoul2 model {model_qpath}: {ASSET_PENDING}"))
+            }
+        }
     }
 
     /// A Ghoul2 model drawn in its own default pose (saber hilts, weapon
@@ -2843,13 +3553,7 @@ impl PlayerPresenter {
         label: &str,
         preview_fallback: bool,
     ) -> Result<Arc<SaberModelAsset>, String> {
-        let key = format!(
-            "{}|{}|preview_fallback={}",
-            model_qpath,
-            custom_skin.unwrap_or(""),
-            u8::from(preview_fallback),
-        )
-        .to_ascii_lowercase();
+        let key = static_model_key(model_qpath, custom_skin, preview_fallback);
         if let Some(model) = self.saber_models.get(&key) {
             return Ok(Arc::clone(model));
         }
@@ -2877,105 +3581,13 @@ impl PlayerPresenter {
         label: &str,
         preview_fallback: bool,
     ) -> Result<SaberModelAsset, String> {
-        let model_bytes = self
-            .assets
-            .read(model_qpath, MAX_GLM_BYTES)
-            .map_err(|error| format!("{model_qpath}: {error}"))?
-            .ok_or_else(|| format!("missing {model_qpath}"))?
-            .bytes;
-        let glm = Arc::new(parse_glm(&model_bytes)?);
-        let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
-            glm.anim_name.clone()
-        } else {
-            format!("{}.gla", glm.anim_name)
-        };
-        let gla = self.load_glm_animation(&gla_qpath)?;
-        // Match OpenJK's MDXM registration rule: the mesh may use fewer
-        // bones than the referenced GLA, it just may not reference beyond it.
-        if glm.num_bones > gla.skeleton.len() {
-            return Err(format!(
-                "GLM references {} bones but GLA only provides {}",
-                glm.num_bones,
-                gla.skeleton.len()
-            ));
-        }
-
-        let skin_map = if let Some(skin_qpath) = custom_skin {
-            match self.load_skin_qpath(skin_qpath) {
-                Ok(skin) => skin
-                    .into_iter()
-                    .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-                    .collect::<HashMap<_, _>>(),
-                Err(error) if preview_fallback => {
-                    println!(
-                        "ASSET VIEWER GLM SKIN FALLBACK: model={} skin={} error={}; using embedded shaders/gray fallback",
-                        model_qpath, skin_qpath, error,
-                    );
-                    HashMap::new()
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            HashMap::new()
-        };
-        let lod = glm
-            .lods
-            .first()
-            .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
-        let mut surfaces = Vec::with_capacity(lod.surfaces.len());
-        for surface in &lod.surfaces {
-            let hierarchy = glm
-                .hierarchy
-                .get(surface.surface_index)
-                .ok_or_else(|| format!("{model_qpath}: missing hierarchy for surface {}", surface.surface_index))?;
-            // Ghoul2 tag surfaces are attachment metadata, not visible hilt geometry.
-            if hierarchy.name.starts_with('*') {
-                continue;
-            }
-            let shader_name = skin_map
-                .get(&hierarchy.name.to_ascii_lowercase())
-                .map(String::as_str)
-                .unwrap_or(hierarchy.shader.as_str());
-            if shader_name.eq_ignore_ascii_case("*off") {
-                continue;
-            }
-            let missing_shader = shader_name.is_empty();
-            let shader_name = if missing_shader {
-                if preview_fallback {
-                    // Player/NPC GLMs often have no embedded shader refs and
-                    // normally rely entirely on model_default.skin. If that
-                    // skin is absent/incomplete, keep the geometry inspectable
-                    // instead of silently producing zero draw surfaces.
-                    "$whiteimage"
-                } else {
-                    continue;
-                }
-            } else {
-                shader_name
-            };
-            let (texture, alpha_mode) = self.resolve_surface_material(shader_name);
-            let fallback_gray = preview_fallback
-                && (missing_shader
-                    || (!shader_name.eq_ignore_ascii_case("$whiteimage") && texture.is_none()));
-            surfaces.push(PlayerSurfaceAsset {
-                surface_index: surface.surface_index,
-                texture,
-                alpha_mode,
-                fallback_gray,
-                gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index)?,
-            });
-        }
-        println!(
-            "GHOUL2 STATIC MODEL REGISTERED: name={} model={} skin={} surfaces={} glmBones={} glaBones={} gla={}",
-            label,
+        build_static_glm(
+            &mut SyncModelSource { presenter: self },
             model_qpath,
-            custom_skin.unwrap_or("<default>"),
-            surfaces.len(),
-            glm.num_bones,
-            gla.skeleton.len(),
-            gla_qpath,
-        );
-        Ok(SaberModelAsset { glm, gla, surfaces })
+            custom_skin,
+            label,
+            preview_fallback,
+        )
     }
 
     /// CG_Player's force-power effect block: drain/lightning effects at the
@@ -3070,6 +3682,117 @@ impl PlayerPresenter {
         shells
     }
 
+    /// OpenJK MP CG_PlayerShadow for cg_shadows 1. The original submits a
+    /// temporary mark via CG_ImpactMark/R_MarkFragments; we preserve the trace,
+    /// stock markShadow image, radius, yaw, fade and eligibility rules, then use
+    /// one plane-aligned quad at the hit plane. This avoids CPU BSP mark-fragment
+    /// clipping and batches every blob into one draw while retaining the same
+    /// normal floor appearance.
+    fn queue_blob_shadow(&mut self, entity: &PresentedEntity) {
+        if !self.blob_shadows_enabled {
+            return;
+        }
+        let state = &entity.state;
+        if state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
+            || state.field_i32("powerups").unwrap_or(0) & (1 << PW_CLOAKED) != 0
+            || entity_is_mind_tricked(entity, self.viewer_client)
+        {
+            return;
+        }
+        let npc_class = state.field_i32("NPC_class").unwrap_or(0);
+        if state.field_i32("m_iVehicleNum").unwrap_or(0) != 0 && npc_class != crate::cgame::CLASS_VEHICLE {
+            return;
+        }
+
+        let Some(world) = self.collision_world.as_mut() else {
+            return;
+        };
+        let mut end = entity.origin;
+        end[2] -= BLOB_SHADOW_DISTANCE;
+        let trace = world.trace(TraceQuery {
+            start: entity.origin,
+            mins: BLOB_SHADOW_MINS,
+            maxs: BLOB_SHADOW_MAXS,
+            end,
+            pass_entity: 0,
+            mask: MASK_PLAYERSOLID,
+        });
+        if trace.fraction == 1.0 || trace.start_solid != 0 || trace.all_solid != 0 {
+            return;
+        }
+
+        // CG_PlayerShadow uses cent->pe.legs.yawAngle. At this point in
+        // CG_Player that is the persistent playerEntity angle from the previous
+        // presentation update; a newly-seen entity falls back to current yaw.
+        let yaw = self
+            .entities
+            .get(&entity.number)
+            .map(|runtime| runtime.player_angles.legs_yaw_angle)
+            .unwrap_or(entity.angles[1]);
+        let radius = if npc_class == CLASS_REMOTE || npc_class == CLASS_SEEKER {
+            BLOB_SHADOW_DROID_RADIUS
+        } else {
+            BLOB_SHADOW_RADIUS
+        };
+        let shade = (1.0 - trace.fraction).clamp(0.0, 1.0);
+        self.push_blob_shadow_quad(trace.end, trace.normal, yaw, radius, shade);
+    }
+
+    fn push_blob_shadow_quad(
+        &mut self,
+        origin: [f32; 3],
+        normal: [f32; 3],
+        yaw_degrees: f32,
+        radius: f32,
+        shade: f32,
+    ) {
+        let normal = Vec3::from_array(normal).normalize_or_zero();
+        if normal.length_squared() < 1.0e-8 {
+            return;
+        }
+        // Build an orthonormal tangent frame, then rotate it by the exact
+        // legs-yaw angle CG_ImpactMark receives. markShadow is essentially
+        // radial, but keeping the rotation preserves OpenJK semantics.
+        let reference = if normal.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+        let tangent0 = reference.cross(normal).normalize_or_zero();
+        if tangent0.length_squared() < 1.0e-8 {
+            return;
+        }
+        let bitangent0 = normal.cross(tangent0).normalize_or_zero();
+        let (sin_yaw, cos_yaw) = yaw_degrees.to_radians().sin_cos();
+        let tangent = tangent0 * cos_yaw + bitangent0 * sin_yaw;
+        let bitangent = -tangent0 * sin_yaw + bitangent0 * cos_yaw;
+        let center = Vec3::from_array(origin) + normal * BLOB_SHADOW_SURFACE_LIFT;
+        let tangent = tangent * radius;
+        let bitangent = bitangent * radius;
+        let corners = [
+            center - tangent - bitangent,
+            center + tangent - bitangent,
+            center + tangent + bitangent,
+            center - tangent + bitangent,
+        ];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let base = match u32::try_from(self.blob_shadow_vertices.len()) {
+            Ok(base) => base,
+            Err(_) => return,
+        };
+        let render_normal = scene::render_position(normal.to_array());
+        for (corner, uv) in corners.into_iter().zip(uvs) {
+            self.blob_shadow_vertices.push(DynamicModelVertex {
+                position: scene::render_position(corner.to_array()),
+                normal: render_normal,
+                uv,
+                // CG_PlayerShadow passes (alpha, alpha, alpha, 1) into
+                // CG_ImpactMark. Preserve that vertex color and let the
+                // authored markShadow shader supply its own blendFunc.
+                color: [shade, shade, shade, 1.0],
+            });
+        }
+        self.blob_shadow_indices.extend_from_slice(&[
+            base, base + 1, base + 2, base, base + 2, base + 3,
+        ]);
+    }
+
     /// A refEntity customShader: its first stage's texture with FX blending
     /// semantics (these shaders are unlit, vertex/entity colored).
     fn custom_shader_material(&mut self, shader_name: &str) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
@@ -3125,6 +3848,289 @@ impl PlayerPresenter {
             true,
         )?;
         Ok(draws)
+    }
+
+    /// Profile preview path for a real JKA player selection. Unlike the generic
+    /// Asset Viewer, this resolves the exact model[/skin] through ClientInfo, so
+    /// multipart skins and `*off` surface mappings behave exactly like CG_Player.
+    // Asset-preview entry point that is not wired into the viewer yet.
+    #[allow(dead_code)]
+    pub fn present_static_player_preview(
+        &mut self,
+        info: &crate::cgame::ClientInfo,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        current_time: i32,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let model = self.load_model(info)?;
+        let pose_started = Instant::now();
+        let pose = Ghoul2Animator::new(&model.gla)
+            .evaluate_pose_openjk_root(&model.gla, current_time)?;
+        record_pose_eval(&mut self.perf, pose_started);
+        self.render_glm_surfaces(
+            0,
+            &info.model_qpath(),
+            &model.glm,
+            &model.surfaces,
+            &pose,
+            0,
+            axis,
+            origin,
+            [1.0; 4],
+            None,
+            true,
+        )
+    }
+
+    /// Modern Profile viewport: stock humanoid stand animation plus the actual
+    /// selected saber hilts bolted to the same hand tags used by CG_Player.
+    /// This is deliberately a thin presentation path over the normal assets;
+    /// model/skin/saber semantics remain OpenJK-compatible userinfo values.
+    pub fn present_profile_player_preview(
+        &mut self,
+        info: &crate::cgame::ClientInfo,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        current_time: i32,
+        animation_name: &str,
+        with_sabers: bool,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let model = self.load_model(info)?;
+        let animation_number = animation_index(animation_name)
+            .ok_or_else(|| format!("missing animation table entry {animation_name}"))? as i32;
+        let animation = *self
+            .animations
+            .get(animation_number)
+            .ok_or_else(|| format!("missing humanoid animation {animation_name}"))?;
+        if animation.frame_lerp == 0 {
+            return Err(format!("humanoid animation {animation_name} has zero frameLerp"));
+        }
+        let anim_speed = 50.0 / f32::from(animation.frame_lerp);
+        let (first_frame, last_frame) = if anim_speed < 0.0 {
+            (
+                i32::from(animation.first_frame) + i32::from(animation.num_frames),
+                i32::from(animation.first_frame),
+            )
+        } else {
+            (
+                i32::from(animation.first_frame),
+                i32::from(animation.first_frame) + i32::from(animation.num_frames),
+            )
+        };
+        let flags = if animation.loop_frames != -1 {
+            BONE_ANIM_OVERRIDE_LOOP
+        } else {
+            BONE_ANIM_OVERRIDE_FREEZE
+        };
+
+        let mut animator = Ghoul2Animator::new(&model.gla);
+        // CG_Player uses model_root for legs and lower_lumbar for torso. For a
+        // full-body menu stand both use the same authored animation; Motion is
+        // updated too, matching the same-animation branch in CG_PlayerAnimation.
+        for bone in ["model_root", "lower_lumbar", "Motion"] {
+            if Ghoul2Animator::bone_index(&model.gla, bone).is_some() {
+                animator.set_bone_anim(
+                    &model.gla,
+                    bone,
+                    first_frame,
+                    last_frame,
+                    flags,
+                    anim_speed,
+                    0,
+                    None,
+                    0,
+                )?;
+            }
+        }
+        let pose_started = Instant::now();
+        let pose = animator.evaluate_pose_openjk_root(&model.gla, current_time.max(0))?;
+        record_pose_eval(&mut self.perf, pose_started);
+        let mut draws = self.render_glm_surfaces(
+            0,
+            &info.model_qpath(),
+            &model.glm,
+            &model.surfaces,
+            &pose,
+            0,
+            axis,
+            origin,
+            [1.0; 4],
+            None,
+            true,
+        )?;
+
+        if with_sabers {
+            for (saber_num, saber_name, hand_name) in [
+                (0usize, info.saber_name.as_str(), "*r_hand"),
+                (1usize, info.saber2_name.as_str(), "*l_hand"),
+            ] {
+                if saber_name.is_empty() || saber_name_is_removed(saber_name) {
+                    continue;
+                }
+                let definition = self.saber_definitions.definition_or_default(saber_name);
+                let Some(hand_bolt) = model_bolt_matrix_timed(
+                    &mut self.perf,
+                    &model.glm,
+                    &model.gla,
+                    &pose,
+                    hand_name,
+                )? else {
+                    continue;
+                };
+                let hilt = self.load_saber_model(&definition)?;
+                let mut hilt_animator = Ghoul2Animator::new(&hilt.gla);
+                let pose_started = Instant::now();
+                let hilt_pose = hilt_animator.evaluate_pose(&hilt.gla, current_time, hand_bolt)?;
+                record_pose_eval(&mut self.perf, pose_started);
+                let mut hilt_draws = self.render_glm_surfaces(
+                    0,
+                    &definition.model,
+                    &hilt.glm,
+                    &hilt.surfaces,
+                    &hilt_pose,
+                    0,
+                    axis,
+                    origin,
+                    [1.0; 4],
+                    None,
+                    false,
+                )?;
+                if self.rt_shadow_casters_enabled {
+                    for surface in &mut hilt_draws {
+                        if let Some(key) = surface.rt_skinned_key.take() {
+                            surface.rt_skinned_key = Some(Arc::<str>::from(format!(
+                                "{}#profile-saber{}",
+                                key.as_ref(),
+                                saber_num,
+                            )));
+                        }
+                    }
+                }
+                draws.append(&mut hilt_draws);
+
+                // CG_AddSaberBlade-equivalent preview path. Phase 2 attached the
+                // hilt but stopped here, which is why the Profile showed a bare
+                // handle. Resolve every authored blade bolt exactly as the live
+                // player presenter does and hand the resulting blade to the same
+                // WeaponFx material/geometry path used in gameplay.
+                let client_color = if saber_num == 0 { info.saber_color } else { info.saber2_color };
+                for blade_index in 0..definition.num_blades {
+                    let tag_name = format!("*blade{}", blade_index + 1);
+                    let (blade_bolt, tag_hack) = if let Some(matrix) = model_bolt_matrix_timed(
+                        &mut self.perf, &hilt.glm, &hilt.gla, &hilt_pose, &tag_name,
+                    )? {
+                        (matrix, false)
+                    } else {
+                        // UI_SaberDrawBlade falls back to *flash for every
+                        // blade, not just blade 0, so pre-JKA hilts still preview.
+                        let Some(matrix) = model_bolt_matrix_timed(
+                            &mut self.perf, &hilt.glm, &hilt.gla, &hilt_pose, "*flash",
+                        )? else {
+                            continue;
+                        };
+                        (matrix, true)
+                    };
+                    let mut origin_model = [blade_bolt[0][3], blade_bolt[1][3], blade_bolt[2][3]];
+                    let mut dir_model = normalize_vec3([
+                        -blade_bolt[0][0], -blade_bolt[1][0], -blade_bolt[2][0],
+                    ]);
+                    // Exact stock UI staff tag-hack: when blade2 has no authored
+                    // bolt, reverse the *flash direction and offset sixteen units.
+                    if tag_hack
+                        && blade_index == 1
+                        && definition.saber_type.eq_ignore_ascii_case("SABER_STAFF")
+                    {
+                        dir_model = [-dir_model[0], -dir_model[1], -dir_model[2]];
+                        origin_model = [
+                            origin_model[0] + dir_model[0] * 16.0,
+                            origin_model[1] + dir_model[1] * 16.0,
+                            origin_model[2] + dir_model[2] * 16.0,
+                        ];
+                    }
+                    let origin_world = transform_jka_model_point(origin_model, axis, origin);
+                    let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, axis));
+                    let blade = definition.blade(blade_index);
+                    let color = blade_color(info, client_color, &blade);
+                    let secondary_style = definition.blade_style2_start > 0
+                        && blade_index >= definition.blade_style2_start;
+                    let trail_style = if secondary_style { definition.trail_style2 } else { definition.trail_style };
+                    let no_wall_marks = if secondary_style { definition.no_wall_marks2 } else { definition.no_wall_marks };
+                    if let Some(request) = saber_blade_fx_request(
+                        origin_world,
+                        dir_world,
+                        blade.length,
+                        blade.radius,
+                        color,
+                        1.0,
+                        0,
+                        saber_num as u8,
+                        blade_index as u8,
+                        0,
+                        animation_number,
+                        false,
+                        trail_style,
+                        definition.num_blades as u8,
+                        definition.no_dlight,
+                        no_wall_marks,
+                    ) {
+                        self.fx_requests.push(request);
+                    }
+                }
+            }
+        }
+
+        // Profile is intentionally studio-lit rather than map-lightgrid-lit.
+        // This bakes a key + soft fill from vertex normals into preview-only
+        // shaderRGBA. Gameplay models continue through the configured lighting.
+        for surface in &mut draws {
+            let vertices = Arc::make_mut(&mut surface.vertices);
+            for vertex in vertices.iter_mut() {
+                let normal = Vec3::from_array(vertex.normal).normalize_or_zero();
+                let key = normal.dot(Vec3::new(-0.35, 0.72, 0.60).normalize()).max(0.0);
+                let fill = normal.dot(Vec3::new(0.55, 0.20, -0.35).normalize()).max(0.0);
+                let light = (0.38 + 0.72 * key + 0.20 * fill).min(1.18);
+                for channel in 0..3 {
+                    vertex.color[channel] *= light;
+                }
+            }
+            // Do not also sample the current BSP lightgrid in the isolated
+            // preview; the studio lighting above should be stable on every map.
+            surface.lighting_origin = None;
+        }
+        Ok(draws)
+    }
+
+    /// TaystJK's Profile saber preview resolves the selected saber block to its
+    /// authored saberModel and optional customSkin. Keep that exact data path,
+    /// but render it through DinurdoJK's normal Ghoul2/WGPU presenter.
+    // Asset-preview entry point that is not wired into the viewer yet.
+    #[allow(dead_code)]
+    pub fn present_static_saber_preview(
+        &mut self,
+        saber_name: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        current_time: i32,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let definition = self.saber_definitions.definition_or_default(saber_name);
+        let model = self.load_saber_model(&definition)?;
+        let pose_started = Instant::now();
+        let pose = Ghoul2Animator::new(&model.gla)
+            .evaluate_pose_openjk_root(&model.gla, current_time)?;
+        record_pose_eval(&mut self.perf, pose_started);
+        self.render_glm_surfaces(
+            0,
+            &definition.model,
+            &model.glm,
+            &model.surfaces,
+            &pose,
+            0,
+            axis,
+            origin,
+            [1.0; 4],
+            None,
+            true,
+        )
     }
 
     /// Developer Asset Viewer GLM path. Player/NPC model.glm files usually
@@ -3199,21 +4205,7 @@ impl PlayerPresenter {
         &mut self,
         shader_name: &str,
     ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
-        let shader_key = shader_name.replace('\\', "/").to_ascii_lowercase();
-        let (image_name, clamp, alpha_mode) = self
-            .shaders
-            .get(&shader_key)
-            .and_then(Shader::primary)
-            .map(|stage| {
-                let alpha_mode = if !stage.alpha_test.trim().is_empty() {
-                    DynamicModelAlphaMode::Mask
-                } else {
-                    crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
-                        .custom_shader_alpha_mode()
-                };
-                (stage.image.as_str(), stage.clamp, alpha_mode)
-            })
-            .unwrap_or((shader_name, false, DynamicModelAlphaMode::Opaque));
+        let (image_name, clamp, alpha_mode) = material_stage(&self.shaders, shader_name);
 
         if image_name.eq_ignore_ascii_case("$whiteimage") {
             return (None, alpha_mode);
@@ -3237,10 +4229,27 @@ impl PlayerPresenter {
     }
 }
 
+fn entity_is_mind_tricked(entity: &PresentedEntity, client: i32) -> bool {
+    if !(0..64).contains(&client) {
+        return false;
+    }
+    let (field, bit) = if client > 47 {
+        ("trickedentindex4", client - 48)
+    } else if client > 31 {
+        ("trickedentindex3", client - 32)
+    } else if client > 15 {
+        ("trickedentindex2", client - 16)
+    } else {
+        ("trickedentindex", client)
+    };
+    entity.state.field_i32(field).unwrap_or(0) & (1_i32 << bit) != 0
+}
+
 /// Ghoul2/GLM triangle order arrives opposite the WGPU player pipeline's
 /// `FrontFace::Ccw` convention. Flip each triangle once at submission time so
 /// back-face culling exposes the same side of the model that TaystJK/OpenGL
 /// renders instead of making the player look inside-out/front-on from behind.
+
 #[cfg(test)]
 fn glm_indices_for_wgpu(mut indices: Vec<u32>) -> Vec<u32> {
     for triangle in indices.chunks_exact_mut(3) {
@@ -3459,6 +4468,76 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 mod tests {
     use super::*;
 
+    fn wait_for_player_model(
+        presenter: &mut PlayerPresenter,
+        info: &crate::cgame::ClientInfo,
+    ) -> ModelResolution {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            presenter.poll_asset_completions();
+            match presenter.resolve_player_model_async(info) {
+                ModelResolution::Loading | ModelResolution::Provisional(_) => {
+                    assert!(Instant::now() < deadline, "player model did not finish loading");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                done => return done,
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock PK3s"]
+    fn async_player_model_registration_never_blocks_and_deduplicates() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        let queued_after_prime = presenter.async_models.stats().queued;
+
+        // Uncached model: the request returns without waiting for IO/parsing.
+        let reborn = crate::cgame::ClientInfo::solo_model("reborn/default");
+        let started = Instant::now();
+        let first = presenter.resolve_player_model_async(&reborn);
+        assert!(started.elapsed().as_millis() < 50, "request blocked the caller");
+        assert!(!matches!(first, ModelResolution::Ready(_)));
+        for _ in 0..25 {
+            presenter.resolve_player_model_async(&reborn);
+        }
+        let stats = presenter.async_models.stats();
+        assert!(stats.duplicates_avoided >= 25, "{stats:?}");
+
+        // The requested model swaps in when ready and was queued exactly once.
+        let ModelResolution::Ready(model) = wait_for_player_model(&mut presenter, &reborn) else {
+            panic!("reborn should load");
+        };
+        assert!(model.key.starts_with("models/players/reborn/"));
+        let queued_for_reborn = presenter.async_models.stats().queued - queued_after_prime;
+        assert!(queued_for_reborn <= 1, "reborn queued {queued_for_reborn} times");
+
+        // A second consumer resolves from the cache with no new job.
+        let queued_before = presenter.async_models.stats().queued;
+        assert!(matches!(
+            presenter.resolve_player_model_async(&reborn),
+            ModelResolution::Ready(_)
+        ));
+        assert_eq!(presenter.async_models.stats().queued, queued_before);
+
+        // Missing model: terminal failure -> OpenJK fallback, never re-queued.
+        let missing = crate::cgame::ClientInfo::solo_model("definitely_not_a_model/default");
+        let ModelResolution::Ready(fallback) = wait_for_player_model(&mut presenter, &missing) else {
+            panic!("missing model should fall back to the default body");
+        };
+        assert!(fallback.key.starts_with("models/players/kyle/"));
+        let queued_before = presenter.async_models.stats().queued;
+        for _ in 0..50 {
+            presenter.resolve_player_model_async(&missing);
+        }
+        assert_eq!(presenter.async_models.stats().queued, queued_before);
+
+        // Shared skeleton: every humanoid model resolves the same GLA Arc, so a
+        // model swap can keep the animation state.
+        assert!(Arc::ptr_eq(&model.gla, &fallback.gla));
+    }
+
     #[test]
     fn body_queue_weapon_rule_copies_actual_model_then_applies_known_weapon() {
         // CG_BodyQueueCopy never manufactures model index 1 when the source
@@ -3537,6 +4616,7 @@ mod tests {
         let bytes = assets.read("demos/cheezyVsource.dm_26", 64 * 1024 * 1024)
             .unwrap().expect("regression demo").bytes;
         let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        presenter.set_async_loading(false);
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
         let mut game = ClientGameState::new();
@@ -3631,6 +4711,7 @@ mod tests {
         let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
         let bytes = assets.read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().unwrap().bytes;
         let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        presenter.set_async_loading(false);
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
         let mut game = ClientGameState::new();
@@ -3653,7 +4734,7 @@ mod tests {
                         }
                         snapshots += 1;
                         let entities = game.present_entities(snapshot.server_time).unwrap();
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None, None);
                         for npc in entities.iter().filter(|entity| entity.entity_type == ET_NPC) {
                             let drawn = draws.iter().any(|surface| surface.entity_num == npc.number);
                             let nodraw = npc.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0;
@@ -3684,6 +4765,7 @@ mod tests {
         let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
         let bytes = assets.read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().unwrap().bytes;
         let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        presenter.set_async_loading(false);
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
         let mut game = ClientGameState::new();
@@ -3739,6 +4821,7 @@ mod tests {
         let open = || AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
         let bytes = open().read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().unwrap().bytes;
         let mut presenter = PlayerPresenter::new(open(), false).unwrap();
+        presenter.set_async_loading(false);
         let mut weapon_fx = crate::cgame::weapon_fx::WeaponFx::new(open());
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
@@ -3779,7 +4862,7 @@ mod tests {
                             if active & (1 << FP_RAGE) != 0 { *state_counts.entry("FP_RAGE").or_insert(0) += 1; }
                             if active & (1 << FP_GRIP) != 0 { *state_counts.entry("FP_GRIP").or_insert(0) += 1; }
                         }
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None, None);
                         shell_surfaces += draws.iter().filter(|surface| surface.alpha_mode == DynamicModelAlphaMode::Additive && surface.vertices.len() > 50).count();
                         for request in presenter.drain_fx_requests() {
                             let key = match &request {
@@ -3814,6 +4897,7 @@ mod tests {
         let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
         let bytes = assets.read("demos/TEST.dm_26", 64 * 1024 * 1024).unwrap().expect("TEST demo").bytes;
         let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        presenter.set_async_loading(false);
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
         let mut game = ClientGameState::new();
@@ -3836,7 +4920,7 @@ mod tests {
                         let npcs = entities.iter().filter(|entity| entity.entity_type == ET_NPC).collect::<Vec<_>>();
                         if npcs.is_empty() { continue; }
                         npc_frames += 1;
-                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None);
+                        let draws = presenter.present_snapshot_players(&entities, &game, &[], snapshot.server_time, None, None, None, None);
                         for npc in npcs {
                             if infos.len() < 3 {
                                 let info = game.npc_client_info(&npc.state).unwrap();
@@ -3877,6 +4961,7 @@ mod tests {
         let bytes = assets.read("demos/cheezyVsource.dm_26", 64 * 1024 * 1024)
             .unwrap().expect("regression demo").bytes;
         let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+        presenter.set_async_loading(false);
         let mut reader = DemoReader::new(std::io::Cursor::new(bytes));
         let mut decoder = Decoder::new();
         let mut game = ClientGameState::new();
@@ -3908,7 +4993,7 @@ mod tests {
                         let again = presenter.load_model(&info).unwrap();
                         assert!(Arc::ptr_eq(&fallback, &again), "fallback assets must be reused");
                         let draws = presenter.present_snapshot_players(
-                            &entities, &game, &[], snapshot.server_time, None, None, None,
+                            &entities, &game, &[], snapshot.server_time, None, None, None, None,
                         );
                         assert!(draws.iter().any(|surface| surface.entity_num == 2
                             && !surface.vertices.is_empty() && !surface.indices.is_empty()));

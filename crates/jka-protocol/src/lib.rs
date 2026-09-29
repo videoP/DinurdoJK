@@ -7,6 +7,7 @@ pub mod adaptive_huffman;
 pub mod commands;
 pub mod demo;
 mod entity_fields;
+pub mod entity_event;
 pub mod gamestate;
 mod huffman_codes;
 mod player_fields;

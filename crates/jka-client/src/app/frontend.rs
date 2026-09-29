@@ -1,6 +1,7 @@
 use jka_assets::pk3::AssetSearchPath;
 use jka_protocol::{
     commands::{atoi, info_value, tokenize, BigConfigOutcome, BigConfigString},
+    entity_event::{EntityEvent, EV_EVENT_BITS},
     demo::DemoReader,
     server::{Decoder as ServerMessageDecoder, Event as ServerMessageEvent},
 };
@@ -13,6 +14,7 @@ use std::{
 use crate::cgame::{CS_PLAYERS, ET_EVENTS};
 
 const LEVELSHOT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const PROFILE_GLM_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrontendPage {
@@ -127,6 +129,143 @@ pub(super) struct AssetDetail {
     pub model_center: Option<[f32; 3]>,
     /// Bounding radius around `model_center` for automatic preview framing.
     pub model_radius: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProfileModelEntry {
+    /// `model` cvar value. Initial Profile work deliberately selects complete
+    /// model/skin presets; per-surface and multipart customization can layer on
+    /// top without changing the userinfo representation.
+    pub value: String,
+    pub model_name: String,
+    pub skin_name: String,
+    /// JKA profile portrait resolved from models/players/<model>/icon_<skin>.*.
+    pub icon: Option<LevelshotAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProfileSaberEntry {
+    /// Saber block identifier written to saber1/saber2.
+    pub name: String,
+    pub display_name: String,
+    pub saber_type: String,
+    pub model: String,
+    pub custom_skin: Option<String>,
+    pub num_blades: usize,
+}
+
+pub(super) fn scan_profile_catalog(
+    base: &Path,
+    game: Option<&Path>,
+) -> Result<(Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>), String> {
+    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
+    let names = assets.names().map(str::to_owned).collect::<Vec<_>>();
+
+    // OpenJK's model cvar is model[/skin]. Keep the initial browser on complete
+    // model_*.skin presets. Multipart head|torso|lower selections already work
+    // when present in the current cvar and will get their own modern editor next.
+    let mut model_folders = BTreeSet::new();
+    let mut skins_by_model = BTreeMap::<String, BTreeSet<String>>::new();
+    for name in &names {
+        let lower = name.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("models/players/") else { continue };
+        let Some((folder, leaf)) = rest.rsplit_once('/') else { continue };
+        if folder.is_empty() || folder.contains('/') {
+            continue;
+        }
+        if leaf == "model.glm" {
+            // Vehicles and other non-player GLMs also live under models/players.
+            // A selectable JKA player model must be driven by the shared humanoid
+            // animation skeleton (_humanoid or one of its authored variants).
+            let candidate = format!("models/players/{folder}/model.glm");
+            let humanoid = assets
+                .read(&candidate, PROFILE_GLM_LIMIT_BYTES)
+                .ok()
+                .flatten()
+                .and_then(|asset| jka_assets::ghoul2::glm_animation_name(&asset.bytes).ok())
+                .is_some_and(|anim_name| {
+                    anim_name
+                        .replace('\\', "/")
+                        .to_ascii_lowercase()
+                        .contains("_humanoid")
+                });
+            if humanoid {
+                model_folders.insert(folder.to_owned());
+            }
+        } else if let Some(skin) = leaf
+            .strip_prefix("model_")
+            .and_then(|leaf| leaf.strip_suffix(".skin"))
+            .filter(|skin| !skin.is_empty())
+        {
+            skins_by_model
+                .entry(folder.to_owned())
+                .or_default()
+                .insert(skin.to_owned());
+        }
+    }
+
+    let mut models = Vec::new();
+    for model in model_folders {
+        let skins = skins_by_model.remove(&model).unwrap_or_else(|| {
+            let mut fallback = BTreeSet::new();
+            fallback.insert("default".to_owned());
+            fallback
+        });
+        for skin in skins {
+            let value = if skin.eq_ignore_ascii_case("default") {
+                model.clone()
+            } else {
+                format!("{model}/{skin}")
+            };
+            let mut icon = None;
+            'icon_search: for extension in ["jpg", "jpeg", "png", "tga"] {
+                let format = match extension {
+                    "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+                    "png" => image::ImageFormat::Png,
+                    "tga" => image::ImageFormat::Tga,
+                    _ => unreachable!(),
+                };
+                for icon_skin in [skin.as_str(), "default"] {
+                    let candidate = format!("models/players/{model}/icon_{icon_skin}.{extension}");
+                    match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
+                        Ok(Some(asset)) => {
+                            icon = Some(LevelshotAsset { bytes: asset.bytes, format });
+                            break 'icon_search;
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("Profile icon {candidate}: {error}"),
+                    }
+                }
+            }
+            models.push(ProfileModelEntry {
+                value,
+                model_name: model.clone(),
+                skin_name: skin,
+                icon,
+            });
+        }
+    }
+    models.sort_by(|a, b| {
+        a.model_name
+            .cmp(&b.model_name)
+            .then_with(|| a.skin_name.cmp(&b.skin_name))
+    });
+
+    let saber_definitions = jka_assets::saber::load_saber_definitions(&mut assets)?;
+    let mut sabers = saber_definitions
+        .iter()
+        .map(|definition| ProfileSaberEntry {
+            name: definition.name.clone(),
+            display_name: definition.proper_name.clone(),
+            saber_type: definition.saber_type.clone(),
+            model: definition.model.clone(),
+            custom_skin: definition.custom_skin.clone(),
+            num_blades: definition.num_blades,
+        })
+        .collect::<Vec<_>>();
+    sabers.sort_by(|a, b| a.display_name.to_ascii_lowercase().cmp(&b.display_name.to_ascii_lowercase()).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())));
+
+    Ok((models, sabers))
 }
 
 #[derive(Debug, Clone)]
@@ -1025,8 +1164,6 @@ fn scan_demo_bytes(
     source: String,
 ) -> Result<(DemoIndex, DemoMetadata), String> {
     const SNAPFLAG_NOT_ACTIVE: u8 = 1 << 1;
-    const EV_EVENT_BITS: i32 = 0x300;
-    const EV_OBITUARY: i32 = 93;
     const MAX_GENTITIES: usize = 1024;
 
     let mut reader = DemoReader::new(Cursor::new(bytes));
@@ -1272,7 +1409,7 @@ fn scan_demo_bytes(
                         let changed = if event_only { !previous_present[entity] } else { raw_event != previous_event[entity] };
                         previous_event[entity] = raw_event;
                         previous_present[entity] = true;
-                        if changed && (raw_event & !EV_EVENT_BITS) == EV_OBITUARY {
+                        if changed && (raw_event & !EV_EVENT_BITS) == EntityEvent::EV_OBITUARY.as_i32() {
                             let target = state.field_i32("otherEntityNum").unwrap_or(-1);
                             let attacker = state.field_i32("otherEntityNum2").unwrap_or(-1);
                             let means_of_death = state.field_i32("eventParm").unwrap_or(0);

@@ -2,6 +2,8 @@
 #define jka_player_jump_level stock_jka_player_jump_level
 #define jka_player_knockback stock_jka_player_knockback
 #define jka_player_set_noclip stock_jka_player_set_noclip
+#define jka_player_teleport stock_jka_player_teleport
+#define jka_player_give_all stock_jka_player_give_all
 #define jka_player_set_saber_movement_info stock_jka_player_set_saber_movement_info
 #define jka_player_offline_force_tick stock_jka_player_offline_force_tick
 #define jka_player_new stock_jka_player_new

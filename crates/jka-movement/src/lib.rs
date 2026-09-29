@@ -690,6 +690,22 @@ impl PlayerState {
         let _guard = ffi::NativeGuard::new();
         unsafe { ffi::jka_player_set_noclip(self.raw.as_ptr(), i32::from(enabled)) };
     }
+    /// Port of OpenJK `TeleportPlayer` (the `setviewpos` cheat): origin + 1 unit
+    /// up, a 400 u/s push along the new view, a 160 ms knockback hold and a
+    /// toggled EF_TELEPORT_BIT so presentation does not lerp.
+    pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
+        if !origin.iter().chain(angles.iter()).all(|v| v.is_finite()) {
+            return Err("Non-finite teleport".into());
+        }
+        let _guard = ffi::NativeGuard::new();
+        unsafe { ffi::jka_player_teleport(self.raw.as_ptr(), origin.as_ptr(), angles.as_ptr(), 0) };
+        Ok(())
+    }
+    /// Port of OpenJK game-side `G_Give(ent, "all", ...)` for the local authority.
+    pub fn give_all(&mut self) {
+        let _guard = ffi::NativeGuard::new();
+        unsafe { ffi::jka_player_give_all(self.raw.as_ptr()) };
+    }
     /// Install one of the two saber definitions visible to stock BG/Pmove.
     /// This is state owned by the authoritative player host, not renderer data.
     pub fn set_saber_movement_info(

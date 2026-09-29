@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const SLOT_COUNT: usize = 11;
+pub const SLOT_COUNT: usize = 21;
 const RECENT_NS: u64 = 750_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,16 @@ pub enum ThreadSlot {
     Worker5 = 8,
     Worker6 = 9,
     Worker7 = 10,
+    Event0 = 11,
+    Event1 = 12,
+    Event2 = 13,
+    Event3 = 14,
+    Event4 = 15,
+    Event5 = 16,
+    Event6 = 17,
+    Event7 = 18,
+    Asset0 = 19,
+    Asset1 = 20,
 }
 
 impl ThreadSlot {
@@ -33,6 +43,28 @@ impl ThreadSlot {
             5 => Some(Self::Worker5),
             6 => Some(Self::Worker6),
             7 => Some(Self::Worker7),
+            _ => None,
+        }
+    }
+
+    pub const fn asset_worker(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Asset0),
+            1 => Some(Self::Asset1),
+            _ => None,
+        }
+    }
+
+    pub const fn event_worker(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Event0),
+            1 => Some(Self::Event1),
+            2 => Some(Self::Event2),
+            3 => Some(Self::Event3),
+            4 => Some(Self::Event4),
+            5 => Some(Self::Event5),
+            6 => Some(Self::Event6),
+            7 => Some(Self::Event7),
             _ => None,
         }
     }
@@ -58,6 +90,9 @@ pub enum Task {
     MapAcoustics = 14,
     MapAudioBake = 15,
     MapPortalPlans = 16,
+    EventPrep = 17,
+    EventSoundDecode = 18,
+    AssetLoad = 19,
 }
 
 impl Task {
@@ -80,6 +115,9 @@ impl Task {
             Self::MapAcoustics => "ACOUSTICS",
             Self::MapAudioBake => "AUDIO BAKE",
             Self::MapPortalPlans => "PVS DRAW PLANS",
+            Self::EventPrep => "EVENT PREP",
+            Self::EventSoundDecode => "EVENT AUDIO DECODE",
+            Self::AssetLoad => "ASSET LOAD",
         }
     }
 
@@ -101,6 +139,9 @@ impl Task {
             14 => Self::MapAcoustics,
             15 => Self::MapAudioBake,
             16 => Self::MapPortalPlans,
+            17 => Self::EventPrep,
+            18 => Self::EventSoundDecode,
+            19 => Self::AssetLoad,
             _ => Self::Idle,
         }
     }
@@ -130,6 +171,16 @@ impl SlotState {
 
 static START: OnceLock<Instant> = OnceLock::new();
 static SLOTS: [SlotState; SLOT_COUNT] = [
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
     SlotState::new(),
     SlotState::new(),
     SlotState::new(),
@@ -208,6 +259,16 @@ pub fn snapshot() -> [RawThreadActivity; SLOT_COUNT] {
         ThreadSlot::Worker5,
         ThreadSlot::Worker6,
         ThreadSlot::Worker7,
+        ThreadSlot::Event0,
+        ThreadSlot::Event1,
+        ThreadSlot::Event2,
+        ThreadSlot::Event3,
+        ThreadSlot::Event4,
+        ThreadSlot::Event5,
+        ThreadSlot::Event6,
+        ThreadSlot::Event7,
+        ThreadSlot::Asset0,
+        ThreadSlot::Asset1,
     ]
     .map(|slot| {
         let state = state(slot);
@@ -249,11 +310,31 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
         ThreadSlot::Worker5 => "WORKER 5",
         ThreadSlot::Worker6 => "WORKER 6",
         ThreadSlot::Worker7 => "WORKER 7",
+        ThreadSlot::Event0 => "EVENT 0",
+        ThreadSlot::Event1 => "EVENT 1",
+        ThreadSlot::Event2 => "EVENT 2",
+        ThreadSlot::Event3 => "EVENT 3",
+        ThreadSlot::Event4 => "EVENT 4",
+        ThreadSlot::Event5 => "EVENT 5",
+        ThreadSlot::Event6 => "EVENT 6",
+        ThreadSlot::Event7 => "EVENT 7",
+        ThreadSlot::Asset0 => "ASSET 0",
+        ThreadSlot::Asset1 => "ASSET 1",
     }
 }
 
 static SAMPLE_LAST_NS: AtomicU64 = AtomicU64::new(0);
 static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

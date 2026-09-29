@@ -7,6 +7,46 @@ struct Node {
     plane: usize,
     children: [i32; 2],
 }
+/// CM_PointLeafnum: walk the BSP tree to the leaf containing `point`.
+fn leaf_at(nodes: &[Node], planes: &[Plane], point: [f32; 3]) -> Option<usize> {
+    if !point.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut node = 0i32;
+    for _ in 0..=nodes.len() {
+        if node < 0 {
+            return Some(-(node + 1) as usize);
+        }
+        let record = &nodes[node as usize];
+        let plane = planes[record.plane];
+        let distance = (0..3).map(|i| point[i] * plane.normal[i]).sum::<f32>() - plane.distance;
+        node = record.children[usize::from(distance < 0.0)];
+    }
+    None
+}
+
+/// Point -> BSP portal area lookup for a server-side areamask
+/// (CM_PointLeafnum + CM_LeafArea).
+#[derive(Debug, Clone)]
+pub struct AreaLocator {
+    nodes: Vec<Node>,
+    planes: Vec<Plane>,
+    leaf_areas: Vec<i32>,
+    area_count: usize,
+}
+
+impl AreaLocator {
+    /// Area of the leaf containing `point`; `None` for solid/unassigned leaves.
+    pub fn area_at(&self, point: [f32; 3]) -> Option<usize> {
+        leaf_at(&self.nodes, &self.planes, point)
+            .and_then(|leaf| usize::try_from(*self.leaf_areas.get(leaf)?).ok())
+    }
+
+    pub fn area_count(&self) -> usize {
+        self.area_count
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Visibility {
     nodes: Vec<Node>,
@@ -149,20 +189,22 @@ impl Visibility {
         }))
     }
     fn leaf_at(&self, point: [f32; 3]) -> Option<usize> {
-        if !point.iter().all(|v| v.is_finite()) {
-            return None;
+        leaf_at(&self.nodes, &self.planes, point)
+    }
+
+    /// The point -> area half of this data, without the cluster bitset.
+    pub fn area_locator(&self) -> AreaLocator {
+        AreaLocator {
+            nodes: self.nodes.clone(),
+            planes: self.planes.clone(),
+            area_count: self
+                .leaf_areas
+                .iter()
+                .filter_map(|&area| usize::try_from(area).ok())
+                .max()
+                .map_or(0, |area| area + 1),
+            leaf_areas: self.leaf_areas.clone(),
         }
-        let mut node = 0i32;
-        for _ in 0..=self.nodes.len() {
-            if node < 0 {
-                return Some(-(node + 1) as usize);
-            }
-            let record = &self.nodes[node as usize];
-            let plane = self.planes[record.plane];
-            let distance = (0..3).map(|i| point[i] * plane.normal[i]).sum::<f32>() - plane.distance;
-            node = record.children[usize::from(distance < 0.0)];
-        }
-        None
     }
 
     pub fn cluster_at(&self, point: [f32; 3]) -> Option<usize> {

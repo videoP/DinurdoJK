@@ -102,9 +102,38 @@ pub struct RegisteredSound {
     sample_rate: rodio::SampleRate,
 }
 
+/// Raw compressed SFX bytes staged by the game thread for CPU-only decoding on
+/// the optional event worker pool. AssetSearchPath itself stays on its owning
+/// thread because ZIP/VFS reads are mutable; only codec work crosses threads.
+pub(crate) struct SoundDecodeJob {
+    key: String,
+    bytes: Vec<u8>,
+}
+
+pub(crate) struct SoundDecodeResult {
+    key: String,
+    decoded: Result<RegisteredSound, String>,
+}
+
+impl SoundDecodeJob {
+    pub(crate) fn decode(self) -> SoundDecodeResult {
+        SoundDecodeResult {
+            key: self.key,
+            decoded: decode_sound(self.bytes),
+        }
+    }
+}
+
 pub struct SoundAssets {
     assets: AssetSearchPath,
     cache: HashMap<String, Arc<RegisteredSound>>,
+    // Worker codec results wait here until their event reaches ordered dispatch.
+    // This preserves cache-limit ordering relative to custom sounds.
+    predecoded: HashMap<String, SoundDecodeResult>,
+    // VFS failures found while staging are held until ordered dispatch, so the
+    // first failure string and subsequent "previously failed" behavior match
+    // the original synchronous SoundAssets::register path.
+    predecode_errors: HashMap<String, String>,
     failed: HashSet<String>,
     cached_samples: usize,
     sample_rate_counts: HashMap<u32, usize>,
@@ -115,6 +144,8 @@ impl SoundAssets {
         Self {
             assets,
             cache: HashMap::new(),
+            predecoded: HashMap::new(),
+            predecode_errors: HashMap::new(),
             failed: HashSet::new(),
             cached_samples: 0,
             sample_rate_counts: HashMap::new(),
@@ -123,7 +154,18 @@ impl SoundAssets {
 
     pub fn register(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
         let key = qpath.replace('\\', "/").to_ascii_lowercase();
+        if !self.predecoded.is_empty() {
+            if let Some(result) = self.predecoded.remove(&key) {
+                self.commit_decode(result)?;
+            }
+        }
         if let Some(sound) = self.cache.get(&key) { return Ok(Arc::clone(sound)); }
+        if !self.predecode_errors.is_empty() {
+            if let Some(error) = self.predecode_errors.remove(&key) {
+                if self.failed.len() < 4096 { self.failed.insert(key); }
+                return Err(error);
+            }
+        }
         if self.failed.contains(&key) { return Err(format!("sound previously failed: {key}")); }
         let result = self.load(&key);
         match result {
@@ -164,7 +206,76 @@ impl SoundAssets {
             .join(", ")
     }
 
-    fn load(&mut self, qpath: &str) -> Result<RegisteredSound, String> {
+    /// Stage an uncached direct sound for worker decoding. This performs the
+    /// VFS/ZIP read on the owning game thread but deliberately leaves WAV/MP3
+    /// codec work for a worker. Cached/previously-failed assets return None.
+    pub(crate) fn stage_decode(&mut self, qpath: &str) -> Option<SoundDecodeJob> {
+        let key = qpath.replace('\\', "/").to_ascii_lowercase();
+        if self.cache.contains_key(&key)
+            || self.predecoded.contains_key(&key)
+            || self.predecode_errors.contains_key(&key)
+            || self.failed.contains(&key)
+        {
+            return None;
+        }
+        match self.load_bytes(&key) {
+            Ok(bytes) => Some(SoundDecodeJob { key, bytes }),
+            Err(error) => {
+                self.predecode_errors.insert(key, error);
+                None
+            }
+        }
+    }
+
+    /// Queue worker codec results without mutating the live cache yet.
+    /// `register()` commits the matching result when its event reaches ordered
+    /// dispatch, so worker preparation cannot reorder cache-limit decisions.
+    pub(crate) fn queue_predecoded<I>(&mut self, results: I)
+    where
+        I: IntoIterator<Item = SoundDecodeResult>,
+    {
+        for result in results {
+            if !self.cache.contains_key(&result.key)
+                && !self.failed.contains(&result.key)
+                && !self.predecode_errors.contains_key(&result.key)
+                && !self.predecoded.contains_key(&result.key)
+            {
+                self.predecoded.insert(result.key.clone(), result);
+            }
+        }
+    }
+
+    fn commit_decode(&mut self, result: SoundDecodeResult) -> Result<(), String> {
+        if self.cache.contains_key(&result.key) {
+            return Ok(());
+        }
+        if self.failed.contains(&result.key) {
+            return Err(format!("sound previously failed: {}", result.key));
+        }
+        match result.decoded {
+            Ok(sound) => {
+                if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
+                    if self.failed.len() < 4096 {
+                        self.failed.insert(result.key);
+                    }
+                    return Err("SFX cache limit reached (128 MiB)".into());
+                }
+                let sound = Arc::new(sound);
+                self.cached_samples += sound.samples.len();
+                *self.sample_rate_counts.entry(sound.sample_rate.get()).or_insert(0) += 1;
+                self.cache.insert(result.key, sound);
+                Ok(())
+            }
+            Err(error) => {
+                if self.failed.len() < 4096 {
+                    self.failed.insert(result.key);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn load_bytes(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
         // JKA commonly requests a .wav whose shipped asset is an .mp3.
         let stem = qpath.strip_suffix(".wav").or_else(|| qpath.strip_suffix(".mp3")).unwrap_or(qpath);
         let candidates = if qpath.ends_with(".wav") || qpath.ends_with(".mp3") {
@@ -172,14 +283,18 @@ impl SoundAssets {
         } else { vec![format!("{stem}.wav"), format!("{stem}.mp3")] };
         for candidate in candidates {
             if let Some(asset) = self.assets.read(&candidate, MAX_SOUND_BYTES).map_err(|e| e.to_string())? {
-                let sound = decode_sound(asset.bytes)?;
-                if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
-                    return Err("SFX cache limit reached (128 MiB)".into());
-                }
-                return Ok(sound);
+                return Ok(asset.bytes);
             }
         }
         Err(format!("missing sound {qpath}"))
+    }
+
+    fn load(&mut self, qpath: &str) -> Result<RegisteredSound, String> {
+        let sound = decode_sound(self.load_bytes(qpath)?)?;
+        if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
+            return Err("SFX cache limit reached (128 MiB)".into());
+        }
+        Ok(sound)
     }
 }
 
@@ -1883,14 +1998,6 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
         direction,
         hrtf_spatializable: distance > 0.0001 && distance_gain > 0.0,
     }
-}
-
-/// Kept as a focused OpenJK-compatible helper for tests and the merged loop
-/// path. New HRTF code must use `spatialize_detail` so it cannot accidentally
-/// derive its direction from already-panned stereo gains.
-#[cfg(test)]
-fn spatialize(origin: [f32; 3], listener: Listener, channel: i32, separation: f32) -> [f32; 2] {
-    spatialize_detail(origin, listener, channel, separation).stereo
 }
 
 #[cfg(test)]
