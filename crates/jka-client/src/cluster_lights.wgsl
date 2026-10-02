@@ -119,8 +119,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let z_max = z_boundary(slice + 1u);
     let light_count = min(settings.values.y, arrayLength(&lights));
 
+    // Runtime transient lights (sabers, blasters) live after the static map
+    // lights. Visit them first so maps with many authored lights cannot fill
+    // the per-cluster cap before a saber light is considered.
+    let transient_start = min(settings.local_shadows.w, light_count);
     var count = 0u;
-    for (var light_index = 0u; light_index < light_count; light_index += 1u) {
+    for (var iteration = 0u; iteration < light_count; iteration += 1u) {
+        let light_index = select(
+            transient_start + iteration,
+            iteration - (light_count - transient_start),
+            iteration >= light_count - transient_start
+        );
         let light = lights[light_index];
         let is_area = light.emitter.w > 0.5;
         if (is_area) {

@@ -197,8 +197,9 @@ fn shader_sun_sky_admission(world_position: vec3<f32>, cascade: i32) -> f32 {
         return 0.0;
     }
     let ndc = clip.xyz / clip.w;
-    if (any(ndc.xy < vec2<f32>(-1.0)) || ndc.z < 0.0 || any(ndc > vec3<f32>(1.0))) {
-        return 0.0;
+    // See bsp.wgsl: only X/Y bound the sky map; encoded sky depth is valid for any Z.
+    if (any(abs(ndc.xy) > vec2<f32>(1.0))) {
+        return 1.0;
     }
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     let dims = vec2<i32>(textureDimensions(sky_admission_texture));
@@ -246,7 +247,7 @@ fn cascaded_shadow_visibility(world_position: vec3<f32>, normal: vec3<f32>) -> f
     }
 
     var visibility = sample_cascade_shadow_legacy(world_position, normal, cascade);
-    if (cascade < 2i) {
+    if (cascade < 2i && cascade + 1i < cascade_count) {
         let split = shadow_settings.split_depths[u32(cascade)];
         let blend_width = max(split * 0.08, 64.0);
         let blend = smoothstep(split - blend_width, split, camera_depth);

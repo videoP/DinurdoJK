@@ -1,11 +1,12 @@
 //! Port of the OpenJK MP spawn functions that give map entities an inline BSP
-//! model (codemp/game/g_mover.c, g_spawn.c). The shim has no mover think or
-//! use logic, so each entity is published in its spawn-time state: doors,
-//! buttons and plats rest at `pos1`, rotating/bobbing/pendulum movers keep the
-//! trajectory CGame evaluates every frame, and START_OFF walls/usables stay
-//! out of the snapshot (SVF_NOCLIENT) exactly like on a real server. A
-//! func_train that starts moving (no targetname, or START_ON) runs
-//! Reached_Train/Think_BeginMoving over its path_corners.
+//! model (codemp/game/g_mover.c, g_spawn.c). Each entity is built in its
+//! spawn-time state: doors, buttons and plats rest at `pos1`,
+//! rotating/bobbing/pendulum movers keep the trajectory CGame evaluates every
+//! frame, and START_OFF walls/usables stay out of the snapshot (SVF_NOCLIENT)
+//! exactly like on a real server. A func_train that starts moving (no
+//! targetname, or START_ON) runs Reached_Train/Think_BeginMoving over its
+//! path_corners. What happens to them afterwards (use, touch, push, block) is
+//! `game.rs`.
 
 use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
 
@@ -34,17 +35,17 @@ const LOCAL_GAMETYPE_NAME: &str = "ffa";
 /// Spawn variables with OpenJK's two lookup rules: G_SpawnString returns the
 /// first matching key, while G_ParseField applies every key in order so the
 /// last one wins for fields such as origin/angles/spawnflags/speed.
-struct SpawnVars<'a>(&'a [(String, String)]);
+pub(super) struct SpawnVars<'a>(pub(super) &'a [(String, String)]);
 
 impl SpawnVars<'_> {
-    fn spawn(&self, key: &str) -> Option<&str> {
+    pub(super) fn spawn(&self, key: &str) -> Option<&str> {
         self.0
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, value)| value.as_str())
     }
 
-    fn field(&self, key: &str) -> Option<&str> {
+    pub(super) fn field(&self, key: &str) -> Option<&str> {
         self.0
             .iter()
             .rev()
@@ -52,30 +53,30 @@ impl SpawnVars<'_> {
             .map(|(_, value)| value.as_str())
     }
 
-    fn spawn_f32(&self, key: &str, default: f32) -> (bool, f32) {
+    pub(super) fn spawn_f32(&self, key: &str, default: f32) -> (bool, f32) {
         match self.spawn(key) {
             Some(value) => (true, atof(value)),
             None => (false, default),
         }
     }
 
-    fn spawn_vec3(&self, key: &str, default: [f32; 3]) -> (bool, [f32; 3]) {
+    pub(super) fn spawn_vec3(&self, key: &str, default: [f32; 3]) -> (bool, [f32; 3]) {
         match self.spawn(key) {
             Some(value) => (true, sscanf_vec3(value)),
             None => (false, default),
         }
     }
 
-    fn field_i32(&self, key: &str) -> i32 {
+    pub(super) fn field_i32(&self, key: &str) -> i32 {
         self.field(key).map_or(0, atoi)
     }
 
-    fn field_f32(&self, key: &str) -> f32 {
+    pub(super) fn field_f32(&self, key: &str) -> f32 {
         self.field(key).map_or(0.0, atof)
     }
 
     /// F_VECTOR `origin`/`angles`, then F_ANGLEHACK `angle` if it came later.
-    fn field_angles(&self) -> [f32; 3] {
+    pub(super) fn field_angles(&self) -> [f32; 3] {
         let mut angles = [0.0; 3];
         for (name, value) in self.0 {
             if name.eq_ignore_ascii_case("angles") {
@@ -89,7 +90,7 @@ impl SpawnVars<'_> {
 }
 
 /// C atof/atoi: parse the longest numeric prefix, 0 when there is none.
-fn atof(text: &str) -> f32 {
+pub(super) fn atof(text: &str) -> f32 {
     let text = text.trim_start();
     let end = text
         .char_indices()
@@ -102,24 +103,24 @@ fn atof(text: &str) -> f32 {
     text[..end].parse::<f32>().ok().filter(|value| value.is_finite()).unwrap_or(0.0)
 }
 
-fn atoi(text: &str) -> i32 {
+pub(super) fn atoi(text: &str) -> i32 {
     atof(text) as i32
 }
 
-fn sscanf_vec3(text: &str) -> [f32; 3] {
+pub(super) fn sscanf_vec3(text: &str) -> [f32; 3] {
     let mut values = text.split_whitespace().map(atof);
     std::array::from_fn(|_| values.next().unwrap_or(0.0))
 }
 
 /// q_math AngleVectors forward vector.
-fn angle_forward(angles: [f32; 3]) -> [f32; 3] {
+pub(super) fn angle_forward(angles: [f32; 3]) -> [f32; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
     [cp * cy, cp * sy, -sp]
 }
 
 /// G_SetMovedir: the editor's -1/-2 `angle` shortcuts mean up/down.
-fn set_movedir(angles: [f32; 3]) -> [f32; 3] {
+pub(super) fn set_movedir(angles: [f32; 3]) -> [f32; 3] {
     if angles == [0.0, -1.0, 0.0] {
         [0.0, 0.0, 1.0]
     } else if angles == [0.0, -2.0, 0.0] {
@@ -342,7 +343,7 @@ fn spawn_mover(entity: &MapBrushEntity) -> Option<Mover> {
 }
 
 /// G_SpawnGEntityFromSpawnVars' gametype filters for the local GT_FFA game.
-fn spawns_in_local_gametype(vars: &SpawnVars) -> bool {
+pub(super) fn spawns_in_local_gametype(vars: &SpawnVars) -> bool {
     if vars.spawn("notfree").map_or(0, atoi) != 0 {
         return false;
     }
@@ -353,6 +354,8 @@ fn spawns_in_local_gametype(vars: &SpawnVars) -> bool {
 /// Everything the shim keeps for the brush entities it spawned.
 pub(super) struct BrushMovers {
     pub entities: Vec<EntityState>,
+    /// Index into the brush entity list of the source of each `entities` item.
+    pub sources: Vec<usize>,
     /// Moving trains; `Train::entity` indexes `entities`.
     pub trains: Vec<Train>,
     /// `model2` names; `modelindex2` N refers to `models[N - 1]`.
@@ -384,18 +387,32 @@ const MAX_TRAIN_STEPS: usize = 4096;
 
 impl Train {
     /// Run every train think due at `time` against its published state.
-    pub(super) fn advance(&mut self, state: &mut EntityState, time: i32) {
+    /// Returns whether the published trajectory changed.
+    pub(super) fn advance(&mut self, state: &mut EntityState, time: i32) -> bool {
+        let mut changed = false;
         for _ in 0..MAX_TRAIN_STEPS {
             match self.phase {
                 TrainPhase::Setup => self.reached(state, time),
                 TrainPhase::Moving { end } if time >= end => self.reached(state, end),
                 TrainPhase::Waiting { until } if time >= until => self.begin_moving(state, until),
-                _ => return,
+                _ => return changed,
             }
+            changed = true;
         }
         // Still behind after a pathological stall: resume from now.
         if let TrainPhase::Moving { .. } = self.phase {
             self.begin_moving(state, time);
+        }
+        true
+    }
+
+    /// G_MoverTeam pushed `pos.trTime` back by `delta` because something
+    /// blocked the train; its pending think moves with it.
+    pub(super) fn delay(&mut self, delta: i32) {
+        match &mut self.phase {
+            TrainPhase::Moving { end } => *end = end.saturating_add(delta),
+            TrainPhase::Waiting { until } => *until = until.saturating_add(delta),
+            TrainPhase::Setup | TrainPhase::Stopped => {}
         }
     }
 
@@ -449,9 +466,10 @@ pub(super) fn build_brush_mover_entities(
     max_entities: u16,
 ) -> BrushMovers {
     let mut entities = Vec::new();
+    let mut sources = Vec::new();
     let mut trains = Vec::new();
     let mut models = Vec::<String>::new();
-    for entity in brush_entities {
+    for (source, entity) in brush_entities.iter().enumerate() {
         let vars = SpawnVars(&entity.spawn_vars);
         if !spawns_in_local_gametype(&vars) {
             continue;
@@ -517,8 +535,9 @@ pub(super) fn build_brush_mover_entities(
             });
         }
         entities.push(state);
+        sources.push(source);
     }
-    BrushMovers { entities, trains, models }
+    BrushMovers { entities, sources, trains, models }
 }
 
 #[cfg(test)]

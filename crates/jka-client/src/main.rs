@@ -15,19 +15,25 @@ mod camera;
 mod cgame;
 mod clipboard;
 mod cloud_noise;
+mod cloud_wind;
 mod color_lut;
 mod config;
 mod console;
+mod crash;
 mod download;
+mod entity_graph;
 mod fx;
 mod grass;
+mod japro_cg;
 mod jump_shade;
 mod keybinds;
+mod lagometer;
 mod lightmap_atlas;
 mod logging;
 mod local_server;
 mod map_jobs;
 mod materials;
+mod model_frame_log;
 mod net;
 mod ocean;
 mod player;
@@ -36,11 +42,14 @@ mod renderer;
 mod runtime;
 mod scene;
 mod server_browser;
+mod speedometer;
 mod surface_deformation;
 mod steam_audio;
+mod strafehelper;
 mod thread_activity;
 mod ui;
 mod vgs;
+mod vote;
 mod weather;
 mod windows_timer;
 
@@ -153,7 +162,15 @@ impl Options {
 
 fn main() -> std::process::ExitCode {
     match logging::init() {
-        Ok(path) => println!("Latest log: {}", path.display()),
+        Ok(path) => {
+            logging::write_line_with_path(
+                logging::Level::Info,
+                format_args!("Latest log: {}", path.display()),
+                path.clone(),
+            );
+            crash::install(&path);
+            crash::log_environment();
+        }
         Err(error) => std::eprintln!("Logging initialization failed: {error}"),
     }
 
@@ -166,7 +183,11 @@ fn main() -> std::process::ExitCode {
     };
 
     println!("DinurdoJK renderer: winit + wgpu, no Bevy");
-    println!("Base directory: {}", options.base.display());
+    logging::write_line_with_path(
+        logging::Level::Info,
+        format_args!("Base directory: {}", options.base.display()),
+        options.base.clone(),
+    );
     let game_dir = options.game.as_ref().map(|game| {
         let candidate = PathBuf::from(game);
         if candidate.is_absolute() {
@@ -180,9 +201,40 @@ fn main() -> std::process::ExitCode {
         }
     });
     if let Some(game) = &game_dir {
-        println!("Active game directory: {}", game.display());
+        logging::write_line_with_path(
+            logging::Level::Info,
+            format_args!("Active game directory: {}", game.display()),
+            game.clone(),
+        );
     }
     println!("Threads: main + dedicated render + background map loader + map worker pool");
+
+    // The grass noise images are CPU-generated and deterministic; build them while
+    // the window and GPU device are being created.
+    grass::prewarm_noise();
+
+    // Index the asset packages now, in parallel with window, adapter and device
+    // creation. The index is cached process-wide (jka_assets::pk3), so the
+    // renderer's UI loads, the first map prepare and the presenters that open
+    // the same directories reuse it, or wait for it, instead of each re-reading
+    // every PK3 central directory.
+    {
+        let base = options.base.clone();
+        let game = game_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("asset-index-prewarm".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                match jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref()) {
+                    Ok(assets) => println!(
+                        "[ASSET INDEX] prewarm: {} qpaths in {:.1} ms",
+                        assets.names().count(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(error) => eprintln!("[ASSET INDEX] prewarm failed: {error}"),
+                }
+            });
+    }
 
     if options.validate {
         let label = options.source.label();
@@ -204,14 +256,18 @@ fn main() -> std::process::ExitCode {
         };
         return match prepared {
             Ok(map) => {
-                println!(
-                    "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
-                    label,
-                    map.triangles,
-                    map.batches.len(),
-                    map.textures.len(),
-                    map.lightmap_pages,
-                    map.source.display()
+                logging::write_line_with_path(
+                    logging::Level::Info,
+                    format_args!(
+                        "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
+                        label,
+                        map.triangles,
+                        map.batches.len(),
+                        map.textures.len(),
+                        map.lightmap_pages,
+                        map.source.display()
+                    ),
+                    map.source.clone(),
                 );
                 if let Some(stats) = map.map_file_stats {
                     println!(

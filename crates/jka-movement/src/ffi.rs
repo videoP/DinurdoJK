@@ -19,6 +19,7 @@ pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) 
 unsafe extern "C" {
     fn jka_lock();
     fn jka_unlock();
+    pub fn jka_set_snap_mode(mode: i32);
     #[cfg(test)]
     fn jka_contract(index: i32) -> i32;
     #[cfg(test)]
@@ -57,6 +58,7 @@ unsafe extern "C" {
         saber_num: i32,
         info: *const SaberMovementInfo,
     ) -> i32;
+    pub fn jka_player_set_foot_bolts(player: *mut c_void, left: *const f32, right: *const f32) -> i32;
     pub fn jka_player_offline_force_tick(player: *mut c_void, time: i32, requested_power: i32);
     pub fn jka_animation_name(index: i32) -> *const c_char;
     pub fn jka_saber_move_trail_length(move_: i32) -> i32;
@@ -65,6 +67,8 @@ unsafe extern "C" {
     // Pure q_math.c helpers (no host state; no lock needed).
     pub fn ByteToDir(b: i32, dir: *mut f32);
     pub fn RotateAroundDirection(axis: *mut [f32; 3], yaw: f32);
+    pub fn jka_item_pickup_sound(index: i32) -> *const c_char;
+    pub fn jka_item_icon(index: i32) -> *const c_char;
     pub fn jka_item_info(
         index: i32,
         classname: *mut *const c_char,

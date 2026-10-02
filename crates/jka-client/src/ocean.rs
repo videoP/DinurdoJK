@@ -63,6 +63,25 @@ pub struct OceanClipmap {
 /// disagree with it.
 pub const OCEAN_CLIPMAP_VERTEX_MARKER: f32 = -1.0;
 
+/// How many clipmap levels a surface needs. Cell size never depends on the size
+/// of the water: level 0 always has the quality's own cell size and each level
+/// doubles it. What a footprint decides is only how far out the rings must reach.
+///
+/// The centre is clamped into the footprint and re-snapped to the outermost
+/// built level's lattice, so it can sit half that lattice step outside it. The
+/// outermost level therefore has to reach `extent + step / 2` from the centre:
+/// `HALF * step >= extent + step / 2`. Anything beyond that would be vertices
+/// folded onto the footprint edge as zero-area triangles.
+fn clipmap_levels_for(base_spacing: f32, extent: f32) -> u32 {
+    if !extent.is_finite() {
+        return CLIPMAP_LEVELS;
+    }
+    let reach = CLIPMAP_HALF_CELLS as f32 - 0.5;
+    (1..=CLIPMAP_LEVELS)
+        .find(|&levels| base_spacing * (1u32 << (levels - 1)) as f32 * reach >= extent)
+        .unwrap_or(CLIPMAP_LEVELS)
+}
+
 /// Builds the clipmap for one promoted water surface. Everything the vertex
 /// shader needs is baked in:
 ///   position.xz  grid offset from the clipmap centre, in world units
@@ -71,22 +90,40 @@ pub const OCEAN_CLIPMAP_VERTEX_MARKER: f32 = -1.0;
 ///   lightmap_uv  footprint maximum (world xz)
 ///   color.r      this vertex's own cell size
 ///   color.g      parent cell size on a level's outer boundary, else 0
+///   color.b      centre snap step: this clipmap's outermost built cell size
+///   color.a      shape-mask slot in `OceanMasks`, or -1 for none
 ///   alpha_cutoff the clipmap marker
+///
+/// Only as many levels are built as the footprint can use. A pool that fits
+/// inside level 0 is a single level, and a single level is also trimmed to the
+/// cells the footprint can reach.
 pub fn build_clipmap(
     base_spacing: f32,
     plane_height: f32,
     footprint_minimum: [f32; 2],
     footprint_maximum: [f32; 2],
+    mask_slot: Option<usize>,
 ) -> OceanClipmap {
-    let half = CLIPMAP_HALF_CELLS;
+    let mask_slot = mask_slot.map_or(-1.0, |slot| slot as f32);
+    let extent = (footprint_maximum[0] - footprint_minimum[0])
+        .max(footprint_maximum[1] - footprint_minimum[1]);
+    let levels = clipmap_levels_for(base_spacing, extent);
+    let snap_step = base_spacing * (1u32 << (levels - 1)) as f32;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    for level in 0..CLIPMAP_LEVELS {
+    for level in 0..levels {
         let spacing = base_spacing * (1u32 << level) as f32;
         // Level 0 is solid; every outer level is an annulus whose hole is
         // exactly the extent of the level it nests around.
-        let hole = if level == 0 { 0 } else { half / 2 };
-        let parent = if level + 1 < CLIPMAP_LEVELS { spacing * 2.0 } else { 0.0 };
+        let hole = if level == 0 { 0 } else { CLIPMAP_HALF_CELLS / 2 };
+        // Only a lone level has no neighbour whose hole it must match, so only
+        // it may shrink below the full width.
+        let half = if levels == 1 {
+            (((extent + spacing * 0.5) / spacing).ceil() as i32).clamp(1, CLIPMAP_HALF_CELLS)
+        } else {
+            CLIPMAP_HALF_CELLS
+        };
+        let parent = if level + 1 < levels { spacing * 2.0 } else { 0.0 };
         let side = (half * 2 + 1) as usize;
         let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
         for row in 0..side {
@@ -102,7 +139,7 @@ pub fn build_clipmap(
                     uv: footprint_minimum,
                     lightmap_uv: footprint_maximum,
                     normal: [0.0, 1.0, 0.0],
-                    color: [spacing, snap, 0.0, 1.0],
+                    color: [spacing, snap, snap_step, mask_slot],
                     alpha_cutoff: OCEAN_CLIPMAP_VERTEX_MARKER,
                 });
             }
@@ -127,8 +164,144 @@ pub fn build_clipmap(
     OceanClipmap {
         vertices,
         indices,
+        // The lattice the uniform's clipmap centre is snapped to. It stays the
+        // full-design value, not `snap_step`, so every surface of one quality
+        // shares one centre however many levels it actually built.
         coarsest_spacing: base_spacing * (1u32 << (CLIPMAP_LEVELS - 1)) as f32,
     }
+}
+
+/// Capacity of the shape-mask triangle store, in vec4s. A triangle takes two.
+pub const OCEAN_MASK_VEC4S: usize = 512;
+
+/// One world-space xz triangle of a promoted water face.
+pub type MaskTriangle = [[f32; 2]; 3];
+
+/// The real outline of each promoted ocean surface. A clipmap is a square
+/// grid folded into its footprint's bounding box, so the water fragments it
+/// shades are cut back to these triangles; that is what keeps a hole or an
+/// L-shape inside contiguous water from being painted over.
+///
+/// `ranges[slot]` is `[first triangle, triangle count, 0, 0]`. A count of zero
+/// means "no mask": the surface fills its whole footprint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OceanMasks {
+    pub ranges: [[f32; 4]; OCEAN_MAX_SURFACES],
+    pub triangles: Vec<[f32; 4]>,
+}
+
+impl Default for OceanMasks {
+    fn default() -> Self {
+        Self { ranges: [[0.0; 4]; OCEAN_MAX_SURFACES], triangles: Vec::new() }
+    }
+}
+
+impl OceanMasks {
+    /// Stores `triangles` for `slot`. Returns false, leaving the slot unmasked,
+    /// when they do not fit; the surface then fills its bounding box.
+    pub fn push_surface(&mut self, slot: usize, triangles: &[MaskTriangle]) -> bool {
+        if slot >= OCEAN_MAX_SURFACES || triangles.is_empty()
+            || (self.triangles.len() / 2 + triangles.len()) * 2 > OCEAN_MASK_VEC4S
+        {
+            return false;
+        }
+        self.ranges[slot] = [(self.triangles.len() / 2) as f32, triangles.len() as f32, 0.0, 0.0];
+        for t in triangles {
+            self.triangles.push([t[0][0], t[0][1], t[1][0], t[1][1]]);
+            self.triangles.push([t[2][0], t[2][1], 0.0, 0.0]);
+        }
+        true
+    }
+}
+
+/// One upward authored water face as the promotion pass sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaterFace {
+    pub plane: f32,
+    pub minimum: [f32; 2],
+    pub maximum: [f32; 2],
+    /// Faces of different map-authored oceans never merge: each has its own
+    /// wave settings.
+    pub authored_ocean: Option<usize>,
+}
+
+/// Contiguous water on one plane, promoted as a single ocean surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaterCluster {
+    pub plane: f32,
+    pub minimum: [f32; 2],
+    pub maximum: [f32; 2],
+    /// Indices into the face slice handed to `cluster_water_faces`.
+    pub members: Vec<usize>,
+}
+
+impl WaterCluster {
+    pub fn area(&self) -> f32 {
+        (self.maximum[0] - self.minimum[0]).max(0.0) * (self.maximum[1] - self.minimum[1]).max(0.0)
+    }
+}
+
+/// Faces closer than this count as touching. BSP splits land on shared edges.
+const WATER_TOUCH_UNITS: f32 = 1.0;
+
+fn faces_touch(a: &WaterFace, b: &WaterFace) -> bool {
+    a.authored_ocean == b.authored_ocean
+        && (a.plane - b.plane).abs() < WATER_TOUCH_UNITS
+        && a.minimum[0] <= b.maximum[0] + WATER_TOUCH_UNITS
+        && b.minimum[0] <= a.maximum[0] + WATER_TOUCH_UNITS
+        && a.minimum[1] <= b.maximum[1] + WATER_TOUCH_UNITS
+        && b.minimum[1] <= a.maximum[1] + WATER_TOUCH_UNITS
+}
+
+/// Merges faces that share a plane and touch or overlap, then orders the result
+/// biggest first so the surface cap keeps the water that matters most.
+///
+/// Connectivity is pairwise between faces, never between cluster bounds, so two
+/// pools that merely sit inside each other's bounding box stay separate. A
+/// cluster's footprint is still the bounding box of its faces; a hole inside
+/// contiguous water is therefore not preserved.
+pub fn cluster_water_faces(faces: &[WaterFace]) -> Vec<WaterCluster> {
+    let mut parent: Vec<usize> = (0..faces.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..faces.len() {
+        for j in i + 1..faces.len() {
+            if faces_touch(&faces[i], &faces[j]) {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                if a != b {
+                    parent[b.max(a)] = b.min(a);
+                }
+            }
+        }
+    }
+    let mut clusters: Vec<WaterCluster> = Vec::new();
+    let mut slot_of_root = vec![usize::MAX; faces.len()];
+    for (index, face) in faces.iter().enumerate() {
+        let r = root(&mut parent, index);
+        if slot_of_root[r] == usize::MAX {
+            slot_of_root[r] = clusters.len();
+            clusters.push(WaterCluster {
+                plane: face.plane,
+                minimum: face.minimum,
+                maximum: face.maximum,
+                members: Vec::new(),
+            });
+        }
+        let cluster = &mut clusters[slot_of_root[r]];
+        cluster.plane = cluster.plane.max(face.plane);
+        for axis in 0..2 {
+            cluster.minimum[axis] = cluster.minimum[axis].min(face.minimum[axis]);
+            cluster.maximum[axis] = cluster.maximum[axis].max(face.maximum[axis]);
+        }
+        cluster.members.push(index);
+    }
+    clusters.sort_by(|a, b| b.area().total_cmp(&a.area()));
+    clusters
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -309,6 +482,8 @@ pub struct OceanRenderUniform {
     pub wind_motion: [f32; 4], // render XZ wind m/s, spray multiplier, reserved
     pub authored_bounds: [f32;4],
     pub authored_plane: [f32;4], // enabled, height, reserved
+    pub mask_ranges: [[f32; 4]; OCEAN_MAX_SURFACES], // first triangle, triangle count
+    pub mask_triangles: [[f32; 4]; OCEAN_MASK_VEC4S], // per triangle: a.xy b.xy / c.xy
 }
 
 pub struct OceanGpu {
@@ -318,6 +493,7 @@ pub struct OceanGpu {
     environment: OceanEnvironment,
     surfaces: [OceanSurface; OCEAN_MAX_SURFACES],
     surface_count: usize,
+    masks: std::sync::Arc<OceanMasks>,
     times: [f32; OCEAN_CASCADES],
     elapsed: f32,
     next_update: f32,
@@ -343,7 +519,6 @@ pub struct OceanGpu {
     windrow_pipeline: wgpu::ComputePipeline,
     windrow_params_buffer: wgpu::Buffer,
     windrow_front: usize,
-    spray_pipeline: wgpu::RenderPipeline,
     render_buffer: wgpu::Buffer,
     pub render_bind_group: wgpu::BindGroup,
 }
@@ -355,7 +530,7 @@ fn jonswap_peak(wind_speed: f32, fetch_m: f32) -> f32 {
     22.0 * (G*G/(wind_speed*fetch_m)).powf(1.0/3.0)
 }
 
-fn create_spray_pipeline(
+pub(crate) fn create_spray_pipeline(
     device: &wgpu::Device,
     camera_layout: &wgpu::BindGroupLayout,
     render_layout: &wgpu::BindGroupLayout,
@@ -504,10 +679,7 @@ impl OceanGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         render_layout: &wgpu::BindGroupLayout,
-        camera_layout: &wgpu::BindGroupLayout,
         spray_albedo_view: &wgpu::TextureView,
-        surface_format: wgpu::TextureFormat,
-        samples: u32,
         requested_settings: OceanSettings,
     ) -> Self {
         let settings = requested_settings.sanitize();
@@ -638,15 +810,7 @@ impl OceanGpu {
             ],
         });
 
-        let spray_pipeline = create_spray_pipeline(
-            device,
-            camera_layout,
-            render_layout,
-            surface_format,
-            samples,
-        );
-
-        let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,remaining:0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,spray_pipeline,render_buffer,render_bind_group };
+        let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,remaining:0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         {
@@ -685,7 +849,18 @@ impl OceanGpu {
         uniform.wind_motion[0] = wind[0] / OCEAN_UNITS_PER_METER;
         uniform.wind_motion[1] = -wind[1] / OCEAN_UNITS_PER_METER;
         apply_scene_context(&mut uniform, self.environment, &self.surfaces, self.surface_count);
+        uniform.mask_ranges = self.masks.ranges;
+        uniform.mask_triangles[..self.masks.triangles.len()].copy_from_slice(&self.masks.triangles);
         queue.write_buffer(&self.render_buffer,0,bytemuck::bytes_of(&uniform));
+    }
+
+    /// Hands the ocean the outlines of the world's promoted surfaces. They are
+    /// indexed by the slot baked into each clipmap, which is not the order of
+    /// `set_surfaces` (that list drops surfaces an authored ocean covers).
+    pub fn set_masks(&mut self, queue: &wgpu::Queue, masks: &std::sync::Arc<OceanMasks>) {
+        if std::sync::Arc::ptr_eq(&self.masks, masks) { return; }
+        self.masks = std::sync::Arc::clone(masks);
+        self.write_render_uniform(queue);
     }
 
     /// Re-centres the clipmap on the viewer. The centre is snapped to the
@@ -807,35 +982,24 @@ impl OceanGpu {
         );
     }
 
-    /// Rebuild only the render pipeline that depends on the scene target
-    /// format/sample count. The FFT simulation and its persistent foam state do
-    /// not need to be recreated when HDR or MSAA changes.
-    pub fn rebuild_spray_pipeline(
-        &mut self,
-        device: &wgpu::Device,
-        camera_layout: &wgpu::BindGroupLayout,
-        render_layout: &wgpu::BindGroupLayout,
-        surface_format: wgpu::TextureFormat,
-        samples: u32,
-    ) {
-        self.spray_pipeline = create_spray_pipeline(
-            device,
-            camera_layout,
-            render_layout,
-            surface_format,
-            samples,
-        );
+    /// Whether this ocean will draw sea spray, i.e. needs the shared spray pipeline.
+    pub fn spray_active(&self) -> bool {
+        self.enabled && self.settings.sea_spray
     }
 
     pub fn draw_spray<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        spray_pipeline: Option<&'a wgpu::RenderPipeline>,
     ) {
         if !self.enabled || !self.settings.sea_spray || self.surface_count == 0 {
             return;
         }
-        pass.set_pipeline(&self.spray_pipeline);
+        let Some(spray_pipeline) = spray_pipeline else {
+            return;
+        };
+        pass.set_pipeline(spray_pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
         pass.set_bind_group(1, &self.render_bind_group, &[]);
         // Upstream uses one 32,768-particle GPUParticles3D emitter. Keep that
@@ -1008,6 +1172,8 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         wind_motion: [0.0,0.0,settings.authored.spray,0.0],
         authored_bounds: settings.bounds.map(|b| [b.minimum[0],b.minimum[1],b.maximum[0],b.maximum[1]]).unwrap_or([0.0;4]),
         authored_plane: settings.bounds.map(|b| [1.0,b.plane_height,0.0,0.0]).unwrap_or([0.0;4]),
+        mask_ranges: [[0.0; 4]; OCEAN_MAX_SURFACES],
+        mask_triangles: [[0.0; 4]; OCEAN_MASK_VEC4S],
     }
 }
 
@@ -1061,7 +1227,8 @@ mod tests {
 
     #[test]
     fn clipmap_levels_nest_and_stay_in_bounds() {
-        let clipmap = build_clipmap(OCEAN_HIGH_MESH_SPACING_UNITS, 100.0, [-1000.0, -1000.0], [1000.0, 1000.0]);
+        // A footprint wider than the outermost ring's reach needs the full stack.
+        let clipmap = build_clipmap(OCEAN_HIGH_MESH_SPACING_UNITS, 100.0, [-100_000.0; 2], [100_000.0; 2], None);
         let side = (CLIPMAP_HALF_CELLS * 2 + 1) as usize;
         assert_eq!(clipmap.vertices.len(), side * side * CLIPMAP_LEVELS as usize);
         for index in &clipmap.indices {
@@ -1104,9 +1271,89 @@ mod tests {
         assert!(snapped > 0);
     }
 
+    fn reach(clipmap: &OceanClipmap) -> f32 {
+        clipmap.vertices.iter()
+            .map(|v| v.position[0].abs().max(v.position[2].abs()))
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn clipmap_cell_size_does_not_depend_on_footprint() {
+        let finest = |c: &OceanClipmap| c.vertices.iter().map(|v| v.color[0]).fold(f32::INFINITY, f32::min);
+        let pool = build_clipmap(10.0, 0.0, [0.0, 0.0], [320.0, 384.0], None);
+        let sea = build_clipmap(10.0, 0.0, [-1.0e5; 2], [1.0e5; 2], None);
+        assert_eq!(finest(&pool), 10.0);
+        assert_eq!(finest(&sea), 10.0);
+        // The pool only drops rings it could never show.
+        assert!(pool.indices.len() * 50 < sea.indices.len());
+        assert_eq!(pool.coarsest_spacing, sea.coarsest_spacing);
+    }
+
+    #[test]
+    fn clipmap_reaches_the_whole_footprint_from_any_centre() {
+        for extent in [100.0f32, 320.0, 1408.0, 1500.0, 5000.0, 40_000.0] {
+            let clipmap = build_clipmap(10.0, 0.0, [0.0; 2], [extent; 2], None);
+            // The shader snaps the centre to color.b, so it can land half a
+            // step outside the footprint.
+            let step = clipmap.vertices[0].color[2];
+            assert!(
+                reach(&clipmap) >= extent + step * 0.5,
+                "extent {extent}: reach {} step {step}", reach(&clipmap)
+            );
+            for index in &clipmap.indices {
+                assert!((*index as usize) < clipmap.vertices.len());
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_water_merges_and_biggest_comes_first() {
+        let face = |plane: f32, x: [f32; 2], z: [f32; 2]| WaterFace {
+            plane, minimum: [x[0], z[0]], maximum: [x[1], z[1]], authored_ocean: None,
+        };
+        let faces = [
+            face(0.0, [0.0, 100.0], [0.0, 100.0]),       // small pool
+            face(500.0, [0.0, 4000.0], [0.0, 4000.0]),   // sea, piece 1
+            face(500.0, [4000.0, 9000.0], [0.0, 4000.0]),// sea, piece 2 (shares an edge)
+            face(500.0, [0.0, 100.0], [9000.0, 9100.0]), // same plane, apart
+            face(0.0, [90.0, 300.0], [0.0, 100.0]),      // overlaps the small pool
+            face(0.4, [300.0, 400.0], [0.0, 100.0]),     // same plane within tolerance, touching
+        ];
+        let clusters = cluster_water_faces(&faces);
+        assert_eq!(clusters.len(), 3);
+        assert_eq!(clusters[0].members, vec![1, 2]);
+        assert_eq!(clusters[0].minimum, [0.0, 0.0]);
+        assert_eq!(clusters[0].maximum, [9000.0, 4000.0]);
+        assert_eq!(clusters[1].members, vec![0, 4, 5]);
+        assert_eq!(clusters[2].members, vec![3]);
+        assert!(clusters.windows(2).all(|w| w[0].area() >= w[1].area()));
+
+        // Different authored oceans, or different planes, never merge.
+        let mut other = faces[2];
+        other.authored_ocean = Some(0);
+        assert_eq!(cluster_water_faces(&[faces[1], other]).len(), 2);
+        assert_eq!(cluster_water_faces(&[faces[1], face(900.0, [0.0, 4000.0], [0.0, 4000.0])]).len(), 2);
+    }
+
+    #[test]
+    fn mask_store_indexes_by_slot_and_refuses_overflow() {
+        let tri: MaskTriangle = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let mut masks = OceanMasks::default();
+        assert!(masks.push_surface(3, &[tri, tri]));
+        assert!(masks.push_surface(0, &[tri]));
+        assert_eq!(masks.ranges[3][..2], [0.0, 2.0]);
+        assert_eq!(masks.ranges[0][..2], [2.0, 1.0]);
+        assert_eq!(masks.triangles.len(), 6);
+        assert!(!masks.push_surface(1, &[]), "empty outline means unmasked");
+        assert!(!masks.push_surface(OCEAN_MAX_SURFACES, &[tri]));
+        let too_many = vec![tri; OCEAN_MASK_VEC4S / 2];
+        assert!(!masks.push_surface(2, &too_many), "overflow leaves the slot unmasked");
+        assert_eq!(masks.ranges[2], [0.0; 4]);
+    }
+
     #[test]
     fn clipmap_triangles_face_up() {
-        let clipmap = build_clipmap(10.0, 0.0, [-1e9, -1e9], [1e9, 1e9]);
+        let clipmap = build_clipmap(10.0, 0.0, [-1e9, -1e9], [1e9, 1e9], None);
         // The renderer culls back faces with a counter-clockwise front face, so
         // the clipmap must wind the same way as an authored +Y water face.
         for triangle in clipmap.indices.chunks_exact(3).take(4096) {

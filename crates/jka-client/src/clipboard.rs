@@ -1,11 +1,18 @@
 #[cfg(windows)]
 mod platform {
     use core::ffi::c_void;
-    use std::{ptr, slice, thread, time::Duration};
+    use std::{
+        os::windows::ffi::OsStrExt,
+        path::Path,
+        ptr, slice, thread,
+        time::Duration,
+    };
 
     type Handle = *mut c_void;
     const CF_DIB: u32 = 8;
     const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    const DROPEFFECT_COPY: u32 = 1;
     const GMEM_MOVEABLE: u32 = 0x0002;
     const BI_RGB: u32 = 0;
 
@@ -24,8 +31,19 @@ mod platform {
         clr_important: u32,
     }
 
+    /// Header of the CF_HDROP payload (Win32 `DROPFILES`); the file list follows it.
+    #[repr(C)]
+    struct DropFiles {
+        files_offset: u32,
+        pt_x: i32,
+        pt_y: i32,
+        non_client: i32,
+        wide: i32,
+    }
+
     #[link(name = "User32")]
     extern "system" {
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
         fn OpenClipboard(hwnd_new_owner: Handle) -> i32;
         fn CloseClipboard() -> i32;
         fn EmptyClipboard() -> i32;
@@ -104,12 +122,17 @@ mod platform {
 
     /// Copies a top-down 32-bit screenshot into the Windows clipboard as CF_DIB.
     /// `pixels` may have a padded row stride and may be BGRA or RGBA.
+    ///
+    /// When `file` is given it is also offered as a file drop (CF_HDROP), so chat
+    /// apps paste that file (e.g. a JPEG) instead of re-encoding the bitmap.
+    /// The file drop is best-effort; the bitmap alone still counts as success.
     pub fn set_image_rgba8(
         width: u32,
         height: u32,
         pixels: &[u8],
         bytes_per_row: usize,
         source_is_bgra: bool,
+        file: Option<&Path>,
     ) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Err("Clipboard image dimensions must be non-zero".into());
@@ -207,7 +230,65 @@ mod platform {
             return Err("Could not set clipboard image".into());
         }
         // SetClipboardData owns memory after success.
+        if let Some(file) = file {
+            set_file_drop(file);
+        }
         Ok(())
+    }
+
+    /// Copies `bytes` into movable global memory and hands it to the open
+    /// clipboard under `format`. Returns false (freeing the memory) on failure.
+    fn set_global_bytes(format: u32, bytes: &[u8]) -> bool {
+        unsafe {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+            if memory.is_null() {
+                return false;
+            }
+            let target = GlobalLock(memory) as *mut u8;
+            if target.is_null() {
+                GlobalFree(memory);
+                return false;
+            }
+            ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
+            GlobalUnlock(memory);
+            if SetClipboardData(format, memory).is_null() {
+                GlobalFree(memory);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Adds `file` to the already-open clipboard as a copy-style file drop.
+    fn set_file_drop(file: &Path) {
+        let header = DropFiles {
+            files_offset: std::mem::size_of::<DropFiles>() as u32,
+            pt_x: 0,
+            pt_y: 0,
+            non_client: 0,
+            wide: 1,
+        };
+        let mut payload = Vec::new();
+        // SAFETY: DropFiles is repr(C) plain data with no padding.
+        payload.extend_from_slice(unsafe {
+            slice::from_raw_parts(
+                (&header as *const DropFiles).cast::<u8>(),
+                std::mem::size_of::<DropFiles>(),
+            )
+        });
+        // Wide path, NUL-terminated, plus the list's own terminating NUL.
+        for unit in file.as_os_str().encode_wide().chain([0, 0]) {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        if !set_global_bytes(CF_HDROP, &payload) {
+            return;
+        }
+        // Tell Explorer-style consumers this is a copy, not a move.
+        let name: Vec<u16> = "Preferred DropEffect\0".encode_utf16().collect();
+        let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+        if format != 0 {
+            set_global_bytes(format, &DROPEFFECT_COPY.to_le_bytes());
+        }
     }
 
     pub fn get_text() -> Result<String, String> {
@@ -245,6 +326,7 @@ mod platform {
         _pixels: &[u8],
         _bytes_per_row: usize,
         _source_is_bgra: bool,
+        _file: Option<&std::path::Path>,
     ) -> Result<(), String> {
         Err("Clipboard image integration is currently implemented for Windows only".into())
     }

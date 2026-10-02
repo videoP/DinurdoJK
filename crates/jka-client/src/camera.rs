@@ -1,3 +1,4 @@
+use egui::Pos2;
 use glam::{Mat4, Vec3};
 use jka_movement::{TraceQuery, TraceWorld};
 
@@ -459,11 +460,83 @@ pub fn far_distance_for_cull(distance_cull: f32) -> f32 {
     (distance_cull * DISTANCE_CULL_DIAGONAL).max(MIN_FAR_DISTANCE)
 }
 
+/// OpenJK `MAX_SHAKE_INTENSITY`.
+const MAX_SHAKE_INTENSITY: f32 = 16.0;
+
+/// One active `CGCam_Shake`: linear falloff over `duration` from `start`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraShake {
+    pub intensity: f32,
+    pub start: std::time::Instant,
+    pub duration: std::time::Duration,
+}
+
+impl CameraShake {
+    pub fn new(intensity: f32, start: std::time::Instant, duration_ms: i32) -> Option<Self> {
+        (intensity > 0.0 && duration_ms > 0).then(|| Self {
+            intensity: intensity.min(MAX_SHAKE_INTENSITY),
+            start,
+            duration: std::time::Duration::from_millis(duration_ms as u64),
+        })
+    }
+
+    pub fn expired(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.start) >= self.duration
+    }
+
+    /// Port of `CG_SE_UpdateShake`: a fresh random offset every frame, scaled by
+    /// the remaining fraction. Roll is left alone, as in OpenJK.
+    pub fn sample(&self, now: std::time::Instant, rng: &mut ShakeRng) -> Option<CameraShakeOffset> {
+        let elapsed = now.saturating_duration_since(self.start);
+        if elapsed >= self.duration {
+            return None;
+        }
+        let remaining = 1.0 - elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        let intensity = self.intensity * remaining;
+        let position = Vec3::new(rng.next_signed(), rng.next_signed(), rng.next_signed()) * intensity;
+        Some(CameraShakeOffset {
+            position,
+            pitch: (rng.next_signed() * intensity).to_radians(),
+            yaw: (rng.next_signed() * intensity).to_radians(),
+        })
+    }
+}
+
+/// Per-frame shake displacement in renderer space (position units, radians).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CameraShakeOffset {
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+/// xorshift32 stand-in for `Q_flrand(-1, 1)`; shake needs no quality.
+#[derive(Debug, Clone, Copy)]
+pub struct ShakeRng(u32);
+
+impl Default for ShakeRng {
+    fn default() -> Self {
+        Self(0x9E37_79B9)
+    }
+}
+
+impl ShakeRng {
+    fn next_signed(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (self.0 >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    /// Pending CGame screen shake. Not part of the base view: it is re-applied
+    /// after every late-latch overwrite of position/yaw/pitch.
+    pub shake: CameraShakeOffset,
     /// OpenJK/TaystJK `cg_fov`: horizontal degrees on the legacy 4:3 baseline.
     cg_fov: f32,
     near: f32,
@@ -480,6 +553,7 @@ impl Camera {
             position: Vec3::from_array(position),
             yaw,
             pitch: 0.0,
+            shake: CameraShakeOffset::default(),
             cg_fov: cg_fov.clamp(MIN_CG_FOV, MAX_CG_FOV),
             near: 1.0,
             far: far_distance_for_cull(DEFAULT_DISTANCE_CULL),
@@ -504,6 +578,18 @@ impl Camera {
 
     pub fn cg_fov(&self) -> f32 {
         self.cg_fov
+    }
+
+    /// Add the pending shake to a freshly assigned base view (position + angles).
+    pub fn apply_shake(&mut self) {
+        self.position += self.shake.position;
+        self.apply_shake_angles();
+    }
+
+    /// Angles only: for late-latch paths that leave the base position untouched.
+    pub fn apply_shake_angles(&mut self) {
+        self.yaw += self.shake.yaw;
+        self.pitch += self.shake.pitch;
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -563,6 +649,26 @@ impl Camera {
         self.view_projection_jittered(width, height, [0.0, 0.0])
     }
 
+    /// Projects a renderer-space (post `scene::render_position`) world point to
+    /// screen-space pixel coordinates, or `None` when it's behind the camera
+    /// or outside the near/far range. Shared by the map editor's egui overlay
+    /// and the `r_drawEntities` label painter.
+    pub fn project_to_screen(&self, width: u32, height: u32, render_point: Vec3) -> Option<Pos2> {
+        let view_proj = self.view_projection(width, height);
+        let clip = view_proj * render_point.extend(1.0);
+        if clip.w <= 0.001 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if ndc.z < -0.1 || ndc.z > 1.1 {
+            return None;
+        }
+        Some(Pos2::new(
+            (ndc.x * 0.5 + 0.5) * width as f32,
+            (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32,
+        ))
+    }
+
     pub fn view_projection_jittered(
         &self,
         width: u32,
@@ -589,6 +695,21 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_shake_falls_off_and_expires() {
+        let start = std::time::Instant::now();
+        let shake = CameraShake::new(100.0, start, 1000).unwrap();
+        assert_eq!(shake.intensity, MAX_SHAKE_INTENSITY);
+        let mut rng = ShakeRng::default();
+        let early = shake.sample(start, &mut rng).unwrap();
+        assert!(early.position.abs().max_element() <= MAX_SHAKE_INTENSITY);
+        assert!(early.position != Vec3::ZERO);
+        assert!(shake.sample(start + std::time::Duration::from_millis(1000), &mut rng).is_none());
+        assert!(shake.expired(start + std::time::Duration::from_millis(1000)));
+        assert!(CameraShake::new(0.0, start, 1000).is_none());
+        assert!(CameraShake::new(4.0, start, 0).is_none());
+    }
 
     #[test]
     fn jka_distance_cull_expands_to_far_plane() {

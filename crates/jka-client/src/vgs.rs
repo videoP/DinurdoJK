@@ -456,6 +456,15 @@ pub fn is_vgs_sound(name: &str) -> bool {
     SOUND_NAMES.iter().any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
+/// jaPRO cg_event.c `isGlobalVGS`: these VGS families are shown/heard by every
+/// team, not only the speaker's.
+pub fn is_global_vgs(name: &str) -> bool {
+    const GLOBAL_PREFIXES: [&str; 5] = ["*global_", "*compliment_", "*respond_", "*taunt_", "*meme_"];
+    GLOBAL_PREFIXES.iter().any(|prefix| {
+        name.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

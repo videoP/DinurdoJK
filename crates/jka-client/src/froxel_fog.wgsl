@@ -61,7 +61,8 @@ struct LightingSettings {
 @group(0) @binding(11) var sky_admission_texture: texture_depth_2d_array;
 
 fn world_ray(uv: vec2<f32>) -> vec3<f32> {
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+    // Reversed-Z: unproject on the far plane (see post.wgsl world_ray).
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
     var world_far = settings.inv_view_proj * ndc;
     world_far = world_far / max(abs(world_far.w), 1e-6);
     return normalize(world_far.xyz - settings.camera_pos_time.xyz);

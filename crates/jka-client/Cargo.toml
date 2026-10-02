@@ -22,6 +22,7 @@ libjpeg-turbo-rs = "=0.8.0"
 jka-assets = { path = "../jka-assets" }
 jka-movement = { path = "../jka-movement" }
 jka-protocol = { path = "../jka-protocol" }
+log = "=0.4.34"
 oximedia-lut = "=0.2.1"
 smaa = { path = "../../vendor/smaa-0.20.0" }
 serde_json = "=1.0.151"

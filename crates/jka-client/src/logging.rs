@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     fs::{File, OpenOptions},
     io::{self, IsTerminal, Write},
@@ -24,9 +24,19 @@ struct Logger {
 }
 
 #[derive(Debug, Clone)]
+pub struct LogPathLink {
+    /// Exact text rendered in the console line for this trusted local path.
+    pub label: String,
+    /// Local filesystem target. This metadata is only attached by internal code;
+    /// arbitrary console/server/chat text is never parsed into a link.
+    pub target: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct LogRecord {
     pub text: String,
     pub local_time: [u16; 3],
+    pub path_links: Vec<LogPathLink>,
 }
 
 const MAX_UI_LOG_LINES: usize = 10_000;
@@ -37,10 +47,17 @@ pub fn init() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let directory = executable.parent().ok_or("Cannot locate executable")?;
     let path = directory.join("latest.log");
-    let file = OpenOptions::new()
+    // Truncate once, then keep an append handle: the crash reporter writes to
+    // this file through its own handle, and appending keeps the two from
+    // overwriting each other's lines.
+    OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = OpenOptions::new()
+        .append(true)
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
 
@@ -79,10 +96,86 @@ pub fn init() -> Result<PathBuf, String> {
         write_line(Level::Error, format_args!("{backtrace}"));
     }));
 
+    // wgpu and its HAL report driver warnings (DX12/Vulkan validation, device
+    // loss reasons, surface problems) through the `log` facade; without a
+    // logger they vanish.
+    if log::set_logger(&FACADE_LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+
     Ok(path)
 }
 
+/// Distinct `log`-facade messages remembered for de-duplication.
+const FACADE_MAX_DISTINCT: usize = 512;
+/// Times one facade message is written before it is suppressed.
+const FACADE_MAX_REPEATS: u32 = 5;
+
+struct FacadeLogger;
+
+static FACADE_LOGGER: FacadeLogger = FacadeLogger;
+static FACADE_SEEN: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+
+impl log::Log for FacadeLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        // naga reports shader failures through returned errors; its warnings
+        // are per-shader noise.
+        if metadata.target().starts_with("naga") {
+            metadata.level() <= log::Level::Error
+        } else {
+            metadata.level() <= log::Level::Warn
+        }
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let message = format!("{}: {}", record.target(), record.args());
+        let repeats = {
+            let Ok(mut seen) = FACADE_SEEN.get_or_init(Default::default).lock() else {
+                return;
+            };
+            if seen.len() >= FACADE_MAX_DISTINCT && !seen.contains_key(&message) {
+                return;
+            }
+            let count = seen.entry(message.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if repeats > FACADE_MAX_REPEATS {
+            return;
+        }
+        let (level, label) = if record.level() == log::Level::Error {
+            (Level::Error, "ERROR")
+        } else {
+            (Level::Info, "WARNING")
+        };
+        let suffix = if repeats == FACADE_MAX_REPEATS {
+            " (repeats suppressed)"
+        } else {
+            ""
+        };
+        write_line(level, format_args!("[{label} {message}]{suffix}"));
+    }
+
+    fn flush(&self) {}
+}
+
 pub fn write_line(level: Level, args: fmt::Arguments<'_>) {
+    write_line_inner(level, args, Vec::new());
+}
+
+/// Write an engine-authored console/log line with an explicitly trusted local
+/// filesystem path. The path is metadata, not something rediscovered by parsing
+/// the rendered text, so external/server/chat strings cannot forge links.
+pub fn write_line_with_path(level: Level, args: fmt::Arguments<'_>, path: impl Into<PathBuf>) {
+    let target = path.into();
+    let label = target.display().to_string();
+    write_line_inner(level, args, vec![LogPathLink { label, target }]);
+}
+
+fn write_line_inner(level: Level, args: fmt::Arguments<'_>, path_links: Vec<LogPathLink>) {
     let message = args.to_string();
     let plain = strip_jka_colors(&message);
 
@@ -98,6 +191,7 @@ pub fn write_line(level: Level, args: fmt::Arguments<'_>) {
             let record = LogRecord {
                 text: message,
                 local_time: local_hms(),
+                path_links,
             };
             logger.ui_lines.push_back(record.clone());
             if let Some(sink) = &logger.ui_sink {

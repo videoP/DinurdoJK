@@ -71,7 +71,7 @@ impl PlayerState {
             .and_then(|index| self.vehicle_fields.get(index).copied())
     }
 
-    fn set_field_bits(&mut self, name: &str, value: u32) -> bool {
+    pub fn set_field_bits(&mut self, name: &str, value: u32) -> bool {
         if let Some(index) = PLAYER_FIELDS.iter().position(|(candidate, _)| *candidate == name) {
             self.fields[index] = value;
             return true;
@@ -98,6 +98,10 @@ pub struct Snapshot {
     pub message_num: i32,
     pub delta_num: i32,
     pub snap_flags: u8,
+    /// `snapshot_t::ping` (`cl.snap.ping`): round-trip time of the usercmd packet this
+    /// snapshot acknowledges. Filled in by `ClientSession` for live play; the wire
+    /// format does not carry it, so the decoder, demos and the local server leave 0.
+    pub ping: i32,
     pub server_command_num: i32,
     /// Portal-area visibility mask from svc_snapshot. Matching Raven/OpenJK
     /// refdef semantics, set bits are areas closed off from the current view.
@@ -359,6 +363,7 @@ impl Decoder {
             message_num: sequence,
             delta_num,
             snap_flags,
+            ping: 0,
             server_command_num: self.server_command_sequence,
             area_mask,
             player_state,

@@ -11,6 +11,8 @@ use crate::pk3::AssetSearchPath;
 
 const VEHICLE_DIRECTORY: &str = "ext_data/vehicles/";
 const VEHICLE_EXTENSION: &str = ".veh";
+const WEAPON_DIRECTORY: &str = "ext_data/vehicles/weapons/";
+const WEAPON_EXTENSION: &str = ".vwp";
 const MAX_VEHICLE_FILE_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,11 +51,18 @@ pub struct VehicleDefinition {
     pub skin: Option<String>,
     pub vehicle_type: Option<String>,
     pub camera: VehicleCameraDefinition,
+    /// `weapMuzzle1..12`: the vehicle weapon (a `.vwp` name) fired from each
+    /// `*muzzleN` bolt. Turret-owned muzzles are not resolved.
+    pub weap_muzzles: [Option<String>; MAX_VEHICLE_MUZZLES],
 }
+
+pub const MAX_VEHICLE_MUZZLES: usize = 12;
 
 #[derive(Debug, Clone, Default)]
 pub struct VehicleDefinitions {
     definitions: BTreeMap<String, VehicleDefinition>,
+    /// Vehicle weapon name (lower case) -> `muzzleFX` effect from `.vwp` files.
+    weapon_muzzle_fx: BTreeMap<String, String>,
 }
 
 impl VehicleDefinitions {
@@ -63,6 +72,11 @@ impl VehicleDefinitions {
 
     pub fn len(&self) -> usize {
         self.definitions.len()
+    }
+
+    /// `g_vehWeaponInfo[weapon].iMuzzleFX` as an effect name.
+    pub fn weapon_muzzle_fx(&self, weapon: &str) -> Option<&str> {
+        self.weapon_muzzle_fx.get(&weapon.to_ascii_lowercase()).map(String::as_str)
     }
 }
 
@@ -84,7 +98,49 @@ pub fn load_vehicle_definitions(assets: &mut AssetSearchPath) -> Result<VehicleD
         parse_vehicle_file(&asset.bytes, &mut definitions)
             .map_err(|error| format!("{name}: {error}"))?;
     }
-    Ok(VehicleDefinitions { definitions })
+    let mut weapon_muzzle_fx = BTreeMap::new();
+    let weapons = assets
+        .names()
+        .filter(|name| name.starts_with(WEAPON_DIRECTORY) && name.ends_with(WEAPON_EXTENSION))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in weapons {
+        let Some(asset) = assets
+            .read(&name, MAX_VEHICLE_FILE_SIZE)
+            .map_err(|error| format!("{name}: {error}"))?
+        else {
+            continue;
+        };
+        // A malformed weapon file only loses its muzzle effects.
+        let _ = parse_weapon_file(&asset.bytes, &mut weapon_muzzle_fx);
+    }
+    Ok(VehicleDefinitions { definitions, weapon_muzzle_fx })
+}
+
+/// `.vwp` blocks: `name { ... muzzleFX "effect" ... }`.
+fn parse_weapon_file(bytes: &[u8], out: &mut BTreeMap<String, String>) -> Result<(), String> {
+    let mut parser = ComParser::new(bytes);
+    while let Some(name) = parser.token(true)? {
+        if parser.token(true)?.as_deref() != Some("{") {
+            return Err(format!("vehicle weapon {name:?} missing opening '{{'"));
+        }
+        let mut muzzle_fx = None;
+        loop {
+            let Some(key) = parser.token(true)? else { return Err("unexpected EOF in vehicle weapon".into()) };
+            if key == "}" {
+                break;
+            }
+            if key.eq_ignore_ascii_case("muzzleFX") {
+                muzzle_fx = parser.token(false)?.filter(|value| !value.is_empty());
+            } else {
+                parser.skip_rest_of_line();
+            }
+        }
+        if let Some(effect) = muzzle_fx {
+            out.entry(name.to_ascii_lowercase()).or_insert(effect);
+        }
+    }
+    Ok(())
 }
 
 fn parse_vehicle_file(
@@ -107,6 +163,7 @@ fn parse_vehicle_file(
         let mut skin = None;
         let mut vehicle_type = None;
         let mut camera = VehicleCameraDefinition::default();
+        let mut weap_muzzles: [Option<String>; MAX_VEHICLE_MUZZLES] = Default::default();
         loop {
             let Some(key) = parser.token(true)? else {
                 return Err(format!("unexpected EOF while parsing vehicle {name:?}"));
@@ -114,7 +171,29 @@ fn parse_vehicle_file(
             if key == "}" {
                 break;
             }
-            match key.to_ascii_lowercase().as_str() {
+            if key == "{" {
+                // A nested block (turret1 { ... }): skip to its matching brace.
+                let mut depth = 1;
+                while depth > 0 {
+                    match parser.token(true)?.as_deref() {
+                        Some("{") => depth += 1,
+                        Some("}") => depth -= 1,
+                        Some(_) => {}
+                        None => return Err(format!("unexpected EOF in nested block of vehicle {name:?}")),
+                    }
+                }
+                continue;
+            }
+            let lower = key.to_ascii_lowercase();
+            if let Some(slot) = lower
+                .strip_prefix("weapmuzzle")
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| (1..=MAX_VEHICLE_MUZZLES).contains(n))
+            {
+                weap_muzzles[slot - 1] = parser.token(false)?.filter(|weapon| !weapon.is_empty() && weapon != "0");
+                continue;
+            }
+            match lower.as_str() {
                 "model" => {
                     if let Some(value) = parser.token(false)? {
                         let value = value.replace('\\', "/");
@@ -165,6 +244,7 @@ fn parse_vehicle_file(
                     skin,
                     vehicle_type,
                     camera,
+                    weap_muzzles,
                 });
         }
     }
@@ -300,6 +380,39 @@ fn ascii_token(bytes: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_muzzle_weapons_skipping_nested_turret_blocks() {
+        let mut defs = BTreeMap::new();
+        parse_vehicle_file(
+            br#"
+                atst {
+                    model atst
+                    turret1
+                    {
+                        weapon atst_laser
+                        muzzle1 3
+                    }
+                    weapMuzzle2 atst_rocket
+                    weapMuzzle3 0
+                }
+            "#,
+            &mut defs,
+        )
+        .unwrap();
+        let atst = &defs["atst"];
+        assert_eq!(atst.weap_muzzles[1].as_deref(), Some("atst_rocket"));
+        assert_eq!(atst.weap_muzzles[2], None);
+        let mut fx = BTreeMap::new();
+        parse_weapon_file(b"swoop_laser
+{
+name swoop_laser
+muzzleFX \"ships/swoop_blastermuzzleflash\"
+speed 2500
+}
+", &mut fx).unwrap();
+        assert_eq!(fx["swoop_laser"], "ships/swoop_blastermuzzleflash");
+    }
 
     #[test]
     fn parses_model_and_skin_from_vehicle_blocks() {

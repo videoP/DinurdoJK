@@ -23,6 +23,9 @@ pub const FX_EXPENSIVE_PHYSICS: u32 = 0x0080_0000;
 pub const FX_GHOUL2_TRACE: u32 = 0x0002_0000;
 pub const FX_GHOUL2_DECALS: u32 = 0x0004_0000;
 pub const FX_PAPER_PHYSICS: u32 = 0x0001_0000;
+/// Shares FX_PAPER_PHYSICS' bit (FX_PLAYER_VIEW); CParticle::UpdateOrigin
+/// never applies physics to it.
+pub const FX_PLAYER_VIEW: u32 = 0x0001_0000;
 pub const FX_ATTACHED_MODEL: u32 = 0x0100_0000;
 pub const FX_APPLY_PHYSICS: u32 = 0x0200_0000;
 pub const FX_USE_BBOX: u32 = 0x0400_0000;
@@ -185,9 +188,29 @@ pub struct PrimitiveTemplate {
     pub length_end: Range,
     pub length_parm: Range,
     pub elasticity: Range,
+    /// Authored `cullRange` squared (like OpenJK's parse would have); 0 = none.
+    pub cull_range_sq: f32,
 }
 
 impl PrimitiveTemplate {
+    /// Largest authored on-screen extent of a single spawned element, in world
+    /// units: sprite size for particles, width/length for tails.
+    pub fn lod_size(&self) -> f32 {
+        let size = self.size_start.min.abs().max(self.size_start.max.abs()).max(self.size_end.min.abs()).max(self.size_end.max.abs());
+        if self.kind == PrimType::Tail {
+            let length = self
+                .length_start
+                .min
+                .abs()
+                .max(self.length_start.max.abs())
+                .max(self.length_end.min.abs())
+                .max(self.length_end.max.abs());
+            size.max(length)
+        } else {
+            size
+        }
+    }
+
     fn new(kind: PrimType) -> Self {
         let one = Range::fixed(1.0);
         let zero = Range::default();
@@ -236,6 +259,7 @@ impl PrimitiveTemplate {
             length_end: one,
             length_parm: zero,
             elasticity: Range::fixed(0.1),
+            cull_range_sq: 0.0,
         }
     }
 
@@ -247,13 +271,39 @@ impl PrimitiveTemplate {
             match pair.name.to_ascii_lowercase().as_str() {
                 "count" => set_range(&mut prim.spawn_count, value),
                 "shaders" | "shader" | "models" | "model" | "sounds" | "sound" => prim.media.extend(list(pair)),
-                "impactfx" => prim.impact_fx.extend(list(pair)),
-                "deathfx" => prim.death_fx.extend(list(pair)),
-                "emitfx" => prim.emitter_fx.extend(list(pair)),
+                "impactfx" => {
+                    let names: Vec<_> = list(pair).collect();
+                    // OpenJK ParseImpactFxStrings: a non-empty list is itself a
+                    // request for impact effects, which need physics.
+                    if !names.is_empty() {
+                        prim.flags |= FX_IMPACT_RUNS_FX | FX_APPLY_PHYSICS;
+                    }
+                    prim.impact_fx.extend(names);
+                }
+                "deathfx" => {
+                    let names: Vec<_> = list(pair).collect();
+                    // OpenJK ParseDeathFxStrings.
+                    if !names.is_empty() {
+                        prim.flags |= FX_DEATH_RUNS_FX;
+                    }
+                    prim.death_fx.extend(names);
+                }
+                "emitfx" => {
+                    let names: Vec<_> = list(pair).collect();
+                    // OpenJK ParseEmitterFxStrings.
+                    if !names.is_empty() {
+                        prim.flags |= FX_EMIT_FX;
+                    }
+                    prim.emitter_fx.extend(names);
+                }
                 "playfx" => prim.play_fx.extend(list(pair)),
                 "life" => set_range(&mut prim.life, value),
                 "delay" => set_range(&mut prim.spawn_delay, value),
-                "cullrange" => {}
+                "cullrange" => {
+                    // atoi, then squared so the spawn check avoids a sqrt.
+                    let range = value.trim().parse::<f32>().map(f32::trunc).unwrap_or(0.0);
+                    prim.cull_range_sq = range * range;
+                }
                 "bounce" | "intensity" => {
                     set_range(&mut prim.elasticity, value);
                     // OpenJK ParseElasticity: authoring bounce/intensity is an
@@ -531,6 +581,20 @@ mod tests {
         assert_eq!(prim.max, [1.0, 2.0, 3.0]);
         assert_eq!(prim.elasticity, Range::fixed(0.4));
         assert_eq!(prim.flags & (FX_USE_BBOX | FX_APPLY_PHYSICS), FX_USE_BBOX | FX_APPLY_PHYSICS);
+    }
+
+    #[test]
+    fn fx_lists_imply_their_runtime_flags() {
+        let bytes = b"particle\n{\n impactfx\n [\n  chunks/rockimpact\n ]\n}\n\
+emitter\n{\n deathfx\n [\n  chunks/puff\n ]\n emitfx\n [\n  env/smoke\n ]\n}\n";
+        let effect = parse_effect("fx_lists", &gp2::parse(bytes));
+        let impact = &effect.primitives[0];
+        assert_eq!(impact.impact_fx, ["chunks/rockimpact"]);
+        assert_eq!(impact.flags, FX_IMPACT_RUNS_FX | FX_APPLY_PHYSICS);
+        let emitter = &effect.primitives[1];
+        assert_eq!(emitter.death_fx, ["chunks/puff"]);
+        assert_eq!(emitter.emitter_fx, ["env/smoke"]);
+        assert_eq!(emitter.flags, FX_DEATH_RUNS_FX | FX_EMIT_FX);
     }
 
     #[test]

@@ -7,6 +7,9 @@ typedef struct mod_player_s {
     jka_predict_settings settings;
 } mod_player;
 static int last_backend;
+/* See host_snap_vector in movement.c. One global shared by both backends. */
+int jka_snap_mode = 0;
+void jka_set_snap_mode(int mode) { jka_snap_mode = mode; }
 extern int japro_set_entities(void *, const jka_prediction_entity *, int);
 extern int japro_clip_entity(const void *, const jka_prediction_entity *);
 int jka_player_set_entities(void *player, const jka_prediction_entity *entities, int count) {
@@ -29,6 +32,8 @@ extern void stock_jka_player_give_all(void *player);
 extern void japro_jka_player_give_all(void *player);
 extern int stock_jka_player_set_saber_movement_info(void *player, int saber_num, const jka_saber_movement_info *info);
 extern int japro_jka_player_set_saber_movement_info(void *player, int saber_num, const jka_saber_movement_info *info);
+extern int stock_jka_player_set_foot_bolts(void *player, const float *left, const float *right);
+extern int japro_jka_player_set_foot_bolts(void *player, const float *left, const float *right);
 extern void stock_jka_player_offline_force_tick(void *player, int time, int requested_power);
 extern void japro_jka_player_offline_force_tick(void *player, int time, int requested_power);
 extern void * stock_jka_player_new(const float *origin, float yaw, int spectator);
@@ -169,6 +174,13 @@ int jka_player_set_saber_movement_info(void *player, int saber_num, const jka_sa
     /* Keep equipment metadata available in both native backends. */
     stock_jka_player_set_saber_movement_info(p->base, saber_num, info);
     return japro_jka_player_set_saber_movement_info(p->japro, saber_num, info);
+}
+
+int jka_player_set_foot_bolts(void *player, const float *left, const float *right) {
+    mod_player *p = player;
+    /* Both backends keep the pose: a server_mod switch must not lose it. */
+    stock_jka_player_set_foot_bolts(p->base, left, right);
+    return japro_jka_player_set_foot_bolts(p->japro, left, right);
 }
 
 void jka_player_offline_force_tick(void *player, int time, int requested_power) {

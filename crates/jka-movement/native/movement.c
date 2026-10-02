@@ -97,6 +97,26 @@ static void host_malloc(void **p, int size) { *p = calloc(1, size); if (!*p) hos
 static void host_free(void **p) { free(*p); *p = NULL; }
 extern void Sys_SnapVector(float *v);
 
+/* trap_SnapVector is the one engine-owned step in PmoveSingle that changes physics: it rounds
+ * velocity to integers after every step. The retail game code is identical to OpenJK's here, but
+ * retail engines on different platforms do not all round the way OpenJK's Sys_SnapVector does,
+ * and at 1 ms steps (1000 "fps") the rounding rule dominates friction and gravity. The mode is
+ * chosen by the host (jka_set_snap_mode, defined once in mod_dispatch.c):
+ *   0 OpenJK Sys_SnapVector (nearest, ties away from zero)   1 truncate toward zero
+ *   2 floor                                                  3 nearest, ties to even
+ *   4 no snapping (float velocity) */
+extern int jka_snap_mode;
+static void host_snap_vector(float *v) {
+    int i;
+    switch (jka_snap_mode) {
+    case 1: for (i = 0; i < 3; ++i) v[i] = truncf(v[i]); break;
+    case 2: for (i = 0; i < 3; ++i) v[i] = floorf(v[i]); break;
+    case 3: for (i = 0; i < 3; ++i) v[i] = nearbyintf(v[i]); break;
+    case 4: break;
+    default: Sys_SnapVector(v); break;
+    }
+}
+
 int jka_load_animations(const unsigned char *data, int length) {
     if (setjmp(error_target)) return 0;
     if (length <= 0 || length >= 59999) return 0;
@@ -107,7 +127,7 @@ int jka_load_animations(const unsigned char *data, int length) {
     imports.FS_Close = animation_close;
     imports.TrueMalloc = host_malloc;
     imports.TrueFree = host_free;
-    imports.SnapVector = Sys_SnapVector;
+    imports.SnapVector = host_snap_vector;
     BG_InitAnimsets();
     BGPAFtextLoaded = qfalse;
     return BG_ParseAnimationFile("models/players/_humanoid/animation.cfg", bgHumanoidAnimations, qtrue) == 0;
@@ -134,6 +154,9 @@ typedef struct jka_player_s {
     int last_generic_cmd;
     int last_generic_cmd_time;
     int saber_cycle_queue;
+    /* Last single-saber stance (sess.saberLevel): restored when the loadout
+     * changes from dual/staff back to a single saber. */
+    int saber_single_level;
     /* Per-player saberInfo_t state. Keep this on the player object rather than
      * permanently in global cgs.clientinfo so local and remote prediction
      * cannot contaminate each other through the _CGAME OpenJK host. */
@@ -142,6 +165,11 @@ typedef struct jka_player_s {
     /* Host-only presentation metadata. This deliberately does not live in
      * playerState_t because OpenJK does not network this fact. */
     qboolean view_forced;
+    /* *l_leg_foot / *r_leg_foot bolt positions in Ghoul2 model space, taken from
+     * the presenter's current pose. Stands in for pmove_t::ghoul2 so
+     * PM_AdjustStandAnimForSlope (leg dangle) runs during prediction. */
+    qboolean foot_valid;
+    float foot_bolt[2][3];
 #ifdef JKA_JAPRO
     jka_prediction_entity entities[MAX_GENTITIES];
     int entity_count;
@@ -321,6 +349,12 @@ static void copy_saber_movement_info(saberInfo_t *out, const jka_saber_movement_
     out->readyAnim = info->ready_anim;
     out->drawAnim = info->draw_anim;
     out->putawayAnim = info->putaway_anim;
+    out->bladeStyle2Start = info->blade_style2_start;
+    out->singleBladeStyle = (saber_styles_t)info->single_blade_style;
+    if (info->no_manual_deactivate)
+        out->saberFlags2 |= SFL2_NO_MANUAL_DEACTIVATE;
+    if (info->no_manual_deactivate2)
+        out->saberFlags2 |= SFL2_NO_MANUAL_DEACTIVATE2;
     out->kataMove = LS_INVALID;
     out->lungeAtkMove = LS_INVALID;
     out->jumpAtkUpMove = LS_INVALID;
@@ -328,6 +362,252 @@ static void copy_saber_movement_info(saberInfo_t *out, const jka_saber_movement_
     out->jumpAtkBackMove = LS_INVALID;
     out->jumpAtkRightMove = LS_INVALID;
     out->jumpAtkLeftMove = LS_INVALID;
+}
+
+/* --- Local-authority saber stance rules ------------------------------------
+ * The local server has no gentity/gclient, so the game-side pieces that decide
+ * fd.saberAnimLevel / saberHolstered are ported here against the same
+ * saberInfo_t data Pmove sees. Sources: bg_saberLoad.c (WP_UseFirstValidSaberStyle,
+ * WP_SaberStyleValidForSaber, WP_SaberCanTurnOffSomeBlades), g_cmds.c
+ * (Cmd_SaberAttackCycle_f), g_active.c (ClientThink_real stance block) and
+ * w_saber.c (WP_SaberPositionUpdate queue handling). The toggle sounds
+ * (G_Sound soundOn/soundOff) need the local server's sound-event path. */
+static qboolean local_saber_can_turn_off_some_blades(const saberInfo_t *saber) {
+    if (saber->bladeStyle2Start > 0 && saber->numBlades > saber->bladeStyle2Start) {
+        if ((saber->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE) &&
+            (saber->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE2))
+            return qfalse;
+    } else if (saber->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE) {
+        return qfalse;
+    }
+    return qtrue;
+}
+
+static void local_saber_active(const saberInfo_t *saber1, const saberInfo_t *saber2,
+                               int holstered, qboolean *saber1_active, qboolean *saber2_active) {
+    *saber1_active = *saber2_active = qfalse;
+    if (saber2->model[0]) { /* dual */
+        if (holstered > 1) {
+            *saber1_active = *saber2_active = qfalse;
+        } else if (holstered > 0) {
+            *saber1_active = qtrue;
+        } else {
+            *saber1_active = *saber2_active = qtrue;
+        }
+    } else if (!saber1->model[0]) {
+        *saber1_active = qfalse;
+    } else if (saber1->numBlades > 1) { /* staff */
+        *saber1_active = holstered > 1 ? qfalse : qtrue;
+    } else { /* single */
+        *saber1_active = holstered ? qfalse : qtrue;
+    }
+}
+
+static qboolean local_saber_style_valid(const saberInfo_t *saber1, const saberInfo_t *saber2,
+                                        int holstered, int level) {
+    qboolean saber1_active, saber2_active;
+    const qboolean dual = saber2->model[0] ? qtrue : qfalse;
+    local_saber_active(saber1, saber2, holstered, &saber1_active, &saber2_active);
+
+    if (saber1_active && saber1->model[0] && saber1->stylesForbidden &&
+        (saber1->stylesForbidden & (1 << level)))
+        return qfalse;
+    if (dual && saber2_active) {
+        if (saber2->stylesForbidden && (saber2->stylesForbidden & (1 << level)))
+            return qfalse;
+        /* Two sabers: only dual, or tavion when both learned it, are allowed. */
+        if (level != SS_DUAL) {
+            if (level != SS_TAVION)
+                return qfalse;
+            if (!(saber1_active && (saber1->stylesLearned & (1 << SS_TAVION))) ||
+                !(saber2->stylesLearned & (1 << SS_TAVION)))
+                return qfalse;
+        }
+    }
+    return qtrue;
+}
+
+static void local_saber_use_first_valid_style(const saberInfo_t *saber1, const saberInfo_t *saber2,
+                                              int holstered, int *level) {
+    qboolean saber1_active, saber2_active, style_invalid = qfalse;
+    const qboolean dual = saber2->model[0] ? qtrue : qfalse;
+    int valid = (1 << SS_NUM_SABER_STYLES) - 2; /* mask off 1 << SS_NONE */
+    int style;
+    local_saber_active(saber1, saber2, holstered, &saber1_active, &saber2_active);
+
+    if (saber1_active && saber1->model[0] && saber1->stylesForbidden &&
+        (saber1->stylesForbidden & (1 << *level))) {
+        style_invalid = qtrue;
+        valid &= ~saber1->stylesForbidden;
+    }
+    if (dual && saber2_active && saber2->stylesForbidden &&
+        (saber2->stylesForbidden & (1 << *level))) {
+        style_invalid = qtrue;
+        valid &= ~saber2->stylesForbidden;
+    }
+    if (!valid || !style_invalid)
+        return;
+    for (style = SS_FAST; style < SS_NUM_SABER_STYLES; ++style) {
+        if (valid & (1 << style)) {
+            *level = style;
+            return;
+        }
+    }
+}
+
+/* Cmd_SaberAttackCycle_f. Blade on/off toggling and stance changes are applied
+ * immediately when idle; a swing in progress queues the new stance instead so
+ * chaining is not reinterpreted halfway through the move. */
+static void local_set_or_queue_saber_style(jka_player *p, int level) {
+    if (p->ps.weaponTime <= 0)
+        p->ps.fd.saberAnimLevel = level;
+    else
+        p->saber_cycle_queue = level;
+}
+
+static void local_saber_attack_cycle(jka_player *p) {
+    playerState_t *ps = &p->ps;
+    saberInfo_t *saber1 = &p->saber[0];
+    saberInfo_t *saber2 = &p->saber[1];
+    int select_level = 0;
+
+    if (ps->stats[STAT_HEALTH] <= 0 || ps->pm_type != PM_NORMAL || ps->weapon != WP_SABER)
+        return;
+
+    if (saber1->model[0] && saber2->model[0]) { /* no style cycling for akimbo */
+        if (local_saber_can_turn_off_some_blades(saber2)) {
+            if (ps->saberHolstered == 1) { /* unholster the second saber */
+                ps->saberHolstered = 0;
+                ps->fd.saberAnimLevel = SS_DUAL;
+            } else if (ps->saberHolstered == 0) {
+                if ((saber2->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE) ||
+                    (saber2->bladeStyle2Start > 0 &&
+                     (saber2->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE2))) {
+                    /* can't turn it off manually */
+                } else {
+                    ps->saberHolstered = 1;
+                    ps->fd.saberAnimLevel = SS_FAST;
+                }
+            }
+            return;
+        }
+    } else if (saber1->numBlades > 1 && local_saber_can_turn_off_some_blades(saber1)) {
+        /* staff: toggle the second blade set */
+        if (ps->saberHolstered == 1) {
+            if (ps->saberInFlight) /* can't relight it while it's in the air */
+                return;
+            ps->saberHolstered = 0;
+            if (saber1->stylesForbidden) { /* have a style we have to use */
+                local_saber_use_first_valid_style(saber1, saber2, ps->saberHolstered, &select_level);
+                local_set_or_queue_saber_style(p, select_level);
+            }
+        } else if (ps->saberHolstered == 0) {
+            if ((saber1->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE) ||
+                (saber1->bladeStyle2Start > 0 &&
+                 (saber1->saberFlags2 & SFL2_NO_MANUAL_DEACTIVATE2))) {
+                /* can't turn it off manually */
+            } else {
+                ps->saberHolstered = 1;
+                if (saber1->singleBladeStyle != SS_NONE)
+                    local_set_or_queue_saber_style(p, saber1->singleBladeStyle);
+            }
+        }
+        return;
+    }
+
+    select_level = p->saber_cycle_queue ? p->saber_cycle_queue : ps->fd.saberAnimLevel;
+    select_level++;
+    if (select_level > ps->fd.forcePowerLevel[FP_SABER_OFFENSE])
+        select_level = FORCE_LEVEL_1;
+    local_saber_use_first_valid_style(saber1, saber2, ps->saberHolstered, &select_level);
+
+    if (ps->weaponTime <= 0) {
+        ps->fd.saberAnimLevelBase = ps->fd.saberAnimLevel = select_level;
+    } else {
+        ps->fd.saberAnimLevelBase = p->saber_cycle_queue = select_level;
+    }
+    if (select_level >= SS_FAST && select_level <= SS_STRONG)
+        p->saber_single_level = select_level;
+}
+
+/* WP_SaberPositionUpdate: the HUD-facing draw level tracks the queued style
+ * immediately, even while a swing keeps fd.saberAnimLevel deferred. The queue
+ * is applied as soon as the player is no longer busy. */
+static void local_apply_queued_saber_style(jka_player *p) {
+    p->ps.fd.saberDrawAnimLevel = p->saber_cycle_queue ? p->saber_cycle_queue : p->ps.fd.saberAnimLevel;
+    if (p->saber_cycle_queue && (p->ps.weaponTime <= 0 || p->ps.stats[STAT_HEALTH] < 1)) {
+        p->ps.fd.saberAnimLevel = p->saber_cycle_queue;
+        p->saber_cycle_queue = 0;
+    }
+}
+
+/* ClientThink_real: keep saberAnimLevel/Base coherent with dual and staff
+ * loadouts and with which blades are currently lit. Runs before Pmove, exactly
+ * where the server does, so the stance Pmove reads is already settled. */
+static void local_client_think_saber_style(jka_player *p) {
+    playerState_t *ps = &p->ps;
+    const saberInfo_t *saber1 = &p->saber[0];
+    const saberInfo_t *saber2 = &p->saber[1];
+
+    if (!saber1->model[0])
+        return;
+
+    if (saber2->model[0]) { /* with two sabers always use akimbo style */
+        if (ps->saberHolstered == 1) {
+            ps->fd.saberAnimLevelBase = SS_DUAL;
+            ps->fd.saberAnimLevel = SS_FAST;
+        } else if (!local_saber_style_valid(saber1, saber2, ps->saberHolstered, ps->fd.saberAnimLevel)) {
+            ps->fd.saberAnimLevelBase = ps->fd.saberAnimLevel = SS_DUAL;
+        }
+        ps->fd.saberDrawAnimLevel = ps->fd.saberAnimLevel;
+    } else {
+        if (saber1->stylesLearned == (1 << SS_STAFF)) /* then *always* use the staff style */
+            ps->fd.saberAnimLevelBase = SS_STAFF;
+        if (ps->fd.saberAnimLevelBase == SS_STAFF) {
+            if (ps->saberHolstered == 1 && saber1->singleBladeStyle != SS_NONE)
+                ps->fd.saberAnimLevel = saber1->singleBladeStyle;
+            else
+                ps->fd.saberAnimLevel = SS_STAFF;
+            ps->fd.saberDrawAnimLevel = ps->fd.saberAnimLevel;
+        }
+    }
+    if (ps->fd.saberAnimLevel >= SS_FAST && ps->fd.saberAnimLevel <= SS_STRONG)
+        p->saber_single_level = ps->fd.saberAnimLevel;
+}
+
+/* ClientSpawn / ClientUserinfoChanged "changedSaber": pick the stance that
+ * belongs to a newly equipped loadout and make sure it is valid for it. */
+static void local_saber_loadout_changed(jka_player *p) {
+    playerState_t *ps = &p->ps;
+    const saberInfo_t *saber1 = &p->saber[0];
+    const saberInfo_t *saber2 = &p->saber[1];
+    int level;
+
+    if (!saber1->model[0])
+        return;
+    if (ps->fd.saberAnimLevel >= SS_FAST && ps->fd.saberAnimLevel <= SS_STRONG)
+        p->saber_single_level = ps->fd.saberAnimLevel;
+    if (ps->saberHolstered == 1) /* the old loadout's half-holstered state means nothing now */
+        ps->saberHolstered = 0;
+    p->saber_cycle_queue = 0;
+
+    if (saber2->model[0]) { /* dual */
+        ps->fd.saberAnimLevelBase = ps->fd.saberAnimLevel = ps->fd.saberDrawAnimLevel = SS_DUAL;
+    } else if (saber1->saberFlags & SFL_TWO_HANDED) { /* staff */
+        ps->fd.saberAnimLevel = ps->fd.saberDrawAnimLevel = SS_STAFF;
+    } else {
+        level = p->saber_single_level;
+        if (level < SS_FAST) level = SS_FAST;
+        if (level > SS_STRONG) level = SS_STRONG;
+        if (level > ps->fd.forcePowerLevel[FP_SABER_OFFENSE])
+            level = ps->fd.forcePowerLevel[FP_SABER_OFFENSE];
+        ps->fd.saberAnimLevelBase = ps->fd.saberAnimLevel = ps->fd.saberDrawAnimLevel = level;
+    }
+    if (!local_saber_style_valid(saber1, saber2, ps->saberHolstered, ps->fd.saberAnimLevel)) {
+        level = ps->fd.saberAnimLevel;
+        local_saber_use_first_valid_style(saber1, saber2, ps->saberHolstered, &level);
+        ps->fd.saberAnimLevelBase = ps->fd.saberAnimLevel = ps->fd.saberDrawAnimLevel = level;
+    }
 }
 
 int jka_player_set_saber_movement_info(void *player, int saber_num,
@@ -344,7 +624,12 @@ int jka_player_set_saber_movement_info(void *player, int saber_num,
     /* A real server keeps an attached saber as a separate non-zero entity.
      * The lightweight host reserves the first non-client slot as the ownership
      * token; attached sabers do not need a packet entity until thrown. */
-    p->ps.saberEntityNum = p->saber_present[0] ? MAX_CLIENTS : 0;
+    if (info->owns_entity_slot)
+        p->ps.saberEntityNum = p->saber_present[0] ? MAX_CLIENTS : 0;
+    /* The local authority owns the stance, so a new loadout picks a fitting
+     * one (slot 1 is installed last). Network prediction keeps the snapshot's. */
+    if (info->owns_entity_slot && saber_num == 1)
+        local_saber_loadout_changed(p);
     return 1;
 }
 
@@ -417,6 +702,52 @@ void jka_player_offline_force_tick(void *player, int time, int requested_power) 
     } else ps->fd.forcePowerRegenDebounceTime = time;
 }
 
+/* pmove_t::ghoul2 stand-in: the only G2API_GetBoltMatrix caller in Pmove is
+ * PM_FootSlopeTrace (bolt 0 = left foot, 1 = right), and it discards the bolt's
+ * z. Place the model-space foot exactly as G2 would for angles = {0, yaw, 0}. */
+static const jka_player *foot_bolt_player;
+static qboolean host_g2_get_foot_bolt_matrix(void *ghoul2, const int modelIndex, const int boltIndex,
+                                              mdxaBone_t *matrix, const vec3_t angles, const vec3_t position,
+                                              const int frameNum, qhandle_t *modelList, vec3_t scale) {
+    const jka_player *p = foot_bolt_player;
+    (void)ghoul2; (void)modelIndex; (void)frameNum; (void)modelList; (void)scale;
+    memset(matrix, 0, sizeof(*matrix));
+    matrix->matrix[0][0] = matrix->matrix[1][1] = matrix->matrix[2][2] = 1.0f;
+    if (!p || !p->foot_valid || boltIndex < 0 || boltIndex > 1) return qfalse;
+    {
+        const float yaw = DEG2RAD(angles[YAW]), s = sinf(yaw), c = cosf(yaw);
+        const float *bolt = p->foot_bolt[boltIndex];
+        matrix->matrix[0][3] = position[0] + c * bolt[0] - s * bolt[1];
+        matrix->matrix[1][3] = position[1] + s * bolt[0] + c * bolt[1];
+        matrix->matrix[2][3] = position[2] + bolt[2];
+    }
+    return qtrue;
+}
+
+/* Null bolts clear it (spectators, follow cam, no model yet). */
+int jka_player_set_foot_bolts(void *player, const float *left, const float *right) {
+    jka_player *p = player;
+    int i;
+    if (!p) return 0;
+    if (!left || !right) { p->foot_valid = qfalse; return 1; }
+    for (i = 0; i < 3; i++)
+        if (!isfinite(left[i]) || !isfinite(right[i])) return 0;
+    VectorCopy(left, p->foot_bolt[0]);
+    VectorCopy(right, p->foot_bolt[1]);
+    p->foot_valid = qtrue;
+    return 1;
+}
+
+/* Call around Pmove: the bolt host reads the player through a file-local pointer. */
+static void begin_foot_bolts(jka_player *p) {
+    p->move.g2Bolts_LFoot = 0;
+    p->move.g2Bolts_RFoot = 1;
+    p->move.ghoul2 = p->foot_valid && p->ps.persistant[PERS_TEAM] != TEAM_SPECTATOR ? (void *)p : NULL;
+    foot_bolt_player = p;
+    imports.G2API_GetBoltMatrix = host_g2_get_foot_bolt_matrix;
+}
+static void end_foot_bolts(void) { foot_bolt_player = NULL; }
+
 void *jka_player_new(const float *origin, float yaw, int spectator) {
     jka_player *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
@@ -442,6 +773,8 @@ void *jka_player_new(const float *origin, float yaw, int spectator) {
     ps->saberMove = LS_READY;
     ps->fd.saberAnimLevel = SS_MEDIUM;
     ps->fd.saberAnimLevelBase = SS_MEDIUM;
+    ps->fd.saberDrawAnimLevel = SS_MEDIUM;
+    p->saber_single_level = SS_MEDIUM;
     ps->fd.forcePower = ps->fd.forcePowerMax = 100;
     ps->fd.forcePowersKnown = (1 << FP_LEVITATION) | (1 << FP_SABER_OFFENSE) | (1 << FP_SPEED) | (1 << FP_RAGE);
     ps->fd.forcePowerLevel[FP_LEVITATION] = FORCE_LEVEL_3;
@@ -488,42 +821,9 @@ static int host_contents(const vec3_t point, int pass) { return contents_callbac
 /* Lightweight counterpart to the generic_cmd switch in OpenJK g_active.c.
  * Pmove intentionally does not execute these: on a real server they are
  * authoritative game-side commands processed after Pmove. Keep that same
- * ordering here and add cases as the local server grows. */
-static void local_apply_queued_saber_style(jka_player *p) {
-    if (p->saber_cycle_queue && p->ps.weaponTime <= 0) {
-        p->ps.fd.saberAnimLevel = p->saber_cycle_queue;
-        p->saber_cycle_queue = 0;
-    }
-}
-
-static void local_saber_attack_cycle(jka_player *p) {
-    playerState_t *ps = &p->ps;
-    int select_level;
-
-    /* Cmd_SaberAttackCycle_f guards that matter to the one-client FFA host.
-     * The current local authority models the stock single-saber case; dual/
-     * staff saberInfo_t ownership belongs in the later full game-entity shim. */
-    if (ps->stats[STAT_HEALTH] <= 0 || ps->pm_type != PM_NORMAL || ps->weapon != WP_SABER)
-        return;
-
-    select_level = p->saber_cycle_queue ? p->saber_cycle_queue : ps->fd.saberAnimLevel;
-    select_level++;
-    if (select_level > ps->fd.forcePowerLevel[FP_SABER_OFFENSE])
-        select_level = FORCE_LEVEL_1;
-    if (select_level < FORCE_LEVEL_1)
-        select_level = FORCE_LEVEL_1;
-
-    /* OpenJK queues a stance switch while a saber move is busy so chaining is
-     * not reinterpreted halfway through the move. */
-    ps->fd.saberAnimLevelBase = select_level;
-    if (ps->weaponTime <= 0) {
-        ps->fd.saberAnimLevel = select_level;
-        p->saber_cycle_queue = 0;
-    } else {
-        p->saber_cycle_queue = select_level;
-    }
-}
-
+ * ordering here and add cases as the local server grows. The saber stance
+ * rules they drive (holster/unholster, dual, staff) live with the other
+ * saberInfo_t helpers above jka_player_set_saber_movement_info. */
 static void local_process_generic_cmd(jka_player *p, int generic_cmd) {
     const int now = p->ps.commandTime;
     if (!generic_cmd)
@@ -540,6 +840,8 @@ static void local_process_generic_cmd(jka_player *p, int generic_cmd) {
     switch (generic_cmd) {
     case GENCMD_SABERATTACKCYCLE:
         local_saber_attack_cycle(p);
+        /* Show the result now rather than after the next WP_SaberPositionUpdate. */
+        p->ps.fd.saberDrawAnimLevel = p->saber_cycle_queue ? p->saber_cycle_queue : p->ps.fd.saberAnimLevel;
         break;
     default:
         /* Other generic commands still require their corresponding game-side
@@ -578,10 +880,13 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
     p->move.cmd.forwardmove = input->forward;
     p->move.cmd.rightmove = input->right;
     p->move.cmd.upmove = input->up;
+    local_client_think_saber_style(p);
     const int saber_client_num = install_player_saber_info(p);
+    begin_foot_bolts(p);
     begin_pmove_view_tracking(p->move.ps);
     Pmove(&p->move);
     p->view_forced = end_pmove_view_tracking();
+    end_foot_bolts();
     clear_player_saber_info(saber_client_num);
     local_apply_queued_saber_style(p);
     local_process_generic_cmd(p, input->generic_command);
@@ -771,6 +1076,18 @@ int jka_item_info(int index, const char **classname, const char **world_model,
     return 1;
 }
 
+/* `bg_itemlist[index].pickup_sound` (CG_EntityEvent EV_ITEM_PICKUP); "" if none. */
+const char *jka_item_pickup_sound(int index) {
+    if (index < 0 || index >= bg_numItems) return "";
+    return bg_itemlist[index].pickup_sound ? bg_itemlist[index].pickup_sound : "";
+}
+
+/* `bg_itemlist[index].icon` (CG_DrawPickupItem); "" if none. */
+const char *jka_item_icon(int index) {
+    if (index < 0 || index >= bg_numItems) return "";
+    return bg_itemlist[index].icon ? bg_itemlist[index].icon : "";
+}
+
 /* ---- Network prediction bridge (CG_PredictPlayerState's Pmove host) ----
  * The Rust CGame owns command selection and error decay; these entry points
  * only load a snapshot playerState into a real playerState_t, run the stock
@@ -786,6 +1103,9 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
                            const int32_t *persistant, const int32_t *ammo, const int32_t *powerups) {
     jka_player *p = player;
     int i;
+    /* cg_predict.c: slopeRecalcTime is "the only value we want to maintain
+     * separately on server/client" - reloading the snapshot must not reset it. */
+    const int slope_recalc_time = p->ps.slopeRecalcTime;
     if (count != JKA_PS_FIELD_COUNT) return 0;
     memset(&p->ps, 0, sizeof(p->ps));
     for (i = 0; i < JKA_PS_FIELD_COUNT; i++)
@@ -794,6 +1114,7 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
     memcpy(p->ps.persistant, persistant, sizeof(int32_t) * MAX_PERSISTANT);
     memcpy(p->ps.ammo, ammo, sizeof(int32_t) * 16);
     memcpy(p->ps.powerups, powerups, sizeof(int32_t) * MAX_POWERUPS);
+    p->ps.slopeRecalcTime = slope_recalc_time;
     p->view_forced = qfalse;
 #ifdef JKA_JAPRO
     p->entities_revision = next_entities_revision++;
@@ -871,7 +1192,6 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     cg_entities[client].playerState = &cg.predictedPlayerState;
     p->move.ps = &cg.predictedPlayerState;
 #endif
-    p->move.ghoul2 = NULL;
     VectorClear(p->move.modelScale);
     p->move.nonHumanoid = qfalse;
     p->move.baseEnt = (bgEntity_t *)cg_entities;
@@ -889,9 +1209,29 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     p->move.stepSlideFix = settings->step_slide_fix;
     p->move.noSpecMove = settings->no_spec_move;
     fill_cmd(&p->move.cmd, input);
+    /* BG_MySaber reads cgs.clientinfo[].saber[] in the real cgame. Install the
+     * predicted client's equipped sabers for exactly this Pmove. */
+    const int saber_client_num = install_player_saber_info(p);
+    /* cg_predict.c CG_PredictPlayerState ("THIS is pretty much bad, but..."):
+     * fd.saberAnimLevelBase is not networked, so the client re-derives it before
+     * every Pmove. Without it BG_SabersOff/PM_InSecondaryStyle treat a half-lit
+     * staff or a single-mode dual saber (saberHolstered == 1) as "sabers off",
+     * so prediction re-ignites the blades and picks the wrong swings, and skips
+     * the BOTH_SABERPULL guiding pose while a thrown saber is out. */
+    p->move.ps->fd.saberAnimLevelBase = p->move.ps->fd.saberAnimLevel;
+    if (p->move.ps->saberHolstered == 1 && saber_client_num >= 0) {
+        const clientInfo_t *ci = &cgs.clientinfo[saber_client_num];
+        if (ci->saber[0].numBlades > 0)
+            p->move.ps->fd.saberAnimLevelBase = SS_STAFF;
+        else if (ci->saber[1].model[0])
+            p->move.ps->fd.saberAnimLevelBase = SS_DUAL;
+    }
+    begin_foot_bolts(p);
     begin_pmove_view_tracking(p->move.ps);
     Pmove(&p->move);
     p->view_forced = end_pmove_view_tracking();
+    end_foot_bolts();
+    clear_player_saber_info(saber_client_num);
 #ifdef JKA_JAPRO
     p->ps = cg.predictedPlayerState;
     p->move.ps = &p->ps;

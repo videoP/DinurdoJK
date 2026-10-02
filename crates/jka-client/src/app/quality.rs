@@ -13,18 +13,30 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QualityPreset {
+    /// Every cost lever off, on the known-fast FastBaseline world renderer whenever
+    /// the settings allow it. The benchmark control.
     Minimal,
+    /// The same settings as `Minimal`, forced through the unified world renderer
+    /// (`r_worldPath unified`) so the two can be compared directly.
+    MinimalUnified,
     Low,
     Medium,
     High,
 }
 
 impl QualityPreset {
-    pub(super) const ALL: [Self; 4] = [Self::Minimal, Self::Low, Self::Medium, Self::High];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Minimal,
+        Self::MinimalUnified,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+    ];
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Minimal => "Minimal",
+            Self::Minimal => "Minimal (Legacy)",
+            Self::MinimalUnified => "Minimal (Unified)",
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
@@ -35,9 +47,9 @@ impl QualityPreset {
     /// the same field: `r_texturemode` is coarse and anisotropy refines it. Keep
     /// aliases that mutate the same state out of this table: for example,
     /// `r_dynamicShadows` already owns the derived cascaded-shadow boolean.
-    pub(super) fn settings(self) -> &'static [(&'static str, &'static str)] {
-        match self {
-            Self::Minimal => &[
+    pub(super) fn settings(self) -> Vec<(&'static str, &'static str)> {
+        let table: &'static [(&'static str, &'static str)] = match self {
+            Self::Minimal | Self::MinimalUnified => &[
                 // The cvar's canonical "off" value is 0; the setter maps both
                 // 0 and 1 to the renderer's single-sample state. Using 0 here
                 // lets active_quality_preset() compare against the getter.
@@ -58,7 +70,7 @@ impl QualityPreset {
                 ("r_smaa", "0"),
                 ("r_taa", "0"),
                 ("r_contactShadows", "0"),
-                ("r_fogMode", "legacy"),
+                ("r_drawfog", "2"),
                 ("r_sunVisibility", "legacy"),
                 ("r_distanceCullScale", "0"),
                 ("r_clouds", "0"),
@@ -111,7 +123,7 @@ impl QualityPreset {
                 ("r_smaa", "0"),
                 ("r_taa", "0"),
                 ("r_contactShadows", "0"),
-                ("r_fogMode", "legacy"),
+                ("r_drawfog", "2"),
                 ("r_sunVisibility", "sky"),
                 ("r_distanceCullScale", "0"),
                 ("r_clouds", "0"),
@@ -169,7 +181,7 @@ impl QualityPreset {
                 ("r_smaa", "1"),
                 ("r_taa", "0"),
                 ("r_contactShadows", "0"),
-                ("r_fogMode", "legacy"),
+                ("r_drawfog", "2"),
                 ("r_sunVisibility", "sky"),
                 ("r_distanceCullScale", "0"),
                 ("r_clouds", "1"),
@@ -229,7 +241,7 @@ impl QualityPreset {
                 ("r_smaa", "0"),
                 ("r_taa", "1"),
                 ("r_contactShadows", "1"),
-                ("r_fogMode", "volumetric"),
+                ("r_drawfog", "3"),
                 ("r_sunVisibility", "filtered"),
                 ("r_distanceCullScale", "0"),
                 ("r_clouds", "1"),
@@ -266,12 +278,20 @@ impl QualityPreset {
                 ("r_genNormalMaps", "1"),
                 ("r_deluxeMapping", "1"),
                 ("r_deluxeSpecular", "1"),
-                ("r_dynamicShadows", "csm_bevy"),
+                ("r_dynamicShadows", "csm"),
                 ("r_emissiveAreaLights", "1"),
                 ("r_voxelProbeGI", "1"),
                 ("r_localLightShadows", "1"),
             ],
+        };
+        let mut settings = table.to_vec();
+        // The two Minimal presets differ only in which world renderer draws.
+        match self {
+            Self::Minimal => settings.push(("r_worldPath", "auto")),
+            Self::MinimalUnified => settings.push(("r_worldPath", "unified")),
+            _ => {}
         }
+        settings
     }
 }
 
@@ -287,8 +307,16 @@ fn cvar_values_match(a: &str, b: &str) -> bool {
 impl App {
     pub(super) fn apply_quality_preset(&mut self, preset: QualityPreset) {
         let mut apply_failed = false;
+        let title = format!("{} quality preset", preset.label());
+        let batch_started = Instant::now();
+        let mut timings: Vec<(&str, f64)> = Vec::with_capacity(preset.settings().len());
+        self.begin_settings_batch(&title);
         for (name, value) in preset.settings() {
-            if let Err(error) = self.set_console_cvar(name, value) {
+            self.render_command(RenderCommand::BatchLabel((*name).to_owned()));
+            let setting_started = Instant::now();
+            let result = self.set_console_cvar(name, value);
+            timings.push((name, setting_started.elapsed().as_secs_f64() * 1000.0));
+            if let Err(error) = result {
                 // A preset naming a cvar the build no longer has is a bug in the
                 // table, not something the player can act on. Keep applying the
                 // rest so one bad entry does not prevent the remaining quality
@@ -296,6 +324,17 @@ impl App {
                 apply_failed = true;
                 eprintln!("[QUALITY] {} preset: {error}", preset.label());
             }
+        }
+
+        self.end_settings_batch();
+        let applied_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+        timings.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!(
+            "[BATCH] {title}: main thread applied {} setting(s) in {applied_ms:.2} ms (render-thread work is reported separately)",
+            timings.len(),
+        );
+        for (name, ms) in timings.iter().filter(|(_, ms)| *ms >= 0.05).take(20) {
+            println!("[BATCH]   main {name}: {ms:.2} ms");
         }
 
         // Capture the canonical values *after* all setters have run. Some cvars

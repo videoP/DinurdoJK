@@ -39,6 +39,12 @@ impl ServerMod {
         }
     }
 
+    /// jaPRO's cgame only honours `SABER_RGB` (`cp_sbRGB1/2` relayed as `c3/c4`)
+    /// when `cgs.serverMod >= SVMOD_JAPLUS`, i.e. on JA+ and jaPRO servers.
+    pub fn supports_rgb_sabers(self) -> bool {
+        matches!(self, Self::Japro | Self::Japlus)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Base => "Base JKA",

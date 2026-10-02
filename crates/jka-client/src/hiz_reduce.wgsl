@@ -1,3 +1,8 @@
+// Hi-Z pyramid, mips 1..: exact 2x2 reduction of the power-of-two pyramid.
+//
+// Reversed-Z: the conservative occluder depth is the MINIMUM (farthest). Every
+// level is exactly half the one below (clamped at one texel on a short axis),
+// so no row or column is ever dropped and UV maps exactly onto texels.
 @group(0) @binding(0) var source_depth: texture_2d<f32>;
 @group(0) @binding(1) var target_depth: texture_storage_2d<r32float, write>;
 
@@ -20,6 +25,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d10 = textureLoad(source_depth, vec2<i32>(p10), 0).x;
     let d01 = textureLoad(source_depth, vec2<i32>(p01), 0).x;
     let d11 = textureLoad(source_depth, vec2<i32>(p11), 0).x;
-    let maximum = max(max(d00, d10), max(d01, d11));
-    textureStore(target_depth, vec2<i32>(gid.xy), vec4<f32>(maximum, 0.0, 0.0, 0.0));
+    let farthest = min(min(d00, d10), min(d01, d11));
+    textureStore(target_depth, vec2<i32>(gid.xy), vec4<f32>(farthest, 0.0, 0.0, 0.0));
 }

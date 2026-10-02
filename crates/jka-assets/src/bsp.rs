@@ -3,8 +3,10 @@
 use std::fmt;
 use std::ops::Range;
 mod collision;
+mod marks;
 mod visibility;
 pub use collision::{CollisionLeaf, CollisionNode, CollisionTree};
+pub use marks::{MarkBuffer, MarkFragment, MarkSurfaces, CONTENTS_FOG, SURF_NOIMPACT, SURF_NOMARKS};
 pub use visibility::{AreaLocator, Visibility};
 
 /// Maximum accepted RBSP size. Large community maps can legitimately exceed 128 MiB
@@ -163,10 +165,26 @@ impl Entity {
     }
 }
 
+/// One `misc_model_static` placement (jaPRO `cg_staticmodel_t`), in JKA space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticModel {
+    pub model: String,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    /// Per-axis scale (`modelscale_vec`, else uniform `modelscale`).
+    pub scale: [f32; 3],
+    /// Added to the cull origin only; the model is drawn at `origin`.
+    pub zoffset: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Spawn {
     pub origin: [f32; 3],
     pub yaw: f32,
+    /// `spawnflags & 1`: the spot JKA prefers for a local client's first spawn.
+    pub initial: bool,
+    /// `nohumans 1`: reserved for bots, so never used for a human player.
+    pub no_humans: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,27 +502,84 @@ impl Bsp {
         })
     }
 
-    /// Initial FFA spawn candidates, without game-side spawn selection rules.
+    /// FFA spawn candidates, without game-side spawn selection rules.
+    /// `info_player_start` is included because OpenJK converts it to
+    /// `info_player_deathmatch` when the entity is spawned.
     pub fn deathmatch_spawns(&self) -> Vec<Spawn> {
+        let parse_triplet = |value: &[u8]| -> Option<[f32; 3]> {
+            let coordinates: Vec<f32> = std::str::from_utf8(value)
+                .ok()?
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()
+                .ok()?;
+            coordinates.try_into().ok()
+        };
         self.entities
             .iter()
             .filter_map(|entity| {
-                if entity.get(b"classname")? != b"info_player_deathmatch" {
+                let classname = entity.get(b"classname")?;
+                if classname != b"info_player_deathmatch" && classname != b"info_player_start" {
                     return None;
                 }
-                let origin = std::str::from_utf8(entity.get(b"origin")?).ok()?;
-                let coordinates: Vec<f32> = origin
-                    .split_whitespace()
-                    .map(str::parse)
-                    .collect::<std::result::Result<_, _>>()
-                    .ok()?;
-                let origin: [f32; 3] = coordinates.try_into().ok()?;
+                let origin = parse_triplet(entity.get(b"origin")?)?;
+                // G_SpawnAngle: `angle` is yaw only, `angles` is pitch/yaw/roll.
                 let yaw: f32 = match entity.get(b"angle") {
                     Some(value) => std::str::from_utf8(value).ok()?.parse().ok()?,
-                    None => 0.0,
+                    None => entity
+                        .get(b"angles")
+                        .and_then(parse_triplet)
+                        .map_or(0.0, |angles| angles[1]),
                 };
-                (origin.iter().all(|x| x.is_finite()) && yaw.is_finite())
-                    .then_some(Spawn { origin, yaw })
+                let integer = |key: &[u8]| -> i32 {
+                    entity
+                        .get(key)
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0)
+                };
+                (origin.iter().all(|x| x.is_finite()) && yaw.is_finite()).then_some(Spawn {
+                    origin,
+                    yaw,
+                    initial: integer(b"spawnflags") & 1 != 0,
+                    no_humans: integer(b"nohumans") != 0,
+                })
+            })
+            .collect()
+    }
+
+    /// `misc_model_static` entities, as jaPRO's cgame `SP_misc_model_static`
+    /// reads them. The game module frees these on the server, so they are never
+    /// snapshot entities: the client places each MD3 from the BSP entity string.
+    pub fn static_models(&self) -> Vec<StaticModel> {
+        let vector = |entity: &Entity, key: &[u8]| -> Option<[f32; 3]> {
+            let coordinates: Vec<f32> = std::str::from_utf8(entity.get(key)?)
+                .ok()?
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()
+                .ok()?;
+            coordinates.try_into().ok()
+        };
+        let float = |entity: &Entity, key: &[u8]| -> Option<f32> {
+            std::str::from_utf8(entity.get(key)?).ok()?.trim().parse().ok()
+        };
+        self.entities
+            .iter()
+            .filter(|entity| entity.get(b"classname") == Some(b"misc_model_static".as_slice()))
+            .filter_map(|entity| {
+                let model = std::str::from_utf8(entity.get(b"model")?).ok()?.trim();
+                if model.is_empty() {
+                    return None;
+                }
+                let origin = vector(entity, b"origin").unwrap_or([0.0; 3]);
+                let angles = vector(entity, b"angles")
+                    .unwrap_or_else(|| [0.0, float(entity, b"angle").unwrap_or(0.0), 0.0]);
+                let scale = vector(entity, b"modelscale_vec")
+                    .unwrap_or_else(|| [float(entity, b"modelscale").unwrap_or(1.0); 3]);
+                let zoffset = float(entity, b"zoffset").unwrap_or(0.0);
+                let finite = origin.iter().chain(&angles).chain(&scale).all(|value| value.is_finite());
+                finite.then(|| StaticModel { model: model.to_owned(), origin, angles, scale, zoffset })
             })
             .collect()
     }
@@ -798,10 +873,10 @@ pub struct DebugVolumeMesh {
 
 impl DebugVolumeMesh {
     pub fn is_empty(&self) -> bool {
-        self.triangle_indices.is_empty()
+        self.triangle_indices.is_empty() && self.line_indices.is_empty()
     }
 
-    fn push_polygon(&mut self, polygon: &[[f32; 3]], color: [u8; 4]) {
+    pub fn push_polygon(&mut self, polygon: &[[f32; 3]], color: [u8; 4]) {
         let base = self.positions.len() as u32;
         self.positions.extend_from_slice(polygon);
         self.colors.extend(std::iter::repeat(color).take(polygon.len()));
@@ -812,6 +887,39 @@ impl DebugVolumeMesh {
         for i in 0..count {
             self.line_indices.extend_from_slice(&[base + i, base + (i + 1) % count]);
         }
+    }
+
+    /// Six quad faces of an axis-aligned box, filled + outlined like any other
+    /// polygon. `mins`/`maxs` are in the same (BSP) coordinate space as the
+    /// rest of the mesh.
+    pub fn push_box(&mut self, mins: [f32; 3], maxs: [f32; 3], color: [u8; 4]) {
+        let corner = |x: usize, y: usize, z: usize| {
+            [
+                if x == 0 { mins[0] } else { maxs[0] },
+                if y == 0 { mins[1] } else { maxs[1] },
+                if z == 0 { mins[2] } else { maxs[2] },
+            ]
+        };
+        // Each face wound so the outline loop traces its 4 edges once.
+        let faces: [[[f32; 3]; 4]; 6] = [
+            [corner(0, 0, 0), corner(1, 0, 0), corner(1, 1, 0), corner(0, 1, 0)], // -Z
+            [corner(0, 0, 1), corner(0, 1, 1), corner(1, 1, 1), corner(1, 0, 1)], // +Z
+            [corner(0, 0, 0), corner(0, 1, 0), corner(0, 1, 1), corner(0, 0, 1)], // -X
+            [corner(1, 0, 0), corner(1, 0, 1), corner(1, 1, 1), corner(1, 1, 0)], // +X
+            [corner(0, 0, 0), corner(0, 0, 1), corner(1, 0, 1), corner(1, 0, 0)], // -Y
+            [corner(0, 1, 0), corner(1, 1, 0), corner(1, 1, 1), corner(0, 1, 1)], // +Y
+        ];
+        for face in faces {
+            self.push_polygon(&face, color);
+        }
+    }
+
+    /// A bare line segment: two vertices, no fill triangles.
+    pub fn push_line(&mut self, a: [f32; 3], b: [f32; 3], color: [u8; 4]) {
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(&[a, b]);
+        self.colors.extend_from_slice(&[color, color]);
+        self.line_indices.extend_from_slice(&[base, base + 1]);
     }
 }
 
@@ -1487,17 +1595,13 @@ fn parse_light_grid(
                 cell_count
             )));
         }
-        let mut indices = Vec::with_capacity(cell_count);
-        for row in array_bytes.chunks_exact(2) {
-            let sample = u16::from_le_bytes(row.try_into().unwrap());
-            if usize::from(sample) >= samples.len() {
-                return Err(invalid(
-                    "light grid array references missing dgrid_t sample",
-                ));
-            }
-            indices.push(sample);
-        }
-        indices
+        // Out-of-range indices are kept as-is: q3map2 maps with a full 65535-record
+        // grid emit 0xFFFF for empty cells, and `sample_for_cell` yields `None` for
+        // them, so those cells render as having no light grid data.
+        array_bytes
+            .chunks_exact(2)
+            .map(|row| u16::from_le_bytes(row.try_into().unwrap()))
+            .collect()
     };
 
     Ok(Some(LightGrid {
@@ -1527,9 +1631,13 @@ fn parse_grid_size(bytes: &[u8]) -> Option<[f32; 3]> {
 }
 
 fn parse_entities(data: &[u8]) -> Result<Vec<Entity>> {
-    if data.len() > 0x40000 {
-        return Err(invalid("entity text exceeds limit"));
-    }
+    // Limits mirror the engine/game: no total-size or entity-count cap
+    // (MAX_MAP_ENTSTRING is a q3map2 compile-time limit; CM_LoadMap copies the
+    // whole lump), per-token truncation at MAX_TOKEN_CHARS, and the game's
+    // per-entity MAX_SPAWN_VARS / MAX_SPAWN_VARS_CHARS in G_ParseSpawnVars.
+    const MAX_TOKEN_CHARS: usize = 1024;
+    const MAX_SPAWN_VARS: usize = 64;
+    const MAX_SPAWN_VARS_CHARS: usize = 4096;
     let mut cursor = 0;
     let mut entities = Vec::new();
     loop {
@@ -1541,21 +1649,23 @@ fn parse_entities(data: &[u8]) -> Result<Vec<Entity>> {
             return Err(invalid("expected entity opening brace"));
         }
         cursor += 1;
-        if entities.len() >= 2048 {
-            return Err(invalid("too many entities"));
-        }
         let mut properties = Vec::new();
+        let mut spawn_chars = 0usize;
         loop {
             skip_space(data, &mut cursor);
             if data.get(cursor) == Some(&b'}') {
                 cursor += 1;
                 break;
             }
-            let key = quoted(data, &mut cursor, 64)?;
+            let key = quoted(data, &mut cursor, MAX_TOKEN_CHARS - 1)?;
             skip_space(data, &mut cursor);
-            let value = quoted(data, &mut cursor, 4096)?;
-            if properties.len() >= 256 {
-                return Err(invalid("too many entity properties"));
+            let value = quoted(data, &mut cursor, MAX_TOKEN_CHARS - 1)?;
+            if properties.len() >= MAX_SPAWN_VARS {
+                return Err(invalid("entity exceeds MAX_SPAWN_VARS"));
+            }
+            spawn_chars += key.len() + 1 + value.len() + 1;
+            if spawn_chars > MAX_SPAWN_VARS_CHARS {
+                return Err(invalid("entity exceeds MAX_SPAWN_VARS_CHARS"));
             }
             properties.push((key, value));
         }
@@ -1586,11 +1696,13 @@ fn quoted(data: &[u8], cursor: &mut usize, limit: usize) -> Result<Vec<u8>> {
     let start = *cursor;
     while let Some(&byte) = data.get(*cursor) {
         if byte == b'"' {
-            let value = data[start..*cursor].to_vec();
+            // COM_ParseExt silently truncates over-long quoted tokens.
+            let end = (*cursor).min(start + limit);
+            let value = data[start..end].to_vec();
             *cursor += 1;
             return Ok(value);
         }
-        if byte == 0 || *cursor - start >= limit {
+        if byte == 0 {
             return Err(invalid("invalid entity key/value length"));
         }
         *cursor += 1;

@@ -5,6 +5,7 @@
 #define jka_player_teleport stock_jka_player_teleport
 #define jka_player_give_all stock_jka_player_give_all
 #define jka_player_set_saber_movement_info stock_jka_player_set_saber_movement_info
+#define jka_player_set_foot_bolts stock_jka_player_set_foot_bolts
 #define jka_player_offline_force_tick stock_jka_player_offline_force_tick
 #define jka_player_new stock_jka_player_new
 #define jka_player_free stock_jka_player_free

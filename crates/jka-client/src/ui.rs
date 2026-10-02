@@ -22,7 +22,13 @@ pub enum OverlayMode {
     Game,
     Vgs,
     HudEdit,
+    /// The in-game third-person camera editor (Setup -> Camera -> Adjust).
+    CameraEdit,
     MapEdit,
+    EntityGraph,
+    /// The `/trace` results menu: a clickable list of everything traced this
+    /// session, with a full-info inspector and solo-server actions.
+    Trace,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,6 +48,8 @@ pub struct UiChatLine {
 pub struct UiCenterPrint {
     pub text: String,
     pub alpha: f32,
+    /// Legacy CGame virtual-screen Y as a 0..1 screen-height fraction.
+    pub y_fraction: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +65,9 @@ pub struct UiScoreEntry {
 pub struct UiScoreboard {
     pub team_scores: [i32; 2],
     pub team_game: bool,
+    /// Duel and power duel keep a win/loss score for the spectators waiting in line;
+    /// every other mode shows only ping and time for them, like jaPRO's scoreboard.
+    pub spectator_scores: bool,
     pub entries: Vec<UiScoreEntry>,
 }
 
@@ -117,28 +128,91 @@ pub struct HudState {
     pub ammo: Option<i32>,
     /// Selected weapon (`weapon_t`); WP_SABER swaps the ammo panel for the saber style.
     pub weapon: i32,
-    /// `fd.saberAnimLevel` (`saber_styles_t`: 1 fast .. 7 staff), 0 when unknown.
+    /// `fd.saberDrawAnimLevel` (`saber_styles_t`: 1 fast .. 7 staff), 0 when unknown.
     pub saber_style: i32,
+    /// The force bar is in the red half of its "no force / out of ammo" flash.
+    pub force_flash: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CrosshairSettings {
-    /// 0 disables the crosshair. Non-zero values select a local HUD shape.
+    /// 0 disables the crosshair. Non-zero values select a local HUD shape
+    /// (`CROSSHAIR_STYLE_LINE` is jaPRO's strafehelper line crosshair).
     pub style: u8,
+    /// 0 draws the `style` shape; 1..=`CROSSHAIR_IMAGE_COUNT` draws the stock
+    /// `gfx/2d/crosshair{a..j}` image instead (while `style` is not 0).
+    pub image: u8,
     /// JKA-compatible cg_crosshairSize value. 24 preserves the stock default.
     pub size: f32,
     /// RGBA, matching TaystJK's cg_crosshairColor 0..255 convention.
     pub color: [u8; 4],
+    /// Visibility, 0..=2, 1 = as authored. Below 1 fades the crosshair; above 1
+    /// strengthens the faint stock images by layering them (shapes are already opaque).
+    pub strength: f32,
+    /// jaPRO `cg_crosshairIdentifyTarget`: colour the crosshair by what it is on.
+    pub identify_target: bool,
+    /// jaPRO `cg_drawCrosshairNames`: 0 off, > 0 seconds a name lingers after
+    /// aiming away, < 0 only while aimed at.
+    pub names: f32,
+    /// jaPRO `cg_drawCrosshairNamesColours`: 1 keeps the name's own colour codes
+    /// (white base), 0 strips them and colours by friend/foe.
+    pub names_colours: bool,
+    /// jaPRO `cg_drawCrosshairNamesOpacity`, 0..=1.
+    pub names_opacity: f32,
+}
+
+/// Highest `cg_drawCrosshair` shape: the jaPRO strafehelper line (`SHELPER_CROSSHAIR`).
+pub const CROSSHAIR_STYLE_LINE: u8 = 7;
+/// Shape ids `cg_drawCrosshair` accepts, 0 (off) through the line.
+pub const CROSSHAIR_STYLE_MAX: u8 = CROSSHAIR_STYLE_LINE;
+/// Largest `cg_crosshairStrength`: 200%.
+pub const CROSSHAIR_STRENGTH_MAX: f32 = 2.0;
+/// Stock image crosshairs, `gfx/2d/crosshaira` .. `crosshairj` (jaPRO adds `j`).
+pub const CROSSHAIR_IMAGE_COUNT: u8 = 10;
+/// `gfx/2d` names of the image crosshairs, `cg_crosshairImage` 1.. in order.
+pub const CROSSHAIR_IMAGE_NAMES: [&str; CROSSHAIR_IMAGE_COUNT as usize] = [
+    "gfx/2d/crosshaira",
+    "gfx/2d/crosshairb",
+    "gfx/2d/crosshairc",
+    "gfx/2d/crosshaird",
+    "gfx/2d/crosshaire",
+    "gfx/2d/crosshairf",
+    "gfx/2d/crosshairg",
+    "gfx/2d/crosshairh",
+    "gfx/2d/crosshairi",
+    "gfx/2d/crosshairj",
+];
+
+/// What the crosshair is currently on, resolved by the app each aim scan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UiCrosshairTarget {
+    /// RGB (0..=1) the crosshair takes; `None` keeps its configured colour.
+    pub color: Option<[f32; 3]>,
+    pub name: Option<UiCrosshairName>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiCrosshairName {
+    pub text: String,
+    pub color: [f32; 3],
+    pub alpha: f32,
 }
 
 impl Default for CrosshairSettings {
     fn default() -> Self {
         Self {
             style: 1,
+            image: 0,
             size: 24.0,
             // Keep DinurdoJK's existing white crosshair by default while using
             // TaystJK's four-component cg_crosshairColor storage convention.
             color: [255, 255, 255, 230],
+            strength: 1.0,
+            // jaPRO defaults.
+            identify_target: true,
+            names: 1.0,
+            names_colours: true,
+            names_opacity: 1.0,
         }
     }
 }
@@ -150,10 +224,44 @@ pub enum HudElementId {
     Shield,
     Ammo,
     Force,
+    MovementKeys,
+    Fps,
+    Chat,
+    CenterPrint,
+    CrosshairName,
+    Follow,
+    Vote,
+    RaceTimer,
+    RaceStart,
+    SurfaceInspector,
+    Speedometer,
+    SpeedometerJumps,
+    SpeedGraph,
 }
 
 impl HudElementId {
-    pub const ALL: [Self; 4] = [Self::Health, Self::Shield, Self::Ammo, Self::Force];
+    // SurfaceInspector is intentionally excluded: the trace panel it used to
+    // position is now the clickable `OverlayMode::Trace` egui menu, which
+    // isn't a draggable HUD element. The variant, its cvar prefix and its
+    // offset field stay (see `element`/`element_mut`) so old configs still load.
+    pub const ALL: [Self; 16] = [
+        Self::Health,
+        Self::Shield,
+        Self::Ammo,
+        Self::Force,
+        Self::MovementKeys,
+        Self::Fps,
+        Self::Chat,
+        Self::CenterPrint,
+        Self::CrosshairName,
+        Self::Follow,
+        Self::Vote,
+        Self::RaceTimer,
+        Self::RaceStart,
+        Self::Speedometer,
+        Self::SpeedometerJumps,
+        Self::SpeedGraph,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -161,6 +269,19 @@ impl HudElementId {
             Self::Shield => "SHIELD",
             Self::Ammo => "AMMO / STYLE",
             Self::Force => "FORCE",
+            Self::MovementKeys => "MOVEMENT KEYS",
+            Self::Fps => "FPS / PERF",
+            Self::Chat => "CHAT",
+            Self::CenterPrint => "CENTER PRINT",
+            Self::CrosshairName => "CROSSHAIR NAME",
+            Self::Follow => "FOLLOW NAME",
+            Self::Vote => "VOTE",
+            Self::RaceTimer => "RACE TIMER",
+            Self::RaceStart => "RACE START SPEED",
+            Self::SurfaceInspector => "TRACE INSPECTOR",
+            Self::Speedometer => "SPEEDOMETER",
+            Self::SpeedometerJumps => "SPEEDOMETER JUMPS",
+            Self::SpeedGraph => "SPEED GRAPH",
         }
     }
 
@@ -170,7 +291,33 @@ impl HudElementId {
             Self::Shield => "cg_hudShield",
             Self::Ammo => "cg_hudAmmo",
             Self::Force => "cg_hudForce",
+            Self::MovementKeys => "cg_hudMovementKeys",
+            Self::Fps => "cg_hudFps",
+            Self::Chat => "cg_hudChat",
+            Self::CenterPrint => "cg_hudCenterPrint",
+            Self::CrosshairName => "cg_hudCrosshairName",
+            Self::Follow => "cg_hudFollow",
+            Self::Vote => "cg_hudVote",
+            Self::RaceTimer => "cg_hudRaceTimer",
+            Self::RaceStart => "cg_hudRaceStart",
+            Self::SurfaceInspector => "cg_hudSurfaceInspector",
+            Self::Speedometer => "cg_hudSpeedometer",
+            Self::SpeedometerJumps => "cg_hudSpeedometerJumps",
+            Self::SpeedGraph => "cg_hudSpeedGraph",
         }
+    }
+
+    pub fn from_cvar(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|id| id.cvar_name().eq_ignore_ascii_case(name))
+    }
+
+    /// The original four panels position themselves from a screen anchor. Every
+    /// other element keeps its own stock layout (cvar-driven 640x480 positions,
+    /// text flow, ...) and its layout is an offset/scale applied on top of it.
+    pub fn is_anchored(self) -> bool {
+        matches!(self, Self::Health | Self::Shield | Self::Ammo | Self::Force)
     }
 }
 
@@ -279,13 +426,46 @@ pub struct HudLayout {
     pub shield: HudElementLayout,
     pub ammo: HudElementLayout,
     pub force: HudElementLayout,
+    pub movement_keys: HudElementLayout,
+    pub fps: HudElementLayout,
+    pub chat: HudElementLayout,
+    pub center_print: HudElementLayout,
+    pub crosshair_name: HudElementLayout,
+    pub follow: HudElementLayout,
+    pub vote: HudElementLayout,
+    pub race_timer: HudElementLayout,
+    pub race_start: HudElementLayout,
+    pub surface_inspector: HudElementLayout,
+    pub speedometer: HudElementLayout,
+    pub speedometer_jumps: HudElementLayout,
+    pub speed_graph: HudElementLayout,
     pub snap_to_grid: bool,
     pub grid_size: f32,
 }
 
+/// Layout of an element that has no anchor of its own: no offset, stock scale.
+const HUD_UNMOVED: HudElementLayout = HudElementLayout {
+    anchor: HudAnchor::TopLeft,
+    offset: [0.0, 0.0],
+    scale: 1.0,
+};
+
 impl Default for HudLayout {
     fn default() -> Self {
         Self {
+            movement_keys: HUD_UNMOVED,
+            fps: HUD_UNMOVED,
+            chat: HUD_UNMOVED,
+            center_print: HUD_UNMOVED,
+            crosshair_name: HUD_UNMOVED,
+            follow: HUD_UNMOVED,
+            vote: HUD_UNMOVED,
+            race_timer: HUD_UNMOVED,
+            race_start: HUD_UNMOVED,
+            surface_inspector: HUD_UNMOVED,
+            speedometer: HUD_UNMOVED,
+            speedometer_jumps: HUD_UNMOVED,
+            speed_graph: HUD_UNMOVED,
             // These resolve to the exact pre-editor positions at scale 1.0.
             health: HudElementLayout {
                 anchor: HudAnchor::BottomLeft,
@@ -320,6 +500,19 @@ impl HudLayout {
             HudElementId::Shield => self.shield,
             HudElementId::Ammo => self.ammo,
             HudElementId::Force => self.force,
+            HudElementId::MovementKeys => self.movement_keys,
+            HudElementId::Fps => self.fps,
+            HudElementId::Chat => self.chat,
+            HudElementId::CenterPrint => self.center_print,
+            HudElementId::CrosshairName => self.crosshair_name,
+            HudElementId::Follow => self.follow,
+            HudElementId::Vote => self.vote,
+            HudElementId::RaceTimer => self.race_timer,
+            HudElementId::RaceStart => self.race_start,
+            HudElementId::SurfaceInspector => self.surface_inspector,
+            HudElementId::Speedometer => self.speedometer,
+            HudElementId::SpeedometerJumps => self.speedometer_jumps,
+            HudElementId::SpeedGraph => self.speed_graph,
         }
     }
 
@@ -329,6 +522,19 @@ impl HudLayout {
             HudElementId::Shield => &mut self.shield,
             HudElementId::Ammo => &mut self.ammo,
             HudElementId::Force => &mut self.force,
+            HudElementId::MovementKeys => &mut self.movement_keys,
+            HudElementId::Fps => &mut self.fps,
+            HudElementId::Chat => &mut self.chat,
+            HudElementId::CenterPrint => &mut self.center_print,
+            HudElementId::CrosshairName => &mut self.crosshair_name,
+            HudElementId::Follow => &mut self.follow,
+            HudElementId::Vote => &mut self.vote,
+            HudElementId::RaceTimer => &mut self.race_timer,
+            HudElementId::RaceStart => &mut self.race_start,
+            HudElementId::SurfaceInspector => &mut self.surface_inspector,
+            HudElementId::Speedometer => &mut self.speedometer,
+            HudElementId::SpeedometerJumps => &mut self.speedometer_jumps,
+            HudElementId::SpeedGraph => &mut self.speed_graph,
         }
     }
 
@@ -345,19 +551,201 @@ pub struct HudRect {
     pub height: f32,
 }
 
+/// The settings that decide where the non-anchored HUD elements sit on screen,
+/// so the renderer and the HUD editor agree on each element's stock rectangle.
+#[derive(Debug, Clone, Copy)]
+pub struct HudRectContext {
+    pub movement_keys: MovementKeysSettings,
+    pub draw_fps: u8,
+    pub gpu_enabled: bool,
+    pub cull_debug: bool,
+    pub thread_count: usize,
+    /// `cg_raceTimer` x, y (640x480) and text size.
+    pub race_timer: [f32; 3],
+    /// `cg_raceStart` x, y (640x480).
+    pub race_start: [f32; 2],
+    pub speedometer: crate::speedometer::Settings,
+}
+
+impl HudRectContext {
+    pub fn new(
+        movement_keys: MovementKeysSettings,
+        video: &VideoSettings,
+        perf: &PerfStats,
+        thread_count: usize,
+        race: &crate::japro_cg::JaproCgame,
+    ) -> Self {
+        Self {
+            movement_keys,
+            draw_fps: video.draw_fps,
+            gpu_enabled: perf.gpu_ms.is_some(),
+            cull_debug: video.cull_debug != CullDebugMode::Off,
+            thread_count,
+            race_timer: [race.race_timer_x, race.race_timer_y, race.race_timer_size],
+            race_start: [race.race_start_x, race.race_start_y],
+            speedometer: race.speedometer,
+        }
+    }
+
+    pub fn from_snapshot(ui: &UiSnapshot) -> Self {
+        let mut race = crate::japro_cg::JaproCgame::default();
+        if let Some(live) = ui.race_timer.as_ref() {
+            race.race_timer_x = live.timer_x;
+            race.race_timer_y = live.timer_y;
+            race.race_timer_size = live.size;
+            race.race_start_x = live.start_x;
+            race.race_start_y = live.start_y;
+        }
+        if let Some(speedometer) = ui.speedometer.as_ref() {
+            race.speedometer = speedometer.settings;
+        }
+        Self::new(ui.movement_keys, &ui.video, &ui.perf, ui.threads.len(), &race)
+    }
+}
+
+/// Stock (untransformed) rectangle of an element that is not anchored. These are
+/// the bounds the editor outlines; text elements are sized for typical content.
+fn hud_stock_rect(id: HudElementId, ctx: &HudRectContext, w: u32, h: u32) -> HudRect {
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    let virtual_rect = |x: f32, y: f32, width: f32, height: f32| HudRect {
+        x: x * sx,
+        y: y * sy,
+        width: width * sx,
+        height: height * sy,
+    };
+    match id {
+        HudElementId::MovementKeys => {
+            let mut settings = ctx.movement_keys;
+            settings.mode = settings.mode.clamp(1, 4);
+            let Some((tile, x, y)) = movement_keys_origin(&settings, w, h) else {
+                return HudRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+            };
+            let first_col = if settings.walk { -1.0 } else { 0.0 };
+            let last_col = if settings.mode == 2 { 4.0 } else { 3.0 };
+            let rows = if settings.mode >= 3 { 3.0 } else { 2.0 };
+            HudRect {
+                x: x + first_col * tile,
+                y,
+                width: (last_col - first_col) * tile,
+                height: rows * tile,
+            }
+        }
+        HudElementId::Fps if ctx.draw_fps >= 2 => {
+            let (x, y, width, height) =
+                perf_panel_rect(w, ctx.gpu_enabled, ctx.cull_debug, ctx.thread_count);
+            HudRect { x, y, width, height }
+        }
+        HudElementId::Fps => {
+            let width = 7.0 * 8.0 * 1.55;
+            HudRect {
+                x: (w as f32 - 12.0 - width).max(12.0),
+                y: 12.0,
+                width,
+                height: 13.0,
+            }
+        }
+        HudElementId::Chat => virtual_rect(30.0, 373.0, 400.0, 52.0),
+        HudElementId::CenterPrint => virtual_rect(170.0, 126.0, 300.0, 36.0),
+        HudElementId::CrosshairName => virtual_rect(220.0, 168.0, 200.0, 22.0),
+        HudElementId::Follow => virtual_rect(4.0, 14.0, 160.0, 16.0),
+        HudElementId::Vote => virtual_rect(4.0, 62.0, 340.0, 30.0),
+        HudElementId::RaceTimer => {
+            let k = ctx.race_timer[2] / 0.75;
+            virtual_rect(ctx.race_timer[0], ctx.race_timer[1], 80.0 * k, 60.0 * k)
+        }
+        HudElementId::RaceStart => {
+            let k = ctx.race_timer[2] / 0.75;
+            virtual_rect(ctx.race_start[0], ctx.race_start[1], 80.0 * k, 20.0 * k)
+        }
+        HudElementId::Speedometer => {
+            let s = &ctx.speedometer;
+            virtual_rect(s.x - 2.0, s.y - 14.0, 212.0, 20.0)
+        }
+        HudElementId::SpeedometerJumps => {
+            let s = &ctx.speedometer;
+            virtual_rect(s.jumps_x, s.jumps_y - 14.0, 260.0, 20.0)
+        }
+        HudElementId::SpeedGraph => {
+            use crate::speedometer::flag;
+            let flags = ctx.speedometer.flags;
+            if flags & flag::SPEEDGRAPHOLD != 0 && flags & flag::SPEEDGRAPH == 0 {
+                virtual_rect(544.0, 168.0, 48.0, 144.0)
+            } else {
+                virtual_rect(245.0, 456.0, 150.0, 22.0)
+            }
+        }
+        HudElementId::SurfaceInspector => {
+            let (x, y, width) = surface_inspector_frame(w);
+            HudRect { x, y, width, height: 300.0_f32.min((h as f32 - y - 18.0).max(0.0)) }
+        }
+        HudElementId::Health | HudElementId::Shield | HudElementId::Ammo | HudElementId::Force => {
+            HudRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }
+        }
+    }
+}
+
+/// Scale a drawn element about the centre of its stock rectangle, then shift it.
+fn apply_hud_layout(
+    vertices: &mut [UiVertex],
+    id: HudElementId,
+    layout: HudElementLayout,
+    ctx: &HudRectContext,
+    w: u32,
+    h: u32,
+) {
+    let scale = layout.scale.clamp(0.5, 2.0);
+    if (scale == 1.0 && layout.offset == [0.0, 0.0]) || w == 0 || h == 0 {
+        return;
+    }
+    let stock = hud_stock_rect(id, ctx, w, h);
+    let (cx, cy) = (stock.x + stock.width * 0.5, stock.y + stock.height * 0.5);
+    let (wf, hf) = (w as f32, h as f32);
+    for vertex in vertices {
+        let px = (vertex.position[0] + 1.0) * 0.5 * wf;
+        let py = (1.0 - vertex.position[1]) * 0.5 * hf;
+        let px = cx + (px - cx) * scale + layout.offset[0];
+        let py = cy + (py - cy) * scale + layout.offset[1];
+        vertex.position = [px / wf * 2.0 - 1.0, 1.0 - py / hf * 2.0];
+    }
+}
+
+/// Run `draw` and position whatever it emitted according to element `id`'s layout.
+fn draw_placed(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    id: HudElementId,
+    w: u32,
+    h: u32,
+    draw: impl FnOnce(&mut Vec<UiVertex>),
+) {
+    let start = out.len();
+    draw(out);
+    if out.len() > start {
+        let ctx = HudRectContext::from_snapshot(ui);
+        apply_hud_layout(&mut out[start..], id, ui.hud_layout.element(id), &ctx, w, h);
+    }
+}
+
 pub fn hud_element_rect(
     id: HudElementId,
     layout: HudElementLayout,
+    ctx: &HudRectContext,
     w: u32,
     h: u32,
 ) -> HudRect {
-    let base_panel_w = 218.0_f32.min((w as f32 * 0.30).max(160.0));
-    let base_size = match id {
-        HudElementId::Health | HudElementId::Shield | HudElementId::Ammo | HudElementId::Force => {
-            [base_panel_w, 24.0]
-        }
-    };
     let scale = layout.scale.clamp(0.5, 2.0);
+    if !id.is_anchored() {
+        let stock = hud_stock_rect(id, ctx, w, h);
+        let (width, height) = (stock.width * scale, stock.height * scale);
+        return HudRect {
+            x: stock.x + stock.width * 0.5 + layout.offset[0] - width * 0.5,
+            y: stock.y + stock.height * 0.5 + layout.offset[1] - height * 0.5,
+            width,
+            height,
+        };
+    }
+    let base_panel_w = 218.0_f32.min((w as f32 * 0.30).max(160.0));
+    let base_size = [base_panel_w, 24.0];
     let width = base_size[0] * scale;
     let height = base_size[1] * scale;
     let screen = layout.anchor.screen_fraction();
@@ -397,11 +785,16 @@ pub const SHELPER_WA: u32 = 1 << 6;
 pub const SHELPER_WD: u32 = 1 << 7;
 pub const SHELPER_A: u32 = 1 << 8;
 pub const SHELPER_D: u32 = 1 << 9;
+pub const SHELPER_REAR: u32 = 1 << 10;
 pub const SHELPER_CENTER: u32 = 1 << 11;
+/// jaPRO's line crosshair: replaces the normal crosshair with a short vertical line.
+pub const SHELPER_CROSSHAIR: u32 = 1 << 14;
 pub const SHELPER_S: u32 = 1 << 15;
 pub const SHELPER_SA: u32 = 1 << 16;
 pub const SHELPER_SD: u32 = 1 << 17;
 pub const SHELPER_TINY: u32 = 1 << 18;
+pub const SHELPER_ACCELMETER: u32 = 1 << 12;
+pub const SHELPER_MAX: u32 = 1 << 19;
 pub const SHELPER_STYLE_MASK: u32 = SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -432,6 +825,8 @@ impl Default for StrafeHelperSettings {
     }
 }
 
+/// Everything the movement HUD (strafehelper, movement keys) reads per frame.
+/// Angles are q3 degrees (pitch positive looks down), positions q3 units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovementHudState {
     pub forward_move: i8,
@@ -439,17 +834,36 @@ pub struct MovementHudState {
     pub up_move: i8,
     pub buttons: i32,
     pub velocity: [f32; 3],
+    /// Rendered view orientation; the strafehelper projects through it.
     pub view_yaw: f32,
+    pub view_pitch: f32,
+    pub view_roll: f32,
     pub player_speed: f32,
+    /// On the ground now, and on the previous pmove step (friction needs both).
     pub grounded: bool,
+    pub was_grounded: bool,
     pub fov_x: f32,
+    /// jaPRO `STAT_MOVEMENTSTYLE` (`MV_JKA` off jaPRO servers).
+    pub move_style: i32,
+    pub knockback: bool,
+    /// `pm_type == PM_JETPACK` and `EF_JETPACK_ACTIVE`.
+    pub jetpack_pm_type: bool,
+    pub jetpack_active: bool,
+    pub in_vehicle: bool,
+    pub third_person: bool,
+    /// Player origin minus the rendered eye position.
+    pub eye_to_origin: [f32; 3],
 }
 
 impl Default for MovementHudState {
     fn default() -> Self {
         Self {
             forward_move: 0, right_move: 0, up_move: 0, buttons: 0,
-            velocity: [0.0; 3], view_yaw: 0.0, player_speed: 250.0, grounded: false, fov_x: 90.0,
+            velocity: [0.0; 3], view_yaw: 0.0, view_pitch: 0.0, view_roll: 0.0,
+            player_speed: 250.0, grounded: false, was_grounded: false, fov_x: 90.0,
+            move_style: crate::strafehelper::mv::JKA,
+            knockback: false, jetpack_pm_type: false, jetpack_active: false,
+            in_vehicle: false, third_person: false, eye_to_origin: [0.0; 3],
         }
     }
 }
@@ -464,6 +878,15 @@ pub struct ConsoleSelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsoleSearchMatch {
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
+/// Render-only span for an engine-authored clickable local filesystem path.
+/// The actual target path remains on the app side and is revalidated on click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsolePathLinkUi {
     pub line: usize,
     pub start_col: usize,
     pub end_col: usize,
@@ -612,9 +1035,6 @@ pub enum PvsMode {
     Full,
     #[default]
     Auto,
-    Auto2,
-    Auto3,
-    Auto4,
 }
 
 impl PvsMode {
@@ -624,9 +1044,6 @@ impl PvsMode {
             Self::Minimal => "minimal",
             Self::Full => "full",
             Self::Auto => "auto",
-            Self::Auto2 => "auto2",
-            Self::Auto3 => "auto3",
-            Self::Auto4 => "auto4",
         }
     }
 }
@@ -824,16 +1241,26 @@ pub enum ColorLutPreset {
     KodakPortra400,
     FujiEterna500,
     FujiVelvia50,
+    /// Index into the `.cube` files found in `<base>/LUTs` (see `color_lut`).
+    External(u16),
 }
 
 impl ColorLutPreset {
-    pub const ALL: [Self; 5] = [
+    const BUILT_IN: [Self; 5] = [
         Self::Off,
         Self::KodakVision3_250d,
         Self::KodakPortra400,
         Self::FujiEterna500,
         Self::FujiVelvia50,
     ];
+
+    /// Built-in looks followed by every external `.cube` file.
+    pub fn all() -> Vec<Self> {
+        Self::BUILT_IN
+            .into_iter()
+            .chain((0..crate::color_lut::external_count() as u16).map(Self::External))
+            .collect()
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -842,6 +1269,7 @@ impl ColorLutPreset {
             Self::KodakPortra400 => "KODAK PORTRA 400",
             Self::FujiEterna500 => "FUJI ETERNA 500",
             Self::FujiVelvia50 => "FUJI VELVIA 50",
+            Self::External(index) => crate::color_lut::external_label(index),
         }
     }
 
@@ -852,6 +1280,7 @@ impl ColorLutPreset {
             Self::KodakPortra400 => "kodak_portra_400",
             Self::FujiEterna500 => "fuji_eterna_500",
             Self::FujiVelvia50 => "fuji_velvia_50",
+            Self::External(index) => crate::color_lut::external_key(index),
         }
     }
 
@@ -862,7 +1291,7 @@ impl ColorLutPreset {
             "kodak_portra_400" | "portra_400" | "portra400" => Some(Self::KodakPortra400),
             "fuji_eterna_500" | "eterna_500" | "eterna500" => Some(Self::FujiEterna500),
             "fuji_velvia_50" | "velvia_50" | "velvia50" => Some(Self::FujiVelvia50),
-            _ => None,
+            other => crate::color_lut::find_external(other).map(Self::External),
         }
     }
 }
@@ -999,19 +1428,19 @@ pub enum DynamicShadowsMode {
     #[default]
     Off,
     Blob,
-    Stencil,
+    /// Entity-only sun shadow map aimed by the baked lightgrid (players, NPCs, models).
+    EntityMap,
+    /// Bevy-style directional-light cascades (the only CSM implementation).
     CascadedShadowMaps,
-    CascadedShadowMapsBevy,
     RayTraced,
 }
 
 impl DynamicShadowsMode {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Off,
         Self::Blob,
-        Self::Stencil,
+        Self::EntityMap,
         Self::CascadedShadowMaps,
-        Self::CascadedShadowMapsBevy,
         Self::RayTraced,
     ];
 
@@ -1019,9 +1448,8 @@ impl DynamicShadowsMode {
         match self {
             Self::Off => "off",
             Self::Blob => "blob",
-            Self::Stencil => "stencil",
+            Self::EntityMap => "entity",
             Self::CascadedShadowMaps => "csm",
-            Self::CascadedShadowMapsBevy => "csm_bevy",
             Self::RayTraced => "ray_traced",
         }
     }
@@ -1032,12 +1460,45 @@ impl DynamicShadowsMode {
             // `blob_stencil` was the old combined placeholder. Preserve old
             // configs by migrating it to the now-functional OpenJK blob mode.
             "blob" | "blob_stencil" | "1" => Some(Self::Blob),
-            "stencil" | "stencil_legacy" => Some(Self::Stencil),
+            // `stencil` was a never-implemented placeholder for this slot; keep old
+            // configs on the nearest functional entity-shadow technique.
+            "entity" | "entity_map" | "stencil" | "stencil_legacy" => Some(Self::EntityMap),
             // Keep the old numeric aliases stable so archived configs do not
-            // silently shift when Stencil gets its own menu slot.
-            "csm" | "cascaded" | "cascaded_shadow_maps" | "2" => Some(Self::CascadedShadowMaps),
-            "csm_bevy" | "bevy_csm" | "cascaded_shadow_maps_bevy" => Some(Self::CascadedShadowMapsBevy),
+            // silently shift when EntityMap gets its own menu slot.
+            // The old non-Bevy CSM was removed; its aliases land on the Bevy CSM.
+            "csm" | "cascaded" | "cascaded_shadow_maps" | "2" | "csm_bevy" | "bevy_csm"
+            | "cascaded_shadow_maps_bevy" => Some(Self::CascadedShadowMaps),
             "ray_traced" | "raytraced" | "3" | "4" => Some(Self::RayTraced),
+            _ => None,
+        }
+    }
+}
+
+/// Where the Entity map shadow mode aims its light.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EntityShadowLight {
+    /// The BSP lightgrid's baked dominant direction at the local player.
+    #[default]
+    Lightgrid,
+    /// The strongest authored map light in range, taken from its real position
+    /// (falls back to the lightgrid direction when no light qualifies).
+    Authored,
+}
+
+impl EntityShadowLight {
+    pub const ALL: [Self; 2] = [Self::Lightgrid, Self::Authored];
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Lightgrid => "lightgrid",
+            Self::Authored => "authored",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lightgrid" | "grid" | "0" => Some(Self::Lightgrid),
+            "authored" | "light" | "lights" | "1" => Some(Self::Authored),
             _ => None,
         }
     }
@@ -1184,6 +1645,40 @@ impl RainIntensity {
             Self::Rain => 0.52,
             Self::Heavy => 0.90,
         }
+    }
+}
+
+/// How puddles and wet ground are shaded. `High` reuses the GodotOcean water
+/// response (roughness-aware Fresnel, GGX sun and light glints) and traces
+/// longer, streaked screen-space reflections; `Standard` keeps the cheaper film
+/// response. Either way the cost is only paid on wet pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PuddleQuality {
+    Standard,
+    #[default]
+    High,
+}
+
+impl PuddleQuality {
+    pub const ALL: [Self; 2] = [Self::Standard, Self::High];
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::High => "high",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" | "normal" | "low" | "0" => Some(Self::Standard),
+            "high" | "ocean" | "1" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn is_high(self) -> bool {
+        self == Self::High
     }
 }
 
@@ -1380,6 +1875,10 @@ pub const VIDEO_ROW_MODEL_BRIGHTNESS: usize = 74;
 pub const VIDEO_ROW_DLIGHT_BRIGHTNESS: usize = 75;
 pub const VIDEO_ROW_DRAW_TRIGGERS: usize = 76;
 pub const VIDEO_ROW_DRAW_CLIP_BRUSHES: usize = 77;
+pub const VIDEO_ROW_FX_PHYSICS: usize = 78;
+pub const VIDEO_ROW_FX_LOD: usize = 79;
+pub const VIDEO_ROW_ENTITY_SHADOW_LIGHT: usize = 80;
+pub const VIDEO_ROW_DRAW_ENTITIES: usize = 81;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -1410,6 +1909,10 @@ pub const ENV_ROW_SUN_COLOR: usize = 25;
 pub const ENV_ROW_SUN_VISIBILITY: usize = 26;
 pub const ENV_ROW_WEATHER_GUST_STRENGTH: usize = 27;
 pub const ENV_ROW_WEATHER_DIRECTION_VARIATION: usize = 28;
+pub const ENV_ROW_PUDDLE_WATER: usize = 29;
+pub const ENV_ROW_PUDDLE_SCATTER: usize = 30;
+pub const ENV_ROW_RAIN_GRADE: usize = 31;
+pub const ENV_ROW_ENTITY_SUN_LIGHTING: usize = 32;
 
 pub const SUN_INTENSITY_MAX: f32 = 4000.0;
 
@@ -1429,24 +1932,27 @@ pub const CLOUD_ROW_EMPTY_SKIP: usize = 13;
 
 
 impl FogMode {
-    pub fn config_value(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::LegacyDrawFog1 => "legacy1",
-            Self::LegacyDrawFog2 => "legacy2",
-            Self::Volumetric => "volumetric",
-        }
-    }
-
     pub fn is_legacy(self) -> bool {
         matches!(self, Self::LegacyDrawFog1 | Self::LegacyDrawFog2)
     }
 
+    /// `r_drawfog`: OpenJK's 0/1/2, plus 3 for DinurdoJK's volumetric fog.
     pub fn drawfog_value(self) -> u8 {
         match self {
+            Self::Off => 0,
             Self::LegacyDrawFog1 => 1,
             Self::LegacyDrawFog2 => 2,
-            _ => 0,
+            Self::Volumetric => 3,
+        }
+    }
+
+    pub fn from_drawfog(value: &str) -> Option<Self> {
+        match value.trim() {
+            "0" => Some(Self::Off),
+            "1" => Some(Self::LegacyDrawFog1),
+            "2" => Some(Self::LegacyDrawFog2),
+            "3" => Some(Self::Volumetric),
+            _ => None,
         }
     }
 }
@@ -1702,6 +2208,16 @@ pub struct VideoSettings {
     /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
     /// render-frame-driven behavior; non-zero values are fixed Hz.
     pub fx_fps: u32,
+    /// `fx_physics`: 0 off, 2 authored expensivePhysics (default), 3 force all.
+    pub fx_physics: u32,
+    /// `fx_lod`: 0 stock, 1 authored cullRange, 2 adaptive screen-size density.
+    pub fx_lod: u32,
+    /// Stock `fx_countScale` (0..1).
+    pub fx_count_scale: f32,
+    /// `r_fxLodScale`: multiplies authored EFX cullRange (default 5, like r_lodscale).
+    pub fx_lod_scale: f32,
+    /// `r_lodScale`: Ghoul2 projected-size LOD scale (OpenJK default 5).
+    pub lod_scale: f32,
     /// View-dependent EFX geometry expansion path. FX simulation itself already
     /// runs on the dedicated `jka-fx` worker; this controls the later sprite/line
     /// tessellation step against the final camera.
@@ -1718,14 +2234,27 @@ pub struct VideoSettings {
     /// Session-only: never written to the config.
     pub draw_triggers: bool,
     pub draw_clip_brushes: bool,
+    /// `r_drawEntities`: NetRadiant-style colored boxes, classname labels and
+    /// target/targetname link lines for every map entity. Session-only.
+    pub draw_entities: bool,
     pub draw_fps: u8,
     pub developer_tools: bool,
     pub perf_trace: bool,
+    /// World renderer choice (`r_worldPath unified`): keeps the world on
+    /// the unified renderer even when the FastBaseline feature envelope matches,
+    /// so "minimal unified" can be timed against the untouched baseline.
+    pub force_unified_world: bool,
+    /// Session-only: parallax occlusion on top of `r_pbr` (`r_pom`, default on).
+    pub pom: bool,
     pub gpu_timings: bool,
     pub ghoul2_skinning: Ghoul2SkinningMode,
     pub ghoul2_early_cull: bool,
     pub ghoul2_lod_bias: i32,
     pub ghoul2_batch_draws: Ghoul2BatchMode,
+    /// `r_ghoul2animsmooth`: jaPRO `CBoneCache::SmoothLow` renderer bone-history
+    /// filter factor. Matches jaPRO's own default of 0.3; only active strictly
+    /// between 0 and 1 (0 or >=1 disables it).
+    pub ghoul2_anim_smooth: f32,
     pub physics_msec: u32,
     pub input_subframe: bool,
     /// Request a 1 ms Windows multimedia timer period for timeout/sleep waits.
@@ -1801,6 +2330,10 @@ pub struct VideoSettings {
     pub sun_color: [f32; 3],
     /// Controls whether direct shader-sun light requires an authored sky portal.
     pub sun_visibility: SunVisibilityMode,
+    /// Strips the baked map sun out of the entity lightgrid sample and re-adds
+    /// it as a directional light that follows the runtime sun (color, intensity,
+    /// direction). Needs Entity ambient lighting = BSP lightgrid.
+    pub entity_sun_lighting: bool,
     /// 0 = map/default distanceCull; otherwise multiplier applied to that base.
     pub distance_cull_scale: f32,
     pub clouds: bool,
@@ -1814,6 +2347,12 @@ pub struct VideoSettings {
     pub weather_wind: crate::ocean::OceanWind,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
+    pub puddle_quality: PuddleQuality,
+    /// How readily rain collects in scattered puddles on large flat ground, 0..1.
+    pub puddle_scatter: f32,
+    /// Strength of the wet-weather colour grade (cool shadows, warm highlights,
+    /// richer neon) while it rains, 0..1.
+    pub rain_grade: f32,
     pub footprints: FootprintMode,
     pub grass: bool,
     /// Runtime A/B diagnostic: hoist root wind/clump work to a compute pass.
@@ -1822,6 +2361,7 @@ pub struct VideoSettings {
     pub grass_mid_lod: bool,
     /// Runtime A/B diagnostic: order opaque grass near-to-far for early-Z.
     pub grass_front_to_back: bool,
+    pub contact_shadow_debug: u8,
     pub ocean: bool,
     pub ocean_settings: crate::ocean::OceanSettings,
     pub cloud_render_resolution: CloudRenderResolution,
@@ -1856,6 +2396,8 @@ pub struct VideoSettings {
     pub entity_ambient_lighting: EntityAmbientLightingMode,
     pub dynamic_lights: DynamicLightsMode,
     pub rt_samples: u32,
+    /// 0 = stock JKA 1 - d^2/r^2, 1 = windowed inverse-square.
+    pub dynamic_light_falloff: u32,
     pub rt_half_resolution: bool,
     /// Source `.map` only: approximate a compiled lighting pass from authored light entities.
     pub map_light_simulation: bool,
@@ -1891,6 +2433,7 @@ pub struct VideoSettings {
     pub emissive_area_lights: bool,
     pub voxel_probe_gi: bool,
     pub dynamic_shadows: DynamicShadowsMode,
+    pub entity_shadow_light: EntityShadowLight,
     pub local_light_shadows: bool,
     pub cascaded_shadows: bool,
     pub cull_debug: CullDebugMode,
@@ -1953,19 +2496,28 @@ impl Default for VideoSettings {
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
             fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
+            fx_lod: crate::fx::FX_LOD_DEFAULT,
+            fx_count_scale: 1.0,
+            fx_lod_scale: crate::fx::LOD_SCALE_DEFAULT,
+            lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             fx_geometry: FxGeometryMode::Cpu,
             fx_zero_alpha_discard: false,
             draw_map_models: true,
             draw_triggers: false,
             draw_clip_brushes: false,
+            draw_entities: false,
             draw_fps: 1,
             developer_tools: false,
             perf_trace: false,
+            force_unified_world: false,
+            pom: true,
             gpu_timings: false,
             ghoul2_skinning: Ghoul2SkinningMode::Gpu,
             ghoul2_early_cull: true,
             ghoul2_lod_bias: 0,
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
+            ghoul2_anim_smooth: 0.3,
             physics_msec: 8,
             input_subframe: false,
             timer_resolution_1ms: false,
@@ -2022,6 +2574,7 @@ impl Default for VideoSettings {
             sun_intensity: 250.0,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
+            entity_sun_lighting: false,
             distance_cull_scale: 0.0,
             clouds: true,
             cloud_type: CloudType::Storm,
@@ -2038,11 +2591,15 @@ impl Default for VideoSettings {
             },
             rain: false,
             rain_intensity: RainIntensity::Rain,
+            puddle_quality: PuddleQuality::High,
+            puddle_scatter: 0.8,
+            rain_grade: 0.5,
             footprints: FootprintMode::ThreeD,
             grass: true,
             grass_precompute: true,
             grass_mid_lod: true,
             grass_front_to_back: true,
+            contact_shadow_debug: 0,
             ocean: false,
             ocean_settings: crate::ocean::OceanSettings::default(),
             cloud_render_resolution: CloudRenderResolution::Full,
@@ -2075,6 +2632,7 @@ impl Default for VideoSettings {
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             dynamic_lights: DynamicLightsMode::Off,
             rt_samples: 1,
+            dynamic_light_falloff: 0,
             rt_half_resolution: false,
             map_light_simulation: false,
             world_lighting: true,
@@ -2092,6 +2650,7 @@ impl Default for VideoSettings {
             emissive_area_lights: false,
             voxel_probe_gi: false,
             dynamic_shadows: DynamicShadowsMode::Off,
+            entity_shadow_light: EntityShadowLight::Lightgrid,
             local_light_shadows: false,
             cascaded_shadows: false,
             cull_debug: CullDebugMode::Off,
@@ -2216,6 +2775,18 @@ pub struct MapLoadingUi {
     pub bars: Vec<MapLoadingBar>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictionDebugUi {
+    /// True while cg_predictionDebug is enabled. The HUD panel is shown even
+    /// before the first miss so a tester can verify instrumentation is active.
+    pub show_panel: bool,
+    /// Flash the screen edge for a recent miss above the configured threshold.
+    pub flash: bool,
+    pub threshold: f32,
+    pub last_miss: Option<f32>,
+    pub lines: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
     pub setup_selected: usize,
@@ -2234,6 +2805,7 @@ pub struct UiSnapshot {
     pub console_search_index: Option<usize>,
     pub console_search_matches: Vec<ConsoleSearchMatch>,
     pub console_search_active: Option<ConsoleSearchMatch>,
+    pub console_path_links: Vec<ConsolePathLinkUi>,
     /// Total retained log lines and how many the view is scrolled up from the newest.
     pub console_total_lines: usize,
     pub console_scrolled: usize,
@@ -2251,14 +2823,24 @@ pub struct UiSnapshot {
     pub chat_lines: Vec<UiChatLine>,
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
+    /// jaPRO `cg_raceTimer` / `cg_raceStart` readout (updates every frame of a run).
+    pub race_timer: Option<crate::japro_cg::RaceTimerUi>,
+    /// `CG_DrawVote`: the open vote's summary line (colour codes included).
+    pub vote_line: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
     pub demo_timeline: Option<DemoTimelineUi>,
+    pub prediction_debug: Option<PredictionDebugUi>,
     pub hud: Option<HudState>,
     pub hud_layout: HudLayout,
     pub crosshair: CrosshairSettings,
+    pub crosshair_target: UiCrosshairTarget,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub movement_hud: MovementHudState,
+    /// jaPRO `cg_speedometer` draw list for this frame.
+    pub speedometer: Option<crate::speedometer::Ui>,
+    /// jaPRO `CG_DrawLagometer` draw list for this frame (graph and connection warning).
+    pub lagometer: Option<crate::lagometer::Ui>,
     pub video: VideoSettings,
     pub perf: PerfStats,
     pub threads: [ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
@@ -2288,6 +2870,7 @@ impl Default for UiSnapshot {
             console_search_index: None,
             console_search_matches: Vec::new(),
             console_search_active: None,
+            console_path_links: Vec::new(),
             console_total_lines: 0,
             console_scrolled: 0,
             console_suggest_enabled: true,
@@ -2301,14 +2884,20 @@ impl Default for UiSnapshot {
             chat_lines: Vec::new(),
             center_print: None,
             follow_name: None,
+            race_timer: None,
+            vote_line: None,
             scoreboard: None,
             demo_timeline: None,
+            prediction_debug: None,
             hud: None,
             hud_layout: HudLayout::default(),
             crosshair: CrosshairSettings::default(),
+            crosshair_target: UiCrosshairTarget::default(),
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             movement_hud: MovementHudState::default(),
+            speedometer: None,
+            lagometer: None,
             video: VideoSettings::default(),
             perf: PerfStats::default(),
             threads: [ThreadPerfStats::default(); crate::thread_activity::SLOT_COUNT],
@@ -2466,9 +3055,8 @@ pub fn build_vertices(
         }
         return out;
     }
-    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit) {
-        build_follow_indicator(&mut out, ui, small_font, width, height);
-        build_scoreboard(&mut out, ui, width, height);
+    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit) {
+        build_scoreboard(&mut out, ui, small_font, width, height);
     }
     if ui.video.reflection_debug {
         build_reflection_debug_legend(&mut out, ui, width, height);
@@ -2477,13 +3065,13 @@ pub fn build_vertices(
         OverlayMode::None | OverlayMode::Chat => {}
         OverlayMode::Console => build_console(&mut out, ui, width, height),
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
-        OverlayMode::Video | OverlayMode::Game | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit => {}
+        OverlayMode::Video | OverlayMode::Game | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit | OverlayMode::EntityGraph | OverlayMode::Trace => {}
     }
-    if matches!(ui.mode, OverlayMode::None | OverlayMode::Game | OverlayMode::Video) {
-        if let Some(info) = &ui.surface_inspector {
-            build_surface_inspector(&mut out, info, width, height);
-        }
-    }
+    // The trace result panel used to be drawn here from `ui.surface_inspector`
+    // (`build_surface_inspector`, a static non-interactive readout). It's now
+    // the clickable `OverlayMode::Trace` egui menu (`app::egui_trace_menu`);
+    // `ui.surface_inspector` still mirrors the selected entry for Ctrl+C, but
+    // nothing draws it on the HUD any more.
     if let Some(progress) = &ui.static_ao_progress {
         build_background_progress(&mut out, progress, width, height);
     }
@@ -2495,7 +3083,7 @@ fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> bool {
         && height != 0
         && !ui.video.skip_ui
         && ui.loading.is_none()
-        && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit)
+        && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit)
 }
 
 /// Stable gameplay HUD geometry. This changes when HUD values/settings change,
@@ -2509,7 +3097,6 @@ pub fn build_dynamic_static_vertices(
     if !gameplay_hud_visible(ui, width, height) {
         return;
     }
-    build_crosshair(out, ui.crosshair, width, height);
     build_hud(out, ui, width, height);
 }
 
@@ -2525,7 +3112,9 @@ pub fn build_movement_vertices(
         return;
     }
     build_strafe_helper(out, ui, width, height);
-    build_movement_keys(out, ui, width, height);
+    draw_placed(out, ui, HudElementId::MovementKeys, width, height, |out| {
+        build_movement_keys(out, ui, width, height);
+    });
 }
 
 /// Chat history and center-print alpha are periodic presentation changes, not
@@ -2542,25 +3131,113 @@ pub fn build_transient_vertices(
     }
     let gameplay_overlay = matches!(
         ui.mode,
-        OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::MapEdit
+        OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit
     );
+    if gameplay_hud_visible(ui, width, height) {
+        // Colour and name follow the aim target, so they share the small batch
+        // that is rebuilt when it changes rather than the stable HUD prefix.
+        let mut crosshair = ui.crosshair;
+        if ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0 {
+            // jaPRO draws its line crosshair from cg_strafeHelper and suppresses the normal one.
+            crosshair.style = CROSSHAIR_STYLE_LINE;
+            crosshair.image = 0;
+        }
+        build_crosshair(
+            out,
+            crosshair,
+            ui.crosshair_target.color,
+            ui.strafe_helper.line_width,
+            width,
+            height,
+        );
+        draw_placed(out, ui, HudElementId::CrosshairName, width, height, |out| {
+            build_crosshair_name(out, ui, small_font, width, height);
+        });
+    }
     if gameplay_overlay {
-        build_chat_history(out, ui, small_font, width, height);
-        build_center_print(out, ui, small_font, width, height);
+        // Follows the snapshot's client every frame (CG_DrawFollow), so it lives
+        // in the batch that is republished on change, not the retained UI.
+        draw_placed(out, ui, HudElementId::Follow, width, height, |out| {
+            build_follow_indicator(out, ui, small_font, width, height);
+        });
+        build_race_timer(out, ui, small_font, width, height);
+        build_speedometer(out, ui, small_font, width, height);
+        build_lagometer(out, ui, small_font, width, height);
+        draw_placed(out, ui, HudElementId::Vote, width, height, |out| {
+            build_vote(out, ui, width, height);
+        });
+        draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
+            build_chat_history(out, ui, small_font, width, height);
+        });
+        draw_placed(out, ui, HudElementId::CenterPrint, width, height, |out| {
+            build_center_print(out, ui, small_font, width, height);
+        });
         build_demo_timeline(out, ui, width, height);
     }
+    build_prediction_debug(out, ui, width, height);
     // FPS/perf is intentionally visible above menus too, matching the old
     // retained path and submit_ui_overlay ordering.
-    match ui.video.draw_fps {
+    draw_placed(out, ui, HudElementId::Fps, width, height, |out| match ui.video.draw_fps {
         0 => {}
         1 => build_fps_simple(out, ui, width, height),
         _ => build_perf(out, ui, width, height),
-    }
+    });
     if ui.mode == OverlayMode::Chat {
         // The input box is anchored to the oldest visible chat line, so keep
         // it in the same transient batch as chat history. This lets fades/new
         // messages reposition it without rebuilding the retained UI.
-        build_chat_input(out, ui, small_font, width, height);
+        draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
+            build_chat_input(out, ui, small_font, width, height);
+        });
+    }
+}
+
+fn build_prediction_debug(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(debug) = &ui.prediction_debug else {
+        return;
+    };
+
+    if debug.flash {
+        // A border instead of a full-screen wash keeps the world readable while
+        // still making a one/few-frame prediction discontinuity impossible to miss.
+        let t = 8.0_f32.min((w.min(h) as f32 * 0.02).max(3.0));
+        let c = [1.0, 0.05, 0.02, 0.72];
+        rect(out, 0.0, 0.0, w as f32, t, c, w, h);
+        rect(out, 0.0, h as f32 - t, w as f32, t, c, w, h);
+        rect(out, 0.0, 0.0, t, h as f32, c, w, h);
+        rect(out, w as f32 - t, 0.0, t, h as f32, c, w, h);
+    }
+
+    if !debug.show_panel {
+        return;
+    }
+
+    let x = 18.0;
+    // Keep clear of the simple/detailed FPS block in the upper-left.
+    let y = if ui.video.draw_fps == 0 { 18.0 } else { 92.0 };
+    let line_h = 10.0;
+    let line_count = debug.lines.len().max(1) as f32;
+    let panel_w = (w as f32 * 0.72).clamp(420.0, 980.0);
+    let panel_h = 34.0 + line_count * line_h;
+    rect(out, x - 8.0, y - 7.0, panel_w, panel_h, [0.0, 0.0, 0.0, 0.68], w, h);
+    rect(out, x - 8.0, y - 7.0, 3.0, panel_h, [0.9, 0.18, 0.05, 0.95], w, h);
+
+    let heading = debug.last_miss.map_or_else(
+        || format!("PREDICTION DIAGNOSTICS  threshold {:.1}u  no miss captured yet", debug.threshold),
+        |miss| format!("PREDICTION DIAGNOSTICS  last miss {:.2}u  threshold {:.1}u", miss, debug.threshold),
+    );
+    text(out, &heading, x, y, 1.0, [1.0, 0.72, 0.45, 1.0], w, h);
+    for (index, line) in debug.lines.iter().enumerate() {
+        text(
+            out,
+            line,
+            x,
+            y + 13.0 + index as f32 * line_h,
+            0.9,
+            [0.92, 0.94, 0.98, 1.0],
+            w,
+            h,
+        );
     }
 }
 
@@ -2685,7 +3362,7 @@ fn build_center_print(
         return;
     }
     let y_scale = h as f32 / 480.0;
-    let center_y = 480.0 * 0.30 * y_scale;
+    let center_y = 480.0 * print.y_fraction.clamp(0.0, 1.0) * y_scale;
 
     if let Some(font) = medium_font {
         // CG_DrawCenterString uses FONT_MEDIUM, scale 1.0, centred around 30%
@@ -2746,49 +3423,291 @@ fn build_follow_indicator(
     w: u32,
     h: u32,
 ) {
-    let Some(name) = ui.follow_name.as_deref() else { return };
+    let Some(follow) = ui.follow_name.as_deref() else { return };
+    // Second line (optional) is the jaPRO racemode movement style.
+    let (name, style) = match follow.split_once('\n') {
+        Some((name, style)) => (name, Some(style)),
+        None => (follow, None),
+    };
     if name.is_empty() {
         return;
     }
 
-    let label = format!("^7FOLLOWING ^2{name}");
-    let y = 72.0 * h as f32 / 480.0;
-    if let Some(font) = small_font {
-        let scale = 0.72;
-        let virtual_width = proportional_text_width(&label, font, scale);
-        let x = ((640.0 - virtual_width) * 0.5) * w as f32 / 640.0;
-        proportional_text(
+    // jaPRO CG_DrawFollow: CG_Text_Paint(4, 27, 0.85, colorWhite, name, ..,
+    // FONT_MEDIUM) - the name, top-left, no drop shadow; in jaPRO racemode the
+    // style goes at (4, 44) scale 0.7. 0.85 * 0.78 maps the medium-font role
+    // onto the shared OCR font (see build_center_print).
+    let x = 4.0 * w as f32 / 640.0;
+    let lines = std::iter::once((name, 27.0, 0.85)).chain(style.map(|style| (style, 44.0, 0.7)));
+    for (text, y, scale) in lines {
+        let y = y * h as f32 / 480.0;
+        if let Some(font) = small_font {
+            proportional_text(out, text, font, x, y, scale * 0.78, [1.0, 1.0, 1.0, 1.0], false, w, h);
+            continue;
+        }
+        let glyph_scale = scale / 0.85;
+        fixed_charset_text(
             out,
-            &label,
-            font,
+            text,
             x,
             y,
-            scale,
+            w as f32 * (8.0 / 640.0) * glyph_scale,
+            h as f32 * (12.0 / 480.0) * glyph_scale,
+            w as f32 * (8.0 / 640.0) * glyph_scale,
             [1.0, 1.0, 1.0, 1.0],
+            false,
+            w,
+            h,
+        );
+    }
+}
+
+/// `CG_DrawVote`: two `CG_DrawSmallString` lines at (4, 62) while a vote is open.
+fn build_vote(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(line) = ui.vote_line.as_deref() else { return };
+    let x = 4.0 * w as f32 / 640.0;
+    let glyph_w = w as f32 * (8.0 / 640.0);
+    let glyph_h = h as f32 * (12.0 / 480.0);
+    let mut y = 62.0 * h as f32 / 480.0;
+    for text in [line, "or press ESC then click Vote"] {
+        fixed_charset_text(out, text, x, y, glyph_w, glyph_h, glyph_w, [1.0, 1.0, 1.0, 1.0], true, w, h);
+        y += h as f32 * (18.0 / 480.0);
+    }
+}
+
+/// jaPRO `DF_RaceTimer`: `CG_Text_Paint(x, y, size, ..)` at the configured
+/// 640x480 position, shadowed, for the timer block and the start-speed line.
+/// Clamp a colour the speedometer derived from `1 / ratio^2` (infinite when the
+/// reference speed is zero) into a drawable range.
+fn speedometer_color(color: [f32; 4]) -> [f32; 4] {
+    color.map(|channel| if channel.is_nan() { 1.0 } else { channel.clamp(0.0, 1.0) })
+}
+
+/// jaPRO `cg_speedometer`: text at the 640x480 positions `DF_DrawSpeedometer`
+/// and friends pick, in the same shadowed font as the race timer.
+fn build_speedometer(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(speedo) = ui.speedometer.as_ref() else { return };
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text| {
+        let (px, py) = (item.x * sx, item.y * sy);
+        let color = speedometer_color(item.color);
+        if let Some(font) = small_font {
+            // Glyph bytes: the acceleration label is the font's 0xB5 character.
+            let bytes: Vec<u8> = item.text.chars().map(|c| c as u32 as u8).collect();
+            proportional_text(out, bytes, font, px, py, speedo.size * 0.78, color, true, w, h);
+        } else {
+            let ascii: String = item.text.chars().map(|c| if c == '\u{b5}' { 'u' } else { c }).collect();
+            text(out, &ascii, px, py, speedo.size * 1.4, color, w, h);
+        }
+    };
+    let fill = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Rect| {
+        let color = speedometer_color(item.color);
+        let (x, y, rw, rh) = (item.x * sx, item.y * sy, item.w * sx, item.h * sy);
+        match item.outline {
+            Some(thickness) => rect_outline(out, x, y, rw, rh, (thickness * sy).max(1.0), color, w, h),
+            None => rect(out, x, y, rw, rh, color, w, h),
+        }
+    };
+    draw_placed(out, ui, HudElementId::Speedometer, w, h, |out| {
+        for item in &speedo.rects {
+            fill(out, item);
+        }
+        for item in &speedo.texts {
+            paint(out, item);
+        }
+    });
+    draw_placed(out, ui, HudElementId::SpeedometerJumps, w, h, |out| {
+        for item in &speedo.jump_texts {
+            paint(out, item);
+        }
+    });
+    draw_placed(out, ui, HudElementId::SpeedGraph, w, h, |out| {
+        // The old speed graph's lag frame goes under its bars, its readout over them.
+        for pic in &speedo.graph_pics {
+            lagometer_pic(out, pic, w, h);
+        }
+        for item in &speedo.graph_rects {
+            fill(out, item);
+        }
+        for item in &speedo.graph_texts {
+            lagometer_text(out, item, small_font, w, h);
+        }
+    });
+}
+
+/// Image names of the icon atlas (see `renderer::load_ui_icon_atlas`): the two
+/// lagometer images in `crate::lagometer::Icon` order, then the image crosshairs
+/// from `ICON_CROSSHAIR_BASE` in `CROSSHAIR_IMAGE_NAMES` order.
+pub const ICON_NAMES: [&str; 2 + CROSSHAIR_IMAGE_COUNT as usize] = [
+    "gfx/2d/lag",
+    "gfx/2d/net",
+    CROSSHAIR_IMAGE_NAMES[0],
+    CROSSHAIR_IMAGE_NAMES[1],
+    CROSSHAIR_IMAGE_NAMES[2],
+    CROSSHAIR_IMAGE_NAMES[3],
+    CROSSHAIR_IMAGE_NAMES[4],
+    CROSSHAIR_IMAGE_NAMES[5],
+    CROSSHAIR_IMAGE_NAMES[6],
+    CROSSHAIR_IMAGE_NAMES[7],
+    CROSSHAIR_IMAGE_NAMES[8],
+    CROSSHAIR_IMAGE_NAMES[9],
+];
+/// Atlas cell of the first image crosshair.
+const ICON_CROSSHAIR_BASE: usize = 2;
+/// Edge of one atlas cell in texels; the retail 32x32 images are resampled to it.
+pub const ICON_CELL: u32 = 64;
+/// Texture source id of the icon atlas in `ui.wgsl`.
+const ICON_TEXTURE_SOURCE: f32 = 5.0;
+
+/// The whole of atlas cell `index` as (uv0, uv1).
+fn icon_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
+    let cell = ICON_CELL as f32;
+    let atlas_w = ICON_NAMES.len() as f32 * cell;
+    let index = index as f32;
+    // Half-texel inset keeps linear filtering inside this image's cell.
+    let u0 = (index * cell + 0.5) / atlas_w;
+    let u1 = ((index + 1.0) * cell - 0.5) / atlas_w;
+    ([u0, 0.5 / cell], [u1, (cell - 0.5) / cell])
+}
+
+/// `CG_DrawPic` of a lagometer image: the whole image, white, alpha blended.
+fn lagometer_pic(out: &mut Vec<UiVertex>, pic: &crate::lagometer::Pic, w: u32, h: u32) {
+    let index = match pic.icon {
+        crate::lagometer::Icon::Lag => 0,
+        crate::lagometer::Icon::Net => 1,
+    };
+    let (uv0, uv1) = icon_cell_uv(index);
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    textured_rect_with_source(
+        out,
+        pic.x * sx,
+        pic.y * sy,
+        pic.w * sx,
+        pic.h * sy,
+        uv0,
+        uv1,
+        [1.0; 4],
+        ICON_TEXTURE_SOURCE,
+        w,
+        h,
+    );
+}
+
+/// `CG_Text_Paint(.., 0.5, colorWhite, .., ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL)`; a
+/// right-aligned item subtracts `CG_Text_Width` from its x first.
+fn lagometer_text(
+    out: &mut Vec<UiVertex>,
+    item: &crate::lagometer::Text,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    const SCALE: f32 = 0.5;
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    if let Some(font) = small_font {
+        let x = if item.right {
+            item.x - proportional_text_width(&item.text, font, SCALE)
+        } else {
+            item.x
+        };
+        proportional_text(out, &item.text, font, x * sx, item.y * sy, SCALE, [1.0; 4], true, w, h);
+    } else {
+        // Asset fallback only (see build_chat_history): the fixed charset at a small size.
+        const GLYPH_W: f32 = 5.0;
+        let x = if item.right {
+            item.x - visible_jka_chars(&item.text) as f32 * GLYPH_W
+        } else {
+            item.x
+        };
+        fixed_charset_text(
+            out,
+            &item.text,
+            x * sx,
+            item.y * sy,
+            GLYPH_W * sx,
+            8.0 * sy,
+            GLYPH_W * sx,
+            [1.0; 4],
             true,
             w,
             h,
         );
-        return;
     }
+}
 
-    let glyph_w = w as f32 * (8.0 / 640.0);
-    let glyph_h = h as f32 * (12.0 / 480.0);
-    let advance = w as f32 * (8.0 / 640.0);
-    let x = (w as f32 - visible_jka_chars(&label) as f32 * advance) * 0.5;
-    fixed_charset_text(
-        out,
-        &label,
-        x,
-        y,
-        glyph_w,
-        glyph_h,
-        advance,
-        [1.0, 1.0, 1.0, 1.0],
-        true,
-        w,
-        h,
-    );
+/// jaPRO `CG_DrawLagometer` / `CG_DrawDisconnect`: the graph in the lag frame, its
+/// numbers, and the "Connection Interrupted" warning, at the 640x480 positions the
+/// draw list carries (no drop of `widthRatioCoef`, as for the speedometer).
+fn build_lagometer(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(lag) = ui.lagometer.as_ref() else { return };
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    for pic in &lag.pics {
+        lagometer_pic(out, pic, w, h);
+    }
+    for bar in &lag.rects {
+        rect(out, bar.x * sx, bar.y * sy, bar.w * sx, bar.h * sy, bar.color, w, h);
+    }
+    for item in &lag.texts {
+        lagometer_text(out, item, small_font, w, h);
+    }
+    // CG_DrawBigString: 16x16 glyphs of the fixed charset, white with a shadow.
+    for item in &lag.big_texts {
+        fixed_charset_text(
+            out,
+            &item.text,
+            item.x * sx,
+            item.y * sy,
+            item.char_w * sx,
+            crate::lagometer::BIGCHAR * sy,
+            item.char_w * sx,
+            [1.0; 4],
+            true,
+            w,
+            h,
+        );
+    }
+}
+
+fn build_race_timer(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(race) = ui.race_timer.as_ref() else { return };
+    let paint = |out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32, color: [f32; 4]| {
+        if value.is_empty() {
+            return;
+        }
+        let px = x * w as f32 / 640.0;
+        let py = y * h as f32 / 480.0;
+        if let Some(font) = small_font {
+            // 0.78 maps the medium-font role onto the shared OCR font (see build_center_print).
+            proportional_text(out, value, font, px, py, race.size * 0.78, color, true, w, h);
+        } else {
+            text(out, value, px, py, race.size * 1.4, color, w, h);
+        }
+    };
+    draw_placed(out, ui, HudElementId::RaceTimer, w, h, |out| {
+        paint(out, &race.timer_text, race.timer_x, race.timer_y, [1.0, 1.0, 1.0, 1.0]);
+    });
+    let [r, g, b] = race.start_color;
+    draw_placed(out, ui, HudElementId::RaceStart, w, h, |out| {
+        paint(out, &race.start_text, race.start_x, race.start_y, [r, g, b, 1.0]);
+    });
 }
 
 fn visible_jka_chars(value: &str) -> usize {
@@ -2855,85 +3774,389 @@ fn center_print_lines(value: &str) -> Vec<String> {
     lines
 }
 
-fn build_scoreboard(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+fn build_scoreboard(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
     let Some(board) = &ui.scoreboard else { return };
 
-    // This is intentionally a renderer-native scoreboard rather than a menu:
-    // holding +scores must work during normal live play without changing input
-    // capture or entering an egui overlay.
-    const BOARD_SCALE: f32 = 1.75;
-    let base_width = (w as f32 * 0.70).clamp(500.0, 780.0);
-    let width = (base_width * BOARD_SCALE).min(w as f32 - 20.0);
-    let x = ((w as f32 - width) * 0.5).max(10.0);
-    let y = (h as f32 * 0.07).max(18.0);
-    let row_h = 19.0 * BOARD_SCALE;
-    let header_h = 54.0 * BOARD_SCALE;
-    let available_rows = (((h as f32 - y - 10.0 - header_h).max(row_h) / row_h).floor() as usize).max(1);
-    let shown = board.entries.len().min(available_rows);
-    let height = (header_h + shown as f32 * row_h).min(h as f32 - y - 10.0);
+    // Renderer-native on purpose: +scores stays a lightweight gameplay overlay
+    // and never changes input capture / enters the egui menu stack.
+    // Layout is authored in a 1080p-ish screen-space and scales with height so
+    // the board keeps the same visual weight from 720p through 4K.
+    let s = (h as f32 / 1080.0).clamp(0.72, 2.0);
+    let width = (960.0 * s).min((w as f32 - 32.0 * s).max(320.0 * s));
+    let x = ((w as f32 - width) * 0.5).max(16.0 * s);
+    let y = (h as f32 * 0.065).max(24.0 * s);
 
-    rect(out, x, y, width, height, [0.0, 0.0, 0.0, 0.82], w, h);
-    rect_outline(out, x, y, width, height, 1.0, [0.55, 0.58, 0.64, 0.92], w, h);
+    let title_h = 48.0 * s;
+    let columns_h = 27.0 * s;
+    let row_h = 36.0 * s;
+    let bottom_pad = 8.0 * s;
+    let overflow_h = if board.entries.is_empty() { 0.0 } else { 20.0 * s };
+    let section_h = 30.0 * s;
 
-    let title = if board.team_game {
-        format!("SCOREBOARD     ^1RED {}     ^4BLUE {}", board.team_scores[0], board.team_scores[1])
+    // jaPRO's CG_DrawOldScoreboard: players first (a team game lists the leading
+    // team, then the other, then anyone on neither), with everyone spectating in a
+    // block of their own underneath. Each group keeps the server's score order.
+    enum Line<'a> {
+        Entry(&'a UiScoreEntry, usize),
+        Section(&'static str, usize),
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(board.entries.len() + 1);
+    let team_order: &[i32] = if !board.team_game {
+        &[0]
+    } else if board.team_scores[0] >= board.team_scores[1] {
+        &[1, 2, 0]
     } else {
-        "SCOREBOARD".to_owned()
+        &[2, 1, 0]
     };
-    text(
+    for &team in team_order {
+        let group = board.entries.iter().filter(|entry| entry.team == team || (!board.team_game && entry.team != 3));
+        for (index, entry) in group.enumerate() {
+            lines.push(Line::Entry(entry, index));
+        }
+        if !board.team_game {
+            break;
+        }
+    }
+    let players = lines.len();
+    let spectators = board.entries.iter().filter(|entry| entry.team == 3).count();
+    if spectators > 0 {
+        lines.push(Line::Section("SPECTATORS", spectators));
+        for (index, entry) in board.entries.iter().filter(|entry| entry.team == 3).enumerate() {
+            lines.push(Line::Entry(entry, index));
+        }
+    }
+
+    let room_for_rows = (h as f32 - y - 18.0 * s - title_h - columns_h - bottom_pad).max(row_h);
+    let available = (room_for_rows - overflow_h).max(row_h);
+    let line_height = |line: &Line| if matches!(line, Line::Section(..)) { section_h } else { row_h };
+    let mut shown = 0usize;
+    let mut used = 0.0f32;
+    for line in &lines {
+        if used + line_height(line) > available && shown > 0 {
+            break;
+        }
+        used += line_height(line);
+        shown += 1;
+    }
+    // Never end on a heading with nothing under it.
+    if shown > 0 && matches!(lines[shown - 1], Line::Section(..)) {
+        used -= section_h;
+        shown -= 1;
+    }
+    let overflow = lines[shown..].iter().filter(|line| matches!(line, Line::Entry(..))).count();
+    let footer_h = if overflow > 0 { overflow_h } else { 0.0 };
+    let height = title_h + columns_h + used + footer_h + bottom_pad;
+
+    const PANEL_TOP: [f32; 4] = [0.045, 0.055, 0.075, 0.965];
+    const PANEL_BOTTOM: [f32; 4] = [0.014, 0.018, 0.028, 0.955];
+    const TITLE_LEFT: [f32; 4] = [0.075, 0.105, 0.145, 0.98];
+    const TITLE_RIGHT: [f32; 4] = [0.030, 0.040, 0.060, 0.98];
+    const ACCENT: [f32; 4] = [0.28, 0.78, 0.94, 1.0];
+    const TEXT_BRIGHT: [f32; 4] = [0.94, 0.965, 0.99, 1.0];
+    const TEXT: [f32; 4] = [0.82, 0.86, 0.91, 1.0];
+    const TEXT_DIM: [f32; 4] = [0.51, 0.58, 0.67, 1.0];
+
+    // A soft, offset shadow plus a low-contrast outer keyline reads much cleaner
+    // than the old bright grey rectangle without making the overlay feel like a
+    // menu window.
+    rect(
         out,
-        &title,
-        x + 14.0 * BOARD_SCALE,
-        y + 9.0 * BOARD_SCALE,
-        1.10 * BOARD_SCALE,
-        [0.92, 0.94, 0.98, 1.0],
+        x - 4.0 * s,
+        y + 5.0 * s,
+        width + 8.0 * s,
+        height + 4.0 * s,
+        [0.0, 0.0, 0.0, 0.30],
+        w,
+        h,
+    );
+    rect_gradient(
+        out,
+        x,
+        y,
+        width,
+        height,
+        PANEL_TOP,
+        PANEL_TOP,
+        PANEL_BOTTOM,
+        PANEL_BOTTOM,
+        w,
+        h,
+    );
+    rect_outline(
+        out,
+        x,
+        y,
+        width,
+        height,
+        (1.0 * s).max(1.0),
+        [0.30, 0.38, 0.48, 0.58],
         w,
         h,
     );
 
-    let header_y = y + 31.0 * BOARD_SCALE;
-    let header_scale = 0.96 * BOARD_SCALE;
-    text(out, "NAME", x + 14.0 * BOARD_SCALE, header_y, header_scale, [0.70, 0.74, 0.80, 1.0], w, h);
-    text(out, "SCORE", x + width - 238.0 * BOARD_SCALE, header_y, header_scale, [0.70, 0.74, 0.80, 1.0], w, h);
-    text(out, "PING", x + width - 167.0 * BOARD_SCALE, header_y, header_scale, [0.70, 0.74, 0.80, 1.0], w, h);
-    text(out, "TIME", x + width - 108.0 * BOARD_SCALE, header_y, header_scale, [0.70, 0.74, 0.80, 1.0], w, h);
+    // Header: restrained blue-grey panel with a thin cyan identity line. Team
+    // scores (when relevant) live here rather than being mixed into the title.
+    rect_gradient(
+        out,
+        x + 1.0 * s,
+        y + 1.0 * s,
+        width - 2.0 * s,
+        title_h - 1.0 * s,
+        TITLE_LEFT,
+        TITLE_RIGHT,
+        [0.045, 0.060, 0.085, 0.98],
+        [0.022, 0.030, 0.046, 0.98],
+        w,
+        h,
+    );
+    rect(out, x + 1.0 * s, y + 1.0 * s, width - 2.0 * s, (2.0 * s).max(1.0), ACCENT, w, h);
+
+    let font_x_scale = w.max(1) as f32 / 640.0;
+    let title_font_scale = 0.52;
+    let header_font_scale = 0.31;
+    let row_font_scale = 0.42;
+    let meta_font_scale = 0.32;
+    let fallback_title_scale = 1.34 * s;
+    let fallback_header_scale = 0.92 * s;
+    let fallback_row_scale = 1.06 * s;
+    let fallback_meta_scale = 0.88 * s;
+
+    let draw = |out: &mut Vec<UiVertex>,
+                value: &str,
+                tx: f32,
+                baseline_y: f32,
+                prop_scale: f32,
+                fallback_scale: f32,
+                color: [f32; 4]| {
+        if let Some(font) = small_font {
+            proportional_text(out, value, font, tx, baseline_y, prop_scale, color, true, w, h);
+        } else {
+            // The proportional font is normally resident. Keep the charsgrid
+            // fallback so a missing font asset can never hide the scoreboard.
+            text(out, value, tx, baseline_y - 8.0 * fallback_scale, fallback_scale, color, w, h);
+        }
+    };
+    let text_width = |value: &str, prop_scale: f32, fallback_scale: f32| -> f32 {
+        if let Some(font) = small_font {
+            proportional_text_width(value, font, prop_scale) * font_x_scale
+        } else {
+            visible_jka_chars(value) as f32 * 6.0 * fallback_scale
+        }
+    };
+
+    let pad = 18.0 * s;
+    let title_baseline = y + title_h * 0.68;
+    draw(
+        out,
+        "SCOREBOARD",
+        x + pad,
+        title_baseline,
+        title_font_scale,
+        fallback_title_scale,
+        TEXT_BRIGHT,
+    );
+
+    let meta = if board.team_game {
+        format!("^1RED  {}    ^7|    ^4BLUE  {}", board.team_scores[0], board.team_scores[1])
+    } else {
+        format!("{} PLAYER{}", players, if players == 1 { "" } else { "S" })
+    };
+    let meta_width = text_width(&meta, meta_font_scale, fallback_meta_scale);
+    draw(
+        out,
+        &meta,
+        x + width - pad - meta_width,
+        y + title_h * 0.66,
+        meta_font_scale,
+        fallback_meta_scale,
+        if board.team_game { TEXT } else { TEXT_DIM },
+    );
+
+    let columns_y = y + title_h;
+    rect(
+        out,
+        x + 1.0 * s,
+        columns_y,
+        width - 2.0 * s,
+        columns_h,
+        [0.75, 0.82, 0.92, 0.055],
+        w,
+        h,
+    );
+    rect(
+        out,
+        x + 10.0 * s,
+        columns_y + columns_h - (1.0 * s).max(1.0),
+        width - 20.0 * s,
+        (1.0 * s).max(1.0),
+        [0.45, 0.56, 0.70, 0.26],
+        w,
+        h,
+    );
+
+    // Numeric columns are right aligned. This removes the ragged, debug-table
+    // look the old scoreboard had while still preserving all vanilla fields.
+    let team_right = x + width - pad;
+    let time_right = if board.team_game { team_right - 82.0 * s } else { team_right };
+    let ping_right = time_right - 92.0 * s;
+    let score_right = ping_right - 92.0 * s;
+    let player_x = x + pad + 7.0 * s;
+    let header_baseline = columns_y + columns_h * 0.69;
+
+    draw(out, "PLAYER", player_x, header_baseline, header_font_scale, fallback_header_scale, TEXT_DIM);
+    for (label, right) in [("SCORE", score_right), ("PING", ping_right), ("TIME", time_right)] {
+        let tw = text_width(label, header_font_scale, fallback_header_scale);
+        draw(out, label, right - tw, header_baseline, header_font_scale, fallback_header_scale, TEXT_DIM);
+    }
     if board.team_game {
-        text(out, "TEAM", x + width - 52.0 * BOARD_SCALE, header_y, header_scale, [0.70, 0.74, 0.80, 1.0], w, h);
+        let tw = text_width("TEAM", header_font_scale, fallback_header_scale);
+        draw(out, "TEAM", team_right - tw, header_baseline, header_font_scale, fallback_header_scale, TEXT_DIM);
     }
 
-    for (index, entry) in board.entries.iter().take(shown).enumerate() {
-        let row_y = y + 49.0 * BOARD_SCALE + index as f32 * row_h;
-        if index % 2 == 0 {
-            rect(out, x + 5.0, row_y - 3.0 * BOARD_SCALE, width - 10.0, row_h, [1.0, 1.0, 1.0, 0.035], w, h);
-        }
+    let row_start = columns_y + columns_h;
+    let mut cursor = row_start;
+    for line in lines.iter().take(shown) {
+        let (entry, index) = match *line {
+            Line::Section(label, count) => {
+                rect(
+                    out,
+                    x + 10.0 * s,
+                    cursor + 4.0 * s,
+                    width - 20.0 * s,
+                    (1.0 * s).max(1.0),
+                    [0.45, 0.56, 0.70, 0.26],
+                    w,
+                    h,
+                );
+                draw(
+                    out,
+                    &format!("{label}  {count}"),
+                    player_x,
+                    cursor + section_h * 0.76,
+                    header_font_scale,
+                    fallback_header_scale,
+                    TEXT_DIM,
+                );
+                cursor += section_h;
+                continue;
+            }
+            Line::Entry(entry, index) => (entry, index),
+        };
+        let row_top = cursor;
+        cursor += row_h;
+        let row_y = row_top + row_h * 0.68;
+        let spectating = entry.team == 3;
+
+        let row_fill = if index % 2 == 0 {
+            [0.80, 0.86, 0.96, 0.050]
+        } else {
+            [0.55, 0.62, 0.72, 0.022]
+        };
+        rect(
+            out,
+            x + 6.0 * s,
+            row_top + 2.0 * s,
+            width - 12.0 * s,
+            row_h - 3.0 * s,
+            row_fill,
+            w,
+            h,
+        );
+
+        let accent = match entry.team {
+            1 => [0.92, 0.22, 0.24, 0.95],
+            2 => [0.24, 0.48, 0.96, 0.95],
+            3 => [0.50, 0.55, 0.62, 0.72],
+            _ => ACCENT,
+        };
+        rect(
+            out,
+            x + 6.0 * s,
+            row_top + 2.0 * s,
+            (3.0 * s).max(2.0),
+            row_h - 3.0 * s,
+            accent,
+            w,
+            h,
+        );
+
         let name = truncate_jka_text(&entry.name, if board.team_game { 24 } else { 30 });
-        let row_scale = BOARD_SCALE;
-        text(out, &name, x + 14.0 * BOARD_SCALE, row_y, row_scale, [0.92, 0.92, 0.92, 1.0], w, h);
-        text(out, &entry.score.to_string(), x + width - 238.0 * BOARD_SCALE, row_y, row_scale, [0.92, 0.92, 0.92, 1.0], w, h);
+        let row_text = if entry.team == 3 {
+            [TEXT[0], TEXT[1], TEXT[2], 0.72]
+        } else {
+            TEXT
+        };
+        draw(out, &name, player_x, row_y, row_font_scale, fallback_row_scale, row_text);
+
+        if !spectating || board.spectator_scores {
+            let score = entry.score.to_string();
+            let score_w = text_width(&score, row_font_scale, fallback_row_scale);
+            draw(
+                out,
+                &score,
+                score_right - score_w,
+                row_y,
+                row_font_scale,
+                fallback_row_scale,
+                TEXT_BRIGHT,
+            );
+        }
+
         let ping = if entry.ping < 0 { "CNCT".to_owned() } else { entry.ping.to_string() };
-        text(out, &ping, x + width - 167.0 * BOARD_SCALE, row_y, row_scale, [0.92, 0.92, 0.92, 1.0], w, h);
-        text(out, &entry.time.to_string(), x + width - 108.0 * BOARD_SCALE, row_y, row_scale, [0.92, 0.92, 0.92, 1.0], w, h);
-        if board.team_game {
+        let ping_w = text_width(&ping, row_font_scale, fallback_row_scale);
+        let ping_color = if entry.ping < 0 {
+            TEXT_DIM
+        } else if entry.ping <= 60 {
+            [0.52, 0.88, 0.66, 1.0]
+        } else if entry.ping <= 120 {
+            [0.88, 0.84, 0.50, 1.0]
+        } else {
+            [0.94, 0.55, 0.52, 1.0]
+        };
+        draw(out, &ping, ping_right - ping_w, row_y, row_font_scale, fallback_row_scale, ping_color);
+
+        let time = entry.time.to_string();
+        let time_w = text_width(&time, row_font_scale, fallback_row_scale);
+        draw(out, &time, time_right - time_w, row_y, row_font_scale, fallback_row_scale, TEXT);
+
+        if board.team_game && !spectating {
             let team = match entry.team {
                 1 => "^1RED",
                 2 => "^4BLUE",
-                3 => "SPEC",
                 _ => "FREE",
             };
-            text(out, team, x + width - 52.0 * BOARD_SCALE, row_y, 0.92 * BOARD_SCALE, [0.86, 0.88, 0.92, 1.0], w, h);
+            let team_w = text_width(team, meta_font_scale, fallback_meta_scale);
+            draw(out, team, team_right - team_w, row_y, meta_font_scale, fallback_meta_scale, TEXT_DIM);
         }
     }
 
-    if board.entries.len() > shown {
-        text(
+    if overflow > 0 {
+        let footer_top = row_start + used;
+        rect(
             out,
-            &format!("+{} MORE", board.entries.len() - shown),
-            x + 14.0 * BOARD_SCALE,
-            y + height - 14.0 * BOARD_SCALE,
-            0.82 * BOARD_SCALE,
-            [0.65, 0.68, 0.74, 1.0],
+            x + 10.0 * s,
+            footer_top,
+            width - 20.0 * s,
+            (1.0 * s).max(1.0),
+            [0.42, 0.52, 0.64, 0.20],
             w,
             h,
+        );
+        let more = format!("+{} MORE PLAYER{}", overflow, if overflow == 1 { "" } else { "S" });
+        draw(
+            out,
+            &more,
+            x + pad,
+            footer_top + footer_h * 0.70,
+            meta_font_scale,
+            fallback_meta_scale,
+            TEXT_DIM,
         );
     }
 }
@@ -3127,11 +4350,24 @@ fn build_loading_screen(
     let dark = [0.0, 0.0, 0.02, 0.80];
     rect_gradient(out, 0.0, h as f32 - fade_h, w as f32, fade_h, clear, clear, dark, dark, w, h);
 
-    let visible: Vec<&MapLoadingBar> = loading
+    // Preparation finishing is not the end of the load: the renderer still has
+    // to upload the world and present its first frame. That runs on the render
+    // thread with no measurable progress, so show it as a final row that stays
+    // WORKING (and keeps the total below 100%) until the loading screen closes.
+    let upload_bar = MapLoadingBar {
+        label: "GPU UPLOAD",
+        completed: 0,
+        total: 1,
+        skipped: false,
+    };
+    let mut visible: Vec<&MapLoadingBar> = loading
         .bars
         .iter()
         .filter(|bar| !(bar.skipped || (loading.preparation_finished && bar.total == 0)))
         .collect();
+    if loading.preparation_finished {
+        visible.push(&upload_bar);
+    }
     let overall = if visible.is_empty() {
         0.0
     } else {
@@ -3213,6 +4449,9 @@ fn build_loading_screen(
             "WAIT".to_string()
         } else if done {
             "DONE".to_string()
+        } else if bar.total == 1 {
+            // A single inline step has no meaningful "0/1".
+            "WORKING".to_string()
         } else {
             format!("{}/{}", bar.completed, bar.total)
         };
@@ -3235,71 +4474,194 @@ fn build_loading_screen(
     }
 }
 
+/// `x, y, width` of the trace inspector panel before any HUD layout is applied.
+/// Unused since the trace panel moved to the `OverlayMode::Trace` egui menu;
+/// kept (not deleted) alongside `build_surface_inspector` in case a non-egui
+/// HUD summary is wanted again later.
+#[allow(dead_code)]
+fn surface_inspector_frame(w: u32) -> (f32, f32, f32) {
+    let panel_w = (w as f32 * 0.46).clamp(620.0, 900.0);
+    ((w as f32 - panel_w - 24.0).max(24.0), 72.0, panel_w)
+}
+
+#[allow(dead_code)]
 fn build_surface_inspector(
     out: &mut Vec<UiVertex>,
     info: &crate::runtime::SurfaceInspectorInfo,
     w: u32,
     h: u32,
 ) {
-    let panel_w = (w as f32 * 0.42).clamp(500.0, 760.0);
-    let max_lines = ((h as f32 - 190.0) / 24.0).floor().max(8.0) as usize;
-    let visible_lines = info.lines.len().min(max_lines);
-    let panel_h = 92.0 + visible_lines as f32 * 24.0;
-    let x = (w as f32 - panel_w - 24.0).max(24.0);
-    let y = 86.0;
+    fn shortened(value: &str, max_chars: usize) -> String {
+        if value.chars().count() <= max_chars {
+            return value.to_owned();
+        }
+        let keep = max_chars.saturating_sub(1);
+        let mut text = value.chars().take(keep).collect::<String>();
+        text.push('…');
+        text
+    }
 
-    rect(
-        out,
-        x,
-        y,
-        panel_w,
-        panel_h,
-        [0.015, 0.025, 0.038, 0.97],
-        w,
-        h,
-    );
-    rect(out, x, y, 4.0, panel_h, [0.92, 0.72, 0.20, 1.0], w, h);
+    let (x, y, panel_w) = surface_inspector_frame(w);
+    let summary_rows = info.summary.len().min(8);
+    let header_h = 104.0;
+    let summary_h = if summary_rows == 0 { 0.0 } else { 14.0 + summary_rows as f32 * 30.0 + 10.0 };
+    let available_detail_h = (h as f32 - y - header_h - summary_h - 34.0).max(0.0);
+    let mut detail_rows = 0usize;
+    for section in &info.sections {
+        if detail_rows >= 14 {
+            break;
+        }
+        detail_rows += 1; // section heading
+        detail_rows += section.lines.len().min(14usize.saturating_sub(detail_rows));
+    }
+    if detail_rows == 0 {
+        detail_rows = info.lines.len().min(8);
+    }
+    let detail_row_h = 22.0;
+    let visible_detail_rows = detail_rows.min((available_detail_h / detail_row_h).floor().max(0.0) as usize);
+    let detail_h = visible_detail_rows as f32 * detail_row_h + if visible_detail_rows > 0 { 14.0 } else { 0.0 };
+    let panel_h = (header_h + summary_h + detail_h + 16.0).min(h as f32 - y - 18.0);
+
+    rect(out, x, y, panel_w, panel_h, [0.012, 0.020, 0.032, 0.975], w, h);
+    rect(out, x, y, 5.0, panel_h, [0.96, 0.72, 0.18, 1.0], w, h);
+
     text(
         out,
-        "SURFACE INSPECTOR",
-        x + 20.0,
-        y + 18.0,
-        2.2,
-        [0.98, 0.92, 0.78, 1.0],
+        "TRACE INSPECTOR",
+        x + 22.0,
+        y + 17.0,
+        2.05,
+        [0.99, 0.94, 0.82, 1.0],
         w,
         h,
     );
     text(
         out,
-        "CTRL+C COPY",
-        x + panel_w - 150.0,
-        y + 22.0,
-        1.25,
-        [0.64, 0.72, 0.80, 1.0],
+        "CTRL+C  COPY FULL DIAGNOSTICS",
+        x + panel_w - 250.0,
+        y + 20.0,
+        1.05,
+        [0.57, 0.65, 0.74, 1.0],
         w,
         h,
     );
+
+    // Keep identity on its own row. The old overlay packed every diagnostic
+    // into equally weighted text; this makes "what am I looking at?" readable
+    // before the eye has to parse any technical detail.
+    let kind = shortened(&info.kind, 26);
+    let kind_w = (kind.chars().count() as f32 * 7.2 + 22.0).clamp(92.0, 220.0);
+    let kind_x = x + 22.0;
+    rect(out, kind_x, y + 54.0, kind_w, 27.0, [0.06, 0.13, 0.19, 0.96], w, h);
+    text(out, &kind, kind_x + 10.0, y + 61.0, 1.15, [0.45, 0.86, 1.0, 1.0], w, h);
+    let title_x = kind_x + kind_w + 14.0;
+    let title_chars = ((x + panel_w - 22.0 - title_x) / 11.5).floor().max(18.0) as usize;
+    let title = shortened(&info.title, title_chars);
     text(
         out,
-        &info.title,
-        x + 20.0,
-        y + 48.0,
-        1.65,
-        [0.72, 0.86, 1.0, 1.0],
+        &title,
+        title_x,
+        y + 58.0,
+        1.75,
+        [0.76, 0.91, 1.0, 1.0],
         w,
         h,
     );
-    for (index, line) in info.lines.iter().take(max_lines).enumerate() {
-        text(
+
+    let mut cursor_y = y + header_h;
+    if summary_rows > 0 {
+        rect(
             out,
-            line,
-            x + 20.0,
-            y + 78.0 + index as f32 * 24.0,
-            1.35,
-            [0.90, 0.93, 0.96, 1.0],
+            x + 16.0,
+            cursor_y - 6.0,
+            panel_w - 32.0,
+            summary_h - 2.0,
+            [0.020, 0.036, 0.052, 0.94],
             w,
             h,
         );
+        for (label, value) in info.summary.iter().take(summary_rows) {
+            let value = shortened(value, ((panel_w - 188.0) / 8.5).floor().max(24.0) as usize);
+            text(
+                out,
+                label,
+                x + 30.0,
+                cursor_y + 7.0,
+                1.12,
+                [0.55, 0.66, 0.77, 1.0],
+                w,
+                h,
+            );
+            text(
+                out,
+                &value,
+                x + 164.0,
+                cursor_y + 5.0,
+                1.34,
+                [0.96, 0.98, 1.0, 1.0],
+                w,
+                h,
+            );
+            cursor_y += 30.0;
+        }
+        cursor_y += 18.0;
+    }
+
+    let max_chars = ((panel_w - 60.0) / 7.5).floor().max(32.0) as usize;
+    let mut rows_left = visible_detail_rows;
+    if rows_left > 0 {
+        for section in &info.sections {
+            if rows_left == 0 {
+                break;
+            }
+            text(
+                out,
+                &section.title,
+                x + 24.0,
+                cursor_y + 1.0,
+                1.10,
+                [0.98, 0.72, 0.24, 1.0],
+                w,
+                h,
+            );
+            cursor_y += detail_row_h;
+            rows_left -= 1;
+            for line in &section.lines {
+                if rows_left == 0 {
+                    break;
+                }
+                let line = shortened(line, max_chars);
+                text(
+                    out,
+                    &line,
+                    x + 34.0,
+                    cursor_y + 1.0,
+                    1.16,
+                    [0.86, 0.90, 0.94, 1.0],
+                    w,
+                    h,
+                );
+                cursor_y += detail_row_h;
+                rows_left -= 1;
+            }
+            cursor_y += 3.0;
+        }
+        if info.sections.is_empty() {
+            for line in info.lines.iter().take(rows_left) {
+                let line = shortened(line, max_chars);
+                text(
+                    out,
+                    &line,
+                    x + 30.0,
+                    cursor_y + 1.0,
+                    1.16,
+                    [0.86, 0.90, 0.94, 1.0],
+                    w,
+                    h,
+                );
+                cursor_y += detail_row_h;
+            }
+        }
     }
 }
 
@@ -3309,10 +4671,10 @@ const HUD_INK_TOP: [f32; 4] = [0.010, 0.014, 0.032, 0.84];
 const HUD_INK_BOTTOM: [f32; 4] = [0.020, 0.026, 0.058, 0.80];
 const HUD_LABEL: [f32; 4] = [0.56, 0.66, 0.79, 1.0];
 const HUD_VALUE: [f32; 4] = [0.96, 0.98, 1.0, 1.0];
-const HUD_HEALTH: [f32; 4] = [1.0, 0.30, 0.52, 1.0];
-const HUD_HEALTH_LOW: [f32; 4] = [1.0, 0.16, 0.20, 1.0];
-const HUD_SHIELD: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
-const HUD_FORCE: [f32; 4] = [0.52, 0.60, 1.0, 1.0];
+const HUD_HEALTH: [f32; 4] = [0.92, 0.18, 0.15, 1.0];
+const HUD_HEALTH_LOW: [f32; 4] = [1.0, 0.07, 0.05, 1.0];
+const HUD_SHIELD: [f32; 4] = [0.26, 0.86, 0.36, 1.0];
+const HUD_FORCE: [f32; 4] = [0.22, 0.50, 1.0, 1.0];
 const HUD_AMMO: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
 
 fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
@@ -3344,7 +4706,8 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     };
 
     let health_layout = ui.hud_layout.health;
-    let health = hud_element_rect(HudElementId::Health, health_layout, w, h);
+    let ctx = HudRectContext::from_snapshot(ui);
+    let health = hud_element_rect(HudElementId::Health, health_layout, &ctx, w, h);
     let low_health = hud.health > 0 && hud.health * 4 <= hud.max_health.max(1);
     hud_meter(
         out,
@@ -3359,7 +4722,7 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     );
 
     let shield_layout = ui.hud_layout.shield;
-    let shield = hud_element_rect(HudElementId::Shield, shield_layout, w, h);
+    let shield = hud_element_rect(HudElementId::Shield, shield_layout, &ctx, w, h);
     hud_meter(
         out,
         shield,
@@ -3374,7 +4737,7 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 
     // The ammo slot doubles as the saber-style readout while the saber is out.
     let ammo_layout = ui.hud_layout.ammo;
-    let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, w, h);
+    let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, &ctx, w, h);
     if hud.weapon == HUD_WP_SABER {
         hud_style_panel(out, ammo, ammo_layout.scale, hud.saber_style, w, h);
     } else {
@@ -3385,7 +4748,7 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     }
 
     let force_layout = ui.hud_layout.force;
-    let force = hud_element_rect(HudElementId::Force, force_layout, w, h);
+    let force = hud_element_rect(HudElementId::Force, force_layout, &ctx, w, h);
     hud_meter(
         out,
         force,
@@ -3393,7 +4756,7 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
         "FORCE",
         hud.force_power,
         hud.force_power_max.max(1),
-        HUD_FORCE,
+        if hud.force_flash { [1.0, 0.15, 0.15, 1.0] } else { HUD_FORCE },
         w,
         h,
     );
@@ -3501,7 +4864,7 @@ fn hud_meter(
             h,
         );
     }
-    let value_color = if accent == HUD_HEALTH_LOW { [1.0, 0.62, 0.66, 1.0] } else { HUD_VALUE };
+    let value_color = if accent == HUD_HEALTH_LOW { [1.0, 0.64, 0.60, 1.0] } else { HUD_VALUE };
     hud_texts(out, rect_, scale, label, &value.max(0).to_string(), value_color, w, h);
 }
 
@@ -3728,193 +5091,149 @@ fn build_chat_input(
 }
 
 
-fn movement_key_cell(
-    out: &mut Vec<UiVertex>, label: &str, active: bool, x: f32, y: f32, size: f32,
-    w: u32, h: u32,
+/// `gfx/hud/keys/*` images `DF_DrawMovementKeys` draws, in atlas order (see
+/// `renderer::load_ui_key_atlas`). `KeyArt` indexes this table.
+pub const MOVEMENT_KEY_ART: [&str; 27] = [
+    "crouch_off", "crouch_on", "jump_off", "jump_on", "back_off", "back_on",
+    "forward_off", "forward_on", "left_off", "left_on", "right_off", "right_on",
+    "attack_off", "attack_on", "alt_off", "alt_on", "walk_off", "walk_on",
+    "crouch_on2", "jump_on2", "back_on2", "forward_on2", "left_on2", "right_on2",
+    "attack_on2", "alt_on2", "walk_on2",
+];
+pub const KEY_ART_SIZE: u32 = 128;
+pub const KEY_ATLAS_COLUMNS: u32 = 6;
+const KEY_ATLAS_ROWS: u32 = (MOVEMENT_KEY_ART.len() as u32).div_ceil(KEY_ATLAS_COLUMNS);
+/// Texture source id of the key atlas in `ui.wgsl`.
+const KEY_TEXTURE_SOURCE: f32 = 4.0;
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum KeyArt {
+    CrouchOff, CrouchOn, JumpOff, JumpOn, BackOff, BackOn,
+    ForwardOff, ForwardOn, LeftOff, LeftOn, RightOff, RightOn,
+    AttackOff, AttackOn, AltOff, AltOn, WalkOff, WalkOn,
+    CrouchOn2, JumpOn2, BackOn2, ForwardOn2, LeftOn2, RightOn2,
+    AttackOn2, AltOn2, WalkOn2,
+}
+
+/// `CG_DrawPic` for one key image: the whole 128x128 image, white, alpha blended.
+fn movement_key_pic(
+    out: &mut Vec<UiVertex>, art: KeyArt, x: f32, y: f32, w: f32, h: f32, width: u32, height: u32,
 ) {
-    let background = if active { [0.08, 0.42, 0.12, 0.88] } else { [0.02, 0.025, 0.035, 0.62] };
-    rect(out, x, y, size, size, background, w, h);
-    rect_outline(out, x, y, size, size, 1.0, [0.72, 0.78, 0.88, 0.72], w, h);
-    let scale = (size / 16.0).clamp(0.55, 1.5);
-    let label_w = label.len() as f32 * 6.0 * scale;
-    text(out, label, x + (size - label_w) * 0.5, y + (size - 8.0 * scale) * 0.5, scale,
-        [0.96, 0.98, 1.0, if active { 1.0 } else { 0.72 }], w, h);
+    let index = art as u32;
+    let (column, row) = (index % KEY_ATLAS_COLUMNS, index / KEY_ATLAS_COLUMNS);
+    let (atlas_w, atlas_h) = ((KEY_ATLAS_COLUMNS * KEY_ART_SIZE) as f32, (KEY_ATLAS_ROWS * KEY_ART_SIZE) as f32);
+    // Half-texel inset keeps linear filtering from pulling in the neighbouring
+    // atlas cell; it stands in for the clamp-to-edge of a standalone image.
+    let u0 = ((column * KEY_ART_SIZE) as f32 + 0.5) / atlas_w;
+    let u1 = (((column + 1) * KEY_ART_SIZE) as f32 - 0.5) / atlas_w;
+    let v0 = ((row * KEY_ART_SIZE) as f32 + 0.5) / atlas_h;
+    let v1 = (((row + 1) * KEY_ART_SIZE) as f32 - 0.5) / atlas_h;
+    textured_rect_with_source(
+        out, x, y, w, h, [u0, v0], [u1, v1], [1.0; 4], KEY_TEXTURE_SOURCE, width, height,
+    );
+}
+
+/// Port of TaystJK `DF_DrawMovementKeys`. Layout is in cgame's 640x480 space with
+/// `cl_ratioFix` on (the default): image sizes come out square, x offsets scale
+/// with the window width and y offsets with its height.
+/// Tile edge in pixels (`w * widthRatioCoef` and `h`, scaled to the window) and
+/// the top-left corner of the 3-wide key block; `None` while the keys are off.
+fn movement_keys_origin(settings: &MovementKeysSettings, w: u32, h: u32) -> Option<(f32, f32, f32)> {
+    if settings.mode == 0 || w == 0 || h == 0 { return None; }
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    let size = settings.size;
+    let walk = settings.walk;
+    Some(match settings.mode {
+        1 => {
+            let tile = 16.0 * size * sy;
+            (tile,
+             320.0 * sx + settings.x * sx - tile * if walk { 1.0 } else { 1.5 },
+             480.0 * 0.9 * sy + settings.y * sy - tile)
+        }
+        2 => {
+            let tile = 16.0 * size * sy;
+            (tile,
+             320.0 * sx + settings.x * sx - tile * if walk { 1.5 } else { 2.0 },
+             480.0 * 0.9 * sy + settings.y * sy - tile)
+        }
+        3 => {
+            // TaystJK ignores cg_movementKeysX/Y in this mode.
+            let tile = 6.0 * size * sy;
+            (tile, 320.0 * sx - tile * 1.5, 240.0 * sy - tile * 1.5)
+        }
+        4 => {
+            let tile = 12.0 * size * sy;
+            (tile,
+             320.0 * sx + settings.x * sx - tile * 1.5,
+             480.0 * 0.9 * sy + settings.y * sy - tile * 1.5)
+        }
+        _ => return None,
+    })
 }
 
 fn build_movement_keys(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let settings = ui.movement_keys;
-    if settings.mode == 0 { return; }
+    let Some((tile, x, y)) = movement_keys_origin(&settings, w, h) else { return };
     let state = ui.movement_hud;
-    let base_scale = (h as f32 / 480.0).clamp(0.65, 2.5);
-    let size_mul = settings.size.clamp(0.25, 4.0);
-    let (tile, origin_x, origin_y, compact) = match settings.mode {
-        1 => {
-            let tile = 16.0 * base_scale * size_mul;
-            let center_shift = if settings.walk { 1.0 } else { 1.5 };
-            (tile,
-             w as f32 * 0.5 + settings.x * base_scale - tile * center_shift,
-             h as f32 * 0.90 + settings.y * base_scale - tile,
-             false)
-        }
-        2 => {
-            let tile = 16.0 * base_scale * size_mul;
-            let center_shift = if settings.walk { 1.5 } else { 2.0 };
-            (tile,
-             w as f32 * 0.5 + settings.x * base_scale - tile * center_shift,
-             h as f32 * 0.90 + settings.y * base_scale - tile,
-             false)
-        }
-        3 => {
-            let tile = 6.0 * base_scale * size_mul;
-            (tile, w as f32 * 0.5 - tile * 1.5, h as f32 * 0.5 - tile * 1.5, true)
-        }
-        _ => {
-            let tile = 12.0 * base_scale * size_mul;
-            (tile, w as f32 * 0.5 + settings.x * base_scale - tile * 1.5,
-             h as f32 * 0.90 + settings.y * base_scale - tile * 1.5, true)
-        }
-    };
+    let walk = settings.walk;
+    let (tw, th) = (tile, tile);
 
-    let f = state.forward_move > 0;
-    let b = state.forward_move < 0;
-    let l = state.right_move < 0;
-    let r = state.right_move > 0;
-    let jump = state.up_move > 0;
-    let crouch = state.up_move < 0;
+    let forward = state.forward_move;
+    let right = state.right_move;
+    let up = state.up_move;
     let attack = state.buttons & jka_movement::BUTTON_ATTACK != 0;
     let alt = state.buttons & jka_movement::BUTTON_ALT_ATTACK != 0;
     let walking = state.buttons & jka_movement::BUTTON_WALKING != 0;
-
-    let draw = |out: &mut Vec<UiVertex>, label: &str, active: bool, col: f32, row: f32| {
-        if compact && !active { return; }
-        movement_key_cell(out, label, active, origin_x + col * tile, origin_y + row * tile, tile - 1.0, w, h);
+    let mut pic = |art: KeyArt, col: f32, row: f32| {
+        movement_key_pic(out, art, x + col * tw, y + row * th, tw, th, w, h);
     };
-    if compact {
-        // TaystJK modes 3/4 only draw active cells in this 3x3 layout.
-        draw(out, "J", jump, 0.0, 0.0);
-        draw(out, "C", crouch, 2.0, 0.0);
-        draw(out, "W", f, 1.0, 0.0);
-        draw(out, "A", l, 0.0, 1.0);
-        draw(out, "D", r, 2.0, 1.0);
-        draw(out, "S", b, 1.0, 2.0);
-        draw(out, "M1", attack, 0.0, 2.0);
-        draw(out, "M2", alt, 2.0, 2.0);
-        if settings.walk { draw(out, "WALK", walking, -1.0, 2.0); }
+
+    if settings.mode >= 3 {
+        // Compact style: only pressed keys are drawn, each with its "2" art.
+        if up < 0 { pic(KeyArt::CrouchOn2, 2.0, 0.0); }
+        if up > 0 { pic(KeyArt::JumpOn2, 0.0, 0.0); }
+        if forward < 0 { pic(KeyArt::BackOn2, 1.0, 2.0); }
+        if forward > 0 { pic(KeyArt::ForwardOn2, 1.0, 0.0); }
+        if right < 0 { pic(KeyArt::LeftOn2, 0.0, 1.0); }
+        if right > 0 { pic(KeyArt::RightOn2, 2.0, 1.0); }
+        if attack { pic(KeyArt::AttackOn2, 0.0, 2.0); }
+        if alt { pic(KeyArt::AltOn2, 2.0, 2.0); }
+        if walk && walking { pic(KeyArt::WalkOn2, -1.0, 2.0); }
     } else {
-        // TaystJK modes 1/2 keep off-state cells visible.
-        draw(out, "J", jump, 0.0, 0.0);
-        draw(out, "C", crouch, 2.0, 0.0);
-        draw(out, "W", f, 1.0, 0.0);
-        draw(out, "A", l, 0.0, 1.0);
-        draw(out, "S", b, 1.0, 1.0);
-        draw(out, "D", r, 2.0, 1.0);
+        // Original style: every key is drawn, in its on or off art.
+        pic(if up < 0 { KeyArt::CrouchOn } else { KeyArt::CrouchOff }, 2.0, 0.0);
+        pic(if up > 0 { KeyArt::JumpOn } else { KeyArt::JumpOff }, 0.0, 0.0);
+        pic(if forward < 0 { KeyArt::BackOn } else { KeyArt::BackOff }, 1.0, 1.0);
+        pic(if forward > 0 { KeyArt::ForwardOn } else { KeyArt::ForwardOff }, 1.0, 0.0);
+        pic(if right < 0 { KeyArt::LeftOn } else { KeyArt::LeftOff }, 0.0, 1.0);
+        pic(if right > 0 { KeyArt::RightOn } else { KeyArt::RightOff }, 2.0, 1.0);
         if settings.mode == 2 {
-            draw(out, "M1", attack, 3.0, 0.0);
-            draw(out, "M2", alt, 3.0, 1.0);
+            pic(if attack { KeyArt::AttackOn } else { KeyArt::AttackOff }, 3.0, 0.0);
+            pic(if alt { KeyArt::AltOn } else { KeyArt::AltOff }, 3.0, 1.0);
         }
-        if settings.walk { draw(out, "WALK", walking, -1.0, 1.0); }
+        if walk {
+            pic(if walking { KeyArt::WalkOn } else { KeyArt::WalkOff }, -1.0, 1.0);
+        }
     }
 }
-fn normalize_degrees(mut angle: f32) -> f32 {
-    while angle > 180.0 { angle -= 360.0; }
-    while angle < -180.0 { angle += 360.0; }
-    angle
-}
-
-fn strafe_angle_to_screen_x(target_yaw: f32, view_yaw: f32, cg_fov: f32, w: u32, h: u32) -> Option<f32> {
-    let aspect = w.max(1) as f32 / h.max(1) as f32;
-    let base = cg_fov.clamp(1.0, 140.0).to_radians();
-    let actual_fov = 2.0 * ((base * 0.5).tan() * 0.75 * aspect).atan();
-    let delta = normalize_degrees(target_yaw - view_yaw).to_radians();
-    if delta.abs() >= actual_fov * 0.5 { return None; }
-    let focal = (w as f32 * 0.5) / (actual_fov * 0.5).tan();
-    Some(w as f32 * 0.5 - delta.tan() * focal)
-}
-
 fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let sh = ui.strafe_helper;
     if sh.flags & SHELPER_STYLE_MASK == 0 { return; }
-    let state = ui.movement_hud;
-    let vx = state.velocity[0];
-    let vy = state.velocity[1];
-    let speed = (vx * vx + vy * vy).sqrt();
-    if speed < 1.0 { return; }
-
-    // Stock JKA air-CGAZ core: pm_airaccelerate=1.0 and full-input
-    // wishspeed=ps.speed. This is the same CGAZ_Opt expression TaystJK uses;
-    // its extended movement-style physics can be layered onto this state later.
-    let fps = if sh.fps >= 1.0 {
-        sh.fps.clamp(1.0, 1000.0)
-    } else if ui.video.fps_cap >= 1 {
-        (ui.video.fps_cap as f32).clamp(1.0, 1000.0)
-    } else {
-        125.0
-    };
-    let wishspeed = state.player_speed.max(1.0);
-    let frametime = 1.0 / fps;
-    let friction_speed = if state.grounded {
-        (speed - speed.max(100.0) * 6.0 * frametime).max(0.0)
-    } else {
-        speed
-    };
-    if friction_speed <= f32::EPSILON { return; }
-    let acceleration = if state.grounded { 10.0 } else { 1.0 };
-    let accel = wishspeed * acceleration * frametime;
-    let argument = ((wishspeed - accel) / friction_speed).clamp(-1.0, 1.0);
-    let mut optimum = argument.acos().to_degrees() - 45.0;
-    if !optimum.is_finite() || optimum < 0.0 { optimum = 0.0; }
-    optimum += sh.offset * 0.01;
-
-    let vel_yaw = vy.atan2(vx).to_degrees();
-    let fm = state.forward_move.signum();
-    let rm = state.right_move.signum();
-    let active_for = |forward: i8, right: i8| fm == forward && rm == right;
-    let center_active = fm == 0;
-    let dirs = [
-        // TaystJK draws both optimum W lines because pure forward can accelerate
-        // toward either side of the velocity vector.
-        (SHELPER_W, 45.0 + optimum, 1, 0, [1.0, 0.75, 0.0, 0.75]),
-        (SHELPER_W, -45.0 - optimum, 1, 0, [1.0, 0.75, 0.0, 0.75]),
-        (SHELPER_WA, optimum, 1, -1, [1.0, 1.0, 1.0, 0.75]),
-        (SHELPER_WD, -optimum, 1, 1, [1.0, 1.0, 1.0, 0.75]),
-        (SHELPER_A, -45.0 + optimum, 0, -1, [0.5, 1.0, 1.0, 0.75]),
-        (SHELPER_D, 45.0 - optimum, 0, 1, [0.5, 1.0, 1.0, 0.75]),
-        (SHELPER_SA, -90.0 + optimum, -1, -1, [0.75, 0.0, 1.0, 0.75]),
-        (SHELPER_SD, 90.0 - optimum, -1, 1, [0.75, 0.0, 1.0, 0.75]),
-        (SHELPER_S, 225.0 + optimum, -1, 0, [1.0, 0.75, 0.0, 0.75]),
-    ];
-
-    let active_color = [
-        sh.active_color[0] as f32 / 255.0, sh.active_color[1] as f32 / 255.0,
-        sh.active_color[2] as f32 / 255.0, sh.active_color[3] as f32 / 255.0,
-    ];
-    let inactive_alpha = sh.inactive_alpha as f32 / 255.0;
-    let width = sh.line_width.clamp(0.25, 5.0) * (h as f32 / 480.0).clamp(0.75, 2.5);
-    let cutoff = sh.cutoff.clamp(0.0, 480.0) * h as f32 / 480.0;
-    let draw_line = |out: &mut Vec<UiVertex>, x: f32, active: bool, mut color: [f32; 4]| {
-        if active { color = active_color; } else { color[3] = inactive_alpha; }
-        if sh.flags & SHELPER_CGAZ != 0 {
-            let half = if sh.flags & SHELPER_TINY != 0 { 5.0 } else { (20.0 - sh.cutoff / 16.0).max(5.0) };
-            hud_line(out, x, h as f32 * 0.5 - half, x, h as f32 * 0.5 + half, width, color, w, h);
-        }
-        if sh.flags & SHELPER_UPDATED != 0 {
-            hud_line(out, w as f32 * 0.5, h as f32 - cutoff, x, h as f32 * 0.5 - 10.0, width, color, w, h);
-        }
-        if sh.flags & SHELPER_ORIGINAL != 0 {
-            hud_line(out, w as f32 * 0.5, h as f32 * 0.5, x, h as f32 * 0.5, width, color, w, h);
-        }
-    };
-
-    for (flag, angle, df, dr, color) in dirs {
-        if sh.flags & flag == 0 { continue; }
-        if let Some(x) = strafe_angle_to_screen_x(vel_yaw + angle, state.view_yaw, state.fov_x, w, h) {
-            draw_line(out, x, active_for(df, dr), color);
-        }
-    }
-    if sh.flags & SHELPER_CENTER != 0 {
-        if let Some(x) = strafe_angle_to_screen_x(vel_yaw, state.view_yaw, state.fov_x, w, h) {
-            draw_line(out, x, center_active, [1.0, 0.75, 0.0, 0.75]);
-        }
+    let aspect = w.max(1) as f32 / h.max(1) as f32;
+    let segments = crate::strafehelper::strafe_lines(&sh, &ui.movement_hud, ui.video.fps_cap, aspect);
+    // cg_draw's 640x480 space maps straight onto the window on both axes.
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    for segment in segments {
+        let [x0, y0] = [segment.from[0] * sx, segment.from[1] * sy];
+        let [x1, y1] = [segment.to[0] * sx, segment.to[1] * sy];
+        // DF_DrawLine stamps size x size squares (scaled per axis) along the
+        // segment; the swept shape is as thick as the square's extent across it.
+        let length = (x1 - x0).hypot(y1 - y0);
+        if length <= f32::EPSILON { continue; }
+        let (nx, ny) = (-(y1 - y0) / length, (x1 - x0) / length);
+        let thickness = segment.size * (sx * nx.abs() + sy * ny.abs());
+        hud_line(out, x0, y0, x1, y1, thickness, segment.color, w, h);
     }
 }
 
@@ -3937,7 +5256,41 @@ fn hud_line(out: &mut Vec<UiVertex>, x0: f32, y0: f32, x1: f32, y1: f32, width_p
     out.extend_from_slice(&[a, b, c, a, c, d]);
 }
 
-fn build_crosshair(out: &mut Vec<UiVertex>, crosshair: CrosshairSettings, w: u32, h: u32) {
+/// `CG_DrawCrosshairNames`: the aimed-at player's name, centred at y = 170.
+fn build_crosshair_name(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(name) = &ui.crosshair_target.name else { return };
+    if ui.crosshair.style == 0 || name.alpha <= 0.001 {
+        return;
+    }
+    let color = [name.color[0], name.color[1], name.color[2], name.alpha.clamp(0.0, 1.0)];
+    let y = 170.0 * h as f32 / 480.0;
+    if let Some(font) = small_font {
+        // The medium-font role on the shared OCR font, as for the centre print.
+        let scale = 0.78;
+        let x = ((640.0 - proportional_text_width(&name.text, font, scale)) * 0.5) * w as f32 / 640.0;
+        proportional_text(out, &name.text, font, x, y, scale, color, true, w, h);
+        return;
+    }
+    let glyph_w = w as f32 * (10.0 / 640.0);
+    let glyph_h = h as f32 * (16.0 / 480.0);
+    let x = (w as f32 - visible_jka_chars(&name.text) as f32 * glyph_w) * 0.5;
+    fixed_charset_text(out, &name.text, x, y, glyph_w, glyph_h, glyph_w, color, true, w, h);
+}
+
+fn build_crosshair(
+    out: &mut Vec<UiVertex>,
+    crosshair: CrosshairSettings,
+    target_color: Option<[f32; 3]>,
+    line_width: f32,
+    w: u32,
+    h: u32,
+) {
     if crosshair.style == 0 {
         return;
     }
@@ -3953,12 +5306,19 @@ fn build_crosshair(out: &mut Vec<UiVertex>, crosshair: CrosshairSettings, w: u32
     let gap_max = (half - thickness * 0.5).max(0.5);
     let gap = (size / 8.0).clamp(0.5, gap_max);
     let arm = (half - gap).max(1.0);
-    let c = [
-        f32::from(crosshair.color[0]) / 255.0,
-        f32::from(crosshair.color[1]) / 255.0,
-        f32::from(crosshair.color[2]) / 255.0,
-        f32::from(crosshair.color[3]) / 255.0,
-    ];
+    // CG_DrawCrosshair sets the identified colour with alpha 1.
+    let mut c = match target_color {
+        Some([r, g, b]) => [r, g, b, 1.0],
+        None => [
+            f32::from(crosshair.color[0]) / 255.0,
+            f32::from(crosshair.color[1]) / 255.0,
+            f32::from(crosshair.color[2]) / 255.0,
+            f32::from(crosshair.color[3]) / 255.0,
+        ],
+    };
+    // Strength below 1 fades everything; above 1 only the images change (below).
+    let strength = crosshair.strength.clamp(0.0, CROSSHAIR_STRENGTH_MAX);
+    c[3] *= strength.min(1.0);
 
     let hbar = |out: &mut Vec<UiVertex>, x: f32, y: f32, width: f32| {
         rect(out, x, y - thickness * 0.5, width, thickness, c, w, h);
@@ -3966,6 +5326,46 @@ fn build_crosshair(out: &mut Vec<UiVertex>, crosshair: CrosshairSettings, w: u32
     let vbar = |out: &mut Vec<UiVertex>, x: f32, y: f32, height: f32| {
         rect(out, x - thickness * 0.5, y, thickness, height, c, w, h);
     };
+
+    if (1..=CROSSHAIR_IMAGE_COUNT).contains(&crosshair.image) {
+        // The retail artwork carries transparent padding, so the image is drawn
+        // `size` pixels square, which matches the apparent size of the shapes above.
+        let side = crosshair.size.clamp(4.0, 96.0);
+        let (uv0, uv1) = icon_cell_uv(ICON_CROSSHAIR_BASE + usize::from(crosshair.image) - 1);
+        // The stock artwork is thin and translucent. Above 100% strength the same
+        // image is drawn again, each pass raising the coverage of its faint pixels;
+        // up to three extra passes at the maximum, the last one fractional.
+        let extra = (strength - 1.0).max(0.0) * 3.0;
+        let passes = 1 + extra.ceil() as usize;
+        for pass in 0..passes {
+            let weight = if pass == 0 { 1.0 } else { (extra - (pass - 1) as f32).min(1.0) };
+            textured_rect_with_source(
+                out,
+                cx - side * 0.5,
+                cy - side * 0.5,
+                side,
+                side,
+                uv0,
+                uv1,
+                [c[0], c[1], c[2], c[3] * weight],
+                ICON_TEXTURE_SOURCE,
+                w,
+                h,
+            );
+        }
+        return;
+    }
+
+    if crosshair.style == CROSSHAIR_STYLE_LINE {
+        // A vertical line 1.25x the length of the plus (`size` px, resolution
+        // independent like the other shapes), cg_strafeHelperLineWidth units thick in
+        // a 640x480 space like the strafehelper's lines.
+        let sx = w as f32 / 640.0;
+        let line_w = line_width.clamp(0.25, 5.0) * sx;
+        let line_h = size * 1.25;
+        rect(out, cx - line_w * 0.5, cy - line_h * 0.5, line_w, line_h, c, w, h);
+        return;
+    }
 
     match crosshair.style {
         // Classic split cross: the shape DinurdoJK used before this setting.
@@ -4095,37 +5495,52 @@ fn draw_perf_metric(
     );
 }
 
-fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
-    let p = ui.perf;
+const PERF_HEADER_H: f32 = 38.0;
+const PERF_CPU_H: f32 = 78.0;
+const PERF_CLIENT_H: f32 = 161.0;
+const PERF_INPUT_H: f32 = 108.0;
+const PERF_THREAD_HEADER_H: f32 = 28.0;
+const PERF_THREAD_ROW_H: f32 = 32.0;
+
+/// `x, y, width, height` of the `cg_drawFPS 2` profiler panel.
+fn perf_panel_rect(w: u32, gpu_enabled: bool, debug_culling: bool, thread_count: usize) -> (f32, f32, f32, f32) {
     let margin = 14.0;
     let panel_w = 900.0_f32.min((w as f32 - margin * 2.0).max(620.0));
     let x = (w as f32 - panel_w - margin).max(margin);
-    let y = margin;
-    let debug_culling = ui.video.cull_debug != CullDebugMode::Off;
-    let gpu_enabled = p.gpu_ms.is_some();
-    let header_h = 38.0;
-    let cpu_h = 78.0;
     let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
-    let client_h = 161.0;
-    let input_h = 108.0;
-    let thread_header_h = 28.0;
-    let thread_row_h = 32.0;
-    let thread_two_columns = ui.threads.len() > 11;
+    let thread_two_columns = thread_count > 11;
     // The original profiler has 11 core/map slots. Keep those together in
     // the left column and put the event-pool and asset-loader slots in the right column.
     // This preserves the old panel height instead of adding eight more rows.
-    let thread_rows = if thread_two_columns { 11 } else { ui.threads.len() };
+    let thread_rows = if thread_two_columns { 11 } else { thread_count };
     let footer_h = if debug_culling { 42.0 } else { 0.0 };
     let panel_h = 12.0
-        + header_h
-        + cpu_h
+        + PERF_HEADER_H
+        + PERF_CPU_H
         + gpu_h
-        + client_h
-        + input_h
-        + thread_header_h
-        + thread_rows as f32 * thread_row_h
+        + PERF_CLIENT_H
+        + PERF_INPUT_H
+        + PERF_THREAD_HEADER_H
+        + thread_rows as f32 * PERF_THREAD_ROW_H
         + footer_h
         + 18.0;
+    (x, margin, panel_w, panel_h)
+}
+
+fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let p = ui.perf;
+    let debug_culling = ui.video.cull_debug != CullDebugMode::Off;
+    let gpu_enabled = p.gpu_ms.is_some();
+    let (x, y, panel_w, panel_h) = perf_panel_rect(w, gpu_enabled, debug_culling, ui.threads.len());
+    let header_h = PERF_HEADER_H;
+    let cpu_h = PERF_CPU_H;
+    let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
+    let client_h = PERF_CLIENT_H;
+    let input_h = PERF_INPUT_H;
+    let thread_header_h = PERF_THREAD_HEADER_H;
+    let thread_row_h = PERF_THREAD_ROW_H;
+    let thread_two_columns = ui.threads.len() > 11;
+    let thread_rows = if thread_two_columns { 11 } else { ui.threads.len() };
     rect(out, x, y, panel_w, panel_h, [0.0, 0.0, 0.0, 0.76], w, h);
 
     let section_color = [0.60, 0.74, 0.88, 1.0];
@@ -5289,6 +6704,48 @@ fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
             }
         }
         console_text(out, line, 20.0, line_y, CON_TEXT, w, h);
+
+        // Trusted engine-authored local paths get conventional hyperlink
+        // treatment. Draw this *after* the normal colored console text so a
+        // green/yellow log line cannot hide the link, and keep the underline
+        // inside the 16 px row (the previous +18 px position fell below it).
+        let mut path_links = ui
+            .console_path_links
+            .iter()
+            .filter(|link| link.line == absolute_line)
+            .peekable();
+        if path_links.peek().is_some() {
+            let plain = crate::logging::strip_jka_colors(line);
+            for link in path_links {
+                if link.end_col <= link.start_col {
+                    continue;
+                }
+                let linked_text: String = plain
+                    .chars()
+                    .skip(link.start_col)
+                    .take(link.end_col - link.start_col)
+                    .collect();
+                console_plain(
+                    out,
+                    &linked_text,
+                    20.0 + link.start_col as f32 * CONSOLE_CHAR_WIDTH,
+                    line_y,
+                    CON_CYAN,
+                    w,
+                    h,
+                );
+                rect(
+                    out,
+                    20.0 + link.start_col as f32 * CONSOLE_CHAR_WIDTH,
+                    line_y + CONSOLE_CHAR_HEIGHT - 2.0,
+                    (link.end_col - link.start_col) as f32 * CONSOLE_CHAR_WIDTH,
+                    1.0,
+                    with_alpha(CON_CYAN, 0.95),
+                    w,
+                    h,
+                );
+            }
+        }
         line_y += line_step;
     }
     if ui.console_lines.is_empty() && !ui.console_status.is_empty() {
@@ -5627,8 +7084,8 @@ fn text(
     }
 }
 
-fn proportional_text_width(value: &str, font: &ProportionalFont, scale: f32) -> f32 {
-    let bytes = value.as_bytes();
+fn proportional_text_width(value: impl AsRef<[u8]>, font: &ProportionalFont, scale: f32) -> f32 {
+    let bytes = value.as_ref();
     let mut width = 0.0f32;
     let mut index = 0usize;
     while index < bytes.len() {
@@ -5713,7 +7170,7 @@ fn wrap_proportional_text(
 #[allow(clippy::too_many_arguments)]
 fn proportional_text(
     out: &mut Vec<UiVertex>,
-    value: &str,
+    value: impl AsRef<[u8]>,
     font: &ProportionalFont,
     x: f32,
     baseline_y: f32,
@@ -5731,7 +7188,7 @@ fn proportional_text(
         let mut cursor_x = x;
         let mut cursor_y = baseline_y;
         let mut active_color = color;
-        let bytes = value.as_bytes();
+        let bytes = value.as_ref();
         let mut index = 0usize;
         while index < bytes.len() {
             let byte = bytes[index];
@@ -6347,7 +7804,10 @@ mod crosshair_tests {
                     style: 2,
                     size: 24.0,
                     color: [255, 255, 255, 255],
+                    ..CrosshairSettings::default()
                 },
+                None,
+                1.0,
                 width,
                 height,
             );
@@ -6380,6 +7840,90 @@ mod crosshair_tests {
                 let radius = ((x - center_x).powi(2) + (y - center_y).powi(2)).sqrt();
                 assert!((radius - expected_radius).abs() < 0.002);
             }
+        }
+    }
+
+    fn pixel_bounds(vertices: &[UiVertex], width: u32, height: u32) -> [f32; 4] {
+        let points = vertices.iter().map(|vertex| {
+            (
+                (vertex.position[0] + 1.0) * 0.5 * width as f32,
+                (1.0 - vertex.position[1]) * 0.5 * height as f32,
+            )
+        });
+        points.fold([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY], |b, (x, y)| {
+            [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)]
+        })
+    }
+
+    #[test]
+    fn image_crosshair_is_a_centered_atlas_quad() {
+        let (width, height) = (1280_u32, 720_u32);
+        let mut vertices = Vec::new();
+        let crosshair = CrosshairSettings { style: 1, image: 3, size: 32.0, ..CrosshairSettings::default() };
+        build_crosshair(&mut vertices, crosshair, None, 1.0, width, height);
+        assert_eq!(vertices.len(), 6);
+        assert!(vertices.iter().all(|vertex| vertex.textured == ICON_TEXTURE_SOURCE));
+
+        let [min_x, min_y, max_x, max_y] = pixel_bounds(&vertices, width, height);
+        assert!((max_x - min_x - 32.0).abs() < 0.01 && (max_y - min_y - 32.0).abs() < 0.01);
+        assert!(((min_x + max_x) * 0.5 - width as f32 * 0.5).abs() < 0.01);
+        assert!(((min_y + max_y) * 0.5 - height as f32 * 0.5).abs() < 0.01);
+
+        // Image 3 is the third crosshair, after the two lagometer cells.
+        let (uv0, uv1) = icon_cell_uv(ICON_CROSSHAIR_BASE + 2);
+        let u_min = vertices.iter().map(|v| v.uv[0]).fold(f32::INFINITY, f32::min);
+        let u_max = vertices.iter().map(|v| v.uv[0]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((u_min - uv0[0]).abs() < 1e-6 && (u_max - uv1[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn image_zero_and_out_of_range_fall_back_to_the_shape() {
+        for image in [0, CROSSHAIR_IMAGE_COUNT + 1] {
+            let mut vertices = Vec::new();
+            let crosshair = CrosshairSettings { style: 2, image, ..CrosshairSettings::default() };
+            build_crosshair(&mut vertices, crosshair, None, 1.0, 1280, 720);
+            assert!(vertices.iter().all(|vertex| vertex.textured == 0.0));
+            assert_eq!(vertices.len(), 16 * 3);
+        }
+    }
+
+    #[test]
+    fn line_crosshair_is_a_short_vertical_line() {
+        let (width, height) = (1280_u32, 960_u32);
+        let mut vertices = Vec::new();
+        let crosshair = CrosshairSettings { style: CROSSHAIR_STYLE_LINE, size: 24.0, ..CrosshairSettings::default() };
+        build_crosshair(&mut vertices, crosshair, None, 2.0, width, height);
+        assert_eq!(vertices.len(), 6);
+        let [min_x, min_y, max_x, max_y] = pixel_bounds(&vertices, width, height);
+        // 2 units wide at 2 px per unit; 1.25x the plus (24 * 2/3 = 16 px) tall.
+        assert!((max_x - min_x - 4.0).abs() < 0.01);
+        assert!((max_y - min_y - 20.0).abs() < 0.01);
+        assert!(((min_x + max_x) * 0.5 - width as f32 * 0.5).abs() < 0.01);
+        assert!(((min_y + max_y) * 0.5 - height as f32 * 0.5).abs() < 0.01);
+
+        // The width follows jaPRO's 0.25..=5 clamp.
+        let mut thick = Vec::new();
+        build_crosshair(&mut thick, crosshair, None, 50.0, width, height);
+        let [min_x, _, max_x, _] = pixel_bounds(&thick, width, height);
+        assert!((max_x - min_x - 10.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod shadow_mode_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_shadow_modes_round_trip_and_keep_old_stencil_configs() {
+        for mode in DynamicShadowsMode::ALL {
+            assert_eq!(DynamicShadowsMode::from_config(mode.config_value()), Some(mode));
+        }
+        // `stencil` configs predate the Entity map and must land on it, not Off.
+        for legacy in ["stencil", "stencil_legacy", "entity_map"] {
+            assert_eq!(DynamicShadowsMode::from_config(legacy), Some(DynamicShadowsMode::EntityMap));
+        }
+        for source in EntityShadowLight::ALL {
+            assert_eq!(EntityShadowLight::from_config(source.config_value()), Some(source));
         }
     }
 }

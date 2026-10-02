@@ -8,9 +8,9 @@
 //! remaining entity kinds explicit instead of silently treating them as models.
 
 use super::{
-    item_presenter::{cg_item, ItemDraw, ItemInput, IT_WEAPON},
+    item_presenter::{cg_item, item_cone_origin, ItemDraw, ItemInput, IT_WEAPON},
     weapon_fx::WeaponFx,
-    player_presenter::{blend_for_alpha, PlayerPresenter},
+    player_presenter::{blend_for_alpha, Ghoul2PresentationView, PlayerPresenter},
     ClientGameState, EntityPresentationKind, PresentedEntity,
 };
 use crate::{
@@ -22,6 +22,7 @@ use crate::{
     scene,
 };
 use jka_assets::{
+    bsp::StaticModel,
     md3::{self, Model as Md3Model},
     pk3::AssetSearchPath,
     shader::Shader,
@@ -64,11 +65,14 @@ pub struct EntityDispatchSummary {
 
 pub struct EntityPresenter {
     assets: AssetSearchPath,
+    pbr: bool,
     shaders: BTreeMap<String, Shader>,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     missing_texture: Arc<TextureData>,
     md3_models: HashMap<String, Arc<Md3Asset>>,
+    /// Cosmetic models that failed to load (logged once each).
+    missing_cosmetics: std::collections::HashSet<&'static str>,
     failed_models: HashSet<String>,
     logged_unsupported: HashSet<String>,
     fx_materials: HashMap<String, Vec<crate::fx::draw::FxMaterial>>,
@@ -78,6 +82,27 @@ pub struct EntityPresenter {
     /// r_drawMapModels: server-placed MD3 props (ET_GENERAL / non-inline
     /// ET_MOVER). Inline BSP brush movers are never affected.
     draw_map_models: bool,
+    /// jaPRO `cgs.miscStaticModels` source: the map's `misc_model_static`
+    /// entities. They are client-only (the game module frees them), so they
+    /// come from the BSP entity string rather than from snapshots.
+    static_model_source: Arc<Vec<StaticModel>>,
+    /// Surfaces for `static_model_source`, built on first use and rebuilt when
+    /// the source changes or the entity assets are refreshed.
+    static_props: Option<Vec<StaticProp>>,
+    /// Whether `static_props` carry RT caster sources (they must be rebuilt when
+    /// hardware RT shadows are toggled).
+    static_props_rt: bool,
+}
+
+/// One placed `misc_model_static` with its world-space surfaces already built.
+struct StaticProp {
+    surfaces: Vec<DynamicModelSurface>,
+    origin: [f32; 3],
+    /// Origin the cull tests use (jaPRO adds 1 + zoffset to z).
+    cull_origin: [f32; 3],
+    /// `RadiusFromBounds` of the frame-0 bounds scaled by the model scale; 0
+    /// when the model has no bounds, which disables the frustum test.
+    radius: f32,
 }
 
 impl EntityPresenter {
@@ -94,21 +119,155 @@ impl EntityPresenter {
         }
         Ok(Self {
             assets,
+            pbr,
             shaders,
             textures: Textures::new(),
             texture_arcs: HashMap::new(),
             missing_texture: Arc::new(materials::missing_texture_data()),
             md3_models: HashMap::new(),
+            missing_cosmetics: std::collections::HashSet::new(),
             failed_models: HashSet::new(),
             logged_unsupported: HashSet::new(),
             fx_materials: HashMap::new(),
             rt_rigid_casters_enabled: false,
             draw_map_models: true,
+            static_model_source: Arc::default(),
+            static_props: None,
+            static_props_rt: false,
         })
     }
 
     pub fn set_draw_map_models(&mut self, enabled: bool) {
         self.draw_map_models = enabled;
+    }
+
+    /// Installs the current map's `misc_model_static` placements.
+    pub fn set_static_models(&mut self, models: Arc<Vec<StaticModel>>) {
+        if Arc::ptr_eq(&self.static_model_source, &models) {
+            return;
+        }
+        self.static_model_source = models;
+        self.static_props = None;
+    }
+
+    /// jaPRO `CG_DrawMiscStaticModels`: every static prop that survives the
+    /// frustum and distance cull, as already-transformed MD3 surfaces. Without a
+    /// view (first frame, teleport) nothing is culled. With hardware RT shadows
+    /// the props are architecture that must keep shadowing, so culled ones stay
+    /// in the list as shadow-only (`raster_visible = false`); that also keeps the
+    /// RT scene signature stable while the camera turns.
+    pub fn present_static_models(
+        &mut self,
+        view: Option<Ghoul2PresentationView>,
+    ) -> Vec<DynamicModelSurface> {
+        if !self.draw_map_models || self.static_model_source.is_empty() {
+            return Vec::new();
+        }
+        if self.static_props.is_none() || self.static_props_rt != self.rt_rigid_casters_enabled {
+            self.static_props_rt = self.rt_rigid_casters_enabled;
+            let props = self.build_static_props();
+            self.static_props = Some(props);
+        }
+        let mut draws = Vec::new();
+        for prop in self.static_props.iter().flatten() {
+            let culled = view.is_some_and(|view| {
+                let distance_cull = view.distance_cull();
+                (prop.radius > 0.0 && view.sphere_outside(prop.cull_origin, prop.radius))
+                    || (distance_cull > 0.0
+                        && view.distance_to(prop.origin) - prop.radius > distance_cull)
+            });
+            if !culled {
+                draws.extend(prop.surfaces.iter().cloned());
+            } else if self.rt_rigid_casters_enabled {
+                draws.extend(prop.surfaces.iter().cloned().map(|mut surface| {
+                    surface.raster_visible = false;
+                    surface
+                }));
+            }
+        }
+        draws
+    }
+
+    fn build_static_props(&mut self) -> Vec<StaticProp> {
+        let source = Arc::clone(&self.static_model_source);
+        let mut props = Vec::with_capacity(source.len());
+        let mut surfaces_total = 0usize;
+        for placement in source.iter() {
+            let mut axis = angles_to_axis(placement.angles);
+            for (row, scale) in axis.iter_mut().zip(placement.scale) {
+                for component in row.iter_mut() {
+                    *component *= scale;
+                }
+            }
+            let submission = ItemDraw {
+                model: placement.model.clone(),
+                origin: placement.origin,
+                axis,
+                rgba: [1.0; 4],
+                custom_shader: None,
+            };
+            // rt_rigid is filled by present_md3_ref_entity while RT casters are on.
+            let surfaces = match self.present_md3_ref_entity(1023, &submission) {
+                Ok(surfaces) => surfaces,
+                Err(error) => {
+                    if self.logged_unsupported.insert(format!("static:{}", placement.model)) {
+                        println!("STATIC MODEL {}: {error}", placement.model);
+                    }
+                    continue;
+                }
+            };
+            surfaces_total += surfaces.len();
+            let radius = self
+                .load_md3(&placement.model)
+                .ok()
+                .and_then(|asset| {
+                    asset.model.frames.first().map(|frame| {
+                        // RadiusFromBounds over the scaled frame-0 bounds.
+                        let corner = |axis: usize| {
+                            let scale = placement.scale[axis];
+                            (frame.mins[axis] * scale).abs().max((frame.maxs[axis] * scale).abs())
+                        };
+                        (corner(0).powi(2) + corner(1).powi(2) + corner(2).powi(2)).sqrt()
+                    })
+                })
+                .unwrap_or(0.0);
+            let mut cull_origin = placement.origin;
+            cull_origin[2] += 1.0 + placement.zoffset;
+            props.push(StaticProp { surfaces, origin: placement.origin, cull_origin, radius });
+        }
+        println!(
+            "STATIC MODELS: {} of {} misc_model_static placement(s) built, {} surface(s)",
+            props.len(),
+            source.len(),
+            surfaces_total,
+        );
+        props
+    }
+
+    /// Targeted filesystem refresh for model registrations that previously
+    /// failed because content was absent. Already-loaded MD3/model caches stay
+    /// resident; only the VFS namespace, shader definition table and failure
+    /// sentinels are refreshed.
+    pub fn retry_failed_assets(&mut self) -> Result<usize, String> {
+        self.assets
+            .refresh()
+            .map_err(|error| format!("ENTITY ASSET REFRESH ERROR: {error}"))?;
+        let mut shader_warnings = Vec::new();
+        let (shaders, diagnostics) =
+            materials::shader_library(&mut self.assets, &mut shader_warnings, self.pbr)?;
+        self.shaders = shaders;
+        for warning in shader_warnings {
+            println!("ENTITY MATERIAL REFRESH WARNING: {warning}");
+        }
+        println!(
+            "ENTITY ASSET REFRESH: shaderDefs={} mtrDefs={}",
+            diagnostics.shader_definitions, diagnostics.mtr_definitions
+        );
+        let retried = self.failed_models.len();
+        self.failed_models.clear();
+        self.fx_materials.clear();
+        self.static_props = None;
+        Ok(retried)
     }
 
     /// `ghoul2` draws Ghoul2 world models (weapon items) through the shared
@@ -147,7 +306,7 @@ impl EntityPresenter {
                 }
                 EntityPresentationKind::Item => {
                     summary.items += 1;
-                    self.present_item(entity, game, time, ghoul2, &mut draws);
+                    self.present_item(entity, game, time, ghoul2, weapon_fx, &mut draws);
                 }
                 EntityPresentationKind::Missile => {
                     summary.missiles += 1;
@@ -189,6 +348,25 @@ impl EntityPresenter {
                     let key = format!("kind:{kind:?}");
                     if self.logged_unsupported.insert(key) {
                         println!("ENTITY DISPATCH TODO: {kind:?}");
+                    }
+                }
+            }
+        }
+
+        // CG_AddLocalEntities: LE_FRAGMENT debris from EV_DEBRIS.
+        for chunk in weapon_fx.chunk_models() {
+            let submission = ItemDraw {
+                model: chunk.qpath.clone(),
+                origin: chunk.origin,
+                axis: chunk.axis,
+                rgba: [1.0, 1.0, 1.0, chunk.alpha],
+                custom_shader: None,
+            };
+            match self.present_md3_ref_entity(1023, &submission) {
+                Ok(mut surfaces) => draws.append(&mut surfaces),
+                Err(error) => {
+                    if self.logged_unsupported.insert(format!("chunk:{}", chunk.qpath)) {
+                        println!("CHUNK MODEL {}: {error}", chunk.qpath);
                     }
                 }
             }
@@ -275,6 +453,7 @@ impl EntityPresenter {
         game: &ClientGameState,
         time: i32,
         ghoul2: &mut PlayerPresenter,
+        weapon_fx: &mut WeaponFx,
         draws: &mut Vec<DynamicModelSurface>,
     ) {
         let index = entity.state.field_i32("modelindex").unwrap_or(0);
@@ -313,6 +492,9 @@ impl EntityPresenter {
                 .unwrap_or(0),
             weapon_midpoint,
         };
+        if let Some(origin) = item_cone_origin(&item, &input) {
+            weapon_fx.item_cone(entity.number, origin);
+        }
         for submission in cg_item(&item, &input, angles_to_axis) {
             let result = if submission.model.to_ascii_lowercase().ends_with(".glm") {
                 ghoul2.present_static_glm(
@@ -332,6 +514,34 @@ impl EntityPresenter {
                 Err(error) => self.log_entity_once(entity, &format!("{} ({}): {error}", item.classname, submission.model)),
             }
         }
+    }
+
+    /// jaPRO cosmetics: the hat/cape MD3s `PlayerPresenter` bolted to players.
+    /// They resolve through this presenter's own VFS like any other model, so
+    /// they only appear when the asset search path provides them (`japro-assets.pk3` in base).
+    pub fn present_cosmetics(
+        &mut self,
+        cosmetics: Vec<super::player_presenter::CosmeticDraw>,
+    ) -> Vec<DynamicModelSurface> {
+        let mut draws = Vec::new();
+        for cosmetic in cosmetics {
+            let submission = ItemDraw {
+                model: cosmetic.model.to_owned(),
+                origin: cosmetic.origin,
+                axis: cosmetic.axis,
+                rgba: cosmetic.rgba,
+                custom_shader: cosmetic.custom_shader,
+            };
+            match self.present_md3_ref_entity(cosmetic.entity_num, &submission) {
+                Ok(mut surfaces) => draws.append(&mut surfaces),
+                Err(error) => {
+                    if self.missing_cosmetics.insert(cosmetic.model) {
+                        println!("COSMETIC UNAVAILABLE: {}: {error}", cosmetic.model);
+                    }
+                }
+            }
+        }
+        draws
     }
 
     /// An MD3 refEntity with an explicit transform (frame 0), shaderRGBA and
@@ -621,6 +831,35 @@ impl EntityPresenter {
             .expect("FX material resolver always returns at least one stage")
     }
 
+    /// Resolve an FX material only when the authored shader or implicit image
+    /// actually exists. This is useful for optional compatibility assets where
+    /// the caller has a known stock fallback and should not draw the missing
+    /// texture checker for the preferred asset.
+    pub fn fx_material_stages_if_present(
+        &mut self,
+        shader_name: &str,
+    ) -> Option<Vec<crate::fx::draw::FxMaterial>> {
+        use crate::fx::draw::{FxBlend, FxMaterial};
+        let key = shader_name.replace('\\', "/").to_ascii_lowercase();
+        if let Some(materials) = self.fx_materials.get(&key) {
+            return Some(materials.clone());
+        }
+        if self.shaders.contains_key(&key) {
+            return Some(self.fx_material_stages(shader_name));
+        }
+        let texture = self.load_texture_arc(&key, false)?;
+        let materials = vec![FxMaterial {
+            texture: Some(texture),
+            blend: FxBlend::Alpha,
+            rgb_vertex: true,
+            alpha_vertex: true,
+            rgb_const: [1.0; 3],
+            alpha_const: 1.0,
+        }];
+        self.fx_materials.insert(key, materials.clone());
+        Some(materials)
+    }
+
     /// Every renderable stage of an FX shader. Jedi Academy effects are often
     /// multi-pass; notably `saberBlur` draws blurglow then blurcore, both with
     /// GL_ONE GL_ONE. Keeping this generic fixes other multi-stage FX too.
@@ -704,20 +943,31 @@ impl EntityPresenter {
                         alpha_const: 1.0,
                     }),
                     None => {
-                        if let Some(warning) = self.textures.warnings.last() {
-                            println!("FX TEXTURE WARNING: {warning}");
+                        if let Some(texture) = self.rgb_saber_fallback_texture(&key) {
+                            materials.push(FxMaterial {
+                                texture: Some(texture),
+                                blend: FxBlend::Add,
+                                rgb_vertex: true,
+                                alpha_vertex: false,
+                                rgb_const: [1.0; 3],
+                                alpha_const: 1.0,
+                            });
+                        } else {
+                            if let Some(warning) = self.textures.warnings.last() {
+                                println!("FX TEXTURE WARNING: {warning}");
+                            }
+                            println!(
+                                "FX MATERIAL WARNING: {shader_name}: no shader definition or implicit image; using shared missing texture placeholder"
+                            );
+                            materials.push(FxMaterial {
+                                texture: Some(Arc::clone(&self.missing_texture)),
+                                blend: FxBlend::Opaque,
+                                rgb_vertex: true,
+                                alpha_vertex: true,
+                                rgb_const: [1.0; 3],
+                                alpha_const: 1.0,
+                            });
                         }
-                        println!(
-                            "FX MATERIAL WARNING: {shader_name}: no shader definition or implicit image; using shared missing texture placeholder"
-                        );
-                        materials.push(FxMaterial {
-                            texture: Some(Arc::clone(&self.missing_texture)),
-                            blend: FxBlend::Opaque,
-                            rgb_vertex: true,
-                            alpha_vertex: true,
-                            rgb_const: [1.0; 3],
-                            alpha_const: 1.0,
-                        });
                     }
                 }
             }
@@ -732,6 +982,27 @@ impl EntityPresenter {
             .entry(index)
             .or_insert_with(|| Arc::new(self.textures.images[index].clone()));
         Some(Arc::clone(&self.texture_arcs[&index]))
+    }
+
+    /// jaPRO's RGB saber glow/core are white images tinted per draw by vertex
+    /// colour. Without its assets, derive equivalents from the stock saber images
+    /// by keeping each texel's brightest channel as a grey level, so the tint
+    /// alone decides the hue.
+    fn rgb_saber_fallback_texture(&mut self, key: &str) -> Option<Arc<TextureData>> {
+        let source = match key {
+            "gfx/effects/sabers/rgbglow1" => "gfx/effects/sabers/yellow_glow2",
+            "gfx/effects/sabers/rgbcore1" => "gfx/effects/sabers/blue_line",
+            _ => return None,
+        };
+        let base = self.load_texture_arc(source, false)?;
+        let mut texture = (*base).clone();
+        texture.label = key.to_owned();
+        texture.rgba16f = None;
+        for texel in texture.rgba.chunks_exact_mut(4) {
+            let grey = texel[0].max(texel[1]).max(texel[2]);
+            texel[..3].fill(grey);
+        }
+        Some(Arc::new(texture))
     }
 
     fn load_texture_arc_or_missing(
@@ -755,10 +1026,7 @@ impl EntityPresenter {
         &mut self,
         shader_name: &str,
     ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
-        let shader_key = shader_name.replace('\\', "/").to_ascii_lowercase();
-        let (image_name, clamp, alpha_mode) = self
-            .shaders
-            .get(&shader_key)
+        let (image_name, clamp, alpha_mode) = jka_assets::shader::find_shader(&self.shaders, shader_name)
             .and_then(Shader::primary)
             .map(|stage| {
                 let alpha_mode = if !stage.alpha_test.trim().is_empty() {

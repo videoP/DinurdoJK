@@ -52,6 +52,20 @@ pub fn bg_item(index: i32) -> Option<ItemInfo> {
     }
 }
 
+/// `bg_itemlist[index].pickup_sound` qpath (CG_EntityEvent EV_ITEM_PICKUP).
+pub fn bg_item_pickup_sound(index: i32) -> Option<String> {
+    // SAFETY: returns a static literal or "" for out-of-range indices.
+    let sound = unsafe { CStr::from_ptr(ffi::jka_item_pickup_sound(index)) }.to_string_lossy().into_owned();
+    (!sound.is_empty()).then_some(sound)
+}
+
+/// `bg_itemlist[index].icon` qpath (the HUD pickup icon); `None` for items without one.
+pub fn bg_item_icon(index: i32) -> Option<String> {
+    // SAFETY: returns a static literal or "" for out-of-range indices.
+    let icon = unsafe { CStr::from_ptr(ffi::jka_item_icon(index)) }.to_string_lossy().into_owned();
+    (!icon.is_empty()).then_some(icon)
+}
+
 /// q_math ByteToDir: the event normal encoding used by EV_MISSILE_* etc.
 pub fn byte_to_dir(b: i32) -> [f32; 3] {
     let mut dir = [0.0f32; 3];
@@ -130,6 +144,16 @@ pub struct SaberMovementInfo {
     pub ready_anim: i32,
     pub draw_anim: i32,
     pub putaway_anim: i32,
+    /// Non-zero for the local authority, which reserves the ownership token
+    /// in `saberEntityNum`. Network prediction must leave the snapshot's
+    /// value alone (see [`SaberMovementInfo::for_prediction`]).
+    pub owns_entity_slot: i32,
+    /// SFL2_NO_MANUAL_DEACTIVATE / SFL2_NO_MANUAL_DEACTIVATE2 (non-zero = set).
+    pub no_manual_deactivate: i32,
+    pub no_manual_deactivate2: i32,
+    /// `bladeStyle2Start` and `singleBladeStyle` from the saber definition.
+    pub blade_style2_start: i32,
+    pub single_blade_style: i32,
 }
 impl Default for SaberMovementInfo {
     fn default() -> Self {
@@ -144,6 +168,11 @@ impl Default for SaberMovementInfo {
             ready_anim: -1,
             draw_anim: -1,
             putaway_anim: -1,
+            owns_entity_slot: 1,
+            no_manual_deactivate: 0,
+            no_manual_deactivate2: 0,
+            blade_style2_start: 0,
+            single_blade_style: 0,
         }
     }
 }
@@ -151,6 +180,12 @@ impl SaberMovementInfo {
     /// Stock `WP_SaberSetDefaults` gameplay state for an equipped saber.
     pub fn equipped_default() -> Self {
         Self { present: 1, ..Self::default() }
+    }
+
+    /// The `cgs.clientinfo[].saber[]` data CG_PredictPlayerState's Pmove reads
+    /// through BG_MySaber. The snapshot playerState stays authoritative.
+    pub fn for_prediction(self) -> Self {
+        Self { owns_entity_slot: 0, ..self }
     }
 }
 
@@ -197,6 +232,15 @@ impl Default for UserCmd {
         }
     }
 }
+/// How the native pmove rounds velocity after every step (`trap_SnapVector`): 0 OpenJK's
+/// `Sys_SnapVector` (nearest, ties away from zero), 1 truncate, 2 floor, 3 nearest-even,
+/// 4 none. Process-wide; the retail game code is the same everywhere but the engine's rounding
+/// is not, and at 1 ms steps it decides friction and gravity.
+pub fn set_snap_mode(mode: i32) {
+    let _guard = ffi::NativeGuard::new();
+    unsafe { ffi::jka_set_snap_mode(mode) };
+}
+
 pub fn angle_to_short(angle: f32) -> i32 {
     ((angle * (65536.0 / 360.0)) as i32) & 65535
 }
@@ -730,6 +774,22 @@ impl PlayerState {
         };
         if ok == 0 {
             return Err("Native saber movement metadata rejected".into());
+        }
+        Ok(())
+    }
+    /// `*l_leg_foot` / `*r_leg_foot` in Ghoul2 model space, from the presented
+    /// pose. This is what `pmove_t::ghoul2` gives the real cgame so Pmove can
+    /// pick the slope stand anims (leg dangle); `None` disables that path.
+    pub fn set_foot_bolts(&mut self, bolts: Option<[[f32; 3]; 2]>) -> Result<(), String> {
+        let _guard = ffi::NativeGuard::new();
+        let ok = unsafe {
+            match &bolts {
+                Some([left, right]) => ffi::jka_player_set_foot_bolts(self.raw.as_ptr(), left.as_ptr(), right.as_ptr()),
+                None => ffi::jka_player_set_foot_bolts(self.raw.as_ptr(), std::ptr::null(), std::ptr::null()),
+            }
+        };
+        if ok == 0 {
+            return Err("Native foot bolts rejected".into());
         }
         Ok(())
     }

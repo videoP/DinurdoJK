@@ -16,6 +16,8 @@ struct VertexOut {
 @group(0) @binding(1) var ui_font_sampler: sampler;
 @group(0) @binding(2) var ui_small_font: texture_2d<f32>;
 @group(0) @binding(3) var ui_splash: texture_2d<f32>;
+@group(0) @binding(4) var ui_keys: texture_2d<f32>;
+@group(0) @binding(5) var ui_icons: texture_2d<f32>;
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
@@ -37,9 +39,15 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         glyph = textureSampleLevel(ui_font, ui_font_sampler, input.uv, 0.0);
     } else if input.textured < 2.5 {
         glyph = textureSampleLevel(ui_small_font, ui_font_sampler, input.uv, 0.0);
-    } else {
+    } else if input.textured < 3.5 {
         let splash = textureSampleLevel(ui_splash, ui_font_sampler, input.uv, 0.0);
         return splash * input.color;
+    } else if input.textured < 4.5 {
+        // gfx/hud/keys art: an ordinary alpha-blended 2D pic, tinted by vertex colour.
+        return textureSampleLevel(ui_keys, ui_font_sampler, input.uv, 0.0) * input.color;
+    } else {
+        // gfx/2d/lag and gfx/2d/net (lagometer): likewise an ordinary 2D pic.
+        return textureSampleLevel(ui_icons, ui_font_sampler, input.uv, 0.0) * input.color;
     }
     return vec4<f32>(input.color.rgb, input.color.a * glyph.a);
 }

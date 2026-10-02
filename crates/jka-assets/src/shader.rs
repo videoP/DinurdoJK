@@ -1,7 +1,67 @@
 //! Native interpretation of common JKA/Q3 shader material declarations.
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Periodic function of a `rgbGen wave` / `alphaGen wave` (id Tech 3's
+/// GF_SIN .. GF_NOISE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveFunc {
+    Sin,
+    Triangle,
+    Square,
+    Sawtooth,
+    InverseSawtooth,
+    Noise,
+}
+
+impl WaveFunc {
+    /// Stable id shared with the world shaders' `wave_value`.
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Sin => 0,
+            Self::Triangle => 1,
+            Self::Square => 2,
+            Self::Sawtooth => 3,
+            Self::InverseSawtooth => 4,
+            Self::Noise => 5,
+        }
+    }
+}
+
+/// `func base amplitude phase frequency`: the value is
+/// `base + func((phase + time * frequency)) * amplitude`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wave {
+    pub func: WaveFunc,
+    pub base: f32,
+    pub amplitude: f32,
+    pub phase: f32,
+    pub frequency: f32,
+}
+
+fn parse_wave(args: &[String]) -> Option<Wave> {
+    let func = match args.first()?.to_ascii_lowercase().as_str() {
+        "sin" => WaveFunc::Sin,
+        "triangle" => WaveFunc::Triangle,
+        "square" => WaveFunc::Square,
+        "sawtooth" => WaveFunc::Sawtooth,
+        "inversesawtooth" => WaveFunc::InverseSawtooth,
+        "noise" => WaveFunc::Noise,
+        _ => return None,
+    };
+    let values = numbers(&args[1..]).ok()?;
+    if values.len() != 4 || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(Wave {
+        func,
+        base: values[0],
+        amplitude: values[1],
+        phase: values[2],
+        frequency: values[3],
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum RgbGen {
     #[default]
     Identity,
@@ -9,6 +69,8 @@ pub enum RgbGen {
     ExactVertex,
     OneMinusVertex,
     Const,
+    /// `rgbGen wave`: all three colour channels take the (clamped) wave value.
+    Wave(Wave),
 }
 
 impl RgbGen {
@@ -17,13 +79,19 @@ impl RgbGen {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum AlphaGen {
     #[default]
     Identity,
     Const,
     Vertex,
     OneMinusVertex,
+    /// `alphaGen wave`: alpha takes the (clamped) wave value.
+    Wave(Wave),
+    /// `alphaGen lightingSpecular`: per-vertex specular highlight of the entity
+    /// light. Near zero away from a highlight, so a `GL_SRC_ALPHA GL_ONE` stage
+    /// using it only adds a glint. World surfaces treat it like identity.
+    LightingSpecular,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -33,6 +101,12 @@ pub enum TcGen {
     Lightmap,
     Vector([f32; 3], [f32; 3]),
     Environment,
+    /// Never authored in a shader script. Sky shaders have no per-vertex
+    /// texture coordinates: the engine projects the view direction onto a
+    /// cloud layer at the `skyParms` height and uses that as the stage's base
+    /// coordinates (before its tcMods). The renderer marks a sky shader's
+    /// stages with this generator, carrying the cloud height.
+    SkyCloud(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,6 +121,37 @@ pub enum TcMod {
         phase: f32,
         frequency: f32,
     },
+}
+
+/// `deformVertexes bulge <width> <height> <speed>`. JKA's `RB_CalcBulgeVertexes`
+/// special-cases `width == 0.0 && speed == 0.0` (as the Rage shell shaders
+/// `gfx/misc/electric`/`fullbodyelectric2` use) into a constant per-vertex
+/// offset along the normal, rather than the time/UV-varying sine wave the
+/// stock id Tech 3 formula would give it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bulge {
+    pub width: f32,
+    pub height: f32,
+    pub speed: f32,
+}
+
+impl Bulge {
+    /// `width == 0.0 && speed == 0.0`: a constant outward offset.
+    pub fn is_static(&self) -> bool {
+        self.width == 0.0 && self.speed == 0.0
+    }
+}
+
+/// `deformVertexes wave <div> <wave>`: id Tech 3's `RB_CalcDeformVertexes`
+/// offsets each vertex along its normal by `wave`, phase-shifted per vertex by
+/// `(x + y + z) / div`. `div` near zero is a divide-by-zero in the original
+/// engine (clamped there to a tiny value); callers that only need a per-draw
+/// approximation (ignoring the per-vertex phase spread) can evaluate `wave`
+/// alone, same as a `deformVertexes bulge` push along the normal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VertexWave {
+    pub div: f32,
+    pub wave: Wave,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,6 +221,8 @@ impl SurfaceSprite {
 pub struct Stage {
     pub image: String,
     pub clamp: bool,
+    /// `videoMap`: `image` names a looping RoQ cinematic instead of a texture.
+    pub video: bool,
     /// Rend2 material companion maps authored directly on this diffuse stage.
     pub normal_map: Option<String>,
     pub normal_height_map: Option<String>,
@@ -146,6 +253,10 @@ pub struct Stage {
     /// but retaining it lets modern fallback detail avoid double-applying to a
     /// material that already authored its own close-range detail pass.
     pub detail: bool,
+    /// `rgbGen lightingDiffuseEntity` / `rgbGen entity`: the stage is modulated by
+    /// the refEntity's `shaderRGBA` (a player's `char_color_*` tint). `rgb_gen`
+    /// stays `Identity` so world materials keep their existing behaviour.
+    pub entity_rgb: bool,
     /// Jedi Academy `surfaceSprites` metadata. This describes a procedural
     /// surface effect; it is not an ordinary material pass.
     pub surface_sprite: Option<SurfaceSprite>,
@@ -160,6 +271,11 @@ pub struct Shader {
     pub portal: bool,
     pub sky: bool,
     pub sky_box: Option<String>,
+    /// `skyParms <outerbox> <cloudheight> <innerbox>`: height of the cloud layer
+    /// that the shader's own stages are projected onto. Zero means the shader
+    /// authored no cloud height, so its stages are not drawn as clouds. As in
+    /// the engine, an authored height of 0 becomes 512.
+    pub sky_cloud_height: f32,
     pub nodraw: bool,
     pub translucent: bool,
     /// q3map2 alpha-shadow metadata; retained separately from visible blending.
@@ -207,6 +323,10 @@ pub struct Shader {
     /// legacy JKA alias for `q3map_sun`; q3map_sunExt carries the same first
     /// six parameters plus penumbra controls.
     pub suns: Vec<Sun>,
+    /// `deformVertexes bulge`. JKA model shaders author at most one.
+    pub bulge: Option<Bulge>,
+    /// `deformVertexes wave`. JKA model shaders author at most one.
+    pub vertex_wave: Option<VertexWave>,
     pub stages: Vec<Stage>,
     pub unsupported: Vec<String>,
 }
@@ -371,15 +491,55 @@ impl Shader {
     }
 }
 
+/// Find a shader by the name a `.skin`/model refers to it by. `R_FindShader`
+/// strips the file extension first, so a skin entry such as
+/// `models/players/jedi_zf/torso_04_clothes.tga` selects the shader
+/// `models/players/jedi_zf/torso_04_clothes`; without that the lookup misses and
+/// the surface falls back to a texture that does not exist.
+pub fn find_shader<'a>(shaders: &'a BTreeMap<String, Shader>, name: &str) -> Option<&'a Shader> {
+    let key = name.replace('\\', "/").to_ascii_lowercase();
+    if let Some(shader) = shaders.get(&key) {
+        return Some(shader);
+    }
+    let file_start = key.rfind('/').map_or(0, |slash| slash + 1);
+    let dot = key[file_start..].rfind('.')?;
+    shaders.get(&key[..file_start + dot])
+}
+
 fn numbers(args: &[String]) -> Result<Vec<f32>, String> {
     args.iter()
         .flat_map(|a| a.split(['(', ')', ',']))
         .filter(|a| !a.is_empty())
         .map(|a| {
             a.parse::<f32>()
-                .map_err(|_| format!("invalid shader number {a}"))
+                .ok()
+                .or_else(|| atof_prefix(a))
+                .ok_or_else(|| format!("invalid shader number {a}"))
         })
         .collect()
+}
+
+/// The engine reads shader numbers with `atof`, which stops at the first
+/// character that cannot continue a number (TinkerBell's `tcMod scroll -0.03
+/// 0.01ce` still loads as 0.01). Needs at least one digit.
+fn atof_prefix(text: &str) -> Option<f32> {
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'+' | b'-' if i == 0 => {}
+            b'0'..=b'9' => seen_digit = true,
+            b'.' if !seen_dot => seen_dot = true,
+            _ => break,
+        }
+        end = i + 1;
+    }
+    if !seen_digit {
+        return None;
+    }
+    text[..end].parse().ok().filter(|value: &f32| value.is_finite())
 }
 
 fn vec3(args: &[String]) -> Result<[f32; 3], String> {
@@ -524,8 +684,13 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         stage.image = first;
                         stage.clamp = key == "clampmap";
                     }
-                    "animmap" | "oneshotanimmap" => {
+                    "videomap" => {
+                        stage.image = first;
+                        stage.video = true;
+                    }
+                    "animmap" | "oneshotanimmap" | "clampanimmap" => {
                         stage.image = args.get(1).cloned().unwrap_or_default();
+                        stage.clamp = key == "clampanimmap";
                         stage.unsupported.push(format!("{key} (first frame only)"));
                     }
                     "normalmap" => stage.normal_map = args.first().cloned(),
@@ -624,6 +789,15 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         stage.alpha_gen = AlphaGen::OneMinusVertex
                     }
                     "alphagen" if first == "identity" => stage.alpha_gen = AlphaGen::Identity,
+                    "alphagen" if first == "lightingspecular" => {
+                        stage.alpha_gen = AlphaGen::LightingSpecular
+                    }
+                    "alphagen" if first == "wave" => match parse_wave(&args[1..]) {
+                        Some(wave) => stage.alpha_gen = AlphaGen::Wave(wave),
+                        None => stage
+                            .unsupported
+                            .push(format!("alphagen {}", args.join(" "))),
+                    },
                     "alphagen" => stage
                         .unsupported
                         .push(format!("alphagen {}", args.join(" "))),
@@ -639,10 +813,20 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                     "rgbgen" if first == "oneminusvertex" => {
                         stage.rgb_gen = RgbGen::OneMinusVertex
                     }
+                    "rgbgen" if first == "wave" => match parse_wave(&args[1..]) {
+                        Some(wave) => stage.rgb_gen = RgbGen::Wave(wave),
+                        None => stage
+                            .unsupported
+                            .push(format!("rgbgen {}", args.join(" "))),
+                    },
                     "rgbgen" if first == "const" => {
                         let v = vec3(&args[1..])?;
                         stage.color = Some(v.map(|n| n.clamp(0.0, 1.0)));
                         stage.rgb_gen = RgbGen::Const;
+                    }
+                    "rgbgen" if first == "lightingdiffuseentity" || first == "entity" => {
+                        stage.entity_rgb = true;
+                        stage.rgb_gen = RgbGen::Identity;
                     }
                     "rgbgen"
                         if ["identity", "identitylighting", "lightingdiffuse"]
@@ -874,6 +1058,16 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         if first != "-" {
                             shader.sky_box = Some(first);
                         }
+                        // R_InitSkyTexCoords is only reached when the cloud
+                        // height token is present.
+                        if let Some(token) = args.get(1) {
+                            let height = token.parse::<f32>().unwrap_or(0.0);
+                            shader.sky_cloud_height = if height.is_finite() && height != 0.0 {
+                                height
+                            } else {
+                                512.0
+                            };
+                        }
                     }
                     "fogparms" => {
                         let values = numbers(args)?;
@@ -913,7 +1107,25 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             shader.unsupported.push(format!("sort {first}"));
                         }
                     }
-                    "deformvertexes" => shader.unsupported.push(key),
+                    "deformvertexes" if first == "bulge" => {
+                        let values = numbers(&args[1..])?;
+                        if values.len() == 3 && values.iter().all(|value| value.is_finite()) {
+                            shader.bulge = Some(Bulge { width: values[0], height: values[1], speed: values[2] });
+                        } else {
+                            shader.unsupported.push(format!("deformvertexes bulge {}", args[1..].join(" ")));
+                        }
+                    }
+                    "deformvertexes" if first == "wave" => {
+                        let div = args.get(1).and_then(|value| value.parse::<f32>().ok());
+                        let wave = args.get(2..).and_then(parse_wave);
+                        match (div, wave) {
+                            (Some(div), Some(wave)) if div.is_finite() && div != 0.0 => {
+                                shader.vertex_wave = Some(VertexWave { div, wave });
+                            }
+                            _ => shader.unsupported.push(format!("deformvertexes wave {}", args[1..].join(" "))),
+                        }
+                    }
+                    "deformvertexes" => shader.unsupported.push(format!("deformvertexes {}", args.join(" "))),
                     _ => (),
                 }
             }
@@ -1001,6 +1213,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_deform_vertexes_bulge() {
+        let shaders = parse(
+            "gfx/misc/electric {\nqer_editorimage gfx/misc/lightning3\ncull twosided\ndeformvertexes bulge 0 2 0\n{\nmap gfx/misc/lightning3\nblendFunc GL_ONE GL_ONE\n}\n}\n",
+        )
+        .unwrap();
+        let bulge = shaders["gfx/misc/electric"].bulge.unwrap();
+        assert_eq!(bulge, Bulge { width: 0.0, height: 2.0, speed: 0.0 });
+        assert!(bulge.is_static());
+        assert!(shaders["gfx/misc/electric"].unsupported.is_empty());
+    }
+
+    #[test]
+    fn non_static_bulge_is_not_static() {
+        let shaders = parse("textures/test/bulge {\ndeformvertexes bulge 100 4 2\n}\n").unwrap();
+        let bulge = shaders["textures/test/bulge"].bulge.unwrap();
+        assert!(!bulge.is_static());
+    }
+
+    #[test]
+    fn parses_deform_vertexes_wave() {
+        let shaders = parse(
+            "powerups/ysalimarishell {\ndeformvertexes wave 100 sin 0 1 0 1\n{\nmap gfx/mp/ysalshell\nblendFunc GL_ONE GL_ONE\n}\n}\n",
+        )
+        .unwrap();
+        let wave = shaders["powerups/ysalimarishell"].vertex_wave.unwrap();
+        assert_eq!(wave.div, 100.0);
+        assert_eq!(wave.wave, Wave { func: WaveFunc::Sin, base: 0.0, amplitude: 1.0, phase: 0.0, frequency: 1.0 });
+        assert!(shaders["powerups/ysalimarishell"].unsupported.is_empty());
+    }
+
+    #[test]
+    fn unrecognized_deform_is_recorded_unsupported() {
+        let shaders = parse("textures/test/wave {\ndeformvertexes autosprite\n}\n").unwrap();
+        assert_eq!(shaders["textures/test/wave"].unsupported, ["deformvertexes autosprite"]);
+    }
+
+    #[test]
     fn parses_map_fog_parameters_as_depth_to_opaque() {
         let shaders = parse("textures/test/fog {\nfogparms ( .2 .3 .4 ) 640\n}\n").unwrap();
         let fog = shaders["textures/test/fog"].fogparms.unwrap();
@@ -1015,6 +1264,92 @@ mod tests {
         )
         .unwrap();
         assert!(shaders["textures/test/nofog"].no_fog);
+    }
+
+    #[test]
+    fn shader_numbers_read_like_atof() {
+        assert_eq!(numbers(&["0.01ce".to_owned()]).unwrap(), [0.01]);
+        assert_eq!(numbers(&["-0.5".to_owned(), "1E".to_owned()]).unwrap(), [-0.5, 1.0]);
+        assert!(numbers(&["sin".to_owned()]).is_err());
+        assert!(numbers(&["-".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_rgb_and_alpha_wave_generation() {
+        let shaders = parse(
+            "textures/test/caustics {
+             {
+             map textures/test/water.tga
+             blendFunc GL_SRC_ALPHA GL_ONE
+             alphaGen wave triangle 0.5 0.25 0.1 2
+             rgbGen wave sin 0.2 0.03 0.5 0.04
+             }
+             {
+             map textures/test/water.tga
+             rgbGen wave bogus 1 2 3 4
+             }
+             }
+",
+        )
+        .unwrap();
+        let stages = &shaders["textures/test/caustics"].stages;
+        assert_eq!(
+            stages[0].rgb_gen,
+            RgbGen::Wave(Wave {
+                func: WaveFunc::Sin,
+                base: 0.2,
+                amplitude: 0.03,
+                phase: 0.5,
+                frequency: 0.04,
+            })
+        );
+        assert_eq!(
+            stages[0].alpha_gen,
+            AlphaGen::Wave(Wave {
+                func: WaveFunc::Triangle,
+                base: 0.5,
+                amplitude: 0.25,
+                phase: 0.1,
+                frequency: 2.0,
+            })
+        );
+        assert!(stages[0].unsupported.is_empty());
+        // An unknown waveform stays flagged instead of silently becoming identity.
+        assert_eq!(stages[1].rgb_gen, RgbGen::Identity);
+        assert_eq!(stages[1].unsupported.len(), 1);
+    }
+
+    #[test]
+    fn parses_sky_cloud_height() {
+        let shaders = parse(
+            "textures/test/sky {\n\
+             skyparms textures/skies/env/sky 2048 -\n\
+             {\n\
+             map textures/test/clouds.tga\n\
+             tcMod transform 0.25 0 0 0.25 0.1 0.2\n\
+             }\n\
+             }\n\
+             textures/test/sky_default {\n\
+             skyparms - 0 -\n\
+             }\n\
+             textures/test/sky_no_height {\n\
+             skyparms textures/skies/env/sky\n\
+             }\n",
+        )
+        .unwrap();
+        let sky = &shaders["textures/test/sky"];
+        assert!(sky.sky);
+        assert_eq!(sky.sky_box.as_deref(), Some("textures/skies/env/sky"));
+        assert_eq!(sky.sky_cloud_height, 2048.0);
+        assert_eq!(sky.stages.len(), 1);
+        assert_eq!(
+            sky.stages[0].tc_mods,
+            vec![TcMod::Transform([0.25, 0.0, 0.0, 0.25, 0.1, 0.2])]
+        );
+        let defaulted = &shaders["textures/test/sky_default"];
+        assert!(defaulted.sky_box.is_none());
+        assert_eq!(defaulted.sky_cloud_height, 512.0);
+        assert_eq!(shaders["textures/test/sky_no_height"].sky_cloud_height, 0.0);
     }
 
     #[test]
@@ -1127,6 +1462,52 @@ mod tests {
     }
 
     #[test]
+    fn clamp_anim_map_keeps_its_first_frame_and_clamping() {
+        let shaders = parse(
+            "textures/test/anim {
+{
+clampanimmap 2 textures/test/a1 textures/test/a2
+}
+}
+",
+        )
+        .unwrap();
+        let stage = &shaders["textures/test/anim"].stages[0];
+        assert_eq!(stage.image, "textures/test/a1");
+        assert!(stage.clamp);
+    }
+
+    #[test]
+    fn video_map_marks_its_stages_as_video() {
+        let shaders = parse(
+            "textures/DF2_lvl1/MC
+{
+	qer_editorimage	textures/DF2_lvl1/MC
+	q3map_nolightmap
+	{
+		videoMap textures/DF2_lvl1/MC
+	}
+	{
+		videoMap textures/DF2_lvl1/MC
+		alphagen const 0.25
+		blendFunc GL_SRC_ALPHA GL_ONE
+		glow
+	}
+}
+",
+        )
+        .unwrap();
+        let stages = &shaders["textures/df2_lvl1/mc"].stages;
+        assert_eq!(stages.len(), 2);
+        for stage in stages {
+            assert!(stage.video);
+            assert_eq!(stage.image, "textures/df2_lvl1/mc");
+            assert!(stage.unsupported.is_empty());
+        }
+        assert!(stages[1].glow);
+    }
+
+    #[test]
     fn parses_jka_saber_glow_stage() {
         let shaders = parse(
             "gfx/effects/sabers/red_glow {\ncull twosided\n{\nmap gfx/effects/sabers/red_glow2\nblendFunc GL_ONE GL_ONE\nglow\nrgbGen vertex\n}\n}\n",
@@ -1204,6 +1585,52 @@ mod tests {
         assert_eq!(stages[1].rgb_gen, RgbGen::ExactVertex);
         assert!(stages[0].unsupported.is_empty());
         assert!(stages[1].unsupported.is_empty());
+    }
+
+    #[test]
+    fn parses_entity_tinted_player_stage() {
+        let shaders = parse(
+            "models/players/test/torso {
+{
+map models/players/test/torso
+blendFunc GL_ONE GL_ZERO
+rgbGen lightingDiffuseEntity
+}
+{
+map models/players/test/torso
+blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+detail
+rgbGen lightingDiffuse
+}
+}
+",
+        )
+        .unwrap();
+        let stages = &shaders["models/players/test/torso"].stages;
+        assert!(stages[0].entity_rgb);
+        assert!(!stages[1].entity_rgb);
+        assert!(stages[1].detail);
+        assert!(stages[0].unsupported.is_empty());
+        assert_eq!(stages[0].rgb_gen, RgbGen::Identity);
+    }
+
+    #[test]
+    fn find_shader_strips_the_skin_extension() {
+        let shaders = parse("models/players/test/torso_04_clothes {
+{
+map models/players/test/torso_04
+}
+}
+").unwrap();
+        for name in [
+            "models/players/test/torso_04_clothes",
+            "models/players/test/torso_04_clothes.tga",
+            "Models\\Players\\Test\\Torso_04_Clothes.TGA",
+        ] {
+            assert!(find_shader(&shaders, name).is_some(), "{name}");
+        }
+        assert!(find_shader(&shaders, "models/players/test/other.tga").is_none());
+        assert!(find_shader(&shaders, "models/players.dir/test").is_none());
     }
 
 }

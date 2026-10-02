@@ -454,7 +454,9 @@
 #define jka_bg_g2_player_angles japro_jka_bg_g2_player_angles
 #define jka_contract japro_jka_contract
 #define jka_item_count japro_jka_item_count
+#define jka_item_icon japro_jka_item_icon
 #define jka_item_info japro_jka_item_info
+#define jka_item_pickup_sound japro_jka_item_pickup_sound
 #define jka_load_animations japro_jka_load_animations
 #define jka_movement_error japro_jka_movement_error
 #define jka_player_clone japro_jka_player_clone
@@ -473,6 +475,7 @@
 #define jka_player_teleport japro_jka_player_teleport
 #define jka_player_give_all japro_jka_player_give_all
 #define jka_player_set_saber_movement_info japro_jka_player_set_saber_movement_info
+#define jka_player_set_foot_bolts japro_jka_player_set_foot_bolts
 #define jka_player_step japro_jka_player_step
 #define jka_player_update_view_angles japro_jka_player_update_view_angles
 #define jka_player_view japro_jka_player_view

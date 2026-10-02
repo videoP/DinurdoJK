@@ -20,6 +20,7 @@ dependencies = [
  "jka-movement",
  "jka-protocol",
  "libjpeg-turbo-rs",
+ "log",
  "naga",
  "oximedia-lut",
  "png",

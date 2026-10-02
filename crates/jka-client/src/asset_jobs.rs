@@ -211,15 +211,6 @@ impl AssetSource {
         })
     }
 
-    /// Same directories under a new identity: worker views re-mount PK3s the
-    /// next time they are used (e.g. after a download changed the disk).
-    pub fn refreshed(&self) -> Arc<Self> {
-        Arc::new(Self {
-            id: NEXT_SOURCE_ID.fetch_add(1, AtomicOrdering::Relaxed),
-            dirs: self.dirs.clone(),
-            allow_overrides: self.allow_overrides,
-        })
-    }
 }
 
 thread_local! {

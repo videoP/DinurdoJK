@@ -236,3 +236,13 @@ fn fs_mask(input: MaskVertexOut) -> FragmentOut {
     out.reflection_policy = reflection_policy(input.world_position);
     return out;
 }
+
+// Depth-only alpha test for the Hi-Z early pass. Opaque surfaces need no
+// fragment stage at all (`vs_main` alone); this is only for alpha-tested ones.
+@fragment
+fn fs_depth_mask(input: MaskVertexOut) {
+    let alpha = textureSample(base_texture, base_sampler, input.uv).a * input.alpha_multiplier;
+    if (alpha < material.params.x) {
+        discard;
+    }
+}

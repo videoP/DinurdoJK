@@ -20,7 +20,29 @@ struct SkinDraw {
     classic_ambient: vec4<f32>,
     classic_directed: vec4<f32>,
     classic_direction: vec4<f32>,
+    classic_sun_directed: vec4<f32>,
+    classic_sun_direction: vec4<f32>,
+    uv_xform: vec4<f32>,
+    spec_light: vec4<f32>,
+    spec_viewer: vec4<f32>,
 };
+// q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
+fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+    if (draw.spec_light.w == 0.0) {
+        return 1.0;
+    }
+    let normal = normalize(world_normal);
+    let light_dir = normalize(draw.spec_light.xyz - world);
+    let reflected = normal * (2.0 * dot(normal, light_dir)) - light_dir;
+    let viewer = normalize(draw.spec_viewer.xyz - world);
+    let l = dot(reflected, viewer);
+    if (l < 0.0) {
+        return 0.0;
+    }
+    let l2 = l * l;
+    return min(l2 * l2, 1.0);
+}
+
 
 // Storage-friendly repack of Ghoul2GpuVertex. The normal raster path keeps its
 // original packed vertex format; this copy exists lazily only while RT shadows
@@ -163,14 +185,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if light_len_sq > 1.0e-8 {
             incoming = max(dot(render_normal, light_dir * inverseSqrt(light_len_sq)), 0.0);
         }
+        // Runtime sun (entity sun lighting): zero radiance when the feature is off.
+        var sun_incoming = 0.0;
+        let sun_dir = draw.classic_sun_direction.xyz;
+        let sun_len_sq = dot(sun_dir, sun_dir);
+        if sun_len_sq > 1.0e-8 {
+            sun_incoming = max(dot(render_normal, sun_dir * inverseSqrt(sun_len_sq)), 0.0);
+        }
         let lighting = clamp(
-            (draw.classic_ambient.xyz + incoming * draw.classic_directed.xyz) / 255.0,
+            (draw.classic_ambient.xyz
+                + incoming * draw.classic_directed.xyz
+                + sun_incoming * draw.classic_sun_directed.xyz) / 255.0,
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
         draw_color = vec4<f32>(draw.color.rgb * lighting, draw.color.a);
     }
 
-    let uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w);
+    draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
+    let uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w) * draw.uv_xform.xy + draw.uv_xform.zw;
     write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color);
 }

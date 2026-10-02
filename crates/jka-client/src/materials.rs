@@ -10,7 +10,13 @@ use jka_assets::{
     pk3::AssetSearchPath,
     shader::{self, AlphaGen, RgbGen, Shader, TcGen, TcMod},
 };
-use std::{collections::BTreeMap, path::{Path, PathBuf}, time::Instant};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::Arc, time::Instant};
+
+/// Largest texture file read from disk/pk3. Matches the 8192x8192 RGBA decode
+/// cap in `decode_texture_data_profiled` plus header/footer slack (a 4096^2 TGA
+/// sky is already 64 MiB + 44 bytes).
+const MAX_TEXTURE_FILE_BYTES: usize = 8192 * 8192 * 4 + 1024;
+const MAX_VIDEO_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlendFactor {
@@ -167,6 +173,10 @@ pub struct SurfaceMaterial {
     pub no_fog: bool,
     pub sky: bool,
     pub skybox: Option<[usize; 6]>,
+    /// `skyParms` cloud height for a sky shader that authored one; zero otherwise.
+    /// A sky's `stages` are its cloud layers: each is drawn over the outer box
+    /// with its coordinates generated from the view direction (`TcGen::SkyCloud`).
+    pub sky_cloud_height: f32,
     pub hidden: bool,
     /// Authored q3map area emitter metadata. This is compile-time material
     /// information and is independent of whether the visible stage has an
@@ -206,6 +216,7 @@ impl Default for SurfaceMaterial {
             no_fog: false,
             sky: false,
             skybox: None,
+            sky_cloud_height: 0.0,
             hidden: false,
             surface_light: None,
             grass: None,
@@ -305,6 +316,87 @@ pub struct TextureLoadStats {
     pub decode_ms: f64,
     pub mip_ms: f64,
     pub decoded_images: usize,
+    /// Preloaded images and decode time (summed over workers) by file type:
+    /// tga, jpg, png.
+    pub format_images: [u32; 3],
+    pub format_decode_ms: [f64; 3],
+    /// Serial time spent in `Textures::generated_normal` (Sobel + mip chain).
+    pub generated_normal_ms: f64,
+    pub generated_normals: usize,
+}
+
+/// Readers lent to texture preload jobs. A job takes an idle reader (or forks a
+/// new one) so concurrent jobs never share an archive handle, then returns it.
+struct TextureReaders {
+    idle: std::sync::Mutex<Vec<AssetSearchPath>>,
+    template: std::sync::Mutex<AssetSearchPath>,
+    overrides_allowed: bool,
+}
+
+impl TextureReaders {
+    /// First readable candidate, with the same stock-before-override order the
+    /// loader thread used to apply: when overrides are disabled, retail
+    /// providers are tried for every candidate before ordinary reads.
+    fn read_first(
+        &self,
+        candidates: &[String],
+    ) -> Result<Option<(String, PathBuf, Vec<u8>)>, String> {
+        let lent = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let mut assets = lent.unwrap_or_else(|| {
+            self.template
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fork()
+        });
+        let result = (|| {
+            if !self.overrides_allowed {
+                for name in candidates {
+                    let asset = assets
+                        .read_stock(name, MAX_TEXTURE_FILE_BYTES)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(asset) = asset {
+                        return Ok(Some((name.clone(), asset.source, asset.bytes)));
+                    }
+                }
+            }
+            for name in candidates {
+                let asset = assets
+                    .read(name, MAX_TEXTURE_FILE_BYTES)
+                    .map_err(|e| e.to_string())?;
+                if let Some(asset) = asset {
+                    return Ok(Some((name.clone(), asset.source, asset.bytes)));
+                }
+            }
+            Ok(None)
+        })();
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(assets);
+        result
+    }
+}
+
+enum TexturePreloadOutcome {
+    Missing,
+    ReadError(String),
+    Decoded(Result<(TextureData, f64, f64, u64), String>),
+}
+
+struct TexturePreloadResult {
+    key: (String, bool, bool),
+    read_ms: f64,
+    outcome: TexturePreloadOutcome,
+}
+
+/// A started `Textures::preload_start` batch awaiting `preload_finish`.
+pub struct TexturePreload {
+    pending: Vec<crate::map_jobs::JobHandle<TexturePreloadResult>>,
+    started: Instant,
 }
 
 pub fn shader_library(
@@ -484,11 +576,51 @@ pub struct Textures {
     generated_normal_cache: BTreeMap<usize, usize>,
     pub warnings: Vec<String>,
     pub load_stats: TextureLoadStats,
+    /// Earlier decodes of this same map that identical requests may copy.
+    seed: Option<TextureSeed>,
+    /// Content hash of each image (0 = not a plain decode), aligned with `images`.
+    hashes: Vec<u64>,
+    /// Hash of the decode that produced the image about to be pushed.
+    last_hash: u64,
+    /// `videoMap` cinematics. Each owns a placeholder entry in `images` that the
+    /// renderer overwrites with decoded frames.
+    pub videos: Vec<VideoSource>,
+    video_cache: BTreeMap<String, Option<usize>>,
+}
+
+/// A looping RoQ cinematic bound to one entry of [`Textures::images`].
+#[derive(Debug, Clone)]
+pub struct VideoSource {
+    pub texture: usize,
+    pub name: String,
+    pub data: Arc<[u8]>,
 }
 
 impl Textures {
+    pub fn set_seed(&mut self, seed: TextureSeed) {
+        self.seed = Some(seed);
+    }
+
+    /// Per-image content hashes for the next preparation's `TextureSeed`.
+    pub fn content_hashes(&self) -> Vec<u64> {
+        let mut hashes = self.hashes.clone();
+        hashes.resize(self.images.len(), 0);
+        hashes
+    }
+
+    fn push_image(&mut self, image: TextureData) {
+        self.hashes.resize(self.images.len(), 0);
+        self.hashes.push(std::mem::take(&mut self.last_hash));
+        self.images.push(image);
+    }
+
     pub fn new() -> Self {
         Self {
+            seed: None,
+            hashes: Vec::new(),
+            last_hash: 0,
+            videos: Vec::new(),
+            video_cache: BTreeMap::new(),
             images: Vec::new(),
             cache: BTreeMap::new(),
             source_cache: BTreeMap::new(),
@@ -496,6 +628,62 @@ impl Textures {
             warnings: Vec::new(),
             load_stats: TextureLoadStats::default(),
         }
+    }
+
+    /// Register a `videoMap` cinematic and return its placeholder texture index.
+    /// The placeholder is single-mip black at the video's size; the renderer
+    /// streams decoded frames into it. Like the engine, a missing `.roq`
+    /// extension is defaulted.
+    pub fn load_video(&mut self, assets: &mut AssetSearchPath, path: &str) -> Option<usize> {
+        let path = path.replace('\\', "/").to_ascii_lowercase();
+        if let Some(value) = self.video_cache.get(&path) {
+            return *value;
+        }
+        let name = if path.ends_with(".roq") { path.clone() } else { format!("{path}.roq") };
+        let value = match assets.read(&name, MAX_VIDEO_FILE_BYTES) {
+            Ok(Some(asset)) => {
+                let bytes: Arc<[u8]> = asset.bytes.into();
+                match jka_assets::roq::RoqVideo::open(Arc::clone(&bytes)) {
+                Ok(video) => {
+                    let (width, height) = (video.width(), video.height());
+                    let mut rgba = vec![0u8; (width * height * 4) as usize];
+                    rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+                    let index = self.images.len();
+                    self.push_image(TextureData {
+                        label: format!("{name} [video]"),
+                        source: Some(asset.source),
+                        width,
+                        height,
+                        rgba,
+                        rgba16f: None,
+                        mip_level_count: 1,
+                        clamp: false,
+                        srgb: true,
+                    });
+                    self.videos.push(VideoSource {
+                        texture: index,
+                        name: name.clone(),
+                        data: bytes,
+                    });
+                    Some(index)
+                }
+                Err(error) => {
+                    self.warnings.push(format!("{name}: {error}"));
+                    None
+                }
+                }
+            }
+            Ok(None) => {
+                self.warnings.push(format!("{name}: video not found"));
+                None
+            }
+            Err(error) => {
+                self.warnings.push(format!("{name}: {error}"));
+                None
+            }
+        };
+        self.video_cache.insert(path, value);
+        value
     }
 
     pub fn load(&mut self, assets: &mut AssetSearchPath, path: &str, clamp: bool) -> Option<usize> {
@@ -507,7 +695,7 @@ impl Textures {
         let value = match result {
             Ok(image) => {
                 let index = self.images.len();
-                self.images.push(image);
+                self.push_image(image);
                 Some(index)
             }
             Err(error) => {
@@ -570,7 +758,7 @@ impl Textures {
         let value = match result {
             Ok(image) => {
                 let index = self.images.len();
-                self.images.push(image);
+                self.push_image(image);
                 Some(index)
             }
             Err(error) => {
@@ -597,7 +785,7 @@ impl Textures {
         }
         let value = self.decode(assets, &path, clamp, false).ok().map(|image| {
             let index = self.images.len();
-            self.images.push(image);
+            self.push_image(image);
             index
         });
         self.cache.insert((path, clamp, false), value);
@@ -617,20 +805,41 @@ impl Textures {
         }
         let value = self.decode(assets, &path, clamp, true).ok().map(|image| {
             let index = self.images.len();
-            self.images.push(image);
+            self.push_image(image);
             index
         });
         self.cache.insert((path, clamp, true), value);
         value
     }
 
+    /// Read and decode `requests` on the map workers, and wait for them.
+    #[allow(dead_code)]
     pub fn preload(
         &mut self,
-        assets: &mut AssetSearchPath,
+        assets: &AssetSearchPath,
         requests: &[(String, bool, bool)],
         jobs: &MapJobPool,
     ) -> Result<(), String> {
-        let preload_started = Instant::now();
+        let pending = self.preload_start(assets, requests, jobs)?;
+        self.preload_finish(pending)
+    }
+
+    /// Queue every uncached request on the map workers and return at once. Each
+    /// job reads its own file (through a private reader over the shared VFS
+    /// index) and decodes it, so the calling thread is free for other work until
+    /// `preload_finish`; it must not touch `self` in between.
+    pub fn preload_start(
+        &mut self,
+        assets: &AssetSearchPath,
+        requests: &[(String, bool, bool)],
+        jobs: &MapJobPool,
+    ) -> Result<TexturePreload, String> {
+        let started = Instant::now();
+        let readers = Arc::new(TextureReaders {
+            idle: std::sync::Mutex::new(Vec::new()),
+            template: std::sync::Mutex::new(assets.fork()),
+            overrides_allowed: assets.asset_overrides_allowed(),
+        });
         let mut pending = Vec::new();
         for (path, clamp, srgb) in requests {
             let path = path.replace('\\', "/").to_ascii_lowercase();
@@ -651,68 +860,69 @@ impl Textures {
                 }
             }
 
-            let mut found = None;
-            if !assets.asset_overrides_allowed() {
-                for name in &candidates {
-                    let read_started = Instant::now();
-                    let asset = assets
-                        .read_stock(name, 64 * 1024 * 1024)
-                        .map_err(|e| e.to_string())?;
-                    self.load_stats.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
-                    if let Some(asset) = asset {
-                        found = Some((name.clone(), asset.source, asset.bytes));
-                        break;
-                    }
-                }
-            }
-            if found.is_none() {
-                for name in candidates {
-                    let read_started = Instant::now();
-                    let asset = assets
-                        .read(&name, 64 * 1024 * 1024)
-                        .map_err(|e| e.to_string())?;
-                    self.load_stats.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
-                    if let Some(asset) = asset {
-                        found = Some((name, asset.source, asset.bytes));
-                        break;
-                    }
-                }
-            }
-            let Some((name, source, bytes)) = found else {
-                continue;
-            };
             let clamp = *clamp;
             let srgb = *srgb;
+            let seed = self.seed.clone();
+            let readers = Arc::clone(&readers);
             let handle = jobs.submit(Task::MapTextureDecode, move || {
-                let result = decode_texture_data_profiled(&name, &bytes, clamp, true, srgb)
-                    .map(|(mut image, decode_ms, mip_ms)| {
-                        image.source = Some(source);
-                        (image, decode_ms, mip_ms)
-                    });
-                (key, result)
+                let read_started = Instant::now();
+                let found = readers.read_first(&candidates);
+                let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+                let outcome = match found {
+                    Err(error) => TexturePreloadOutcome::ReadError(error),
+                    Ok(None) => TexturePreloadOutcome::Missing,
+                    Ok(Some((name, source, bytes))) => TexturePreloadOutcome::Decoded(
+                        decode_texture_seeded(seed.as_ref(), &name, &bytes, clamp, srgb).map(
+                            |(mut image, decode_ms, mip_ms, hash)| {
+                                image.source = Some(source);
+                                (image, decode_ms, mip_ms, hash)
+                            },
+                        ),
+                    ),
+                };
+                TexturePreloadResult { key, read_ms, outcome }
             })?;
             pending.push(handle);
         }
+        Ok(TexturePreload { pending, started })
+    }
 
+    /// Wait for a `preload_start` batch and install its images.
+    pub fn preload_finish(&mut self, preload: TexturePreload) -> Result<(), String> {
         // Resolve in request order so texture indices remain deterministic.
-        for handle in pending {
-            let (key, result) = handle.join()?;
-            match result {
-                Ok((image, decode_ms, mip_ms)) => {
+        for handle in preload.pending {
+            let TexturePreloadResult { key, read_ms, outcome } = handle.join()?;
+            self.load_stats.read_ms += read_ms;
+            match outcome {
+                // Not found anywhere: leave it uncached so a later load can warn.
+                TexturePreloadOutcome::Missing => {}
+                TexturePreloadOutcome::ReadError(error) => return Err(error),
+                TexturePreloadOutcome::Decoded(Ok((image, decode_ms, mip_ms, hash))) => {
+                    let format = match image.label.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+                        "tga" => Some(0),
+                        "jpg" | "jpeg" => Some(1),
+                        "png" => Some(2),
+                        _ => None,
+                    };
+                    if let Some(format) = format {
+                        self.load_stats.format_images[format] += 1;
+                        self.load_stats.format_decode_ms[format] += decode_ms;
+                    }
                     let index = self.images.len();
-                    self.images.push(image);
+                    self.last_hash = hash;
+                    self.push_image(image);
                     self.cache.insert(key, Some(index));
                     self.load_stats.decode_ms += decode_ms;
                     self.load_stats.mip_ms += mip_ms;
                     self.load_stats.decoded_images += 1;
                 }
-                Err(error) => {
+                TexturePreloadOutcome::Decoded(Err(error)) => {
                     self.warnings.push(error);
                     self.cache.insert(key, None);
                 }
             }
         }
-        self.load_stats.preload_wall_ms += preload_started.elapsed().as_secs_f64() * 1000.0;
+        self.load_stats.preload_wall_ms += preload.started.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 
@@ -725,12 +935,21 @@ impl Textures {
         if let Some(&index) = self.generated_normal_cache.get(&base_index) {
             return Some(index);
         }
-        let base = self.images.get(base_index)?.clone();
+        use rayon::prelude::*;
+
+        let started = Instant::now();
+        // Borrow the source rather than cloning it: its RGBA buffer carries the whole
+        // mip chain, and this runs once per material base texture.
+        let base = self.images.get(base_index)?;
         let width = base.width as usize;
         let height = base.height as usize;
         if width == 0 || height == 0 || base.rgba.len() < width * height * 4 {
             return None;
         }
+        let (base_width, base_height) = (base.width, base.height);
+        let base_clamp = base.clamp;
+        let base_label = base.label.clone();
+        let base_source = base.source.clone();
 
         let mut rgba = vec![0_u8; width * height * 4];
 
@@ -767,16 +986,18 @@ impl Textures {
             ((value * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8
         };
 
-        // Run the reference 3x3 Sobel filter over the generated alpha heights.
+        // Run the reference 3x3 Sobel filter over the generated alpha heights. Rows
+        // only read the immutable `heights` snapshot, so they filter in parallel with
+        // bit-identical output.
         let heights = rgba.clone();
-        for y in 0..height {
+        rgba.par_chunks_mut(width * 4).enumerate().for_each(|(y, row)| {
             for x in 0..width {
                 let mut s = [0_f32; 9];
                 let mut n = 0;
                 for oy in -1_isize..=1 {
-                    let sy = coord(y as isize + oy, height, base.clamp);
+                    let sy = coord(y as isize + oy, height, base_clamp);
                     for ox in -1_isize..=1 {
-                        let sx = coord(x as isize + ox, width, base.clamp);
+                        let sx = coord(x as isize + ox, width, base_clamp);
                         s[n] = f32::from(heights[(sy * width + sx) * 4 + 3]);
                         n += 1;
                     }
@@ -790,25 +1011,27 @@ impl Textures {
                 } else {
                     [0.0, 0.0, 1.0]
                 };
-                let i = (y * width + x) * 4;
-                rgba[i] = encode(normal[0]);
-                rgba[i + 1] = encode(normal[1]);
-                rgba[i + 2] = encode(normal[2]);
-                // rgba[i + 3] intentionally remains the generated height.
+                let i = x * 4;
+                row[i] = encode(normal[0]);
+                row[i + 1] = encode(normal[1]);
+                row[i + 2] = encode(normal[2]);
+                // row[i + 3] intentionally remains the generated height.
             }
-        }
+        });
 
-        let (rgba, mip_level_count) = build_normal_height_mip_chain(base.width, base.height, rgba);
+        let (rgba, mip_level_count) = build_normal_height_mip_chain(base_width, base_height, rgba);
         let index = self.images.len();
-        self.images.push(TextureData {
-            label: format!("{} [Rend2 generated normal]", base.label),
-            source: base.source.clone(),
-            width: base.width,
-            height: base.height,
+        self.load_stats.generated_normal_ms += started.elapsed().as_secs_f64() * 1000.0;
+        self.load_stats.generated_normals += 1;
+        self.push_image(TextureData {
+            label: format!("{base_label} [Rend2 generated normal]"),
+            source: base_source,
+            width: base_width,
+            height: base_height,
             rgba,
             rgba16f: None,
             mip_level_count,
-            clamp: base.clamp,
+            clamp: base_clamp,
             srgb: false,
         });
         self.generated_normal_cache.insert(base_index, index);
@@ -881,14 +1104,16 @@ impl Textures {
         for name in &candidates {
             let read_started = Instant::now();
             let asset = assets
-                .read_from_source(name, 64 * 1024 * 1024, source)
+                .read_from_source(name, MAX_TEXTURE_FILE_BYTES, source)
                 .map_err(|e| e.to_string())?;
             self.load_stats.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
             let Some(asset) = asset else {
                 continue;
             };
-            let (mut image, decode_ms, mip_ms) =
-                decode_texture_data_profiled(name, &asset.bytes, clamp, true, srgb)?;
+            let (mut image, decode_ms, mip_ms, hash) = decode_texture_seeded(
+                self.seed.as_ref(), name, &asset.bytes, clamp, srgb,
+            )?;
+            self.last_hash = hash;
             image.source = Some(asset.source);
             self.load_stats.decode_ms += decode_ms;
             self.load_stats.mip_ms += mip_ms;
@@ -925,14 +1150,16 @@ impl Textures {
             for name in &candidates {
                 let read_started = Instant::now();
                 let asset = assets
-                    .read_stock(name, 64 * 1024 * 1024)
+                    .read_stock(name, MAX_TEXTURE_FILE_BYTES)
                     .map_err(|e| e.to_string())?;
                 self.load_stats.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
                 let Some(asset) = asset else {
                     continue;
                 };
-                let (mut image, decode_ms, mip_ms) =
-                    decode_texture_data_profiled(name, &asset.bytes, clamp, true, srgb)?;
+                let (mut image, decode_ms, mip_ms, hash) = decode_texture_seeded(
+                    self.seed.as_ref(), name, &asset.bytes, clamp, srgb,
+                )?;
+                self.last_hash = hash;
                 image.source = Some(asset.source);
                 self.load_stats.decode_ms += decode_ms;
                 self.load_stats.mip_ms += mip_ms;
@@ -944,14 +1171,16 @@ impl Textures {
         for name in &candidates {
             let read_started = Instant::now();
             let asset = assets
-                .read(name, 64 * 1024 * 1024)
+                .read(name, MAX_TEXTURE_FILE_BYTES)
                 .map_err(|e| e.to_string())?;
             self.load_stats.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
             let Some(asset) = asset else {
                 continue;
             };
-            let (mut image, decode_ms, mip_ms) =
-                decode_texture_data_profiled(name, &asset.bytes, clamp, true, srgb)?;
+            let (mut image, decode_ms, mip_ms, hash) = decode_texture_seeded(
+                self.seed.as_ref(), name, &asset.bytes, clamp, srgb,
+            )?;
+            self.last_hash = hash;
             image.source = Some(asset.source);
             self.load_stats.decode_ms += decode_ms;
             self.load_stats.mip_ms += mip_ms;
@@ -1096,6 +1325,61 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
+/// Decoded images from an earlier preparation of the same map, lent by the
+/// app's restart cache. A decode is a pure function of (qpath, file bytes,
+/// clamp, sRGB), so an identical request copies the finished image out of the
+/// previous map instead of decoding and mipping it again. Nothing is stored
+/// beyond the map the app already keeps.
+#[derive(Clone)]
+pub struct TextureSeed {
+    map: std::sync::Arc<crate::scene::PreparedMap>,
+    by_hash: std::sync::Arc<std::collections::HashMap<u64, usize>>,
+}
+
+impl TextureSeed {
+    pub fn new(map: &std::sync::Arc<crate::scene::PreparedMap>) -> Self {
+        let by_hash = map
+            .texture_hashes
+            .iter()
+            .enumerate()
+            .filter(|&(index, &hash)| hash != 0 && index < map.textures.len())
+            .map(|(index, &hash)| (hash, index))
+            .collect();
+        Self { map: std::sync::Arc::clone(map), by_hash: std::sync::Arc::new(by_hash) }
+    }
+}
+
+fn texture_content_hash(name: &str, bytes: &[u8], clamp: bool, srgb: bool) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(name.as_bytes());
+    hasher.write_u8(u8::from(clamp) | (u8::from(srgb) << 1));
+    hasher.write(bytes);
+    // 0 means "unknown" in `Textures::hashes`, so never produce it.
+    hasher.finish().max(1)
+}
+
+/// `decode_texture_data_profiled` with mipmaps, reusing the seed's identical
+/// earlier decode when there is one. Also returns the content hash that
+/// identifies this decode for the next preparation. A hit reports zero
+/// decode/mip time: none was spent.
+fn decode_texture_seeded(
+    seed: Option<&TextureSeed>,
+    name: &str,
+    bytes: &[u8],
+    clamp: bool,
+    srgb: bool,
+) -> Result<(TextureData, f64, f64, u64), String> {
+    let hash = texture_content_hash(name, bytes, clamp, srgb);
+    if let Some(image) = seed
+        .and_then(|seed| seed.by_hash.get(&hash).and_then(|&index| seed.map.textures.get(index)))
+    {
+        return Ok((image.clone(), 0.0, 0.0, hash));
+    }
+    let (image, decode_ms, mip_ms) = decode_texture_data_profiled(name, bytes, clamp, true, srgb)?;
+    Ok((image, decode_ms, mip_ms, hash))
+}
+
 fn decode_texture_data_profiled(
     name: &str,
     bytes: &[u8],
@@ -1164,7 +1448,7 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
         let width = (previous_width / 2).max(1);
         let height = (previous_height / 2).max(1);
         let mut next = vec![0_u8; width as usize * height as usize * 4];
-        for y in 0..height {
+        let fill_row = |y: u32, row: &mut [u8]| {
             for x in 0..width {
                 let mut normal = [0.0_f32; 3];
                 let mut max_height = 0_u8;
@@ -1185,13 +1469,24 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
                 } else {
                     normal = [0.0, 0.0, 1.0];
                 }
-                let index = ((y * width + x) * 4) as usize;
-                next[index] = encode(normal[0]);
-                next[index + 1] = encode(normal[1]);
-                next[index + 2] = encode(normal[2]);
+                let index = (x * 4) as usize;
+                row[index] = encode(normal[0]);
+                row[index + 1] = encode(normal[1]);
+                row[index + 2] = encode(normal[2]);
                 // Rend2's R_MipMapNormalHeight preserves the strongest height
                 // sample instead of averaging it away.
-                next[index + 3] = max_height;
+                row[index + 3] = max_height;
+            }
+        };
+        let row_bytes = width as usize * 4;
+        if u64::from(width) * u64::from(height) >= 16 * 1024 {
+            use rayon::prelude::*;
+            next.par_chunks_mut(row_bytes)
+                .enumerate()
+                .for_each(|(y, row)| fill_row(y as u32, row));
+        } else {
+            for (y, row) in next.chunks_mut(row_bytes).enumerate() {
+                fill_row(y as u32, row);
             }
         }
         all.extend_from_slice(&next);
@@ -1204,7 +1499,52 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
     (all, levels)
 }
 
+/// Box-filtered mip chain (2x2 average, truncating, edge texels repeated for odd
+/// sizes), stored base level first. Each level is written straight after the
+/// previous one in a single buffer, so nothing is cloned.
 fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
+    let mut all = base;
+    // A full chain adds a third of the base again.
+    all.reserve(all.len() / 3 + 64);
+    let mut previous_offset = 0_usize;
+    let mut previous_width = width as usize;
+    let mut previous_height = height as usize;
+    let mut levels = 1_u32;
+
+    while previous_width > 1 || previous_height > 1 {
+        let width = (previous_width / 2).max(1);
+        let height = (previous_height / 2).max(1);
+        let next_offset = all.len();
+        all.resize(next_offset + width * height * 4, 0);
+        let (done, next) = all.split_at_mut(next_offset);
+        let previous = &done[previous_offset..];
+        for (y, row) in next.chunks_exact_mut(width * 4).enumerate() {
+            let top = &previous[(y * 2).min(previous_height - 1) * previous_width * 4..];
+            let bottom = &previous[(y * 2 + 1).min(previous_height - 1) * previous_width * 4..];
+            for (x, texel) in row.chunks_exact_mut(4).enumerate() {
+                let left = (x * 2).min(previous_width - 1) * 4;
+                let right = (x * 2 + 1).min(previous_width - 1) * 4;
+                for channel in 0..4 {
+                    let sum = u32::from(top[left + channel])
+                        + u32::from(top[right + channel])
+                        + u32::from(bottom[left + channel])
+                        + u32::from(bottom[right + channel]);
+                    texel[channel] = (sum / 4) as u8;
+                }
+            }
+        }
+        previous_offset = next_offset;
+        previous_width = width;
+        previous_height = height;
+        levels += 1;
+    }
+
+    (all, levels)
+}
+
+/// The original per-sample implementation, kept to prove the fast one identical.
+#[cfg(test)]
+fn build_mip_chain_reference(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
     let mut all = base.clone();
     let mut previous = base;
     let mut previous_width = width;
@@ -1344,6 +1684,8 @@ fn stage_blend(stage: &shader::Stage) -> Option<BlendFunc> {
 fn alpha_cutoff(stage: &shader::Stage) -> f32 {
     match stage.alpha_test.as_str() {
         "ge128" => 0.5,
+        // GLS_ATEST_GE_C0 (OpenJK `GE192`): alpha >= 0xC0 / 255.
+        "ge192" => 0.75,
         "gt0" => 1.0 / 255.0,
         _ => 0.0,
     }
@@ -1472,7 +1814,38 @@ fn stage_enhancements(
     }
 }
 
+/// sRGB byte -> linear value, evaluated with the exact per-pixel formula so a
+/// table lookup is bit-identical to computing `powf` for every pixel.
+fn srgb_byte_to_linear() -> &'static [f64; 256] {
+    static TABLE: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|byte| {
+            let srgb = byte as f64 / 255.0;
+            if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
+}
+
+/// Nanoseconds spent averaging light images, for the `[MAP MATERIALS]` line.
+pub(crate) static LIGHT_IMAGE_AVERAGE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn normalized_texture_average(texture: &TextureData) -> [f32; 3] {
+    let started = Instant::now();
+    let result = normalized_texture_average_inner(texture);
+    LIGHT_IMAGE_AVERAGE_NS.fetch_add(
+        started.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    result
+}
+
+fn normalized_texture_average_inner(texture: &TextureData) -> [f32; 3] {
+    let linear = srgb_byte_to_linear();
     let pixel_count = usize::try_from(texture.width)
         .ok()
         .and_then(|width| {
@@ -1492,12 +1865,7 @@ fn normalized_texture_average(texture: &TextureData) -> [f32; 3] {
         // part of the average. Decode sRGB before averaging because the GPU
         // samples ordinary color textures in linear space as well.
         for channel in 0..3 {
-            let srgb = f64::from(pixel[channel]) / 255.0;
-            sum[channel] += if srgb <= 0.04045 {
-                srgb / 12.92
-            } else {
-                ((srgb + 0.055) / 1.055).powf(2.4)
-            };
+            sum[channel] += linear[usize::from(pixel[channel])];
         }
         count += 1;
     }
@@ -1528,18 +1896,12 @@ fn emissive_surface_light_stats(texture: &TextureData) -> Option<([f32; 3], f32)
         return None;
     }
 
+    let linear = srgb_byte_to_linear();
     let mut weighted_rgb = [0.0_f64; 3];
     let mut luminance_sum = 0.0_f64;
     let mut active = 0_u64;
     for pixel in texture.rgba[..base_bytes].chunks_exact(4) {
-        let rgb = [pixel[0], pixel[1], pixel[2]].map(|channel| {
-            let srgb = f64::from(channel) / 255.0;
-            if srgb <= 0.04045 {
-                srgb / 12.92
-            } else {
-                ((srgb + 0.055) / 1.055).powf(2.4)
-            }
-        });
+        let rgb = [pixel[0], pixel[1], pixel[2]].map(|channel| linear[usize::from(channel)]);
         let luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
         if luminance > 0.01 {
             active += 1;
@@ -1633,6 +1995,64 @@ pub fn primary_texture_requests(
     requests
 }
 
+/// The stages of a sky shader that authored a `skyParms` cloud height. The
+/// engine draws every one of them over the outer box as a cloud layer, so they
+/// keep their own blend, rgbGen/alphaGen and tcMods. They carry no PBR companion
+/// maps, lightmap or surface-sprite behaviour: none of that applies to a sky.
+fn sky_cloud_stages(
+    name: &str,
+    definition: &Shader,
+    assets: &mut AssetSearchPath,
+    textures: &mut Textures,
+    preferred_source: Option<&std::path::Path>,
+) -> Vec<MaterialStage> {
+    let mut stages = Vec::new();
+    for source in &definition.stages {
+        if source.image.is_empty()
+            || source.image == "$lightmap"
+            || source.surface_sprite.is_some()
+        {
+            continue;
+        }
+        let texture = match source.image.as_str() {
+            "$whiteimage" | "*white" => StageTexture::White,
+            value if value.starts_with('$') => {
+                textures.warnings.push(format!(
+                    "{name}: unsupported generated image {value}; using white"
+                ));
+                StageTexture::White
+            }
+            value => preferred_source
+                .and_then(|provider| textures.load_from_source(assets, value, source.clamp, provider))
+                .or_else(|| textures.load(assets, value, source.clamp))
+                .map(StageTexture::Image)
+                .unwrap_or(StageTexture::White),
+        };
+        let blend = stage_blend(source);
+        if !source.blend.is_empty() && blend.is_none() {
+            textures.warnings.push(format!(
+                "{name}: unsupported blendFunc {}; rendering stage opaque",
+                source.blend
+            ));
+        }
+        stages.push(MaterialStage {
+            texture,
+            enhancements: StageEnhancements::default(),
+            blend,
+            alpha_cutoff: alpha_cutoff(source),
+            opacity: source.alpha.unwrap_or(1.0),
+            color: source.color.unwrap_or([1.0; 3]),
+            rgb_gen: source.rgb_gen,
+            alpha_gen: source.alpha_gen,
+            tc_gen: source.tc_gen,
+            tc_mods: source.tc_mods.clone(),
+            depth_write: source.depth_write,
+            depth_equal: source.depth_equal,
+        });
+    }
+    stages
+}
+
 pub fn describe(
     name: &str,
     flags: u32,
@@ -1653,7 +2073,12 @@ pub fn describe(
         .filter(|origin| origin.mtr_override)
         .map(|origin| origin.source.as_path());
     let sky = flags & SURF_SKY != 0 || definition.sky;
-    let base_hidden = definition.nodraw || flags & SURF_NODRAW != 0;
+    // A `surfaceparm fog` shader without stages only defines a fog volume; the
+    // engine never draws its brush faces or q3map2's fog hull. Without this the
+    // stageless-shader fallback below turns the hull into an opaque white box
+    // that encloses the viewer and hides the sky.
+    let stageless_fog = definition.fog && definition.stages.is_empty();
+    let base_hidden = definition.nodraw || flags & SURF_NODRAW != 0 || stageless_fog;
     let surface_sprite_cull_quirk = definition
         .stages
         .iter()
@@ -1798,6 +2223,10 @@ pub fn describe(
                     continue;
                 }
                 let texture = match source.image.as_str() {
+                    value if source.video => textures
+                        .load_video(assets, value)
+                        .map(StageTexture::Image)
+                        .unwrap_or(StageTexture::White),
                     "$lightmap" => StageTexture::Lightmap,
                     "$whiteimage" | "*white" => StageTexture::White,
                     value if value.starts_with('$') => {
@@ -1838,6 +2267,8 @@ pub fn describe(
                     blend = None;
                 }
                 let base_index = match texture {
+                    // A video frame has no companion maps to look up or derive.
+                    StageTexture::Image(_) if source.video => None,
                     StageTexture::Image(index) => Some(index),
                     StageTexture::Lightmap | StageTexture::White => None,
                 };
@@ -1934,6 +2365,10 @@ pub fn describe(
         }
     }
 
+    if sky && definition.sky_cloud_height > 0.0 && explicit {
+        stages = sky_cloud_stages(name, definition, assets, textures, preferred_source);
+    }
+
     // Modern material packs often express glow only through an emissive
     // companion map and have no q3map_surfacelight directive. Promote the first
     // meaningful emissive companion to an opt-in runtime area emitter. The
@@ -1986,6 +2421,7 @@ pub fn describe(
         no_fog: definition.no_fog,
         sky,
         skybox,
+        sky_cloud_height: if sky { definition.sky_cloud_height } else { 0.0 },
         explicit,
         // JKA's `detail` keyword is only a stage-enable marker. For the
         // fallback AUTO detail-texture path, only that authored marker counts
@@ -2000,6 +2436,37 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mip_chain_matches_the_reference_for_odd_and_thin_sizes() {
+        let mut state = 0x2545_f491_u32;
+        for (width, height) in [(1, 1), (2, 2), (4, 1), (1, 4), (3, 5), (7, 2), (64, 64), (33, 17), (256, 128), (5, 1)] {
+            let base: Vec<u8> = (0..width * height * 4)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state >> 8) as u8
+                })
+                .collect();
+            assert_eq!(
+                build_mip_chain(width, height, base.clone()),
+                build_mip_chain_reference(width, height, base),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_func_cutoffs_match_the_stock_tests() {
+        let cutoff = |func: &str| {
+            alpha_cutoff(&shader::Stage { alpha_test: func.to_owned(), ..Default::default() })
+        };
+        assert_eq!(cutoff("ge128"), 0.5);
+        assert_eq!(cutoff("ge192"), 0.75);
+        assert_eq!(cutoff("gt0"), 1.0 / 255.0);
+        assert_eq!(cutoff(""), 0.0);
+    }
 
     fn material_with_environment_policy(
         text: &str,

@@ -3,12 +3,20 @@ use std::{
     io::{BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const ICON_SIZE: usize = 256;
 
 fn main() {
+    // Keep the embedded timestamp tied to the sources that produced this
+    // executable. If nothing changed, Cargo does not relink the binary, so the
+    // previous compile time remains the correct one.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../icon.png");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    emit_build_timestamp();
 
     if env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return;
@@ -21,6 +29,51 @@ fn main() {
     if let Err(error) = copy_steam_audio_runtime_dll() {
         println!("cargo:warning=could not stage phonon.dll next to the executable: {error}");
     }
+}
+
+fn emit_build_timestamp() {
+    // Respect SOURCE_DATE_EPOCH when a reproducible-build environment supplies
+    // it; otherwise capture when this crate is actually rebuilt.
+    let epoch_seconds = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the Unix epoch")
+                .as_secs() as i64
+        });
+    let timestamp = format_utc_timestamp(epoch_seconds);
+    println!("cargo:rustc-env=DINURDOJK_BUILD_UTC={timestamp}");
+}
+
+fn format_utc_timestamp(epoch_seconds: i64) -> String {
+    let days = epoch_seconds.div_euclid(86_400);
+    let seconds_of_day = epoch_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+// Gregorian civil date from days since 1970-01-01. Kept here so build info
+// does not need another dependency just to format one timestamp.
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
+            / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// audionimbus-sys auto-installs Steam Audio's `phonon.dll` into its own

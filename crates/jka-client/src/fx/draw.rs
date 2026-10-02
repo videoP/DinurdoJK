@@ -88,10 +88,18 @@ impl FxBlend {
         match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             ["add"] | ["gl_one", "gl_one"] => Self::Add,
             ["gl_src_alpha", "gl_one"] => Self::AddAlpha,
+            // GL_DST_COLOR GL_ONE (dst*src + dst, e.g. gfx/misc/personalshield's
+            // chrome stage): never darkens, so additive is the closer of our
+            // fixed blend states, unlike the generic alpha-blend fallback below
+            // which would key off a texture alpha channel these "shiny" stages
+            // were never authored to carry, making the stage nearly invisible.
+            ["gl_dst_color", "gl_one"] => Self::Add,
             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
             ["gl_dst_color", "gl_src_color"] => Self::Modulate2x,
             ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
-            [] => Self::Opaque,
+            // GL_ONE GL_ZERO replaces the framebuffer: opaque whatever the texture alpha
+            // (player entity-tint stages rely on this to keep their alpha mask unblended).
+            [] | ["gl_one", "gl_zero"] => Self::Opaque,
             _ => Self::Alpha,
         }
     }
@@ -135,8 +143,25 @@ pub struct FxMaterial {
 pub struct ScreenFxDraw {
     /// x, y, width, height in the 640x480 virtual CGame coordinate system.
     pub rect: [f32; 4],
+    /// u0, v0, u1, v1. Full-material draws use [0, 0, 1, 1]; atlas-backed
+    /// CGame HUD elements (for example the reward count charset) can crop.
+    pub uv_rect: [f32; 4],
     pub color: [f32; 4],
     pub material: FxMaterial,
+    pub anchor: ScreenFxAnchor,
+}
+
+/// How a `ScreenFxDraw` rect follows the screen aspect ratio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenFxAnchor {
+    /// Stretch the 640x480 space over the whole screen.
+    Stretch,
+    /// CGame's `widthRatioCoef` rule around SCREEN_WIDTH / 2. Used by
+    /// centered legacy HUD art such as reward medals.
+    Center,
+    /// CGame's `widthRatioCoef` HUD rule: keep the 4:3 proportions and the
+    /// distance from the right edge (icons drawn at `SCREEN_WIDTH - k`).
+    Right,
 }
 
 impl FxMaterial {
@@ -455,7 +480,7 @@ pub fn tessellate_gpu_particles(
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: Some(FxGpuSprites { instances: Arc::new(instances) }),
+                fx_gpu_sprites: Some(FxGpuSprites { instances: Arc::new(instances), blob_shadow: false }),
                 texture: mat.texture.clone(),
                 alpha_mode: mat.blend.alpha_mode(),
             }),
@@ -682,6 +707,8 @@ mod tests {
             FxBlend::Darken
         );
         assert_eq!(FxBlend::from_blend_func(""), FxBlend::Opaque);
+        assert_eq!(FxBlend::from_blend_func("GL_ONE GL_ZERO"), FxBlend::Opaque);
+        assert_eq!(FxBlend::from_blend_func("GL_DST_COLOR GL_ONE"), FxBlend::Add);
     }
 
     #[test]

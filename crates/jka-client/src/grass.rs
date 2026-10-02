@@ -24,7 +24,11 @@ use fastnoise_lite::{
     NoiseType,
 };
 use glam::{Mat4, Vec3, Vec4};
-use std::{ops::Range, time::Instant};
+use std::{
+    ops::Range,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 use wgpu::util::DeviceExt;
 
 /// The GodotGrass demo is authored in meters. Treat 64 JKA units as one Godot meter.
@@ -191,12 +195,15 @@ pub struct GrassRenderer {
     pipeline_layout: wgpu::PipelineLayout,
     map_layout: wgpu::BindGroupLayout,
     shader: wgpu::ShaderModule,
-    pipeline: wgpu::RenderPipeline,
+    // Lazy: compiled by `ensure_render_pipeline` the first frame a draw needs it.
+    pipeline: Option<wgpu::RenderPipeline>,
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
     prepared_pipeline_layout: wgpu::PipelineLayout,
     prepared_layout: wgpu::BindGroupLayout,
     prepared_shader: wgpu::ShaderModule,
-    prepared_pipeline: wgpu::RenderPipeline,
+    prepared_pipeline: Option<wgpu::RenderPipeline>,
+    pipeline_format: wgpu::TextureFormat,
+    pipeline_samples: u32,
     prepared_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: wgpu::RenderPipeline,
     bevy_shadow_pipeline: wgpu::RenderPipeline,
@@ -501,22 +508,6 @@ impl GrassRenderer {
                 },
             ],
         });
-        let pipeline = create_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            surface_format,
-            msaa_samples,
-            false,
-        );
-        let prepared_pipeline = create_prepared_pipeline(
-            device,
-            &prepared_pipeline_layout,
-            &prepared_shader,
-            surface_format,
-            msaa_samples,
-            false,
-        );
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GodotGrass near shadow WGSL"),
             source: wgpu::ShaderSource::Wgsl(include_str!("grass_shadow.wgsl").into()),
@@ -547,12 +538,14 @@ impl GrassRenderer {
             pipeline_layout,
             map_layout,
             shader,
-            pipeline,
+            pipeline: None,
             wireframe_pipeline: None,
             prepared_pipeline_layout,
             prepared_layout,
             prepared_shader,
-            prepared_pipeline,
+            prepared_pipeline: None,
+            pipeline_format: surface_format,
+            pipeline_samples: msaa_samples,
             prepared_wireframe_pipeline: None,
             shadow_pipeline,
             bevy_shadow_pipeline,
@@ -586,28 +579,42 @@ impl GrassRenderer {
 
     pub fn rebuild_pipeline(
         &mut self,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) {
         self.wireframe_pipeline = None;
         self.prepared_wireframe_pipeline = None;
-        self.pipeline = create_pipeline(
-            device,
-            &self.pipeline_layout,
-            &self.shader,
-            surface_format,
-            msaa_samples,
-            self.legacy_fog_compiled,
-        );
-        self.prepared_pipeline = create_prepared_pipeline(
-            device,
-            &self.prepared_pipeline_layout,
-            &self.prepared_shader,
-            surface_format,
-            msaa_samples,
-            self.legacy_fog_compiled,
-        );
+        self.pipeline_format = surface_format;
+        self.pipeline_samples = msaa_samples;
+        // Lazy: `prepare_draw` recompiles whichever variant the next grass
+        // draw actually needs via `ensure_render_pipeline`.
+        self.pipeline = None;
+        self.prepared_pipeline = None;
+    }
+
+    fn ensure_render_pipeline(&mut self, device: &wgpu::Device, gpu_precompute: bool) {
+        if gpu_precompute {
+            if self.prepared_pipeline.is_none() {
+                self.prepared_pipeline = Some(create_prepared_pipeline(
+                    device,
+                    &self.prepared_pipeline_layout,
+                    &self.prepared_shader,
+                    self.pipeline_format,
+                    self.pipeline_samples,
+                    self.legacy_fog_compiled,
+                ));
+            }
+        } else if self.pipeline.is_none() {
+            self.pipeline = Some(create_pipeline(
+                device,
+                &self.pipeline_layout,
+                &self.shader,
+                self.pipeline_format,
+                self.pipeline_samples,
+                self.legacy_fog_compiled,
+            ));
+        }
     }
 
     pub fn ensure_wireframe_pipeline_for_draw(
@@ -844,7 +851,7 @@ impl GrassRenderer {
     /// one low + one high draw per required storage chunk; on GPUs whose storage
     /// binding can hold the whole map this is literally two indexed instanced draws.
     pub fn prepare_draw(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         map: &GrassMapGpu,
@@ -1101,6 +1108,9 @@ impl GrassRenderer {
         }
 
         stats.cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if total_visible != 0 {
+            self.ensure_render_pipeline(device, gpu_precompute);
+        }
         GrassPreparedDraw {
             stats,
             chunks: prepared_chunks,
@@ -1193,7 +1203,10 @@ impl GrassRenderer {
         pass.set_bind_group(2, shadow_bind_group, &[]);
 
         if prepared.gpu_precompute {
-            pass.set_pipeline(&self.prepared_pipeline);
+            let Some(prepared_pipeline) = self.prepared_pipeline.as_ref() else {
+                return stats;
+            };
+            pass.set_pipeline(prepared_pipeline);
             pass.set_bind_group(3, &map.prepared_bind_group, &[]);
 
             // Grass is opaque/depth-writing. High-detail blades are overwhelmingly
@@ -1274,7 +1287,10 @@ impl GrassRenderer {
 
         // Fallback for an unusually large visible set that exceeds the compact
         // prepared buffer. This retains the exact faithful per-vertex source math.
-        pass.set_pipeline(&self.pipeline);
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return stats;
+        };
+        pass.set_pipeline(pipeline);
         let visible_buffer = prepared
             .overflow_index_buffer
             .as_ref()
@@ -1746,7 +1762,35 @@ fn r8_mip_chain(width: u32, height: u32, base: &[u8]) -> (Vec<u8>, u32) {
     (all, levels)
 }
 
-pub(crate) fn godot_clump_noise() -> Vec<u8> {
+/// The clump noise image. Deterministic and costly to generate, so it is built
+/// once per process and shared by the renderer and the map-prep grass workers;
+/// [`prewarm_noise`] lets startup generate it while the GPU device is created.
+pub(crate) fn godot_clump_noise() -> Arc<Vec<u8>> {
+    static CLUMP: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    Arc::clone(CLUMP.get_or_init(|| Arc::new(generate_clump_noise())))
+}
+
+/// The wind noise image, built once per process like [`godot_clump_noise`].
+fn godot_wind_noise() -> Arc<Vec<u8>> {
+    static WIND: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    Arc::clone(WIND.get_or_init(|| Arc::new(generate_wind_noise())))
+}
+
+/// Generate both grass noise images on background threads so they are ready (or
+/// in progress, and then waited on rather than repeated) by the time the
+/// renderer builds its grass resources.
+pub(crate) fn prewarm_noise() {
+    for (name, generate) in [
+        ("grass-clump-noise", godot_clump_noise as fn() -> Arc<Vec<u8>>),
+        ("grass-wind-noise", godot_wind_noise as fn() -> Arc<Vec<u8>>),
+    ] {
+        let _ = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || drop(generate()));
+    }
+}
+
+fn generate_clump_noise() -> Vec<u8> {
     // mat_grass.tres: FastNoiseLite noise_type=Cellular. All other fields use
     // Godot FastNoiseLite's defaults (seed 0, FBM 5 octaves, frequency .01, etc.).
     let mut noise = FastNoiseLite::with_seed(0);
@@ -1765,7 +1809,7 @@ pub(crate) fn godot_clump_noise() -> Vec<u8> {
     })
 }
 
-fn godot_wind_noise() -> Vec<u8> {
+fn generate_wind_noise() -> Vec<u8> {
     // mat_grass.tres exact settings: Perlin, frequency .0275, fractal gain .1,
     // domain warp amplitude 20 and domain warp frequency .005.
     let mut noise = FastNoiseLite::with_seed(0);

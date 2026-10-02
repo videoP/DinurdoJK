@@ -27,8 +27,10 @@ pub const RETRANSMIT_TIMEOUT: i32 = 3000;
 /// commands") whenever latency exceeds it. TaystJK/JAPro raise it with
 /// cl_commandsize (max 512). The ring is client-local, not part of the protocol.
 pub const CMD_BACKUP: usize = 512;
-/// Client-side PACKET_BACKUP (used for outPackets / ping estimation).
-pub const PACKET_BACKUP: usize = 32;
+/// Client-side PACKET_BACKUP (used for outPackets / ping estimation). Vanilla's 32 covers
+/// 256 ms at the stock cl_maxpackets cap of 125, but only 32 ms at cl_maxpackets 1000, so the
+/// ping search ran off the end (999) whenever latency exceeded that. The ring is client-local.
+pub const PACKET_BACKUP: usize = 512;
 const RESET_TIME: i32 = 500;
 pub const SNAPFLAG_NOT_ACTIVE: u8 = 2;
 pub const CS_SYSTEMINFO: u16 = 1;
@@ -75,6 +77,35 @@ struct OutPacket {
     realtime: i32,
     server_time: i32,
     cmd_number: i32,
+    reliable_sequence: i32,
+}
+
+/// Client-side packet preparation counters. These do not prove server receipt;
+/// UDP send outcomes are recorded separately by the transport.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PacketDebug {
+    pub packets: u64,
+    pub empty_packets: u64,
+    pub command_transmissions: u64,
+    pub last_sequence: i32,
+    pub last_realtime: i32,
+    pub last_command_count: usize,
+    pub first_command_time: i32,
+    pub last_command_time: i32,
+}
+
+/// See [`ClientSession::snapshot_stats`]. Gaps are in server milliseconds.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotStats {
+    pub samples: usize,
+    pub min_ms: i32,
+    pub p10_ms: i32,
+    pub median_ms: i32,
+    pub max_ms: i32,
+    /// Snapshots actually received per real second.
+    pub received_per_second: f32,
+    /// The most frequent gaps, `(ms, count)`.
+    pub common_gaps: Vec<(i32, usize)>,
 }
 
 pub struct ClientSession {
@@ -111,10 +142,15 @@ pub struct ClientSession {
     cmds: Vec<UserCmd>,
     cmd_number: i32,
     out_packets: [OutPacket; PACKET_BACKUP],
+    packet_debug: PacketDebug,
+    /// cl_packetdup: how many earlier packets' usercmds each packet repeats (0..=5).
+    packet_dup: i32,
     /// cl.snap: the newest valid snapshot's bookkeeping.
     snap_valid: bool,
     snap_message_num: i32,
     snap_server_time: i32,
+    /// `(server time, our realtime)` of recently received snapshots, for `snapshot_stats`.
+    snap_times: VecDeque<(i32, i32)>,
     snap_flags: u8,
     snap_command_time: i32,
     ping: i32,
@@ -178,9 +214,12 @@ impl ClientSession {
             cmds: vec![UserCmd::default(); CMD_BACKUP],
             cmd_number: 0,
             out_packets: [OutPacket::default(); PACKET_BACKUP],
+            packet_debug: PacketDebug::default(),
+            packet_dup: 1,
             snap_valid: false,
             snap_message_num: 0,
             snap_server_time: 0,
+            snap_times: VecDeque::new(),
             snap_flags: 0,
             snap_command_time: 0,
             ping: 999,
@@ -205,6 +244,46 @@ impl ClientSession {
     pub fn state(&self) -> ConnectionState { self.state }
     pub fn decoder(&self) -> &Decoder { &self.decoder }
     pub fn server_time(&self) -> i32 { self.server_time }
+    /// Server time minus the commandTime the newest snapshot acknowledged: how far behind the
+    /// server's clock our commands are being processed (about the round trip plus a server frame).
+    pub fn snapshot_command_lag(&self) -> i32 { self.snap_server_time - self.snap_command_time }
+
+    /// How often snapshots arrive, from the server times of the recent ones. The gap between two
+    /// snapshots is a whole number of server frames, so the smallest common gap approximates the
+    /// server frame time (1000 / sv_fps), but only while our `snaps` setting does not floor it.
+    pub fn snapshot_stats(&self) -> SnapshotStats {
+        let mut gaps: Vec<i32> = self
+            .snap_times
+            .iter()
+            .zip(self.snap_times.iter().skip(1))
+            .map(|(a, b)| b.0 - a.0)
+            .filter(|gap| *gap > 0 && *gap <= 1000)
+            .collect();
+        let mut stats = SnapshotStats { samples: gaps.len(), ..SnapshotStats::default() };
+        if gaps.is_empty() {
+            return stats;
+        }
+        let mut counts: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        for gap in &gaps {
+            *counts.entry(*gap).or_default() += 1;
+        }
+        let mut common: Vec<(i32, usize)> = counts.into_iter().collect();
+        common.sort_by(|a, b| b.1.cmp(&a.1));
+        common.truncate(4);
+        stats.common_gaps = common;
+        gaps.sort_unstable();
+        stats.min_ms = gaps[0];
+        stats.p10_ms = gaps[gaps.len() / 10];
+        stats.median_ms = gaps[gaps.len() / 2];
+        stats.max_ms = gaps[gaps.len() - 1];
+        if let (Some(first), Some(last)) = (self.snap_times.front(), self.snap_times.back()) {
+            let real_ms = last.1 - first.1;
+            if real_ms > 0 {
+                stats.received_per_second = (self.snap_times.len() - 1) as f32 * 1000.0 / real_ms as f32;
+            }
+        }
+        stats
+    }
     pub fn ping(&self) -> i32 { self.ping }
     pub fn cmd_number(&self) -> i32 { self.cmd_number }
     pub fn client_num(&self) -> i32 { self.decoder.client_number }
@@ -213,6 +292,7 @@ impl ClientSession {
     pub fn reliable_sequence(&self) -> i32 { self.reliable_sequence }
     pub fn sv_pure(&self) -> bool { self.sv_pure }
     pub fn dropped_packets(&self) -> i32 { self.netchan.as_ref().map_or(0, |chan| chan.dropped) }
+    pub fn packet_debug(&self) -> PacketDebug { self.packet_debug }
     pub fn connect_preflight_paused(&self) -> bool { self.connect_preflight_paused }
 
     pub fn resume_connect(&mut self, realtime: i32) {
@@ -515,6 +595,8 @@ impl ClientSession {
         self.cmds.fill(UserCmd::default());
         self.cmd_number = 0;
         self.out_packets = [OutPacket::default(); PACKET_BACKUP];
+        self.packet_debug = PacketDebug::default();
+        self.snap_times.clear();
         self.snap_valid = false;
         self.snap_message_num = 0;
         self.new_snapshots = false;
@@ -531,10 +613,16 @@ impl ClientSession {
     }
 
     /// CL_ParseSnapshot bookkeeping after the decoder accepted a valid frame.
-    fn snapshot_parsed(&mut self, snapshot: Snapshot, realtime: i32) {
+    fn snapshot_parsed(&mut self, mut snapshot: Snapshot, realtime: i32) {
         self.snap_valid = true;
         self.snap_message_num = snapshot.message_num;
         self.snap_server_time = snapshot.server_time;
+        if self.snap_times.back().map_or(true, |&(time, _)| time != snapshot.server_time) {
+            self.snap_times.push_back((snapshot.server_time, realtime));
+            while self.snap_times.len() > 256 {
+                self.snap_times.pop_front();
+            }
+        }
         self.snap_flags = snapshot.snap_flags;
         self.snap_command_time = snapshot.player_state.field_i32("commandTime").unwrap_or(0);
         self.ping = 999;
@@ -547,6 +635,7 @@ impl ClientSession {
                 }
             }
         }
+        snapshot.ping = self.ping;
         self.new_snapshots = true;
         self.pending_snapshot = true;
         self.events.push_back(SessionEvent::Snapshot(snapshot));
@@ -580,14 +669,27 @@ impl ClientSession {
 
     /// CL_CreateNewCommands for one frame; the caller fills everything except
     /// serverTime, which is cl.serverTime (CL_FinishMove).
-    pub fn create_command(&mut self, mut cmd: UserCmd) -> Option<i32> {
+    pub fn create_command(&mut self, cmd: UserCmd) -> Option<i32> {
+        let server_time = self.server_time;
+        self.create_command_at(cmd, server_time)
+    }
+
+    /// Like [`Self::create_command`], stamped with an explicit `cl.serverTime`
+    /// (callers keep it at or before the current server time and past the previous
+    /// command's, so the stream stays monotonic).
+    pub fn create_command_at(&mut self, mut cmd: UserCmd, server_time: i32) -> Option<i32> {
         if self.state < ConnectionState::Primed {
             return None;
         }
-        cmd.server_time = self.server_time;
+        cmd.server_time = server_time;
         self.cmd_number += 1;
         self.cmds[self.cmd_number as usize & (CMD_BACKUP - 1)] = cmd;
         Some(self.cmd_number)
+    }
+
+    /// cl_packetdup (clamped to OpenJK's 0..=5).
+    pub fn set_packet_dup(&mut self, dup: i32) {
+        self.packet_dup = dup.clamp(0, 5);
     }
 
     /// CL_ReadyToSendPacket + CL_WritePacket.
@@ -605,6 +707,22 @@ impl ClientSession {
             if realtime - old.realtime < 1000 / max_packets {
                 return;
             }
+            // CL_SendCmd normally runs on command-producing client frames.
+            // Our app ticks independently of cl_commandRate: sending here on
+            // every tick advances the packet history with empty messages and
+            // reduces cl_packetdup's command recovery window to 1-2 ms at a
+            // high cl_maxpackets, even when commands are 8-17 ms apart.
+            // During active play send with new commands or a newly queued
+            // reliable command. Repeat pending reliable commands with those
+            // packets, and retain an idle keepalive if commands stop.
+            if self.state == ConnectionState::Active
+                && self.cmd_number > 0
+                && self.cmd_number == old.cmd_number
+                && self.reliable_sequence <= old.reliable_sequence
+                && realtime - old.realtime < 1000
+            {
+                return;
+            }
         }
         self.write_packet(realtime);
     }
@@ -614,8 +732,8 @@ impl ClientSession {
         let reliable: Vec<(i32, &[u8])> = ((self.reliable_acknowledge + 1)..=self.reliable_sequence)
             .map(|sequence| (sequence, self.reliable_commands[sequence as usize & (MAX_RELIABLE_COMMANDS - 1)].as_slice()))
             .collect();
-        // cl_packetdup 1: resend the previous packet's commands too.
-        let old_packet = self.out_packets[(outgoing_sequence - 1 - 1) as usize & (PACKET_BACKUP - 1)];
+        // cl_packetdup N: resend the commands of the previous N packets too.
+        let old_packet = self.out_packets[(outgoing_sequence - 1 - self.packet_dup) as usize & (PACKET_BACKUP - 1)];
         let count = (self.cmd_number - old_packet.cmd_number).clamp(0, MAX_PACKET_USERCMDS as i32) as usize;
         let commands: Vec<UserCmd> = (0..count)
             .map(|i| self.cmds[(self.cmd_number - count as i32 + i as i32 + 1) as usize & (CMD_BACKUP - 1)])
@@ -654,12 +772,29 @@ impl ClientSession {
         let packet_num = outgoing_sequence as usize & (PACKET_BACKUP - 1);
         self.out_packets[packet_num] = OutPacket {
             realtime,
-            server_time: commands.last().map_or(0, |cmd| cmd.server_time),
+            // CL_WritePacket: p_serverTime is the newest command's time even when this packet
+            // carries no new commands. Taking it from `commands` made empty packets (common at a
+            // high cl_maxpackets) record 0, so the ping search matched the newest packet and
+            // reported the time since the last send (1-5 ms) instead of the round trip.
+            server_time: if self.cmd_number > 0 {
+                self.cmds[self.cmd_number as usize & (CMD_BACKUP - 1)].server_time
+            } else {
+                0
+            },
             cmd_number: self.cmd_number,
+            reliable_sequence: self.reliable_sequence,
         };
         self.last_packet_sent_time = realtime;
         let chan = self.netchan.as_mut().expect("checked above");
         let datagrams = chan.transmit(&data);
+        self.packet_debug.packets += 1;
+        self.packet_debug.empty_packets += u64::from(count == 0);
+        self.packet_debug.command_transmissions += count as u64;
+        self.packet_debug.last_sequence = outgoing_sequence;
+        self.packet_debug.last_realtime = realtime;
+        self.packet_debug.last_command_count = count;
+        self.packet_debug.first_command_time = commands.first().map_or(0, |cmd| cmd.server_time);
+        self.packet_debug.last_command_time = commands.last().map_or(0, |cmd| cmd.server_time);
         self.outgoing.extend(datagrams);
     }
 
@@ -777,6 +912,67 @@ mod tests {
     fn addr() -> SocketAddr { "10.0.0.1:29070".parse().unwrap() }
 
     const USERINFO: &[u8] = br"\name\Padawan\rate\25000\snaps\40\model\kyle/default\forcepowers\7-1-032330000000001333\color1\4\color2\4\handicap\100\sex\male\saber1\single_1\saber2\none";
+
+    fn active_session() -> ClientSession {
+        let mut session = ClientSession::connect(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        session.take_outgoing();
+        session.state = ConnectionState::Active;
+        session.netchan = Some(Netchan::new(4321));
+        session
+    }
+
+    #[test]
+    fn high_packet_cap_preserves_command_redundancy_between_app_ticks() {
+        let mut session = active_session();
+        session.create_command_at(UserCmd::default(), 1000);
+        session.send_commands(1000, 1000);
+        assert_eq!(session.take_outgoing().len(), 1);
+        assert_eq!(session.packet_debug().last_command_count, 1);
+        for time in 1001..1017 {
+            session.send_commands(time, 1000);
+        }
+        assert!(session.take_outgoing().is_empty());
+        session.create_command_at(UserCmd::default(), 1017);
+        session.send_commands(1017, 1000);
+        assert_eq!(session.take_outgoing().len(), 1);
+        let debug = session.packet_debug();
+        assert_eq!(debug.last_command_count, 2, "previous command remains recoverable");
+        assert_eq!(debug.first_command_time, 1000);
+        assert_eq!(debug.last_command_time, 1017);
+        assert_eq!(debug.empty_packets, 0);
+    }
+
+    #[test]
+    fn lower_packet_cap_batches_commands_without_changing_their_times() {
+        let mut session = active_session();
+        for time in [1000, 1008, 1016] {
+            session.create_command_at(UserCmd::default(), time);
+            session.send_commands(time, 60);
+        }
+        assert_eq!(session.take_outgoing().len(), 2);
+        let debug = session.packet_debug();
+        assert_eq!(debug.last_command_count, 3);
+        assert_eq!(debug.first_command_time, 1000);
+        assert_eq!(debug.last_command_time, 1016);
+        assert_eq!(session.cmd_number(), 3);
+    }
+
+    #[test]
+    fn reliable_commands_and_idle_keepalive_do_not_need_a_new_usercmd() {
+        let mut session = active_session();
+        session.create_command_at(UserCmd::default(), 1000);
+        session.send_commands(1000, 1000);
+        session.take_outgoing();
+        session.add_reliable_command(b"score", false).unwrap();
+        session.send_commands(1001, 1000);
+        assert_eq!(session.take_outgoing().len(), 1);
+        session.send_commands(1002, 1000);
+        assert!(session.take_outgoing().is_empty());
+        session.write_packet_now(1002);
+        assert_eq!(session.take_outgoing().len(), 1, "explicit reliable flush remains immediate");
+        session.send_commands(2002, 1000);
+        assert_eq!(session.take_outgoing().len(), 1, "retain an idle keepalive");
+    }
 
     #[test]
     fn handshake_follows_openjk_order() {

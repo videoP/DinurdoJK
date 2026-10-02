@@ -38,6 +38,8 @@ pub(super) const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x99,
 pub(super) const TEXT_DISABLED: egui::Color32 = egui::Color32::from_rgb(0x55, 0x5F, 0x6C);
 
 pub(super) const WARNING: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB8, 0x3C);
+/// Deeper warning tone used for controls whose value is staged for Apply.
+pub(super) const WARNING_DEEP: egui::Color32 = egui::Color32::from_rgb(0x8D, 0x59, 0x13);
 pub(super) const DANGER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x74, 0x66);
 
 /// Drop shadow painted behind menu captions so they stay readable over the
@@ -68,7 +70,7 @@ pub(super) const TOP_BAR_H: f32 = 44.0;
 pub(super) const TAB_BAR_H: f32 = 34.0;
 pub(super) const FOOTER_H: f32 = 40.0;
 pub(super) const ROW_H: f32 = 30.0;
-pub(super) const LABEL_W: f32 = 210.0;
+pub(super) const LABEL_W: f32 = 232.0;
 pub(super) const VALUE_W: f32 = 132.0;
 pub(super) const NAV_W: f32 = 170.0;
 
@@ -97,6 +99,10 @@ fn widget(
 }
 
 pub(super) fn apply(ctx: &egui::Context) {
+    // The palette is dark-only. Without this egui follows the OS theme, and a
+    // light-mode Windows swaps every native widget (text fields, drag values,
+    // combo boxes) to white light-theme visuals that these styles never touch.
+    ctx.options_mut(|options| options.theme_preference = egui::ThemePreference::Dark);
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = SURFACE;
     visuals.window_fill = SURFACE;
@@ -127,10 +133,11 @@ pub(super) fn apply(ctx: &egui::Context) {
     visuals.widgets.hovered = widget(CONTROL_HOVER, CONTROL_HOVER, LINE_STRONG, TEXT);
     visuals.widgets.active = widget(CONTROL_SELECTED, CONTROL_SELECTED, ACCENT, TEXT);
     visuals.widgets.open = widget(CONTROL_HOVER, CONTROL_HOVER, LINE_STRONG, TEXT);
-    // Slider rails and check boxes read their fill from `inactive.bg_fill`;
-    // the sunken tone separates them from the flat button chrome.
-    visuals.widgets.inactive.bg_fill = INSET;
-    visuals.widgets.hovered.bg_fill = INSET;
+    // Slider rails and check boxes read their fill from `inactive.bg_fill`.
+    // The rail sits over the live world on the Video page, where the near-black
+    // INSET tone vanished; a hairline-strong grey stays visible on both.
+    visuals.widgets.inactive.bg_fill = LINE;
+    visuals.widgets.hovered.bg_fill = LINE_STRONG;
 
     ctx.set_visuals(visuals);
 
@@ -273,21 +280,40 @@ pub(super) fn nav_item(
 
 /// One option inside a segmented control.
 pub(super) fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    chip_sized(ui, text, selected, None)
+}
+
+/// A [`chip`] with a fixed width, for grids of options that should line up.
+/// Text wider than the chip is clipped to it.
+pub(super) fn chip_sized(
+    ui: &mut egui::Ui,
+    text: &str,
+    selected: bool,
+    width: Option<f32>,
+) -> egui::Response {
     let font = egui::FontId::proportional(12.5);
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), font.clone(), TEXT);
-    let size = egui::vec2(galley.size().x + 20.0, 23.0);
+    let size = egui::vec2(width.unwrap_or(galley.size().x + 20.0), 23.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter().clone();
-    let fill = match (selected, response.hovered()) {
-        (true, false) => CONTROL_SELECTED,
-        (true, true) => CONTROL_SELECTED_HOVER,
-        (false, false) => CONTROL,
-        (false, true) => CONTROL_HOVER,
+    let pending = controls_are_pending(ui);
+    let fill = match (selected, response.hovered(), pending) {
+        (true, false, true) => WARNING_DEEP,
+        (true, true, true) => WARNING_DEEP.lerp_to_gamma(WARNING, 0.35),
+        (true, false, false) => CONTROL_SELECTED,
+        (true, true, false) => CONTROL_SELECTED_HOVER,
+        (false, false, _) => CONTROL,
+        (false, true, _) => CONTROL_HOVER,
     };
-    fill_with_underline(&painter, rect, fill, selected.then_some(ACCENT));
-    painter.text(
+    fill_with_underline(
+        &painter,
+        rect,
+        fill,
+        selected.then_some(if pending { WARNING } else { ACCENT }),
+    );
+    painter.with_clip_rect(rect).text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
@@ -301,17 +327,23 @@ pub(super) fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Respo
 pub(super) fn switch(ui: &mut egui::Ui, on: bool) -> Option<bool> {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::click());
     let painter = ui.painter().clone();
-    let track = match (on, response.hovered()) {
-        (true, false) => ACCENT_DEEP,
-        (true, true) => ACCENT,
-        (false, false) => CONTROL,
-        (false, true) => CONTROL_HOVER,
+    let pending = controls_are_pending(ui);
+    let track = match (on, response.hovered(), pending) {
+        (true, false, true) => WARNING_DEEP,
+        (true, true, true) => WARNING,
+        (true, false, false) => ACCENT_DEEP,
+        (true, true, false) => ACCENT,
+        (false, false, _) => CONTROL,
+        (false, true, _) => CONTROL_HOVER,
     };
     painter.rect_filled(rect, egui::CornerRadius::ZERO, track);
     painter.rect_stroke(
         rect,
         egui::CornerRadius::ZERO,
-        egui::Stroke::new(1.0_f32, if on { ACCENT } else { LINE }),
+        egui::Stroke::new(
+            1.0_f32,
+            if on { if pending { WARNING } else { ACCENT } } else { LINE },
+        ),
         egui::StrokeKind::Inside,
     );
     let knob_w = 16.0;
@@ -520,14 +552,19 @@ fn quality_meter_track(
         let lit = current.is_some_and(|selected| segment <= selected);
         let fill = if lit {
             // Ramp the filled run from deep to bright so "more" reads as
-            // "heavier" rather than as a flat block of one color.
+            // "heavier" rather than as a flat block of one color. Pending
+            // Apply rows use the same ramp in warning orange.
             let selected = current.expect("lit segments require an active selection");
             let t = if selected == 0 {
                 1.0
             } else {
                 segment as f32 / selected as f32
             };
-            ACCENT_DEEP.lerp_to_gamma(ACCENT, t)
+            if controls_are_pending(ui) {
+                WARNING_DEEP.lerp_to_gamma(WARNING, t)
+            } else {
+                ACCENT_DEEP.lerp_to_gamma(ACCENT, t)
+            }
         } else if hovered == Some(segment) {
             CONTROL_HOVER
         } else {
@@ -545,7 +582,7 @@ fn quality_meter_track(
                 egui::vec2(2.0, rect.height() + 4.0),
             ),
             egui::CornerRadius::ZERO,
-            TEXT,
+            if controls_are_pending(ui) { WARNING } else { TEXT },
         );
     }
 
@@ -601,6 +638,35 @@ pub(super) fn take_reset(ctx: &egui::Context) -> Option<Reset> {
     })
 }
 
+fn pending_resets_channel() -> egui::Id {
+    egui::Id::new("jka_pending_video_setting_rows")
+}
+
+/// Marks rows whose controls represent values waiting for Apply Video Settings.
+/// The Video page installs this only while it is being built, then clears it so
+/// unrelated pages that happen to reuse a reset tag cannot inherit the tint.
+pub(super) fn set_pending_resets(ctx: &egui::Context, pending: Vec<Reset>) {
+    ctx.data_mut(|data| data.insert_temp(pending_resets_channel(), pending));
+}
+
+pub(super) fn clear_pending_resets(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.remove::<Vec<Reset>>(pending_resets_channel());
+    });
+}
+
+fn reset_is_pending(ctx: &egui::Context, reset: Reset) -> bool {
+    reset != Reset::None
+        && ctx.data(|data| {
+            data.get_temp::<Vec<Reset>>(pending_resets_channel())
+                .is_some_and(|rows| rows.contains(&reset))
+        })
+}
+
+fn controls_are_pending(ui: &egui::Ui) -> bool {
+    ui.visuals().selection.stroke.color == WARNING
+}
+
 // ----------------------------------------------------------------- layout --
 
 /// Section heading with a rule that runs to the right edge.
@@ -631,17 +697,20 @@ pub(super) fn section(ui: &mut egui::Ui, title: &str, detail: &str) {
         );
     }
     if !detail.is_empty() {
-        let (detail_rect, _) =
-            ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::hover());
+        // Wrapped rather than clipped: long captions used to run past the
+        // panel edge and into the world view.
+        let font = egui::FontId::proportional(11.5);
         let painter = ui.painter().clone();
-        glow_text(
-            &painter,
-            detail_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            detail,
-            egui::FontId::proportional(11.5),
-            TEXT_FAINT,
+        let galley = painter.layout(detail.to_owned(), font.clone(), TEXT_FAINT, width);
+        let shadow = painter.layout(detail.to_owned(), font, SHADOW, width);
+        let (detail_rect, _) = ui.allocate_exact_size(
+            egui::vec2(width, galley.size().y.max(16.0)),
+            egui::Sense::hover(),
         );
+        for offset in [egui::vec2(1.0, 1.0), egui::vec2(1.0, 0.0)] {
+            painter.galley(detail_rect.left_top() + offset, shadow.clone(), SHADOW);
+        }
+        painter.galley(detail_rect.left_top(), galley, TEXT_FAINT);
     }
     ui.add_space(4.0);
 }
@@ -725,8 +794,15 @@ Click the label to restore the default.")
         ui.ctx()
             .data_mut(|data| data.insert_temp(reset_channel(), reset));
     }
+    let pending = reset_is_pending(ui.ctx(), reset);
 
-    let label_color = if emphasise || hovered { TEXT } else { TEXT_DIM };
+    let label_color = if pending {
+        WARNING
+    } else if emphasise || hovered {
+        TEXT
+    } else {
+        TEXT_DIM
+    };
     let label_pos = egui::pos2(rect.left(), rect.top() + ROW_H * 0.5);
     glow_text(
         &painter,
@@ -780,6 +856,22 @@ Click the label to restore the default.")
             .max_rect(control_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    if pending {
+        // Native sliders use the child visuals, while the custom meter/switch/chip
+        // helpers below key off the warning selection stroke. This keeps the tint
+        // local to the staged row rather than changing the page/global palette.
+        let visuals = &mut control.style_mut().visuals;
+        visuals.selection.bg_fill = WARNING_DEEP;
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, WARNING);
+        // egui sliders/checkboxes use inactive/hovered bg_fill for their rail,
+        // so tint those too; this guarantees staged sliders read orange even
+        // before they are actively being dragged.
+        visuals.widgets.inactive.bg_fill = WARNING_DEEP;
+        visuals.widgets.hovered.bg_fill = WARNING_DEEP.lerp_to_gamma(WARNING, 0.35);
+        visuals.widgets.active.bg_fill = WARNING_DEEP.lerp_to_gamma(WARNING, 0.55);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, WARNING);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, WARNING);
+    }
     add(&mut control)
 }
 
@@ -814,7 +906,10 @@ pub(super) fn slider(
 
 /// Right-aligned hint printed at the end of a control row.
 pub(super) fn hint(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    // `with_layout` would claim all remaining vertical space in a vertical parent,
+    // pushing following rows off the page; allocate a single-line strip instead.
+    let size = egui::vec2(ui.available_width(), 18.0);
+    ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
         glow_label(ui, text, 11.5, color);
     });
 }

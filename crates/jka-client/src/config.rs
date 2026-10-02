@@ -3,10 +3,10 @@ use crate::player::{LocalPresentationSettings, MouseInputSettings};
 use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::ui::{
     CloudRenderResolution, CloudType, ColorLutPreset, DetailTextureMode, DofQuality, DynamicLightsMode,
-    DynamicShadowsMode, EntityAmbientLightingMode, FogMode, FootprintMode, FullscreenMode,
+    DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FullscreenMode,
     CrosshairSettings, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
     MovementKeysSettings, StrafeHelperSettings,
-    PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter,
+    PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter,
     VideoSettings, VsyncMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_THICKNESS_MAX,
     CLOUD_THICKNESS_MIN, MAX_DISTANCE_CULL_SCALE, MAX_FOG_STRENGTH,
 };
@@ -46,16 +46,75 @@ pub struct ClientPresentationSettings {
     pub console_timestamps: bool,
     /// con_suggest: live command/cvar filter popup while typing in the console.
     pub console_suggest: bool,
+    /// cg_chatboxCompletion: Tab in the chat input completes player names.
+    pub chatbox_completion: bool,
     /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
     pub ui_vgs: i32,
     /// r_jumpHeightShade: tint landing surfaces by jump height in jaPRO SP physics.
     pub jump_height_shade: bool,
+    /// cg_screenShake: 0 off, 1 effect-driven shake (explosions, stomps), 2 also weapon-fire shake.
+    pub screen_shake: u8,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
+    /// jaPRO cgame options: `cg_stylePlayer`, the race timer, spectator aids.
+    pub japro: crate::japro_cg::JaproCgame,
     /// TaystJK-compatible server-browser masters (`sv_master1`..`sv_master5`).
     pub master_servers: [String; crate::server_browser::MAX_MASTER_SLOTS],
 }
 
+
+/// jaPRO/TaystJK client options (sounds, gibs, auto switch: `cg_jumpSounds` and friends). They apply
+/// to any server, as in TaystJK. Defaults keep stock JKA behaviour where jaPRO's
+/// own defaults would change it (jaPRO ships `cg_jumpSounds 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameOptions {
+    /// 0 off, 1 everyone, 2 other players only, 3 own jumps only.
+    pub jump: u8,
+    /// 0 off, 1 everyone, 2 other players only, 3 own rolls only.
+    pub roll: u8,
+    /// Suppress taunt voice lines.
+    pub no_taunt: bool,
+    /// 0 off, 1 sound + text, 2 sound only, 3 text only for the duel start.
+    pub duel: u8,
+    /// 0 off, 1 frag sound, 2 frag sound with a mid-air variant.
+    pub kill: u8,
+    /// TaystJK `cg_killMessage`: 0 off, 1 normal + FFA place/score, 2 kill
+    /// only at normal height, 3 kill message at TaystJK's higher position.
+    pub kill_message: u8,
+    /// TaystJK `cg_drawRewards`: 0 off, 1 JKA/Mon Mothma awards, 2 Q3
+    /// variants for impressive/excellent/humiliation/denied.
+    pub draw_rewards: u8,
+    /// 0 off, 1..=4 hit sound set; 5/6 choose saber-hit variants only.
+    pub hit: u8,
+    /// `cg_duelMusic`: play the duel track while you are in a duel.
+    pub duel_music: bool,
+    /// `cg_ambientSounds`: level ambience (`sound.txt` general/local sets).
+    pub ambient: bool,
+    /// jaPRO `cg_blood`: 0 no gibs (a death voice instead), 1 skull or brain,
+    /// 2 full gibs. Lives here because the sound side reads it too.
+    pub blood: u8,
+    /// `cg_autoSwitch`: 0 never, 1 switch to a better *safe* weapon on pickup (and
+    /// when one runs dry), 2 any better weapon.
+    pub auto_switch: u8,
+    /// `cg_scorePlums`: floating score numbers when you score.
+    pub score_plums: bool,
+    /// `cg_ghoul2Marks`: burn marks kept per player model (0 off; jaPRO's default is 16).
+    pub g2_marks: u8,
+    /// jaPRO `cg_raceSounds` bit mask; bit 0 keeps the race start-trigger sound.
+    pub race_sounds: u8,
+    /// jaPRO `cg_chatSounds`: 0 silent, 1 the legacy talk beep for every chat
+    /// line, 2 distinct beeps for private messages and team chat.
+    pub chat_sounds: u8,
+    /// jaPRO `cg_footsteps`: 0 off, 1 sounds, 2 + material effects, 3 + prints
+    /// (how they look is `r_footprints`), 4 the debugging "always" level.
+    pub footsteps: u8,
+}
+
+impl Default for GameOptions {
+    fn default() -> Self {
+        Self { jump: 1, roll: 1, no_taunt: false, duel: 1, kill: 2, kill_message: 1, draw_rewards: 1, hit: 0, duel_music: true, ambient: true, blood: 0, auto_switch: 1, score_plums: true, g2_marks: 16, race_sounds: 1, chat_sounds: 0, footsteps: 3 }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioSettings {
@@ -71,6 +130,7 @@ pub struct AudioSettings {
     pub steam_audio_binaural: bool,
     /// Live direct-path Steam Audio occlusion and transmission.
     pub steam_audio_environmental: bool,
+    pub game: GameOptions,
 }
 
 impl Default for AudioSettings {
@@ -85,8 +145,15 @@ impl Default for AudioSettings {
             steam_audio: false,
             steam_audio_binaural: true,
             steam_audio_environmental: true,
+            game: GameOptions::default(),
         }
     }
+}
+
+/// An integer cvar value clamped to `0..=max` (cvar `.integer` truncates).
+fn int_in(value: &str, max: u8) -> Option<u8> {
+    let number = value.trim().parse::<f32>().ok().filter(|number| number.is_finite())?;
+    Some((number as i32).clamp(0, i32::from(max)) as u8)
 }
 
 /// Load the archived OpenJK sound controls that DinurdoJK already implements
@@ -147,6 +214,23 @@ pub fn load_audio_settings(primary: &Path, fallback: Option<&Path>) -> AudioSett
             "s_steamaudioenvironmental" => {
                 settings.steam_audio_environmental = parse_bool(value).unwrap_or(settings.steam_audio_environmental)
             }
+            "cg_jumpsounds" => settings.game.jump = int_in(value, 3).unwrap_or(settings.game.jump),
+            "cg_rollsounds" => settings.game.roll = int_in(value, 3).unwrap_or(settings.game.roll),
+            "cg_notaunt" => settings.game.no_taunt = parse_bool(value).unwrap_or(settings.game.no_taunt),
+            "cg_duelsounds" => settings.game.duel = int_in(value, 3).unwrap_or(settings.game.duel),
+            "cg_killsounds" => settings.game.kill = int_in(value, 2).unwrap_or(settings.game.kill),
+            "cg_killmessage" => settings.game.kill_message = int_in(value, 3).unwrap_or(settings.game.kill_message),
+            "cg_drawrewards" => settings.game.draw_rewards = int_in(value, 2).unwrap_or(settings.game.draw_rewards),
+            "cg_hitsounds" => settings.game.hit = int_in(value, 6).unwrap_or(settings.game.hit),
+            "cg_duelmusic" => settings.game.duel_music = parse_bool(value).unwrap_or(settings.game.duel_music),
+            "cg_ambientsounds" => settings.game.ambient = parse_bool(value).unwrap_or(settings.game.ambient),
+            "cg_blood" => settings.game.blood = int_in(value, 2).unwrap_or(settings.game.blood),
+            "cg_autoswitch" => settings.game.auto_switch = int_in(value, 2).unwrap_or(settings.game.auto_switch),
+            "cg_scoreplums" => settings.game.score_plums = parse_bool(value).unwrap_or(settings.game.score_plums),
+            "cg_ghoul2marks" => settings.game.g2_marks = int_in(value, 64).unwrap_or(settings.game.g2_marks),
+            "cg_racesounds" => settings.game.race_sounds = int_in(value, 255).unwrap_or(settings.game.race_sounds),
+            "cg_chatsounds" => settings.game.chat_sounds = int_in(value, 2).unwrap_or(settings.game.chat_sounds),
+            "cg_footsteps" => settings.game.footsteps = int_in(value, 4).unwrap_or(settings.game.footsteps),
             _ => {}
         }
     }
@@ -174,9 +258,12 @@ impl Default for ClientPresentationSettings {
             strafe_helper: StrafeHelperSettings::default(),
             console_timestamps: true,
             console_suggest: true,
+            chatbox_completion: true,
             ui_vgs: 1,
-            jump_height_shade: false,
+            jump_height_shade: true,
+            screen_shake: 1,
             network: crate::net::NetworkSettings::default(),
+            japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
         }
     }
@@ -223,7 +310,12 @@ pub fn load_client_presentation_settings(
             "cg_forcemodel" => settings.force_model = value.trim().to_owned(),
             "cg_drawcrosshair" => {
                 if let Ok(style) = value.trim().parse::<u8>() {
-                    settings.crosshair.style = style.min(6);
+                    settings.crosshair.style = style.min(crate::ui::CROSSHAIR_STYLE_MAX);
+                }
+            }
+            "cg_crosshairimage" => {
+                if let Ok(image) = value.trim().parse::<u8>() {
+                    settings.crosshair.image = image.min(crate::ui::CROSSHAIR_IMAGE_COUNT);
                 }
             }
             "cg_crosshairsize" => {
@@ -231,29 +323,39 @@ pub fn load_client_presentation_settings(
                     .unwrap_or(settings.crosshair.size)
                     .clamp(4.0, 96.0);
             }
+            "cg_crosshairstrength" => {
+                settings.crosshair.strength = finite()
+                    .unwrap_or(settings.crosshair.strength)
+                    .clamp(0.0, crate::ui::CROSSHAIR_STRENGTH_MAX);
+            }
             "cg_crosshaircolor" => {
                 if let Some(color) = parse_rgba8(value) {
                     settings.crosshair.color = color;
                 }
             }
-            "cg_hudhealth" => {
-                if let Some(layout) = HudElementLayout::from_config(value) {
-                    settings.hud_layout.health = layout;
-                }
+            "cg_crosshairidentifytarget" => {
+                settings.crosshair.identify_target =
+                    parse_bool(value).unwrap_or(settings.crosshair.identify_target)
             }
-            "cg_hudshield" => {
-                if let Some(layout) = HudElementLayout::from_config(value) {
-                    settings.hud_layout.shield = layout;
-                }
+            "cg_drawcrosshairnames" => {
+                settings.crosshair.names = finite()
+                    .unwrap_or(settings.crosshair.names)
+                    .clamp(-1000.0, 1000.0);
             }
-            "cg_hudammo" => {
-                if let Some(layout) = HudElementLayout::from_config(value) {
-                    settings.hud_layout.ammo = layout;
-                }
+            "cg_drawcrosshairnamescolours" => {
+                settings.crosshair.names_colours =
+                    parse_bool(value).unwrap_or(settings.crosshair.names_colours)
             }
-            "cg_hudforce" => {
-                if let Some(layout) = HudElementLayout::from_config(value) {
-                    settings.hud_layout.force = layout;
+            "cg_drawcrosshairnamesopacity" => {
+                settings.crosshair.names_opacity = finite()
+                    .unwrap_or(settings.crosshair.names_opacity)
+                    .clamp(0.0, 1.0);
+            }
+            hud_cvar if HudElementId::from_cvar(hud_cvar).is_some() => {
+                if let (Some(id), Some(layout)) =
+                    (HudElementId::from_cvar(hud_cvar), HudElementLayout::from_config(value))
+                {
+                    *settings.hud_layout.element_mut(id) = layout;
                 }
             }
             "cg_hudsnap" => {
@@ -294,8 +396,15 @@ pub fn load_client_presentation_settings(
                 settings.console_suggest =
                     parse_bool(value).unwrap_or(settings.console_suggest)
             }
+            "cg_chatboxcompletion" => {
+                settings.chatbox_completion =
+                    parse_bool(value).unwrap_or(settings.chatbox_completion)
+            }
             "ui_vgs" => {
                 settings.ui_vgs = value.trim().parse::<i32>().unwrap_or(settings.ui_vgs)
+            }
+            "cg_screenshake" => {
+                settings.screen_shake = int_in(value, 2).unwrap_or(settings.screen_shake)
             }
             "r_jumpheightshade" => {
                 settings.jump_height_shade =
@@ -306,6 +415,9 @@ pub fn load_client_presentation_settings(
             "sv_master3" => settings.master_servers[2] = value.trim().to_owned(),
             "sv_master4" => settings.master_servers[3] = value.trim().to_owned(),
             "sv_master5" => settings.master_servers[4] = value.trim().to_owned(),
+            other if settings.japro.cvar_value(other).is_some() => {
+                let _ = settings.japro.set_cvar(other, value);
+            }
             other if settings.network.cvar_value(other).is_some() => {
                 let _ = settings.network.set_cvar(other, value);
             }
@@ -533,6 +645,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_perftrace" => {
                 settings.perf_trace = parse_bool(value).unwrap_or(settings.perf_trace);
             }
+            "r_worldpath" => {
+                settings.force_unified_world = value.trim().eq_ignore_ascii_case("unified");
+            }
             "r_gputimings" => {
                 settings.gpu_timings = parse_bool(value).unwrap_or(settings.gpu_timings);
             }
@@ -555,11 +670,38 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                 settings.ghoul2_batch_draws =
                     Ghoul2BatchMode::from_config(value).unwrap_or(settings.ghoul2_batch_draws);
             }
+            "r_ghoul2animsmooth" => {
+                // jaPRO stores this cvar unclamped and only activates smoothing
+                // when it reads strictly inside (0, 1) at use; 1.0+ is a no-op
+                // there, not "maximum". Don't clamp the upper bound here either.
+                settings.ghoul2_anim_smooth = value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.max(0.0))
+                    .unwrap_or(settings.ghoul2_anim_smooth);
+            }
             "com_maxfps" => {
                 settings.fps_cap = normalize_fps_cap(value, settings.fps_cap);
             }
             "cg_fxfps" => {
                 settings.fx_fps = normalize_fx_fps(value, settings.fx_fps);
+            }
+            "fx_physics" => {
+                settings.fx_physics = normalize_fx_physics(value, settings.fx_physics);
+            }
+            "fx_lod" => {
+                settings.fx_lod = normalize_fx_lod(value, settings.fx_lod);
+            }
+            "r_fxlodscale" => {
+                settings.fx_lod_scale = normalize_lod_scale(value, settings.fx_lod_scale);
+            }
+            "r_lodscale" => {
+                settings.lod_scale = normalize_lod_scale(value, settings.lod_scale);
+            }
+            "fx_countscale" => {
+                settings.fx_count_scale = normalize_fx_count_scale(value, settings.fx_count_scale);
             }
             "r_fxgeometry" => {
                 settings.fx_geometry =
@@ -662,10 +804,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     "off" | "0" => Some(PvsMode::Off),
                     "minimal" | "1" => Some(PvsMode::Minimal),
                     "full" | "2" => Some(PvsMode::Full),
-                    "auto" | "3" => Some(PvsMode::Auto),
-                    "auto2" | "4" => Some(PvsMode::Auto2),
-                    "auto3" | "5" => Some(PvsMode::Auto3),
-                    "auto4" | "batched" | "pvsbatched" | "6" => Some(PvsMode::Auto4),
+                    // Auto 1-3 were removed; Auto 4 became Auto.
+                    "auto" | "3" | "auto2" | "4" | "auto3" | "5" | "auto4" | "batched" | "pvsbatched"
+                    | "6" => Some(PvsMode::Auto),
                     _ => pvs_mode,
                 };
             }
@@ -729,6 +870,8 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_contactshadows" => {
                 settings.contact_shadows = parse_bool(value).unwrap_or(settings.contact_shadows)
             }
+            // Read-only alias: configs written before r_fogMode was folded into
+            // r_drawfog. It is never written back.
             "r_fogmode" => {
                 settings.fog_mode = match value.to_ascii_lowercase().as_str() {
                     "off" | "0" => FogMode::Off,
@@ -744,13 +887,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             // Preserve OpenJK's real r_drawfog split:
             //   1 = explicit fog redraw after the material stages
             //   2 = global fog during shader stages; local brush fog still redraws
+            // DinurdoJK adds 3 = volumetric.
             "r_drawfog" => {
-                settings.fog_mode = match value {
-                    "0" => FogMode::Off,
-                    "1" => FogMode::LegacyDrawFog1,
-                    "2" => FogMode::LegacyDrawFog2,
-                    _ => settings.fog_mode,
-                }
+                settings.fog_mode = FogMode::from_drawfog(value).unwrap_or(settings.fog_mode);
             }
             "r_fogstrength" => {
                 if let Ok(strength) = value.parse::<f32>() {
@@ -765,6 +904,10 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_sunvisibility" => {
                 settings.sun_visibility = SunVisibilityMode::from_config(value)
                     .unwrap_or(settings.sun_visibility);
+            }
+            "r_entitysunlighting" => {
+                settings.entity_sun_lighting =
+                    parse_bool(value).unwrap_or(settings.entity_sun_lighting)
             }
             "r_sunyaw" => {
                 if let Ok(yaw) = value.parse::<f32>() {
@@ -1023,6 +1166,26 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                 settings.rain_intensity =
                     RainIntensity::from_config(value).unwrap_or(settings.rain_intensity)
             }
+            "r_puddlequality" => {
+                settings.puddle_quality =
+                    PuddleQuality::from_config(value).unwrap_or(settings.puddle_quality)
+            }
+            "r_puddlescatter" => {
+                settings.puddle_scatter = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|amount| amount.is_finite())
+                    .map(|amount| amount.clamp(0.0, 1.0))
+                    .unwrap_or(settings.puddle_scatter)
+            }
+            "r_raingrade" => {
+                settings.rain_grade = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|strength| strength.is_finite())
+                    .map(|strength| strength.clamp(0.0, 1.0))
+                    .unwrap_or(settings.rain_grade)
+            }
             "r_footprints" => {
                 settings.footprints =
                     FootprintMode::from_config(value).unwrap_or(settings.footprints)
@@ -1108,6 +1271,11 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     settings.rt_samples = samples;
                 }
             }
+            "r_dynamiclightfalloff" => {
+                if let Ok(mode @ (0 | 1)) = value.parse::<u32>() {
+                    settings.dynamic_light_falloff = mode;
+                }
+            }
             "r_rtresolution" => {
                 match value.to_ascii_lowercase().as_str() {
                     "full" | "1" => settings.rt_half_resolution = false,
@@ -1161,6 +1329,10 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_voxelprobegi" => {
                 settings.voxel_probe_gi = parse_bool(value).unwrap_or(settings.voxel_probe_gi)
             }
+            "r_entityshadowlight" => {
+                settings.entity_shadow_light =
+                    EntityShadowLight::from_config(value).unwrap_or(settings.entity_shadow_light)
+            }
             "r_locallightshadows" => {
                 settings.local_light_shadows =
                     parse_bool(value).unwrap_or(settings.local_light_shadows)
@@ -1208,10 +1380,7 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
     settings.sync_linked_brightness();
     // r_dynamicLights is the source of truth for all runtime-light techniques.
     if dynamic_shadows_mode_seen {
-        settings.cascaded_shadows = matches!(
-            settings.dynamic_shadows,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
-        );
+        settings.cascaded_shadows = settings.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
     } else {
         settings.dynamic_shadows = if settings.cascaded_shadows {
             DynamicShadowsMode::CascadedShadowMaps
@@ -1318,11 +1487,13 @@ seta r_showtris \"{}\"\n\
 seta r_skipUi \"{}\"\n\
 seta developer \"{}\"\n\
 seta r_perfTrace \"{}\"\n\
+seta r_worldPath \"{}\"\n\
 seta r_gpuTimings \"{}\"\n\
 seta r_ghoul2Skinning \"{}\"\n\
 seta r_ghoul2EarlyCull \"{}\"\n\
 seta r_lodbias \"{}\"\n\
 seta r_ghoul2BatchDraws \"{}\"\n\
+seta r_ghoul2AnimSmooth \"{}\"\n\
 seta r_novis \"{}\"\n\
 seta r_pvsMode \"{}\"\n\
 seta com_maxfps \"{}\"\n\
@@ -1349,10 +1520,11 @@ seta r_fxaa \"{}\"\n\
 seta r_smaa \"{}\"\n\
 seta r_taa \"{}\"\n\
 seta r_contactShadows \"{}\"\n\
-seta r_fogMode \"{}\"\n\
+seta r_drawfog \"{}\"\n\
 seta r_fogStrength \"{:.3}\"\n\
 seta r_sunOverride \"{}\"\n\
 seta r_sunVisibility \"{}\"\n\
+seta r_entitySunLighting \"{}\"\n\
 seta r_sunYaw \"{:.3}\"\n\
 seta r_sunPitch \"{:.3}\"\n\
 seta r_sunIntensity \"{:.3}\"\n\
@@ -1383,6 +1555,9 @@ seta r_cloudThicknessVariation \"{:.3}\"\n\
 seta r_cloudSize \"{:.3}\"\n\
 seta r_rain \"{}\"\n\
 seta r_rainIntensity \"{}\"\n\
+seta r_puddleQuality \"{}\"\n\
+seta r_puddleScatter \"{:.3}\"\n\
+seta r_rainGrade \"{:.3}\"\n\
 seta r_grass \"{}\"\n\
 seta r_ocean \"{}\"\n\
 seta r_oceanMapSize \"{}\"\n\
@@ -1426,6 +1601,7 @@ seta r_emissiveAreaLights \"{}\"\n\
 seta r_voxelProbeGI \"{}\"\n\
 seta r_localLightShadows \"{}\"\n\
 seta r_cascadedShadows \"{}\"\n\
+seta r_entityShadowLight \"{}\"\n\
 ",
         settings.resolution[0],
         settings.resolution[1],
@@ -1446,11 +1622,13 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.skip_ui),
         u8::from(settings.developer_tools),
         u8::from(settings.perf_trace),
+        if settings.force_unified_world { "unified" } else { "auto" },
         u8::from(settings.gpu_timings),
         settings.ghoul2_skinning.config_value(),
         u8::from(settings.ghoul2_early_cull),
         settings.ghoul2_lod_bias,
         settings.ghoul2_batch_draws.config_value(),
+        settings.ghoul2_anim_smooth,
         u8::from(settings.pvs_mode == PvsMode::Off),
         pvs_mode,
         settings.fps_cap,
@@ -1477,10 +1655,11 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.smaa),
         u8::from(settings.taa),
         u8::from(settings.contact_shadows),
-        settings.fog_mode.config_value(),
+        settings.fog_mode.drawfog_value(),
         settings.fog_strength,
         u8::from(settings.sun_override),
         settings.sun_visibility.config_value(),
+        u8::from(settings.entity_sun_lighting),
         settings.sun_yaw,
         settings.sun_pitch,
         settings.sun_intensity,
@@ -1514,6 +1693,9 @@ seta r_cascadedShadows \"{}\"\n\
         settings.cloud_size,
         u8::from(settings.rain),
         settings.rain_intensity.config_value(),
+        settings.puddle_quality.config_value(),
+        settings.puddle_scatter,
+        settings.rain_grade,
         u8::from(settings.grass),
         u8::from(settings.ocean),
         settings.ocean_settings.map_size,
@@ -1557,10 +1739,12 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.voxel_probe_gi),
         u8::from(settings.local_light_shadows),
         u8::from(settings.cascaded_shadows),
+        settings.entity_shadow_light.config_value(),
     );
     use std::fmt::Write as _;
     let mut text = text;
     writeln!(text, "seta r_rtSamples \"{}\"", settings.rt_samples).unwrap();
+    writeln!(text, "seta r_dynamicLightFalloff \"{}\"", settings.dynamic_light_falloff).unwrap();
     writeln!(text, "seta r_rtResolution \"{}\"", if settings.rt_half_resolution { "half" } else { "full" }).unwrap();
     text.push_str(&format!(
         "seta r_fullbright \"{}\"\nseta r_vertexLight \"{}\"\nseta r_lightmap \"{}\"\n",
@@ -1569,6 +1753,11 @@ seta r_cascadedShadows \"{}\"\n\
         u8::from(settings.lightmap_only),
     ));
     let _ = writeln!(text, "seta cg_fxFPS \"{}\"", settings.fx_fps);
+    let _ = writeln!(text, "seta fx_physics \"{}\"", settings.fx_physics);
+    let _ = writeln!(text, "seta fx_lod \"{}\"", settings.fx_lod);
+    let _ = writeln!(text, "seta fx_countScale \"{}\"", settings.fx_count_scale);
+    let _ = writeln!(text, "seta r_fxLodScale \"{}\"", settings.fx_lod_scale);
+    let _ = writeln!(text, "seta r_lodScale \"{}\"", settings.lod_scale);
     let _ = writeln!(text, "seta r_fxGeometry \"{}\"", settings.fx_geometry.config_value());
     let _ = writeln!(text, "seta r_fxZeroAlphaDiscard \"{}\"", u8::from(settings.fx_zero_alpha_discard));
     let _ = writeln!(text, "seta r_drawMapModels \"{}\"", u8::from(settings.draw_map_models));
@@ -1621,9 +1810,15 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta model \"{}\"", presentation.model);
     let _ = writeln!(text, "seta cg_forceModel \"{}\"", presentation.force_model);
     let _ = writeln!(text, "seta cg_drawCrosshair \"{}\"", presentation.crosshair.style);
+    let _ = writeln!(text, "seta cg_crosshairImage \"{}\"", presentation.crosshair.image);
     let _ = writeln!(text, "seta cg_crosshairSize \"{:.3}\"", presentation.crosshair.size);
+    let _ = writeln!(text, "seta cg_crosshairStrength \"{:.3}\"", presentation.crosshair.strength);
     let [r, g, b, a] = presentation.crosshair.color;
     let _ = writeln!(text, "seta cg_crosshairColor \"{r} {g} {b} {a}\"");
+    let _ = writeln!(text, "seta cg_crosshairIdentifyTarget \"{}\"", u8::from(presentation.crosshair.identify_target));
+    let _ = writeln!(text, "seta cg_drawCrosshairNames \"{}\"", presentation.crosshair.names);
+    let _ = writeln!(text, "seta cg_drawCrosshairNamesColours \"{}\"", u8::from(presentation.crosshair.names_colours));
+    let _ = writeln!(text, "seta cg_drawCrosshairNamesOpacity \"{}\"", presentation.crosshair.names_opacity);
     for id in HudElementId::ALL {
         let _ = writeln!(
             text,
@@ -1650,8 +1845,10 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta cg_strafeHelperInactiveAlpha \"{}\"", presentation.strafe_helper.inactive_alpha);
     let _ = writeln!(text, "seta con_timestamps \"{}\"", u8::from(presentation.console_timestamps));
     let _ = writeln!(text, "seta con_suggest \"{}\"", u8::from(presentation.console_suggest));
+    let _ = writeln!(text, "seta cg_chatboxCompletion \"{}\"", u8::from(presentation.chatbox_completion));
     let _ = writeln!(text, "seta ui_vgs \"{}\"", presentation.ui_vgs);
     let _ = writeln!(text, "seta r_jumpHeightShade \"{}\"", u8::from(presentation.jump_height_shade));
+    let _ = writeln!(text, "seta cg_screenShake \"{}\"", presentation.screen_shake);
     let _ = writeln!(text, "seta cg_zoomFov \"{:.3}\"", presentation.zoom_fov);
     let _ = writeln!(text, "seta cg_fkDuration \"{}\"", presentation.fk_duration);
     let _ = writeln!(text, "seta cg_fkFirstJumpDuration \"{}\"", presentation.fk_first_jump_duration);
@@ -1661,6 +1858,7 @@ seta r_physicsStats \"{}\"\n",
         let _ = writeln!(text, "seta sv_master{} \"{}\"", index + 1, master);
     }
     presentation.network.write_cfg(&mut text);
+    presentation.japro.write_cfg(&mut text);
     let _ = writeln!(text, "seta sensitivity \"{:.6}\"", presentation.mouse.sensitivity);
     let _ = writeln!(text, "seta m_yaw \"{:.6}\"", presentation.mouse.yaw);
     let _ = writeln!(text, "seta m_pitch \"{:.6}\"", presentation.mouse.pitch);
@@ -1689,6 +1887,23 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta s_steamAudio \"{}\"", u8::from(audio.steam_audio));
     let _ = writeln!(text, "seta s_steamAudioBinaural \"{}\"", u8::from(audio.steam_audio_binaural));
     let _ = writeln!(text, "seta s_steamAudioEnvironmental \"{}\"", u8::from(audio.steam_audio_environmental));
+    let _ = writeln!(text, "seta cg_jumpSounds \"{}\"", audio.game.jump);
+    let _ = writeln!(text, "seta cg_rollSounds \"{}\"", audio.game.roll);
+    let _ = writeln!(text, "seta cg_noTaunt \"{}\"", u8::from(audio.game.no_taunt));
+    let _ = writeln!(text, "seta cg_duelSounds \"{}\"", audio.game.duel);
+    let _ = writeln!(text, "seta cg_killSounds \"{}\"", audio.game.kill);
+    let _ = writeln!(text, "seta cg_killMessage \"{}\"", audio.game.kill_message);
+    let _ = writeln!(text, "seta cg_drawRewards \"{}\"", audio.game.draw_rewards);
+    let _ = writeln!(text, "seta cg_hitsounds \"{}\"", audio.game.hit);
+    let _ = writeln!(text, "seta cg_duelMusic \"{}\"", u8::from(audio.game.duel_music));
+    let _ = writeln!(text, "seta cg_ambientSounds \"{}\"", u8::from(audio.game.ambient));
+    let _ = writeln!(text, "seta cg_blood \"{}\"", audio.game.blood);
+    let _ = writeln!(text, "seta cg_autoSwitch \"{}\"", audio.game.auto_switch);
+    let _ = writeln!(text, "seta cg_scorePlums \"{}\"", u8::from(audio.game.score_plums));
+    let _ = writeln!(text, "seta cg_ghoul2Marks \"{}\"", audio.game.g2_marks);
+    let _ = writeln!(text, "seta cg_raceSounds \"{}\"", audio.game.race_sounds);
+    let _ = writeln!(text, "seta cg_chatSounds \"{}\"", audio.game.chat_sounds);
+    let _ = writeln!(text, "seta cg_footsteps \"{}\"", audio.game.footsteps);
     bindings.write_cfg(&mut text);
     let a = settings.ocean_settings.authored;
     let o = settings.ocean_settings.optics;
@@ -1724,6 +1939,37 @@ pub fn normalize_fx_fps(value: &str, fallback: u32) -> u32 {
         Ok(FX_FPS_LEGACY_JKA) => FX_FPS_LEGACY_JKA,
         Ok(value) => value.clamp(FX_FPS_MIN, FX_FPS_MAX),
         Err(_) => fallback,
+    }
+}
+
+/// `fx_physics` 0..3. Stock level 1 ("non-expensive only") has no code path of
+/// its own and behaves exactly like 0, so it is stored as 0.
+pub fn normalize_fx_physics(value: &str, fallback: u32) -> u32 {
+    match value.trim().parse::<u32>() {
+        Ok(0 | 1) => 0,
+        Ok(value) => value.min(3),
+        Err(_) => fallback,
+    }
+}
+
+/// `fx_lod` 0..2.
+pub fn normalize_fx_lod(value: &str, fallback: u32) -> u32 {
+    value.trim().parse::<u32>().map_or(fallback, |value| value.min(crate::fx::FX_LOD_ADAPTIVE))
+}
+
+/// `r_lodScale` / `r_fxLodScale`, kept in a sane positive range.
+pub fn normalize_lod_scale(value: &str, fallback: f32) -> f32 {
+    match value.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() => value.clamp(crate::fx::LOD_SCALE_MIN, crate::fx::LOD_SCALE_MAX),
+        _ => fallback,
+    }
+}
+
+/// `fx_countScale` 0..1 (stock never scales upward).
+pub fn normalize_fx_count_scale(value: &str, fallback: f32) -> f32 {
+    match value.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() => value.clamp(0.0, 1.0),
+        _ => fallback,
     }
 }
 
@@ -1891,6 +2137,7 @@ mod tests {
             separation: 0.75,
             mute_when_unfocused: false,
             steam_audio: true,
+            game: GameOptions { jump: 3, roll: 2, no_taunt: true, duel: 2, kill: 1, kill_message: 3, draw_rewards: 2, hit: 4, duel_music: false, ambient: false, blood: 2, auto_switch: 2, score_plums: false, g2_marks: 4, race_sounds: 0, chat_sounds: 2, footsteps: 1 },
             ..AudioSettings::default()
         };
         save_video_settings(
@@ -1913,6 +2160,11 @@ mod tests {
         assert!(text.contains("seta s_muteWhenUnfocused \"0\""));
         assert!(text.contains("seta s_steamAudio \"1\""));
         assert!(text.contains("seta s_steamAudioEnvironmental \"1\""));
+        assert!(text.contains("seta cg_jumpSounds \"3\""));
+        assert!(text.contains("seta cg_noTaunt \"1\""));
+        assert!(text.contains("seta cg_killMessage \"3\""));
+        assert!(text.contains("seta cg_drawRewards \"2\""));
+        assert!(text.contains("seta cg_hitsounds \"4\""));
     }
 
     #[test]
@@ -1922,6 +2174,7 @@ mod tests {
         settings.ghoul2_early_cull = false;
         settings.ghoul2_lod_bias = 2;
         settings.ghoul2_batch_draws = Ghoul2BatchMode::Force;
+        settings.ghoul2_anim_smooth = 0.3;
 
         let dir = std::env::temp_dir().join(format!(
             "jka-ghoul2-cfg-{}-{:?}",
@@ -1946,10 +2199,12 @@ mod tests {
         assert!(!loaded.ghoul2_early_cull);
         assert_eq!(loaded.ghoul2_lod_bias, 2);
         assert_eq!(loaded.ghoul2_batch_draws, Ghoul2BatchMode::Force);
+        assert_eq!(loaded.ghoul2_anim_smooth, 0.3);
         assert!(text.contains("seta r_ghoul2Skinning \"workers\""));
         assert!(text.contains("seta r_ghoul2EarlyCull \"0\""));
         assert!(text.contains("seta r_lodbias \"2\""));
         assert!(text.contains("seta r_ghoul2BatchDraws \"2\""));
+        assert!(text.contains("seta r_ghoul2AnimSmooth \"0.3\""));
     }
 
     #[test]
@@ -2068,6 +2323,7 @@ mod tests {
         settings.sun_intensity = 777.0;
         settings.sun_color = [1.0, 0.625, 0.25];
         settings.sun_visibility = SunVisibilityMode::Filtered;
+        settings.entity_sun_lighting = true;
 
         let dir = std::env::temp_dir().join(format!(
             "jka-sun-cfg-{}-{:?}",
@@ -2093,6 +2349,7 @@ mod tests {
         assert!((loaded.sun_intensity - 777.0).abs() < 1e-3);
         assert_eq!(loaded.sun_color, [1.0, 0.625, 0.25]);
         assert_eq!(loaded.sun_visibility, SunVisibilityMode::Filtered);
+        assert!(loaded.entity_sun_lighting);
     }
 
     #[test]
@@ -2132,13 +2389,15 @@ mod tests {
                 "seta cg_thirdPersonSpecialCam \"1\"\n",
                 "seta cg_thirdPersonTargetDamp \"0.61\"\n",
                 "seta cg_thirdPersonVertOffset \"21\"\n",
-                "seta cg_drawCrosshair \"5\"\n",
+                "seta cg_drawCrosshair \"7\"\n",
+                "seta cg_crosshairImage \"99\"\n",
                 "seta cg_crosshairSize \"36\"\n",
                 "seta cg_crosshairColor \"64 128 255 200\"\n",
                 "seta cg_hudHealth \"bl 40 -72 1.25\"\n",
                 "seta cg_hudShield \"bc -120 -40 0.75\"\n",
                 "seta cg_hudAmmo \"br -32 -72 1.5\"\n",
                 "seta cg_hudForce \"c 180 120 0.9\"\n",
+                "seta cg_hudMovementKeys \"tl 30 -12 1.5\"\n",
                 "seta cg_hudSnap \"0\"\n",
                 "seta cg_hudGridSize \"12\"\n",
             ),
@@ -2173,7 +2432,9 @@ mod tests {
         assert!(loaded.third_person.special_cam);
         assert!((loaded.third_person.target_damp - 0.61).abs() < 1e-6);
         assert!((loaded.third_person.vert_offset - 21.0).abs() < 1e-6);
-        assert_eq!(loaded.crosshair.style, 5);
+        assert_eq!(loaded.crosshair.style, crate::ui::CROSSHAIR_STYLE_LINE);
+        // An out-of-range image id is clamped to the last image crosshair.
+        assert_eq!(loaded.crosshair.image, crate::ui::CROSSHAIR_IMAGE_COUNT);
         assert!((loaded.crosshair.size - 36.0).abs() < 1e-6);
         assert_eq!(loaded.crosshair.color, [64, 128, 255, 200]);
         assert_eq!(loaded.hud_layout.health.anchor, crate::ui::HudAnchor::BottomLeft);
@@ -2181,6 +2442,8 @@ mod tests {
         assert!((loaded.hud_layout.health.scale - 1.25).abs() < 1e-6);
         assert_eq!(loaded.hud_layout.shield.anchor, crate::ui::HudAnchor::BottomCenter);
         assert_eq!(loaded.hud_layout.force.anchor, crate::ui::HudAnchor::Center);
+        assert_eq!(loaded.hud_layout.movement_keys.offset, [30.0, -12.0]);
+        assert!((loaded.hud_layout.movement_keys.scale - 1.5).abs() < 1e-6);
         assert!(!loaded.hud_layout.snap_to_grid);
         assert!((loaded.hud_layout.grid_size - 12.0).abs() < 1e-6);
     }
@@ -2221,12 +2484,18 @@ mod tests {
         presentation.third_person.target_damp = 0.7;
         presentation.third_person.vert_offset = 18.0;
         presentation.crosshair.style = 4;
+        presentation.crosshair.image = 7;
         presentation.crosshair.size = 32.0;
         presentation.crosshair.color = [20, 140, 255, 210];
         presentation.hud_layout.health = HudElementLayout {
             anchor: crate::ui::HudAnchor::TopLeft,
             offset: [48.0, 64.0],
             scale: 1.25,
+        };
+        presentation.hud_layout.fps = HudElementLayout {
+            anchor: crate::ui::HudAnchor::TopLeft,
+            offset: [-20.0, 10.0],
+            scale: 0.75,
         };
         presentation.hud_layout.snap_to_grid = false;
         presentation.hud_layout.grid_size = 16.0;
@@ -2268,9 +2537,12 @@ mod tests {
         assert!(text.contains("seta cg_thirdPersonTargetDamp \"0.700\""));
         assert!(text.contains("seta cg_thirdPersonVertOffset \"18.000\""));
         assert!(text.contains("seta cg_drawCrosshair \"4\""));
+        assert!(text.contains("seta cg_crosshairImage \"7\""));
         assert!(text.contains("seta cg_crosshairSize \"32.000\""));
         assert!(text.contains("seta cg_crosshairColor \"20 140 255 210\""));
         assert!(text.contains("seta cg_hudHealth \"tl 48.000 64.000 1.250\""));
+        assert!(text.contains("seta cg_hudFps \"tl -20.000 10.000 0.750\""));
+        assert!(text.contains("seta cg_hudChat \"tl 0.000 0.000 1.000\""));
         assert!(text.contains("seta cg_hudSnap \"0\""));
         assert!(text.contains("seta cg_hudGridSize \"16.000\""));
 
@@ -2312,6 +2584,34 @@ mod tests {
     fn parses_jka_style_lines() {
         let words = split_cfg_words("seta r_textureMode \"GL_LINEAR_MIPMAP_LINEAR\"");
         assert_eq!(words, ["seta", "r_textureMode", "GL_LINEAR_MIPMAP_LINEAR"]);
+    }
+
+    #[test]
+    fn fx_lod_defaults_to_adaptive_and_clamps() {
+        assert_eq!(VideoSettings::default().fx_lod, crate::fx::FX_LOD_ADAPTIVE);
+        assert_eq!(VideoSettings::default().fx_count_scale, 1.0);
+        assert_eq!(VideoSettings::default().fx_lod_scale, 5.0);
+        assert_eq!(VideoSettings::default().lod_scale, 5.0);
+        assert_eq!(normalize_fx_lod("0", 2), 0);
+        assert_eq!(normalize_fx_lod("9", 0), 2);
+        assert_eq!(normalize_fx_lod("bad", 1), 1);
+        assert_eq!(normalize_fx_count_scale("0.5", 1.0), 0.5);
+        assert_eq!(normalize_fx_count_scale("3", 1.0), 1.0);
+        assert_eq!(normalize_fx_count_scale("nan", 0.7), 0.7);
+        assert_eq!(normalize_lod_scale("2.5", 5.0), 2.5);
+        assert_eq!(normalize_lod_scale("0", 5.0), crate::fx::LOD_SCALE_MIN);
+        assert_eq!(normalize_lod_scale("bad", 5.0), 5.0);
+    }
+
+    #[test]
+    fn fx_physics_defaults_to_authored_and_folds_level_one_into_off() {
+        assert_eq!(VideoSettings::default().fx_physics, crate::fx::FX_PHYSICS_AUTHORED);
+        assert_eq!(normalize_fx_physics("0", 2), 0);
+        assert_eq!(normalize_fx_physics("1", 2), 0);
+        assert_eq!(normalize_fx_physics("2", 0), 2);
+        assert_eq!(normalize_fx_physics("3", 0), 3);
+        assert_eq!(normalize_fx_physics("9", 0), 3);
+        assert_eq!(normalize_fx_physics("bad", 2), 2);
     }
 
     #[test]

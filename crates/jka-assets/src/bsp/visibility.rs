@@ -45,6 +45,53 @@ impl AreaLocator {
     pub fn area_count(&self) -> usize {
         self.area_count
     }
+
+    /// SV_LinkEntity's areanum/areanum2: the first two distinct portal areas
+    /// among the leaves a box touches (CM_BoxLeafnums + CM_LeafArea). A door's
+    /// brush straddles the areaportal, so these are the two areas it joins.
+    pub fn box_areas(&self, mins: [f32; 3], maxs: [f32; 3]) -> [Option<usize>; 2] {
+        let mut areas = [None, None];
+        if !mins.iter().chain(&maxs).all(|v| v.is_finite()) || self.nodes.is_empty() {
+            return areas;
+        }
+        let mut stack = vec![0i32];
+        let mut budget = self.nodes.len() * 2 + 8;
+        while let Some(node) = stack.pop() {
+            budget = match budget.checked_sub(1) {
+                Some(budget) => budget,
+                None => break,
+            };
+            if node < 0 {
+                let Some(&area) = self.leaf_areas.get(-(node + 1) as usize) else { continue };
+                let Ok(area) = usize::try_from(area) else { continue };
+                if areas[0].is_none() || areas[0] == Some(area) {
+                    areas[0] = Some(area);
+                } else {
+                    areas[1] = Some(area);
+                }
+                continue;
+            }
+            let record = &self.nodes[node as usize];
+            let plane = self.planes[record.plane];
+            // BoxOnPlaneSide: nearest and farthest box corners along the normal.
+            let (mut near, mut far) = (0.0f32, 0.0f32);
+            for axis in 0..3 {
+                let (low, high) = (plane.normal[axis] * mins[axis], plane.normal[axis] * maxs[axis]);
+                near += low.min(high);
+                far += low.max(high);
+            }
+            // child 0 is the front (distance >= 0), child 1 the back.
+            if near - plane.distance >= 0.0 {
+                stack.push(record.children[0]);
+            } else if far - plane.distance < 0.0 {
+                stack.push(record.children[1]);
+            } else {
+                stack.push(record.children[1]);
+                stack.push(record.children[0]);
+            }
+        }
+        areas
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +108,9 @@ pub struct Visibility {
     pub clusters: usize,
     stride: usize,
     bits: Vec<u8>,
+    /// Transpose of `bits` (built on first use): for each target cluster, the
+    /// bitset of source clusters that can see it, including itself.
+    visible_from: std::sync::OnceLock<Vec<u64>>,
 }
 impl Visibility {
     pub(super) fn parse(
@@ -186,6 +236,7 @@ impl Visibility {
             clusters,
             stride,
             bits: vis[8..].to_vec(),
+            visible_from: std::sync::OnceLock::new(),
         }))
     }
     fn leaf_at(&self, point: [f32; 3]) -> Option<usize> {
@@ -229,6 +280,54 @@ impl Visibility {
                     || self.bits[from * self.stride + to / 8] & (1 << (to % 8)) != 0
             })
     }
+
+    /// `visible(Some(from), targets)` for every source cluster at once: bit
+    /// `from % 64` of word `from / 64` is set when `from` sees any target.
+    /// Identical to testing each source separately, but costs one row OR per
+    /// target instead of one bit test per (source, target) pair.
+    pub fn pvs_signature(&self, targets: &[usize]) -> Vec<u64> {
+        let words = self.clusters.div_ceil(64);
+        let mut signature = vec![0_u64; words];
+        if targets.is_empty() || targets.iter().any(|&to| to >= self.clusters) {
+            self.set_all_clusters(&mut signature);
+            return signature;
+        }
+        let columns = self.visible_from.get_or_init(|| self.transpose());
+        for &to in targets {
+            for (word, value) in signature.iter_mut().zip(&columns[to * words..(to + 1) * words]) {
+                *word |= value;
+            }
+        }
+        signature
+    }
+
+    fn set_all_clusters(&self, signature: &mut [u64]) {
+        for (index, word) in signature.iter_mut().enumerate() {
+            let remaining = self.clusters - index * 64;
+            *word = if remaining >= 64 { u64::MAX } else { (1_u64 << remaining) - 1 };
+        }
+    }
+
+    fn transpose(&self) -> Vec<u64> {
+        let words = self.clusters.div_ceil(64);
+        let mut columns = vec![0_u64; self.clusters * words];
+        for from in 0..self.clusters {
+            let (from_word, from_bit) = (from / 64, 1_u64 << (from % 64));
+            columns[from * words + from_word] |= from_bit;
+            let row = &self.bits[from * self.stride..(from + 1) * self.stride];
+            for (byte_index, &byte) in row.iter().enumerate() {
+                let mut remaining = byte;
+                while remaining != 0 {
+                    let to = byte_index * 8 + remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    if to < self.clusters {
+                        columns[to * words + from_word] |= from_bit;
+                    }
+                }
+            }
+        }
+        columns
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +366,49 @@ mod tests {
         assert!(!vis.visible(Some(0), &vis.surface_clusters[1]));
         assert!(vis.visible(None, &[1]));
         assert!(vis.visible(Some(0), &[]));
+    }
+    #[test]
+    fn pvs_signature_matches_per_cluster_visible() {
+        let mut vis = fixture(-1).unwrap().unwrap();
+        // Spans three signature words and leaves padding bits in the last row byte.
+        vis.clusters = 150;
+        vis.stride = 150_usize.div_ceil(8);
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        vis.bits = (0..vis.clusters * vis.stride).map(|_| (next() & next()) as u8).collect();
+        vis.visible_from = std::sync::OnceLock::new();
+        let mut cases: Vec<Vec<usize>> = vec![vec![], vec![0], vec![149], vec![3, 150], vec![200]];
+        for _ in 0..200 {
+            let len = 1 + (next() % 5) as usize;
+            cases.push((0..len).map(|_| (next() % 150) as usize).collect());
+        }
+        for targets in cases {
+            let signature = vis.pvs_signature(&targets);
+            let mut expected = vec![0_u64; 150_usize.div_ceil(64)];
+            for from in 0..150 {
+                if vis.visible(Some(from), &targets) {
+                    expected[from / 64] |= 1_u64 << (from % 64);
+                }
+            }
+            assert_eq!(signature, expected, "targets {targets:?}");
+        }
+    }
+    #[test]
+    fn box_areas_reports_the_areas_a_door_straddles() {
+        let locator = AreaLocator {
+            nodes: vec![Node { plane: 0, children: [-1, -2] }],
+            planes: vec![Plane { normal: [1.0, 0.0, 0.0], distance: 0.0 }],
+            leaf_areas: vec![3, 5],
+            area_count: 6,
+        };
+        assert_eq!(locator.box_areas([1.0, 0.0, 0.0], [8.0, 8.0, 8.0]), [Some(3), None]);
+        assert_eq!(locator.box_areas([-8.0, 0.0, 0.0], [-1.0, 8.0, 8.0]), [Some(5), None]);
+        assert_eq!(locator.box_areas([-4.0, 0.0, 0.0], [4.0, 8.0, 8.0]), [Some(3), Some(5)]);
     }
     #[test]
     fn rejects_cycles_bad_children_and_truncated_bits() {

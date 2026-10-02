@@ -185,8 +185,6 @@ fn add_relative(base: usize, relative: i32, limit: usize, what: &str) -> Result<
 }
 
 /// Read only the GLM animation-skeleton reference from the MDXM header.
-/// Profile discovery uses this to reject vehicles without decoding every LOD,
-/// surface and weight in every installed player model.
 pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
     if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
         return Err("expected Ghoul2 GLM/MDXM file".into());
@@ -1731,6 +1729,53 @@ pub fn multiply_3x4(parent: &Matrix3x4, local: &Matrix3x4) -> Matrix3x4 {
             + parent[row][3];
     }
     out
+}
+
+/// Port of jaPRO `CBoneCache::SmoothLow` (`r_ghoul2animsmooth`): blend each
+/// composed bone matrix in `current` against its previous-frame filtered
+/// value in `previous` (`factor` weights `previous`), then remove the
+/// shear/scale drift that linearly blending rotation matrices introduces by
+/// renormalizing the result through the bone's bind pose. `factor` of `0.0`
+/// returns `current` unchanged. `previous` and `current` must be the same
+/// length (one entry per GLA bone); mismatched lengths are a caller bug, not
+/// a discontinuity to smooth over.
+pub fn smooth_ghoul2_pose(
+    gla: &GlaAnimation,
+    previous: &[Matrix3x4],
+    current: &[Matrix3x4],
+    factor: f32,
+) -> Vec<Matrix3x4> {
+    assert_eq!(previous.len(), current.len(), "smooth_ghoul2_pose: pose length mismatch");
+    current
+        .iter()
+        .enumerate()
+        .map(|(index, current_matrix)| {
+            let mut blended = [[0.0_f32; 4]; 3];
+            for row in 0..3 {
+                for col in 0..4 {
+                    blended[row][col] = factor * previous[index][row][col]
+                        + (1.0 - factor) * current_matrix[row][col];
+                }
+            }
+            let base_pose = &gla.skeleton[index].base_pose;
+            let base_pose_inv = &gla.skeleton[index].base_pose_inv;
+            let mut temp = multiply_3x4(&blended, base_pose);
+            let maxl = (base_pose[0][0] * base_pose[0][0]
+                + base_pose[0][1] * base_pose[0][1]
+                + base_pose[0][2] * base_pose[0][2])
+                .sqrt();
+            for row in temp.iter_mut() {
+                let len = (row[0] * row[0] + row[1] * row[1] + row[2] * row[2]).sqrt();
+                if len > f32::EPSILON {
+                    let scale = maxl / len;
+                    row[0] *= scale;
+                    row[1] *= scale;
+                    row[2] *= scale;
+                }
+            }
+            multiply_3x4(&temp, base_pose_inv)
+        })
+        .collect()
 }
 
 pub fn transform_point(matrix: &Matrix3x4, point: [f32; 3]) -> [f32; 3] {

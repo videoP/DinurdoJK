@@ -6,10 +6,18 @@
 //! override earlier ones. Every caller uses package-relative qpaths such as
 //! `maps/mp/ffa3.bsp`, `textures/foo/bar.tga`, or `shaders/common.shader`.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::HashMap,
+    error::Error,
+    ffi::OsString,
     fs::{self, File},
+    hash::{DefaultHasher, Hash, Hasher},
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        atomic::AtomicUsize,
+        Arc, Mutex, PoisonError,
+    },
+    time::{Duration, SystemTime},
 };
 
 #[derive(Debug)]
@@ -22,8 +30,71 @@ pub struct Asset {
 
 #[derive(Debug, Clone)]
 enum Provider {
-    Archive { archive: usize, entry: String },
+    /// `entry` is the zip entry number, so reads skip the name hash lookup and
+    /// the index does not need to keep a second copy of every entry name.
+    Archive { archive: usize, entry: usize },
     Loose { path: PathBuf },
+}
+
+/// One normalized qpath and every provider of it, highest priority first.
+#[derive(Debug)]
+struct IndexEntry {
+    key: String,
+    first: Provider,
+    rest: Vec<Provider>,
+}
+
+impl IndexEntry {
+    fn providers(&self) -> impl Iterator<Item = &Provider> {
+        std::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
+/// The immutable, shareable namespace of a set of search directories. Building
+/// it reads every PK3 central directory, which dominates startup, so it is built
+/// in parallel and cached process-wide (see [`shared_index`]).
+#[derive(Debug)]
+struct VfsIndex {
+    archive_paths: Vec<PathBuf>,
+    /// Entry count of each archive when it was indexed, to detect an archive
+    /// that was replaced on disk before a lazily opened handle reads from it.
+    archive_lens: Vec<usize>,
+    /// Whether each archive is a retail `assets0..assets3.pk3`.
+    archive_stock: Vec<bool>,
+    /// Sorted by key, keys unique.
+    entries: Vec<IndexEntry>,
+    search_dirs: Vec<PathBuf>,
+    /// Parsed archive handles returned by dropped `AssetSearchPath`s, per
+    /// archive. Parsing a large PK3's central directory costs tens of
+    /// milliseconds, so short-lived views reuse a parsed handle instead.
+    idle_archives: Vec<Mutex<Vec<zip::ZipArchive<File>>>>,
+}
+
+/// Idle handles kept per archive; more concurrent readers just open their own.
+/// Opening one parses the archive's whole central directory, so enough are kept
+/// for every map worker to read textures at once.
+const MAX_IDLE_ARCHIVE_HANDLES: usize = 16;
+
+/// Process-wide count and total time of archive handles opened (as opposed to
+/// reused from an idle pool); see [`archive_open_stats`].
+static ARCHIVE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ARCHIVE_OPEN_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(handles opened, milliseconds spent opening them)` since process start.
+pub fn archive_open_stats() -> (u64, f64) {
+    (
+        ARCHIVE_OPENS.load(std::sync::atomic::Ordering::Relaxed),
+        ARCHIVE_OPEN_MICROS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+    )
+}
+
+impl VfsIndex {
+    fn find(&self, key: &str) -> Option<&IndexEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
 }
 
 /// The physical game directory that owns writable game-relative output.
@@ -91,21 +162,16 @@ pub fn resolve_fs_game_directory(base: &Path, value: &[u8]) -> Result<Option<Pat
 /// then loose files, matching JKA's normal package-before-directory behavior.
 
 pub struct AssetSearchPath {
-    archives: Vec<(PathBuf, zip::ZipArchive<File>)>,
-    index: BTreeMap<String, Provider>,
+    shared: Arc<VfsIndex>,
+    /// Per-instance archive handles, opened lazily on the first read from each
+    /// archive (a `ZipArchive` is not shareable and needs `&mut` to read). The
+    /// instance that built the index starts with its handles already open.
+    archives: Vec<Option<zip::ZipArchive<File>>>,
     /// Normal JKA/OpenJK VFS behavior allows later/higher-priority packages to
     /// shadow stock assets. When false, ordinary reads prefer the stock
     /// assets0..assets3 provider whenever the qpath exists there. Explicit
     /// material-source reads intentionally bypass this protection.
     allow_asset_overrides: bool,
-    /// Every provider for a qpath in normal VFS priority order. `index` keeps
-    /// the fast winning-provider lookup while this list lets material-aware
-    /// callers deliberately fall through one package without changing global
-    /// JKA search-path semantics.
-    providers: BTreeMap<String, Vec<Provider>>,
-    /// Directories this search path was opened from (highest priority first),
-    /// so background readers can open an equivalent independent view.
-    search_dirs: Vec<PathBuf>,
 }
 
 impl AssetSearchPath {
@@ -124,126 +190,81 @@ impl AssetSearchPath {
         Self::open_search_dirs(dirs)
     }
 
+    /// Open the search directories (highest priority first).
+    ///
+    /// The namespace index is shared process-wide: opening the same directories
+    /// again is nearly free while no PK3 or directory beneath them has changed
+    /// (see [`shared_index`]), so callers can keep opening short-lived views.
     pub fn open_search_dirs<I, P>(dirs: I) -> Result<Self, Box<dyn std::error::Error>>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let mut result = Self {
-            archives: Vec::new(),
-            index: BTreeMap::new(),
+        let dirs = dirs
+            .into_iter()
+            .map(|dir| dir.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let (shared, archives) = shared_index(&dirs)?;
+        Ok(Self::from_shared(shared, archives))
+    }
+
+    fn from_shared(
+        shared: Arc<VfsIndex>,
+        archives: Option<Vec<Option<zip::ZipArchive<File>>>>,
+    ) -> Self {
+        let archives = archives
+            .unwrap_or_else(|| (0..shared.archive_paths.len()).map(|_| None).collect());
+        Self {
+            shared,
+            archives,
             allow_asset_overrides: true,
-            providers: BTreeMap::new(),
-            search_dirs: Vec::new(),
-        };
-        for dir in dirs {
-            result.search_dirs.push(dir.as_ref().to_path_buf());
-            result.mount_directory(dir.as_ref())?;
         }
-        Ok(result)
+    }
+
+    /// A second reader over the same index, for another thread. It costs an
+    /// `Arc` clone: no directory scan, and archive handles open lazily (reusing
+    /// idle ones) on its first read from each archive.
+    pub fn fork(&self) -> Self {
+        let mut fork = Self::from_shared(Arc::clone(&self.shared), None);
+        fork.allow_asset_overrides = self.allow_asset_overrides;
+        fork
+    }
+
+    /// Open a handle on every retail assets0..assets3 archive now. Dropping this
+    /// reader parks the handles in the shared idle pool, so later readers (for
+    /// example parallel texture loads) skip the central-directory parse.
+    pub fn warm_stock_archives(&mut self) {
+        for index in 0..self.archives.len() {
+            if self.shared.archive_stock[index] {
+                let _ = self.archive_handle(index);
+            }
+        }
     }
 
     /// Directories this search path was opened from, highest priority first.
     pub fn search_dirs(&self) -> &[PathBuf] {
-        &self.search_dirs
+        &self.shared.search_dirs
     }
 
-    fn mount_directory(&mut self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-
-        let mut packages = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_file() && is_archive_package(&path) {
-                packages.push(path);
-            }
-        }
-        packages.sort_by(|a, b| {
-            a.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .cmp(
-                    &b.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase(),
-                )
-                .reverse()
-        });
-        for path in packages {
-            self.mount_archive(path)?;
-        }
-
-        // JKA's normal search path checks the loose directory after that game
-        // directory's PK3s, but before falling through to the lower-priority
-        // base game. Indexing the directory here gives every asset class the
-        // same behavior without renderer-specific filesystem fallbacks.
-        self.mount_loose_files(dir)?;
-        Ok(())
-    }
-
-    fn mount_archive(&mut self, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-        let file = File::open(&path)?;
-        let archive = zip::ZipArchive::new(file)?;
-        let archive_index = self.archives.len();
-        let mut seen = BTreeSet::new();
-        for name in archive.file_names() {
-            let key = normalize_asset_name(name);
-            if !seen.insert(key.clone()) {
-                return Err(format!(
-                    "ambiguous case-insensitive entry {name} in {}",
-                    path.display()
-                )
-                .into());
-            }
-            // Higher-priority search directories and later-sorting packages are
-            // mounted first, so the first provider of an asset wins.
-            let provider = Provider::Archive {
-                archive: archive_index,
-                entry: name.to_owned(),
-            };
-            self.providers
-                .entry(key.clone())
-                .or_default()
-                .push(provider.clone());
-            self.index.entry(key).or_insert(provider);
-        }
-        self.archives.push((path, archive));
-        Ok(())
-    }
-
-    fn mount_loose_files(&mut self, root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let mut files = Vec::<(String, PathBuf)>::new();
-        collect_loose_files(root, root, &mut files)?;
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut seen = BTreeSet::new();
-        for (key, path) in files {
-            if !seen.insert(key.clone()) {
-                return Err(format!(
-                    "ambiguous case-insensitive loose asset {key} under {}",
-                    root.display()
-                )
-                .into());
-            }
-            let provider = Provider::Loose { path };
-            self.providers
-                .entry(key.clone())
-                .or_default()
-                .push(provider.clone());
-            self.index.entry(key).or_insert(provider);
-        }
+    /// Re-scan the same game directories and re-open every mounted archive.
+    ///
+    /// Ordinary loose-file reads already reopen their physical file, so this is
+    /// only needed when the VFS namespace itself may have changed: new/deleted
+    /// loose files, or added/replaced PK3/ZIP packages. Existing callers keep
+    /// their `AssetSearchPath` allocation while its indexed view is swapped
+    /// atomically after the replacement view opens successfully. The shared
+    /// index is revalidated against the filesystem, so a refresh with nothing
+    /// changed on disk does not re-read any archive.
+    pub fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let (shared, archives) = shared_index(&self.shared.search_dirs)?;
+        let allow_asset_overrides = self.allow_asset_overrides;
+        *self = Self::from_shared(shared, archives);
+        self.allow_asset_overrides = allow_asset_overrides;
         Ok(())
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.index.keys().map(String::as_str)
+        self.shared.entries.iter().map(|entry| entry.key.as_str())
     }
 
     /// Control whether ordinary VFS reads may shadow qpaths present in the
@@ -267,11 +288,7 @@ impl AssetSearchPath {
         limit: usize,
     ) -> Result<Option<Asset>, Box<dyn std::error::Error>> {
         validate_asset_name(name)?;
-        let provider = self
-            .providers
-            .get(&normalize_asset_name(name))
-            .and_then(|providers| providers.iter().find(|provider| self.provider_is_stock(provider)))
-            .cloned();
+        let provider = self.stock_provider(&normalize_asset_name(name));
         let Some(provider) = provider else {
             return Ok(None);
         };
@@ -291,22 +308,26 @@ impl AssetSearchPath {
         self.read_provider(name, limit, provider).map(Some)
     }
 
+    fn stock_provider(&self, key: &str) -> Option<Provider> {
+        self.shared
+            .find(key)?
+            .providers()
+            .find(|provider| self.provider_is_stock(provider))
+            .cloned()
+    }
+
     fn provider_for_ordinary_read(&self, key: &str) -> Option<Provider> {
         if !self.allow_asset_overrides {
-            if let Some(stock) = self
-                .providers
-                .get(key)
-                .and_then(|providers| providers.iter().find(|provider| self.provider_is_stock(provider)))
-            {
-                return Some(stock.clone());
+            if let Some(stock) = self.stock_provider(key) {
+                return Some(stock);
             }
         }
-        self.index.get(key).cloned()
+        self.shared.find(key).map(|entry| entry.first.clone())
     }
 
     fn provider_is_stock(&self, provider: &Provider) -> bool {
         match provider {
-            Provider::Archive { archive, .. } => is_stock_asset_archive(&self.archives[*archive].0),
+            Provider::Archive { archive, .. } => self.shared.archive_stock[*archive],
             Provider::Loose { .. } => false,
         }
     }
@@ -322,24 +343,58 @@ impl AssetSearchPath {
         source: &Path,
     ) -> Result<Option<Asset>, Box<dyn std::error::Error>> {
         validate_asset_name(name)?;
-        let providers = self
-            .providers
-            .get(&normalize_asset_name(name))
-            .cloned()
-            .unwrap_or_default();
-        for provider in providers {
-            if self.provider_matches_source(&provider, source) {
-                return self.read_provider(name, limit, provider).map(Some);
-            }
+        let provider = self
+            .shared
+            .find(&normalize_asset_name(name))
+            .and_then(|entry| {
+                entry
+                    .providers()
+                    .find(|provider| self.provider_matches_source(provider, source))
+            })
+            .cloned();
+        match provider {
+            Some(provider) => self.read_provider(name, limit, provider).map(Some),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     fn provider_matches_source(&self, provider: &Provider, source: &Path) -> bool {
         match provider {
-            Provider::Archive { archive, .. } => self.archives[*archive].0.as_path() == source,
+            Provider::Archive { archive, .. } => self.shared.archive_paths[*archive].as_path() == source,
             Provider::Loose { path } => path.as_path() == source,
         }
+    }
+
+    /// The open handle for archive `index`, opening it on first use.
+    fn archive_handle(
+        &mut self,
+        index: usize,
+    ) -> Result<&mut zip::ZipArchive<File>, Box<dyn std::error::Error>> {
+        if self.archives[index].is_none() {
+            let idle = self.shared.idle_archives[index]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop();
+            let archive = match idle {
+                Some(archive) => archive,
+                None => {
+                    let path = &self.shared.archive_paths[index];
+                    let opened = std::time::Instant::now();
+                    let archive = zip::ZipArchive::new(File::open(path)?)?;
+                    ARCHIVE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ARCHIVE_OPEN_MICROS
+                        .fetch_add(opened.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if archive.len() != self.shared.archive_lens[index] {
+                        return Err(
+                            format!("{} changed on disk since it was indexed", path.display()).into(),
+                        );
+                    }
+                    archive
+                }
+            };
+            self.archives[index] = Some(archive);
+        }
+        Ok(self.archives[index].as_mut().expect("archive handle just opened"))
     }
 
     fn read_provider(
@@ -350,8 +405,18 @@ impl AssetSearchPath {
     ) -> Result<Asset, Box<dyn std::error::Error>> {
         match provider {
             Provider::Archive { archive, entry } => {
-                let (path, archive) = &mut self.archives[archive];
-                let mut file = archive.by_name(&entry)?;
+                // Clone the Arc so the paths stay readable while `file` holds
+                // the mutable borrow of the archive handle.
+                let shared = Arc::clone(&self.shared);
+                let handle = self.archive_handle(archive)?;
+                let mut file = handle.by_index(entry)?;
+                if normalize_asset_name(file.name()) != normalize_asset_name(name) {
+                    return Err(format!(
+                        "{name}: {} changed on disk since it was indexed",
+                        shared.archive_paths[archive].display()
+                    )
+                    .into());
+                }
                 let declared = file.size();
                 if declared > limit as u64 {
                     return Err(format!("{name} exceeds asset size limit").into());
@@ -363,7 +428,7 @@ impl AssetSearchPath {
                 }
                 Ok(Asset {
                     bytes,
-                    source: path.clone(),
+                    source: shared.archive_paths[archive].clone(),
                 })
             }
             Provider::Loose { path } => {
@@ -381,6 +446,365 @@ impl AssetSearchPath {
                     bytes,
                     source: path,
                 })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index construction and the process-wide index cache
+// ---------------------------------------------------------------------------
+
+type ArchiveHandles = Vec<Option<zip::ZipArchive<File>>>;
+
+/// A directory whose newest timestamp is younger than this cannot be trusted as
+/// "unchanged": a modification in the same timestamp tick would not move the
+/// fingerprint. Such an index is rebuilt on its next open instead of reused.
+const RACY_WINDOW: Duration = Duration::from_secs(3);
+
+/// One thing to mount, listed in priority order (highest first): each search
+/// directory contributes its PK3s (later-sorting names first) and then its
+/// loose files.
+enum Source {
+    Archive { path: PathBuf, size: u64 },
+    Loose(PathBuf),
+}
+
+enum Scanned {
+    /// The opened archive and its `(normalized key, zip entry number)` pairs,
+    /// sorted by key.
+    Archive(zip::ZipArchive<File>, Vec<(String, usize)>),
+    /// `(normalized key, path)` pairs, sorted by key.
+    Loose(Vec<(String, PathBuf)>),
+}
+
+fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
+    let mut sources = Vec::new();
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut packages = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_file() && is_archive_package(&path) {
+                let size = entry.metadata().map_or(0, |metadata| metadata.len());
+                packages.push((path, size));
+            }
+        }
+        let name_of = |path: &Path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
+        packages.sort_by(|a, b| name_of(&a.0).cmp(&name_of(&b.0)).reverse());
+        sources.extend(
+            packages
+                .into_iter()
+                .map(|(path, size)| Source::Archive { path, size }),
+        );
+        // JKA's normal search path checks the loose directory after that game
+        // directory's PK3s, but before falling through to the lower-priority
+        // base game. Indexing the directory here gives every asset class the
+        // same behavior without renderer-specific filesystem fallbacks.
+        sources.push(Source::Loose(dir.clone()));
+    }
+    Ok(sources)
+}
+
+fn scan_source(source: &Source) -> Result<Scanned, String> {
+    match source {
+        Source::Archive { path, .. } => {
+            let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let archive = zip::ZipArchive::new(file)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let mut keys = Vec::with_capacity(archive.len());
+            for index in 0..archive.len() {
+                let name = archive
+                    .name_for_index(index)
+                    .ok_or_else(|| format!("{}: unreadable entry {index}", path.display()))?;
+                keys.push((normalize_asset_name(name), index));
+            }
+            keys.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(pair) = keys.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                let name = archive.name_for_index(pair[1].1).unwrap_or(&pair[1].0);
+                return Err(format!(
+                    "ambiguous case-insensitive entry {name} in {}",
+                    path.display()
+                ));
+            }
+            Ok(Scanned::Archive(archive, keys))
+        }
+        Source::Loose(root) => {
+            let mut files = Vec::<(String, PathBuf)>::new();
+            collect_loose_files(root, root, &mut files).map_err(|error| error.to_string())?;
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(pair) = files.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                return Err(format!(
+                    "ambiguous case-insensitive loose asset {} under {}",
+                    pair[1].0,
+                    root.display()
+                ));
+            }
+            Ok(Scanned::Loose(files))
+        }
+    }
+}
+
+/// Scan every source, in parallel, returning results in `sources` order. The
+/// biggest archives start first so the slowest central directory is not left
+/// to the end.
+fn scan_sources(sources: &[Source]) -> Vec<Result<Scanned, String>> {
+    let count = sources.len();
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |parallelism| parallelism.get())
+        .min(8)
+        .min(count);
+    if workers <= 1 {
+        return sources.iter().map(scan_source).collect();
+    }
+    let mut order = (0..count).collect::<Vec<_>>();
+    order.sort_by_key(|&index| match &sources[index] {
+        Source::Loose(_) => std::cmp::Reverse(u64::MAX),
+        Source::Archive { size, .. } => std::cmp::Reverse(*size),
+    });
+    let next = AtomicUsize::new(0);
+    let results = (0..count).map(|_| Mutex::new(None)).collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&index) = order.get(slot) else {
+                    break;
+                };
+                let scanned = scan_source(&sources[index]);
+                *results[index].lock().unwrap_or_else(PoisonError::into_inner) = Some(scanned);
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwrap_or_else(|| Err("asset scan worker did not finish".to_owned()))
+        })
+        .collect()
+}
+
+fn build_index(dirs: &[PathBuf]) -> Result<(VfsIndex, ArchiveHandles), Box<dyn Error>> {
+    let sources = plan_sources(dirs)?;
+    let scans = scan_sources(&sources);
+
+    let total = scans
+        .iter()
+        .map(|scan| match scan {
+            Ok(Scanned::Archive(_, keys)) => keys.len(),
+            Ok(Scanned::Loose(files)) => files.len(),
+            Err(_) => 0,
+        })
+        .sum();
+    let mut archive_paths = Vec::new();
+    let mut archive_lens = Vec::new();
+    let mut handles = ArchiveHandles::new();
+    let mut flat = Vec::<(String, Provider)>::with_capacity(total);
+    for (source, scan) in sources.iter().zip(scans) {
+        match (source, scan?) {
+            (Source::Archive { path, .. }, Scanned::Archive(archive, keys)) => {
+                let archive_index = archive_paths.len();
+                archive_paths.push(path.clone());
+                archive_lens.push(archive.len());
+                handles.push(Some(archive));
+                flat.extend(keys.into_iter().map(|(key, entry)| {
+                    (
+                        key,
+                        Provider::Archive {
+                            archive: archive_index,
+                            entry,
+                        },
+                    )
+                }));
+            }
+            (_, Scanned::Loose(files)) => {
+                flat.extend(
+                    files
+                        .into_iter()
+                        .map(|(key, path)| (key, Provider::Loose { path })),
+                );
+            }
+            _ => unreachable!("scan result matches its source"),
+        }
+    }
+
+    // `flat` is in priority order and the sort is stable, so equal keys keep
+    // their priority order: the first provider of an asset wins.
+    flat.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut entries = Vec::<IndexEntry>::with_capacity(flat.len());
+    for (key, provider) in flat {
+        match entries.last_mut() {
+            Some(last) if last.key == key => last.rest.push(provider),
+            _ => entries.push(IndexEntry {
+                key,
+                first: provider,
+                rest: Vec::new(),
+            }),
+        }
+    }
+    let archive_stock = archive_paths
+        .iter()
+        .map(|path| is_stock_asset_archive(path))
+        .collect();
+    let idle_archives = archive_paths.iter().map(|_| Mutex::default()).collect();
+    Ok((
+        VfsIndex {
+            archive_paths,
+            archive_lens,
+            archive_stock,
+            entries,
+            search_dirs: dirs.to_vec(),
+            idle_archives,
+        },
+        handles,
+    ))
+}
+
+struct Fingerprint {
+    hash: u64,
+    racy: bool,
+}
+
+/// Cheap summary of everything the index is derived from: every directory's
+/// modification time and listing beneath the search directories, plus the size
+/// and modification time of each mounted package. Adding, removing or renaming
+/// a PK3 or loose file moves it; walking it costs a few `read_dir` calls
+/// instead of parsing every package.
+fn fingerprint_search_dirs(dirs: &[PathBuf]) -> Fingerprint {
+    let mut hasher = DefaultHasher::new();
+    let mut newest = SystemTime::UNIX_EPOCH;
+    for dir in dirs {
+        dir.hash(&mut hasher);
+        fingerprint_tree(dir, true, &mut hasher, &mut newest);
+    }
+    let racy = SystemTime::now()
+        .duration_since(newest)
+        .map_or(true, |age| age < RACY_WINDOW);
+    Fingerprint {
+        hash: hasher.finish(),
+        racy,
+    }
+}
+
+fn fingerprint_tree(dir: &Path, top: bool, hasher: &mut DefaultHasher, newest: &mut SystemTime) {
+    let modified = fs::metadata(dir).and_then(|metadata| metadata.modified()).ok();
+    modified.hash(hasher);
+    if let Some(modified) = modified {
+        *newest = (*newest).max(modified);
+    }
+    let Ok(read) = fs::read_dir(dir) else {
+        0u8.hash(hasher);
+        return;
+    };
+    let mut children = Vec::<(OsString, bool, Option<(u64, Option<SystemTime>)>)>::new();
+    for entry in read.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let stamp = (top && file_type.is_file() && is_archive_package(&entry.path()))
+            .then(|| entry.metadata().ok())
+            .flatten()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()));
+        if let Some((_, Some(modified))) = stamp {
+            *newest = (*newest).max(modified);
+        }
+        children.push((entry.file_name(), file_type.is_dir(), stamp));
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    children.len().hash(hasher);
+    for (name, is_dir, stamp) in &children {
+        name.hash(hasher);
+        is_dir.hash(hasher);
+        stamp.hash(hasher);
+    }
+    for (name, is_dir, _) in &children {
+        if *is_dir {
+            fingerprint_tree(&dir.join(name), false, hasher, newest);
+        }
+    }
+}
+
+struct CachedIndex {
+    fingerprint: u64,
+    racy: bool,
+    index: Arc<VfsIndex>,
+}
+
+type CacheSlot = Arc<Mutex<Option<CachedIndex>>>;
+
+fn index_cache() -> &'static Mutex<HashMap<Vec<PathBuf>, CacheSlot>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<Vec<PathBuf>, CacheSlot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `JKA_VFS_CACHE=0` rebuilds the index on every open (the pre-cache behavior),
+/// as an escape hatch for file systems whose directory timestamps are unreliable.
+fn index_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("JKA_VFS_CACHE").map_or(true, |value| value != "0"))
+}
+
+/// The index for `dirs`, from the process-wide cache while the file system still
+/// matches the fingerprint it was built under, otherwise freshly built (in
+/// parallel). The archive handles are returned only when this call built the
+/// index, so the first caller does not reopen them.
+///
+/// A concurrent open of the same directories (for example the startup prewarm
+/// thread and the renderer) waits on the slot and then reuses the result rather
+/// than building twice.
+fn shared_index(dirs: &[PathBuf]) -> Result<(Arc<VfsIndex>, Option<ArchiveHandles>), Box<dyn Error>> {
+    if !index_cache_enabled() {
+        let (index, handles) = build_index(dirs)?;
+        return Ok((Arc::new(index), Some(handles)));
+    }
+    let slot = {
+        let mut cache = index_cache().lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(cache.entry(dirs.to_vec()).or_default())
+    };
+    let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let fingerprint = fingerprint_search_dirs(dirs);
+    if let Some(entry) = cached.as_ref() {
+        if !entry.racy && entry.fingerprint == fingerprint.hash {
+            return Ok((Arc::clone(&entry.index), None));
+        }
+    }
+    let (index, handles) = build_index(dirs)?;
+    let index = Arc::new(index);
+    *cached = Some(CachedIndex {
+        fingerprint: fingerprint.hash,
+        racy: fingerprint.racy,
+        index: Arc::clone(&index),
+    });
+    Ok((index, Some(handles)))
+}
+
+impl Drop for AssetSearchPath {
+    fn drop(&mut self) {
+        for (index, archive) in self.archives.drain(..).enumerate() {
+            let Some(archive) = archive else {
+                continue;
+            };
+            let mut idle = self.shared.idle_archives[index]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if idle.len() < MAX_IDLE_ARCHIVE_HANDLES {
+                idle.push(archive);
             }
         }
     }
@@ -543,6 +967,44 @@ mod tests {
         let map = assets.read("maps/source.map", 32).unwrap().unwrap();
         assert_eq!(map.bytes, b"source-map");
         assert!(assets.names().any(|name| name == "shaders/dev.shader"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_discovers_new_loose_files_and_packages() {
+        let root = test_root("refresh-search-path");
+        let base = root.join("base");
+        std::fs::create_dir_all(base.join("maps")).unwrap();
+
+        let mut assets = AssetSearchPath::open(&base).unwrap();
+        assert!(assets.read("maps/new.map", 32).unwrap().is_none());
+        assert!(assets.read("textures/new/image.tga", 32).unwrap().is_none());
+
+        std::fs::write(base.join("maps/new.map"), b"loose-new").unwrap();
+        write_package(
+            &base.join("zz_new.pk3"),
+            "textures/new/image.tga",
+            b"packed-new",
+        );
+
+        // The old index remains stable until the explicit refresh boundary.
+        assert!(assets.read("maps/new.map", 32).unwrap().is_none());
+        assert!(assets.read("textures/new/image.tga", 32).unwrap().is_none());
+
+        assets.refresh().unwrap();
+        assert_eq!(
+            assets.read("maps/new.map", 32).unwrap().unwrap().bytes,
+            b"loose-new"
+        );
+        assert_eq!(
+            assets
+                .read("textures/new/image.tga", 32)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"packed-new"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

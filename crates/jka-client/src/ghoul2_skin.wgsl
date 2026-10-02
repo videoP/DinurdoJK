@@ -26,7 +26,29 @@ struct SkinDraw {
     classic_ambient: vec4<f32>,
     classic_directed: vec4<f32>,
     classic_direction: vec4<f32>,
+    classic_sun_directed: vec4<f32>,
+    classic_sun_direction: vec4<f32>,
+    uv_xform: vec4<f32>,
+    spec_light: vec4<f32>,
+    spec_viewer: vec4<f32>,
 };
+// q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
+fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+    if (draw.spec_light.w == 0.0) {
+        return 1.0;
+    }
+    let normal = normalize(world_normal);
+    let light_dir = normalize(draw.spec_light.xyz - world);
+    let reflected = normal * (2.0 * dot(normal, light_dir)) - light_dir;
+    let viewer = normalize(draw.spec_viewer.xyz - world);
+    let l = dot(reflected, viewer);
+    if (l < 0.0) {
+        return 0.0;
+    }
+    let l2 = l * l;
+    return min(l2 * l2, 1.0);
+}
+
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -38,6 +60,9 @@ struct EntityLightingSettings {
     legacy_fog_color_depth: vec4<f32>,
     // x: 0 off, 1 authored global EXP2, 2 manual fog; y: strength scale.
     legacy_fog_params: vec4<f32>,
+    // Cloud ground shadow: xyz = unit direction toward the sun (render space),
+    // w = 1 while projected cloud shadows are active, else 0.
+    cloud_shadow_sun: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 @group(2) @binding(0) var<storage, read> bones: array<BoneMatrix>;
@@ -118,7 +143,7 @@ fn jka_to_render(world: vec3<f32>) -> vec3<f32> {
 @vertex
 fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexOut {
     let draw = skin_draws[draw_index];
-    let model_position = skin_position(
+    var model_position = skin_position(
         input.position,
         input.bone_indices,
         input.weights,
@@ -132,6 +157,15 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         input.normal,
     );
 
+    // `deformVertexes bulge <0> <height> <0>`: JKA's static-offset special
+    // case (RB_CalcBulgeVertexes), packed into spec_viewer.w (see
+    // ghoul2_specular_viewer). A constant push outward along the model-space
+    // normal, applied before the entity transform, same as the engine.
+    let bulge_height = draw.spec_viewer.w;
+    if (bulge_height != 0.0) {
+        model_position += normalize(model_normal) * bulge_height;
+    }
+
     let world = model_to_world(draw, model_position);
     let world_normal = vec3<f32>(
         draw.axis0.x * model_normal.x + draw.axis1.x * model_normal.y + draw.axis2.x * model_normal.z,
@@ -144,7 +178,19 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
 
     var output: VertexOut;
     output.clip_position = camera.view_proj * vec4<f32>(render_position, 1.0);
-    output.uv = input.uv;
+    // `tcGen environment` (packed into params.w; see ghoul2_specular_viewer /
+    // Ghoul2GpuSkinning::env_map): q3's RB_CalcEnvironmentTexCoords, done
+    // directly in render space (an orthogonal axis relabeling of JKA space,
+    // so the reflection vector's components just swap/flip accordingly:
+    // JKA .y = render -.z, JKA .z = render .y).
+    if (draw.params.w != 0u) {
+        let viewer = normalize(camera.camera_pos_time.xyz - render_position);
+        let d = 2.0 * dot(render_normal, viewer);
+        let reflected = render_normal * d - viewer;
+        output.uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
+    } else {
+        output.uv = input.uv * draw.uv_xform.xy + draw.uv_xform.zw;
+    }
     output.normal = render_normal;
     var draw_color = draw.color;
     if (draw.params.y != 0u) {
@@ -154,13 +200,23 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         if (light_len_sq > 1.0e-8) {
             incoming = max(dot(render_normal, light_dir * inverseSqrt(light_len_sq)), 0.0);
         }
+        // Runtime sun (entity sun lighting): zero radiance when the feature is off.
+        var sun_incoming = 0.0;
+        let sun_dir = draw.classic_sun_direction.xyz;
+        let sun_len_sq = dot(sun_dir, sun_dir);
+        if (sun_len_sq > 1.0e-8) {
+            sun_incoming = max(dot(render_normal, sun_dir * inverseSqrt(sun_len_sq)), 0.0);
+        }
         let lighting = clamp(
-            (draw.classic_ambient.xyz + incoming * draw.classic_directed.xyz) / 255.0,
+            (draw.classic_ambient.xyz
+                + incoming * draw.classic_directed.xyz
+                + sun_incoming * draw.classic_sun_directed.xyz) / 255.0,
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
         draw_color = vec4<f32>(draw.color.rgb * lighting, draw.color.a);
     }
+    draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
     output.color = draw_color;
     output.world_position = render_position;
     return output;
@@ -258,19 +314,35 @@ struct PrepassVertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world_position: vec3<f32>,
+    @location(2) normal: vec3<f32>,
 };
 
 struct PrepassOut {
     @location(0) linear_depth: f32,
     @location(1) motion_vector: vec2<f32>,
+    // G carries the smooth cloud-shadow sun-facing code (see md3.wgsl).
     @location(2) reflection_policy: vec4<f32>,
 };
 
-fn prepass_output(world_position: vec3<f32>) -> PrepassOut {
+// See md3.wgsl cloud_shadow_facing_code.
+fn cloud_shadow_facing_code(normal: vec3<f32>) -> f32 {
+    let sun = entity_lighting.cloud_shadow_sun;
+    if (sun.w < 0.5) {
+        return 0.0;
+    }
+    let length_sq = dot(normal, normal);
+    if (length_sq < 1.0e-6) {
+        return 0.0;
+    }
+    let facing = smoothstep(0.0, 0.3, dot(normal * inverseSqrt(length_sq), sun.xyz));
+    return (26.0 + 100.0 * facing) / 255.0;
+}
+
+fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>) -> PrepassOut {
     var out: PrepassOut;
     out.linear_depth = distance(world_position, camera.camera_pos_time.xyz);
     out.motion_vector = vec2<f32>(0.0);
-    out.reflection_policy = vec4<f32>(0.0, 0.0, 1.0, 2.0 / 3.0);
+    out.reflection_policy = vec4<f32>(0.0, cloud_shadow_facing_code(normal), 1.0, 2.0 / 3.0);
     return out;
 }
 
@@ -285,16 +357,27 @@ fn vs_prepass(input: VertexIn, @builtin(instance_index) draw_index: u32) -> Prep
         draw.params.x,
     );
     let render_position = jka_to_render(model_to_world(draw, model_position));
+    // Same weight-0 bone normal as vs_main, for the cloud-shadow facing code.
+    let model_normal = transform_vector(
+        bones[draw.params.x + input.bone_indices.x],
+        input.normal,
+    );
+    let world_normal = vec3<f32>(
+        draw.axis0.x * model_normal.x + draw.axis1.x * model_normal.y + draw.axis2.x * model_normal.z,
+        draw.axis0.y * model_normal.x + draw.axis1.y * model_normal.y + draw.axis2.y * model_normal.z,
+        draw.axis0.z * model_normal.x + draw.axis1.z * model_normal.y + draw.axis2.z * model_normal.z,
+    );
     var output: PrepassVertexOut;
     output.clip_position = camera.view_proj * vec4<f32>(render_position, 1.0);
     output.uv = input.uv;
     output.world_position = render_position;
+    output.normal = vec3<f32>(world_normal.x, world_normal.z, -world_normal.y);
     return output;
 }
 
 @fragment
 fn fs_prepass(input: PrepassVertexOut) -> PrepassOut {
-    return prepass_output(input.world_position);
+    return prepass_output(input.world_position, input.normal);
 }
 
 @fragment
@@ -302,5 +385,15 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
-    return prepass_output(input.world_position);
+    return prepass_output(input.world_position, input.normal);
+}
+
+// Entity shadow map (Dynamic shadows = Entity map): depth-only light-space pass.
+// Opaque casters use vs_prepass with no fragment stage; only alpha-tested
+// surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
+@fragment
+fn fs_shadow_mask(input: PrepassVertexOut) {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
 }

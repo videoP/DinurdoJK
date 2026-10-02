@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const SLOT_COUNT: usize = 21;
+pub const SLOT_COUNT: usize = 22;
 const RECENT_NS: u64 = 750_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub enum ThreadSlot {
     Event7 = 18,
     Asset0 = 19,
     Asset1 = 20,
+    UiCatalog = 21,
 }
 
 impl ThreadSlot {
@@ -93,6 +94,11 @@ pub enum Task {
     EventPrep = 17,
     EventSoundDecode = 18,
     AssetLoad = 19,
+    UiBuild = 20,
+    UiTessellate = 21,
+    UiCatalog = 22,
+    MapMaterials = 23,
+    MapGeometry = 24,
 }
 
 impl Task {
@@ -118,6 +124,11 @@ impl Task {
             Self::EventPrep => "EVENT PREP",
             Self::EventSoundDecode => "EVENT AUDIO DECODE",
             Self::AssetLoad => "ASSET LOAD",
+            Self::UiBuild => "UI BUILD",
+            Self::UiTessellate => "UI TESSELLATE",
+            Self::UiCatalog => "UI CATALOG",
+            Self::MapMaterials => "MATERIALS",
+            Self::MapGeometry => "WORLD GEOMETRY",
         }
     }
 
@@ -142,6 +153,11 @@ impl Task {
             17 => Self::EventPrep,
             18 => Self::EventSoundDecode,
             19 => Self::AssetLoad,
+            20 => Self::UiBuild,
+            21 => Self::UiTessellate,
+            22 => Self::UiCatalog,
+            23 => Self::MapMaterials,
+            24 => Self::MapGeometry,
             _ => Self::Idle,
         }
     }
@@ -192,6 +208,7 @@ static SLOTS: [SlotState; SLOT_COUNT] = [
     SlotState::new(),
     SlotState::new(),
     SlotState::new(),
+    SlotState::new(),
 ];
 
 fn now_ns() -> u64 {
@@ -209,12 +226,19 @@ fn state(slot: ThreadSlot) -> &'static SlotState {
 pub struct ActivityGuard {
     slot: ThreadSlot,
     started_ns: u64,
+    /// Task of an enclosing guard on the same slot, restored on drop. The
+    /// enclosing guard keeps ownership of the busy-time accounting.
+    outer_task: Option<u8>,
 }
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         let now = now_ns();
         let state = state(self.slot);
+        if let Some(outer) = self.outer_task {
+            state.task.store(outer, Ordering::Relaxed);
+            return;
+        }
         state
             .busy_total_ns
             .fetch_add(now.saturating_sub(self.started_ns), Ordering::Relaxed);
@@ -228,12 +252,23 @@ impl Drop for ActivityGuard {
 pub fn activity(slot: ThreadSlot, task: Task) -> ActivityGuard {
     let now = now_ns();
     let state = state(slot);
+    if state.active.load(Ordering::Acquire) {
+        // Nested section (e.g. UI build inside the main tick): relabel the
+        // slot without restarting or double-counting its busy interval.
+        let outer = state.task.swap(task as u8, Ordering::Relaxed);
+        return ActivityGuard {
+            slot,
+            started_ns: now,
+            outer_task: Some(outer),
+        };
+    }
     state.task.store(task as u8, Ordering::Relaxed);
     state.busy_started_ns.store(now, Ordering::Relaxed);
     state.active.store(true, Ordering::Release);
     ActivityGuard {
         slot,
         started_ns: now,
+        outer_task: None,
     }
 }
 
@@ -269,6 +304,7 @@ pub fn snapshot() -> [RawThreadActivity; SLOT_COUNT] {
         ThreadSlot::Event7,
         ThreadSlot::Asset0,
         ThreadSlot::Asset1,
+        ThreadSlot::UiCatalog,
     ]
     .map(|slot| {
         let state = state(slot);
@@ -320,11 +356,13 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
         ThreadSlot::Event7 => "EVENT 7",
         ThreadSlot::Asset0 => "ASSET 0",
         ThreadSlot::Asset1 => "ASSET 1",
+        ThreadSlot::UiCatalog => "UI CATALOG",
     }
 }
 
 static SAMPLE_LAST_NS: AtomicU64 = AtomicU64::new(0);
 static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

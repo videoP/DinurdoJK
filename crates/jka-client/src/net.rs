@@ -12,7 +12,7 @@ use std::{
 
 use jka_movement::{
     CollisionWorld, EntityClip, NetworkPlayerState, TraceQuery, TraceResult, TraceWorld, PlayerState as NativePlayerState, PmoveContext, PredictSettings,
-    UserCmd as MovementCmd,
+    SaberMovementInfo, UserCmd as MovementCmd,
 };
 use jka_protocol::{
     commands::{atoi, info_value},
@@ -32,27 +32,97 @@ pub struct NetworkSettings {
     pub rate: u32,
     pub snaps: u32,
     pub max_packets: u32,
+    /// `cl_packetdup`: repeat the usercmds of this many earlier packets (0..=5).
+    pub packet_dup: u32,
     pub time_nudge: i32,
+    /// `net_port`: preferred local UDP port for the live game socket. Like TaystJK/OpenJK,
+    /// connection startup scans this port and the next 9 ports if it is occupied.
+    pub net_port: u16,
     pub saber1: String,
     pub saber2: String,
     pub color1: u8,
     pub color2: u8,
+    /// jaPRO `cp_sbRGB1` / `cp_sbRGB2`: packed `r | g << 8 | b << 16` blade colour
+    /// used when `color1` / `color2` is `SABER_RGB`.
+    pub sb_rgb1: u32,
+    pub sb_rgb2: u32,
     pub forcepowers: String,
     pub sex: String,
     pub password: String,
+    /// `char_color_red/green/blue`: the player tint the server relays as
+    /// `customRGBA`; only shaders reading the entity colour follow it.
+    pub char_color: [u8; 3],
+    /// `handicap`: the server clamps it to 1..100 and uses it as max health.
+    pub handicap: u32,
+    /// `cg_predictItems`: tells the server whether this client predicts pickups.
+    pub predict_items: bool,
+    /// jaPRO `cp_cosmetics`: bitfield of enabled model cosmetics.
+    pub cosmetics: u32,
+    /// `fs_game` for local (solo) games: the game directory mounted over base
+    /// when a local map loads. A server's own `fs_game` overrides it while connected.
+    pub fs_game: String,
+    /// jaPRO `cp_clanPwd`. Never archived, as in jaPRO.
+    pub clan_pwd: String,
+    /// jaPRO `ui_username`: account name for the login menu / `login` command.
+    pub ui_username: String,
+    /// jaPRO `ui_password`. jaPRO archives it in plain text; here it lives for
+    /// the session only, like `cp_clanPwd`.
+    pub ui_password: String,
+    /// `rconPassword` (CVAR_TEMP in jaPRO, so never archived or sent in userinfo).
+    pub rcon_password: String,
+    /// `rconAddress`: server used by `rcon` while not connected. Not archived.
+    pub rcon_address: String,
+    /// jaPRO ROM cvar `cg_displayCameraPosition` ("thirdPerson range vertOffset").
+    /// The app refreshes it from the live camera before every userinfo send.
+    pub display_camera_position: String,
+    /// jaPRO ROM cvar `cg_displayNetSettings` ("cl_maxPackets cl_timeNudge com_maxFPS").
+    pub display_net_settings: String,
     pub error_decay: f32,
     pub no_predict: bool,
     pub show_miss: bool,
+    /// Session-only prediction instrumentation. This intentionally does not
+    /// affect Pmove or the state sent to the server.
+    pub prediction_debug: bool,
+    /// Flash a HUD warning when a prediction correction exceeds the threshold.
+    pub prediction_miss_highlight: bool,
+    /// Keep the rolling per-frame history that `hitchmark` writes out. Session-only.
+    pub hitch_record: bool,
+    /// Per-present model anchor CSV. Session-only; disk I/O runs on a worker.
+    pub model_frame_debug: bool,
+    /// `cg_groundTraceDebug`: 0 off, 1 = ground transitions and server mismatches, 2 = every new
+    /// command. Prints this client's ground-trace results to the console. Session-only.
+    pub ground_trace_debug: u8,
+    /// `cg_physicsDiag`: 0 off, 1 = report snapshot intervals whose replay does not reproduce the
+    /// server's state, 2 = every interval. Session-only.
+    pub physics_diag: u8,
+    /// `cg_snapMode`: how the native pmove rounds velocity after each step (the engine's
+    /// `trap_SnapVector`). -1 = detect per server (default), 0 OpenJK nearest, 1 truncate,
+    /// 2 floor, 3 nearest-even, 4 none.
+    pub snap_mode: i32,
+    /// `cg_predictBackend`: which native pmove predicts. -1 = detect (jaPRO servers use the jaPRO
+    /// backend; others are tried against both by replaying snapshot intervals), 0 stock OpenJK,
+    /// 1 jaPRO/TaystJK. Session-only.
+    pub predict_backend: i32,
+    /// Minimum correction distance, in JKA units, for the visual miss warning.
+    pub prediction_miss_threshold: f32,
     /// Legacy compatibility escape hatch; normal joins now use the explicit missing-map prompt.
     pub allow_missing_map: bool,
     /// Allow HTTP package autodownload when the server advertises a TaystJK mvhttp/mvhttpurl endpoint.
     pub allow_http_downloads: bool,
     /// Allow the stock protocol-26 svc_download transport.
     pub allow_legacy_downloads: bool,
-    /// Usercmds per second (OpenJK: one per com_maxfps client frame).
+    /// Usercmds per second (authored; not tied to com_maxfps).
     pub command_rate: u32,
+    /// Pace usercmds on `cl.serverTime` so their spacing is exactly 1000/cl_commandRate
+    /// ms (race physics steps by the command interval); false = wall-clock pacing.
+    pub command_pacing: bool,
     /// JAPRO userinfo bitfield, also consumed by the native predictor.
     pub plugin_disable: i32,
+    /// jaPRO `cl_chatBubbleSelf`: send BUTTON_TALK (the chat balloon over your
+    /// head) while a console/chat/menu has the keyboard.
+    pub chat_bubble_self: bool,
+    /// jaPRO `cl_chatBubbleUnfocused`: also while the game window is unfocused.
+    pub chat_bubble_unfocused: bool,
 }
 
 impl Default for NetworkSettings {
@@ -62,22 +132,50 @@ impl Default for NetworkSettings {
             rate: 25000,
             snaps: 40,
             max_packets: 60,
+            packet_dup: 1,
             time_nudge: 0,
+            net_port: jka_protocol::DEFAULT_PORT,
             saber1: "single_1".into(),
             saber2: "none".into(),
             color1: 4,
             color2: 4,
+            sb_rgb1: 0,
+            sb_rgb2: 0,
             forcepowers: "7-1-032330000000001333".into(),
             sex: "male".into(),
             password: String::new(),
+            char_color: [255; 3],
+            handicap: 100,
+            predict_items: true,
+            cosmetics: 0,
+            fs_game: "japro".into(),
+            clan_pwd: "none".into(),
+            ui_username: String::new(),
+            ui_password: String::new(),
+            rcon_password: String::new(),
+            rcon_address: String::new(),
+            display_camera_position: "1 80 16".into(),
+            display_net_settings: "125 0 125".into(),
             error_decay: 100.0,
             no_predict: false,
             show_miss: false,
+            prediction_debug: false,
+            prediction_miss_highlight: false,
+            hitch_record: false,
+            model_frame_debug: false,
+            ground_trace_debug: 0,
+            physics_diag: 0,
+            snap_mode: -1,
+            predict_backend: -1,
+            prediction_miss_threshold: 8.0,
             allow_missing_map: false,
             allow_http_downloads: true,
             allow_legacy_downloads: true,
             command_rate: 125,
+            command_pacing: true,
             plugin_disable: 1536,
+            chat_bubble_self: true,
+            chat_bubble_unfocused: true,
         }
     }
 }
@@ -89,22 +187,52 @@ impl NetworkSettings {
             "rate" => self.rate.to_string(),
             "snaps" => self.snaps.to_string(),
             "cl_maxpackets" => self.max_packets.to_string(),
+            "cl_packetdup" => self.packet_dup.to_string(),
             "cl_timenudge" => self.time_nudge.to_string(),
+            "net_port" => self.net_port.to_string(),
             "saber1" => self.saber1.clone(),
             "saber2" => self.saber2.clone(),
             "color1" => self.color1.to_string(),
             "color2" => self.color2.to_string(),
+            "cp_sbrgb1" => self.sb_rgb1.to_string(),
+            "cp_sbrgb2" => self.sb_rgb2.to_string(),
             "forcepowers" => self.forcepowers.clone(),
             "sex" => self.sex.clone(),
             "password" => self.password.clone(),
+            "char_color_red" => self.char_color[0].to_string(),
+            "char_color_green" => self.char_color[1].to_string(),
+            "char_color_blue" => self.char_color[2].to_string(),
+            "handicap" => self.handicap.to_string(),
+            "cg_predictitems" => u8::from(self.predict_items).to_string(),
+            "cp_cosmetics" => (self.cosmetics as i32).to_string(),
+            "fs_game" => self.fs_game.clone(),
+            "cp_clanpwd" => self.clan_pwd.clone(),
+            "ui_username" => self.ui_username.clone(),
+            "ui_password" => self.ui_password.clone(),
+            "rconpassword" => self.rcon_password.clone(),
+            "rconaddress" => self.rcon_address.clone(),
+            "cg_displaycameraposition" => self.display_camera_position.clone(),
+            "cg_displaynetsettings" => self.display_net_settings.clone(),
             "cg_errordecay" => format!("{}", self.error_decay),
             "cg_nopredict" => u8::from(self.no_predict).to_string(),
             "cg_showmiss" => u8::from(self.show_miss).to_string(),
+            "cg_predictiondebug" => u8::from(self.prediction_debug).to_string(),
+            "cg_predictionmisshighlight" => u8::from(self.prediction_miss_highlight).to_string(),
+            "cg_hitchrecord" => u8::from(self.hitch_record).to_string(),
+            "cg_modelframedebug" => u8::from(self.model_frame_debug).to_string(),
+            "cg_groundtracedebug" => self.ground_trace_debug.to_string(),
+            "cg_physicsdiag" => self.physics_diag.to_string(),
+            "cg_snapmode" => self.snap_mode.to_string(),
+            "cg_predictbackend" => self.predict_backend.to_string(),
+            "cg_predictionmissthreshold" => format!("{}", self.prediction_miss_threshold),
             "cl_allowmissingmap" => u8::from(self.allow_missing_map).to_string(),
             "cl_allowhttpdownload" => u8::from(self.allow_http_downloads).to_string(),
             "cl_allowdownload" => u8::from(self.allow_legacy_downloads).to_string(),
             "cl_commandrate" => self.command_rate.to_string(),
+            "cl_commandpacing" => u8::from(self.command_pacing).to_string(),
             "cp_plugindisable" => self.plugin_disable.to_string(),
+            "cl_chatbubbleself" => u8::from(self.chat_bubble_self).to_string(),
+            "cl_chatbubbleunfocused" => u8::from(self.chat_bubble_unfocused).to_string(),
             _ => return None,
         })
     }
@@ -131,14 +259,51 @@ impl NetworkSettings {
             "rate" => number(1000, 90000).map(|v| { self.rate = v as u32; true }),
             "snaps" => number(1, 125).map(|v| { self.snaps = v as u32; true }),
             "cl_maxpackets" => number(15, 1000).map(|v| { self.max_packets = v as u32; false }),
+            "cl_packetdup" => number(0, 5).map(|v| { self.packet_dup = v as u32; false }),
             "cl_timenudge" => number(-900, 900).map(|v| { self.time_nudge = v as i32; false }),
+            // TaystJK/OpenJK register net_port as CVAR_LATCH: changing it does not
+            // disturb an existing socket; the new value is used on the next connect.
+            "net_port" => number(0, u16::MAX as i64).map(|v| { self.net_port = v as u16; false }),
             "saber1" => text().map(|v| { self.saber1 = v; true }),
             "saber2" => text().map(|v| { self.saber2 = v; true }),
             "color1" => number(0, 255).map(|v| { self.color1 = v as u8; true }),
             "color2" => number(0, 255).map(|v| { self.color2 = v as u8; true }),
+            "cp_sbrgb1" => number(0, 0xFF_FFFF).map(|v| { self.sb_rgb1 = v as u32; true }),
+            "cp_sbrgb2" => number(0, 0xFF_FFFF).map(|v| { self.sb_rgb2 = v as u32; true }),
             "forcepowers" => text().map(|v| { self.forcepowers = v; true }),
             "sex" => text().map(|v| { self.sex = v; true }),
             "password" => text().map(|v| { self.password = v; true }),
+            "char_color_red" => number(0, 255).map(|v| { self.char_color[0] = v as u8; true }),
+            "char_color_green" => number(0, 255).map(|v| { self.char_color[1] = v as u8; true }),
+            "char_color_blue" => number(0, 255).map(|v| { self.char_color[2] = v as u8; true }),
+            "handicap" => number(1, 100).map(|v| { self.handicap = v as u32; true }),
+            "cg_predictitems" => Ok({ self.predict_items = atoi(value.as_bytes()) != 0; true }),
+            "cp_cosmetics" => number(i64::from(i32::MIN), i64::from(i32::MAX)).map(|v| { self.cosmetics = v as i32 as u32; true }),
+            "fs_game" => {
+                // A sibling directory name, as `resolve_fs_game_directory` accepts.
+                let name = value.trim();
+                let valid = name.len() <= 63
+                    && name != "."
+                    && name != ".."
+                    && !name.bytes().any(|b| b < 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b':' | b';' | b'"'));
+                if valid {
+                    self.fs_game = name.to_owned();
+                    Ok(false)
+                } else {
+                    Err(format!("{name}: expected a game directory name like japro (empty or base for none)"))
+                }
+            }
+            "cp_clanpwd" => text().map(|v| { self.clan_pwd = v; true }),
+            // Client-only, so not userinfo (`false`). Passwords may hold `;`/`"`
+            // characters in a real Cvar, but the console splits on them anyway.
+            "ui_username" => text().map(|v| { self.ui_username = v; false }),
+            "ui_password" => text().map(|v| { self.ui_password = v; false }),
+            "rconpassword" => Ok({ self.rcon_password = value.to_owned(); false }),
+            "rconaddress" => Ok({ self.rcon_address = value.trim().to_owned(); false }),
+            // CVAR_ROM in jaPRO: derived state the app keeps current, not user-editable.
+            "cg_displaycameraposition" | "cg_displaynetsettings" => {
+                Err(format!("{name} is read-only"))
+            }
             "cg_errordecay" => value
                 .trim()
                 .parse::<f32>()
@@ -148,11 +313,29 @@ impl NetworkSettings {
                 .ok_or_else(|| format!("{name}: expected a number")),
             "cg_nopredict" => Ok({ self.no_predict = atoi(value.as_bytes()) != 0; false }),
             "cg_showmiss" => Ok({ self.show_miss = atoi(value.as_bytes()) != 0; false }),
+            "cg_predictiondebug" => Ok({ self.prediction_debug = atoi(value.as_bytes()) != 0; false }),
+            "cg_predictionmisshighlight" => Ok({ self.prediction_miss_highlight = atoi(value.as_bytes()) != 0; false }),
+            "cg_hitchrecord" => Ok({ self.hitch_record = atoi(value.as_bytes()) != 0; false }),
+            "cg_modelframedebug" => Ok({ self.model_frame_debug = atoi(value.as_bytes()) != 0; false }),
+            "cg_groundtracedebug" => Ok({ self.ground_trace_debug = atoi(value.as_bytes()).clamp(0, 2) as u8; false }),
+            "cg_physicsdiag" => Ok({ self.physics_diag = atoi(value.as_bytes()).clamp(0, 2) as u8; false }),
+            "cg_snapmode" => Ok({ self.snap_mode = atoi(value.as_bytes()).clamp(-1, 4); false }),
+            "cg_predictbackend" => Ok({ self.predict_backend = atoi(value.as_bytes()).clamp(-1, 1); false }),
+            "cg_predictionmissthreshold" => value
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| { self.prediction_miss_threshold = v.clamp(0.0, 4096.0); false })
+                .ok_or_else(|| format!("{name}: expected a number")),
             "cl_allowmissingmap" => Ok({ self.allow_missing_map = atoi(value.as_bytes()) != 0; false }),
             "cl_allowhttpdownload" => Ok({ self.allow_http_downloads = atoi(value.as_bytes()) != 0; false }),
             "cl_allowdownload" => Ok({ self.allow_legacy_downloads = atoi(value.as_bytes()) != 0; false }),
             "cl_commandrate" => number(15, 1000).map(|v| { self.command_rate = v as u32; false }),
+            "cl_commandpacing" => Ok({ self.command_pacing = atoi(value.as_bytes()) != 0; false }),
             "cp_plugindisable" => number(0, i32::MAX as i64).map(|v| { self.plugin_disable = v as i32; true }),
+            "cl_chatbubbleself" => Ok({ self.chat_bubble_self = atoi(value.as_bytes()) != 0; false }),
+            "cl_chatbubbleunfocused" => Ok({ self.chat_bubble_unfocused = atoi(value.as_bytes()) != 0; false }),
             _ => return None,
         };
         Some(result)
@@ -162,16 +345,15 @@ impl NetworkSettings {
     pub fn userinfo(&self, model: &str) -> Vec<u8> {
         let mut info = Vec::new();
         // Info_SetValueForKey prepends, so insert in reverse of the desired order.
-        let pairs: [(&str, String); 16] = [
-            ("teamtask", "0".into()),
-            ("char_color_blue", "255".into()),
-            ("char_color_green", "255".into()),
-            ("char_color_red", "255".into()),
+        let pairs: [(&str, String); 15] = [
+            ("char_color_blue", self.char_color[2].to_string()),
+            ("char_color_green", self.char_color[1].to_string()),
+            ("char_color_red", self.char_color[0].to_string()),
             ("saber2", self.saber2.clone()),
             ("saber1", self.saber1.clone()),
-            ("cg_predictItems", "1".into()),
+            ("cg_predictItems", u8::from(self.predict_items).to_string()),
             ("sex", self.sex.clone()),
-            ("handicap", "100".into()),
+            ("handicap", self.handicap.to_string()),
             ("color2", self.color2.to_string()),
             ("color1", self.color1.to_string()),
             ("forcepowers", self.forcepowers.clone()),
@@ -191,9 +373,30 @@ impl NetworkSettings {
 
     pub fn userinfo_for_mod(&self, model: &str, server_mod: mod_support::ServerMod) -> Vec<u8> {
         let mut info = self.userinfo(model);
+        if server_mod.supports_rgb_sabers() {
+            // jaPRO / JA+ relay these as c3/c4 in the client configstring.
+            set_info_value(&mut info, b"cp_sbRGB1", self.sb_rgb1.to_string().as_bytes());
+            set_info_value(&mut info, b"cp_sbRGB2", self.sb_rgb2.to_string().as_bytes());
+        } else {
+            // Stock servers and clients only know the six base colours; send the
+            // closest one instead of a value they would draw as blue or garbage.
+            let base = |color: u8, rgb: u32| -> u8 {
+                match i32::from(color) {
+                    SABER_RGB => nearest_base_saber_color(rgb),
+                    c if c > SABER_PURPLE => nearest_base_saber_color(rgb),
+                    _ => color,
+                }
+            };
+            set_info_value(&mut info, b"color1", base(self.color1, self.sb_rgb1).to_string().as_bytes());
+            set_info_value(&mut info, b"color2", base(self.color2, self.sb_rgb2).to_string().as_bytes());
+        }
         if server_mod == mod_support::ServerMod::Japro {
             set_info_value(&mut info, b"cjp_client", b"1.4JAPRO");
             set_info_value(&mut info, b"cp_pluginDisable", self.plugin_disable.to_string().as_bytes());
+            set_info_value(&mut info, b"cp_cosmetics", (self.cosmetics as i32).to_string().as_bytes());
+            set_info_value(&mut info, b"cp_clanPwd", self.clan_pwd.as_bytes());
+            set_info_value(&mut info, b"cg_displayCameraPosition", self.display_camera_position.as_bytes());
+            set_info_value(&mut info, b"cg_displayNetSettings", self.display_net_settings.as_bytes());
         }
         info
     }
@@ -205,20 +408,67 @@ impl NetworkSettings {
         let _ = writeln!(out, "seta rate \"{}\"", self.rate);
         let _ = writeln!(out, "seta snaps \"{}\"", self.snaps);
         let _ = writeln!(out, "seta cl_maxpackets \"{}\"", self.max_packets);
+        let _ = writeln!(out, "seta cl_packetdup \"{}\"", self.packet_dup);
         let _ = writeln!(out, "seta cl_timeNudge \"{}\"", self.time_nudge);
         let _ = writeln!(out, "seta saber1 \"{}\"", self.saber1);
         let _ = writeln!(out, "seta saber2 \"{}\"", self.saber2);
         let _ = writeln!(out, "seta color1 \"{}\"", self.color1);
         let _ = writeln!(out, "seta color2 \"{}\"", self.color2);
+        let _ = writeln!(out, "seta cp_sbRGB1 \"{}\"", self.sb_rgb1);
+        let _ = writeln!(out, "seta cp_sbRGB2 \"{}\"", self.sb_rgb2);
         let _ = writeln!(out, "seta forcepowers \"{}\"", self.forcepowers);
         let _ = writeln!(out, "seta sex \"{}\"", self.sex);
+        let _ = writeln!(out, "seta char_color_red \"{}\"", self.char_color[0]);
+        let _ = writeln!(out, "seta char_color_green \"{}\"", self.char_color[1]);
+        let _ = writeln!(out, "seta char_color_blue \"{}\"", self.char_color[2]);
+        let _ = writeln!(out, "seta handicap \"{}\"", self.handicap);
+        let _ = writeln!(out, "seta cg_predictItems \"{}\"", u8::from(self.predict_items));
+        let _ = writeln!(out, "seta cp_cosmetics \"{}\"", self.cosmetics as i32);
+        let _ = writeln!(out, "seta fs_game \"{}\"", self.fs_game);
+        let _ = writeln!(out, "seta ui_username \"{}\"", self.ui_username);
         let _ = writeln!(out, "seta cg_errorDecay \"{}\"", self.error_decay);
         let _ = writeln!(out, "seta cg_noPredict \"{}\"", u8::from(self.no_predict));
         let _ = writeln!(out, "seta cl_allowMissingMap \"{}\"", u8::from(self.allow_missing_map));
         let _ = writeln!(out, "seta cl_allowHttpDownload \"{}\"", u8::from(self.allow_http_downloads));
         let _ = writeln!(out, "seta cl_allowDownload \"{}\"", u8::from(self.allow_legacy_downloads));
         let _ = writeln!(out, "seta cl_commandRate \"{}\"", self.command_rate);
+        let _ = writeln!(out, "seta cl_commandPacing \"{}\"", u8::from(self.command_pacing));
+        let _ = writeln!(out, "seta cl_chatBubbleSelf \"{}\"", u8::from(self.chat_bubble_self));
+        let _ = writeln!(out, "seta cl_chatBubbleUnfocused \"{}\"", u8::from(self.chat_bubble_unfocused));
     }
+}
+
+/// `saber_colors_t`: the six stock colours, then jaPRO's custom-RGB colour.
+pub const SABER_PURPLE: i32 = 5;
+pub const SABER_RGB: i32 = 6;
+
+/// Stock blade colours as sent in `color1` (red, orange, yellow, green, blue,
+/// purple), with the RGB they are drawn with (CG_RGBForSaberColor).
+const BASE_SABER_RGB: [[f32; 3]; 6] = [
+    [255.0, 51.0, 51.0],
+    [255.0, 128.0, 26.0],
+    [255.0, 255.0, 51.0],
+    [51.0, 255.0, 51.0],
+    [51.0, 102.0, 255.0],
+    [230.0, 51.0, 255.0],
+];
+
+/// Packed `cp_sbRGB` (`r | g << 8 | b << 16`) of a stock `color1` value; used to
+/// start the RGB sliders from the blade colour the player already has.
+pub fn base_saber_rgb_packed(color: u8) -> u32 {
+    let rgb = BASE_SABER_RGB[usize::from(color).min(BASE_SABER_RGB.len() - 1)];
+    (rgb[0] as u32) | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16)
+}
+
+/// The stock `color1` value whose blade looks most like the packed `cp_sbRGB`.
+pub fn nearest_base_saber_color(packed_rgb: u32) -> u8 {
+    let rgb = [(packed_rgb & 255) as f32, ((packed_rgb >> 8) & 255) as f32, ((packed_rgb >> 16) & 255) as f32];
+    (0..BASE_SABER_RGB.len())
+        .min_by(|&a, &b| {
+            let distance = |i: usize| (0..3).map(|c| (rgb[c] - BASE_SABER_RGB[i][c]).powi(2)).sum::<f32>();
+            distance(a).total_cmp(&distance(b))
+        })
+        .unwrap_or(4) as u8
 }
 
 // ------------------------------------------------------------- commands --
@@ -293,10 +543,83 @@ const BUTTON_FORCEPOWER: i32 = 512;
 
 // ------------------------------------------------------------ transport --
 
+/// `MAX_RCON_MESSAGE`, including the 4 byte connectionless header.
+const MAX_RCON_MESSAGE: usize = 1024;
+
+/// CL_Rcon_f's transport: a connectionless `rcon <password> <command>` datagram
+/// to `target` and the connectionless `print` replies the server sends back.
+/// It owns its own socket so it works both in a game and from the main menu
+/// (`rconAddress`), exactly like the engine's unconnected rcon.
+pub struct RconChannel {
+    socket: UdpSocket,
+    target: SocketAddr,
+}
+
+impl RconChannel {
+    pub fn open(target: SocketAddr) -> Result<Self, String> {
+        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("UDP bind failed: {error}"))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| format!("UDP socket setup failed: {error}"))?;
+        Ok(Self { socket, target })
+    }
+
+    pub fn target(&self) -> SocketAddr { self.target }
+
+    /// `command` is the rest of the console line after `rcon `, verbatim.
+    pub fn send(&self, password: &str, command: &str) -> Result<(), String> {
+        let mut message = b"\xff\xff\xff\xffrcon ".to_vec();
+        message.extend_from_slice(password.as_bytes());
+        message.push(b' ');
+        message.extend_from_slice(command.as_bytes());
+        // Q_strcat truncates at MAX_RCON_MESSAGE - 1, then NUL terminates.
+        message.truncate(MAX_RCON_MESSAGE - 1);
+        message.push(0);
+        self.socket
+            .send_to(&message, self.target)
+            .map(|_| ())
+            .map_err(|error| format!("rcon send to {}: {error}", self.target))
+    }
+
+    /// The text of every `print` reply received since the last poll. Datagrams
+    /// from any other address are ignored (NET_CompareAdr(from, rcon_address)).
+    pub fn poll(&self) -> Vec<Vec<u8>> {
+        let mut buffer = [0u8; 4096];
+        let mut replies = Vec::new();
+        loop {
+            match self.socket.recv_from(&mut buffer) {
+                Ok((len, from)) => {
+                    if from != self.target || len < 5 || buffer[..4] != [0xff; 4] {
+                        continue;
+                    }
+                    let body = &buffer[4..len];
+                    let split = body.iter().position(|b| b.is_ascii_whitespace()).unwrap_or(body.len());
+                    if body[..split].eq_ignore_ascii_case(b"print") {
+                        let text = body.get(split + 1..).unwrap_or_default();
+                        let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                        replies.push(text[..end].to_vec());
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => continue,
+                Err(_) => break,
+            }
+        }
+        replies
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TransportDebug {
+    pub sent_datagrams: u64,
+    pub send_errors: u64,
+}
+
 pub struct NetClient {
     socket: UdpSocket,
     session: ClientSession,
     epoch: Instant,
+    transport_debug: TransportDebug,
     pub server_name: String,
 }
 
@@ -326,19 +649,40 @@ pub fn resolve_server(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("Bad server address {text}: no IPv4 address"))
 }
 
+/// TaystJK/OpenJK NET_OpenIP parity for the live client socket. The requested
+/// `net_port` is tried first, followed by the next 9 ports. `0` asks the OS for
+/// an ephemeral port and succeeds on the first attempt.
+fn bind_live_socket(net_port: u16) -> Result<UdpSocket, String> {
+    let attempts: u16 = if net_port == 0 { 1 } else { 10 };
+    let mut last_error = None;
+    for offset in 0..attempts {
+        let Some(port) = net_port.checked_add(offset) else { break };
+        match UdpSocket::bind(("0.0.0.0", port)) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some((port, error)),
+        }
+    }
+    match last_error {
+        Some((port, error)) => Err(format!(
+            "UDP bind failed: net_port {net_port} (last tried {port}): {error}"
+        )),
+        None => Err(format!("UDP bind failed: invalid net_port {net_port}")),
+    }
+}
+
 impl NetClient {
     #[cfg(test)]
-    pub fn connect(server_name: &str, userinfo: Vec<u8>) -> Result<Self, String> {
-        Self::connect_inner(server_name, userinfo, false)
+    pub fn connect(server_name: &str, userinfo: Vec<u8>, net_port: u16) -> Result<Self, String> {
+        Self::connect_inner(server_name, userinfo, net_port, false)
     }
 
-    pub fn connect_preflight(server_name: &str, userinfo: Vec<u8>) -> Result<Self, String> {
-        Self::connect_inner(server_name, userinfo, true)
+    pub fn connect_preflight(server_name: &str, userinfo: Vec<u8>, net_port: u16) -> Result<Self, String> {
+        Self::connect_inner(server_name, userinfo, net_port, true)
     }
 
-    fn connect_inner(server_name: &str, userinfo: Vec<u8>, preflight: bool) -> Result<Self, String> {
+    fn connect_inner(server_name: &str, userinfo: Vec<u8>, net_port: u16, preflight: bool) -> Result<Self, String> {
         let server = resolve_server(server_name)?;
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("UDP bind failed: {error}"))?;
+        let socket = bind_live_socket(net_port)?;
         socket
             .set_nonblocking(true)
             .map_err(|error| format!("UDP socket setup failed: {error}"))?;
@@ -361,7 +705,10 @@ impl NetClient {
                 0,
             )
         };
-        let mut client = Self { socket, session, epoch, server_name: server_name.to_owned() };
+        let mut client = Self {
+            socket, session, epoch, server_name: server_name.to_owned(),
+            transport_debug: TransportDebug::default(),
+        };
         client.flush();
         Ok(client)
     }
@@ -373,6 +720,9 @@ impl NetClient {
 
     pub fn session(&self) -> &ClientSession { &self.session }
     pub fn session_mut(&mut self) -> &mut ClientSession { &mut self.session }
+    pub(crate) fn transport_debug(&self) -> TransportDebug { self.transport_debug }
+    pub fn local_port(&self) -> u16 { self.socket.local_addr().map_or(0, |addr| addr.port()) }
+    pub(crate) fn connection_started(&self) -> Instant { self.epoch }
 
     pub fn resume_connect(&mut self) {
         let now = self.realtime();
@@ -412,7 +762,10 @@ impl NetClient {
     pub fn flush(&mut self) {
         let server = self.session.server();
         for packet in self.session.take_outgoing() {
-            let _ = self.socket.send_to(&packet, server);
+            match self.socket.send_to(&packet, server) {
+                Ok(length) if length == packet.len() => self.transport_debug.sent_datagrams += 1,
+                _ => self.transport_debug.send_errors += 1,
+            }
         }
     }
 
@@ -615,6 +968,46 @@ impl LiveInput {
         self.weapon_select = original;
     }
 
+    /// CG_OutOfAmmoChange with cg_autoSwitch 1 ("safe"): pick the highest
+    /// selectable weapon that is not the one that just ran dry, skipping the
+    /// explosive/placed weapons.
+    pub fn out_of_ammo_change(&mut self, ps: &PlayerState, old_weapon: i32, auto_switch: u8) {
+        const WP_ROCKET_LAUNCHER: i32 = 11;
+        const WP_THERMAL: i32 = 12;
+        const WP_TRIP_MINE: i32 = 13;
+        const WP_DET_PACK: i32 = 14;
+        const LAST_USEABLE_WEAPON: i32 = 16;
+        for weapon in (1..=LAST_USEABLE_WEAPON).rev() {
+            if auto_switch == 1 && matches!(weapon, WP_ROCKET_LAUNCHER | WP_THERMAL | WP_TRIP_MINE | WP_DET_PACK) {
+                continue;
+            }
+            if weapon != old_weapon && Self::selectable(ps, weapon) {
+                self.weapon_select = weapon as u8;
+                return;
+            }
+        }
+    }
+
+    /// CG_ItemPickup's weapon auto-select: switch to a freshly picked-up weapon
+    /// (`tag`) that is better than the current one, never away from the saber.
+    pub fn pickup_autoswitch(&mut self, ps: &PlayerState, tag: i32, auto_switch: u8) {
+        const WP_SABER: i32 = 3;
+        const WP_ROCKET_LAUNCHER: i32 = 11;
+        const WP_THERMAL: i32 = 12;
+        const WP_TRIP_MINE: i32 = 13;
+        const WP_DET_PACK: i32 = 14;
+        let current = ps.field_i32("weapon").unwrap_or(0);
+        let better = tag > current && current != WP_SABER;
+        let allowed = match auto_switch {
+            0 => false,
+            1 => better && !matches!(tag, WP_TRIP_MINE | WP_DET_PACK | WP_THERMAL | WP_ROCKET_LAUNCHER),
+            _ => better,
+        };
+        if allowed && (0..19).contains(&tag) {
+            self.weapon_select = tag as u8;
+        }
+    }
+
     /// OpenJK BG_CycleForce, used by CG_NextForcePower_f / CG_PrevForcePower_f.
     pub fn cycle_force(&mut self, ps: &PlayerState, forward: bool) {
         // codemp/game/bg_misc.c forcePowerSorted[] -- keep OpenJK's authored order.
@@ -736,7 +1129,9 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         pmove_float: int(system, b"pmove_float", 0),
         gametype: int(server, b"g_gametype", 0),
         debug_melee: int(server, b"g_debugMelee", 0),
-        step_slide_fix: int(server, b"g_stepSlideFix", 1),
+        // cg_servercmds.c: atoi(Info_ValueForKey("g_stepSlideFix")), so a server that
+        // never advertises it (retail JKA) is predicted with the fix off.
+        step_slide_fix: int(server, b"g_stepSlideFix", 0),
         no_spec_move: int(server, b"g_noSpecMove", 0),
         tracemask,
         no_footsteps: i32::from(int(server, b"dmflags", 0) & 32 != 0),
@@ -805,6 +1200,113 @@ fn origin(ps: &PlayerState) -> [f32; 3] {
     ]
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredictionStateDebug {
+    pub command_time: i32,
+    pub origin: [f32; 3],
+    pub velocity: [f32; 3],
+    pub ground_entity: i32,
+    pub pm_flags: i32,
+    pub pm_type: i32,
+    pub pm_time: i32,
+    pub gravity: i32,
+    pub speed: f32,
+    pub view_angles: [f32; 3],
+    pub client_num: i32,
+    pub e_flags: i32,
+    pub legs_anim: i32,
+    pub torso_anim: i32,
+    pub in_air_anim: i32,
+    pub model_scale: i32,
+}
+
+pub(crate) fn prediction_state_debug(ps: &PlayerState) -> PredictionStateDebug {
+    PredictionStateDebug {
+        command_time: ps.field_i32("commandTime").unwrap_or(0),
+        origin: origin(ps),
+        velocity: [
+            ps.field_f32("velocity[0]").unwrap_or(0.0),
+            ps.field_f32("velocity[1]").unwrap_or(0.0),
+            ps.field_f32("velocity[2]").unwrap_or(0.0),
+        ],
+        ground_entity: ps.field_i32("groundEntityNum").unwrap_or(-1),
+        pm_flags: ps.field_i32("pm_flags").unwrap_or(0),
+        pm_type: ps.field_i32("pm_type").unwrap_or(0),
+        pm_time: ps.field_i32("pm_time").unwrap_or(0),
+        gravity: ps.field_i32("gravity").unwrap_or(0),
+        speed: ps.field_f32("speed").unwrap_or(0.0),
+        view_angles: ["viewangles[0]", "viewangles[1]", "viewangles[2]"]
+            .map(|name| ps.field_f32(name).unwrap_or(0.0)),
+        client_num: ps.field_i32("clientNum").unwrap_or(0),
+        e_flags: ps.field_i32("eFlags").unwrap_or(0),
+        legs_anim: ps.field_i32("legsAnim").unwrap_or(0),
+        torso_anim: ps.field_i32("torsoAnim").unwrap_or(0),
+        in_air_anim: ps.field_i32("inAirAnim").unwrap_or(0),
+        model_scale: ps.field_i32("iModelScale").unwrap_or(0),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PredictionTraceDebug {
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub fraction: f32,
+    pub hit_end: [f32; 3],
+    pub normal: [f32; 3],
+    pub entity: i32,
+    pub start_solid: bool,
+    pub all_solid: bool,
+}
+
+impl PredictionTraceDebug {
+    fn from_trace(query: TraceQuery, result: TraceResult) -> Self {
+        Self {
+            start: query.start,
+            end: query.end,
+            fraction: result.fraction,
+            hit_end: result.end,
+            normal: result.normal,
+            entity: result.entity,
+            start_solid: result.start_solid != 0,
+            all_solid: result.all_solid != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PredictionMissDebug {
+    pub sequence: u64,
+    pub detected_at: Instant,
+    pub command_time: i32,
+    pub delta: [f32; 3],
+    pub length: f32,
+    pub predicted: PredictionStateDebug,
+    pub server: PredictionStateDebug,
+    /// Ground trace from the previous predicted frame: this is the trace that
+    /// may have produced the state which is now being corrected.
+    pub previous_ground_trace: Option<PredictionTraceDebug>,
+    /// 64-unit look-down trace used by PM_GroundTraceMissed, when present.
+    pub previous_ground_probe: Option<PredictionTraceDebug>,
+    /// Ground trace from the replay which follows this correction.
+    pub replay_ground_trace: Option<PredictionTraceDebug>,
+    pub replay_ground_probe: Option<PredictionTraceDebug>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredictionFrameDebug {
+    pub server_time: i32,
+    /// The actual replay base, which can be the next snapshot.
+    pub base_message: i32,
+    pub base_time: i32,
+    pub base: PredictionStateDebug,
+    pub settings: PredictSettings,
+    pub display: PredictionStateDebug,
+    pub committed: PredictionStateDebug,
+    pub view_error: [f32; 3],
+    pub ground_trace: Option<PredictionTraceDebug>,
+    pub ground_probe: Option<PredictionTraceDebug>,
+}
+
 const EF_TELEPORT_BIT: i32 = 1 << 3;
 
 /// One entry of cg_solidEntities.
@@ -814,11 +1316,19 @@ pub struct SolidEntity {
     pub generic_enemy_index: i32,
     pub skip_movement: bool,
     pub clip: EntityClip,
+    /// World-space bounds of the clip volume (`r.absmin`/`r.absmax`). Traces
+    /// that stay clear of them skip the entity, like SV_AreaEntities does;
+    /// `None` always tests it (CG_ClipMoveToEntities).
+    pub bounds: Option<([f32; 3], [f32; 3])>,
 }
 
 /// CG_BuildSolidList over this frame's lerped entities: triggers and items
-/// are not solid; `solid` is either SOLID_BMODEL or an encoded bbox.
-pub fn solid_entities(entities: &[crate::cgame::PresentedEntity]) -> Vec<SolidEntity> {
+/// are not solid; `solid` is either SOLID_BMODEL or an encoded bbox. Brush
+/// models sit where their trajectory puts them at `physics_time`
+/// (CG_ClipMoveToEntities: `BG_EvaluateTrajectory(&currentState.pos,
+/// cg.physicsTime)`), the time the predicted commands are replayed from, not
+/// at the smoothed render time.
+pub fn solid_entities(entities: &[crate::cgame::PresentedEntity], physics_time: i32) -> Vec<SolidEntity> {
     const ET_ITEM: i32 = 2;
     const ET_PUSH_TRIGGER: i32 = 10;
     const ET_TELEPORT_TRIGGER: i32 = 11;
@@ -834,7 +1344,7 @@ pub fn solid_entities(entities: &[crate::cgame::PresentedEntity]) -> Vec<SolidEn
             let clip = if solid == SOLID_BMODEL {
                 EntityClip::InlineModel {
                     index: entity.state.field_i32("modelindex").unwrap_or(0),
-                    origin: entity.origin,
+                    origin: crate::cgame::evaluate_entity_trajectory(&entity.state, "pos", physics_time).unwrap_or(entity.origin),
                     angles: entity.angles,
                 }
             } else {
@@ -849,9 +1359,82 @@ pub fn solid_entities(entities: &[crate::cgame::PresentedEntity]) -> Vec<SolidEn
                 generic_enemy_index: entity.state.field_i32("genericenemyindex").unwrap_or(0),
                 skip_movement: false,
                 clip,
+                bounds: None,
             })
         })
         .collect()
+}
+
+const ET_MOVER: i32 = 6;
+const ENTITYNUM_MAX_NORMAL: i32 = 1022;
+const PMF_FOLLOW_FLAG: i32 = 4096;
+const PERS_TEAM: usize = 3;
+const TEAM_SPECTATOR: i32 = 3;
+/// jaPRO `STAT_RACEMODE`, `STAT_MOVEMENTSTYLE` and the `MV_OCPM` entry of `movementStyle_e`.
+const STAT_RACEMODE: usize = 11;
+const STAT_MOVEMENTSTYLE: usize = 13;
+const MV_OCPM: i32 = 16;
+
+/// CG_AdjustPositionForMover: carry `position` with the mover it stands on
+/// from `from_time` to `to_time`. A ground entity that is not an ET_MOVER, and
+/// spectators or followers, are left where they are. Rotation is not applied,
+/// like the original ("FIXME: origin change when on a rotating object").
+pub fn adjust_position_for_mover(
+    entities: &[crate::cgame::PresentedEntity],
+    ps: &PlayerState,
+    position: [f32; 3],
+    from_time: i32,
+    to_time: i32,
+) -> [f32; 3] {
+    if ps.persistant[PERS_TEAM] == TEAM_SPECTATOR || ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW_FLAG != 0 {
+        return position;
+    }
+    let mover_num = ps.field_i32("groundEntityNum").unwrap_or(ENTITYNUM_MAX_NORMAL);
+    if mover_num <= 0 || mover_num >= ENTITYNUM_MAX_NORMAL {
+        return position;
+    }
+    let Some(mover) = entities
+        .iter()
+        .find(|entity| i32::from(entity.number) == mover_num && entity.entity_type == ET_MOVER)
+    else {
+        return position;
+    };
+    let evaluate = |time| crate::cgame::evaluate_entity_trajectory(&mover.state, "pos", time);
+    let (Some(old), Some(new)) = (evaluate(from_time), evaluate(to_time)) else {
+        return position;
+    };
+    std::array::from_fn(|axis| position[axis] + (new[axis] - old[axis]))
+}
+
+/// The provisional step repeats held inputs a few ms past a command that has
+/// already run them. Its discrete results (a jump or flip animation started by
+/// a held or tapped jump key) are taken back by the next real command, which
+/// shows up as a one-frame pose flash on the model. Movement stays predicted;
+/// the model's animation follows the committed state.
+fn keep_committed_animation(display: &mut PlayerState, committed: &PlayerState) {
+    let get = |ps: &PlayerState, name: &str| ps.field_i32(name).unwrap_or(0);
+    let (display_legs, display_torso) = (get(display, "legsAnim"), get(display, "torsoAnim"));
+    if display_legs == get(committed, "legsAnim") {
+        return;
+    }
+    // BOTH_ animations drive legs and torso together; leave an independent
+    // torso (saber attacks, weapon fire) alone.
+    let both = display_legs == display_torso;
+    let copied: &[&str] = if both {
+        &["legsAnim", "legsTimer", "torsoAnim", "torsoTimer"]
+    } else {
+        &["legsAnim", "legsTimer"]
+    };
+    for name in copied {
+        let value = get(committed, name);
+        display.set_field_bits(name, value as u32);
+    }
+}
+
+fn set_origin(ps: &mut PlayerState, origin: [f32; 3]) {
+    for (axis, value) in origin.into_iter().enumerate() {
+        ps.set_field_bits(&format!("origin[{axis}]"), value.to_bits());
+    }
 }
 
 /// CG_Trace / CG_PointContents: the world plus CG_ClipMoveToEntities.
@@ -869,6 +1452,15 @@ impl TraceWorld for PredictionWorld<'_> {
         for solid in self.solids {
             if solid.skip_movement || solid.number == query.pass_entity {
                 continue;
+            }
+            if let Some((low, high)) = solid.bounds {
+                let clear = (0..3).any(|axis| {
+                    let (start, end) = (query.start[axis], query.end[axis]);
+                    start.min(end) + query.mins[axis] > high[axis] || start.max(end) + query.maxs[axis] < low[axis]
+                });
+                if clear {
+                    continue;
+                }
             }
             // Objects owned by the predicted client never block it.
             if solid.number > MAX_CLIENTS && solid.generic_enemy_index - MAX_GENTITIES == self.client_num {
@@ -906,6 +1498,39 @@ impl TraceWorld for PredictionWorld<'_> {
     }
 }
 
+/// Thin diagnostic wrapper around the real CG_Trace implementation. It does
+/// not alter collision results; it only remembers the characteristic traces
+/// used by OpenJK PM_GroundTrace (0.25 units down) and
+/// PM_GroundTraceMissed (64 units down).
+struct PredictionTraceWorld<'a, 'b> {
+    inner: PredictionWorld<'a>,
+    ground_trace: &'b mut Option<PredictionTraceDebug>,
+    ground_probe: &'b mut Option<PredictionTraceDebug>,
+    enabled: bool,
+}
+
+impl TraceWorld for PredictionTraceWorld<'_, '_> {
+    fn trace(&mut self, query: TraceQuery) -> TraceResult {
+        let result = self.inner.trace(query);
+        if !self.enabled {
+            return result;
+        }
+        let same_xy = (query.start[0] - query.end[0]).abs() < 0.001
+            && (query.start[1] - query.end[1]).abs() < 0.001;
+        let down = query.start[2] - query.end[2];
+        if same_xy && (down - 0.25).abs() < 0.001 {
+            *self.ground_trace = Some(PredictionTraceDebug::from_trace(query, result));
+        } else if same_xy && (down - 64.0).abs() < 0.01 {
+            *self.ground_probe = Some(PredictionTraceDebug::from_trace(query, result));
+        }
+        result
+    }
+
+    fn point_contents(&mut self, point: [f32; 3], pass_entity: i32) -> i32 {
+        self.inner.point_contents(point, pass_entity)
+    }
+}
+
 /// cg.predictedPlayerState and its error-decay bookkeeping.
 #[derive(Default)]
 pub struct Predictor {
@@ -926,7 +1551,105 @@ pub struct Predictor {
     old_time: i32,
     last_snapshot: Option<(i32, i32, i32)>,
     this_frame_teleport: bool,
+    /// `cgs.clientinfo[predicted client].saber[]`, which BG_MySaber hands to Pmove.
+    saber_movement: Option<[SaberMovementInfo; 2]>,
+    /// The loadout the native player currently carries.
+    saber_installed: Option<[SaberMovementInfo; 2]>,
+    /// Foot bolts of the predicted client's rendered Ghoul2 pose (`pmove_t::ghoul2`).
+    foot_bolts: Option<[[f32; 3]; 2]>,
     pub misses: Vec<String>,
+    miss_sequence: u64,
+    latest_miss: Option<PredictionMissDebug>,
+    debug_frame: Option<PredictionFrameDebug>,
+    last_ground_trace: Option<PredictionTraceDebug>,
+    last_ground_probe: Option<PredictionTraceDebug>,
+    last_view_error: [f32; 3],
+    /// What the last replay ran with, for the `predsettings` console command.
+    last_regime: Option<(PredictSettings, i32, i32)>,
+    /// `cg_groundTraceDebug`: what each new command's ground trace predicted, kept until the
+    /// server's snapshot for that command time arrives and can be compared against it.
+    ground_log: std::collections::VecDeque<GroundRecord>,
+    ground_logged_cmd: i32,
+    ground_compared_snapshot: i32,
+    ground_previous: i32,
+    /// `cg_physicsDiag`: the previous base snapshot (message number, state) and running totals.
+    diag_previous: Option<(i32, PlayerState)>,
+    diag_compared: u32,
+    diag_matched: u32,
+    /// Per candidate rounding mode: how many compared intervals it reproduced exactly, and the
+    /// votes (intervals where it was exact and at least one other mode was not).
+    diag_combo_matched: [u32; 10],
+    combo_votes: [u32; 10],
+    /// What detection currently selects, and the rounding mode last handed to the native side.
+    auto_backend: i32,
+    auto_snap: i32,
+    snap_mode_applied: Option<i32>,
+}
+
+/// One predicted command's ground state, for `cg_groundTraceDebug`.
+#[derive(Debug, Clone, Copy)]
+struct GroundRecord {
+    cmd_number: i32,
+    cmd_time: i32,
+    origin: [f32; 3],
+    velocity: [f32; 3],
+    ground_entity: i32,
+    pm_flags: i32,
+    pm_time: i32,
+    legs_anim: i32,
+    trace: Option<PredictionTraceDebug>,
+    probe: Option<PredictionTraceDebug>,
+}
+
+/// Replay of one snapshot interval compared with the server's state (see `cg_physicsDiag`).
+struct IntervalCheck {
+    exact: bool,
+    origin_delta: [f32; 3],
+    velocity_delta: [f32; 3],
+    ground: (i32, i32),
+    flags: (i32, i32),
+    timer: (i32, i32),
+}
+
+fn check_interval(replayed: &PlayerState, server: &PlayerState) -> IntervalCheck {
+    let delta = |name: &str| replayed.field_f32(name).unwrap_or(0.0) - server.field_f32(name).unwrap_or(0.0);
+    let origin_delta = [delta("origin[0]"), delta("origin[1]"), delta("origin[2]")];
+    let velocity_delta = [delta("velocity[0]"), delta("velocity[1]"), delta("velocity[2]")];
+    let pair = |name: &str, default: i32| (replayed.field_i32(name).unwrap_or(default), server.field_i32(name).unwrap_or(default));
+    let (ground, flags, timer) = (pair("groundEntityNum", -1), pair("pm_flags", 0), pair("pm_time", 0));
+    let magnitude = (origin_delta[0].powi(2) + origin_delta[1].powi(2) + origin_delta[2].powi(2)).sqrt();
+    let exact = magnitude < 0.01
+        && velocity_delta.iter().all(|v| v.abs() < 0.01)
+        && ground.0 == ground.1
+        && flags.0 == flags.1
+        && timer.0 == timer.1;
+    IntervalCheck { exact, origin_delta, velocity_delta, ground, flags, timer }
+}
+
+/// Index of a (backend, rounding) pair in the vote arrays.
+fn combo_index(backend: i32, snap: i32) -> usize {
+    (backend.clamp(0, 1) * 5 + snap.clamp(0, 4)) as usize
+}
+
+fn combo_name(backend: i32, snap: i32) -> String {
+    let backend = if backend == 1 { "jaPRO backend" } else { "stock backend" };
+    let snap = ["nearest", "truncate", "floor", "nearest-even", "no rounding"][snap.clamp(0, 4) as usize];
+    format!("{backend}, {snap} rounding")
+}
+
+/// `cg_groundTraceDebug 1` reports a snapshot comparison once the origin differs by more than this.
+const DRIFT_UNITS: f32 = 3.0;
+
+fn ground_trace_text(label: &str, trace: Option<PredictionTraceDebug>) -> String {
+    match trace {
+        Some(t) => format!(
+            "{label} z {:.2}->{:.2} frac={:.4} hit=({:.2},{:.2},{:.2}) ent={} nz={:.3}{}{}",
+            t.start[2], t.end[2], t.fraction, t.hit_end[0], t.hit_end[1], t.hit_end[2], t.entity, t.normal[2],
+            if t.start_solid { " STARTSOLID" } else { "" },
+            if t.all_solid { " ALLSOLID" } else { "" },
+        ),
+        None => format!("{label} -"),
+    }
 }
 
 pub struct PredictionInput<'a> {
@@ -948,14 +1671,77 @@ pub struct PredictionInput<'a> {
 impl Predictor {
     pub fn reset(&mut self) {
         *self = Self::default();
+        // The rounding mode is process-wide native state; solo play and the next server start at
+        // OpenJK's and detection starts over.
+        jka_movement::set_snap_mode(0);
     }
 
-    /// The committed `cg.predictedPlayerState`, excluding this frame's
-    /// provisional display-only command. Predictable event transitions must
-    /// use this state so the same local event is not emitted once per render
-    /// frame before its usercmd is actually committed.
-    pub fn committed_predicted(&self) -> Option<&PlayerState> {
-        self.predicted.as_ref()
+    /// Install the predicted client's equipped sabers (what CG_NewClientInfo's
+    /// WP_SetSaber leaves in `cgs.clientinfo[].saber[]`). Pmove consults them
+    /// through BG_MySaber for stances, special attacks and style rules.
+    pub fn set_saber_movement(&mut self, sabers: [SaberMovementInfo; 2]) {
+        self.saber_movement = Some(sabers.map(SaberMovementInfo::for_prediction));
+    }
+
+    /// The predicted client's `*l_leg_foot` / `*r_leg_foot` in model space, from
+    /// the last presented pose. PM_AdjustStandAnimForSlope (leg dangle) needs
+    /// them; without a model Pmove skips the slope anims like a spectator.
+    pub fn set_foot_bolts(&mut self, bolts: Option<[[f32; 3]; 2]>) {
+        self.foot_bolts = bolts;
+    }
+
+    /// One line per setting the last replay ran with (`predsettings`), including
+    /// which rules of PmoveSingle's end-of-frame velocity snap and Pmove()'s
+    /// command chopping apply under them.
+    pub fn regime_report(&self, command_rate: &str) -> Vec<String> {
+        const MV_NAMES: [&str; 19] = [
+            "siege", "jka", "qw", "cpm", "q3", "pjk", "wsw", "rjq3", "rjcpm", "swoop", "jetpack", "speed", "sp",
+            "slick", "botcpm", "coop", "ocpm", "tribes", "surf",
+        ];
+        const JAPRO_CINFO_HIGHFPSFIX: i32 = 1 << 21;
+        let Some((settings, race, style)) = self.last_regime else {
+            return vec!["predsettings: no prediction has run yet (connect to a server first)".to_owned()];
+        };
+        let race = race != 0 && settings.server_mod == 1;
+        let ocpm = style == MV_OCPM;
+        let style_name = usize::try_from(style).ok().and_then(|i| MV_NAMES.get(i)).copied().unwrap_or("?");
+        let snap = if race && !ocpm || (!race && settings.pmove_float > 1) {
+            "OFF (float velocity)"
+        } else if settings.pmove_float != 0 {
+            "OFF (pmove_float 1)"
+        } else if settings.jcinfo & JAPRO_CINFO_HIGHFPSFIX != 0 {
+            "ON, except when a command's msec is <4 or >25 (g_fixHighFPSAbuse)"
+        } else {
+            "ON (integer velocity every step)"
+        };
+        let chop = if race {
+            if ocpm {
+                "race+OCPM: every step chopped to 8 ms; server also rounds each cmd time up to a multiple of 8 (this client does not, like the stock cgame)"
+            } else {
+                "race: steps are the full command msec (rolls chopped to 8); server rounds cmd time to 3 ms when msec<3 (this client does not, like the stock cgame)"
+            }
+        } else if settings.pmove_fixed != 0 {
+            "pmove_fixed: steps chopped to pmove_msec; cmd times rounded up to pmove_msec"
+        } else {
+            "steps chopped to 66 ms"
+        };
+        vec![
+            format!(
+                "predsettings: server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
+                settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
+            ),
+            format!("  velocity snap: {snap}"),
+            format!("  step chopping: {chop}"),
+            format!(
+                "  jcinfo={:#x} jcinfo2={:#x} taystJKinfo={:#x} step_slide_fix={} provisional_step={}",
+                settings.jcinfo,
+                settings.jcinfo2,
+                settings.taystjk_info,
+                settings.step_slide_fix,
+                if settings.pmove_fixed == 0 { "on" } else { "off (pmove_fixed)" },
+            ),
+            "  not predicted here: push triggers / jump pads, teleporter touch, item pickups (CG_TouchTriggerPrediction)".to_owned(),
+        ]
     }
 
     /// The playerstate to present this frame (see `display`).
@@ -980,22 +1766,35 @@ impl Predictor {
 
     /// CG_CalcViewValues: the decaying prediction error added to the view.
     pub fn view_error(&mut self, time: i32, error_decay: f32) -> [f32; 3] {
-        if error_decay <= 0.0 {
-            return [0.0; 3];
-        }
-        let f = (error_decay - (time - self.predicted_error_time) as f32) / error_decay;
-        if f > 0.0 && f < 1.0 {
-            self.predicted_error.map(|e| e * f)
-        } else {
-            self.predicted_error_time = 0;
+        let error = if error_decay <= 0.0 {
             [0.0; 3]
+        } else {
+            let f = (error_decay - (time - self.predicted_error_time) as f32) / error_decay;
+            if f > 0.0 && f < 1.0 {
+                self.predicted_error.map(|e| e * f)
+            } else {
+                self.predicted_error_time = 0;
+                [0.0; 3]
+            }
+        };
+        self.last_view_error = error;
+        if let Some(frame) = &mut self.debug_frame {
+            frame.view_error = error;
         }
+        error
     }
 
-    /// CG_PredictPlayerState (vanilla, no vehicles/movers yet).
+    pub fn prediction_debug_frame(&self) -> Option<PredictionFrameDebug> {
+        self.debug_frame
+    }
+
+    pub fn latest_prediction_miss(&self) -> Option<&PredictionMissDebug> {
+        self.latest_miss.as_ref()
+    }
+
+    /// CG_PredictPlayerState (vanilla, no vehicles).
     pub fn predict(&mut self, input: PredictionInput<'_>) -> Result<(), String> {
         let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional } = input;
-        let mut solids = solid_entities(entities);
         let client_num = snap.player_state.field_i32("clientNum").unwrap_or(0);
         // cg.thisFrameTeleport is raised by CG_TransitionSnapshot when the
         // playerstate teleport bit or client number changes.
@@ -1029,6 +1828,11 @@ impl Predictor {
             self.display_angles = None;
             self.predicted_view_forced = false;
             self.display_view_forced = false;
+            self.debug_frame = None;
+            self.last_view_error = [0.0; 3];
+            self.latest_miss = None;
+            self.last_ground_trace = None;
+            self.last_ground_probe = None;
             return Ok(());
         }
         let old = self.predicted.clone().expect("seeded above");
@@ -1046,15 +1850,74 @@ impl Predictor {
         let base_ps = &base.player_state;
         let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
         prediction_settings.plugin_disable = settings.plugin_disable;
+        // Backend and rounding: jaPRO servers always use the jaPRO backend (their prediction was exact);
+        // for every other server both are chosen by `cg_predictBackend` / `cg_snapMode`, or detected
+        // by replaying snapshot intervals (below) when left at -1.
+        let detected_japro = prediction_settings.server_mod == 1;
+        let effective_backend = if settings.predict_backend >= 0 {
+            settings.predict_backend
+        } else if detected_japro {
+            1
+        } else {
+            self.auto_backend
+        };
+        prediction_settings.server_mod = effective_backend;
+        let effective_snap_mode = if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap };
+        if self.snap_mode_applied != Some(effective_snap_mode) {
+            jka_movement::set_snap_mode(effective_snap_mode);
+            self.snap_mode_applied = Some(effective_snap_mode);
+        }
+        let regime = (prediction_settings, base_ps.stats[STAT_RACEMODE], base_ps.stats[STAT_MOVEMENTSTYLE]);
+        if self.last_regime != Some(regime) {
+            // One line in the console/latest.log whenever the settings the replay runs with change
+            // (first prediction of a session included), so a dump can be read against them.
+            self.misses.push(format!(
+                "PRED-SETTINGS backend={} pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} base_snapshot={} cmdtime={}",
+                if prediction_settings.server_mod == 1 { "jaPRO" } else { "stock" },
+                prediction_settings.pmove_fixed,
+                prediction_settings.pmove_float,
+                prediction_settings.pmove_msec,
+                prediction_settings.step_slide_fix,
+                base_ps.field_i32("gravity").unwrap_or(0),
+                base_ps.field_f32("speed").unwrap_or(0.0),
+                regime.1,
+                regime.2,
+                prediction_settings.jcinfo,
+                base.message_num,
+                base_ps.field_i32("commandTime").unwrap_or(0),
+            ));
+        }
+        self.last_regime = Some(regime);
+        // cg.physicsTime: the snapshot time the replay starts from, which is
+        // where movers are clipped and where the ground-mover adjustment starts.
+        let mut physics_time = base.server_time;
+        if prediction_settings.server_mod == 1
+            && physics_time - base_ps.field_i32("commandTime").unwrap_or(0) > 8
+            && base_ps.stats[STAT_MOVEMENTSTYLE] == MV_OCPM
+        {
+            physics_time = base_ps.field_i32("commandTime").unwrap_or(0) + 8;
+        }
+        let mut solids = solid_entities(entities, physics_time);
         let native = match &mut self.native {
             Some(native) => {
                 native.configure(&prediction_settings)?;
                 native.set_network(&to_native(base_ps))?;
                 native
             }
-            slot => slot.insert(NativePlayerState::from_network(&to_native(base_ps))?),
+            slot => {
+                self.saber_installed = None;
+                slot.insert(NativePlayerState::from_network(&to_native(base_ps))?)
+            }
         };
+        if self.saber_installed != self.saber_movement {
+            if let Some(sabers) = self.saber_movement {
+                native.set_saber_movement_info(0, sabers[0])?;
+                native.set_saber_movement_info(1, sabers[1])?;
+            }
+            self.saber_installed = self.saber_movement;
+        }
 
+        native.set_foot_bolts(self.foot_bolts)?;
         native.configure(&prediction_settings)?;
         if prediction_settings.server_mod == 1 {
             let prediction_entities: Vec<_> = entities.iter().map(|entity| {
@@ -1080,11 +1943,32 @@ impl Predictor {
                 solid.skip_movement = skip[solid.number as usize];
             }
         }
-        let mut world = PredictionWorld { world, solids: &solids, client_num };
+        let debug_enabled = settings.prediction_debug
+            || settings.prediction_miss_highlight
+            || settings.hitch_record
+            || settings.ground_trace_debug > 0;
+        let mut frame_ground_trace = None;
+        let mut frame_ground_probe = None;
+        let mut world = PredictionTraceWorld {
+            inner: PredictionWorld { world, solids: &solids, client_num },
+            ground_trace: &mut frame_ground_trace,
+            ground_probe: &mut frame_ground_probe,
+            enabled: debug_enabled,
+        };
 
         let mut moved = false;
         let mut replay_view_forced = self.predicted_view_forced;
         let mut command_time = base_ps.field_i32("commandTime").unwrap_or(0);
+        let mut miss_sequence_this_frame = None;
+        // CG_PredictPlayerState compares the previous frame's prediction with this replay at
+        // the same commandTime. Stock does it while processing a *later* command, which always
+        // exists there (one usercmd per frame). Here ticks outnumber commands ~7:1, so a snapshot
+        // that lands on a tick with no new command was never compared: the correction was applied
+        // raw (no miss, no cg_errorDecay smoothing), a hard pop of several to tens of units.
+        // Capture the replayed state the moment it reaches that commandTime instead.
+        let old_command_time = old.field_i32("commandTime").unwrap_or(0);
+        let mut replayed_at_old: Option<PlayerState> = (command_time == old_command_time)
+            .then(|| from_native(native.network()));
         for number in first..=current {
             let mut cmd = command(number);
             if prediction_settings.pmove_fixed != 0 {
@@ -1093,70 +1977,408 @@ impl Predictor {
             if cmd.server_time <= command_time || cmd.server_time > latest.server_time {
                 continue;
             }
-            if command_time == old.field_i32("commandTime").unwrap_or(0) {
-                if self.this_frame_teleport {
-                    self.predicted_error = [0.0; 3];
-                    self.this_frame_teleport = false;
-                } else {
-                    // CG_AdjustPositionForMover is not applied yet (no mover pushes).
-                    let replayed = from_native(native.network());
-                    let now = origin(&replayed);
-                    let before = origin(&old);
-                    let delta = [before[0] - now[0], before[1] - now[1], before[2] - now[2]];
-                    let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-                    if length > 0.1 {
-                        if settings.show_miss {
-                            let describe = |ps: &PlayerState| {
-                                let velocity = [
-                                    ps.field_f32("velocity[0]").unwrap_or(0.0),
-                                    ps.field_f32("velocity[1]").unwrap_or(0.0),
-                                    ps.field_f32("velocity[2]").unwrap_or(0.0),
-                                ];
-                                format!(
-                                    "o={:?} v={:?} ground={} pm_flags={:#x} legs={}",
-                                    origin(ps),
-                                    velocity,
-                                    ps.field_i32("groundEntityNum").unwrap_or(-1),
-                                    ps.field_i32("pm_flags").unwrap_or(0),
-                                    ps.field_i32("legsAnim").unwrap_or(0),
-                                )
-                            };
-                            self.misses.push(format!(
-                                "Prediction miss: {length} at commandTime {command_time} | predicted {} | server {}",
-                                describe(&old),
-                                describe(&replayed)
-                            ));
-                        }
-                        if settings.error_decay > 0.0 {
-                            let t = time - self.predicted_error_time;
-                            let f = ((settings.error_decay - t as f32) / settings.error_decay).max(0.0);
-                            self.predicted_error = self.predicted_error.map(|e| e * f);
-                        } else {
-                            self.predicted_error = [0.0; 3];
-                        }
-                        for axis in 0..3 {
-                            self.predicted_error[axis] += delta[axis];
-                        }
-                        self.predicted_error_time = old_time;
-                    }
-                }
-            }
             if prediction_settings.pmove_fixed != 0 {
                 let msec = prediction_settings.pmove_msec;
                 cmd.server_time = ((cmd.server_time + msec - 1) / msec) * msec;
             }
+            let record_ground = settings.ground_trace_debug > 0 && number > self.ground_logged_cmd;
+            if record_ground {
+                *world.ground_trace = None;
+                *world.ground_probe = None;
+            }
             movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
             let native_view = native.view();
+            if record_ground {
+                self.ground_logged_cmd = number;
+                let record = GroundRecord {
+                    cmd_number: number,
+                    cmd_time: cmd.server_time,
+                    origin: native_view.origin,
+                    velocity: native_view.velocity,
+                    ground_entity: native_view.ground_entity,
+                    pm_flags: native_view.pm_flags,
+                    pm_time: native_view.pm_time,
+                    legs_anim: native_view.legs_anim,
+                    trace: *world.ground_trace,
+                    probe: *world.ground_probe,
+                };
+                let describe = |r: &GroundRecord| {
+                    format!(
+                        "cmd={} t={} ground={} o=({:.2},{:.2},{:.2}) v=({:.0},{:.0},{:.0}) pmf={:#x} pmt={} | {} | {}",
+                        r.cmd_number, r.cmd_time, r.ground_entity, r.origin[0], r.origin[1], r.origin[2],
+                        r.velocity[0], r.velocity[1], r.velocity[2], r.pm_flags, r.pm_time,
+                        ground_trace_text("trace.25", r.trace), ground_trace_text("probe64", r.probe),
+                    )
+                };
+                let changed = record.ground_entity != self.ground_previous;
+                if settings.ground_trace_debug >= 2 || changed {
+                    let tag = if changed { format!("GT {}->{}", self.ground_previous, record.ground_entity) } else { "GT".to_owned() };
+                    self.misses.push(format!("^3{tag}^7 {}", describe(&record)));
+                }
+                self.ground_previous = record.ground_entity;
+                self.ground_log.push_back(record);
+                while self.ground_log.len() > 512 {
+                    self.ground_log.pop_front();
+                }
+            }
             command_time = native_view.command_time;
             replay_view_forced = native_view.view_forced != 0;
             moved = true;
+            if replayed_at_old.is_none() && command_time == old_command_time {
+                replayed_at_old = Some(from_native(native.network()));
+            }
+        }
+        if let Some(replayed) = replayed_at_old.take() {
+            let command_time = old_command_time;
+            if self.this_frame_teleport {
+                self.predicted_error = [0.0; 3];
+                self.this_frame_teleport = false;
+            } else {
+                // The mover under the replayed state has moved since last frame.
+                let now = adjust_position_for_mover(entities, &replayed, origin(&replayed), physics_time, old_time);
+                let before = origin(&old);
+                let delta = [before[0] - now[0], before[1] - now[1], before[2] - now[2]];
+                let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                if length > 0.1 {
+                if debug_enabled {
+                    self.miss_sequence = self.miss_sequence.wrapping_add(1);
+                    let sequence = self.miss_sequence;
+                    let mut server = prediction_state_debug(&replayed);
+                    // Match the mover-adjusted position used by the actual
+                    // prediction-error calculation above.
+                    server.origin = now;
+                    self.latest_miss = Some(PredictionMissDebug {
+                        sequence,
+                        detected_at: Instant::now(),
+                        command_time,
+                        delta,
+                        length,
+                        predicted: prediction_state_debug(&old),
+                        server,
+                        previous_ground_trace: self.last_ground_trace,
+                        previous_ground_probe: self.last_ground_probe,
+                        replay_ground_trace: None,
+                        replay_ground_probe: None,
+                    });
+                    miss_sequence_this_frame = Some(sequence);
+                }
+                if settings.show_miss {
+                    let describe = |ps: &PlayerState| {
+                        let velocity = [
+                            ps.field_f32("velocity[0]").unwrap_or(0.0),
+                            ps.field_f32("velocity[1]").unwrap_or(0.0),
+                            ps.field_f32("velocity[2]").unwrap_or(0.0),
+                        ];
+                        format!(
+                            "o={:?} v={:?} ground={} pm_flags={:#x} legs={}",
+                            origin(ps),
+                            velocity,
+                            ps.field_i32("groundEntityNum").unwrap_or(-1),
+                            ps.field_i32("pm_flags").unwrap_or(0),
+                            ps.field_i32("legsAnim").unwrap_or(0),
+                        )
+                    };
+                    self.misses.push(format!(
+                        "Prediction miss: {length} at commandTime {command_time} | predicted {} | server {}",
+                        describe(&old),
+                        describe(&replayed)
+                    ));
+                }
+                if settings.prediction_miss_highlight && length >= settings.prediction_miss_threshold {
+                    // The red screen-edge flash fired for this one: leave a timestamped line in the
+                    // log saying what was corrected (the flash itself is not recorded anywhere).
+                    let predicted = prediction_state_debug(&old);
+                    let mut server = prediction_state_debug(&replayed);
+                    server.origin = now;
+                    self.misses.push(format!(
+                        "^1PRED-FLASH^7 miss={length:.2}u delta=[{:.2},{:.2},{:.2}] cmd={command_time} | predicted o=({:.2},{:.2},{:.2}) v=({:.0},{:.0},{:.0}) ground={} pmf={:#x} legs={} | replay o=({:.2},{:.2},{:.2}) v=({:.0},{:.0},{:.0}) ground={} pmf={:#x} legs={}",
+                        delta[0], delta[1], delta[2],
+                        predicted.origin[0], predicted.origin[1], predicted.origin[2],
+                        predicted.velocity[0], predicted.velocity[1], predicted.velocity[2],
+                        predicted.ground_entity, predicted.pm_flags, predicted.legs_anim,
+                        server.origin[0], server.origin[1], server.origin[2],
+                        server.velocity[0], server.velocity[1], server.velocity[2],
+                        server.ground_entity, server.pm_flags, server.legs_anim,
+                    ));
+                }
+                if settings.prediction_debug {
+                    let predicted = prediction_state_debug(&old);
+                    let mut server = prediction_state_debug(&replayed);
+                    server.origin = now;
+                    self.misses.push(format!(
+                        "PRED-DIAG miss={length:.3} delta=[{:.3},{:.3},{:.3}] cmd={} | pred o={:?} v={:?} ground={} pm_type={} flags={:#x} legs={} torso={} inAir={} scale={} | replay o={:?} v={:?} ground={} pm_type={} flags={:#x} legs={} torso={} inAir={} scale={}",
+                        delta[0], delta[1], delta[2], command_time,
+                        predicted.origin, predicted.velocity, predicted.ground_entity, predicted.pm_type,
+                        predicted.pm_flags, predicted.legs_anim, predicted.torso_anim,
+                        predicted.in_air_anim, predicted.model_scale,
+                        server.origin, server.velocity, server.ground_entity, server.pm_type,
+                        server.pm_flags, server.legs_anim, server.torso_anim,
+                        server.in_air_anim, server.model_scale,
+                    ));
+                    if let Some(trace) = self.last_ground_trace {
+                        self.misses.push(format!(
+                            "PRED-DIAG previous groundTrace start={:?} end={:?} frac={:.4} hit={:?} normal={:?} ent={} startSolid={} allSolid={}",
+                            trace.start, trace.end, trace.fraction, trace.hit_end, trace.normal,
+                            trace.entity, trace.start_solid, trace.all_solid,
+                        ));
+                    }
+                    if let Some(trace) = self.last_ground_probe {
+                        self.misses.push(format!(
+                            "PRED-DIAG previous groundProbe64 start={:?} end={:?} frac={:.4} hit={:?} normal={:?} ent={} startSolid={} allSolid={}",
+                            trace.start, trace.end, trace.fraction, trace.hit_end, trace.normal,
+                            trace.entity, trace.start_solid, trace.all_solid,
+                        ));
+                    }
+                }
+                if settings.error_decay > 0.0 {
+                    let t = time - self.predicted_error_time;
+                    let f = ((settings.error_decay - t as f32) / settings.error_decay).max(0.0);
+                    self.predicted_error = self.predicted_error.map(|e| e * f);
+                } else {
+                    self.predicted_error = [0.0; 3];
+                }
+                for axis in 0..3 {
+                    self.predicted_error[axis] += delta[axis];
+                }
+                self.predicted_error_time = old_time;
+                }
+            }
+        }
+        if settings.ground_trace_debug > 0 && base.message_num != self.ground_compared_snapshot {
+            // The server's ground state for this snapshot's commandTime against what this client
+            // predicted for that same command when it was first run.
+            self.ground_compared_snapshot = base.message_num;
+            let server_time = base_ps.field_i32("commandTime").unwrap_or(0);
+            let server_ground = base_ps.field_i32("groundEntityNum").unwrap_or(-1);
+            let server_origin = origin(base_ps);
+            if let Some(record) = self.ground_log.iter().rev().find(|r| r.cmd_time == server_time).copied() {
+                let delta = [
+                    record.origin[0] - server_origin[0],
+                    record.origin[1] - server_origin[1],
+                    record.origin[2] - server_origin[2],
+                ];
+                let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                let grounded = |entity: i32| entity != 1023 && entity >= 0;
+                let ground_differs = grounded(record.ground_entity) != grounded(server_ground)
+                    || (grounded(server_ground) && record.ground_entity != server_ground);
+                if ground_differs || distance > DRIFT_UNITS || settings.ground_trace_debug >= 2 {
+                    let verdict = if ground_differs { "^1GT-MISMATCH" } else if distance > DRIFT_UNITS { "^3GT-DRIFT" } else { "^2GT-OK" };
+                    self.misses.push(format!(
+                        "{verdict}^7 snap#{} cmd={} t={} | predicted ground={} o=({:.2},{:.2},{:.2}) v=({:.0},{:.0},{:.0}) pmf={:#x} pmt={} legs={} | server ground={} o=({:.2},{:.2},{:.2}) v=({:.0},{:.0},{:.0}) pmf={:#x} pmt={} legs={} | delta=({:.2},{:.2},{:.2}) |d|={distance:.2} | {}",
+                        base.message_num, record.cmd_number, server_time,
+                        record.ground_entity, record.origin[0], record.origin[1], record.origin[2],
+                        record.velocity[0], record.velocity[1], record.velocity[2],
+                        record.pm_flags, record.pm_time, record.legs_anim,
+                        server_ground, server_origin[0], server_origin[1], server_origin[2],
+                        base_ps.field_f32("velocity[0]").unwrap_or(0.0),
+                        base_ps.field_f32("velocity[1]").unwrap_or(0.0),
+                        base_ps.field_f32("velocity[2]").unwrap_or(0.0),
+                        base_ps.field_i32("pm_flags").unwrap_or(0),
+                        base_ps.field_i32("pm_time").unwrap_or(0),
+                        base_ps.field_i32("legsAnim").unwrap_or(0),
+                        delta[0], delta[1], delta[2],
+                        ground_trace_text("trace.25", record.trace),
+                    ));
+                }
+            }
+        }
+        let replay_ground_trace = *world.ground_trace;
+        let replay_ground_probe = *world.ground_probe;
+        let backend_candidates: Vec<i32> = if settings.predict_backend >= 0 {
+            vec![settings.predict_backend]
+        } else if detected_japro {
+            vec![1]
+        } else {
+            vec![0, 1]
+        };
+        let snap_candidates: Vec<i32> = if settings.snap_mode >= 0 {
+            vec![settings.snap_mode]
+        } else if detected_japro {
+            vec![0]
+        } else {
+            vec![0, 1, 2]
+        };
+        let combos: Vec<(i32, i32)> = backend_candidates
+            .iter()
+            .flat_map(|&backend| snap_candidates.iter().map(move |&snap| (backend, snap)))
+            .collect();
+        let detecting = combos.len() > 1;
+        if (settings.physics_diag > 0 || detecting)
+            && self.diag_previous.as_ref().map_or(true, |(message, _)| *message != base.message_num)
+        {
+            // Does this client's pmove reproduce the server's? Replay exactly the commands the server
+            // ran between the previous snapshot and this one, starting from the previous snapshot's
+            // state, and compare with this snapshot. Any difference is a pure physics mismatch over
+            // one snapshot interval, with no long replay chain, time sync or smoothing involved.
+            // The same interval is replayed under every candidate (stock or jaPRO backend, each
+            // velocity rounding) and the candidate that reproduces the server wins the vote: at 1 ms
+            // steps the rounding, and any modded server's movement, decide friction and gravity.
+            if let Some((_, previous)) = self.diag_previous.take() {
+                let start = previous.field_i32("commandTime").unwrap_or(0);
+                let end = base_ps.field_i32("commandTime").unwrap_or(0);
+                let skipped = (previous.field_i32("eFlags").unwrap_or(0) ^ base_ps.field_i32("eFlags").unwrap_or(0))
+                    & EF_TELEPORT_BIT
+                    != 0
+                    || previous.field_i32("clientNum") != base_ps.field_i32("clientNum")
+                    || previous.field_i32("pm_type") != base_ps.field_i32("pm_type");
+                if end > start && !skipped {
+                    let mut results: Vec<(i32, i32, IntervalCheck, PlayerState)> = Vec::new();
+                    let (mut steps, mut min_gap, mut max_gap) = (0u32, i32::MAX, 0i32);
+                    for &(backend, snap) in &combos {
+                        jka_movement::set_snap_mode(snap);
+                        let mut candidate = prediction_settings;
+                        candidate.server_mod = backend;
+                        let mut probe = NativePlayerState::from_network(&to_native(&previous))?;
+                        probe.configure(&candidate)?;
+                        probe.set_foot_bolts(self.foot_bolts)?;
+                        let (mut count, mut low, mut high, mut last) = (0u32, i32::MAX, 0i32, start);
+                        for number in first..=current {
+                            let mut cmd = command(number);
+                            let mut time = cmd.server_time;
+                            if candidate.pmove_fixed != 0 {
+                                let msec = candidate.pmove_msec;
+                                time = ((time + msec - 1) / msec) * msec;
+                            }
+                            if time <= start {
+                                continue;
+                            }
+                            if time > end {
+                                break;
+                            }
+                            if candidate.pmove_fixed != 0 {
+                                movement.update_view_angles(&mut probe, movement_cmd(&cmd));
+                                cmd.server_time = time;
+                            }
+                            low = low.min(time - last);
+                            high = high.max(time - last);
+                            last = time;
+                            movement.predict(&mut probe, movement_cmd(&cmd), &candidate, &mut world)?;
+                            count += 1;
+                        }
+                        if count > 0 && last == end {
+                            let replayed = from_native(probe.network());
+                            let check = check_interval(&replayed, base_ps);
+                            (steps, min_gap, max_gap) = (count, low, high);
+                            results.push((backend, snap, check, replayed));
+                        }
+                    }
+                    jka_movement::set_snap_mode(effective_snap_mode);
+                    if !results.is_empty() {
+                        if detecting && results.len() == combos.len() {
+                            for (backend, snap, check, _) in &results {
+                                self.diag_combo_matched[combo_index(*backend, *snap)] += u32::from(check.exact);
+                            }
+                            let exact: Vec<(i32, i32)> = results.iter().filter(|r| r.2.exact).map(|r| (r.0, r.1)).collect();
+                            // Informative only when the candidates disagree about this interval.
+                            if !exact.is_empty() && exact.len() < results.len() {
+                                for &(backend, snap) in &exact {
+                                    self.combo_votes[combo_index(backend, snap)] += 1;
+                                }
+                                if self.combo_votes.iter().sum::<u32>() > 400 {
+                                    self.combo_votes = self.combo_votes.map(|votes| votes / 2);
+                                }
+                                let best = combos
+                                    .iter()
+                                    .copied()
+                                    .max_by_key(|&(backend, snap)| self.combo_votes[combo_index(backend, snap)])
+                                    .unwrap_or((effective_backend, effective_snap_mode));
+                                let best_votes = self.combo_votes[combo_index(best.0, best.1)];
+                                let current_votes = self.combo_votes[combo_index(effective_backend, effective_snap_mode)];
+                                if best != (effective_backend, effective_snap_mode)
+                                    && best_votes >= 4
+                                    && best_votes >= current_votes + 3
+                                {
+                                    if settings.predict_backend < 0 && !detected_japro {
+                                        self.auto_backend = best.0;
+                                    }
+                                    if settings.snap_mode < 0 && !detected_japro {
+                                        self.auto_snap = best.1;
+                                    }
+                                    jka_movement::set_snap_mode(if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap });
+                                    self.snap_mode_applied = Some(if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap });
+                                    self.misses.push(format!(
+                                        "^3PREDICT-MODE^7 detected: {} reproduces this server best ({best_votes} votes vs {current_votes} for {}); applying it",
+                                        combo_name(best.0, best.1),
+                                        combo_name(effective_backend, effective_snap_mode),
+                                    ));
+                                }
+                            }
+                        }
+                        let active = results
+                            .iter()
+                            .find(|r| r.0 == effective_backend && r.1 == effective_snap_mode)
+                            .unwrap_or(&results[0]);
+                        let (check, replayed) = (&active.2, &active.3);
+                        let field = |ps: &PlayerState, name: &str| ps.field_f32(name).unwrap_or(0.0);
+                        let magnitude = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                        self.diag_compared += 1;
+                        self.diag_matched += u32::from(check.exact);
+                        if settings.physics_diag > 0 && (!check.exact || settings.physics_diag >= 2) {
+                            self.misses.push(format!(
+                                "{}^7 snap#{} cmdtime {start}->{end} steps={steps} gaps={min_gap}..{max_gap}ms using {} | origin d=({:.3},{:.3},{:.3}) |d|={:.3} | vel d=({:.2},{:.2},{:.2}) | start v=({:.0},{:.0},{:.0}) replay v=({:.2},{:.2},{:.2}) server v=({:.2},{:.2},{:.2}) | ground {}/{} pmf {:#x}/{:#x} pmt {}/{} (replay/server)",
+                                if check.exact { "^2PHYS-OK" } else { "^1PHYS-DIAG" },
+                                base.message_num,
+                                combo_name(active.0, active.1),
+                                check.origin_delta[0], check.origin_delta[1], check.origin_delta[2], magnitude(check.origin_delta),
+                                check.velocity_delta[0], check.velocity_delta[1], check.velocity_delta[2],
+                                field(&previous, "velocity[0]"), field(&previous, "velocity[1]"), field(&previous, "velocity[2]"),
+                                field(replayed, "velocity[0]"), field(replayed, "velocity[1]"), field(replayed, "velocity[2]"),
+                                field(base_ps, "velocity[0]"), field(base_ps, "velocity[1]"), field(base_ps, "velocity[2]"),
+                                check.ground.0, check.ground.1, check.flags.0, check.flags.1, check.timer.0, check.timer.1,
+                            ));
+                        }
+                        if settings.physics_diag > 0 && self.diag_compared % 20 == 0 {
+                            let by_candidate = if detecting {
+                                let parts: Vec<String> = combos
+                                    .iter()
+                                    .map(|&(backend, snap)| format!("{} {}", combo_name(backend, snap), self.diag_combo_matched[combo_index(backend, snap)]))
+                                    .collect();
+                                format!("; exact per candidate: {}; using {}", parts.join(" | "), combo_name(effective_backend, effective_snap_mode))
+                            } else {
+                                String::new()
+                            };
+                            self.misses.push(format!(
+                                "^3PHYS-DIAG summary^7: {} of {} snapshot intervals reproduced exactly ({} commands per interval, gaps {min_gap}..{max_gap} ms){by_candidate}",
+                                self.diag_matched, self.diag_compared, steps,
+                            ));
+                        }
+                    }
+                }
+            }
+            self.diag_previous = Some((base.message_num, base_ps.clone()));
+        }
+        if let Some(sequence) = miss_sequence_this_frame {
+            if let Some(miss) = self.latest_miss.as_mut().filter(|miss| miss.sequence == sequence) {
+                miss.replay_ground_trace = replay_ground_trace;
+                miss.replay_ground_probe = replay_ground_probe;
+            }
+            if settings.prediction_debug {
+                if let Some(trace) = replay_ground_trace {
+                    self.misses.push(format!(
+                        "PRED-DIAG replay groundTrace start={:?} end={:?} frac={:.4} hit={:?} normal={:?} ent={} startSolid={} allSolid={}",
+                        trace.start, trace.end, trace.fraction, trace.hit_end, trace.normal,
+                        trace.entity, trace.start_solid, trace.all_solid,
+                    ));
+                }
+                if let Some(trace) = replay_ground_probe {
+                    self.misses.push(format!(
+                        "PRED-DIAG replay groundProbe64 start={:?} end={:?} frac={:.4} hit={:?} normal={:?} ent={} startSolid={} allSolid={}",
+                        trace.start, trace.end, trace.fraction, trace.hit_end, trace.normal,
+                        trace.entity, trace.start_solid, trace.all_solid,
+                    ));
+                }
+            }
         }
         // OpenJK leaves cg.predictedPlayerState at the base snapshot's state
         // when no command was replayed.
-        self.predicted = Some(if moved { from_native(native.network()) } else { base_ps.clone() });
+        let mut predicted = if moved { from_native(native.network()) } else { base_ps.clone() };
         if moved {
+            // Adjust for the movement of the ground entity up to this frame.
+            let carried = adjust_position_for_mover(entities, &predicted, origin(&predicted), physics_time, time);
+            set_origin(&mut predicted, carried);
             self.predicted_view_forced = replay_view_forced;
         }
+        self.predicted = Some(predicted);
         self.display = self.predicted.clone();
         self.display_view_forced = self.predicted_view_forced;
         self.display_angles = session.command(current).map(|cmd| cmd.angles);
@@ -1165,10 +2387,39 @@ impl Predictor {
             if prediction_settings.pmove_fixed == 0 && cmd.server_time > reached && cmd.server_time > latest.server_time {
                 movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
                 let native_view = native.view();
-                self.display = Some(from_native(native.network()));
+                let mut display = from_native(native.network());
+                let carried = adjust_position_for_mover(entities, &display, origin(&display), physics_time, time);
+                set_origin(&mut display, carried);
+                if let Some(committed) = self.predicted.as_ref() {
+                    keep_committed_animation(&mut display, committed);
+                }
+                self.display = Some(display);
                 self.display_view_forced = native_view.view_forced != 0;
                 self.display_angles = Some(cmd.angles);
             }
+        }
+        if debug_enabled {
+            let display = self.display.as_ref().map(prediction_state_debug).unwrap_or_default();
+            let committed = self.predicted.as_ref().map(prediction_state_debug).unwrap_or_default();
+            self.last_ground_trace = *world.ground_trace;
+            self.last_ground_probe = *world.ground_probe;
+            self.debug_frame = Some(PredictionFrameDebug {
+                server_time: time,
+                base_message: base.message_num,
+                base_time: base.server_time,
+                base: prediction_state_debug(base_ps),
+                settings: prediction_settings,
+                display,
+                committed,
+                view_error: self.last_view_error,
+                ground_trace: self.last_ground_trace,
+                ground_probe: self.last_ground_probe,
+            });
+        } else {
+            self.debug_frame = None;
+            self.latest_miss = None;
+            self.last_ground_trace = None;
+            self.last_ground_probe = None;
         }
         Ok(())
     }
@@ -1177,6 +2428,67 @@ impl Predictor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mover_entity(number: u16, entity_type: i32, base: [f32; 3], delta: [f32; 3]) -> crate::cgame::PresentedEntity {
+        use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+        let mut state = EntityState { number, fields: [0; ENTITY_FIELDS.len()] };
+        let mut set = |name: &str, bits: u32| {
+            let index = ENTITY_FIELDS.iter().position(|(n, _)| *n == name).unwrap();
+            state.fields[index] = bits;
+        };
+        set("pos.trType", 2); // TR_LINEAR
+        set("pos.trTime", 0);
+        for axis in 0..3 {
+            set(&format!("pos.trBase[{axis}]"), base[axis].to_bits());
+            set(&format!("pos.trDelta[{axis}]"), delta[axis].to_bits());
+        }
+        crate::cgame::PresentedEntity { number, entity_type, origin: base, angles: [0.0; 3], state }
+    }
+
+    fn standing_on(ground: i32) -> PlayerState {
+        let mut ps = PlayerState::default();
+        assert!(ps.set_field_bits("groundEntityNum", ground as u32));
+        ps
+    }
+
+    #[test]
+    fn ground_mover_carries_the_predicted_origin_between_times() {
+        let entities = [mover_entity(70, ET_MOVER, [0.0; 3], [0.0, 0.0, 100.0])];
+        let carried = adjust_position_for_mover(&entities, &standing_on(70), [10.0, 20.0, 30.0], 1000, 1250);
+        assert_eq!(carried, [10.0, 20.0, 55.0]);
+        // Going back in time undoes the same amount (oldTime < physicsTime).
+        let back = adjust_position_for_mover(&entities, &standing_on(70), [10.0, 20.0, 30.0], 1250, 1000);
+        assert_eq!(back, [10.0, 20.0, 5.0]);
+    }
+
+    #[test]
+    fn only_ground_movers_carry_the_player() {
+        let position = [1.0, 2.0, 3.0];
+        let mover = mover_entity(70, ET_MOVER, [0.0; 3], [0.0, 0.0, 100.0]);
+        let not_a_mover = mover_entity(71, 1, [0.0; 3], [0.0, 0.0, 100.0]);
+        let entities = [mover, not_a_mover];
+        // World ground, ENTITYNUM_NONE, a non-mover and a missing entity stay put.
+        for ground in [0, 1023, 71, 72] {
+            assert_eq!(adjust_position_for_mover(&entities, &standing_on(ground), position, 0, 500), position);
+        }
+        // Spectators and followers are never carried.
+        let mut spectator = standing_on(70);
+        spectator.persistant[PERS_TEAM] = TEAM_SPECTATOR;
+        assert_eq!(adjust_position_for_mover(&entities, &spectator, position, 0, 500), position);
+        let mut follower = standing_on(70);
+        follower.set_field_bits("pm_flags", PMF_FOLLOW_FLAG as u32);
+        assert_eq!(adjust_position_for_mover(&entities, &follower, position, 0, 500), position);
+    }
+
+    #[test]
+    fn mover_solids_are_placed_at_physics_time() {
+        let mut entity = mover_entity(70, ET_MOVER, [0.0; 3], [0.0, 0.0, 100.0]);
+        let index = jka_protocol::gamestate::ENTITY_FIELDS.iter().position(|(n, _)| *n == "solid").unwrap();
+        entity.state.fields[index] = 0x00ff_ffff;
+        let solids = solid_entities(&[entity], 500);
+        let EntityClip::InlineModel { origin, .. } = solids[0].clip else { panic!("bmodel expected") };
+        assert_eq!(origin, [0.0, 0.0, 50.0]);
+    }
 
     #[test]
     #[ignore = "requires JKA_TEST_BASE with the stock mp/ffa3 BSP"]
@@ -1197,6 +2509,7 @@ mod tests {
             generic_enemy_index: 0,
             skip_movement: false,
             clip: EntityClip::Box { mins: [-15.0, -15.0, -24.0], maxs: [15.0, 15.0, 40.0], origin: [spawn[0] + 48.0, spawn[1], spawn[2] + 16.0] },
+            bounds: None,
         };
         let solids = [player];
         let mut prediction = PredictionWorld { world: &mut world, solids: &solids, client_num: 4 };
@@ -1206,7 +2519,7 @@ mod tests {
         // The passed entity (ourselves) and owned objects are ignored.
         let ignored = PredictionWorld { world: &mut world, solids: &solids, client_num: 4 }.trace(TraceQuery { pass_entity: 7, ..query });
         assert_eq!(ignored.fraction, 1.0);
-        let owned = [SolidEntity { number: 300, generic_enemy_index: 1024 + 4, skip_movement: false, clip: player.clip }];
+        let owned = [SolidEntity { number: 300, generic_enemy_index: 1024 + 4, skip_movement: false, clip: player.clip, bounds: None }];
         assert_eq!(PredictionWorld { world: &mut world, solids: &owned, client_num: 4 }.trace(query).fraction, 1.0);
 
         // An inline model translated onto the path blocks like CM_TransformedBoxTrace.
@@ -1215,6 +2528,7 @@ mod tests {
             generic_enemy_index: 0,
             skip_movement: false,
             clip: EntityClip::InlineModel { index: 1, origin: [0.0; 3], angles: [0.0; 3] },
+            bounds: None,
         }];
         let model_contents = PredictionWorld { world: &mut world, solids: &mover, client_num: 4 }.point_contents(start, 4);
         assert_eq!(model_contents & 1, 0, "spawn point is not inside *1 at its compiled position");
@@ -1237,7 +2551,7 @@ mod tests {
         let movement = PmoveContext::new(&animation).unwrap();
         let mut settings = NetworkSettings { name: "DinurdoPredict".into(), show_miss: true, ..NetworkSettings::default() };
         settings.max_packets = 60;
-        let mut net = NetClient::connect(&server, settings.userinfo("kyle/default")).unwrap();
+        let mut net = NetClient::connect(&server, settings.userinfo("kyle/default"), 0).unwrap();
         let mut world: Option<CollisionWorld> = None;
         let mut latest: Option<Snapshot> = None;
         let mut input = LiveInput::default();
@@ -1300,6 +2614,7 @@ mod tests {
                 preview.server_time = net.session().server_time();
                 provisional = Some(preview);
             }
+            net.session_mut().set_packet_dup(settings.packet_dup as i32);
             net.session_mut().send_commands(now, settings.max_packets as i32);
             net.flush();
             if let (Some(time), Some(snapshot), Some(world)) = (time, latest.as_ref(), world.as_mut()) {
@@ -1371,12 +2686,115 @@ mod tests {
     }
 
     #[test]
+    fn chat_bubble_cvars_default_on_and_round_trip() {
+        let mut settings = NetworkSettings::default();
+        assert_eq!(settings.cvar_value("cl_chatBubbleSelf").as_deref(), Some("1"));
+        assert_eq!(settings.cvar_value("cl_chatBubbleUnfocused").as_deref(), Some("1"));
+        assert_eq!(settings.set_cvar("cl_chatBubbleSelf", "0").unwrap().unwrap(), false);
+        assert!(!settings.chat_bubble_self && settings.chat_bubble_unfocused);
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta cl_chatBubbleSelf \"0\""));
+        assert!(cfg.contains("seta cl_chatBubbleUnfocused \"1\""));
+    }
+
+    #[test]
+    fn rgb_saber_userinfo_follows_server_mod() {
+        use mod_support::ServerMod;
+        let mut settings = NetworkSettings::default();
+        assert_eq!(settings.set_cvar("color1", "6").unwrap().unwrap(), true);
+        assert_eq!(settings.set_cvar("cp_sbRGB1", "16711680").unwrap().unwrap(), true); // pure blue
+
+        // jaPRO / JA+ relay the RGB and keep colour 6.
+        for server_mod in [ServerMod::Japro, ServerMod::Japlus] {
+            let info = settings.userinfo_for_mod("kyle/default", server_mod);
+            assert_eq!(info_value(&info, b"color1"), Some(b"6".as_slice()));
+            assert_eq!(info_value(&info, b"cp_sbRGB1"), Some(b"16711680".as_slice()));
+        }
+        // Everyone else gets the closest stock colour and no RGB key.
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"color1"), Some(b"4".as_slice()));
+        assert_eq!(info_value(&info, b"cp_sbRGB1"), None);
+        // A stock colour is never rewritten.
+        settings.set_cvar("color2", "2").unwrap().unwrap();
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"color2"), Some(b"2".as_slice()));
+
+        assert_eq!(nearest_base_saber_color(0x0000FF), 0); // red
+        assert_eq!(nearest_base_saber_color(0x00FF00), 3); // green
+        assert_eq!(nearest_base_saber_color(base_saber_rgb_packed(5)), 5);
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta cp_sbRGB1 \"16711680\""));
+    }
+
+    #[test]
+    fn char_color_is_a_userinfo_cvar_like_openjk() {
+        use mod_support::ServerMod;
+        let mut settings = NetworkSettings::default();
+        let info = settings.userinfo("kyle/default");
+        for key in [&b"char_color_red"[..], b"char_color_green", b"char_color_blue"] {
+            assert_eq!(info_value(&info, key), Some(b"255".as_slice()));
+        }
+        assert_eq!(settings.set_cvar("char_color_red", "10").unwrap().unwrap(), true);
+        assert_eq!(settings.set_cvar("char_color_green", "300").unwrap().unwrap(), true); // clamped
+        assert_eq!(settings.set_cvar("char_color_blue", "0").unwrap().unwrap(), true);
+        assert_eq!(settings.set_cvar("handicap", "50").unwrap().unwrap(), true);
+        assert_eq!(settings.cvar_value("CHAR_COLOR_GREEN").as_deref(), Some("255"));
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"char_color_red"), Some(b"10".as_slice()));
+        assert_eq!(info_value(&info, b"char_color_green"), Some(b"255".as_slice()));
+        assert_eq!(info_value(&info, b"char_color_blue"), Some(b"0".as_slice()));
+        assert_eq!(info_value(&info, b"handicap"), Some(b"50".as_slice()));
+        assert_eq!(info_value(&info, b"cp_cosmetics"), None);
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta char_color_red \"10\""));
+        assert!(!cfg.contains("cp_clanPwd"));
+    }
+
+    #[test]
+    fn cosmetics_bit_31_round_trips_as_a_signed_int() {
+        let mut settings = NetworkSettings::default();
+        // Super Saiyan is bit 31; jaPRO stores the mask as a signed int.
+        let mask = (1u32 << 31) | (1 << 3);
+        settings.set_cvar("cp_cosmetics", &(mask as i32).to_string()).unwrap().unwrap();
+        assert_eq!(settings.cosmetics, mask);
+        assert_eq!(settings.cvar_value("cp_cosmetics").as_deref(), Some((mask as i32).to_string().as_str()));
+    }
+
+    #[test]
+    fn japro_only_userinfo_is_sent_to_japro_servers() {
+        use mod_support::ServerMod;
+        let mut settings = NetworkSettings::default();
+        settings.set_cvar("cp_cosmetics", "5").unwrap().unwrap();
+        settings.display_camera_position = "0 120 8".into();
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Japro);
+        assert_eq!(info_value(&info, b"cp_cosmetics"), Some(b"5".as_slice()));
+        assert_eq!(info_value(&info, b"cp_clanPwd"), Some(b"none".as_slice()));
+        assert_eq!(info_value(&info, b"cg_displayCameraPosition"), Some(b"0 120 8".as_slice()));
+        assert_eq!(info_value(&info, b"cg_displayNetSettings"), Some(b"125 0 125".as_slice()));
+        assert!(jka_protocol::netchan::connect_packet(&info).is_ok());
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"cg_displayNetSettings"), None);
+        assert!(settings.set_cvar("cg_displayNetSettings", "1 2 3").unwrap().is_err());
+    }
+
+    #[test]
     fn userinfo_contains_stock_keys_in_openjk_order() {
         let info = NetworkSettings::default().userinfo("kyle/default");
-        let text = String::from_utf8(info).unwrap();
+        let text = String::from_utf8(info.clone()).unwrap();
         assert!(text.starts_with("\\name\\Padawan\\rate\\25000\\snaps\\40\\model\\kyle/default"), "{text}");
-        assert!(text.ends_with("\\teamtask\\0"), "{text}");
+        assert!(text.ends_with("\\char_color_blue\\255"), "{text}");
+        assert_eq!(info_value(&info, b"teamtask"), None);
         assert!(jka_protocol::netchan::connect_packet(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn net_port_defaults_to_jka_port_but_is_not_userinfo() {
+        let settings = NetworkSettings::default();
+        assert_eq!(settings.net_port, jka_protocol::DEFAULT_PORT);
+        assert_eq!(info_value(&settings.userinfo("kyle/default"), b"net_port"), None);
     }
 
     #[test]
@@ -1397,6 +2815,17 @@ mod tests {
         assert_eq!(settings.hook_pull, 0);
         config.clear();
         assert_eq!(predict_settings(&config, &ps).server_mod, 0);
+    }
+
+    #[test]
+    fn step_slide_fix_follows_serverinfo_and_is_off_when_absent() {
+        let ps = PlayerState::default();
+        let mut config = std::collections::BTreeMap::from([(0, br"\gamename\basejka".to_vec())]);
+        assert_eq!(predict_settings(&config, &ps).step_slide_fix, 0);
+        config.insert(0, br"\gamename\basejka\g_stepSlideFix\1".to_vec());
+        assert_eq!(predict_settings(&config, &ps).step_slide_fix, 1);
+        config.insert(0, br"\gamename\basejka\g_stepSlideFix\0".to_vec());
+        assert_eq!(predict_settings(&config, &ps).step_slide_fix, 0);
     }
 
     #[test]
@@ -1457,5 +2886,40 @@ mod tests {
         assert_eq!(input.weapon_select, 3, "slot 1 selects the saber when not already wielded");
         input.cycle_weapon(&ps, true);
         assert_eq!(input.weapon_select, 4);
+    }
+
+    #[test]
+    fn out_of_ammo_change_skips_the_dry_weapon_and_explosives() {
+        let mut ps = PlayerState::default();
+        ps.stats[4] = (1 << 4) | (1 << 5) | (1 << 12);
+        ps.ammo[2] = 100;
+        ps.ammo[8] = 100; // thermal ammo: safe autoswitch must still skip it
+        let mut input = LiveInput::default();
+        input.out_of_ammo_change(&ps, 5, 1);
+        assert_eq!(input.weapon_select, 4, "blaster ran dry, pistol is next best");
+        input.out_of_ammo_change(&ps, 4, 1);
+        assert_eq!(input.weapon_select, 5);
+    }
+
+    #[test]
+    fn pickup_autoswitch_respects_level_saber_and_safety() {
+        let with_weapon = |weapon: u32| {
+            let mut ps = PlayerState::default();
+            ps.set_field_bits("weapon", weapon);
+            ps
+        };
+        let mut input = LiveInput::default();
+        input.pickup_autoswitch(&with_weapon(4), 5, 1);
+        assert_eq!(input.weapon_select, 5, "a better safe weapon is selected");
+        input.pickup_autoswitch(&with_weapon(4), 11, 1);
+        assert_eq!(input.weapon_select, 5, "rockets are unsafe at level 1");
+        input.pickup_autoswitch(&with_weapon(4), 11, 2);
+        assert_eq!(input.weapon_select, 11);
+        input.pickup_autoswitch(&with_weapon(3), 7, 2);
+        assert_eq!(input.weapon_select, 11, "never away from the saber");
+        input.pickup_autoswitch(&with_weapon(6), 5, 2);
+        assert_eq!(input.weapon_select, 11, "worse weapons are ignored");
+        input.pickup_autoswitch(&with_weapon(4), 8, 0);
+        assert_eq!(input.weapon_select, 11, "level 0 never switches");
     }
 }

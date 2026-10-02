@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-const TASK_COUNT: usize = 17;
+const TASK_COUNT: usize = 25;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MapJobProgress {
@@ -193,6 +193,25 @@ impl MapJobPool {
 
     pub fn worker_count(&self) -> usize {
         self.worker_count
+    }
+
+    /// Report a stage as complete without running a job, for stages a re-prepare
+    /// copied from an earlier preparation. Otherwise the loading panel would keep
+    /// showing them as WAIT because no job ever reports progress for them.
+    pub fn mark_reused(&self, task: Task) {
+        self.mark_done(task);
+    }
+
+    /// Show a loader-thread stage (one that runs inline, not as a pool job) as
+    /// in progress, so the panel names what the loader is actually busy with.
+    pub fn mark_started(&self, task: Task) {
+        let request_id = self.progress.request_id.load(Ordering::Acquire);
+        self.progress.set_explicit(request_id, task, 0, 1);
+    }
+
+    pub fn mark_done(&self, task: Task) {
+        let request_id = self.progress.request_id.load(Ordering::Acquire);
+        self.progress.set_explicit(request_id, task, 1, 1);
     }
 
     pub fn submit<T, F>(&self, task: Task, job: F) -> Result<JobHandle<T>, String>

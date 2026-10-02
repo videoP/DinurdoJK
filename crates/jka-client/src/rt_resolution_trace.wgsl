@@ -8,22 +8,40 @@
 // reconstruction cost on every full-resolution receiver, whether or not a light
 // was nearby). On frames a pixel is not scheduled, its value is carried forward
 // by reprojecting through the existing TAA motion-vector buffer and validating
-// against the world position recorded the last time that pixel was traced;
-// disocclusion (reprojection out of bounds, or a world-position mismatch beyond
+// against the camera distance recorded the last time that pixel was traced;
+// disocclusion (reprojection out of bounds, or a distance mismatch beyond
 // tolerance) forces an immediate fresh trace instead of waiting for the next
-// scheduled frame.
+// scheduled frame. Shadow edges (a history texel that is partly lit, or that
+// disagrees with a neighbour) are re-traced every frame rather than carried, so
+// a moving caster's edge is not left to crawl through the 4-frame schedule.
+//
+// Each texel is (visibility, camera distance). The result is written twice from
+// this one pass: the ping-pong history and the published copy the receivers
+// read, which is why no copy pass follows it.
 @group(1) @binding(0) var<uniform> rt_shadow_settings: RtSunShadowSettings;
 @group(1) @binding(1) var rt_full_depth: texture_2d<f32>;
 @group(1) @binding(2) var rt_motion_vectors: texture_2d<f32>;
 @group(1) @binding(3) var rt_shadow_prev: texture_2d<f32>;
-@group(1) @binding(4) var rt_shadow_out: texture_storage_2d<rgba32float, write>;
+@group(1) @binding(4) var rt_shadow_out: texture_storage_2d<rg32float, write>;
 @group(1) @binding(5) var<uniform> lighting_settings: LightingSettings;
 @group(1) @binding(6) var<uniform> shadow_settings: ShadowSettings;
+@group(1) @binding(7) var rt_shadow_published: texture_storage_2d<rg32float, write>;
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 fn rt_shadow_depth_at(pixel: vec2<i32>) -> f32 {
     let max_pixel = vec2<i32>(rt_shadow_settings.dimensions.xy) - vec2<i32>(1);
     return textureLoad(rt_full_depth, clamp(pixel, vec2<i32>(0), max_pixel), 0).x;
+}
+
+fn rt_shadow_store(pixel: vec2<i32>, visibility: f32, distance_to_camera: f32) {
+    let texel = vec4<f32>(visibility, distance_to_camera, 0.0, 0.0);
+    textureStore(rt_shadow_out, pixel, texel);
+    textureStore(rt_shadow_published, pixel, texel);
+}
+
+fn rt_shadow_history_at(pixel: vec2<i32>) -> vec2<f32> {
+    let max_pixel = vec2<i32>(rt_shadow_settings.dimensions.xy) - vec2<i32>(1);
+    return textureLoad(rt_shadow_prev, clamp(pixel, vec2<i32>(0), max_pixel), 0).xy;
 }
 
 fn rt_shadow_point_at(pixel: vec2<i32>) -> vec3<f32> {
@@ -44,7 +62,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let depth = textureLoad(rt_full_depth, pixel, 0).x;
     if (!(depth > 0.0 && depth < 999999.0)) {
         // No receiver here (sky/far plane): nothing to shadow, nothing to cache.
-        textureStore(rt_shadow_out, pixel, vec4<f32>(1.0, 1.0e9, 1.0e9, 1.0e9));
+        rt_shadow_store(pixel, 1.0, 1.0e9);
         return;
     }
     let position = rt_shadow_world_position(vec2<f32>(pixel) + vec2<f32>(0.5), depth);
@@ -81,12 +99,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             need_trace = true;
         } else {
             let history_pixel = clamp(vec2<i32>(history_uv * dims), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
-            let history = textureLoad(rt_shadow_prev, history_pixel, 0);
+            let history = rt_shadow_history_at(history_pixel);
+            // Where this point sat, relative to last frame's eye, if it did not move.
+            let expected = distance(rt_shadow_settings.prev_camera_pos.xyz, position);
             let tolerance = clamp(depth * 0.02, 0.05, 2.0);
-            if (distance(history.yzw, position) > tolerance) {
+            if (abs(history.y - expected) > tolerance) {
                 need_trace = true;
             } else {
-                visibility = history.x;
+                // Only uniformly lit or uniformly shadowed neighbourhoods may
+                // be carried. Anything with an edge in it is cheap to trace
+                // (a few percent of the screen) and is exactly where a stale
+                // sample shows.
+                let edge = abs(history.x - rt_shadow_history_at(history_pixel + vec2<i32>(1, 0)).x)
+                    + abs(history.x - rt_shadow_history_at(history_pixel - vec2<i32>(1, 0)).x)
+                    + abs(history.x - rt_shadow_history_at(history_pixel + vec2<i32>(0, 1)).x)
+                    + abs(history.x - rt_shadow_history_at(history_pixel - vec2<i32>(0, 1)).x);
+                if (edge > 0.01 || (history.x > 0.01 && history.x < 0.99)) {
+                    need_trace = true;
+                } else {
+                    visibility = history.x;
+                }
             }
         }
     }
@@ -96,5 +128,5 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         input.world_position = position;
         visibility = rt_uncached_sun_visibility(input, normal);
     }
-    textureStore(rt_shadow_out, pixel, vec4<f32>(visibility, position));
+    rt_shadow_store(pixel, visibility, depth);
 }

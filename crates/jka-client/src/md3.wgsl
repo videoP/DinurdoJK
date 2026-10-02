@@ -20,6 +20,9 @@ struct EntityLightingSettings {
     legacy_fog_color_depth: vec4<f32>,
     // x: 0 off, 1 authored global EXP2, 2 manual fog; y: strength scale.
     legacy_fog_params: vec4<f32>,
+    // Cloud ground shadow: xyz = unit direction toward the sun (render space),
+    // w = 1 while projected cloud shadows are active, else 0.
+    cloud_shadow_sun: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 
@@ -144,21 +147,42 @@ struct PrepassVertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world_position: vec3<f32>,
+    @location(2) normal: vec3<f32>,
 };
 
 struct PrepassOut {
     @location(0) linear_depth: f32,
     // Write-masked off by the pipeline: TAA keeps its existing entity behavior.
     @location(1) motion_vector: vec2<f32>,
-    // No SSR/planar/probe; alpha packs bit 1 (global fog) as 2/3.
+    // No SSR/planar/probe; alpha packs bit 1 (global fog) as 2/3. G carries the
+    // smooth cloud-shadow sun-facing code (post.wgsl entity_cloud_shadow_facing).
     @location(2) reflection_policy: vec4<f32>,
 };
 
-fn prepass_output(world_position: vec3<f32>) -> PrepassOut {
+// Projected cloud shadows only darken surfaces turned toward the sun, and post
+// has just the depth buffer to judge that from, which gives a per-triangle
+// faceted normal on a model. Entities publish the same smoothstep(0, 0.3, N.L)
+// from their interpolated vertex normal instead, as code 26..126 of 255 in the
+// policy G channel (the BSP prepass writes exactly 0 or 1 there, so the range
+// marks an entity pixel). 0 means "not provided"; post falls back to depth.
+fn cloud_shadow_facing_code(normal: vec3<f32>) -> f32 {
+    let sun = entity_lighting.cloud_shadow_sun;
+    if (sun.w < 0.5) {
+        return 0.0;
+    }
+    let length_sq = dot(normal, normal);
+    if (length_sq < 1.0e-6) {
+        return 0.0;
+    }
+    let facing = smoothstep(0.0, 0.3, dot(normal * inverseSqrt(length_sq), sun.xyz));
+    return (26.0 + 100.0 * facing) / 255.0;
+}
+
+fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>) -> PrepassOut {
     var out: PrepassOut;
     out.linear_depth = distance(world_position, camera.camera_pos_time.xyz);
     out.motion_vector = vec2<f32>(0.0);
-    out.reflection_policy = vec4<f32>(0.0, 0.0, 1.0, 2.0 / 3.0);
+    out.reflection_policy = vec4<f32>(0.0, cloud_shadow_facing_code(normal), 1.0, 2.0 / 3.0);
     return out;
 }
 
@@ -168,12 +192,13 @@ fn vs_prepass(input: VertexIn) -> PrepassVertexOut {
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;
     output.world_position = input.position;
+    output.normal = input.normal;
     return output;
 }
 
 @fragment
 fn fs_prepass(input: PrepassVertexOut) -> PrepassOut {
-    return prepass_output(input.world_position);
+    return prepass_output(input.world_position, input.normal);
 }
 
 @fragment
@@ -181,5 +206,15 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
-    return prepass_output(input.world_position);
+    return prepass_output(input.world_position, input.normal);
+}
+
+// Entity shadow map (Dynamic shadows = Entity map): depth-only light-space pass.
+// Opaque casters use vs_prepass with no fragment stage; only alpha-tested
+// surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
+@fragment
+fn fs_shadow_mask(input: PrepassVertexOut) {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
 }

@@ -37,6 +37,16 @@ pub fn pk3_pure_checksum(
     pk3_checksums(path, checksum_feed).map(|(_, pure)| pure)
 }
 
+/// True when the PK3 contains any of `names` (case-insensitive, exact entry name).
+/// Mirrors the server's `FS_FileIsInPAK("cgamex86.dll")` pure lookups.
+pub fn pk3_has_entry(path: &Path, names: &[&str]) -> Result<bool, Box<dyn std::error::Error>> {
+    let archive = zip::ZipArchive::new(File::open(path)?)?;
+    let found = archive
+        .file_names()
+        .any(|entry| names.iter().any(|wanted| entry.eq_ignore_ascii_case(wanted)));
+    Ok(found)
+}
+
 fn pk3_crc_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;

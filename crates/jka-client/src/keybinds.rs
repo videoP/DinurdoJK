@@ -73,12 +73,12 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "CHAT", command: "messagemode", group: "Other" },
     ControlAction { label: "TEAM CHAT", command: "messagemode2", group: "Other" },
     ControlAction { label: "SCORES", command: "+scores", group: "Other" },
-    ControlAction { label: "ZOOM", command: "zoom", group: "Other" },
+    ControlAction { label: "BINOCULAR ZOOM", command: "zoom", group: "Other" },
+    ControlAction { label: "ZOOM", command: "+zoom", group: "Other" },
     ControlAction { label: "TAUNT", command: "taunt", group: "Other" },
     ControlAction { label: "CHALLENGE DUEL", command: "engage_duel", group: "Other" },
     ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson", group: "Other" },
     // DinurdoJK-local actions stay available, but do not create extra top-level groups.
-    ControlAction { label: "NOCLIP", command: "noclip", group: "Other" },
     ControlAction { label: "SURFACE TRACE", command: "trace", group: "Other" },
     ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Other" },
 ];
@@ -90,12 +90,10 @@ pub const JAPRO_CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "JETPACK", command: "+button12", group: "jaPRO" },
     ControlAction { label: "DASH", command: "+button13", group: "jaPRO" },
     ControlAction { label: "THROW FLAG", command: "throwflag", group: "jaPRO" },
-    ControlAction { label: "ZOOM", command: "+zoom", group: "jaPRO" },
     ControlAction { label: "FULL FORCE CHALLENGE", command: "engage_fullforceduel", group: "jaPRO" },
     ControlAction { label: "GUN CHALLENGE", command: "engage_gunduel", group: "jaPRO" },
     ControlAction { label: "TELEPORT MARK", command: "amTeleMark", group: "jaPRO" },
     ControlAction { label: "TELEPORT", command: "amTele", group: "jaPRO" },
-    ControlAction { label: "NOCLIP", command: "noclip", group: "jaPRO" },
     ControlAction { label: "FLIPKICK", command: "flipkick", group: "jaPRO" },
     ControlAction { label: "VOICE CHAT / VGS", command: "voicechat", group: "jaPRO" },
 ];
@@ -125,25 +123,74 @@ pub struct Bindings {
 impl Default for Bindings {
     fn default() -> Self {
         let mut bindings = Self { map: HashMap::new() };
+        // Mirrors the stock MP mpdefault.cfg, which jaPRO also runs on (it ships no
+        // default binds of its own). Commands this client does not implement yet
+        // (+strafe, +lookup/+lookdown, +left/+right, centerview, +mlook,
+        // messagemode3/4, scoresUp/Down, automap_toggle, the siege menu) are left
+        // out so a keypress never lands on "unknown command". N is DinurdoJK's own
+        // noclip key; the stock keys it would otherwise collide with stay stock.
         for (key, command) in [
+            // Weapons.
+            (BindKey::Keyboard(KeyCode::Digit1), "weapon 1"),
+            (BindKey::Keyboard(KeyCode::Digit2), "weapon 2"),
+            (BindKey::Keyboard(KeyCode::Digit3), "weapon 3"),
+            (BindKey::Keyboard(KeyCode::Digit4), "weapon 4"),
+            (BindKey::Keyboard(KeyCode::Digit5), "weapon 5"),
+            (BindKey::Keyboard(KeyCode::Digit6), "weapon 6"),
+            (BindKey::Keyboard(KeyCode::Digit7), "weapon 7"),
+            (BindKey::Keyboard(KeyCode::Digit8), "weapon 8"),
+            (BindKey::Keyboard(KeyCode::Digit9), "weapon 13"),
+            (BindKey::Keyboard(KeyCode::Digit0), "weapon 9"),
+            (BindKey::Keyboard(KeyCode::Minus), "weapon 10"),
+            (BindKey::WheelUp, "weapprev"),
+            (BindKey::WheelDown, "weapnext"),
+            // Movement.
             (BindKey::Keyboard(KeyCode::KeyW), "+forward"),
             (BindKey::Keyboard(KeyCode::KeyS), "+back"),
             (BindKey::Keyboard(KeyCode::KeyA), "+moveleft"),
             (BindKey::Keyboard(KeyCode::KeyD), "+moveright"),
+            (BindKey::Keyboard(KeyCode::ArrowUp), "+forward"),
+            (BindKey::Keyboard(KeyCode::ArrowDown), "+back"),
+            (BindKey::Keyboard(KeyCode::Comma), "+moveleft"),
+            (BindKey::Keyboard(KeyCode::Period), "+moveright"),
             (BindKey::Keyboard(KeyCode::Space), "+moveup"),
-            (BindKey::Keyboard(KeyCode::ControlLeft), "+movedown"),
+            (BindKey::Keyboard(KeyCode::KeyC), "+movedown"),
             (BindKey::Keyboard(KeyCode::ShiftLeft), "+speed"),
+            (BindKey::Keyboard(KeyCode::Enter), "+use"),
+            (BindKey::Keyboard(KeyCode::KeyR), "+use"),
+            // Attack.
+            (BindKey::Keyboard(KeyCode::ControlLeft), "+attack"),
+            (BindKey::Keyboard(KeyCode::AltLeft), "+altattack"),
             (BindKey::Mouse(1), "+attack"),
             (BindKey::Mouse(2), "+altattack"),
+            (BindKey::Mouse(3), "saberAttackCycle"),
+            (BindKey::Keyboard(KeyCode::KeyL), "saberAttackCycle"),
+            // Force powers.
+            (BindKey::Keyboard(KeyCode::F1), "force_throw"),
+            (BindKey::Keyboard(KeyCode::F2), "force_pull"),
+            (BindKey::Keyboard(KeyCode::F3), "force_speed"),
+            (BindKey::Keyboard(KeyCode::F4), "force_seeing"),
+            (BindKey::Keyboard(KeyCode::F5), "force_heal"),
+            (BindKey::Keyboard(KeyCode::F6), "force_protect"),
+            (BindKey::Keyboard(KeyCode::F7), "force_absorb"),
+            (BindKey::Keyboard(KeyCode::F8), "force_distract"),
+            (BindKey::Keyboard(KeyCode::F9), "+force_grip"),
+            (BindKey::Keyboard(KeyCode::F10), "+force_lightning"),
+            (BindKey::Keyboard(KeyCode::F11), "force_rage"),
+            (BindKey::Keyboard(KeyCode::F12), "+force_drain"),
+            (BindKey::Keyboard(KeyCode::Backslash), "force_forcepowerother"),
+            (BindKey::Keyboard(KeyCode::BracketRight), "force_healother"),
+            (BindKey::Keyboard(KeyCode::KeyF), "+useforce"),
+            (BindKey::Keyboard(KeyCode::KeyE), "forcenext"),
+            (BindKey::Keyboard(KeyCode::KeyQ), "forceprev"),
+            // Communication, scoreboard and misc.
             (BindKey::Keyboard(KeyCode::KeyY), "messagemode"),
-            (BindKey::Keyboard(KeyCode::KeyU), "messagemode2"),
+            (BindKey::Keyboard(KeyCode::KeyT), "messagemode2"),
             (BindKey::Keyboard(KeyCode::KeyV), "voicechat"),
             (BindKey::Keyboard(KeyCode::Tab), "+scores"),
+            (BindKey::Keyboard(KeyCode::KeyP), "toggle cg_thirdPerson"),
+            (BindKey::Keyboard(KeyCode::KeyK), "engage_duel"),
             (BindKey::Keyboard(KeyCode::KeyN), "noclip"),
-            (BindKey::Keyboard(KeyCode::F3), "force_speed"),
-            (BindKey::Keyboard(KeyCode::F4), "force_rage"),
-            (BindKey::Keyboard(KeyCode::F5), "puddle_debug"),
-            (BindKey::Keyboard(KeyCode::KeyQ), "trace"),
         ] {
             bindings.set(key, command);
         }
@@ -447,6 +494,18 @@ mod tests {
         let bindings = Bindings::default();
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyW)), Some("+forward"));
         assert_eq!(bindings.get(BindKey::Mouse(1)), Some("+attack"));
+    }
+
+    #[test]
+    fn default_bindings_follow_mpdefault() {
+        let bindings = Bindings::default();
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyC)), Some("+movedown"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::Digit1)), Some("weapon 1"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::Digit9)), Some("weapon 13"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::Digit0)), Some("weapon 9"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::F4)), Some("force_seeing"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyQ)), Some("forceprev"));
+        assert_eq!(bindings.get(BindKey::WheelUp), Some("weapprev"));
     }
 
     #[test]

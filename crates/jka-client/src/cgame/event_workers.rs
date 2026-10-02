@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     event_presenter::{prepare_event_visual, PreparedEventVisual},
-    sound_presenter::{prepare_sound_event, PreparedSoundEvent},
+    sound_presenter::{prepare_sound_event, PreparedSoundEvent, SoundPrepData},
     weapon_fx::{prepare_entity_event, PreparedFxEvent},
     ClientGameState, PresentationEvent,
 };
@@ -81,11 +81,10 @@ fn prepare_one(
     event: PresentationEvent,
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
-    sound_saber_definitions: Option<&SaberDefinitions>,
+    sound_prep: Option<&SoundPrepData>,
     fx_saber_definitions: &SaberDefinitions,
 ) -> PreparedPresentationEvent {
-    let sound = sound_saber_definitions
-        .map(|definitions| prepare_sound_event(&event, game, siege_classes, definitions));
+    let sound = sound_prep.map(|prep| prepare_sound_event(&event, game, siege_classes, prep));
     let fx = prepare_entity_event(&event, game, siege_classes, fx_saber_definitions);
     let visual = prepare_event_visual(&event, game);
     PreparedPresentationEvent {
@@ -100,7 +99,7 @@ fn prepare_one_profiled(
     event: PresentationEvent,
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
-    sound_saber_definitions: Option<&SaberDefinitions>,
+    sound_prep: Option<&SoundPrepData>,
     fx_saber_definitions: &SaberDefinitions,
 ) -> PreparedPresentationEvent {
     // This function is only called from EVENT_WORKER_POOL. Rayon assigns a
@@ -114,7 +113,7 @@ fn prepare_one_profiled(
         event,
         game,
         siege_classes,
-        sound_saber_definitions,
+        sound_prep,
         fx_saber_definitions,
     )
 }
@@ -123,14 +122,14 @@ pub(crate) fn prepare_inline(
     event: PresentationEvent,
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
-    sound_saber_definitions: Option<&SaberDefinitions>,
+    sound_prep: Option<&SoundPrepData>,
     fx_saber_definitions: &SaberDefinitions,
 ) -> PreparedPresentationEvent {
     prepare_one(
         event,
         game,
         siege_classes,
-        sound_saber_definitions,
+        sound_prep,
         fx_saber_definitions,
     )
 }
@@ -194,7 +193,7 @@ pub(crate) fn prepare_batch(
     events: Vec<PresentationEvent>,
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
-    sound_saber_definitions: Option<&SaberDefinitions>,
+    sound_prep: Option<&SoundPrepData>,
     fx_saber_definitions: &SaberDefinitions,
     workers_enabled: bool,
 ) -> PreparedEventBatch {
@@ -216,7 +215,7 @@ pub(crate) fn prepare_batch(
                         event,
                         game,
                         siege_classes,
-                        sound_saber_definitions,
+                        sound_prep,
                         fx_saber_definitions,
                     )
                 })
@@ -232,7 +231,7 @@ pub(crate) fn prepare_batch(
                         event,
                         game,
                         siege_classes,
-                        sound_saber_definitions,
+                        sound_prep,
                         fx_saber_definitions,
                     )
                 })
@@ -287,12 +286,13 @@ mod tests {
     fn worker_batch_preserves_receive_queue_order() {
         let game = ClientGameState::new();
         let definitions = SaberDefinitions::default();
+        let prep = SoundPrepData::default();
         let input = vec![
             event(7, EntityEvent::EV_SABER_HIT),
             event(8, EntityEvent::EV_FOOTSTEP),
             event(9, EntityEvent::EV_SABER_BLOCK),
         ];
-        let batch = prepare_batch(input, &game, &[], Some(&definitions), &definitions, true);
+        let batch = prepare_batch(input, &game, &[], Some(&prep), &definitions, true);
         let sequences = batch
             .events
             .iter()
@@ -306,11 +306,12 @@ mod tests {
     fn one_event_never_uses_parallel_barrier() {
         let game = ClientGameState::new();
         let definitions = SaberDefinitions::default();
+        let prep = SoundPrepData::default();
         let batch = prepare_batch(
             vec![event(11, EntityEvent::EV_SABER_HIT)],
             &game,
             &[],
-            Some(&definitions),
+            Some(&prep),
             &definitions,
             true,
         );

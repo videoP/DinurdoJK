@@ -17,13 +17,6 @@ struct SsrTemporalSettings {
     prev_view_proj: mat4x4<f32>,
 };
 
-struct WeatherSurfaceSettings {
-    amount_distance: vec4<f32>, // wetness, fade start/end, rain-intensity response
-    puddle: vec4<f32>,          // accumulation, time, active-rain ripple strength, reserved
-    occlusion_uv: vec4<f32>,    // min X/Z, inverse map width/depth
-    occlusion_size: vec4<u32>,  // width, height, active, reserved
-};
-
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var linear_depth_texture: texture_2d<f32>;
@@ -155,7 +148,8 @@ fn history_depth_at_uv(uv: vec2<f32>) -> f32 {
 }
 
 fn world_ray(uv: vec2<f32>) -> vec3<f32> {
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+    // Reversed-Z: unproject on the far plane (see post.wgsl world_ray).
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
     var world_far = settings.inv_view_proj * ndc;
     world_far = world_far / max(abs(world_far.w), 1e-6);
     return normalize(world_far.xyz - settings.camera_pos_time.xyz);
@@ -210,152 +204,97 @@ fn surface_normal(uv: vec2<f32>, centre_depth: f32) -> vec3<f32> {
     return n;
 }
 
-fn weather_exposure_from_cover(cover_y: f32, surface_y: f32) -> f32 {
-    if (cover_y <= -1.0e19) {
-        return 1.0;
-    }
-    return 1.0 - smoothstep(6.0, 24.0, cover_y - surface_y);
-}
+// What the screen-space trace needs to know about a wet surface. Shares the
+// puddle shape, ripples and water normal with the material pass (weather_surface.wgsl),
+// so the reflection and the surface it lies on always agree.
+struct SsrWeather {
+    wetness: f32,
+    puddle: f32,
+    water_normal: vec3<f32>,
+};
 
-fn hash12(p: vec2<f32>) -> f32 {
-    let p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    let p3b = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
-    return fract((p3b.x + p3b.y) * p3b.z);
-}
-
-fn weather_puddle_noise(world_xz: vec2<f32>) -> f32 {
-    let p = world_xz / 170.0;
-    let cell = floor(p);
-    let f = fract(p);
-    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);
-    let n00 = hash12(cell);
-    let n10 = hash12(cell + vec2<f32>(1.0, 0.0));
-    let n01 = hash12(cell + vec2<f32>(0.0, 1.0));
-    let n11 = hash12(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(n00, n10, u.x), mix(n01, n11, u.x), u.y);
-}
-
-fn weather_puddle_mask(world_xz: vec2<f32>, accumulation: f32, depression: f32) -> f32 {
-    let low = mix(0.46, 0.18, accumulation);
-    let high = mix(0.72, 0.34, accumulation);
-    let basin = smoothstep(low, high, depression);
-    let edge_breakup = mix(0.82, 1.0, weather_puddle_noise(world_xz));
-    return clamp(basin * edge_breakup, 0.0, 1.0);
-}
-
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(
-        hash12(p + vec2<f32>(17.17, 3.11)),
-        hash12(p + vec2<f32>(5.73, 41.91))
-    );
-}
-
-fn weather_ripple_layer(
-    world_xz: vec2<f32>,
-    time_seconds: f32,
-    uv_offset: vec2<f32>,
-    phase_offset: f32,
-    cell_size: f32,
-) -> vec2<f32> {
-    let uv = world_xz / cell_size + uv_offset;
-    let cell = floor(uv);
-    let local = fract(uv);
-    let rnd = hash22(cell + uv_offset * 19.0);
-    let centre = vec2<f32>(0.14) + rnd * 0.72;
-    let delta = local - centre;
-    let dist = max(length(delta), 0.001);
-    let age = fract(time_seconds * 0.52 + phase_offset
-        + hash12(cell + uv_offset * 31.0));
-    let radius = mix(0.025, 0.78, age);
-    let signed_distance = dist - radius;
-    let band = 1.0 - smoothstep(0.018, 0.095, abs(signed_distance));
-    let birth = smoothstep(0.0, 0.06, age);
-    let death = 1.0 - smoothstep(0.72, 1.0, age);
-    let slope_sign = select(-1.0, 1.0, signed_distance >= 0.0);
-    return (delta / dist) * band * birth * death * slope_sign;
-}
-
-fn weather_ripple_gradient(
-    world_xz: vec2<f32>,
-    time_seconds: f32,
-    rain_strength: f32,
-) -> vec2<f32> {
-    let weights = clamp(
-        (vec4<f32>(rain_strength) - vec4<f32>(0.0, 0.25, 0.50, 0.75)) * 4.0,
-        vec4<f32>(0.0),
-        vec4<f32>(1.0)
-    );
-    let r1 = weather_ripple_layer(world_xz, time_seconds, vec2<f32>( 0.25,  0.00), 0.00, 64.0);
-    let r2 = weather_ripple_layer(world_xz, time_seconds, vec2<f32>(-0.55,  0.30), 0.31, 67.0);
-    let r3 = weather_ripple_layer(world_xz, time_seconds, vec2<f32>( 0.60,  0.85), 0.57, 61.0);
-    let r4 = weather_ripple_layer(world_xz, time_seconds, vec2<f32>( 0.50, -0.75), 0.79, 70.0);
-    let capillary = vec2<f32>(
-        sin(world_xz.x * 0.092 + world_xz.y * 0.037 + time_seconds * 2.7)
-            + 0.55 * sin(world_xz.y * 0.121 - time_seconds * 3.2),
-        cos(world_xz.y * 0.086 - world_xz.x * 0.031 - time_seconds * 2.9)
-            + 0.50 * cos(world_xz.x * 0.115 + time_seconds * 3.5)
-    ) * (0.11 * rain_strength);
-    return r1 * weights.x + r2 * weights.y + r3 * weights.z + r4 * weights.w + capillary;
-}
-
-fn weather_surface_response(world: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+fn ssr_weather(world: vec3<f32>, normal: vec3<f32>) -> SsrWeather {
+    var result: SsrWeather;
+    result.wetness = 0.0;
+    result.puddle = 0.0;
+    result.water_normal = vec3<f32>(0.0, 1.0, 0.0);
     if ((weather_surface.amount_distance.x <= 0.001 && weather_surface.puddle.x <= 0.001)
         || weather_surface.occlusion_size.z == 0u
         || weather_surface.occlusion_size.x == 0u
         || weather_surface.occlusion_size.y == 0u) {
-        return vec2<f32>(0.0);
+        return result;
     }
 
     let to_surface = world - settings.camera_pos_time.xyz;
-    let distance_squared = dot(to_surface, to_surface);
-    let fade_end = max(weather_surface.amount_distance.z, 1.0);
-    let distance_weight = 1.0 - smoothstep(weather_surface.amount_distance.y, fade_end, sqrt(distance_squared));
-
-    let uv = (world.xz - weather_surface.occlusion_uv.xy) * weather_surface.occlusion_uv.zw;
-    if (!all(uv > vec2<f32>(0.0)) || !all(uv < vec2<f32>(1.0))) {
-        return vec2<f32>(0.0);
-    }
-
-    let dimensions = weather_surface.occlusion_size.xy;
-    let dimensions_f = vec2<f32>(f32(dimensions.x), f32(dimensions.y));
-    let texel_position = uv * dimensions_f - vec2<f32>(0.5);
-    let blend = fract(texel_position);
-    let covers = textureGather(0, weather_occlusion_height, weather_occlusion_sampler, uv);
-    let surface_heights = textureGather(1, weather_occlusion_height, weather_occlusion_sampler, uv);
-    let upness = textureGather(2, weather_occlusion_height, weather_occlusion_sampler, uv);
-    let basins = textureGather(3, weather_occlusion_height, weather_occlusion_sampler, uv);
-    let e00 = weather_exposure_from_cover(covers.w, world.y);
-    let e10 = weather_exposure_from_cover(covers.z, world.y);
-    let e01 = weather_exposure_from_cover(covers.x, world.y);
-    let e11 = weather_exposure_from_cover(covers.y, world.y);
-    let exposure = mix(mix(e00, e10, blend.x), mix(e01, e11, blend.x), blend.y);
-    let s00 = 1.0 - smoothstep(6.0, 20.0, abs(surface_heights.w - world.y));
-    let s10 = 1.0 - smoothstep(6.0, 20.0, abs(surface_heights.z - world.y));
-    let s01 = 1.0 - smoothstep(6.0, 20.0, abs(surface_heights.x - world.y));
-    let s11 = 1.0 - smoothstep(6.0, 20.0, abs(surface_heights.y - world.y));
-    let physical_upness = mix(
-        mix(upness.w * s00, upness.z * s10, blend.x),
-        mix(upness.x * s01, upness.y * s11, blend.x),
-        blend.y
+    let fade_start = weather_surface.film_fade.x;
+    let distance_weight = 1.0 - smoothstep(
+        fade_start,
+        max(weather_surface.film_fade.y, fade_start + 1.0),
+        length(to_surface)
     );
-    let local_depression = mix(
-        mix(basins.w * s00, basins.z * s10, blend.x),
-        mix(basins.x * s01, basins.y * s11, blend.x),
-        blend.y
+    let field = weather_sample_field(
+        weather_occlusion_height,
+        world,
+        weather_surface.occlusion_uv.xy,
+        weather_surface.occlusion_uv.zw,
+        normalize(normal).y
     );
 
-    let geometric_normal = normalize(normal);
-    let orientation = smoothstep(-0.45, 0.12, geometric_normal.y);
-    let film = clamp(weather_surface.amount_distance.x * weather_surface.amount_distance.w
-        * distance_weight * exposure * orientation, 0.0, 1.0);
-    var puddle = 0.0;
-    if (weather_surface.puddle.x > 0.001 && physical_upness > 0.70 && local_depression > 0.001) {
-        let accumulation = clamp(weather_surface.puddle.x, 0.0, 1.0);
-        let flatness = smoothstep(0.70, 0.985, physical_upness);
-        let basin = weather_puddle_mask(world.xz, accumulation, local_depression);
-        puddle = clamp((0.28 + accumulation * 1.04) * exposure * flatness * basin, 0.0, 1.0);
+    let normal_y = normalize(normal).y;
+    let orientation = smoothstep(-0.45, 0.12, normal_y);
+    var wetness = clamp(weather_surface.amount_distance.x * weather_surface.amount_distance.w
+        * distance_weight * field.exposure * orientation, 0.0, 1.0);
+
+    let accumulation = clamp(weather_surface.puddle.x, 0.0, 1.0);
+    if (accumulation > 0.001 && field.exposure > 0.001) {
+        let shape = weather_puddle_shape(field, world.xz, accumulation, weather_surface.look.x);
+        let upright = smoothstep(0.75, 0.95, normal_y);
+        let coverage = shape.coverage * field.exposure * upright;
+        result.puddle = coverage;
+        wetness = max(wetness, max(coverage * 0.96, shape.damp * field.exposure * upright * 0.85));
+        if (coverage > 0.001) {
+            let gradient = (weather_water_gradient(
+                world.xz,
+                weather_surface.puddle.y,
+                clamp(weather_surface.puddle.z, 0.0, 1.0),
+                weather_surface.wind.xy
+            ) + weather_wake_gradient(world)) * smoothstep(0.0, 0.5, shape.depth);
+            result.water_normal = weather_water_normal(gradient, 0.12);
+        }
     }
-    return vec2<f32>(max(film, puddle * 0.96), puddle);
+    result.wetness = wetness;
+    return result;
+}
+
+fn scene_level(uv: vec2<f32>) -> vec3<f32> {
+    return textureSampleLevel(
+        scene_texture,
+        scene_sampler,
+        clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+        0.0
+    ).rgb;
+}
+
+// A reflection in wet ground smears along the screen-space vertical: ripples and
+// the roughness of the wet film tilt the reflected ray mostly in the view plane, so
+// a neon tube or a lit window becomes a long soft streak rather than a mirror
+// image. Five taps along the projected world-up axis, jittered per pixel and per
+// frame so the temporal accumulation below integrates them into a continuous blur.
+fn ssr_streaked_scene(hit_uv: vec2<f32>, hit_world: vec3<f32>, length_px: f32, jitter: f32) -> vec3<f32> {
+    let viewport = max(settings.viewport_history.xy, vec2<f32>(1.0));
+    var axis_px = (project_uv(hit_world + vec3<f32>(0.0, 96.0, 0.0)).xy - hit_uv) * viewport;
+    let axis_length = length(axis_px);
+    if (length_px < 1.0 || axis_length < 0.5) {
+        return scene_level(hit_uv);
+    }
+    axis_px = axis_px / axis_length;
+    let spacing_uv = axis_px * (length_px * 0.25) / viewport;
+    let origin_uv = hit_uv + spacing_uv * (jitter - 0.5);
+    return scene_level(origin_uv - spacing_uv * 2.0) * 0.06
+        + scene_level(origin_uv - spacing_uv) * 0.24
+        + scene_level(origin_uv) * 0.40
+        + scene_level(origin_uv + spacing_uv) * 0.24
+        + scene_level(origin_uv + spacing_uv * 2.0) * 0.06;
 }
 
 fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSample {
@@ -386,9 +325,9 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
 
     let world = world_position(uv, centre_depth);
     let geometric_normal = surface_normal(uv, centre_depth);
-    let weather = weather_surface_response(world, geometric_normal);
-    let wetness = weather.x;
-    let puddle = weather.y;
+    let weather = ssr_weather(world, geometric_normal);
+    let wetness = weather.wetness;
+    let puddle = weather.puddle;
 
     // Spend dry SSR on progressively rougher materials only as quality rises.
     // Current rain/puddle response is intentionally allowed to override this
@@ -411,21 +350,28 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
     // the same thing locally for SSR: standing rain film slightly flattens an
     // upward-facing response normal and adds a low-roughness dielectric Fresnel
     // term. Dry SSR remains byte-for-byte equivalent in the wetness == 0 case.
+    let high_quality = weather_surface.look.z > 0.5;
+    let water = smoothstep(0.05, 0.85, puddle);
     let upward = smoothstep(0.25, 0.90, geometric_normal.y);
     // Thin wet film respects the reconstructed surface slope. Puddle placement
     // has already been validated against the cached physical BSP plane, so its
-    // water normal can flatten independently of a noisy/interpolated screen normal.
-    let film_flatten = wetness * upward * 0.14;
-    let puddle_flatten = smoothstep(0.05, 0.85, puddle) * 0.90;
-    var normal = normalize(mix(geometric_normal, vec3<f32>(0.0, 1.0, 0.0), clamp(max(film_flatten, puddle_flatten), 0.0, 0.92)));
-    let ripple_strength = clamp(weather_surface.puddle.z, 0.0, 1.0) * puddle;
-    if (ripple_strength > 0.001) {
-        let ripple = weather_ripple_gradient(
-            world.xz,
-            weather_surface.puddle.y,
-            clamp(weather_surface.puddle.z, 0.0, 1.0)
-        );
-        normal = normalize(normal + vec3<f32>(-ripple.x, 0.0, -ripple.y) * (0.080 * ripple_strength));
+    // water surface replaces a noisy/interpolated screen normal outright, exactly
+    // as it does in the material pass.
+    var normal = normalize(mix(
+        geometric_normal,
+        vec3<f32>(0.0, 1.0, 0.0),
+        clamp(wetness * upward * 0.14, 0.0, 0.92)
+    ));
+    normal = normalize(mix(normal, weather.water_normal, water * 0.985));
+    if (high_quality && puddle < 0.5 && geometric_normal.y > 0.97) {
+        // Level wet asphalt is never optically flat: static micro-relief breaks the
+        // reflection into the fine grain seen on wet streets. Slopes are left
+        // alone: world-space grain stretches along them into visible bands.
+        let grain = vec2<f32>(
+            weather_value_noise(world.xz / 9.0),
+            weather_value_noise(world.xz / 9.0 + vec2<f32>(53.1, 17.7))
+        ) - vec2<f32>(0.5);
+        normal = normalize(normal + vec3<f32>(grain.x, 0.0, grain.y) * (0.12 * wetness * upward));
     }
     let view_dir = normalize(settings.camera_pos_time.xyz - world);
     let facing = clamp(dot(normal, view_dir), 0.0, 1.0);
@@ -438,8 +384,9 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
     // shelter-, and distance-weighted by the shared weather surface system.
     let wet_fresnel = 0.02 + 0.98 * grazing;
     let wet_smoothness = mix(0.72, 0.96, pow(wetness, 1.20));
-    let puddle_smoothness = mix(wet_smoothness, 0.999, smoothstep(0.05, 0.80, puddle));
-    let wet_strength = wetness * wet_fresnel * puddle_smoothness * (0.10 + horizontal * 0.56);
+    let puddle_smoothness = mix(wet_smoothness, 0.999, water);
+    let wet_strength = wetness * wet_fresnel * puddle_smoothness
+        * (0.10 + horizontal * 0.56) * weather_surface.look.w;
     let puddle_strength = smoothstep(0.03, 0.75, puddle) * wet_fresnel * (0.44 + horizontal * 0.78);
     let strength = dry_strength + wet_strength + puddle_strength;
     if (strength < 0.01) {
@@ -451,8 +398,15 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
     // bracketed. At half resolution, 10 stochastic linear steps + 3 bisections
     // give us a more accurate hit than the old 18 fixed world-space taps while
     // doing far less total work over the frame.
-    let ray_dir = normalize(reflect(-view_dir, normal));
-    let ray_origin = world + normal * 4.0;
+    var ray_dir = normalize(reflect(-view_dir, normal));
+    // A ray that dips into the surface it leaves (a perturbed normal at a grazing
+    // angle, a sloped floor) would hit that surface again at once and reflect
+    // itself in stripes: keep every ray above the geometry it starts on.
+    let lift = dot(ray_dir, geometric_normal);
+    if (lift < 0.05) {
+        ray_dir = normalize(ray_dir + geometric_normal * (0.05 - lift));
+    }
+    let ray_origin = world + geometric_normal * max(4.0, centre_depth * 0.004);
     var linear_steps = 6u;
     var refinement_steps = 2u;
     var distance_scale = 0.75;
@@ -466,16 +420,24 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
         refinement_steps = 4u;
         distance_scale = 1.25;
     }
-    let max_ray_distance = max(216.0, centre_depth * mix(0.22, mix(0.28, 0.34, puddle), wetness)) * distance_scale;
+    var max_ray_distance = max(216.0, centre_depth * mix(0.22, mix(0.28, 0.34, puddle), wetness)) * distance_scale;
+    var step_curve = 1.15;
+    if (high_quality && weather_reflective) {
+        // A wet street mirrors things a block away: facades, signs, the far end
+        // of the road. Reach that far, and bunch the steps toward the surface so
+        // nearby objects still resolve.
+        max_ray_distance = max(max_ray_distance, (600.0 + centre_depth * 0.9) * distance_scale);
+        step_curve = 1.6;
+    }
     let frame = settings.viewport_history.w;
-    let jitter = hash12(frag_coord + vec2<f32>(frame * 17.0, frame * 11.0));
+    let jitter = weather_hash12(frag_coord + vec2<f32>(frame * 17.0, frame * 11.0));
 
     var miss_t = 0.0;
     var hit_t = 0.0;
     var found_hit = false;
     for (var i = 0u; i < linear_steps; i = i + 1u) {
         let linear_t = (f32(i) + jitter) / f32(linear_steps);
-        let candidate_t = pow(clamp(linear_t, 0.0, 1.0), 1.15);
+        let candidate_t = pow(clamp(linear_t, 0.0, 1.0), step_curve);
         let sample_world = ray_origin + ray_dir * max_ray_distance * candidate_t;
         let projected = project_uv(sample_world);
         if (projected.x <= 0.0 || projected.x >= 1.0 ||
@@ -502,6 +464,19 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
     }
 
     if (!found_hit) {
+        if (high_quality && weather_reflective && ray_dir.y > 0.03) {
+            // The ray left the screen or the world without touching anything
+            // visible: what the water mirrors is the sky. Look for the point on
+            // screen where that sky is.
+            let sky_uv = project_uv(ray_origin + ray_dir * 60000.0);
+            if (sky_uv.x > 0.0 && sky_uv.x < 1.0 && sky_uv.y > 0.0 && sky_uv.y < 1.0
+                && !valid_depth(depth_at_uv(sky_uv.xy))) {
+                let edge = min(min(sky_uv.x, 1.0 - sky_uv.x), min(sky_uv.y, 1.0 - sky_uv.y));
+                result.radiance = scene_level(sky_uv.xy);
+                let max_sky_weight = mix(mix(0.42, 0.60, wetness), 0.92, smoothstep(0.05, 0.80, puddle));
+                result.weight = clamp(strength * smoothstep(0.01, 0.10, edge), 0.0, max_sky_weight);
+            }
+        }
         return result;
     }
 
@@ -555,8 +530,18 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
         min(hit_projection.y, 1.0 - hit_projection.y)
     );
     let edge_fade = smoothstep(0.015, 0.08, edge_distance);
-    let travel_fade = 1.0 - hi;
+    // Long reach must not dim far facades away: only the last stretch of a
+    // high-quality wet ray fades with travel.
+    let travel_fade = select(1.0 - hi, 1.0 - hi * hi, high_quality && weather_reflective);
     result.radiance = scene(hit_projection.xy);
+    if (high_quality && weather_surface.look.y > 0.001) {
+        // Rougher film smears further than still water; a patchy noise keeps
+        // neighbouring stretches of street from streaking identically.
+        let patchiness = 0.6 + 0.8 * weather_value_noise(world.xz / 140.0);
+        let length_px = settings.viewport_history.y
+            * mix(0.030, 0.006, water) * patchiness * weather_surface.look.y;
+        result.radiance = ssr_streaked_scene(hit_projection.xy, final_world, length_px, jitter);
+    }
     let max_weight = mix(mix(0.42, 0.60, wetness), 0.92, smoothstep(0.05, 0.80, puddle));
     result.weight = clamp(strength * travel_fade * edge_fade, 0.0, max_weight);
     return result;
@@ -644,7 +629,9 @@ fn fs_main(input: VertexOut) -> SsrFragmentOut {
 
     let current = current_ssr(input.uv, centre_depth, input.position.xy);
     let resolved = temporal_ssr(input.uv, centre_depth, current);
-    out.radiance = vec4<f32>(max(resolved.radiance, vec3<f32>(0.0)), clamp(resolved.weight, 0.0, 0.60));
+    // Standing water may reflect almost fully; everything else is capped lower by
+    // current_ssr itself.
+    out.radiance = vec4<f32>(max(resolved.radiance, vec3<f32>(0.0)), clamp(resolved.weight, 0.0, 0.94));
     out.depth = centre_depth;
     return out;
 }

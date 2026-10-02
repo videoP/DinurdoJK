@@ -1,0 +1,28 @@
+# Deluxe-mapping cost on mp/ffa3. Run:  bench.cmd bench\plans\deluxe.bench
+# Rounds are interleaved, so every case sees the same machine state.
+
+map       mp/ffa3
+launches  3        # launches per case
+settle    3        # seconds at each spot before measuring (absorbs shader compiles)
+sample    5        # seconds measured per spot
+timeout   400      # per launch; cold caches can stall the first one
+
+# Applied to every case. `cfg` goes into the cfg file (needed for restart-latched
+# cvars), `set` is a console `set` after the map loads (needed for session-only
+# cvars such as r_pom).
+cfg r_pbr 1
+cfg r_gpuTimings 1
+cfg r_perfTrace 1
+
+# spot NAME X Y Z YAW [PITCH]   (setviewpos values: z = viewpos eye z - 37)
+spot ffa3_a 712 -1449 -103 90 1
+
+# case NAME  cvar=value ...     first case is the baseline for the dms column
+#   cvar=value        console set after map load
+#   cfg:cvar=value    cfg-file setting
+#   cmd:screenshot    extra console command before the measured sample
+#   map=NAME          run this case on a different map
+case deluxe_off   r_deluxeMapping=0
+case deluxe_on    r_deluxeMapping=1
+case spec_zero    r_deluxeMapping=1 r_deluxeSpecular=0
+case spec_full    r_deluxeMapping=1 r_deluxeSpecular=1

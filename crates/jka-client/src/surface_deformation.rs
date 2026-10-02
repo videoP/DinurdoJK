@@ -1,6 +1,7 @@
 //! Client-side authored-surface deformation inputs and the persistent Snowflow state field.
 //!
-//! 2D mode retains stock JKA footprint marks. 3D mode layers those same marks over
+//! 2D mode's stock JKA footprint marks are projected decals made by the footstep
+//! system. 3D mode layers those same marks over
 //! Snowflow's GPU state model: R=depression, G=displaced mass/berm, B=compression,
 //! A=ice. Contacts are only transient brush inputs; history lives in the toroidal
 //! RGBA16F field.
@@ -510,6 +511,8 @@ impl SurfaceDeformationGpu {
         }
     }
 
+    pub fn mode(&self) -> FootprintMode { self.mode }
+
     pub fn set_mode(&mut self, queue: &wgpu::Queue, mode: FootprintMode) {
         self.mode = mode;
         self.upload_world_uniform(queue);
@@ -542,7 +545,9 @@ impl SurfaceDeformationGpu {
     pub fn push(&mut self, queue: &wgpu::Queue, stamp: SurfaceDeformationStamp) {
         if stamp.material as u32 != MATERIAL_SNOW { return; }
         self.focus = Vec2::new(stamp.position[0], stamp.position[2]);
-        if stamp.kind == SurfaceDeformationKind::Foot {
+        // 2D mode's prints are projected decals from the footstep system
+        // (`WeaponFx::footstep`); the shader stamp only accompanies the 3D dent.
+        if stamp.kind == SurfaceDeformationKind::Foot && self.mode == FootprintMode::ThreeD {
             let legacy: LegacyGpuStamp = stamp.into();
             if self.legacy_stamps.len() == MAX_VISUAL_STAMPS {
                 self.legacy_stamps.rotate_left(1);

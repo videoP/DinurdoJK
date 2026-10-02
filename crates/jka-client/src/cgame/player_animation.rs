@@ -79,6 +79,19 @@ pub struct PlayerAnimationState {
     ci_torso_anim: i32,
     ci_broken_limbs: i32,
     no_lumbar: bool,
+    /// Whether `update` has run since the last reset, so the first frame an
+    /// entity is seen does not look like a jump through the cycle.
+    frames_seen: bool,
+    /// The legs bone frames `CG_TriggerAnimSounds` compared on the last update.
+    legs_step: Option<LegsFrameStep>,
+}
+
+/// The legs bone went from `old_frame` to `frame` while playing `anim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegsFrameStep {
+    pub old_frame: i32,
+    pub frame: i32,
+    pub anim: i32,
 }
 
 impl PlayerAnimationState {
@@ -105,7 +118,15 @@ impl PlayerAnimationState {
             ci_torso_anim: 0,
             ci_broken_limbs: 0,
             no_lumbar: Ghoul2Animator::bone_index(gla, "lower_lumbar").is_none(),
+            frames_seen: false,
+            legs_step: None,
         })
+    }
+
+    /// The legs frame change of the last `update`, the input of the animation
+    /// events (footsteps). `None` when the frame did not move.
+    pub fn legs_frame_step(&self) -> Option<LegsFrameStep> {
+        self.legs_step
     }
 
     /// Port of OpenJK `CG_PlayerAnimation` for the stock humanoid path.
@@ -191,6 +212,12 @@ impl PlayerAnimationState {
             gla,
             current_time,
         )?;
+        self.legs_step = (self.frames_seen && self.legs.frame != self.legs.old_frame).then_some(LegsFrameStep {
+            old_frame: self.legs.old_frame,
+            frame: self.legs.frame,
+            anim: self.legs.animation_number,
+        });
+        self.frames_seen = true;
         Ok(())
     }
 
@@ -208,6 +235,8 @@ impl PlayerAnimationState {
     /// `entityState_t`.  Resetting the Rust lerp bookkeeping here preserves
     /// that behavior without inventing a second animation transition path.
     pub fn reset_player_entity(&mut self) {
+        self.frames_seen = false;
+        self.legs_step = None;
         self.legs = LerpFrameState::default();
         self.torso = LerpFrameState::default();
         self.animator.clear_bone_angle_overrides();

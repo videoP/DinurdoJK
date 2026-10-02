@@ -133,7 +133,11 @@ fn local_pk3_checksums(base_dir: &Path, active_game_dir: Option<&Path>) -> Resul
             }
             match jka_assets::pak_checksum::pk3_checksum(&path) {
                 Ok(checksum) => { checksums.insert(checksum); }
-                Err(error) => eprintln!("[DOWNLOAD] ignoring unreadable PK3 {}: {error}", path.display()),
+                Err(error) => crate::logging::write_line_with_path(
+                    crate::logging::Level::Error,
+                    format_args!("[DOWNLOAD] ignoring unreadable PK3 {}: {error}", path.display()),
+                    path.clone(),
+                ),
             }
         }
     }

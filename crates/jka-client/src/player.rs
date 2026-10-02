@@ -1,12 +1,13 @@
 use crate::{
     camera::Camera,
+    net::{PredictionWorld, SolidEntity},
     scene::{jka_position, render_position, SpawnPoint},
     surface_deformation::{LocalFootContactShim, SurfaceDeformationStamp},
 };
 use jka_movement::{
-    angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PmoveContext,
-    SaberMovementInfo, TraceQuery, TraceResult, TraceWorld, UserCmd, BUTTON_WALKING,
-    ENTITY_NONE, MAX_TICK_MSEC, MIN_TICK_MSEC, TICK_MSEC,
+    angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PlayerView,
+    PmoveContext, SaberMovementInfo, TraceQuery, TraceResult, TraceWorld, UserCmd,
+    BUTTON_WALKING, ENTITY_NONE, MAX_TICK_MSEC, MIN_TICK_MSEC, TICK_MSEC,
 };
 use std::{collections::HashSet, time::Duration};
 use winit::keyboard::KeyCode;
@@ -109,6 +110,58 @@ fn idrive_axis(positive_down: bool, negative_down: bool, priority: i8, magnitude
     }
 }
 
+/// Server-side game logic that shares the local player's fixed timeline: the
+/// part of `G_RunFrame` and `ClientThink_real` that sits around each Pmove.
+pub trait SoloGame {
+    /// Brush models Pmove collides with, at the positions of the last frame.
+    fn solids(&self) -> &[SolidEntity];
+    /// `G_RunFrame` at `time` (the command time the coming Pmove ends on).
+    /// `player` is the joined, clipping player; movers push it out of the way.
+    fn run_frame(&mut self, time: i32, player: Option<&mut PlayerState>, world: &mut CollisionWorld);
+    /// The rest of `ClientThink_real` after Pmove: touched entities, trigger
+    /// contact and the use key. `player` is `None` unless it is a live, clipping player.
+    fn after_pmove(&mut self, time: i32, player: Option<(&PlayerView, i32)>, world: &mut CollisionWorld);
+}
+
+/// A map with no game logic: nothing moves and nothing is solid but the world.
+#[cfg(test)]
+pub struct NoGame;
+
+#[cfg(test)]
+impl SoloGame for NoGame {
+    fn solids(&self) -> &[SolidEntity] {
+        &[]
+    }
+    fn run_frame(&mut self, _: i32, _: Option<&mut PlayerState>, _: &mut CollisionWorld) {}
+    fn after_pmove(&mut self, _: i32, _: Option<(&PlayerView, i32)>, _: &mut CollisionWorld) {}
+}
+
+/// The static world plus the game's brush models, as Pmove traces them.
+struct GameWorld<'a> {
+    world: &'a mut World,
+    solids: &'a [SolidEntity],
+}
+impl TraceWorld for GameWorld<'_> {
+    fn trace(&mut self, q: TraceQuery) -> TraceResult {
+        match self.world.0.as_mut() {
+            Some(world) if !self.solids.is_empty() => {
+                PredictionWorld { world, solids: self.solids, client_num: 0 }.trace(q)
+            }
+            Some(world) => world.trace(q),
+            None => TraceResult::clear(q.end),
+        }
+    }
+    fn point_contents(&mut self, point: [f32; 3], pass: i32) -> i32 {
+        match self.world.0.as_mut() {
+            Some(world) if !self.solids.is_empty() => {
+                PredictionWorld { world, solids: self.solids, client_num: 0 }.point_contents(point, pass)
+            }
+            Some(world) => world.point_contents(point, pass),
+            None => 0,
+        }
+    }
+}
+
 struct World(Option<CollisionWorld>);
 impl TraceWorld for World {
     fn trace(&mut self, q: TraceQuery) -> TraceResult {
@@ -158,6 +211,8 @@ pub struct LocalPlayer {
     move_priority: [i8; 3],
     noclip: bool,
     saber_movement: [SaberMovementInfo; 2],
+    /// The viewer's foot bolts from its last posed frame (`pmove_t::ghoul2`).
+    foot_bolts: Option<[[f32; 3]; 2]>,
     mouse_input: MouseInputSettings,
     deformation_shim: LocalFootContactShim,
 }
@@ -208,6 +263,7 @@ impl LocalPlayer {
             move_priority: [0; 3],
             noclip: false,
             saber_movement,
+            foot_bolts: None,
             mouse_input: MouseInputSettings::default(),
             deformation_shim: LocalFootContactShim::new(spectator_view.origin),
         })
@@ -231,6 +287,12 @@ impl LocalPlayer {
         }
         self.saber_movement = sabers;
         Ok(())
+    }
+
+    /// Foot bolts of the local player's presented Ghoul2 pose. Pmove needs
+    /// them for the slope stand anims (leg dangle); applied before each step.
+    pub fn set_foot_bolts(&mut self, bolts: Option<[[f32; 3]; 2]>) {
+        self.foot_bolts = bolts;
     }
 
     pub fn can_join(&self) -> bool {
@@ -424,12 +486,25 @@ impl LocalPlayer {
         self.apply_mouse_look_timed(mouse, Duration::from_millis(1));
     }
 
+    #[cfg(test)]
     pub fn update(
         &mut self,
         elapsed: Duration,
         keys: &HashSet<KeyCode>,
         mouse: (f64, f64),
         client_cmd: UserCmd,
+    ) -> Result<(), String> {
+        self.update_with_game(elapsed, keys, mouse, client_cmd, &mut NoGame)
+    }
+
+    /// [`Self::update`] with server game logic running around every fixed step.
+    pub fn update_with_game(
+        &mut self,
+        elapsed: Duration,
+        keys: &HashSet<KeyCode>,
+        mouse: (f64, f64),
+        client_cmd: UserCmd,
+        game: &mut dyn SoloGame,
     ) -> Result<(), String> {
         self.apply_mouse_look_timed(mouse, elapsed);
         // Preserve tapped +commands until a fixed Pmove step actually runs.
@@ -445,10 +520,12 @@ impl LocalPlayer {
         while self.accumulated >= tick {
             self.accumulated -= tick;
             let move_priority = self.move_priority;
+            let foot_bolts = self.foot_bolts;
             let state = match self.mode {
                 JoinMode::Player => self.player.as_mut().expect("joined player"),
                 JoinMode::Spectator => &mut self.spectator,
             };
+            state.set_foot_bolts(foot_bolts)?;
             let walk = keys.contains(&KeyCode::ShiftLeft) || keys.contains(&KeyCode::ShiftRight);
             let magnitude = if walk { 64 } else { 127 };
             let crouch =
@@ -503,14 +580,28 @@ impl LocalPlayer {
             self.previous_eye = self.current_eye;
             self.previous_origin = self.current_origin;
             self.previous_command_time = self.current_command_time;
+            // Only a joined player that clips is pushed, touches triggers or
+            // collides with brush models; a spectator or noclipper flies through.
+            let clipping = self.mode == JoinMode::Player && !self.noclip;
+            if let Some(collision) = self.world.0.as_mut() {
+                game.run_frame(cmd.server_time, clipping.then_some(&mut *state), collision);
+            }
             state.offline_force_tick_with_msec(
                 cmd.server_time,
                 self.pending_power.take(),
                 self.tick_msec,
             )?;
-            let view = self
-                .movement
-                .step_with_msec(state, cmd, self.tick_msec, &mut self.world)?;
+            let view = if clipping {
+                let mut traced = GameWorld { world: &mut self.world, solids: game.solids() };
+                self.movement.step_with_msec(state, cmd, self.tick_msec, &mut traced)?
+            } else {
+                self.movement
+                    .step_with_msec(state, cmd, self.tick_msec, &mut self.world)?
+            };
+            if let Some(collision) = self.world.0.as_mut() {
+                let alive = clipping && view.health > 0;
+                game.after_pmove(cmd.server_time, alive.then_some((&view, cmd.buttons)), collision);
+            }
             // The current Pmove state came from this exact command. Subframe
             // presentation uses it as the baseline, like remote prediction does.
             self.subframe_base_cmd_angles = cmd.angles;
@@ -645,6 +736,7 @@ mod tests {
         let spawn = SpawnPoint {
             position: render_position([0.0, 0.0, 24.125]),
             yaw: 0.0,
+            ..SpawnPoint::default()
         };
         let mut player = LocalPlayer::new(
             Some(support::animations()),
@@ -872,6 +964,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(player.network_state().fields[SABER_ANIM_LEVEL_FIELD], 3); // SS_STRONG
+        // fd.saberDrawAnimLevel (slot 25) is what the HUD shows.
+        assert_eq!(player.network_state().fields[25], 3);
 
         // OpenJK debounces repeats of the same generic command for 300 ms.
         player
@@ -958,6 +1052,7 @@ mod tests {
         let spawn = SpawnPoint {
             position: [0.0; 3],
             yaw: 0.0,
+            ..SpawnPoint::default()
         };
         let mut player = LocalPlayer::new(None, None, spawn).unwrap();
         assert!(player.join(JoinMode::Player, spawn).is_err());

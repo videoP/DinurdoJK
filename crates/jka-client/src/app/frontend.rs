@@ -14,7 +14,6 @@ use std::{
 use crate::cgame::{CS_PLAYERS, ET_EVENTS};
 
 const LEVELSHOT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-const PROFILE_GLM_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrontendPage {
@@ -139,8 +138,6 @@ pub(super) struct ProfileModelEntry {
     pub value: String,
     pub model_name: String,
     pub skin_name: String,
-    /// JKA profile portrait resolved from models/players/<model>/icon_<skin>.*.
-    pub icon: Option<LevelshotAsset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,103 +152,11 @@ pub(super) struct ProfileSaberEntry {
 }
 
 pub(super) fn scan_profile_catalog(
-    base: &Path,
-    game: Option<&Path>,
+    assets: &mut AssetSearchPath,
 ) -> Result<(Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>), String> {
-    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
-    let names = assets.names().map(str::to_owned).collect::<Vec<_>>();
+    let models = profile_model_entries(assets.names());
 
-    // OpenJK's model cvar is model[/skin]. Keep the initial browser on complete
-    // model_*.skin presets. Multipart head|torso|lower selections already work
-    // when present in the current cvar and will get their own modern editor next.
-    let mut model_folders = BTreeSet::new();
-    let mut skins_by_model = BTreeMap::<String, BTreeSet<String>>::new();
-    for name in &names {
-        let lower = name.to_ascii_lowercase();
-        let Some(rest) = lower.strip_prefix("models/players/") else { continue };
-        let Some((folder, leaf)) = rest.rsplit_once('/') else { continue };
-        if folder.is_empty() || folder.contains('/') {
-            continue;
-        }
-        if leaf == "model.glm" {
-            // Vehicles and other non-player GLMs also live under models/players.
-            // A selectable JKA player model must be driven by the shared humanoid
-            // animation skeleton (_humanoid or one of its authored variants).
-            let candidate = format!("models/players/{folder}/model.glm");
-            let humanoid = assets
-                .read(&candidate, PROFILE_GLM_LIMIT_BYTES)
-                .ok()
-                .flatten()
-                .and_then(|asset| jka_assets::ghoul2::glm_animation_name(&asset.bytes).ok())
-                .is_some_and(|anim_name| {
-                    anim_name
-                        .replace('\\', "/")
-                        .to_ascii_lowercase()
-                        .contains("_humanoid")
-                });
-            if humanoid {
-                model_folders.insert(folder.to_owned());
-            }
-        } else if let Some(skin) = leaf
-            .strip_prefix("model_")
-            .and_then(|leaf| leaf.strip_suffix(".skin"))
-            .filter(|skin| !skin.is_empty())
-        {
-            skins_by_model
-                .entry(folder.to_owned())
-                .or_default()
-                .insert(skin.to_owned());
-        }
-    }
-
-    let mut models = Vec::new();
-    for model in model_folders {
-        let skins = skins_by_model.remove(&model).unwrap_or_else(|| {
-            let mut fallback = BTreeSet::new();
-            fallback.insert("default".to_owned());
-            fallback
-        });
-        for skin in skins {
-            let value = if skin.eq_ignore_ascii_case("default") {
-                model.clone()
-            } else {
-                format!("{model}/{skin}")
-            };
-            let mut icon = None;
-            'icon_search: for extension in ["jpg", "jpeg", "png", "tga"] {
-                let format = match extension {
-                    "jpg" | "jpeg" => image::ImageFormat::Jpeg,
-                    "png" => image::ImageFormat::Png,
-                    "tga" => image::ImageFormat::Tga,
-                    _ => unreachable!(),
-                };
-                for icon_skin in [skin.as_str(), "default"] {
-                    let candidate = format!("models/players/{model}/icon_{icon_skin}.{extension}");
-                    match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
-                        Ok(Some(asset)) => {
-                            icon = Some(LevelshotAsset { bytes: asset.bytes, format });
-                            break 'icon_search;
-                        }
-                        Ok(None) => {}
-                        Err(error) => eprintln!("Profile icon {candidate}: {error}"),
-                    }
-                }
-            }
-            models.push(ProfileModelEntry {
-                value,
-                model_name: model.clone(),
-                skin_name: skin,
-                icon,
-            });
-        }
-    }
-    models.sort_by(|a, b| {
-        a.model_name
-            .cmp(&b.model_name)
-            .then_with(|| a.skin_name.cmp(&b.skin_name))
-    });
-
-    let saber_definitions = jka_assets::saber::load_saber_definitions(&mut assets)?;
+    let saber_definitions = jka_assets::saber::load_saber_definitions(assets)?;
     let mut sabers = saber_definitions
         .iter()
         .map(|definition| ProfileSaberEntry {
@@ -268,12 +173,109 @@ pub(super) fn scan_profile_catalog(
     Ok((models, sabers))
 }
 
+/// Image extensions accepted for `icon_<skin>.*`, in OpenJK's `bIsImageFile`
+/// probe order (jpg, png, tga) plus jpeg.
+const PROFILE_ICON_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "tga"];
+
+/// Profile entries promoted the way OpenJK's `UI_BuildQ3Model_List` does: for
+/// every `models/players/<model>/*_<skin>.skin` file, the skin is listed only
+/// when a matching `icon_<skin>.{jpg,png,tga}` exists. No model.glm or GLA
+/// check is made; a missing icon hides the skin from the browser but leaves it
+/// valid for `/model model/skin`. Names are VFS-normalized qpaths, so each
+/// logical skin/icon appears once however many providers or image formats
+/// carry it. Storage is unbounded (OpenJK caps at MAX_Q3PLAYERMODELS).
+fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ProfileModelEntry> {
+    let mut skins = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut icons = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for name in names {
+        let Some(rest) = name.strip_prefix("models/players/") else { continue };
+        let Some((folder, leaf)) = rest.split_once('/') else { continue };
+        // Only direct children of models/players/<model>/, like FS_GetFileList.
+        if folder.is_empty() || leaf.contains('/') {
+            continue;
+        }
+        if let Some(stem) = leaf.strip_suffix(".skin") {
+            // Everything after the first underscore: model_/head_/torso_/lower_<skin>.
+            if let Some((_, skin)) = stem.split_once('_').filter(|(_, skin)| !skin.is_empty()) {
+                skins.entry(folder).or_default().insert(skin);
+            }
+        } else if let Some((stem, extension)) = leaf.rsplit_once('.') {
+            if PROFILE_ICON_EXTENSIONS.contains(&extension) {
+                if let Some(skin) = stem.strip_prefix("icon_").filter(|skin| !skin.is_empty()) {
+                    icons.entry(folder).or_default().insert(skin);
+                }
+            }
+        }
+    }
+
+    let mut models = Vec::new();
+    for (model, model_skins) in skins {
+        let Some(model_icons) = icons.get(model) else { continue };
+        for skin in model_skins.intersection(model_icons) {
+            let value = if skin.eq_ignore_ascii_case("default") {
+                model.to_owned()
+            } else {
+                format!("{model}/{skin}")
+            };
+            models.push(ProfileModelEntry {
+                value,
+                model_name: model.to_owned(),
+                skin_name: (*skin).to_owned(),
+            });
+        }
+    }
+    // BTreeMap/BTreeSet iteration is already sorted by (model, skin).
+    models
+}
+
+/// JKA profile portrait for models/players/<model>/icon_<skin>.*. Read on
+/// demand for visible tiles instead of during the catalog scan. There is no
+/// fallback to the default icon: catalog entries exist only because this icon
+/// does.
+pub(super) fn read_profile_icon(
+    assets: &mut AssetSearchPath,
+    model: &str,
+    skin: &str,
+) -> Option<LevelshotAsset> {
+    for extension in PROFILE_ICON_EXTENSIONS {
+        let format = match extension {
+            "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+            "png" => image::ImageFormat::Png,
+            _ => image::ImageFormat::Tga,
+        };
+        let candidate = format!("models/players/{model}/icon_{skin}.{extension}");
+        match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
+            Ok(Some(asset)) => return Some(LevelshotAsset { bytes: asset.bytes, format }),
+            Ok(None) => {}
+            Err(error) => eprintln!("Profile icon {candidate}: {error}"),
+        }
+    }
+    None
+}
+
+/// One `gfx/2d/crosshair*` image (`cg_crosshairImage` 1..=10) for the settings picker.
+/// Tries the engine's TGA-first order; the VFS picks the winning package.
+pub(super) fn read_crosshair_image(assets: &mut AssetSearchPath, index: u8) -> Option<LevelshotAsset> {
+    let name = *crate::ui::CROSSHAIR_IMAGE_NAMES.get(usize::from(index).checked_sub(1)?)?;
+    for (extension, format) in [
+        ("tga", image::ImageFormat::Tga),
+        ("png", image::ImageFormat::Png),
+        ("jpg", image::ImageFormat::Jpeg),
+    ] {
+        let candidate = format!("{name}.{extension}");
+        match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
+            Ok(Some(asset)) => return Some(LevelshotAsset { bytes: asset.bytes, format }),
+            Ok(None) => {}
+            Err(error) => eprintln!("Crosshair image {candidate}: {error}"),
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SoloMapEntry {
     /// Package-relative map name without `maps/` or `.bsp`, e.g. `mp/ffa3`.
     pub map_name: String,
-    /// Compressed levelshot asset. Decoded lazily only for the selected map.
-    pub levelshot: Option<LevelshotAsset>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,117 +290,59 @@ pub(super) struct LevelshotAsset {
     pub format: image::ImageFormat,
 }
 
-pub(super) fn scan_solo_maps(
-    base: &Path,
-    game: Option<&Path>,
-) -> Result<Vec<SoloMapEntry>, String> {
-    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
-    let map_names: Vec<String> = assets
+fn scan_map_names(assets: &AssetSearchPath, extension: &str) -> Vec<SoloMapEntry> {
+    let mut maps = assets
         .names()
         .filter_map(|name| {
             let lower = name.to_ascii_lowercase();
             lower
                 .strip_prefix("maps/")
-                .and_then(|name| name.strip_suffix(".bsp"))
+                .and_then(|name| name.strip_suffix(extension))
                 .filter(|name| !name.is_empty())
-                .map(str::to_owned)
+                .map(|map_name| SoloMapEntry { map_name: map_name.to_owned() })
         })
-        .collect();
-
-    let mut maps = Vec::with_capacity(map_names.len());
-    for map_name in map_names {
-        let leaf = map_name.rsplit('/').next().unwrap_or(&map_name);
-        let mut levelshot = None;
-
-        // JKA levelshots usually mirror the map qpath after maps/, e.g.
-        // maps/mp/ffa3.bsp -> levelshots/mp/ffa3.jpg. Keep a leaf-name
-        // fallback for custom packs that flatten their levelshots directory.
-        'search: for stem in [map_name.as_str(), leaf] {
-            for (extension, format) in [
-                ("jpg", image::ImageFormat::Jpeg),
-                ("jpeg", image::ImageFormat::Jpeg),
-                ("png", image::ImageFormat::Png),
-                ("tga", image::ImageFormat::Tga),
-            ] {
-                let candidate = format!("levelshots/{stem}.{extension}");
-                match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
-                    Ok(Some(asset)) => {
-                        levelshot = Some(LevelshotAsset {
-                            bytes: asset.bytes,
-                            format,
-                        });
-                        break 'search;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("Levelshot {candidate}: {error}");
-                    }
-                }
-            }
-        }
-
-        maps.push(SoloMapEntry {
-            map_name,
-            levelshot,
-        });
-    }
-
+        .collect::<Vec<_>>();
     maps.sort_by(|a, b| a.map_name.cmp(&b.map_name));
-    Ok(maps)
+    maps
 }
 
-pub(super) fn scan_source_maps(
-    base: &Path,
-    game: Option<&Path>,
-) -> Result<Vec<SoloMapEntry>, String> {
-    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
-    let map_names: Vec<String> = assets
-        .names()
-        .filter_map(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower
-                .strip_prefix("maps/")
-                .and_then(|name| name.strip_suffix(".map"))
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-        })
-        .collect();
+pub(super) fn scan_solo_maps(assets: &AssetSearchPath) -> Vec<SoloMapEntry> {
+    scan_map_names(assets, ".bsp")
+}
 
-    let mut maps = Vec::with_capacity(map_names.len());
-    for map_name in map_names {
-        let leaf = map_name.rsplit('/').next().unwrap_or(&map_name);
-        let mut levelshot = None;
-        'search: for stem in [map_name.as_str(), leaf] {
-            for (extension, format) in [
-                ("jpg", image::ImageFormat::Jpeg),
-                ("jpeg", image::ImageFormat::Jpeg),
-                ("png", image::ImageFormat::Png),
-                ("tga", image::ImageFormat::Tga),
-            ] {
-                let candidate = format!("levelshots/{stem}.{extension}");
-                match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
-                    Ok(Some(asset)) => {
-                        levelshot = Some(LevelshotAsset { bytes: asset.bytes, format });
-                        break 'search;
-                    }
-                    Ok(None) => {}
-                    Err(error) => eprintln!("Levelshot {candidate}: {error}"),
-                }
+pub(super) fn scan_source_maps(assets: &AssetSearchPath) -> Vec<SoloMapEntry> {
+    scan_map_names(assets, ".map")
+}
+
+/// Compressed levelshot for one map, read on demand for the selected entry.
+pub(super) fn read_levelshot(assets: &mut AssetSearchPath, map_name: &str) -> Option<LevelshotAsset> {
+    let leaf = map_name.rsplit('/').next().unwrap_or(map_name);
+    // JKA levelshots usually mirror the map qpath after maps/, e.g.
+    // maps/mp/ffa3.bsp -> levelshots/mp/ffa3.jpg. Keep a leaf-name
+    // fallback for custom packs that flatten their levelshots directory.
+    for stem in [map_name, leaf] {
+        for (extension, format) in [
+            ("jpg", image::ImageFormat::Jpeg),
+            ("jpeg", image::ImageFormat::Jpeg),
+            ("png", image::ImageFormat::Png),
+            ("tga", image::ImageFormat::Tga),
+        ] {
+            let candidate = format!("levelshots/{stem}.{extension}");
+            match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
+                Ok(Some(asset)) => return Some(LevelshotAsset { bytes: asset.bytes, format }),
+                Ok(None) => {}
+                Err(error) => eprintln!("Levelshot {candidate}: {error}"),
             }
         }
-        maps.push(SoloMapEntry { map_name, levelshot });
     }
-    maps.sort_by(|a, b| a.map_name.cmp(&b.map_name));
-    Ok(maps)
+    None
 }
 
 pub(super) fn scan_asset_viewer_assets(
-    base: &Path,
-    game: Option<&Path>,
+    assets: &mut AssetSearchPath,
 ) -> Result<Vec<AssetEntry>, String> {
     const SHADER_CATALOG_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
-    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
     // Snapshot names before reading shader files because reads require mutable
     // VFS access. Shader files expand into one browser entry per definition;
     // the .shader container itself is only a filter/source label.
@@ -484,9 +428,9 @@ pub(super) fn scan_asset_viewer_assets(
         });
     }
 
-    // Asset Viewer is an A-Z browser. Sort by the name actually shown in the
-    // grid so the alphabet rail and visual order always agree. Generic JKA
-    // model.glm/model.md3 files use their parent folder as the model name.
+    // Sort by the compact browser label. Generic JKA model.glm/model.md3
+    // files use their parent folder as the model name, so the visible list
+    // remains stable and human-readable across mixed asset kinds.
     entries.sort_by(|a, b| {
         a.display_name
             .to_ascii_lowercase()
@@ -1596,4 +1540,113 @@ fn scan_demo_bytes(
         console,
         kill_count,
     }))
+}
+
+#[cfg(test)]
+mod profile_catalog_tests {
+    use super::*;
+
+    fn values(names: &[&str]) -> Vec<String> {
+        profile_model_entries(names.iter().copied())
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect()
+    }
+
+    #[test]
+    fn default_skin_with_icon_lists_bare_model() {
+        let entries = profile_model_entries(
+            ["models/players/foo/model.glm", "models/players/foo/model_default.skin", "models/players/foo/icon_default.jpg"]
+                .into_iter(),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "foo");
+        assert_eq!(entries[0].model_name, "foo");
+        assert_eq!(entries[0].skin_name, "default");
+    }
+
+    #[test]
+    fn custom_skin_with_icon_lists_model_slash_skin() {
+        assert_eq!(
+            values(&["models/players/foo/model_black.skin", "models/players/foo/icon_black.jpg"]),
+            ["foo/black"]
+        );
+    }
+
+    #[test]
+    fn skin_without_icon_is_hidden() {
+        assert!(values(&["models/players/foo/model.glm", "models/players/foo/model_secret.skin"]).is_empty());
+        // The default icon does not stand in for a missing skin icon.
+        assert!(values(&[
+            "models/players/foo/model_secret.skin",
+            "models/players/foo/icon_default.jpg",
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn red_and_blue_icons_with_skins_stay_available_for_team_tabs() {
+        assert_eq!(
+            values(&[
+                "models/players/foo/model_red.skin",
+                "models/players/foo/icon_red.jpg",
+                "models/players/foo/model_blue.skin",
+                "models/players/foo/icon_blue.tga",
+            ]),
+            ["foo/blue", "foo/red"]
+        );
+    }
+
+    #[test]
+    fn no_glm_or_humanoid_requirement() {
+        assert_eq!(
+            values(&["models/players/foo/model_default.skin", "models/players/foo/icon_default.png"]),
+            ["foo"]
+        );
+    }
+
+    #[test]
+    fn duplicate_icon_formats_and_split_skins_are_one_entry() {
+        assert_eq!(
+            values(&[
+                "models/players/foo/model_default.skin",
+                "models/players/foo/head_default.skin",
+                "models/players/foo/icon_default.jpg",
+                "models/players/foo/icon_default.png",
+            ]),
+            ["foo"]
+        );
+    }
+
+    #[test]
+    fn skin_name_is_everything_after_first_underscore() {
+        assert_eq!(
+            values(&["models/players/foo/torso_dark_hood.skin", "models/players/foo/icon_dark_hood.jpg"]),
+            ["foo/dark_hood"]
+        );
+    }
+
+    #[test]
+    fn ignores_nested_folders_and_unsupported_icon_formats() {
+        assert!(values(&[
+            "models/players/custom/foo/model_default.skin",
+            "models/players/custom/foo/icon_default.jpg",
+            "models/players/bar/model_default.skin",
+            "models/players/bar/icon_default.bmp",
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn catalog_is_not_capped_at_openjk_array_size() {
+        let names = (0..3000)
+            .flat_map(|i| {
+                [
+                    format!("models/players/m{i}/model_default.skin"),
+                    format!("models/players/m{i}/icon_default.jpg"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(profile_model_entries(names.iter().map(String::as_str)).len(), 3000);
+    }
 }

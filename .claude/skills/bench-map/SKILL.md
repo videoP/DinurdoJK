@@ -9,6 +9,10 @@ Everything runs through `scripts/bench-map.sh`, which launches the release
 client with scripted console commands, prints the key log lines, and restores
 the user's config afterwards.
 
+For multi-case comparisons (settings A/B/C x spots x repeated launches, with a
+report file), use the plan runner instead: `bench.cmd bench\plans\<plan>.bench`.
+See `bench/plans/README.txt`. It calls this script once per launch.
+
 ## Steps
 
 1. **Build** (about 30 s, fast profile):

@@ -2,6 +2,9 @@
 mod rt_models;
 #[path = "renderer_rt_resolution.rs"]
 mod rt_resolution;
+#[cfg(test)]
+#[path = "renderer_shader_audit.rs"]
+mod shader_audit;
 
 use crate::{
     camera::{late_latch_third_person_view, Camera, ThirdPersonLateLatchView},
@@ -10,7 +13,7 @@ use crate::{
     grass::{GrassDrawStats, GrassMapGpu, GrassPreparedDraw, GrassRenderer},
     jump_shade::JumpShadeState,
     materials::{BlendFactor, BlendFunc, CullMode, TextureData},
-    runtime::{RenderStats, SurfaceInspectorInfo, UserEvent, WorldUploadTimings},
+    runtime::{RenderStats, ScreenshotOutput, SurfaceInspectorInfo, SurfaceInspectorSection, UserEvent, WorldUploadTimings},
     scene::{
         self, BlendMode, DirectionalSun, DrawBatch, DrawClass, GpuVertex,
         PipelineKey, PreparedMap, PreparedPortalDrawPlan, PreparedPortalPlanBatchRef,
@@ -22,7 +25,7 @@ use crate::{
     weather::{self, FroxelUniform, WeatherOcclusionCache, WeatherSurfaceUniform, WeatherSystem},
     ui::{
         self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DetailTextureMode, DofQuality, FogMode,
-        DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PvsMode, RainIntensity,
+        DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode, PlanarReflectionMode, PuddleQuality, PvsMode, RainIntensity,
         ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex, VsyncMode,
     },
 };
@@ -58,11 +61,7 @@ const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 const UI_DYNAMIC_BUFFER_BYTES: u64 = 512 * 1024;
 const UI_TRANSIENT_BUFFER_BYTES: u64 = 1024 * 1024;
 const SCREEN_FX_BUFFER_BYTES: u64 = 64 * 1024;
-// AUTO and AUTO 2 use a conservative vertex-equivalent cost for an extra draw
-// call. Existing AUTO compares whole BSP clusters; AUTO 2 applies the same cost
-// independently per coarse surface group.
-const AUTO_DRAW_VERTEX_EQUIVALENT: u64 = 8192;
-// AUTO 4 physically collapses non-contiguous per-cluster recipes lazily. The GPU
+// AUTO physically collapses non-contiguous per-cluster recipes lazily. The GPU
 // index buffer reserves at most this much extra space; LRU eviction keeps custom
 // maps with thousands of clusters from multiplying index memory without bound.
 const AUTO4_COLLAPSE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -76,15 +75,18 @@ const MAX_DYNAMIC_LIGHTS: usize = 256;
 const MAX_LOCAL_SHADOW_LIGHTS: usize = 4;
 const LOCAL_SHADOW_CACHE_SLOTS: usize = 8;
 const LOCAL_SHADOW_MAP_SIZE: u32 = 512;
+/// `camera_water_surface` / `PostUniform::underwater` value for a camera that is not submerged.
+const NO_WATER_SURFACE: f32 = -1.0e30;
 const LOCAL_SHADOW_NEAR: f32 = 4.0;
 const LOCAL_SHADOW_RESELECT_DISTANCE: f32 = 192.0;
 const LOCAL_SHADOW_HYSTERESIS: f32 = 1.35;
 const SHADOW_CASCADES: usize = 4;
-const LEGACY_SHADOW_CASCADES: usize = 3;
 const SHADOW_MAP_SIZE: u32 = 2048;
-const LEGACY_SHADOW_SPLITS: [f32; LEGACY_SHADOW_CASCADES] = [1024.0, 4096.0, 16384.0];
-const SHADOW_CASCADE_BLEND_FRACTION: f32 = 0.08;
-const SHADOW_CASCADE_MIN_BLEND: f32 = 64.0;
+// BSP compilers keep only the faces visible from playable space, so a roof or
+// ceiling is very often a single face that points down into the room. From the
+// sun's side that face is a back face: culling it would let sunlight straight
+// through the map's own geometry. Sun casters therefore draw both sides.
+const SHADOW_CASTER_CULL: Option<wgpu::Face> = None;
 // Bevy 0.19.1 CascadeShadowConfig::default() uses 0.1 / 10.0 / 150.0.
 // This renderer already treats 64 JKA units as one metre for weather/world effects,
 // so only the unit conversion is applied here; the Bevy cascade ratios are unchanged.
@@ -100,7 +102,6 @@ const BEVY_CSM_SHADOW_NORMAL_BIAS: f32 = 1.8;
 // apparent solar diameter as its default emitter extent. The shader receives
 // cos(half-angle), matching Bevy's DirectionalLight representation.
 const RT_SUN_ANGULAR_DIAMETER_RADIANS: f32 = 0.00930842;
-const RT_SHADOW_SAMPLES_PER_PIXEL: f32 = 1.0;
 // Dynamic RT casters are deliberately bounded. Static BSP plus inline movers
 // occupy fixed slots first; ordinary rigid entities use the remaining tail.
 // This avoids allowing an effects-heavy custom server to turn one shadow mode
@@ -108,6 +109,9 @@ const RT_SHADOW_SAMPLES_PER_PIXEL: f32 = 1.0;
 const RT_DYNAMIC_TLAS_INSTANCE_BUDGET: usize = 1024;
 const RT_RIGID_BLAS_CACHE_LIMIT: usize = 2048;
 const RT_SKINNED_BLAS_CACHE_LIMIT: usize = 2048;
+/// Side of the cloud march's interleave block: one texel in grid x grid is
+/// marched per frame. Shared by the post uniform and the march viewport.
+const CLOUD_INTERLEAVE_GRID: u32 = 2;
 const FALLBACK_SUN_DIRECTION: [f32; 3] = [-0.38, -0.84, -0.39];
 const FALLBACK_SUN_COLOR: [f32; 3] = [0.57735026, 0.57735026, 0.57735026];
 const FALLBACK_SUN_INTENSITY: f32 = 250.0;
@@ -122,6 +126,7 @@ const PLANAR_REFLECTION_HYSTERESIS: f32 = 1.15;
 /// that resolution, so the "high detail" channels contributed aliasing rather
 /// than shape.
 use crate::cloud_noise;
+use crate::cloud_wind;
 
 fn camera_depth_clear() -> f32 {
     0.0
@@ -129,6 +134,26 @@ fn camera_depth_clear() -> f32 {
 
 fn camera_depth_compare() -> wgpu::CompareFunction {
     wgpu::CompareFunction::GreaterEqual
+}
+
+/// Depth bias for shaders that author `polygonOffset` (decals, caustic overlays
+/// and other surfaces lying coplanar on a wall).
+///
+/// The engine calls `glPolygonOffset(-1, -2)` with a forward-Z depth buffer,
+/// which pulls the surface toward the camera. The camera depth here is
+/// reversed-Z (near -> 1, far -> 0) in a Depth32Float buffer, so "toward the
+/// camera" is a POSITIVE bias, and a float buffer's bias unit is far finer than
+/// a 24-bit fixed-point unit, so it takes many units to cover the difference in
+/// rasterised depth between two coplanar triangles. With the sign wrong the
+/// overlay lost the depth test to the wall and only survived in triangle-shaped
+/// patches where rounding happened to favour it.
+fn polygon_offset_depth_bias() -> wgpu::DepthBiasState {
+    debug_assert_eq!(camera_depth_compare(), wgpu::CompareFunction::GreaterEqual);
+    wgpu::DepthBiasState {
+        constant: 16,
+        slope_scale: 1.0,
+        clamp: 0.0,
+    }
 }
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     0 => Float32x3,
@@ -321,6 +346,8 @@ fn sample_view_rotation(
         ViewLatchMode::Direct => {
             camera.yaw = sample.yaw;
             camera.pitch = sample.pitch;
+            // The base position (already shaken by the frame setup) is untouched.
+            camera.apply_shake_angles();
         }
         ViewLatchMode::ThirdPerson(latch) => {
             // LatestViewState uses renderer conventions (yaw radians, positive
@@ -334,6 +361,7 @@ fn sample_view_rotation(
             camera.position = Vec3::from_array(scene::render_position(view.origin));
             camera.yaw = view.angles[1].to_radians();
             camera.pitch = -view.angles[0].to_radians();
+            camera.apply_shake();
         }
     }
     let sampled_at = Instant::now();
@@ -361,6 +389,26 @@ pub enum DynamicModelAlphaMode {
     Modulate2x,
     /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
     Darken,
+}
+
+impl DynamicModelAlphaMode {
+    const COUNT: usize = 10;
+
+    /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
+    const fn index(self) -> usize {
+        match self {
+            Self::Opaque => 0,
+            Self::Mask => 1,
+            Self::Blend => 2,
+            Self::MaskBlend => 3,
+            Self::AdditiveOne => 4,
+            Self::Additive => 5,
+            Self::BlendUnlit => 6,
+            Self::Modulate => 7,
+            Self::Modulate2x => 8,
+            Self::Darken => 9,
+        }
+    }
 }
 
 const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 10] = [
@@ -462,6 +510,21 @@ pub struct Ghoul2GpuSkinning {
     pub axis: [[f32; 3]; 3],
     pub origin: [f32; 3],
     pub color: [f32; 4],
+    /// Texture-coordinate transform `uv * xy + zw`; [1, 1, 0, 0] is identity.
+    pub uv_xform: [f32; 4],
+    /// `alphaGen lightingSpecular`: JKA world-space (light, viewer) points. The
+    /// shader multiplies the draw alpha by q3's `(R.V)^4` specular term.
+    pub specular: Option<([f32; 3], [f32; 3])>,
+    /// `deformVertexes bulge <0> <height> <0>` (JKA's static-offset special
+    /// case; see `jka_assets::shader::Bulge::is_static`): a constant JKA-unit
+    /// offset along the model-space vertex normal, applied before the entity
+    /// transform. Zero for ordinary surfaces. Packed into the GPU draw's
+    /// otherwise-unused `spec_viewer.w` (mutually exclusive with specular).
+    pub bulge_height: f32,
+    /// `tcGen environment` (e.g. `gfx/misc/personalshield`'s chrome stage):
+    /// replaces `uv_xform`'s mapping of the base mesh UVs with q3's reflection-
+    /// vector environment mapping (`RB_CalcEnvironmentTexCoords`).
+    pub env_map: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +617,12 @@ pub struct FxGpuSpriteInstance {
 #[derive(Clone)]
 pub struct FxGpuSprites {
     pub instances: Arc<Vec<FxGpuSpriteInstance>>,
+    /// Instances are player blob-shadow requests, not billboards. The renderer
+    /// clips the rendered floor into each request (`Renderer::build_blob_shadow_marks`,
+    /// OpenJK R_MarkFragments) and draws the resulting polygons as one ordinary
+    /// dynamic mesh. origin = center on the collision plane (w = shade), left/up =
+    /// in-plane half axes of length `radius` (left.w = entity number).
+    pub blob_shadow: bool,
 }
 
 #[derive(Clone)]
@@ -744,8 +813,23 @@ pub struct TransientLight {
     pub blade_segments: Option<Arc<[crate::fx::system::FxLightSegment]>>,
 }
 
+/// A lit saber blade in renderer space. The blade is additive FX light that no
+/// depth buffer knows about, so the cloud composite is told where it is and
+/// keeps its own transmittance and radiance off those pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudForegroundBlade {
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub radius: f32,
+}
+
+/// Most blades the cloud composite exempts. A saber has up to eight blades, and
+/// the nearest ones win when a scene has more.
+const MAX_CLOUD_FOREGROUND_BLADES: usize = 8;
+
 #[derive(Clone)]
 pub struct RenderSnapshot {
+    pub model_frame_source: Option<crate::model_frame_log::FrameSource>,
     pub camera: Camera,
     /// Mapping from latest local-player input orientation to this render camera.
     pub view_latch: ViewLatchMode,
@@ -763,6 +847,8 @@ pub struct RenderSnapshot {
     pub transient_lights: Arc<Vec<TransientLight>>,
     /// Authored CGame screen-space stages, in 640x480 virtual coordinates.
     pub screen_fx: Arc<Vec<crate::fx::draw::ScreenFxDraw>>,
+    /// Lit saber blades the volumetric clouds must not composite over.
+    pub cloud_foreground: Arc<Vec<CloudForegroundBlade>>,
     /// `None`: no CGame owns the scene (solo/offline), so inline models keep
     /// their compiled pose. `Some`: exactly the movers in the current
     /// snapshot are drawn, as OpenJK only draws bmodels CGame submits.
@@ -777,6 +863,9 @@ pub struct RenderSnapshot {
     pub movement_hud: ui::MovementHudState,
     /// jaPRO SP-physics jump-height helper. `Off` costs nothing in the world shader.
     pub jump_shade: JumpShadeState,
+    /// Active `EV_SCREENSHAKE`/`CGCam_Shake`; the render thread rolls a fresh
+    /// offset each frame so it composes with the late-latched view.
+    pub camera_shake: Option<crate::camera::CameraShake>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -806,6 +895,7 @@ pub struct PostEffects {
     pub sun_intensity: f32,
     pub sun_color: [f32; 3],
     pub sun_visibility: SunVisibilityMode,
+    pub entity_sun_lighting: bool,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
@@ -831,6 +921,9 @@ pub struct PostEffects {
     pub cloud_size: f32,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
+    pub puddle_quality: PuddleQuality,
+    pub puddle_scatter: f32,
+    pub rain_grade: f32,
     pub reflection_quality: ReflectionQuality,
     pub reflection_debug: bool,
     pub chromatic_aberration: f32,
@@ -862,6 +955,50 @@ pub struct EguiRenderData {
     pub pixels_per_point: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct InspectorEntityHint {
+    pub entity_num: u16,
+    pub distance: f32,
+    pub hit: [f32; 3],
+}
+
+/// Render-thread cost of each setting inside a `BatchBegin`..`BatchEnd` window.
+struct RenderBatchTiming {
+    title: String,
+    started: Instant,
+    current: String,
+    entries: Vec<(String, f64)>,
+}
+
+impl RenderBatchTiming {
+    fn new(title: String) -> Self {
+        Self { title, started: Instant::now(), current: "(unlabelled)".to_owned(), entries: Vec::new() }
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        match self.entries.iter_mut().find(|(label, _)| *label == self.current) {
+            Some((_, total)) => *total += ms,
+            None => self.entries.push((self.current.clone(), ms)),
+        }
+    }
+
+    fn print(mut self) {
+        let busy: f64 = self.entries.iter().map(|(_, ms)| ms).sum();
+        self.entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!(
+            "[BATCH] {}: render thread applied {} setting(s) in {:.2} ms busy ({:.2} ms wall)",
+            self.title,
+            self.entries.len(),
+            busy,
+            self.started.elapsed().as_secs_f64() * 1000.0,
+        );
+        for (label, ms) in self.entries.iter().filter(|(_, ms)| *ms >= 0.05).take(20) {
+            println!("[BATCH]   render {label}: {ms:.2} ms");
+        }
+    }
+}
+
 pub enum RenderCommand {
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
@@ -876,6 +1013,12 @@ pub enum RenderCommand {
     SetWireframeMask(u32),
     /// Trigger-volume / clip-brush debug overlays (session-only).
     SetDebugVolumes { triggers: bool, clips: bool },
+    /// `r_drawEntities`: boxes + link lines for every map entity, rebuilt on
+    /// the app thread every tick (small vertex counts; see `DebugVolumeRenderer::entities`).
+    /// `None` clears the overlay (cvar off or no map entity graph loaded).
+    SetEntityMarkers(Option<jka_assets::bsp::DebugVolumeMesh>),
+    /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
+    SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
     SetFpsCap(u32),
     SetGamma(f32),
@@ -889,11 +1032,14 @@ pub enum RenderCommand {
     SetGrassPrecompute(bool),
     SetGrassMidLod(bool),
     SetGrassFrontToBack(bool),
+    SetContactShadowDebug(u8),
     SetOceanEnabled(bool),
     SetOceanSettings(crate::ocean::OceanSettings),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
     SetOceanTime(f32),
     SetPerfTrace(bool),
+    SetForceUnifiedWorld(bool),
+    SetPom(bool),
     SetGpuTimings(bool),
     SetFxZeroAlphaDiscard(bool),
     SetGhoul2BatchDraws(Ghoul2BatchMode),
@@ -903,6 +1049,7 @@ pub enum RenderCommand {
     },
     SetDynamicLighting(DynamicLightsMode),
     SetRtSamples(u32),
+    SetDynamicLightFalloff(u32),
     SetRtHalfResolution(bool),
     SetMapLightSimulation(bool),
     SetClassicWorldLighting { fullbright: bool, vertex_light: bool, lightmap_only: bool },
@@ -910,6 +1057,7 @@ pub enum RenderCommand {
     SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
     SetLocalLightShadows(bool),
+    SetEntityShadowLight(EntityShadowLight),
     SetPbrSettings {
         enabled: bool,
         deluxe_mapping: bool,
@@ -928,17 +1076,26 @@ pub enum RenderCommand {
         y: f32,
         width: u32,
         height: u32,
+        entity_hint: Option<InspectorEntityHint>,
     },
     ClearSurfaceInspection,
     AddSurfaceDeformation(SurfaceDeformationStamp),
     Screenshot {
         directory: PathBuf,
     },
+    CopyFrameToClipboard,
     SetUi(UiSnapshot),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
         center_print: Option<ui::UiCenterPrint>,
         demo_timeline: Option<ui::DemoTimelineUi>,
+        prediction_debug: Option<ui::PredictionDebugUi>,
+        crosshair_target: ui::UiCrosshairTarget,
+        follow_name: Option<String>,
+        race_timer: Option<crate::japro_cg::RaceTimerUi>,
+        vote_line: Option<String>,
+        speedometer: Option<crate::speedometer::Ui>,
+        lagometer: Option<crate::lagometer::Ui>,
     },
     SetUiTelemetry {
         perf: ui::PerfStats,
@@ -959,6 +1116,14 @@ pub enum RenderCommand {
         name: String,
         map: Box<PreparedMap>,
     },
+    /// Open a settings batch (quality preset): world pipeline-variant
+    /// activation is deferred and per-setting render-thread cost is recorded.
+    BatchBegin(String),
+    /// Attribute the render-thread cost of the following commands to this cvar.
+    BatchLabel(String),
+    /// Close the batch: activate the final pipeline variant once and print the
+    /// per-setting timing report.
+    BatchEnd,
     Shutdown,
 }
 
@@ -1096,6 +1261,25 @@ impl RenderThread {
         }
     }
 
+    /// Ask the render thread to exit without waiting for it. Swapchain and
+    /// surface teardown can synchronously message the window's owning thread
+    /// (DXGI and some Vulkan drivers do), so the UI thread must keep pumping
+    /// its event loop while the renderer drops instead of blocking in `join`.
+    pub fn request_shutdown(&self) {
+        let _ = self.command_tx.send(RenderCommand::Shutdown);
+    }
+
+    /// True once the render thread has returned (or was already detached).
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Detach a render thread that never exited so dropping this handle cannot
+    /// block on it. The thread keeps its window/device alive until it dies.
+    pub fn abandon(&mut self) {
+        self.join.take();
+    }
+
 }
 
 impl Drop for RenderThread {
@@ -1189,6 +1373,7 @@ fn render_thread_main(
         sun_intensity: initial_ui.video.sun_intensity,
         sun_color: initial_ui.video.sun_color,
         sun_visibility: initial_ui.video.sun_visibility,
+        entity_sun_lighting: initial_ui.video.entity_sun_lighting,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
         cloud_quality: initial_ui.video.cloud_quality,
@@ -1214,6 +1399,9 @@ fn render_thread_main(
         cloud_size: initial_ui.video.cloud_size,
         rain: initial_ui.video.rain,
         rain_intensity: initial_ui.video.rain_intensity,
+        puddle_quality: initial_ui.video.puddle_quality,
+        puddle_scatter: initial_ui.video.puddle_scatter,
+        rain_grade: initial_ui.video.rain_grade,
         reflection_quality: initial_ui.video.reflection_quality,
         reflection_debug: initial_ui.video.reflection_debug,
         chromatic_aberration: initial_ui.video.chromatic_aberration,
@@ -1238,12 +1426,14 @@ fn render_thread_main(
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
+    renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
     renderer.set_rt_half_resolution(initial_ui.video.rt_half_resolution);
     renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
     renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
     renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
     renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
     renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
+    renderer.set_entity_shadow_light(initial_ui.video.entity_shadow_light);
     renderer.set_pbr_settings(
         initial_ui.video.pbr,
         initial_ui.video.deluxe_mapping,
@@ -1251,12 +1441,15 @@ fn render_thread_main(
     );
     renderer.set_cascaded_shadows(initial_ui.video.dynamic_shadows);
     renderer.set_cull_debug(initial_ui.video.cull_debug);
+    renderer.set_force_unified_world(initial_ui.video.force_unified_world);
+    renderer.set_pom_enabled(initial_ui.video.pom);
     renderer.set_planar_reflection_debug(initial_ui.video.planar_reflection_debug);
     let mut perf_trace = initial_ui.video.perf_trace;
     renderer.set_ui(initial_ui);
     renderer.set_dynamic_hud(snapshot.hud, snapshot.movement_hud);
     renderer.set_jump_shade(snapshot.jump_shade);
     renderer.set_screen_fx(&snapshot.screen_fx);
+    renderer.set_cloud_foreground(&snapshot.cloud_foreground);
     println!(
         "[RENDER INIT] ready after applying video state {:.1} ms total",
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
@@ -1267,6 +1460,10 @@ fn render_thread_main(
     });
 
     let mut stats_started = Instant::now();
+    // Start of the current cap interval. Pacing from a fixed cadence rather than
+    // from the top of each frame keeps the loop's own overhead (command drain,
+    // snapshot swap, scene rebuild) out of the interval, so a cap of N yields N.
+    let mut frame_pace_anchor = Instant::now();
     let mut stats_frames = 0_u64;
     let mut last_info = FrameInfo::default();
     let mut last_measured_input_sequence = 0_u64;
@@ -1295,6 +1492,7 @@ fn render_thread_main(
     // Track the previous *camera snapshot* rather than the previous rendered frame
     // so camera motion remains visible instead of collapsing to zero at 2000+ FPS.
     let mut motion_reference_camera = snapshot.camera;
+    let mut shake_rng = crate::camera::ShakeRng::default();
     let mut motion_camera_sample_dt = 1.0 / 120.0;
     let mut motion_camera_changed_at = Instant::now();
 
@@ -1310,11 +1508,16 @@ fn render_thread_main(
     let mut trace_present_ms = 0.0_f64;
     let mut trace_dynamic_model_ms = 0.0_f64;
     let mut trace_grass_cpu_ms = 0.0_f64;
+    // Advanced-path prepare breakdown: camera, shadow, world, reflection.
+    let mut trace_prep_stage_ms = [0.0_f64; 4];
     if perf_trace {
         println!("JKA perf trace enabled (enable GPU TIMESTAMPS too for per-pass GPU timings)");
     }
 
     let mut first_frame_notified = false;
+    let mut batch_timing: Option<RenderBatchTiming> = None;
+
+    let mut deferred_load_map = None;
 
     loop {
         {
@@ -1322,8 +1525,49 @@ fn render_thread_main(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderCommands,
             );
+            if let Some((request_id, started, name, map)) = deferred_load_map.take() {
+                let map: Box<PreparedMap> = map;
+                let triangles = map.triangles;
+                let batches = map.batches.len();
+                let timings = map.load_timings;
+                let bsp_stats = map.bsp_stats.clone();
+                let upload_started = Instant::now();
+                let upload_timings = renderer.load_map(*map);
+                let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                pending_world_uploaded = Some((
+                    request_id,
+                    started,
+                    name,
+                    triangles,
+                    batches,
+                    upload_ms,
+                    upload_timings,
+                    timings,
+                    bsp_stats,
+                ));
+            }
             loop {
-                match command_rx.try_recv() {
+                let received = command_rx.try_recv();
+                let command_started = Instant::now();
+                match received {
+                    Ok(RenderCommand::BatchBegin(title)) => {
+                        renderer.begin_settings_batch();
+                        batch_timing = Some(RenderBatchTiming::new(title));
+                    }
+                    Ok(RenderCommand::BatchLabel(label)) => {
+                        if let Some(batch) = batch_timing.as_mut() {
+                            batch.current = label;
+                        }
+                    }
+                    Ok(RenderCommand::BatchEnd) => {
+                        let finish_started = Instant::now();
+                        renderer.end_settings_batch();
+                        if let Some(mut batch) = batch_timing.take() {
+                            batch.current = "(deferred world pipeline variant)".to_owned();
+                            batch.record(finish_started.elapsed());
+                            batch.print();
+                        }
+                    }
                     Ok(RenderCommand::Resize(size)) => renderer.resize(size),
                     Ok(RenderCommand::SetVsync(vsync)) => renderer.set_vsync(vsync),
                     Ok(RenderCommand::SetMaxFrameLatency(latency)) => {
@@ -1356,6 +1600,12 @@ fn render_thread_main(
                         renderer.debug_volumes.triggers_enabled = triggers;
                         renderer.debug_volumes.clips_enabled = clips;
                     }
+                    Ok(RenderCommand::SetEntityMarkers(mesh)) => {
+                        renderer.set_entity_markers(mesh);
+                    }
+                    Ok(RenderCommand::SetSunRayPreview(enabled)) => {
+                        renderer.debug_volumes.sun_ray_enabled = enabled;
+                    }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
                     Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
@@ -1381,6 +1631,9 @@ fn render_thread_main(
                     Ok(RenderCommand::SetGrassFrontToBack(enabled)) => {
                         renderer.set_grass_front_to_back(enabled)
                     }
+                    Ok(RenderCommand::SetContactShadowDebug(enabled)) => {
+                        renderer.contact_shadow_debug = enabled
+                    }
                     Ok(RenderCommand::SetOceanEnabled(enabled)) => {
                         renderer.set_ocean_enabled(enabled)
                     }
@@ -1403,6 +1656,7 @@ fn render_thread_main(
                         trace_submit_ms = 0.0;
                         trace_present_ms = 0.0;
                         trace_grass_cpu_ms = 0.0;
+                        trace_prep_stage_ms = [0.0; 4];
                         println!(
                             "JKA perf trace {}",
                             if enabled { "enabled" } else { "disabled" }
@@ -1427,6 +1681,7 @@ fn render_thread_main(
                         renderer.set_dynamic_lighting(mode);
                     }
                     Ok(RenderCommand::SetRtSamples(samples)) => renderer.set_rt_samples(samples),
+                    Ok(RenderCommand::SetDynamicLightFalloff(mode)) => renderer.set_dynamic_light_falloff(mode),
                     Ok(RenderCommand::SetRtHalfResolution(enabled)) => renderer.set_rt_half_resolution(enabled),
                     Ok(RenderCommand::SetMapLightSimulation(enabled)) => {
                         renderer.set_map_light_simulation(enabled);
@@ -1446,6 +1701,9 @@ fn render_thread_main(
                     Ok(RenderCommand::SetLocalLightShadows(enabled)) => {
                         renderer.set_local_light_shadows(enabled);
                     }
+                    Ok(RenderCommand::SetEntityShadowLight(source)) => {
+                        renderer.set_entity_shadow_light(source);
+                    }
                     Ok(RenderCommand::SetPbrSettings { enabled, deluxe_mapping, deluxe_specular }) => {
                         renderer.set_pbr_settings(enabled, deluxe_mapping, deluxe_specular);
                     }
@@ -1454,6 +1712,12 @@ fn render_thread_main(
                     }
                     Ok(RenderCommand::SetCullDebug(mode)) => {
                         renderer.set_cull_debug(mode);
+                    }
+                    Ok(RenderCommand::SetForceUnifiedWorld(force)) => {
+                        renderer.set_force_unified_world(force);
+                    }
+                    Ok(RenderCommand::SetPom(enabled)) => {
+                        renderer.set_pom_enabled(enabled);
                     }
                     Ok(RenderCommand::SetPlanarReflectionDebug(mode)) => {
                         renderer.set_planar_reflection_debug(mode);
@@ -1469,12 +1733,22 @@ fn render_thread_main(
                         y,
                         width,
                         height,
+                        entity_hint,
                     }) => {
-                        let info = renderer.inspect_surface(&snapshot.camera, x, y, width, height);
+                        let info = renderer.inspect_surface(
+                            &snapshot.camera,
+                            snapshot.dynamic_models.as_slice(),
+                            x,
+                            y,
+                            width,
+                            height,
+                            entity_hint,
+                        );
                         let _ = proxy.send_event(UserEvent::SurfaceInspected(info));
                     }
                     Ok(RenderCommand::ClearSurfaceInspection) => {
                         renderer.inspector_vertex_range = None;
+                        renderer.inspector_entity_num = None;
                     }
                     Ok(RenderCommand::AddSurfaceDeformation(stamp)) => {
                         renderer.surface_deformation.push(&renderer.queue, stamp);
@@ -1482,19 +1756,19 @@ fn render_thread_main(
                     Ok(RenderCommand::Screenshot { directory }) => {
                         renderer.request_screenshot(directory)
                     }
+                    Ok(RenderCommand::CopyFrameToClipboard) => {
+                        renderer.request_clipboard_capture()
+                    }
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
-                    Ok(RenderCommand::SetTransientUi { chat_lines, center_print, demo_timeline }) => {
-                        renderer.set_transient_ui(chat_lines, center_print, demo_timeline);
+                    Ok(RenderCommand::SetTransientUi { chat_lines, center_print, demo_timeline, prediction_debug, crosshair_target, follow_name, race_timer, vote_line, speedometer, lagometer }) => {
+                        renderer.set_transient_ui(chat_lines, center_print, demo_timeline, prediction_debug, crosshair_target, follow_name, race_timer, vote_line, speedometer, lagometer);
                     }
                     Ok(RenderCommand::SetUiTelemetry { perf, threads }) => {
                         renderer.set_ui_telemetry(perf, threads);
                     }
                     Ok(RenderCommand::SetEgui(frame)) => renderer.set_egui(frame),
                     Ok(RenderCommand::SetAssetPreviewMode(enabled)) => {
-                        renderer.asset_preview_mode = enabled;
-                        if !enabled {
-                            renderer.asset_preview_viewport = None;
-                        }
+                        renderer.set_asset_preview_mode(enabled);
                     }
                     Ok(RenderCommand::SetAssetPreviewViewport(viewport)) => {
                         renderer.asset_preview_viewport = viewport;
@@ -1506,28 +1780,49 @@ fn render_thread_main(
                         name,
                         map,
                     }) => {
-                        let triangles = map.triangles;
-                        let batches = map.batches.len();
-                        let timings = map.load_timings;
-                        let bsp_stats = map.bsp_stats.clone();
-                        let upload_started = Instant::now();
-                        let upload_timings = renderer.load_map(*map);
-                        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
-                        pending_world_uploaded = Some((
-                            request_id,
-                            started,
-                            name,
-                            triangles,
-                            batches,
-                            upload_ms,
-                            upload_timings,
-                            timings,
-                            bsp_stats,
-                        ));
+                        // The upload blocks this thread for seconds, and the loading
+                        // screen is drawn by this same thread. Hold the map back,
+                        // stop draining so command order is kept, and let one frame
+                        // present the latest loading state ("uploading") first; the
+                        // upload itself runs at the top of the next iteration.
+                        deferred_load_map = Some((request_id, started, name, map));
+                        break;
                     }
-                    Ok(RenderCommand::Shutdown) => return,
+                    Ok(RenderCommand::Shutdown) => {
+                        let teardown_started = Instant::now();
+                        println!("[RENDER SHUTDOWN] command received; dropping renderer");
+                        // Swapchain/device teardown can wedge or fault inside the
+                        // GPU driver. If it is still running after a few seconds,
+                        // log it and dump every thread's stack while it is stuck.
+                        let (teardown_done, teardown_wait) = mpsc::channel::<()>();
+                        let _ = thread::Builder::new()
+                            .name("render-teardown-watchdog".into())
+                            .spawn(move || {
+                                if teardown_wait.recv_timeout(Duration::from_secs(4))
+                                    == Err(mpsc::RecvTimeoutError::Timeout)
+                                {
+                                    eprintln!(
+                                        "[RENDER SHUTDOWN] renderer drop still running after 4 s (GPU driver hang?)"
+                                    );
+                                    crate::crash::write_hang_dump("hang-render-shutdown");
+                                }
+                            });
+                        drop(renderer);
+                        let _ = teardown_done.send(());
+                        println!(
+                            "[RENDER SHUTDOWN] renderer dropped {:.1} ms",
+                            teardown_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                        return;
+                    }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        println!("[RENDER SHUTDOWN] command channel closed; render thread exiting");
+                        return;
+                    }
+                }
+                if let Some(batch) = batch_timing.as_mut() {
+                    batch.record(command_started.elapsed());
                 }
             }
             if let Some((completed, total)) = renderer.poll_static_ao_progress() {
@@ -1571,6 +1866,7 @@ fn render_thread_main(
             renderer.set_dynamic_hud(next.hud, next.movement_hud);
             renderer.set_jump_shade(next.jump_shade);
             renderer.set_screen_fx(&next.screen_fx);
+            renderer.set_cloud_foreground(&next.cloud_foreground);
             snapshot = next;
         }
 
@@ -1591,6 +1887,13 @@ fn render_thread_main(
         // the renderer's last coherent camera point, making the A/B comparison
         // about latch timing rather than about two different input pipelines.
         let mut frame_camera = snapshot.camera;
+        if let Some(shake) = snapshot.camera_shake {
+            let now = Instant::now();
+            if let Some(offset) = shake.sample(now, &mut shake_rng) {
+                frame_camera.shake = offset;
+                frame_camera.apply_shake();
+            }
+        }
         let frame_start_view_sample = (input_subframe && !input_latelatch)
             .then(|| {
                 sample_view_rotation(
@@ -1605,6 +1908,13 @@ fn render_thread_main(
             .or(snapshot.input_latency)
             .filter(|sample| sample.sequence != last_measured_input_sequence);
         let render_result = {
+            let mut model_source = snapshot.model_frame_source;
+            if let Some(source) = model_source.as_mut() {
+                source.raster_surfaces = snapshot.dynamic_models.iter()
+                    .filter(|surface| surface.entity_num == source.entity && surface.raster_visible)
+                    .count();
+            }
+            renderer.model_frame_log.set_source(model_source);
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderFrame,
@@ -1629,6 +1939,10 @@ fn render_thread_main(
                     first_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstFrame);
                 }
+                let splashes = renderer.weather.rain.take_water_splashes();
+                if !splashes.is_empty() {
+                    let _ = proxy.send_event(UserEvent::WaterSplashes(splashes));
+                }
                 if perf_trace {
                     trace_frames += 1;
                     trace_frame_ms += info.frame_ms;
@@ -1639,6 +1953,10 @@ fn render_thread_main(
                     trace_present_ms += info.cpu_present_ms;
                     trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
                     trace_grass_cpu_ms += info.grass.cpu_ms;
+                    trace_prep_stage_ms[0] += info.prep_camera_ms;
+                    trace_prep_stage_ms[1] += info.prep_shadow_ms;
+                    trace_prep_stage_ms[2] += info.prep_world_ms;
+                    trace_prep_stage_ms[3] += info.prep_reflection_ms;
                 }
                 last_info = info;
                 let late_measurement = input_latelatch
@@ -1902,6 +2220,23 @@ fn render_thread_main(
                 last_info.world_multidraw_groups,
                 last_info.world_multidraw_batches,
             );
+            // A/B line: which world renderer ran, plus the unified prepare split.
+            // FastBaseline does not split its prepare stage, so those read 0.
+            println!(
+                "[JKA PERF PATH] path={} gpu_timings={} cpu_frame={:.4}ms prep={:.4}ms[camera={:.4} shadow={:.4} world={:.4} reflection={:.4} dynamic={:.4}] encode={:.4}ms submit={:.4}ms present={:.4}ms",
+                last_info.world_path,
+                renderer.gpu_profiler.enabled(),
+                trace_frame_ms / frames,
+                trace_prepare_ms / frames,
+                trace_prep_stage_ms[0] / frames,
+                trace_prep_stage_ms[1] / frames,
+                trace_prep_stage_ms[2] / frames,
+                trace_prep_stage_ms[3] / frames,
+                trace_dynamic_model_ms / frames,
+                trace_encode_ms / frames,
+                trace_submit_ms / frames,
+                trace_present_ms / frames,
+            );
             let client = snapshot.client_perf;
             println!(
                 "[JKA CLIENT PERF] total={:.4}ms snapshot={:.4}ms audio={:.4}ms events={:.4}ms event_prep={:.4}ms jobs={} pool_threads={} parallel={} event_decode={:.4}ms decode_jobs={} decode_parallel={} entities={:.4}ms players={:.4}ms followed={:.4}ms fx={:.4}ms fx_tess={:.4}ms g2_mode={} g2_pose={:.4}ms/{} motion={:.4}ms/{} g2_skin={:.4}ms g2_bolt={:.4}ms/{} surfaces={} verts={} cull={}/{} lod=[{},{},{},{}] dyn[surfaces={} verts={} indices={}]",
@@ -2011,7 +2346,7 @@ fn render_thread_main(
                 );
             }
             println!(
-                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms",
+                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
@@ -2028,6 +2363,7 @@ fn render_thread_main(
                 gpu_ms(GpuPass::Cull),
                 gpu_ms(GpuPass::Cluster),
                 gpu_ms(GpuPass::Ui),
+                gpu_ms(GpuPass::Clouds),
             );
             if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
@@ -2194,22 +2530,35 @@ fn render_thread_main(
             trace_present_ms = 0.0;
             trace_dynamic_model_ms = 0.0;
             trace_grass_cpu_ms = 0.0;
+            trace_prep_stage_ms = [0.0; 4];
         }
 
         if fps_cap > 0 {
             let target = Duration::from_secs_f64(1.0 / fps_cap as f64);
-            precise_frame_wait(frame_loop_started, target);
+            let deadline = frame_pace_anchor + target;
+            precise_frame_wait(deadline);
+            // On time: keep the exact cadence. Late (frame slower than the cap,
+            // cap changed, menu/pause transition): restart it rather than
+            // bursting to catch up.
+            let now = Instant::now();
+            frame_pace_anchor = if now.saturating_duration_since(deadline) > target {
+                now
+            } else {
+                deadline
+            };
+        } else {
+            frame_pace_anchor = Instant::now();
         }
     }
 }
 
-fn precise_frame_wait(frame_started: Instant, target: Duration) {
+fn precise_frame_wait(deadline: Instant) {
     loop {
-        let elapsed = frame_started.elapsed();
-        if elapsed >= target {
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
-        let remaining = target - elapsed;
+        let remaining = deadline - now;
         if remaining > Duration::from_millis(2) {
             thread::sleep(remaining - Duration::from_millis(1));
         } else if remaining > Duration::from_micros(150) {
@@ -2256,6 +2605,11 @@ struct MaterialUniform {
     pbr_params1: [f32; 4],
     reflection_probe: [f32; 4],
     planar_plane: [f32; 4],
+    // `rgbGen wave` / `alphaGen wave`: base, amplitude, phase, frequency.
+    wave_rgb: [f32; 4],
+    wave_alpha: [f32; 4],
+    // x: rgb waveform id, y: alpha waveform id (see jka_assets::shader::WaveFunc::id).
+    wave_funcs: [u32; 4],
 }
 
 #[repr(C)]
@@ -2305,6 +2659,9 @@ impl Default for MaterialUniform {
             pbr_params1: [0.04, 0.04, 0.04, 0.0],
             reflection_probe: [0.0; 4],
             planar_plane: [0.0; 4],
+            wave_rgb: [0.0; 4],
+            wave_alpha: [0.0; 4],
+            wave_funcs: [0; 4],
         }
     }
 }
@@ -2384,6 +2741,75 @@ struct DofUniform {
     quality: [f32; 4],        // x: 0 performance, 1 adaptive, 2 high
 }
 
+/// Everything that invalidates the temporal cloud history when it changes: the
+/// sun, the cloud shape controls, the wind, and the temporal tuning itself.
+#[derive(Clone, PartialEq)]
+struct CloudHistoryKey {
+    sun_override: bool,
+    sun_visibility: SunVisibilityMode,
+    sun_yaw: f32,
+    sun_pitch: f32,
+    sun_intensity: f32,
+    sun_color: [f32; 3],
+    clouds: bool,
+    cloud_type: CloudType,
+    quality: f32,
+    coverage: f32,
+    height: f32,
+    thickness: f32,
+    weather_wind: crate::ocean::OceanWind,
+    resolution: CloudRenderResolution,
+    temporal: bool,
+    temporal_depth_fix: bool,
+    shear: f32,
+    base_variation: f32,
+    shape_evolution: bool,
+    terrain_interaction: bool,
+    empty_skip: bool,
+    aerial: f32,
+    sky_ambient: bool,
+    history_blend: f32,
+    motion_reject: f32,
+    history_depth_reject: bool,
+    thickness_variation: f32,
+    size: f32,
+}
+
+impl CloudHistoryKey {
+    fn of(effects: &PostEffects) -> Self {
+        Self {
+            sun_override: effects.sun_override,
+            sun_visibility: effects.sun_visibility,
+            sun_yaw: effects.sun_yaw.rem_euclid(360.0),
+            sun_pitch: effects.sun_pitch,
+            sun_intensity: effects.sun_intensity,
+            sun_color: effects.sun_color,
+            clouds: effects.clouds,
+            cloud_type: effects.cloud_type,
+            quality: effects.cloud_quality,
+            coverage: effects.cloud_coverage,
+            height: effects.cloud_height,
+            thickness: effects.cloud_thickness,
+            weather_wind: effects.weather_wind.sanitize(),
+            resolution: effects.cloud_render_resolution,
+            temporal: effects.cloud_temporal,
+            temporal_depth_fix: effects.cloud_temporal_depth_fix,
+            shear: effects.cloud_shear,
+            base_variation: effects.cloud_base_variation,
+            shape_evolution: effects.cloud_shape_evolution,
+            terrain_interaction: effects.cloud_terrain_interaction,
+            empty_skip: effects.cloud_empty_skip,
+            aerial: effects.cloud_aerial,
+            sky_ambient: effects.cloud_sky_ambient,
+            history_blend: effects.cloud_history_blend,
+            motion_reject: effects.cloud_motion_reject,
+            history_depth_reject: effects.cloud_history_depth_reject,
+            thickness_variation: effects.cloud_thickness_variation,
+            size: effects.cloud_size,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CloudRenderSettings {
@@ -2440,6 +2866,29 @@ struct PostCloudTemporalSettings {
     values: [f32; 4], // enabled, history valid, active 2x2 pattern, grid size
 }
 
+/// Frame-constant wind terms the cloud shader used to recompute per sample.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostCloudWindSettings {
+    direction: [f32; 4],
+    offset: [f32; 4],
+    delta: [f32; 4],
+    detail_slip: [f32; 4],
+    detail_billow: [f32; 4],
+}
+
+impl From<cloud_wind::CloudWindTerms> for PostCloudWindSettings {
+    fn from(terms: cloud_wind::CloudWindTerms) -> Self {
+        Self {
+            direction: terms.direction,
+            offset: terms.offset,
+            delta: terms.delta,
+            detail_slip: terms.detail_slip,
+            detail_billow: terms.detail_billow,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PostUniform {
@@ -2463,8 +2912,14 @@ struct PostUniform {
     cloud_temporal_tuning: PostCloudTemporalTuningSettings,
     cloud_variation: PostCloudVariationSettings,
     cloud_temporal: PostCloudTemporalSettings,
+    cloud_wind: PostCloudWindSettings,
     rain: [f32; 4],           // enabled, intensity, distant haze strength, puddle accumulation
     weather_occlusion: [f32; 4], // min render X/Z, inverse heightfield extent X/Z
+    weather_look: [f32; 4],   // scattered puddle amount, wet grade amount, high-quality water, reserved
+    underwater: [f32; 4],     // surface Y over a submerged camera (NO_WATER_SURFACE if dry), absorption distance, reserved
+    cloud_foreground: [f32; 4], // blade count, reserved x3
+    // Two vec4 per blade: [ax, ay, bx, by] pixels, then [glow radius px, nearest distance].
+    cloud_blades: [[f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
     camera_pos_time: [f32; 4],
     prev_camera_pos_time: [f32; 4],
     view_proj: [[f32; 4]; 4],
@@ -2603,7 +3058,7 @@ struct LightingSettings {
     local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, transient-light start
     feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode (0/1/2), reflection quality
     map_ambient: [f32; 4],   // xyz q3map2 ambient RGB; w RT sample count (1, 2, 4)
-    map_minlight: [f32; 4],  // source-.map q3map2 minlight RGB, normalized; w reserved
+    map_minlight: [f32; 4],  // source-.map q3map2 minlight RGB, normalized; w runtime-dlight falloff mode (0 stock, 1 physical)
 }
 
 #[repr(C)]
@@ -2632,6 +3087,92 @@ struct ShadowReceiverUniform {
 struct ShadowCasterUniform {
     view_proj: [[f32; 4]; 4],
     camera_pos_time: [f32; 4],
+}
+
+/// Entity map shadow window: radius of the orthographic map, in world units.
+/// 2048 texels across 2 * 768 units is ~0.75 unit per texel, finer than the
+/// nearest BSP cascade, so one map is enough for the characters in view.
+const ENTITY_SHADOW_RADIUS: f32 = 768.0;
+/// Receiver darkening at full contrast (the shared receiver multiplies the lit
+/// colour by `1 - strength * facing * occlusion`).
+const ENTITY_SHADOW_MAX_STRENGTH: f32 = 0.55;
+/// Lowest allowed sin(elevation) of the shadow-casting light. Near-horizontal
+/// baked light would throw shadows hundreds of units; JKA's own shadow code
+/// likewise forced its light mostly downward.
+const ENTITY_SHADOW_MIN_ELEVATION: f32 = 0.3;
+/// Time constant for smoothing the lightgrid-derived direction/strength, so
+/// crossing probe cells or a dark doorway never snaps the shadow.
+const ENTITY_SHADOW_SMOOTHING_SECONDS: f32 = 0.2;
+
+/// Light cameras kept for entity casters: the Entity map uses [0]; the CSM modes
+/// draw entities into cascades 0 and 1 and use [0] and [1].
+const ENTITY_SHADOW_CAMERAS: usize = 2;
+/// Authored lights farther than this from the player are ignored as shadow sources.
+const ENTITY_SHADOW_LIGHT_RANGE: f32 = 1536.0;
+
+/// Entity shadow state: per-cascade light-camera uniforms (the entity shaders take
+/// the light's view-projection through the ordinary camera slot) plus the smoothed
+/// light the Entity map is aimed with.
+struct EntityShadowState {
+    cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Smoothed unit direction the light travels, renderer coordinates.
+    direction: Vec3,
+    /// Smoothed 0..1 fraction of `ENTITY_SHADOW_MAX_STRENGTH`.
+    strength: f32,
+    initialized: bool,
+}
+
+impl EntityShadowState {
+    fn new(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout) -> Self {
+        let cameras = (0..ENTITY_SHADOW_CAMERAS)
+            .map(|_| {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA entity shadow light camera"),
+                    size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JKA entity shadow light camera bind group"),
+                    layout: camera_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
+                (buffer, bind_group)
+            })
+            .collect();
+        Self {
+            cameras,
+            direction: Vec3::NEG_Y,
+            strength: 0.0,
+            initialized: false,
+        }
+    }
+
+    /// Stores `view_proj` as light camera `index`; entity shaders read only that.
+    fn write_camera(&self, queue: &wgpu::Queue, index: usize, view_proj: Mat4) {
+        let light_camera = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos_time: [0.0; 4],
+            clip_plane: [0.0; 4],
+            render_flags: [0; 4],
+            camera_forward: [0.0, 0.0, -1.0, 0.0],
+            unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            jump_shade: [0.0; 4],
+        };
+        queue.write_buffer(&self.cameras[index].0, 0, bytemuck::bytes_of(&light_camera));
+    }
+}
+
+/// What the Entity map needs for one frame, produced before command encoding.
+struct EntityShadowFrame {
+    view_proj: Mat4,
+    /// False when the baked light here is too weak/ambient for a visible shadow:
+    /// receivers are told shadows are off and the pass is skipped.
+    active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3279,8 +3820,6 @@ struct ShadowResources {
     caster_bind_groups: Vec<wgpu::BindGroup>,
     pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
-    translucent_pipeline: wgpu::RenderPipeline,
-    sky_pipeline: wgpu::RenderPipeline,
     bevy_pipeline: wgpu::RenderPipeline,
     bevy_mask_pipeline: wgpu::RenderPipeline,
     bevy_translucent_pipeline: wgpu::RenderPipeline,
@@ -3313,6 +3852,18 @@ struct GpuImage {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
 }
+
+/// One looping `videoMap` cinematic. RoQ frames are deltas, so every frame must be
+/// decoded in order; only the newest decoded frame of a tick is uploaded.
+struct WorldVideoPlayer {
+    texture: usize,
+    video: jka_assets::roq::RoqVideo,
+    next_frame_at: f64,
+}
+
+/// Most frames decoded in one render call before the player resynchronises
+/// to the clock (after a stall or a long load).
+const WORLD_VIDEO_MAX_CATCH_UP: u32 = 8;
 
 struct PendingUiLevelshot {
     key: String,
@@ -4090,6 +4641,18 @@ const GHOUL2_GPU_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_at
     5 => Uint32
 ];
 
+fn ghoul2_specular_light(specular: Option<([f32; 3], [f32; 3])>) -> [f32; 4] {
+    specular.map_or([0.0; 4], |(light, _)| [light[0], light[1], light[2], 1.0])
+}
+
+/// `.w` doubles as the `deformVertexes bulge` static offset (see
+/// `Ghoul2GpuSkinning::bulge_height`): shells that bulge never carry specular,
+/// and specular surfaces never bulge, so the two never collide.
+fn ghoul2_specular_viewer(specular: Option<([f32; 3], [f32; 3])>, bulge_height: f32) -> [f32; 4] {
+    let viewer = specular.map_or([0.0; 3], |(_, viewer)| viewer);
+    [viewer[0], viewer[1], viewer[2], bulge_height]
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct Ghoul2GpuDrawUniform {
@@ -4102,6 +4665,54 @@ struct Ghoul2GpuDrawUniform {
     classic_ambient: [f32; 4],
     classic_directed: [f32; 4],
     classic_direction: [f32; 4],
+    // Runtime sun as a second directional light (entity sun lighting). Zero
+    // radiance when the feature is off, which adds nothing in the shaders.
+    classic_sun_directed: [f32; 4],
+    classic_sun_direction: [f32; 4],
+    /// Per-draw texture-coordinate transform `uv * xy + zw` (shader tcMod
+    /// scale/scroll); identity is [1, 1, 0, 0].
+    uv_xform: [f32; 4],
+    /// xyz = light point, w = 1 when `alphaGen lightingSpecular` applies.
+    spec_light: [f32; 4],
+    spec_viewer: [f32; 4],
+}
+
+/// Everything needed to swap the baked map sun in a lightgrid sample for the
+/// runtime sun. Built per frame by `Renderer::entity_sun_relight`.
+#[derive(Clone, Copy, Debug)]
+struct EntitySunRelight {
+    /// Unit direction toward the sun baked into the lightgrid.
+    map_toward_sun: [f32; 3],
+    /// Unit direction toward the runtime sun.
+    toward_sun: [f32; 3],
+    /// Runtime sun radiance / baked map sun radiance, per channel.
+    gain: [f32; 3],
+}
+
+fn sample_entity_classic_light(
+    grid: &scene::ClassicEntityLightGrid,
+    origin: [f32; 3],
+    relight: Option<EntitySunRelight>,
+) -> Option<scene::ClassicEntityLight> {
+    let mut light = grid.sample_classic_entity_light(origin)?;
+    if let Some(relight) = relight {
+        light.relight_sun(relight.map_toward_sun, relight.toward_sun, relight.gain);
+    }
+    Some(light)
+}
+
+/// Classic vertex lighting for one normal: ambient + the (remaining) baked
+/// directed light + the optional runtime sun, in 0..255 light units.
+fn classic_vertex_illumination(light: &scene::ClassicEntityLight, normal: Vec3) -> [f32; 3] {
+    let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
+    let sun_incoming = normal.dot(Vec3::from_array(light.sun_direction)).max(0.0);
+    std::array::from_fn(|channel| {
+        (light.ambient[channel]
+            + incoming * light.directed[channel]
+            + sun_incoming * light.sun_directed[channel])
+            .clamp(0.0, 255.0)
+            / 255.0
+    })
 }
 
 struct Ghoul2GpuMesh {
@@ -4190,6 +4801,10 @@ struct DynamicEntityLightingUniform {
     values: [u32; 4],
     // Self-applied Legacy fog, see md3.wgsl apply_self_legacy_fog.
     legacy_fog: EntityLegacyFog,
+    // Cloud ground shadow: xyz = unit direction toward the sun (render space),
+    // w = 1 while projected cloud shadows are active. The entity depth prepass
+    // uses it to publish a smooth sun-facing value (md3.wgsl).
+    cloud_shadow_sun: [f32; 4],
 }
 
 /// Legacy fog applied in the entity/grass shaders. Zeroed (mode 0) disables it.
@@ -4203,15 +4818,26 @@ pub(crate) struct EntityLegacyFog {
 }
 
 impl DynamicEntityLightingUniform {
-    fn new(mode: EntityAmbientLightingMode, legacy_fog: EntityLegacyFog, brightness: f32) -> Self {
+    fn new(
+        mode: EntityAmbientLightingMode,
+        legacy_fog: EntityLegacyFog,
+        brightness: f32,
+        cloud_shadow_sun: [f32; 4],
+    ) -> Self {
         let value = match mode {
             EntityAmbientLightingMode::Off => 0,
             EntityAmbientLightingMode::BspLightgridClassic => 1,
             EntityAmbientLightingMode::BevyIrradianceVolume => 2,
         };
-        Self { values: [value, brightness.to_bits(), 0, 0], legacy_fog }
+        Self { values: [value, brightness.to_bits(), 0, 0], legacy_fog, cloud_shadow_sun }
     }
 }
+
+// CG_ImpactMark's blob-shadow box: projected 20 units against the plane normal
+// (the shared projector adds the stock 32-unit near plane).
+const BLOB_MARK_PROJECTION: f32 = 20.0;
+// polygonOffset stand-in: dynamic meshes carry no depth bias, so lift the mark.
+const BLOB_MARK_SURFACE_LIFT: f32 = 0.25;
 
 struct DynamicGpuTexture {
     _image: GpuImage,
@@ -4245,23 +4871,22 @@ struct DynamicModelRenderer {
     texture_layout: wgpu::BindGroupLayout,
     entity_lighting_buffer: wgpu::Buffer,
     entity_ambient_lighting: EntityAmbientLightingMode,
+    /// Set by the renderer each frame before `prepare`; None keeps the stock
+    /// lightgrid sample untouched.
+    entity_sun_relight: Option<EntitySunRelight>,
     model_brightness: f32,
     entity_legacy_fog: EntityLegacyFog,
+    /// Last value written to the uniform's `cloud_shadow_sun`; w = 0 when off.
+    cloud_shadow_sun: [f32; 4],
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
     legacy_fog_compiled: bool,
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    opaque_pipeline: wgpu::RenderPipeline,
-    mask_pipeline: wgpu::RenderPipeline,
-    blend_pipeline: wgpu::RenderPipeline,
-    mask_blend_pipeline: wgpu::RenderPipeline,
-    additive_one_pipeline: wgpu::RenderPipeline,
-    additive_pipeline: wgpu::RenderPipeline,
-    blend_unlit_pipeline: wgpu::RenderPipeline,
-    modulate_pipeline: wgpu::RenderPipeline,
-    modulate2x_pipeline: wgpu::RenderPipeline,
-    darken_pipeline: wgpu::RenderPipeline,
+    /// Lazy per-alpha-mode pipelines; built only for modes with draws.
+    model_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Bit per `DynamicModelAlphaMode::index` with a prepared MD3 draw this frame.
+    model_alpha_mask: u16,
     fx_sprite_shader: Option<wgpu::ShaderModule>,
     fx_sprite_surface_format: wgpu::TextureFormat,
     fx_sprite_samples: u32,
@@ -4281,22 +4906,20 @@ struct DynamicModelRenderer {
     skin_pipeline_layout: wgpu::PipelineLayout,
     skin_shader: wgpu::ShaderModule,
     skin_wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    skin_opaque_pipeline: wgpu::RenderPipeline,
-    skin_mask_pipeline: wgpu::RenderPipeline,
-    skin_blend_pipeline: wgpu::RenderPipeline,
-    skin_mask_blend_pipeline: wgpu::RenderPipeline,
-    skin_additive_one_pipeline: wgpu::RenderPipeline,
-    skin_additive_pipeline: wgpu::RenderPipeline,
-    skin_blend_unlit_pipeline: wgpu::RenderPipeline,
-    skin_modulate_pipeline: wgpu::RenderPipeline,
-    skin_modulate2x_pipeline: wgpu::RenderPipeline,
-    skin_darken_pipeline: wgpu::RenderPipeline,
+    skin_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Bit per `DynamicModelAlphaMode::index` with a prepared Ghoul2 draw this frame.
+    skin_alpha_mask: u16,
     // Depth-writing entities in the single-sample scene depth prepass. These
     // target the fixed prepass formats, so they never depend on MSAA/HDR.
     prepass_pipeline: wgpu::RenderPipeline,
     prepass_mask_pipeline: wgpu::RenderPipeline,
     skin_prepass_pipeline: wgpu::RenderPipeline,
     skin_prepass_mask_pipeline: wgpu::RenderPipeline,
+    /// Depth-only light-space variants for entity shadow casters, in the order
+    /// [md3 opaque, md3 mask, skin opaque, skin mask]. Index 0 is forward-Z (Entity
+    /// map and legacy CSM), 1 is reverse-Z (Bevy CSM). Each is built lazily the
+    /// first time it draws, so modes that never need it never compile it.
+    entity_shadow_pipelines: [Option<[wgpu::RenderPipeline; 4]>; 2],
     repeat_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
     fallback_bind_group: wgpu::BindGroup,
@@ -4310,6 +4933,10 @@ struct DynamicModelRenderer {
     fx_sprite_instance_capacity: u64,
     fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
     scratch_fx_sprite_instances: Vec<FxGpuSpriteInstance>,
+    /// Floor-clipped blob-shadow mesh (local indices) for the frame's
+    /// `FxGpuSprites::blob_shadow` surface, built by the renderer before `prepare`.
+    blob_mesh_vertices: Vec<DynamicModelVertex>,
+    blob_mesh_indices: Vec<u32>,
     ghoul2_meshes: HashMap<Arc<str>, Ghoul2GpuMesh>,
     skin_bone_buffer: wgpu::Buffer,
     skin_draw_buffer: wgpu::Buffer,
@@ -4361,6 +4988,7 @@ impl DynamicModelRenderer {
                 EntityAmbientLightingMode::Off,
                 EntityLegacyFog::default(),
                 1.0,
+                [0.0; 4],
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -4477,26 +5105,6 @@ impl DynamicModelRenderer {
             ],
         });
 
-        let opaque_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Opaque, false);
-        let mask_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Mask, false);
-        let blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Blend, false);
-        let mask_blend_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, false);
-        let additive_one_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, false);
-        let additive_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Additive, false);
-        let blend_unlit_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, false);
-        let modulate_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate, false);
-        let modulate2x_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, false);
-        let darken_pipeline = create_dynamic_model_pipeline(device, &pipeline_layout, &shader, surface_format, samples, DynamicModelAlphaMode::Darken, false);
-        let skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque, false);
-        let skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask, false);
-        let skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend, false);
-        let skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, false);
-        let skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, false);
-        let skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive, false);
-        let skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, false);
-        let skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate, false);
-        let skin_modulate2x_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, false);
-        let skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &skin_pipeline_layout, &skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken, false);
         let md3_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -4516,22 +5124,16 @@ impl DynamicModelRenderer {
             texture_layout,
             entity_lighting_buffer,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
+            entity_sun_relight: None,
             model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
+            cloud_shadow_sun: [0.0; 4],
             legacy_fog_compiled: false,
             pipeline_layout,
             shader,
             wireframe_pipeline: None,
-            opaque_pipeline,
-            mask_pipeline,
-            blend_pipeline,
-            mask_blend_pipeline,
-            additive_one_pipeline,
-            additive_pipeline,
-            blend_unlit_pipeline,
-            modulate_pipeline,
-            modulate2x_pipeline,
-            darken_pipeline,
+            model_pipelines: Default::default(),
+            model_alpha_mask: 0,
             fx_sprite_shader: None,
             fx_sprite_surface_format: surface_format,
             fx_sprite_samples: samples,
@@ -4551,20 +5153,13 @@ impl DynamicModelRenderer {
             skin_pipeline_layout,
             skin_shader,
             skin_wireframe_pipeline: None,
-            skin_opaque_pipeline,
-            skin_mask_pipeline,
-            skin_blend_pipeline,
-            skin_mask_blend_pipeline,
-            skin_additive_one_pipeline,
-            skin_additive_pipeline,
-            skin_blend_unlit_pipeline,
-            skin_modulate_pipeline,
-            skin_modulate2x_pipeline,
-            skin_darken_pipeline,
+            skin_pipelines: Default::default(),
+            skin_alpha_mask: 0,
             prepass_pipeline,
             prepass_mask_pipeline,
             skin_prepass_pipeline,
             skin_prepass_mask_pipeline,
+            entity_shadow_pipelines: [None, None],
             repeat_sampler,
             clamp_sampler,
             fallback_bind_group,
@@ -4578,6 +5173,8 @@ impl DynamicModelRenderer {
             fx_sprite_instance_capacity,
             fx_sprite_draws: Vec::new(),
             scratch_fx_sprite_instances: Vec::new(),
+            blob_mesh_vertices: Vec::new(),
+            blob_mesh_indices: Vec::new(),
             ghoul2_meshes: HashMap::new(),
             skin_bone_buffer,
             skin_draw_buffer,
@@ -4835,7 +5432,7 @@ impl DynamicModelRenderer {
 
     fn rebuild_pipelines(
         &mut self,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         samples: u32,
     ) {
@@ -4844,16 +5441,10 @@ impl DynamicModelRenderer {
         self.fx_sprite_surface_format = surface_format;
         self.fx_sprite_samples = samples;
         self.skin_wireframe_pipeline = None;
-        self.opaque_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
-        self.mask_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
-        self.blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
-        self.mask_blend_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, self.legacy_fog_compiled);
-        self.additive_one_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, self.legacy_fog_compiled);
-        self.additive_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Additive, self.legacy_fog_compiled);
-        self.blend_unlit_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, self.legacy_fog_compiled);
-        self.modulate_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate, self.legacy_fog_compiled);
-        self.modulate2x_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, self.legacy_fog_compiled);
-        self.darken_pipeline = create_dynamic_model_pipeline(device, &self.pipeline_layout, &self.shader, surface_format, samples, DynamicModelAlphaMode::Darken, self.legacy_fog_compiled);
+        // MD3 / Ghoul2 alpha-mode pipelines are lazy: recompiled by
+        // ensure_model_pipelines for only the modes that have draws.
+        self.model_pipelines = Default::default();
+        self.model_alpha_mask = 0;
         self.fx_sprite_opaque_pipeline = None;
         self.fx_sprite_mask_pipeline = None;
         self.fx_sprite_blend_pipeline = None;
@@ -4864,16 +5455,8 @@ impl DynamicModelRenderer {
         self.fx_sprite_modulate_pipeline = None;
         self.fx_sprite_modulate2x_pipeline = None;
         self.fx_sprite_darken_pipeline = None;
-        self.skin_opaque_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Opaque, self.legacy_fog_compiled);
-        self.skin_mask_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Mask, self.legacy_fog_compiled);
-        self.skin_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Blend, self.legacy_fog_compiled);
-        self.skin_mask_blend_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::MaskBlend, self.legacy_fog_compiled);
-        self.skin_additive_one_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::AdditiveOne, self.legacy_fog_compiled);
-        self.skin_additive_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Additive, self.legacy_fog_compiled);
-        self.skin_blend_unlit_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::BlendUnlit, self.legacy_fog_compiled);
-        self.skin_modulate_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate, self.legacy_fog_compiled);
-        self.skin_modulate2x_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Modulate2x, self.legacy_fog_compiled);
-        self.skin_darken_pipeline = create_ghoul2_skin_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, surface_format, samples, DynamicModelAlphaMode::Darken, self.legacy_fog_compiled);
+        self.skin_pipelines = Default::default();
+        self.skin_alpha_mask = 0;
     }
 
     fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required: u64) {
@@ -4913,6 +5496,51 @@ impl DynamicModelRenderer {
         self.fx_sprite_blend_pipeline = None;
         self.fx_sprite_additive_pipeline = None;
         self.fx_sprite_blend_unlit_pipeline = None;
+    }
+
+    /// Compiles the MD3 / Ghoul2 pipelines for exactly the alpha modes that have
+    /// draws this frame and records which modes those are for `draw_phase`.
+    fn ensure_model_pipelines(&mut self, device: &wgpu::Device) {
+        let mut model_mask = 0u16;
+        for draw in &self.draws {
+            model_mask |= 1 << draw.alpha_mode.index();
+        }
+        let mut skin_mask = 0u16;
+        for draw in &self.skin_draws {
+            skin_mask |= 1 << draw.alpha_mode.index();
+        }
+        self.model_alpha_mask = model_mask;
+        self.skin_alpha_mask = skin_mask;
+        if model_mask | skin_mask == 0 {
+            return;
+        }
+        let surface_format = self.fx_sprite_surface_format;
+        let samples = self.fx_sprite_samples;
+        for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
+            let index = alpha_mode.index();
+            if model_mask & (1 << index) != 0 && self.model_pipelines[index].is_none() {
+                self.model_pipelines[index] = Some(create_dynamic_model_pipeline(
+                    device,
+                    &self.pipeline_layout,
+                    &self.shader,
+                    surface_format,
+                    samples,
+                    alpha_mode,
+                    self.legacy_fog_compiled,
+                ));
+            }
+            if skin_mask & (1 << index) != 0 && self.skin_pipelines[index].is_none() {
+                self.skin_pipelines[index] = Some(create_ghoul2_skin_pipeline(
+                    device,
+                    &self.skin_pipeline_layout,
+                    &self.skin_shader,
+                    surface_format,
+                    samples,
+                    alpha_mode,
+                    self.legacy_fog_compiled,
+                ));
+            }
+        }
     }
 
     fn ensure_fx_sprite_pipeline(&mut self, device: &wgpu::Device, alpha_mode: DynamicModelAlphaMode) {
@@ -5087,8 +5715,19 @@ impl DynamicModelRenderer {
                 self.entity_ambient_lighting,
                 self.entity_legacy_fog,
                 self.model_brightness,
+                self.cloud_shadow_sun,
             )),
         );
+    }
+
+    /// Entity prepass input for projected cloud shadows. Called every frame but
+    /// only touches the GPU when the direction or the on/off state changes.
+    fn set_cloud_shadow_sun(&mut self, queue: &wgpu::Queue, sun: [f32; 4]) {
+        if sun == self.cloud_shadow_sun {
+            return;
+        }
+        self.cloud_shadow_sun = sun;
+        self.write_entity_lighting(queue);
     }
 
     fn set_model_brightness(&mut self, queue: &wgpu::Queue, brightness: f32) {
@@ -5164,7 +5803,9 @@ impl DynamicModelRenderer {
                 )
             {
                 match (surface.lighting_origin, classic_grid) {
-                    (Some(origin), Some(grid)) => grid.sample_classic_entity_light(origin),
+                    (Some(origin), Some(grid)) => {
+                        sample_entity_classic_light(grid, origin, self.entity_sun_relight)
+                    }
                     _ => None,
                 }
             } else {
@@ -5247,7 +5888,7 @@ impl DynamicModelRenderer {
                     axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
                     origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
                     color: skin.color,
-                    params: [bone_base, u32::from(classic_light.is_some()), base_vertex, 0],
+                    params: [bone_base, u32::from(classic_light.is_some()), base_vertex, u32::from(skin.env_map)],
                     classic_ambient: classic_light
                         .map(|light| [light.ambient[0], light.ambient[1], light.ambient[2], 0.0])
                         .unwrap_or([0.0; 4]),
@@ -5257,6 +5898,15 @@ impl DynamicModelRenderer {
                     classic_direction: classic_light
                         .map(|light| [light.direction[0], light.direction[1], light.direction[2], 0.0])
                         .unwrap_or([0.0; 4]),
+                    classic_sun_directed: classic_light
+                        .map(|light| [light.sun_directed[0], light.sun_directed[1], light.sun_directed[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_sun_direction: classic_light
+                        .map(|light| [light.sun_direction[0], light.sun_direction[1], light.sun_direction[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    uv_xform: skin.uv_xform,
+                    spec_light: ghoul2_specular_light(skin.specular),
+                    spec_viewer: ghoul2_specular_viewer(skin.specular, skin.bulge_height),
                 });
                 mesh_draw_indices
                     .entry(Arc::clone(&mesh_key))
@@ -5305,14 +5955,10 @@ impl DynamicModelRenderer {
             if let Some(light) = classic_light {
                 for source in surface.vertices.iter() {
                     let normal = Vec3::from_array(source.normal).normalize_or_zero();
-                    let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
+                    let illumination = classic_vertex_illumination(&light, normal);
                     let mut vertex = *source;
                     for channel in 0..3 {
-                        let illumination =
-                            (light.ambient[channel] + incoming * light.directed[channel])
-                                .clamp(0.0, 255.0)
-                                / 255.0;
-                        vertex.color[channel] *= illumination;
+                        vertex.color[channel] *= illumination[channel];
                     }
                     vertices.push(vertex);
                 }
@@ -5439,6 +6085,7 @@ impl DynamicModelRenderer {
         }
         rt.casters = rt_casters;
         self.rt_prepared = true;
+        self.ensure_model_pipelines(device);
 
         self.scratch_vertices = vertices;
         self.scratch_indices = indices;
@@ -5506,14 +6153,36 @@ impl DynamicModelRenderer {
         for surface in surfaces {
             let texture_key = self.ensure_texture(device, queue, surface.texture.as_ref());
             if let Some(sprites) = surface.fx_gpu_sprites.as_ref() {
+                if sprites.blob_shadow {
+                    // Requests were clipped onto the rendered floor by the renderer
+                    // and arrive as an ordinary mesh drawn through the CPU path.
+                    if !self.blob_mesh_indices.is_empty() {
+                        let base_vertex = vertices.len() as u32;
+                        let first_index = indices.len() as u32;
+                        vertices.extend_from_slice(self.blob_mesh_vertices.as_slice());
+                        indices.extend(self.blob_mesh_indices.iter().map(|index| base_vertex.saturating_add(*index)));
+                        self.draws.push(DynamicPreparedDraw {
+                            first_index,
+                            index_count: self.blob_mesh_indices.len() as u32,
+                            base_vertex: 0,
+                            texture_key,
+                            alpha_mode: surface.alpha_mode,
+                            wireframe_class: surface.wireframe_class,
+                        });
+                        self.blob_mesh_vertices.clear();
+                        self.blob_mesh_indices.clear();
+                    }
+                    continue;
+                }
                 if sprites.instances.is_empty() {
                     continue;
                 }
+                let instances = sprites.instances.as_slice();
                 let first_instance = u32::try_from(fx_sprite_instances.len()).unwrap_or(u32::MAX);
-                fx_sprite_instances.extend_from_slice(sprites.instances.as_slice());
+                fx_sprite_instances.extend_from_slice(instances);
                 self.fx_sprite_draws.push(FxGpuSpritePreparedDraw {
                     first_instance,
-                    instance_count: u32::try_from(sprites.instances.len()).unwrap_or(u32::MAX),
+                    instance_count: u32::try_from(instances.len()).unwrap_or(u32::MAX),
                     texture_key,
                     alpha_mode: surface.alpha_mode,
                     wireframe_class: surface.wireframe_class,
@@ -5531,7 +6200,9 @@ impl DynamicModelRenderer {
                 )
             {
                 match (surface.lighting_origin, classic_grid) {
-                    (Some(origin), Some(grid)) => grid.sample_classic_entity_light(origin),
+                    (Some(origin), Some(grid)) => {
+                        sample_entity_classic_light(grid, origin, self.entity_sun_relight)
+                    }
                     _ => None,
                 }
             } else {
@@ -5576,7 +6247,7 @@ impl DynamicModelRenderer {
                     axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
                     origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
                     color: skin.color,
-                    params: [bone_base, u32::from(classic_light.is_some()), 0, 0],
+                    params: [bone_base, u32::from(classic_light.is_some()), 0, u32::from(skin.env_map)],
                     classic_ambient: classic_light
                         .map(|light| [light.ambient[0], light.ambient[1], light.ambient[2], 0.0])
                         .unwrap_or([0.0; 4]),
@@ -5586,6 +6257,15 @@ impl DynamicModelRenderer {
                     classic_direction: classic_light
                         .map(|light| [light.direction[0], light.direction[1], light.direction[2], 0.0])
                         .unwrap_or([0.0; 4]),
+                    classic_sun_directed: classic_light
+                        .map(|light| [light.sun_directed[0], light.sun_directed[1], light.sun_directed[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    classic_sun_direction: classic_light
+                        .map(|light| [light.sun_direction[0], light.sun_direction[1], light.sun_direction[2], 0.0])
+                        .unwrap_or([0.0; 4]),
+                    uv_xform: skin.uv_xform,
+                    spec_light: ghoul2_specular_light(skin.specular),
+                    spec_viewer: ghoul2_specular_viewer(skin.specular, skin.bulge_height),
                 };
                 skin_pending.push(Ghoul2PendingDraw {
                     mesh_key,
@@ -5607,14 +6287,10 @@ impl DynamicModelRenderer {
             if let Some(light) = classic_light {
                 for source in surface.vertices.iter() {
                     let normal = Vec3::from_array(source.normal).normalize_or_zero();
-                    let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
+                    let illumination = classic_vertex_illumination(&light, normal);
                     let mut vertex = *source;
                     for channel in 0..3 {
-                        let illumination =
-                            (light.ambient[channel] + incoming * light.directed[channel])
-                                .clamp(0.0, 255.0)
-                                / 255.0;
-                        vertex.color[channel] *= illumination;
+                        vertex.color[channel] *= illumination[channel];
                     }
                     vertices.push(vertex);
                 }
@@ -5744,6 +6420,7 @@ impl DynamicModelRenderer {
             queue.write_buffer(&self.index_buffer, 0, index_bytes);
         }
 
+        self.ensure_model_pipelines(device);
         if !self.fx_sprite_draws.is_empty() {
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
                 if self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == alpha_mode) {
@@ -5807,18 +6484,11 @@ impl DynamicModelRenderer {
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
                 .into_iter()
                 .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+                // Pipelines are lazy: only modes with draws were compiled.
+                .filter(|mode| self.model_alpha_mask & (1 << mode.index()) != 0)
             {
-                let pipeline = match alpha_mode {
-                    DynamicModelAlphaMode::Opaque => &self.opaque_pipeline,
-                    DynamicModelAlphaMode::Mask => &self.mask_pipeline,
-                    DynamicModelAlphaMode::Blend => &self.blend_pipeline,
-                    DynamicModelAlphaMode::MaskBlend => &self.mask_blend_pipeline,
-                    DynamicModelAlphaMode::AdditiveOne => &self.additive_one_pipeline,
-                    DynamicModelAlphaMode::Additive => &self.additive_pipeline,
-                    DynamicModelAlphaMode::BlendUnlit => &self.blend_unlit_pipeline,
-                    DynamicModelAlphaMode::Modulate => &self.modulate_pipeline,
-                    DynamicModelAlphaMode::Modulate2x => &self.modulate2x_pipeline,
-                    DynamicModelAlphaMode::Darken => &self.darken_pipeline,
+                let Some(pipeline) = self.model_pipelines[alpha_mode.index()].as_ref() else {
+                    continue;
                 };
                 let pipeline = if let Some((models, scene)) = rt_receivers.filter(|_| self.rt_prepared) {
                     let receiver_pipeline = match alpha_mode {
@@ -5907,18 +6577,10 @@ impl DynamicModelRenderer {
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
                 .into_iter()
                 .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+                .filter(|mode| self.skin_alpha_mask & (1 << mode.index()) != 0)
             {
-                let pipeline = match alpha_mode {
-                    DynamicModelAlphaMode::Opaque => &self.skin_opaque_pipeline,
-                    DynamicModelAlphaMode::Mask => &self.skin_mask_pipeline,
-                    DynamicModelAlphaMode::Blend => &self.skin_blend_pipeline,
-                    DynamicModelAlphaMode::MaskBlend => &self.skin_mask_blend_pipeline,
-                    DynamicModelAlphaMode::AdditiveOne => &self.skin_additive_one_pipeline,
-                    DynamicModelAlphaMode::Additive => &self.skin_additive_pipeline,
-                    DynamicModelAlphaMode::BlendUnlit => &self.skin_blend_unlit_pipeline,
-                    DynamicModelAlphaMode::Modulate => &self.skin_modulate_pipeline,
-                    DynamicModelAlphaMode::Modulate2x => &self.skin_modulate2x_pipeline,
-                    DynamicModelAlphaMode::Darken => &self.skin_darken_pipeline,
+                let Some(pipeline) = self.skin_pipelines[alpha_mode.index()].as_ref() else {
+                    continue;
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(2, &self.skin_bind_group, &[]);
@@ -6065,9 +6727,72 @@ impl DynamicModelRenderer {
     /// consumers then read each entity's own depth instead of the BSP behind it.
     /// Requires `prepare` to have run for this frame.
     fn draw_prepass<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
+        self.draw_depth_only(
+            pass,
+            camera,
+            [
+                (&self.prepass_pipeline, &self.skin_prepass_pipeline),
+                (&self.prepass_mask_pipeline, &self.skin_prepass_mask_pipeline),
+            ],
+        );
+    }
+
+    /// True when this frame's prepared entities include any depth-writing
+    /// geometry, i.e. something the Entity map shadow pass would draw.
+    fn has_depth_casters(&self) -> bool {
+        self.draws.iter().any(|draw| dynamic_model_writes_depth(draw.alpha_mode))
+            || self.skin_draws.iter().any(|draw| dynamic_model_writes_depth(draw.alpha_mode))
+    }
+
+    fn ensure_entity_shadow_pipelines(&mut self, device: &wgpu::Device, reverse_z: bool, unclipped_depth: bool) {
+        let slot = usize::from(reverse_z);
+        if self.entity_shadow_pipelines[slot].is_some() {
+            return;
+        }
+        let md3_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+        };
+        let skin_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
+        };
+        self.entity_shadow_pipelines[slot] = Some([
+            create_entity_shadow_pipeline(device, &self.pipeline_layout, &self.shader, md3_vertex_layout.clone(), false, reverse_z, unclipped_depth, "JKA entity shadow pipeline"),
+            create_entity_shadow_pipeline(device, &self.pipeline_layout, &self.shader, md3_vertex_layout, true, reverse_z, unclipped_depth, "JKA entity shadow alpha-test pipeline"),
+            create_entity_shadow_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, skin_vertex_layout.clone(), false, reverse_z, unclipped_depth, "JKA Ghoul2 entity shadow pipeline"),
+            create_entity_shadow_pipeline(device, &self.skin_pipeline_layout, &self.skin_shader, skin_vertex_layout, true, reverse_z, unclipped_depth, "JKA Ghoul2 entity shadow alpha-test pipeline"),
+        ]);
+    }
+
+    /// Draws this frame's depth-writing entities into a shadow layer.
+    /// `camera` is a camera-layout bind group holding the light's view-projection.
+    /// Requires `prepare` and a matching `ensure_entity_shadow_pipelines`.
+    fn draw_entity_shadow<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+        reverse_z: bool,
+    ) {
+        let Some([md3, md3_mask, skin, skin_mask]) = self.entity_shadow_pipelines[usize::from(reverse_z)].as_ref() else {
+            return;
+        };
+        self.draw_depth_only(pass, camera, [(md3, skin), (md3_mask, skin_mask)]);
+    }
+
+    /// Shared opaque + alpha-tested entity draw loop for every depth-only pass.
+    /// `pipelines` is [(md3, ghoul2 skin); opaque, then alpha-tested].
+    fn draw_depth_only<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+        pipelines: [(&'a wgpu::RenderPipeline, &'a wgpu::RenderPipeline); 2],
+    ) {
         let prepass_modes = [
-            (DynamicModelAlphaMode::Opaque, &self.prepass_pipeline, &self.skin_prepass_pipeline),
-            (DynamicModelAlphaMode::Mask, &self.prepass_mask_pipeline, &self.skin_prepass_mask_pipeline),
+            (DynamicModelAlphaMode::Opaque, pipelines[0].0, pipelines[0].1),
+            (DynamicModelAlphaMode::Mask, pipelines[1].0, pipelines[1].1),
         ];
         if !self.draws.is_empty() {
             let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
@@ -6185,6 +6910,18 @@ struct WorldShaderVariantKey {
     legacy_fog: bool,
     jump_shade: bool,
     ocean: bool,
+    /// Wetness/puddle shading compiled in. Off for dry scenes (see `weather_surface_needed`).
+    weather_surface: bool,
+    /// r_fullbright / r_vertexLight / r_lightmap active.
+    classic_render_flags: bool,
+    /// Cached BSP ambient occlusion applied to baked light.
+    static_bsp_ao: bool,
+    /// An r_planarDebug view is selected.
+    planar_debug: bool,
+    /// Directional baked lighting (deluxemap / lightgrid) on PBR surfaces; implies `pbr`.
+    deluxe: bool,
+    /// Deluxe GGX specular lobe; implies `deluxe` and a non-zero r_deluxeSpecular.
+    deluxe_specular: bool,
     detail_texture_mode: u32,
 }
 
@@ -6256,6 +6993,15 @@ impl WorldShaderVariantKey {
             ("DETAIL_TEXTURE_MODE", f64::from(self.detail_texture_mode)),
             ("ENABLE_LEGACY_FOG", f64::from(u8::from(self.legacy_fog))),
             ("ENABLE_JUMP_SHADE", f64::from(u8::from(self.jump_shade))),
+            ("ENABLE_WEATHER_SURFACE", f64::from(u8::from(self.weather_surface))),
+            (
+                "ENABLE_CLASSIC_RENDER_FLAGS",
+                f64::from(u8::from(self.classic_render_flags)),
+            ),
+            ("ENABLE_STATIC_BSP_AO", f64::from(u8::from(self.static_bsp_ao))),
+            ("ENABLE_PLANAR_DEBUG", f64::from(u8::from(self.planar_debug))),
+            ("ENABLE_DELUXE", f64::from(u8::from(self.deluxe))),
+            ("ENABLE_DELUXE_SPECULAR", f64::from(u8::from(self.deluxe_specular))),
         ];
         // The stock BSP shaders intentionally do not declare the experimental
         // ray-query override. Only the lazily-created RT shader receives it, so
@@ -6339,6 +7085,21 @@ impl WorldShaderVariantKey {
         if self.ocean {
             enabled.push("ocean");
         }
+        if self.weather_surface {
+            enabled.push("wet");
+        }
+        if self.classic_render_flags {
+            enabled.push("classic");
+        }
+        if self.static_bsp_ao {
+            enabled.push("static-ao");
+        }
+        if self.planar_debug {
+            enabled.push("planar-debug");
+        }
+        if self.deluxe {
+            enabled.push(if self.deluxe_specular { "deluxe+spec" } else { "deluxe" });
+        }
         if self.detail_texture_mode != 0 {
             enabled.push("detail");
         }
@@ -6358,11 +7119,16 @@ struct FramePlan {
     gamma_only_post: bool,
     needs_linear_depth: bool,
     use_hiz: bool,
+    /// Hi-Z is the only consumer of depth this frame, so no full prepass is
+    /// drawn: a depth-only early pass of last frame's visible batches builds
+    /// the pyramid instead (Bevy's two-phase occlusion culling, minus the late
+    /// prepass nothing here would read).
+    hiz_early: bool,
     use_gpu_culling: bool,
     use_clustered_lighting: bool,
 }
 
-const GPU_PASS_COUNT: usize = 20;
+const GPU_PASS_COUNT: usize = 21;
 const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 const GPU_PROFILER_SLOTS: usize = 3;
 const CULL_DIAGNOSTIC_READBACK_SLOTS: usize = 3;
@@ -6405,6 +7171,9 @@ enum GpuPass {
     // Sub-timing inside World: OpenJK-style additive projected-light redraw of
     // only BSP triangle runs carrying a non-zero Legacy dlight surface mask.
     LegacyDlights = 19,
+    // Independent interval between the world and post passes: volumetric cloud
+    // march plus its temporal resolve.
+    Clouds = 20,
 }
 
 impl GpuPass {
@@ -6450,6 +7219,7 @@ impl GpuTiming {
             GpuPass::RtBuild,
             GpuPass::RtVisibility,
             GpuPass::World,
+            GpuPass::Clouds,
             GpuPass::Post,
             GpuPass::Ui,
         ] {
@@ -6988,6 +7758,9 @@ struct WorldBatch {
     is_inline_entity: bool,
     /// Clipmap index ranges for this promoted water surface, low then high.
     ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
+    /// Which promoted surface `ocean_clipmap` belongs to. Every face merged into
+    /// one surface shares that clipmap, so a pass draws it once, not per face.
+    ocean_clipmap_id: u8,
     bind_group: wgpu::BindGroup,
     fast_bind_group: wgpu::BindGroup,
     _material_buffer: UniformSlot,
@@ -7004,17 +7777,83 @@ struct WorldBatch {
 
 struct SnowShellDraw {
     coarse_batch_index: usize,
+    /// Vertex range inside the owning chunk's buffer.
     vertices: std::ops::Range<u32>,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
 }
 
-struct SnowShellGpu {
-    // Static map-load tessellation, spatially chunked. Runtime footsteps never
-    // rebuild this buffer; the persistent Snowflow field moves vertices on GPU.
-    vertex_buffer: wgpu::Buffer,
-    legacy_dlight_surface_id_buffer: wgpu::Buffer,
+/// One up-facing snow triangle as authored, before tessellation.
+struct SnowSourceTriangle {
+    coarse_batch_index: usize,
+    vertices: [GpuVertex; 3],
+}
+
+/// One resident chunk of tessellated snow: every snow sub-triangle whose centroid
+/// falls in a `SNOW_SHELL_CHUNK_SIZE` cell, with one draw per source batch.
+struct SnowShellChunk {
+    /// `None` when the cell turned out to hold no sub-triangle centroid.
+    vertex_buffer: Option<wgpu::Buffer>,
     draws: Vec<SnowShellDraw>,
+    /// XZ extent of the chunk cell, for a cheap whole-chunk distance reject.
+    min: Vec2,
+    max: Vec2,
+}
+
+impl SnowShellChunk {
+    fn near_center(&self, center: Vec2) -> bool {
+        let closest = center.clamp(self.min, self.max);
+        // The draw bounds can poke a few units past the cell edge.
+        (closest - center).length_squared()
+            <= (SNOW_SHELL_DRAW_RADIUS + 8.0) * (SNOW_SHELL_DRAW_RADIUS + 8.0)
+    }
+}
+
+struct SnowShellGpu {
+    // The shell is the snow surface tessellated down to `SNOW_SHELL_TESSELLATION`
+    // so the Snowflow field can move vertices on the GPU. Only the area around the
+    // field centre is ever drawn, so instead of tessellating the whole map up
+    // front (hundreds of MiB), keep the cheap source triangles and tessellate a
+    // chunk when the field centre approaches it. Runtime footsteps never rebuild
+    // a chunk; the persistent Snowflow field moves its vertices on the GPU.
+    source: Arc<SnowSource>,
+    chunks: BTreeMap<(i32, i32), SnowShellChunk>,
+    /// Cells handed to the worker pool whose result has not been collected yet.
+    pending: HashSet<(i32, i32)>,
+    results_tx: mpsc::Sender<SnowChunkBuild>,
+    /// Only the render thread reads it (`stream` has `&mut self`); the mutex just
+    /// keeps `WorldGpu` `Sync`.
+    results_rx: Mutex<mpsc::Receiver<SnowChunkBuild>>,
+    /// A shared per-vertex `u32::MAX` stream; every chunk binds it as slot 1.
+    legacy_dlight_surface_id_buffer: wgpu::Buffer,
+    id_capacity: usize,
+    stats: SnowShellStats,
+}
+
+/// The map's snow triangles and which chunk cells they overlap; immutable after
+/// load and shared with the tessellation workers.
+struct SnowSource {
+    triangles: Vec<SnowSourceTriangle>,
+    /// Source-triangle indices (ascending) overlapping each chunk cell in XZ.
+    cells: HashMap<(i32, i32), Vec<u32>>,
+}
+
+/// A chunk tessellated on a worker, waiting to become a GPU buffer.
+struct SnowChunkBuild {
+    cell: (i32, i32),
+    vertices: Vec<GpuVertex>,
+    draws: Vec<SnowShellDraw>,
+    build_ms: f64,
+}
+
+/// Counters for the `[SNOW STREAM]` log line; reset whenever the queue drains.
+#[derive(Clone, Copy, Default)]
+struct SnowShellStats {
+    chunks: u32,
+    build_ms_sum: f64,
+    build_ms_max: f64,
+    upload_ms_sum: f64,
+    upload_ms_max: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7343,6 +8182,8 @@ struct InlineModelGpu {
 }
 
 struct WorldGpu {
+    /// Drawn, markable world surfaces shared with saber marks (R_MarkFragments).
+    mark_surfaces: Option<Arc<jka_assets::bsp::MarkSurfaces>>,
     /// Direct source-.map worlds have no compiled BSP/PVS. They therefore use
     /// conservative per-batch frustum rejection on their 1024-unit spatial batches.
     source_map: bool,
@@ -7351,10 +8192,14 @@ struct WorldGpu {
     /// it so a desert, sunset or night sky does not leave the clouds lit by the
     /// reference's hardcoded blue.
     sky_average: [f32; 3],
+    /// `misc_skyportal` camera; when present the sky is a second world view.
+    sky_portal: Option<scene::SkyPortal>,
     /// Representative authored map skybox used by non-sky surfaces that need environment sampling (ocean).
     primary_skybox: Option<[usize; 6]>,
     /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
     ocean_surfaces: Vec<crate::ocean::OceanSurface>,
+    /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
+    ocean_masks: Arc<crate::ocean::OceanMasks>,
     inline_models: Vec<InlineModelGpu>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -7368,6 +8213,9 @@ struct WorldGpu {
     ocean_coarsest_spacing: f32,
     cull_records_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
+    /// Hi-Z early-pass draw list, one entry per cull record: last frame's
+    /// visible batches, rewritten each frame by `cs_early`.
+    early_indirect_buffer: wgpu::Buffer,
     active_cull_indices_buffer: wgpu::Buffer,
     compact_indirect_buffer: wgpu::Buffer,
     compact_count_buffer: wgpu::Buffer,
@@ -7424,27 +8272,10 @@ struct WorldGpu {
     coarse_batches: Vec<WorldBatch>,
     /// Exact PVS-signature sub-batches referencing subranges of the same vertex buffer.
     full_batches: Vec<WorldBatch>,
-    /// Shallow aliases of coarse followed by full batches. AUTO 2 and AUTO 3
-    /// use this one address space so one cluster can mix both representations
-    /// without duplicating any vertex/index/material GPU storage.
-    auto2_batches: Vec<WorldBatch>,
     visibility: Option<jka_assets::bsp::Visibility>,
     coarse_visible_batches_by_cluster: Vec<Vec<usize>>,
     full_visible_batches_by_cluster: Vec<Vec<usize>>,
-    /// AUTO selects FULL for clusters where its reduced submitted geometry is
-    /// estimated to outweigh the extra draw calls; otherwise it selects MINIMAL.
-    auto_use_full_by_cluster: Vec<bool>,
-    /// AUTO 2 applies the same cost model independently to each coarse surface
-    /// group, producing a mixed coarse/full list for every BSP cluster.
-    auto2_visible_batches_by_cluster: Vec<Vec<usize>>,
-    auto2_candidate_batches_by_cluster: Vec<usize>,
-    /// AUTO 3 is the exact-PVS hybrid: a coarse parent is legal only when all
-    /// of its Full children are visible for the camera cluster and all children
-    /// have identical area membership. Otherwise it uses only visible Full
-    /// children, so it cannot re-introduce PVS/areamask-hidden geometry.
-    auto3_visible_batches_by_cluster: Vec<Vec<usize>>,
-    auto3_candidate_batches_by_cluster: Vec<usize>,
-    /// AUTO 4 representation. `[0, auto4_variant_base)` is a shallow alias of
+    /// AUTO representation. `[0, auto4_variant_base)` is a shallow alias of
     /// `full_batches` (same indices, cull records and compaction groups, used
     /// as the exact cold fallback); `[auto4_variant_base, ..)` holds one batch
     /// per collapsed recipe (visible FULL pieces of one MINIMAL batch).
@@ -9271,7 +10102,11 @@ fn write_static_ao_cache(
     }
     bytes.extend_from_slice(vertex_values);
     if let Err(error) = fs::write(&path, bytes) {
-        eprintln!("Static BSP AO: could not write cache {}: {error}", path.display());
+        crate::logging::write_line_with_path(
+            crate::logging::Level::Error,
+            format_args!("Static BSP AO: could not write cache {}: {error}", path.display()),
+            path.clone(),
+        );
     }
 }
 
@@ -9481,6 +10316,14 @@ struct FrameInfo {
     cpu_encode_ms: f64,
     cpu_submit_ms: f64,
     cpu_present_ms: f64,
+    /// Which world renderer produced this frame ("fast-baseline" / "unified").
+    world_path: &'static str,
+    /// Advanced-path breakdown of `cpu_prepare_ms`. All zero on FastBaseline,
+    /// whose prepare stage is not split (it stays free of extra timers).
+    prep_camera_ms: f64,
+    prep_shadow_ms: f64,
+    prep_world_ms: f64,
+    prep_reflection_ms: f64,
     submit_call_at: Option<Instant>,
     present_call_completed_at: Option<Instant>,
     late_latch: Option<ViewSampleMeasurement>,
@@ -9547,6 +10390,16 @@ struct MenuBackdropResources {
     pipeline: wgpu::RenderPipeline,
 }
 
+impl RenderTargets {
+    fn cloud_width(&self) -> u32 {
+        self._cloud_march_texture.width()
+    }
+
+    fn cloud_height(&self) -> u32 {
+        self._cloud_march_texture.height()
+    }
+}
+
 struct RenderTargets {
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -9577,8 +10430,15 @@ struct RenderTargets {
     reflection_mask_view: wgpu::TextureView,
     _ssr_visibility_texture: Option<wgpu::Texture>,
     ssr_visibility_view: Option<wgpu::TextureView>,
-    linear_depth_mip_views: Vec<wgpu::TextureView>,
-    linear_depth_mip_count: u32,
+    /// Power-of-two Hi-Z pyramid of `ao_depth` (reversed-Z, min-reduced). Its
+    /// base level is the previous power of two of the viewport so every level
+    /// maps exactly onto UV.
+    _hiz_texture: wgpu::Texture,
+    hiz_view: wgpu::TextureView,
+    hiz_mip_views: Vec<wgpu::TextureView>,
+    hiz_mip_count: u32,
+    hiz_width: u32,
+    hiz_height: u32,
     _rain_haze_mask_texture: wgpu::Texture,
     rain_haze_mask_view: wgpu::TextureView,
     rain_haze_mask_width: u32,
@@ -9586,6 +10446,7 @@ struct RenderTargets {
 }
 
 struct Renderer {
+    model_frame_log: crate::model_frame_log::ModelFrameLog,
     base: PathBuf,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -9609,6 +10470,8 @@ struct Renderer {
     fast_camera_bind_group: wgpu::BindGroup,
     planar_camera_buffers: Vec<wgpu::Buffer>,
     planar_camera_bind_groups: Vec<wgpu::BindGroup>,
+    sky_portal_camera_buffer: wgpu::Buffer,
+    sky_portal_camera_bind_group: wgpu::BindGroup,
     surface_layout: wgpu::BindGroupLayout,
     fast_surface_layout: wgpu::BindGroupLayout,
     surface_deformation: SurfaceDeformationGpu,
@@ -9628,7 +10491,13 @@ struct Renderer {
     detail_auto_textures: HashMap<String, GpuImage>,
     ocean: Option<crate::ocean::OceanGpu>,
     authored_oceans: Vec<(crate::ocean::authoring::AuthoredOcean, crate::ocean::OceanGpu)>,
+    /// Shared by every ocean; lazy, see ensure_lazy_scene_pipelines.
+    ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
     authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
+    /// Render-space min/max of every water volume this frame (at most eight).
+    water_boxes: Vec<([f32; 3], [f32; 3])>,
+    /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
+    camera_water_surface: f32,
     ocean_enabled: bool,
     ocean_settings: crate::ocean::OceanSettings,
     world_pipeline_layout: wgpu::PipelineLayout,
@@ -9652,6 +10521,9 @@ struct Renderer {
     debug_volumes: DebugVolumeRenderer,
     debug_volume_shader: wgpu::ShaderModule,
     inspector_vertex_range: Option<std::ops::Range<u32>>,
+    inspector_entity_num: Option<u16>,
+    /// Scratch for the per-frame blob shadow projection (no allocation once warm).
+    blob_mark_buffer: jka_assets::bsp::MarkBuffer,
     ui_pipeline: wgpu::RenderPipeline,
     screen_fx_shader: wgpu::ShaderModule,
     screen_fx_texture_layout: wgpu::BindGroupLayout,
@@ -9668,6 +10540,19 @@ struct Renderer {
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
     _ui_splash: GpuImage,
+    /// TaystJK `gfx/hud/keys/*` art packed into one atlas (UI texture source 4).
+    _ui_keys: GpuImage,
+    /// The 27-image movement key atlas is read only once cg_movementKeys is on;
+    /// until then `_ui_keys` is a 1x1 placeholder nothing samples.
+    ui_keys_loaded: bool,
+    /// `gfx/2d/lag` and `gfx/2d/net` (the lagometer frame and phone jack) side by side
+    /// (UI texture source 5), read the first time something draws them; until then a
+    /// 1x1 placeholder nothing samples.
+    _ui_icons: GpuImage,
+    ui_icons_loaded: bool,
+    /// True while bind group binding 3 holds the unknown-map art rather than the
+    /// splash/levelshot, so a rebuild for another binding keeps the right image.
+    ui_binding_is_unknown_map: bool,
     /// OpenJK MP fallback (`menu/art/unknownmap_mp`) uploaded once with the
     /// renderer so entering a load screen never waits on filesystem/image I/O.
     _ui_unknown_map: GpuImage,
@@ -9700,6 +10585,8 @@ struct Renderer {
     // compile or allocate this pass.
     menu_backdrop: Option<MenuBackdropResources>,
     world: Option<WorldGpu>,
+    /// `videoMap` cinematics of the current world, streamed into `world.textures`.
+    world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
     white: GpuImage,
     missing: GpuImage,
@@ -9741,6 +10628,7 @@ struct Renderer {
     sun_intensity: f32,
     sun_color: [f32; 3],
     sun_visibility: SunVisibilityMode,
+    entity_sun_lighting: bool,
     clouds_enabled: bool,
     cloud_type: CloudType,
     cloud_quality: f32,
@@ -9771,7 +10659,9 @@ struct Renderer {
     grass_precompute_enabled: bool,
     grass_mid_lod_enabled: bool,
     grass_front_to_back_enabled: bool,
+    contact_shadow_debug: u8,
     cloud_history_valid: bool,
+    cloud_history_key: Option<CloudHistoryKey>,
     cloud_history_read_index: usize,
     cloud_temporal_frame_index: u32,
     reflection_quality: ReflectionQuality,
@@ -9795,6 +10685,8 @@ struct Renderer {
     cloud_noise_resources: Option<CloudNoiseResources>,
     cloud_noise_fallback: CloudNoiseResources,
     frame_plan: FramePlan,
+    /// Benchmark control: never select `WorldRenderPath::FastBaseline`.
+    force_unified_world: bool,
     indirect_supported: bool,
     gpu_compaction_supported: bool,
     compact_group_scratch: Vec<bool>,
@@ -9815,6 +10707,7 @@ struct Renderer {
     hiz_occlusion_enabled: bool,
     dynamic_lights_mode: DynamicLightsMode,
     rt_samples: u32,
+    dynamic_light_falloff: u32,
     rt_reduced_shadows: bool,
     clustered_lighting_enabled: bool,
     map_light_simulation_enabled: bool,
@@ -9822,18 +10715,27 @@ struct Renderer {
     classic_vertex_light: bool,
     classic_lightmap_only: bool,
     transient_lights: Vec<TransientLight>,
-    /// Setup > Video brightness multiplier applied to runtime dynamic lights.
+    cloud_foreground: Vec<CloudForegroundBlade>,
+/// Setup > Video brightness multiplier applied to runtime dynamic lights.
     dynamic_light_brightness: f32,
     emissive_area_lights_enabled: bool,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
     local_light_shadows_enabled: bool,
+    /// Inside a settings batch: `activate_world_pipeline_variant` only records
+    /// that it is owed, so intermediate setting combinations never compile.
+    settings_batch_open: bool,
+    variant_activation_pending: bool,
     pbr_enabled: bool,
+    /// Parallax occlusion on top of PBR (`r_pom`). Only meaningful while PBR is on.
+    pom_enabled: bool,
     deluxe_mapping_enabled: bool,
     deluxe_specular: f32,
     bc_compression_supported: bool,
     cascaded_shadows_enabled: bool,
     cascaded_shadow_mode: DynamicShadowsMode,
+    entity_shadow: EntityShadowState,
+    entity_shadow_light: EntityShadowLight,
     cull_debug_mode: CullDebugMode,
     planar_reflection_mode: PlanarReflectionMode,
     planar_reflection_debug_mode: PlanarReflectionDebugMode,
@@ -9854,11 +10756,19 @@ struct Renderer {
     ssr_frame_index: u32,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     depth_prepass_mask_pipeline: wgpu::RenderPipeline,
+    /// Depth-only world pipelines for the Hi-Z early pass (no colour targets,
+    /// so none of the full prepass's motion / reflection-policy fill cost).
+    hiz_prepass_pipeline: wgpu::RenderPipeline,
+    hiz_prepass_mask_pipeline: wgpu::RenderPipeline,
+    hiz_build_layout: wgpu::BindGroupLayout,
+    hiz_build_pipeline: wgpu::ComputePipeline,
+    hiz_build_bind_group: wgpu::BindGroup,
     hiz_reduce_layout: wgpu::BindGroupLayout,
     hiz_reduce_pipeline: wgpu::ComputePipeline,
     hiz_reduce_bind_groups: Vec<wgpu::BindGroup>,
     gpu_cull_layout: wgpu::BindGroupLayout,
     gpu_cull_pipeline: wgpu::ComputePipeline,
+    gpu_cull_early_pipeline: wgpu::ComputePipeline,
     gpu_cull_settings_buffer: wgpu::Buffer,
     cull_debug_layout: wgpu::BindGroupLayout,
     cull_debug_pipeline_layout: wgpu::PipelineLayout,
@@ -9881,7 +10791,10 @@ struct Renderer {
     post_layout: wgpu::BindGroupLayout,
     post_shader: wgpu::ShaderModule,
     post_pipeline_layout: wgpu::PipelineLayout,
-    post_pipeline: wgpu::RenderPipeline,
+    /// `None` until the background compile finishes and a frame needs it; see
+    /// `ensure_post_pipeline`.
+    post_pipeline: Option<wgpu::RenderPipeline>,
+    post_pipeline_task: Option<JoinHandle<wgpu::RenderPipeline>>,
     taa_post_pipeline: Option<wgpu::RenderPipeline>,
     cloud_march_pipeline: wgpu::RenderPipeline,
     cloud_resolve_pipeline: wgpu::RenderPipeline,
@@ -9925,11 +10838,11 @@ struct Renderer {
     surface_diag_pending: bool,
     frame_diag_pending: bool,
     screenshot_supported: bool,
-    screenshot_requested: Option<PathBuf>,
-    screenshot_result: Option<Result<(PathBuf, Option<String>), String>>,
+    screenshot_requested: Option<ScreenshotDestination>,
+    screenshot_result: Option<Result<ScreenshotOutput, String>>,
     screenshot_readback_buffer: Option<ScreenshotReadbackBuffer>,
     screenshot_worker_tx: Sender<ScreenshotEncodeJob>,
-    screenshot_worker_rx: Receiver<Result<(PathBuf, Option<String>), String>>,
+    screenshot_worker_rx: Receiver<Result<ScreenshotOutput, String>>,
     started: Instant,
 }
 
@@ -9938,8 +10851,13 @@ struct ScreenshotReadbackBuffer {
     size: u64,
 }
 
+enum ScreenshotDestination {
+    File(PathBuf),
+    Clipboard,
+}
+
 struct ScreenshotReadback {
-    screenshot_dir: PathBuf,
+    destination: ScreenshotDestination,
     width: u32,
     height: u32,
     padded_bytes_per_row: u32,
@@ -9965,7 +10883,7 @@ struct ScreenshotEncodeJob {
     height: u32,
     padded_bytes_per_row: u32,
     pixel_format: ScreenshotPixelFormat,
-    screenshot_dir: PathBuf,
+    destination: ScreenshotDestination,
     copy_record_ms: f64,
     copy_submit_ms: f64,
     map_request_ms: f64,
@@ -10037,27 +10955,38 @@ fn screenshot_timestamp() -> String {
     )
 }
 
-fn encode_screenshot_job(
-    job: ScreenshotEncodeJob,
-) -> Result<(PathBuf, Option<String>), String> {
-    let row_bytes = job.width as usize * 4;
-    let padded_row_bytes = job.padded_bytes_per_row as usize;
-    let width = job.width as usize;
-    let height = job.height as usize;
-    let pixel_format = match job.pixel_format {
+/// Compresses a padded GPU readback buffer to a quality-95 4:2:0 JPEG. The
+/// second value names the input path taken, for the screenshot timing log.
+fn encode_screenshot_jpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    pixel_format: ScreenshotPixelFormat,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let width = width as usize;
+    let height = height as usize;
+    let row_bytes = width * 4;
+    let padded_row_bytes = padded_bytes_per_row as usize;
+    let pixel_format = match pixel_format {
         ScreenshotPixelFormat::Bgra => libjpeg_turbo_rs::PixelFormat::Bgra,
         ScreenshotPixelFormat::Rgba => libjpeg_turbo_rs::PixelFormat::Rgba,
     };
 
-    let jpeg_started = Instant::now();
-    let (jpeg, jpeg_input_mode) = if row_bytes == padded_row_bytes {
+    if row_bytes == padded_row_bytes {
         let byte_len = row_bytes
             .checked_mul(height)
             .ok_or_else(|| "screenshot byte size overflowed usize".to_owned())?;
         let jpeg = libjpeg_turbo_rs::compress(
-            &job.pixels[..byte_len], width, height, pixel_format, 95, libjpeg_turbo_rs::Subsampling::S420,
-        ).map_err(|error| format!("JPEG encode failed: {error}"))?;
-        (jpeg, "direct")
+            &pixels[..byte_len],
+            width,
+            height,
+            pixel_format,
+            95,
+            libjpeg_turbo_rs::Subsampling::S420,
+        )
+        .map_err(|error| format!("JPEG encode failed: {error}"))?;
+        Ok((jpeg, "direct"))
     } else {
         let mut encoder = libjpeg_turbo_rs::ScanlineEncoder::new(width, height, pixel_format);
         encoder.set_quality(95);
@@ -10065,52 +10994,161 @@ fn encode_screenshot_job(
         for row_index in 0..height {
             let row_start = row_index * padded_row_bytes;
             encoder
-                .write_scanline(&job.pixels[row_start..row_start + row_bytes])
+                .write_scanline(&pixels[row_start..row_start + row_bytes])
                 .map_err(|error| format!("JPEG scanline encode failed: {error}"))?;
         }
-        let jpeg = encoder.finish().map_err(|error| format!("JPEG encode failed: {error}"))?;
-        (jpeg, "scanline")
-    };
-    let jpeg_ms = jpeg_started.elapsed().as_secs_f64() * 1000.0;
-
-    let file_io_started = Instant::now();
-    std::fs::create_dir_all(&job.screenshot_dir).map_err(|error| {
-        format!("could not create {}: {error}", job.screenshot_dir.display())
-    })?;
-    let path = job.screenshot_dir.join(format!("shot{}.jpg", screenshot_timestamp()));
-    std::fs::write(&path, &jpeg)
-        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-    let file_io_ms = file_io_started.elapsed().as_secs_f64() * 1000.0;
-
-    // Do this after the file encode/write. Besides keeping the renderer thread
-    // untouched, the slight worker delay means our fresh GPU capture wins over
-    // Windows' own stale desktop PrintScreen update in exclusive fullscreen.
-    let clipboard_started = Instant::now();
-    let clipboard_error = crate::clipboard::set_image_rgba8(
-        job.width,
-        job.height,
-        &job.pixels,
-        padded_row_bytes,
-        matches!(job.pixel_format, ScreenshotPixelFormat::Bgra),
-    )
-    .err();
-    let clipboard_ms = clipboard_started.elapsed().as_secs_f64() * 1000.0;
-
-    let total_ms = job.started.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms jpeg_420={:.3}ms file_io={:.3}ms clipboard={:.3}ms total={:.3}ms buffer={} copy={} jpeg_input={} encode=worker",
-        job.width, job.height, job.copy_record_ms, job.copy_submit_ms, job.map_request_ms, job.gpu_wait_ms,
-        job.readback_copy_ms, jpeg_ms, file_io_ms, clipboard_ms, total_ms,
-        if job.reused_buffer { "reused" } else { "new" },
-        if job.inline_copy { "inline" } else { "late-submit" }, jpeg_input_mode,
-    );
-    if let Some(error) = &clipboard_error {
-        eprintln!("[JKA SCREENSHOT] clipboard copy failed: {error}");
+        let jpeg = encoder
+            .finish()
+            .map_err(|error| format!("JPEG encode failed: {error}"))?;
+        Ok((jpeg, "scanline"))
     }
-    Ok((path, clipboard_error))
+}
+
+/// Writes the clipboard screenshot's JPEG to the temp directory so it can ride
+/// on the clipboard as a file drop. Older copies are swept first; a pasted file
+/// is read immediately by chat apps, so a day of grace is plenty.
+fn write_clipboard_jpeg(jpeg: &[u8]) -> Result<PathBuf, String> {
+    const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+    let dir = std::env::temp_dir().join("jka-clipboard-screenshots");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_AFTER);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let path = dir.join(format!("shot{}.jpg", screenshot_timestamp()));
+    std::fs::write(&path, jpeg)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn encode_screenshot_job(job: ScreenshotEncodeJob) -> Result<ScreenshotOutput, String> {
+    let padded_row_bytes = job.padded_bytes_per_row as usize;
+
+    match job.destination {
+        ScreenshotDestination::File(screenshot_dir) => {
+            let jpeg_started = Instant::now();
+            let (jpeg, jpeg_input_mode) = encode_screenshot_jpeg(
+                &job.pixels,
+                job.width,
+                job.height,
+                job.padded_bytes_per_row,
+                job.pixel_format,
+            )?;
+            let jpeg_ms = jpeg_started.elapsed().as_secs_f64() * 1000.0;
+
+            let file_io_started = Instant::now();
+            std::fs::create_dir_all(&screenshot_dir).map_err(|error| {
+                format!("could not create {}: {error}", screenshot_dir.display())
+            })?;
+            let path = screenshot_dir.join(format!("shot{}.jpg", screenshot_timestamp()));
+            std::fs::write(&path, &jpeg)
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            let file_io_ms = file_io_started.elapsed().as_secs_f64() * 1000.0;
+
+            let total_ms = job.started.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms jpeg_420={:.3}ms file_io={:.3}ms total={:.3}ms buffer={} copy={} jpeg_input={} output=file encode=worker",
+                job.width,
+                job.height,
+                job.copy_record_ms,
+                job.copy_submit_ms,
+                job.map_request_ms,
+                job.gpu_wait_ms,
+                job.readback_copy_ms,
+                jpeg_ms,
+                file_io_ms,
+                total_ms,
+                if job.reused_buffer { "reused" } else { "new" },
+                if job.inline_copy { "inline" } else { "late-submit" },
+                jpeg_input_mode,
+            );
+            Ok(ScreenshotOutput::Saved(path))
+        }
+        ScreenshotDestination::Clipboard => {
+            // PrintScreen is clipboard-only: same GPU readback as /screenshot.
+            // The clipboard carries the raw bitmap (CF_DIB, for image editors)
+            // plus a temp JPEG as a file drop (for chat apps, which then upload
+            // the compressed file instead of re-encoding the bitmap to a large
+            // PNG). A JPEG failure falls back to bitmap-only. This runs on the
+            // screenshot worker so the render thread never blocks on it.
+            let jpeg_started = Instant::now();
+            let jpeg_file = encode_screenshot_jpeg(
+                &job.pixels,
+                job.width,
+                job.height,
+                job.padded_bytes_per_row,
+                job.pixel_format,
+            )
+            .and_then(|(jpeg, _)| write_clipboard_jpeg(&jpeg))
+            .map_err(|error| eprintln!("[JKA SCREENSHOT] clipboard JPEG skipped: {error}"))
+            .ok();
+            let jpeg_ms = jpeg_started.elapsed().as_secs_f64() * 1000.0;
+
+            let clipboard_started = Instant::now();
+            crate::clipboard::set_image_rgba8(
+                job.width,
+                job.height,
+                &job.pixels,
+                padded_row_bytes,
+                matches!(job.pixel_format, ScreenshotPixelFormat::Bgra),
+                jpeg_file.as_deref(),
+            )
+            .map_err(|error| format!("clipboard copy failed: {error}"))?;
+            let clipboard_ms = clipboard_started.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = job.started.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms jpeg_420={:.3}ms clipboard={:.3}ms total={:.3}ms buffer={} copy={} output=clipboard jpeg_file={}",
+                job.width,
+                job.height,
+                job.copy_record_ms,
+                job.copy_submit_ms,
+                job.map_request_ms,
+                job.gpu_wait_ms,
+                job.readback_copy_ms,
+                jpeg_ms,
+                clipboard_ms,
+                total_ms,
+                if job.reused_buffer { "reused" } else { "new" },
+                if job.inline_copy { "inline" } else { "late-submit" },
+                if jpeg_file.is_some() { "yes" } else { "no" },
+            );
+            Ok(ScreenshotOutput::Clipboard)
+        }
+    }
 }
 
 impl Renderer {
+    /// Feeds the sun-to-head beam shown while the sun angles are edited. The head
+    /// is the local player's eye (actor origin + JKA standing view height); the
+    /// camera stands in when there is no local player (demos, free camera).
+    fn update_sun_ray_preview(&mut self, camera: &Camera, player_position: Option<Vec3>) {
+        if !self.debug_volumes.sun_ray_enabled {
+            return;
+        }
+        const STANDING_VIEW_HEIGHT: f32 = 36.0;
+        let head = player_position
+            .map(|origin| origin + Vec3::Y * STANDING_VIEW_HEIGHT)
+            .unwrap_or(camera.position);
+        let light_direction = Vec3::from_array(self.active_sun().direction);
+        self.debug_volumes.update_sun_ray(
+            &self.device,
+            &self.queue,
+            head,
+            light_direction,
+            camera.position,
+        );
+    }
+
     fn active_sun(&self) -> DirectionalSun {
         if self.sun_override {
             return DirectionalSun::from_q3_angles(
@@ -10130,6 +11168,41 @@ impl Renderer {
             })
     }
 
+    /// Sun swap for the entity lightgrid: strips the map's baked sun share out of
+    /// each probe sample and lights entities with `active_sun()` instead. None
+    /// when the setting is off, the entity lightgrid mode isn't in use, or the
+    /// map has no authored sun to have been baked in.
+    fn entity_sun_relight(&self) -> Option<EntitySunRelight> {
+        if !self.entity_sun_lighting
+            || self.dynamic_model_renderer.entity_ambient_lighting
+                != EntityAmbientLightingMode::BspLightgridClassic
+        {
+            return None;
+        }
+        let world = self.world.as_ref()?;
+        let map_sun = world.sun?;
+        let map_toward_sun = world.entity_light_grid.as_ref()?.map_toward_sun()?;
+        let sun = self.active_sun();
+        let toward_sun = Vec3::from_array(sun.direction).normalize_or_zero() * -1.0;
+        if toward_sun == Vec3::ZERO {
+            return None;
+        }
+        // Radiance ratio, per channel. The floor keeps a near-zero map channel
+        // (a strongly tinted map sun) from exploding the ratio; the probe's
+        // baked share is ~0 in that channel too, so the floor costs nothing.
+        let radiance = |sun: &DirectionalSun| {
+            Vec3::from_array(sun.color) * sun.intensity
+        };
+        let baked = radiance(&map_sun);
+        let floor = (baked.max_element() * 0.05).max(1e-4);
+        let gain = (radiance(&sun) / baked.max(Vec3::splat(floor))).min(Vec3::splat(16.0));
+        Some(EntitySunRelight {
+            map_toward_sun,
+            toward_sun: toward_sun.to_array(),
+            gain: gain.to_array(),
+        })
+    }
+
     async fn new(
         window: Arc<Window>,
         instance: wgpu::Instance,
@@ -10140,6 +11213,16 @@ impl Renderer {
         _detail_texture_path: &str,
     ) -> Result<Self, String> {
         let size = window.inner_size();
+        // Per-phase wall times for the "[RENDER INIT] phases" line, so startup
+        // regressions show which section grew instead of one opaque total.
+        let mut init_phase = Instant::now();
+        let mut init_marks: Vec<(&'static str, f64)> = Vec::new();
+        macro_rules! init_mark {
+            ($name:expr) => {{
+                init_marks.push(($name, init_phase.elapsed().as_secs_f64() * 1000.0));
+                init_phase = Instant::now();
+            }};
+        }
         let adapter_started = Instant::now();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -10157,6 +11240,10 @@ impl Renderer {
         println!(
             "GPU: {} ({:?}, {:?})",
             info.name, info.backend, info.device_type
+        );
+        println!(
+            "GPU driver: {} {} (vendor 0x{:04x}, device 0x{:04x})",
+            info.driver, info.driver_info, info.vendor, info.device
         );
         let adapter_features = adapter.features();
         // Request timestamp-query capability up front when the adapter supports it so
@@ -10183,6 +11270,7 @@ impl Renderer {
         let timestamp_pass_feature = wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let bc_compression_feature = wgpu::Features::TEXTURE_COMPRESSION_BC;
         let ray_query_feature = wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+        let depth_clip_control_feature = wgpu::Features::DEPTH_CLIP_CONTROL;
         let ray_tracing_supported = adapter_features.contains(ray_query_feature);
         let bc_compression_supported = adapter_features.contains(bc_compression_feature);
         let wireframe_supported = adapter_features.contains(wireframe_feature);
@@ -10197,6 +11285,13 @@ impl Renderer {
         let timestamp_inside_passes = timestamp_supported
             && adapter_features.contains(timestamp_pass_feature);
         let mut required_features = wgpu::Features::empty();
+        // Directional shadow casters must not be clipped by the cascade's depth
+        // range (Bevy's UNCLIPPED_DEPTH_ORTHO): occluders between the sun and the
+        // cascade would otherwise vanish from the map.
+        let depth_clip_control_supported = adapter_features.contains(depth_clip_control_feature);
+        if depth_clip_control_supported {
+            required_features |= depth_clip_control_feature;
+        }
         if adapter_features.contains(adapter_specific_formats) {
             required_features |= adapter_specific_formats;
         }
@@ -10283,6 +11378,17 @@ impl Renderer {
             "[RENDER INIT] device request {:.1} ms",
             device_started.elapsed().as_secs_f64() * 1000.0
         );
+        init_mark!("adapter+device");
+
+        // A lost device (TDR, driver reset, removed adapter) otherwise shows up
+        // only as downstream validation noise or a dead screen. `Destroyed` is
+        // the normal teardown notification and is logged as such.
+        device.set_device_lost_callback(|reason, message| match reason {
+            wgpu::DeviceLostReason::Destroyed => {
+                println!("[GPU] device destroyed: {message}");
+            }
+            reason => eprintln!("[GPU DEVICE LOST] reason={reason:?}: {message}"),
+        });
 
         // Diagnostics should print the actual wgpu validation reason instead of
         // collapsing it into the generic CurrentSurfaceTexture::Validation path.
@@ -10338,6 +11444,66 @@ impl Renderer {
         let hdr_supported_msaa = supported_msaa(&adapter, wgpu::TextureFormat::Rgba16Float);
         println!("MSAA supported: {surface_supported_msaa:?}");
         println!("HDR Rgba16Float MSAA supported: {hdr_supported_msaa:?}");
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA post-process layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                unfilterable_texture_entry(3),
+                texture_entry(4),
+                storage_buffer_entry(5, true, wgpu::ShaderStages::FRAGMENT),
+                texture_entry(6),
+                texture_entry(7),
+                texture_entry(8),
+                texture_3d_entry(9),
+                sampler_entry(10),
+                texture_entry(11),
+                texture_entry(12),
+                unfilterable_texture_entry(13),
+                texture_entry(14),
+                texture_3d_entry(15),
+                sampler_entry(16),
+                texture_entry(17),
+                unfilterable_texture_entry(18),
+                texture_entry(19),
+                texture_entry(20),
+                texture_entry(21),
+                depth_texture_entry(22),
+                texture_entry(23),
+                storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
+                unfilterable_texture_entry(25),
+            ],
+        });
+        let post_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
+            label: Some("JKA post-process shader"),
+            source: wgpu::ShaderSource::Wgsl(weather::with_weather_surface(&weather::with_post_settings(include_str!("post.wgsl"))).into()),
+        });
+        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA post-process pipeline layout"),
+            bind_group_layouts: &[Some(&post_layout)],
+            immediate_size: 0,
+        });
+        // The full post pipeline is by far the slowest compile at startup, and
+        // nothing needs it until the first frame that enables advanced post
+        // effects, so compile it in the background from the very start of init
+        // (see ensure_post_pipeline).
+        let post_pipeline_task = {
+            let (device, layout, shader, format) = (
+                device.clone(),
+                post_pipeline_layout.clone(),
+                post_shader.clone(),
+                config.format,
+            );
+            thread::Builder::new()
+                .name("post-pipeline-compile".into())
+                .spawn(move || {
+                    timed_init_step("post pipeline (background)", || {
+                        create_post_pipeline(&device, &layout, &shader, format)
+                    })
+                })
+                .ok()
+        };
         let msaa_samples = 1;
         let targets = create_targets(
             &device,
@@ -10352,6 +11518,7 @@ impl Renderer {
             CloudRenderResolution::Half,
         );
 
+        init_mark!("surface config+caps");
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA camera uniform"),
             contents: bytemuck::bytes_of(&CameraUniform {
@@ -10452,7 +11619,9 @@ impl Renderer {
                 label: Some("JKA fast camera layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // The fast fragment stage reads camera time for wave rgbGen/
+                    // alphaGen and sky-cloud tcMods, so FRAGMENT must be visible.
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -10497,6 +11666,7 @@ impl Renderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
+        let entity_shadow = EntityShadowState::new(&device, &camera_layout);
         let fast_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA fast camera bind group"),
             layout: &fast_camera_layout,
@@ -10519,6 +11689,28 @@ impl Renderer {
                 })
             })
             .collect();
+        let sky_portal_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA sky portal camera uniform"),
+            contents: bytemuck::bytes_of(&CameraUniform {
+                view_proj: [[0.0; 4]; 4],
+                camera_pos_time: [0.0; 4],
+                clip_plane: [0.0; 4],
+                render_flags: [0; 4],
+                camera_forward: [0.0, 0.0, -1.0, 0.0],
+                unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                jump_shade: [0.0; 4],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let sky_portal_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA sky portal camera bind group"),
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_portal_camera_buffer.as_entire_binding(),
+            }],
+        });
         let planar_reflection_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA planar reflection layout"),
@@ -10536,7 +11728,8 @@ impl Renderer {
             1,
             false,
         );
-        let planar_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("camera/bind groups/planar reflection");
+        let planar_debug_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA planar reflection debug preview shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("planar_debug.wgsl").into()),
         });
@@ -10629,7 +11822,7 @@ impl Renderer {
                 label: Some("JKA cascaded-shadow caster layout"),
                 entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
             });
-        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shadow_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA cascaded-shadow caster shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
         });
@@ -10646,24 +11839,26 @@ impl Renderer {
                 immediate_size: 0,
             });
         let shadow_pipeline = create_shadow_pipeline(
-            &device, &shadow_pipeline_layout, &shadow_shader, false, Some(wgpu::Face::Back));
-        let shadow_sky_pipeline = create_sky_admission_pipeline(
-            &device, &shadow_pipeline_layout, &shadow_shader, false);
-        let shadow_mask_pipeline =
-            create_shadow_mask_pipeline(&device, &shadow_mask_pipeline_layout, &shadow_shader, false);
-        let shadow_translucent_pipeline = create_shadow_translucent_pipeline(
-            &device, &shadow_mask_pipeline_layout, &shadow_shader, false);
+            &device, &shadow_pipeline_layout, &shadow_shader, false, SHADOW_CASTER_CULL,
+            depth_clip_control_supported);
+        let shadow_mask_pipeline = create_shadow_mask_pipeline(
+            &device, &shadow_mask_pipeline_layout, &shadow_shader, false,
+            depth_clip_control_supported);
         let bevy_shadow_pipeline = create_shadow_pipeline(
-            &device, &shadow_pipeline_layout, &shadow_shader, true, Some(wgpu::Face::Back));
+            &device, &shadow_pipeline_layout, &shadow_shader, true, SHADOW_CASTER_CULL,
+            depth_clip_control_supported);
         let bevy_shadow_sky_pipeline = create_sky_admission_pipeline(
             &device, &shadow_pipeline_layout, &shadow_shader, true);
-        let bevy_shadow_mask_pipeline =
-            create_shadow_mask_pipeline(&device, &shadow_mask_pipeline_layout, &shadow_shader, true);
+        let bevy_shadow_mask_pipeline = create_shadow_mask_pipeline(
+            &device, &shadow_mask_pipeline_layout, &shadow_shader, true,
+            depth_clip_control_supported);
         let bevy_shadow_translucent_pipeline = create_shadow_translucent_pipeline(
-            &device, &shadow_mask_pipeline_layout, &shadow_shader, true);
+            &device, &shadow_mask_pipeline_layout, &shadow_shader, true,
+            depth_clip_control_supported);
         // Grass owns the canonical GodotGrass Perlin/domain-warp wind texture.
         // Create it before weather so rain can reuse that exact GPU resource rather
         // than generating or uploading a second copy of the same noise.
+        init_mark!("shadow layouts+pipelines");
         let grass_renderer = GrassRenderer::new(
             &device,
             &queue,
@@ -10674,6 +11869,7 @@ impl Renderer {
             config.format,
             msaa_samples,
         );
+        init_mark!("grass renderer");
         let surface_sprite_effect_renderer = SurfaceSpriteEffectRenderer::new(
             &device,
             &camera_layout,
@@ -10688,21 +11884,21 @@ impl Renderer {
             msaa_samples,
             grass_renderer.wind_noise_texture(),
         );
+        init_mark!("sprites+weather");
         let shadow_resources = create_shadow_resources(
             &device,
             &shadow_receiver_layout,
             &shadow_caster_layout,
             shadow_pipeline,
             shadow_mask_pipeline,
-            shadow_translucent_pipeline,
-            shadow_sky_pipeline,
             bevy_shadow_pipeline,
             bevy_shadow_mask_pipeline,
             bevy_shadow_translucent_pipeline,
             bevy_shadow_sky_pipeline,
             weather.fog.legacy_control_buffer(),
         );
-        let cluster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("shadow resources");
+        let cluster_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA clustered-light builder"),
             source: wgpu::ShaderSource::Wgsl(include_str!("cluster_lights.wgsl").into()),
         });
@@ -10746,29 +11942,15 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let world_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA BSP shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}",
-                    include_str!("bsp.wgsl"),
-                    include_str!("surface_deformation.wgsl")
-                )
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(compose_world_shader(include_str!("bsp.wgsl")).into()),
         });
-        let world_shader_lean = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let world_shader_lean = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA BSP shader (lean baseline)"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}",
-                    include_str!("bsp_lean.wgsl"),
-                    include_str!("surface_deformation.wgsl")
-                )
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(compose_world_shader(include_str!("bsp_lean.wgsl")).into()),
         });
-        let fast_world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let fast_world_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA BSP shader (known-fast baseline)"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
@@ -10779,6 +11961,7 @@ impl Renderer {
                 .into(),
             ),
         });
+        init_mark!("buffers+shader modules");
         let ocean_layout = crate::ocean::OceanGpu::create_render_layout(&device);
         let ocean_optics = crate::ocean::optics::Resources::new(&device,
             &cloud_shadow_layout, &ocean_layout, (1, 1, msaa_samples, config.format));
@@ -10796,6 +11979,7 @@ impl Renderer {
             &missing_texture_data,
         );
         let ocean_spray_albedo = upload_texture(&device, &queue, &ocean_spray_albedo_data);
+        init_mark!("ocean optics+spray");
         // Detail textures are permanently AUTO and intentionally lazy. Renderer
         // startup must not scan/decode the DT_* library before a BSP even exists.
         // This neutral 1x1 is only a safe binding fallback until the current map's
@@ -10846,7 +12030,7 @@ impl Renderer {
                 bind_group_layouts: &[Some(&fast_camera_layout), Some(&fast_surface_layout)],
                 immediate_size: 0,
             });
-        let wireframe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let wireframe_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA wireframe overlay shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("wireframe.wgsl").into()),
         });
@@ -10860,18 +12044,18 @@ impl Renderer {
         // creates them, and changing the category mask only compiles a family the
         // first frame that family is actually requested.
         let wireframe_pipeline = None;
-        let debug_volume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let debug_volume_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA trigger/clip debug volume shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("volume_debug.wgsl").into()),
         });
-        let surface_inspector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let surface_inspector_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA surface inspector shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("surface_inspector.wgsl").into()),
         });
         // Diagnostic-only: compiled by ensure_lazy_scene_pipelines on first use.
         let surface_inspector_pipeline = None;
 
-        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let ui_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA UI shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("ui.wgsl").into()),
         });
@@ -10882,6 +12066,8 @@ impl Renderer {
                 sampler_entry(1),
                 texture_entry(2),
                 texture_entry(3),
+                texture_entry(4),
+                texture_entry(5),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -10894,7 +12080,7 @@ impl Renderer {
         // CGame screen-space effects (for example CG_SaberClashFlare) must use
         // their authored JKA shader stage/blend, not the normal alpha-only HUD
         // pipeline. Pipelines are compiled lazily on the first requested blend.
-        let screen_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let screen_fx_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA CGame screen FX shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("screen_fx.wgsl").into()),
         });
@@ -10925,6 +12111,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        init_mark!("detail/wireframe/UI pipelines");
         let ui_font_data = load_ui_font_texture(base, game);
         let ui_font = upload_texture(&device, &queue, &ui_font_data);
         let (ui_small_font_data, ui_small_font_metrics) =
@@ -10932,11 +12119,25 @@ impl Renderer {
         let ui_small_font = upload_texture(&device, &queue, &ui_small_font_data);
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
         let ui_splash = upload_texture(&device, &queue, &ui_splash_data);
+        // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
+        // on; set_ui loads it the first time that happens.
+        let ui_keys = upload_texture(
+            &device,
+            &queue,
+            &empty_ui_font_texture("JKA UI movement key atlas (not loaded)"),
+        );
+        // Lagometer frame / phone jack: read on first use, like the key atlas.
+        let ui_icons = upload_texture(
+            &device,
+            &queue,
+            &empty_ui_font_texture("JKA UI icon atlas (not loaded)"),
+        );
         // Keep the MP unknown-map art resident from renderer startup. Map-load UI
         // can bind this immediately, present it once, and only then resolve the
         // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
         let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game);
         let ui_unknown_map = upload_texture(&device, &queue, &ui_unknown_map_data);
+        init_mark!("UI textures");
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA UI font sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -10967,6 +12168,14 @@ impl Renderer {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&ui_splash.view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&ui_keys.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&ui_icons.view),
+                },
             ],
         });
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -10991,12 +12200,14 @@ impl Renderer {
         // egui is used for the modern Setup -> Video panel. It is kept as a
         // separate late overlay so the game/world renderer and legacy HUD/menu
         // remain untouched, and it costs nothing when the Video panel is closed.
+        init_mark!("UI buffers");
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
 
+        init_mark!("egui renderer");
         let texture_filter = TextureFilter::Trilinear;
         let repeat_sampler = create_texture_sampler(&device, false, texture_filter);
         let clamp_sampler = create_texture_sampler(&device, true, texture_filter);
@@ -11060,6 +12271,7 @@ impl Renderer {
             ],
         });
         let missing = upload_texture(&device, &queue, &missing_texture_data);
+        init_mark!("samplers+white/missing textures");
         let dynamic_model_renderer = DynamicModelRenderer::new(
             &device,
             &camera_layout,
@@ -11067,6 +12279,7 @@ impl Renderer {
             msaa_samples,
             &white,
         );
+        init_mark!("dynamic model renderer");
         let flat_normal = upload_texture(
             &device,
             &queue,
@@ -11083,48 +12296,7 @@ impl Renderer {
             },
         );
 
-        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("JKA post-process layout"),
-            entries: &[
-                texture_entry(0),
-                sampler_entry(1),
-                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
-                unfilterable_texture_entry(3),
-                texture_entry(4),
-                storage_buffer_entry(5, true, wgpu::ShaderStages::FRAGMENT),
-                texture_entry(6),
-                texture_entry(7),
-                texture_entry(8),
-                texture_3d_entry(9),
-                sampler_entry(10),
-                texture_entry(11),
-                texture_entry(12),
-                unfilterable_texture_entry(13),
-                texture_entry(14),
-                texture_3d_entry(15),
-                sampler_entry(16),
-                texture_entry(17),
-                unfilterable_texture_entry(18),
-                texture_entry(19),
-                texture_entry(20),
-                texture_entry(21),
-                depth_texture_entry(22),
-                texture_entry(23),
-                storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
-                unfilterable_texture_entry(25),
-            ],
-        });
-        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("JKA post-process shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("post.wgsl").into()),
-        });
-        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("JKA post-process pipeline layout"),
-            bind_group_layouts: &[Some(&post_layout)],
-            immediate_size: 0,
-        });
-        let post_pipeline =
-            create_post_pipeline(&device, &post_pipeline_layout, &post_shader, config.format);
+        init_mark!("cluster+lighting buffers (pre-post)");
         // Only used while TAA is enabled; compiled by ensure_lazy_scene_pipelines.
         let taa_post_pipeline = None;
         // The resolve pass reads the march output. It gets its own bind group
@@ -11141,20 +12313,6 @@ impl Renderer {
                 bind_group_layouts: &[Some(&post_layout), Some(&cloud_resolve_layout)],
                 immediate_size: 0,
             });
-        let cloud_march_pipeline = create_cloud_pass_pipeline(
-            &device,
-            &post_pipeline_layout,
-            &post_shader,
-            "fs_cloud_march",
-            "JKA volumetric cloud march pipeline",
-        );
-        let cloud_resolve_pipeline = create_cloud_pass_pipeline(
-            &device,
-            &cloud_resolve_pipeline_layout,
-            &post_shader,
-            "fs_cloud_resolve",
-            "JKA volumetric cloud resolve pipeline",
-        );
         let cloud_resolve_bind_group = create_cloud_resolve_bind_group(
             &device,
             &cloud_resolve_layout,
@@ -11174,7 +12332,7 @@ impl Renderer {
                     uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
                 ],
             });
-        let ssao_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let ssao_temporal_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA half-resolution temporal SSAO shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("ssao_temporal.wgsl").into()),
         });
@@ -11184,11 +12342,6 @@ impl Renderer {
                 bind_group_layouts: &[Some(&ssao_temporal_layout)],
                 immediate_size: 0,
             });
-        let ssao_temporal_pipeline = create_ssao_temporal_pipeline(
-            &device,
-            &ssao_temporal_pipeline_layout,
-            &ssao_temporal_shader,
-        );
 
         // Port Bevy's hybrid SSR ray refinement and FidelityFX's temporal
         // reflection history as a separate half-resolution pass. The expensive
@@ -11216,26 +12369,15 @@ impl Renderer {
                     unfilterable_texture_entry(10),
                 ],
             });
-        let ssr_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let ssr_temporal_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA half-resolution temporal SSR shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("ssr_temporal.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(weather::with_bound_weather_surface(include_str!("ssr_temporal.wgsl")).into()),
         });
         let ssr_temporal_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("JKA temporal SSR pipeline layout"),
                 bind_group_layouts: &[Some(&ssr_temporal_layout)],
                 immediate_size: 0,
-            });
-        let ssr_temporal_pipeline = create_ssr_temporal_pipeline(
-            &device,
-            &ssr_temporal_pipeline_layout,
-            &ssr_temporal_shader,
-        );
-        let ssr_visibility_resources =
-            create_ssr_visibility_resources(&device, &targets, msaa_samples);
-        let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
-            ssr_visibility_resources.map_or((None, None, None), |(layout, pipeline, bind_group)| {
-                (Some(layout), Some(pipeline), Some(bind_group))
             });
 
         // Gamma is common even in otherwise-minimal configurations. Keep a tiny
@@ -11252,7 +12394,7 @@ impl Renderer {
                 sampler_entry(4),
             ],
         });
-        let gamma_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let gamma_post_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA gamma-only post shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("post_gamma.wgsl").into()),
         });
@@ -11262,12 +12404,6 @@ impl Renderer {
                 bind_group_layouts: &[Some(&gamma_post_layout)],
                 immediate_size: 0,
             });
-        let gamma_post_pipeline = create_gamma_post_pipeline(
-            &device,
-            &gamma_post_pipeline_layout,
-            &gamma_post_shader,
-            config.format,
-        );
         let fast_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA known-fast gamma post layout"),
             entries: &[
@@ -11276,7 +12412,7 @@ impl Renderer {
                 uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let fast_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let fast_post_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA known-fast gamma post shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("post_fast.wgsl").into()),
         });
@@ -11286,12 +12422,103 @@ impl Renderer {
                 bind_group_layouts: &[Some(&fast_post_layout)],
                 immediate_size: 0,
             });
-        let fast_post_pipeline = create_gamma_post_pipeline(
-            &device,
-            &fast_post_pipeline_layout,
-            &fast_post_shader,
-            config.format,
+        // Every always-on post/screen-space pipeline is independent once its
+        // shader and layout exist. Their driver compiles dominate startup, so
+        // overlap them instead of stalling this thread on one after another
+        // (wgpu pipeline creation is thread-safe; see compile_pipeline_jobs).
+        let post_compile_started = Instant::now();
+        let (
+            cloud_march_pipeline,
+            cloud_resolve_pipeline,
+            ssao_temporal_pipeline,
+            ssr_temporal_pipeline,
+            ssr_visibility_resources,
+            gamma_post_pipeline,
+            fast_post_pipeline,
+        ) = thread::scope(|scope| {
+            let cloud_march = scope.spawn(|| {
+                timed_init_step("cloud march pipeline", || {
+                    create_cloud_pass_pipeline(
+                        &device,
+                        &post_pipeline_layout,
+                        &post_shader,
+                        "fs_cloud_march",
+                        "JKA volumetric cloud march pipeline",
+                    )
+                })
+            });
+            let cloud_resolve = scope.spawn(|| {
+                timed_init_step("cloud resolve pipeline", || {
+                    create_cloud_pass_pipeline(
+                        &device,
+                        &cloud_resolve_pipeline_layout,
+                        &post_shader,
+                        "fs_cloud_resolve",
+                        "JKA volumetric cloud resolve pipeline",
+                    )
+                })
+            });
+            let ssao_temporal = scope.spawn(|| {
+                timed_init_step("SSAO temporal pipeline", || {
+                    create_ssao_temporal_pipeline(
+                        &device,
+                        &ssao_temporal_pipeline_layout,
+                        &ssao_temporal_shader,
+                    )
+                })
+            });
+            let ssr_temporal = scope.spawn(|| {
+                timed_init_step("SSR temporal pipeline", || {
+                    create_ssr_temporal_pipeline(
+                        &device,
+                        &ssr_temporal_pipeline_layout,
+                        &ssr_temporal_shader,
+                    )
+                })
+            });
+            let ssr_visibility = scope.spawn(|| {
+                timed_init_step("SSR visibility resources", || {
+                    create_ssr_visibility_resources(&device, &targets, msaa_samples)
+                })
+            });
+            let gamma_post = scope.spawn(|| {
+                timed_init_step("gamma post pipeline", || {
+                    create_gamma_post_pipeline(
+                        &device,
+                        &gamma_post_pipeline_layout,
+                        &gamma_post_shader,
+                        config.format,
+                    )
+                })
+            });
+            // The last one runs on this thread rather than idling at the join.
+            let fast_post = timed_init_step("fast post pipeline", || {
+                create_gamma_post_pipeline(
+                    &device,
+                    &fast_post_pipeline_layout,
+                    &fast_post_shader,
+                    config.format,
+                )
+            });
+            let joined = |name: &str| format!("{name} pipeline compile thread panicked");
+            (
+                cloud_march.join().expect(&joined("cloud march")),
+                cloud_resolve.join().expect(&joined("cloud resolve")),
+                ssao_temporal.join().expect(&joined("SSAO")),
+                ssr_temporal.join().expect(&joined("SSR")),
+                ssr_visibility.join().expect(&joined("SSR visibility")),
+                gamma_post.join().expect(&joined("gamma post")),
+                fast_post,
+            )
+        });
+        println!(
+            "[RENDER INIT] post/screen-space pipelines (7) compiled in parallel: {:.1} ms wall",
+            post_compile_started.elapsed().as_secs_f64() * 1000.0
         );
+        let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
+            ssr_visibility_resources.map_or((None, None, None), |(layout, pipeline, bind_group)| {
+                (Some(layout), Some(pipeline), Some(bind_group))
+            });
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA post-process sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -11302,7 +12529,7 @@ impl Renderer {
             ..Default::default()
         });
         let (color_lut_texture, color_lut_view) =
-            create_color_lut_texture(&device, &queue, ColorLutPreset::Off);
+            create_color_lut_texture(&device, &queue, ColorLutPreset::Off, base, game);
         let color_lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA color LUT sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -11325,7 +12552,8 @@ impl Renderer {
             label: Some("JKA bloom downsample layout"),
             entries: &[texture_entry(0), sampler_entry(1)],
         });
-        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("post shaders/pipelines");
+        let bloom_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA low-resolution bloom shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("bloom.wgsl").into()),
         });
@@ -11356,7 +12584,7 @@ impl Renderer {
                 uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let dof_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let dof_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA Gaussian DOF shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("dof.wgsl").into()),
         });
@@ -11455,6 +12683,7 @@ impl Renderer {
                 cloud_temporal: PostCloudTemporalSettings {
                     values: [0.0, 0.0, 0.88, 0.0],
                 },
+                cloud_wind: PostCloudWindSettings::zeroed(),
                 rain: [
                     0.0,
                     RainIntensity::Rain.shader_value(),
@@ -11462,6 +12691,10 @@ impl Renderer {
                     0.0,
                 ],
                 weather_occlusion: [0.0; 4],
+                weather_look: [0.0; 4],
+                underwater: [NO_WATER_SURFACE, 1.0, 0.0, 0.0],
+                cloud_foreground: [0.0; 4],
+                cloud_blades: [[0.0; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
                 camera_pos_time: [0.0; 4],
                 prev_camera_pos_time: [0.0; 4],
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -11481,7 +12714,8 @@ impl Renderer {
                 uniform_entry(2, wgpu::ShaderStages::COMPUTE),
             ],
         });
-        let auto_exposure_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("bloom/dof");
+        let auto_exposure_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA auto-exposure shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("auto_exposure.wgsl").into()),
         });
@@ -11675,7 +12909,8 @@ impl Renderer {
             timestamp_inside_passes,
         );
 
-        let depth_prepass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("auto-exposure..pre-depth");
+        let depth_prepass_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA AO depth prepass shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("depth_prepass.wgsl").into()),
         });
@@ -11706,6 +12941,70 @@ impl Renderer {
             &depth_prepass_shader,
         );
 
+        let hiz_prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Hi-Z early depth pipeline layout"),
+            bind_group_layouts: &[Some(&camera_layout), Some(&surface_layout)],
+            immediate_size: 0,
+        });
+        let hiz_prepass_pipeline = create_hiz_prepass_pipeline(
+            &device,
+            &hiz_prepass_layout,
+            &depth_prepass_shader,
+            false,
+        );
+        let hiz_prepass_mask_pipeline = create_hiz_prepass_pipeline(
+            &device,
+            &hiz_prepass_layout,
+            &depth_prepass_shader,
+            true,
+        );
+
+        let hiz_build_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA Hi-Z build layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let hiz_build_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Hi-Z build shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("hiz_build.wgsl").into()),
+        });
+        let hiz_build_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("JKA Hi-Z build pipeline layout"),
+                bind_group_layouts: &[Some(&hiz_build_layout)],
+                immediate_size: 0,
+            });
+        let hiz_build_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("JKA Hi-Z build pipeline"),
+                layout: Some(&hiz_build_pipeline_layout),
+                module: &hiz_build_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let hiz_build_bind_group = create_hiz_build_bind_group(&device, &hiz_build_layout, &targets);
+
         let hiz_reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA Hi-Z reduce layout"),
             entries: &[
@@ -11731,7 +13030,7 @@ impl Renderer {
                 },
             ],
         });
-        let hiz_reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let hiz_reduce_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA Hi-Z reduce shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("hiz_reduce.wgsl").into()),
         });
@@ -11774,9 +13073,11 @@ impl Renderer {
                 storage_buffer_entry(6, false, wgpu::ShaderStages::COMPUTE),
                 storage_buffer_entry(7, false, wgpu::ShaderStages::COMPUTE),
                 storage_buffer_entry(8, false, wgpu::ShaderStages::COMPUTE),
+                storage_buffer_entry(9, false, wgpu::ShaderStages::COMPUTE),
             ],
         });
-        let gpu_cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("depth prepass/hiz");
+        let gpu_cull_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA GPU cull shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("gpu_cull.wgsl").into()),
         });
@@ -11794,14 +13095,23 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        let gpu_cull_early_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("JKA Hi-Z early draw-list pipeline"),
+                layout: Some(&gpu_cull_pipeline_layout),
+                module: &gpu_cull_shader,
+                entry_point: Some("cs_early"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let gpu_cull_settings_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("JKA GPU cull settings"),
                 contents: bytemuck::bytes_of(&GpuCullSettings {
                     viewport_mips_flags: [
-                        config.width.max(1),
-                        config.height.max(1),
-                        targets.linear_depth_mip_count,
+                        targets.hiz_width,
+                        targets.hiz_height,
+                        targets.hiz_mip_count,
                         0,
                     ],
                     active_compaction: [0, 0, u32::from(gpu_compaction_supported), 0],
@@ -11813,7 +13123,8 @@ impl Renderer {
             label: Some("JKA cull debug layout"),
             entries: &[storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX)],
         });
-        let cull_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        init_mark!("gpu cull");
+        let cull_debug_shader = create_shader_module_timed(&device, wgpu::ShaderModuleDescriptor {
             label: Some("JKA cull debug shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("cull_debug.wgsl").into()),
         });
@@ -11838,7 +13149,7 @@ impl Renderer {
         );
         let (screenshot_worker_tx, screenshot_job_rx) = mpsc::channel::<ScreenshotEncodeJob>();
         let (screenshot_result_tx, screenshot_worker_rx) =
-            mpsc::channel::<Result<(PathBuf, Option<String>), String>>();
+            mpsc::channel::<Result<ScreenshotOutput, String>>();
         thread::Builder::new()
             .name("screenshot-encode".into())
             .spawn(move || {
@@ -11851,7 +13162,18 @@ impl Renderer {
             })
             .map_err(|error| format!("could not start screenshot worker: {error}"))?;
 
+        init_marks.push(("remaining pipelines/targets", init_phase.elapsed().as_secs_f64() * 1000.0));
+        println!(
+            "[RENDER INIT] phases: {}",
+            init_marks
+                .iter()
+                .map(|(name, ms)| format!("{name} {ms:.1}"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
         Ok(Self {
+            model_frame_log: crate::model_frame_log::ModelFrameLog::new(
+                jka_assets::pk3::active_game_directory(base, game).join("hitch")),
             base: base.to_path_buf(),
             window,
             surface,
@@ -11874,6 +13196,8 @@ impl Renderer {
             fast_camera_bind_group,
             planar_camera_buffers,
             planar_camera_bind_groups,
+            sky_portal_camera_buffer,
+            sky_portal_camera_bind_group,
             surface_layout,
             fast_surface_layout,
             surface_deformation,
@@ -11893,7 +13217,10 @@ impl Renderer {
             detail_auto_textures,
             ocean: None,
             authored_oceans: Vec::new(),
+            ocean_spray_pipeline: None,
             authored_ocean_definitions: Vec::new(),
+            water_boxes: Vec::new(),
+            camera_water_surface: NO_WATER_SURFACE,
             ocean_enabled: false,
             ocean_settings: crate::ocean::OceanSettings::default(),
             world_pipeline_layout,
@@ -11915,6 +13242,8 @@ impl Renderer {
             debug_volumes: DebugVolumeRenderer::default(),
             debug_volume_shader,
             inspector_vertex_range: None,
+            inspector_entity_num: None,
+            blob_mark_buffer: jka_assets::bsp::MarkBuffer::default(),
             ui_pipeline,
             screen_fx_shader,
             screen_fx_texture_layout,
@@ -11931,6 +13260,11 @@ impl Renderer {
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
             _ui_splash: ui_splash,
+            _ui_keys: ui_keys,
+            ui_keys_loaded: false,
+            _ui_icons: ui_icons,
+            ui_icons_loaded: false,
+            ui_binding_is_unknown_map: false,
             _ui_unknown_map: ui_unknown_map,
             ui_unknown_map_size,
             ui_splash_size,
@@ -11958,6 +13292,7 @@ impl Renderer {
             asset_preview_viewport: None,
             menu_backdrop: None,
             world: None,
+            world_videos: Vec::new(),
             dynamic_model_renderer,
             white,
             missing,
@@ -11999,6 +13334,7 @@ impl Renderer {
             sun_intensity: 250.0,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
+            entity_sun_lighting: false,
             clouds_enabled: true,
             cloud_type: CloudType::Storm,
             cloud_quality: 1.0,
@@ -12027,7 +13363,9 @@ impl Renderer {
             grass_precompute_enabled: true,
             grass_mid_lod_enabled: true,
             grass_front_to_back_enabled: true,
+            contact_shadow_debug: 0,
             cloud_history_valid: false,
+            cloud_history_key: None,
             cloud_history_read_index: 0,
             cloud_temporal_frame_index: 0,
             reflection_quality: ReflectionQuality::Off,
@@ -12051,6 +13389,7 @@ impl Renderer {
             cloud_noise_resources,
             cloud_noise_fallback,
             frame_plan: FramePlan::default(),
+            force_unified_world: false,
             indirect_supported,
             gpu_compaction_supported,
             compact_group_scratch: Vec::new(),
@@ -12065,6 +13404,7 @@ impl Renderer {
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
             rt_samples: 1,
+            dynamic_light_falloff: 0,
             rt_reduced_shadows: false,
             clustered_lighting_enabled: false,
             map_light_simulation_enabled: false,
@@ -12072,17 +13412,23 @@ impl Renderer {
             classic_vertex_light: false,
             classic_lightmap_only: false,
             transient_lights: Vec::new(),
+            cloud_foreground: Vec::new(),
             dynamic_light_brightness: 1.0,
             emissive_area_lights_enabled: false,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
             local_light_shadows_enabled: false,
+            settings_batch_open: false,
+            variant_activation_pending: false,
             pbr_enabled: true,
+            pom_enabled: true,
             deluxe_mapping_enabled: true,
             deluxe_specular: 1.0,
             bc_compression_supported,
             cascaded_shadows_enabled: false,
             cascaded_shadow_mode: DynamicShadowsMode::Off,
+            entity_shadow,
+            entity_shadow_light: EntityShadowLight::Lightgrid,
             cull_debug_mode: CullDebugMode::Off,
             planar_reflection_mode: PlanarReflectionMode::Off,
             planar_reflection_debug_mode: PlanarReflectionDebugMode::Off,
@@ -12103,11 +13449,17 @@ impl Renderer {
             ssr_frame_index: 0,
             depth_prepass_pipeline,
             depth_prepass_mask_pipeline,
+            hiz_prepass_pipeline,
+            hiz_prepass_mask_pipeline,
+            hiz_build_layout,
+            hiz_build_pipeline,
+            hiz_build_bind_group,
             hiz_reduce_layout,
             hiz_reduce_pipeline,
             hiz_reduce_bind_groups,
             gpu_cull_layout,
             gpu_cull_pipeline,
+            gpu_cull_early_pipeline,
             gpu_cull_settings_buffer,
             cull_debug_layout,
             cull_debug_pipeline_layout,
@@ -12130,7 +13482,8 @@ impl Renderer {
             post_layout,
             post_shader,
             post_pipeline_layout,
-            post_pipeline,
+            post_pipeline: None,
+            post_pipeline_task,
             taa_post_pipeline,
             cloud_march_pipeline,
             cloud_resolve_pipeline,
@@ -12182,33 +13535,41 @@ impl Renderer {
     }
 
     fn request_screenshot(&mut self, directory: PathBuf) {
+        // Capture the destination together with the request. `fs_game` can change
+        // without a renderer restart, so renderer construction time is not a safe
+        // place to decide where a game-relative write belongs.
+        self.request_screenshot_capture(ScreenshotDestination::File(directory));
+    }
+
+    fn request_clipboard_capture(&mut self) {
+        self.request_screenshot_capture(ScreenshotDestination::Clipboard);
+    }
+
+    fn request_screenshot_capture(&mut self, destination: ScreenshotDestination) {
         if !self.screenshot_supported {
             self.screenshot_result = Some(Err(
                 "the current WGPU surface does not support COPY_SRC readback".into(),
             ));
             return;
         }
-        // Capture the destination together with the request. `fs_game` can change
-        // without a renderer restart, so renderer construction time is not a safe
-        // place to decide where a game-relative write belongs.
-        self.screenshot_requested = Some(directory);
+        self.screenshot_requested = Some(destination);
     }
 
-    fn take_screenshot_result(
-        &mut self,
-    ) -> Option<Result<(PathBuf, Option<String>), String>> {
+    fn take_screenshot_result(&mut self) -> Option<Result<ScreenshotOutput, String>> {
         self.screenshot_result
             .take()
             .or_else(|| self.screenshot_worker_rx.try_recv().ok())
     }
 
     fn prepare_screenshot_readback(&mut self) -> Option<ScreenshotReadback> {
-        let screenshot_dir = self.screenshot_requested.take()?;
+        let destination = self.screenshot_requested.take()?;
 
         let started = Instant::now();
         let width = self.config.width.max(1);
         let height = self.config.height.max(1);
-        if width > u16::MAX as u32 || height > u16::MAX as u32 {
+        if matches!(&destination, ScreenshotDestination::File(_))
+            && (width > u16::MAX as u32 || height > u16::MAX as u32)
+        {
             self.screenshot_result = Some(Err(format!(
                 "screenshot dimensions {width}x{height} exceed JPEG's 65535-pixel limit"
             )));
@@ -12250,7 +13611,7 @@ impl Renderer {
         }
 
         Some(ScreenshotReadback {
-            screenshot_dir,
+            destination,
             width,
             height,
             padded_bytes_per_row,
@@ -12371,7 +13732,7 @@ impl Renderer {
                 height: readback.height,
                 padded_bytes_per_row: readback.padded_bytes_per_row,
                 pixel_format,
-                screenshot_dir: readback.screenshot_dir,
+                destination: readback.destination,
                 copy_record_ms: readback.copy_record_ms,
                 copy_submit_ms: readback.copy_submit_ms,
                 map_request_ms,
@@ -12385,9 +13746,90 @@ impl Renderer {
     }
 
     fn set_ui(&mut self, ui_state: UiSnapshot) {
+        let needs_key_atlas = !self.ui_keys_loaded && ui_state.movement_keys.mode != 0;
         self.ui_state = ui_state;
+        if needs_key_atlas {
+            self.load_ui_key_atlas_now();
+        }
+        self.load_ui_icons_if_needed();
         self.sync_ui_loading_background();
         self.rebuild_ui();
+    }
+
+    /// Rebuild the UI bind group from the current font/splash/key textures.
+    fn rebuild_ui_bind_group(&mut self) {
+        let splash = if self.ui_binding_is_unknown_map {
+            &self._ui_unknown_map
+        } else {
+            &self._ui_splash
+        };
+        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA UI font bind group"),
+            layout: &self.ui_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&splash.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_keys.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_icons.view),
+                },
+            ],
+        });
+    }
+
+    /// Bind the icon atlas the first time a draw list wants it: the lagometer's
+    /// own frame / phone jack, the old speed graph's frame, or an image crosshair.
+    fn load_ui_icons_if_needed(&mut self) {
+        if self.ui_icons_loaded {
+            return;
+        }
+        let wanted = self.ui_state.lagometer.as_ref().is_some_and(|ui| !ui.pics.is_empty())
+            || self.ui_state.speedometer.as_ref().is_some_and(|ui| !ui.graph_pics.is_empty())
+            || self.ui_state.crosshair.image != 0;
+        if !wanted {
+            return;
+        }
+        let started = Instant::now();
+        let data = load_ui_icon_atlas(&self.base, self.detail_texture_game.as_deref());
+        self._ui_icons = upload_texture(&self.device, &self.queue, &data);
+        self.ui_icons_loaded = true;
+        self.rebuild_ui_bind_group();
+        println!(
+            "UI icon atlas: loaded on first use in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Read the movement key images and bind them. Runs once, the first time the
+    /// movement keys are switched on, instead of at every startup.
+    fn load_ui_key_atlas_now(&mut self) {
+        let started = Instant::now();
+        let data = load_ui_key_atlas(&self.base, self.detail_texture_game.as_deref());
+        self._ui_keys = upload_texture(&self.device, &self.queue, &data);
+        self.ui_keys_loaded = true;
+        self.rebuild_ui_bind_group();
+        println!(
+            "UI movement keys: atlas loaded on first use in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     fn sync_ui_loading_background(&mut self) {
@@ -12421,28 +13863,8 @@ impl Renderer {
         // First present the already-resident OpenJK MP unknown-map art. The real
         // levelshot is deliberately resolved only after this frame reaches present().
         self.ui_splash_size = self.ui_unknown_map_size;
-        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA UI font bind group"),
-            layout: &self.ui_texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_unknown_map.view),
-                },
-            ],
-        });
+        self.ui_binding_is_unknown_map = true;
+        self.rebuild_ui_bind_group();
         self.ui_pending_levelshot = Some(PendingUiLevelshot { key, map_name, game });
     }
 
@@ -12483,28 +13905,8 @@ impl Renderer {
         let image = upload_texture(&self.device, &self.queue, &data);
         self.ui_splash_size = Some(size);
         self._ui_splash = image;
-        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA UI font bind group"),
-            layout: &self.ui_texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_splash.view),
-                },
-            ],
-        });
+        self.ui_binding_is_unknown_map = false;
+        self.rebuild_ui_bind_group();
         // Cover-mode geometry depends on the source dimensions.
         self.rebuild_retained_ui();
     }
@@ -12576,12 +13978,23 @@ impl Renderer {
                 .as_ref()
                 .map(|texture| self.ensure_screen_fx_texture(texture));
 
-            let [x, y, w, h] = draw.rect;
+            let [mut x, y, mut w, h] = draw.rect;
+            if draw.anchor != crate::fx::draw::ScreenFxAnchor::Stretch {
+                // widthRatioCoef = (640 * height) / (480 * width)
+                let coef = (640.0 * self.config.height as f32) / (480.0 * self.config.width.max(1) as f32);
+                match draw.anchor {
+                    crate::fx::draw::ScreenFxAnchor::Center => x = 320.0 + (x - 320.0) * coef,
+                    crate::fx::draw::ScreenFxAnchor::Right => x = 640.0 - (640.0 - x) * coef,
+                    crate::fx::draw::ScreenFxAnchor::Stretch => {}
+                }
+                w *= coef;
+            }
             let x0 = x / 640.0 * 2.0 - 1.0;
             let x1 = (x + w) / 640.0 * 2.0 - 1.0;
             let y0 = 1.0 - y / 480.0 * 2.0;
             let y1 = 1.0 - (y + h) / 480.0 * 2.0;
             let color = draw.material.float_vertex_color(draw.color);
+            let [u0, v0, u1, v1] = draw.uv_rect;
             let vertex = |position, uv| UiVertex {
                 position,
                 uv,
@@ -12590,12 +14003,12 @@ impl Renderer {
             };
             let start = vertices.len() as u32;
             vertices.extend_from_slice(&[
-                vertex([x0, y0], [0.0, 0.0]),
-                vertex([x0, y1], [0.0, 1.0]),
-                vertex([x1, y1], [1.0, 1.0]),
-                vertex([x0, y0], [0.0, 0.0]),
-                vertex([x1, y1], [1.0, 1.0]),
-                vertex([x1, y0], [1.0, 0.0]),
+                vertex([x0, y0], [u0, v0]),
+                vertex([x0, y1], [u0, v1]),
+                vertex([x1, y1], [u1, v1]),
+                vertex([x0, y0], [u0, v0]),
+                vertex([x1, y1], [u1, v1]),
+                vertex([x1, y0], [u1, v0]),
             ]);
             self.screen_fx_batches.push(ScreenFxBatch {
                 range: start..start + 6,
@@ -12637,10 +14050,25 @@ impl Renderer {
         chat_lines: Vec<ui::UiChatLine>,
         center_print: Option<ui::UiCenterPrint>,
         demo_timeline: Option<ui::DemoTimelineUi>,
+        prediction_debug: Option<ui::PredictionDebugUi>,
+        crosshair_target: ui::UiCrosshairTarget,
+        follow_name: Option<String>,
+        race_timer: Option<crate::japro_cg::RaceTimerUi>,
+        vote_line: Option<String>,
+        speedometer: Option<crate::speedometer::Ui>,
+        lagometer: Option<crate::lagometer::Ui>,
     ) {
         self.ui_state.chat_lines = chat_lines;
         self.ui_state.center_print = center_print;
         self.ui_state.demo_timeline = demo_timeline;
+        self.ui_state.prediction_debug = prediction_debug;
+        self.ui_state.crosshair_target = crosshair_target;
+        self.ui_state.follow_name = follow_name;
+        self.ui_state.race_timer = race_timer;
+        self.ui_state.vote_line = vote_line;
+        self.ui_state.speedometer = speedometer;
+        self.ui_state.lagometer = lagometer;
+        self.load_ui_icons_if_needed();
         self.rebuild_transient_ui();
     }
 
@@ -13198,7 +14626,6 @@ impl Renderer {
             reflection_probes,
             coarse_batches,
             full_batches,
-            auto2_batches,
             ..
         } = world;
         let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
@@ -13209,7 +14636,6 @@ impl Renderer {
         for batch in coarse_batches
             .iter_mut()
             .chain(full_batches.iter_mut())
-            .chain(auto2_batches.iter_mut())
         {
             let detail_texture = detail_texture_for_source(
                 &batch.source,
@@ -13493,6 +14919,7 @@ impl Renderer {
     }
 
     fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
+        let load_map_started = Instant::now();
         // A new world must not inherit transient RE_AddLightToScene submissions
         // from the previous map. The next CGame snapshot will repopulate them.
         self.transient_lights.clear();
@@ -13503,6 +14930,7 @@ impl Renderer {
         let weather_occlusion = map.weather_occlusion.take();
         self.weather.rain.start_map_occlusion(weather_occlusion);
         self.inspector_vertex_range = None;
+        self.inspector_entity_num = None;
         // Acceleration structures point at the previous world's buffers. Drop
         // them before replacing the world; they are rebuilt lazily below only
         // when RT Shadows is actually selected.
@@ -13546,6 +14974,7 @@ impl Renderer {
             }),
         );
         let source_map = map.map_file_stats.is_some();
+        let videos = std::mem::take(&mut map.videos);
         // The BLAS needs the uploaded world buffers, so map upload always creates
         // a normal raster variant first.  If RT Shadows is selected we build the
         // acceleration structures immediately after WorldGpu is installed, then
@@ -13567,6 +14996,7 @@ impl Renderer {
             WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
         };
+        let pre_build_ms = load_map_started.elapsed().as_secs_f64() * 1000.0;
         let (mut world, mut upload_timings) = build_world(
             &self.device,
             &self.queue,
@@ -13610,18 +15040,21 @@ impl Renderer {
                 && self.bc_compression_supported,
             map,
         );
+        upload_timings.pre_build_ms = pre_build_ms;
+        let post_bind_started = Instant::now();
         world.cull_bind_group = Some(create_gpu_cull_bind_group(
             &self.device,
             &self.gpu_cull_layout,
             &world.cull_records_buffer,
             &world.indirect_buffer,
-            &self.targets.linear_depth_view,
+            &self.targets.hiz_view,
             &self.gpu_cull_settings_buffer,
             &world.active_cull_indices_buffer,
             &world.compact_indirect_buffer,
             &world.compact_count_buffer,
             &world.cull_debug_reason_buffer,
             &world.cull_debug_count_buffer,
+            &world.early_indirect_buffer,
         ));
         world.froxel_bind_group = Some(create_world_froxel_bind_group(
             &self.device,
@@ -13639,7 +15072,25 @@ impl Renderer {
             &self.weather.rain.gpu.wind_noise_view,
             &self.weather.rain.gpu.wind_noise_sampler,
         ));
+        upload_timings.post_bind_groups_ms = post_bind_started.elapsed().as_secs_f64() * 1000.0;
+        let post_misc_started = Instant::now();
         self.world = Some(world);
+        self.world_videos = videos
+            .iter()
+            .filter_map(|source| {
+                match jka_assets::roq::RoqVideo::open(Arc::clone(&source.data)) {
+                    Ok(video) => Some(WorldVideoPlayer {
+                        texture: source.texture,
+                        video,
+                        next_frame_at: 0.0,
+                    }),
+                    Err(error) => {
+                        eprintln!("[JKA] video {}: {error}", source.name);
+                        None
+                    }
+                }
+            })
+            .collect();
         if self.hardware_rt_requested() {
             self.ensure_ray_traced_shadow_resources();
         }
@@ -13667,12 +15118,17 @@ impl Renderer {
         self.update_weather_surface_uniform();
         self.weather.fog.write_legacy_control(&self.queue);
         self.sync_self_legacy_fog();
+        upload_timings.post_misc_ms = post_misc_started.elapsed().as_secs_f64() * 1000.0;
+        let frame_plan_started = Instant::now();
         self.rebuild_planar_reflection_resources();
         self.rebuild_frame_plan();
+        upload_timings.frame_plan_ms = frame_plan_started.elapsed().as_secs_f64() * 1000.0;
         // Loading the world may discover authored/environment planar reflectors,
         // which changes the specialized BSP feature key after build_world had to
         // create its first variant. Activate (or lazily build) the final key now.
+        let variant_started = Instant::now();
         self.activate_world_pipeline_variant();
+        upload_timings.variant_ms = variant_started.elapsed().as_secs_f64() * 1000.0;
         let finalize_started = Instant::now();
         self.update_lighting_settings();
         upload_timings.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
@@ -13706,6 +15162,58 @@ impl Renderer {
         );
     }
 
+    /// Advance every `videoMap` cinematic to the wall clock and upload its newest frame.
+    fn update_world_videos(&mut self) {
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+        let now = self.started.elapsed().as_secs_f64();
+        for player in &mut self.world_videos {
+            if now < player.next_frame_at {
+                continue;
+            }
+            let period = 1.0 / f64::from(player.video.fps().max(1));
+            let mut decoded = false;
+            let mut steps = 0;
+            while player.next_frame_at <= now && steps < WORLD_VIDEO_MAX_CATCH_UP {
+                if player.video.next_frame().is_none() {
+                    player.video.rewind();
+                    if player.video.next_frame().is_none() {
+                        break;
+                    }
+                }
+                decoded = true;
+                player.next_frame_at += period;
+                steps += 1;
+            }
+            if player.next_frame_at <= now {
+                player.next_frame_at = now + period;
+            }
+            let (Some(image), true) = (world.textures.get(player.texture), decoded) else {
+                continue;
+            };
+            let (width, height) = (player.video.width(), player.video.height());
+            // The decoder keeps its newest frame until the next call, so the
+            // upload source is the frame decoded last above.
+            let frame = player.video.current_frame();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &image._texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                frame,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
     fn unload_map(&mut self) {
         // BLAS/TLAS resources refer to the current world's static geometry.
         self.ray_traced_shadows = None;
@@ -13713,7 +15221,9 @@ impl Renderer {
         // overlay over the last gameplay frame. Drop all map-owned GPU state so
         // the renderer returns to the same world-less state used at startup.
         self.world = None;
+        self.world_videos.clear();
         self.inspector_vertex_range = None;
+        self.inspector_entity_num = None;
         self.surface_deformation.clear(&self.queue);
         self.weather.rain.start_map_occlusion(None);
         self.weather
@@ -13951,7 +15461,7 @@ impl Renderer {
         if self.msaa_samples == samples || !self.supported_msaa.contains(&samples) {
             return;
         }
-        let samples = if self.scene_format() == wgpu::TextureFormat::Rgba16Float
+        let samples = if self.gameplay_scene_format() == wgpu::TextureFormat::Rgba16Float
             && !self.hdr_supported_msaa.contains(&samples)
         {
             1
@@ -14246,7 +15756,7 @@ impl Renderer {
         let has_deformation = self
             .world
             .as_ref()
-            .map_or(false, |world| !world.snow_shell.draws.is_empty());
+            .map_or(false, |world| world.snow_shell.has_snow());
         if self.frame_plan.world_path == WorldRenderPath::FastBaseline
             && self.wireframe_mask & ui::wireframe::DEFORMATION != 0
             && has_deformation
@@ -14656,41 +16166,28 @@ impl Renderer {
             .expect("RT Shadows: bsp_lean.wgsl transform must match the renderer shader");
         let world_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA BSP shader (hardware ray-traced shadows)"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\
-{}", world_shader_source, include_str!("surface_deformation.wgsl")).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(compose_world_shader(&world_shader_source).into()),
         });
         let world_shader_lean = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA BSP shader lean (hardware ray-traced shadows)"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\
-{}", world_shader_lean_source, include_str!("surface_deformation.wgsl")).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(compose_world_shader(&world_shader_lean_source).into()),
         });
         let sun_shadow_history = rt_resolution::RtSunShadowHistory::new(&self.device);
-        let receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
+        let receiver_bind_group = create_rt_receiver_bind_group(
             &self.device,
-            &receiver_layout,
-            &self.shadow_resources._array_view,
-            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
-                &self.shadow_resources.bevy_sampler
-            } else {
-                &self.shadow_resources.legacy_sampler
-            },
-            &self.shadow_resources.sky_array_view,
-            &self.shadow_resources.receiver_buffer,
+            &self.shadow_resources,
             self.weather.fog.legacy_control_buffer(),
-            &self.shadow_resources.weather_height_view,
-            &self.shadow_resources.weather_sampler,
-            &self.shadow_resources.weather_surface_buffer,
-            &tlas,
-            &alpha_vertex_buffer,
-            &alpha_index_buffer,
-            &alpha_geometry_buffer,
-            &alpha_material_buffer,
-            &alpha_texture_buffer,
-            &alpha_texel_buffer,
+            self.cascaded_shadow_mode,
+            &receiver_layout,
+            RtReceiverScene {
+                tlas: &tlas,
+                alpha_vertices: &alpha_vertex_buffer,
+                alpha_indices: &alpha_index_buffer,
+                alpha_geometries: &alpha_geometry_buffer,
+                alpha_materials: &alpha_material_buffer,
+                alpha_textures: &alpha_texture_buffer,
+                alpha_texels: &alpha_texel_buffer,
+            },
             &sun_shadow_history,
         );
 
@@ -14793,28 +16290,13 @@ impl Renderer {
             wgpu::BufferUsages::empty(),
         );
         rt.alpha_buffers_generation = rt.alpha_buffers_generation.wrapping_add(1);
-        rt.receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
+        rt.receiver_bind_group = create_rt_receiver_bind_group(
             &self.device,
-            &rt.receiver_layout,
-            &self.shadow_resources._array_view,
-            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
-                &self.shadow_resources.bevy_sampler
-            } else {
-                &self.shadow_resources.legacy_sampler
-            },
-            &self.shadow_resources.sky_array_view,
-            &self.shadow_resources.receiver_buffer,
+            &self.shadow_resources,
             self.weather.fog.legacy_control_buffer(),
-            &self.shadow_resources.weather_height_view,
-            &self.shadow_resources.weather_sampler,
-            &self.shadow_resources.weather_surface_buffer,
-            &rt._tlas,
-            &rt.alpha_vertex_buffer,
-            &rt.alpha_index_buffer,
-            &rt.alpha_geometry_buffer,
-            &rt.alpha_material_buffer,
-            &rt.alpha_texture_buffer,
-            &rt.alpha_texel_buffer,
+            self.cascaded_shadow_mode,
+            &rt.receiver_layout,
+            rt.scene(),
             &rt.sun_shadow_history,
         );
         self.ray_traced_shadows = Some(rt);
@@ -15230,16 +16712,22 @@ impl Renderer {
 
         // Dynamic geometry/material records have fixed slots, so updating them
         // does not allocate or rebuild bind groups on ordinary animated frames.
-        if active_masked_skinned + active_masked_rigid > 0 {
+        // Only the populated head of the dynamic tail can have changed; the
+        // static records and the unused slots stay untouched on the GPU.
+        if active_masked_skinned + active_masked_rigid > 0 && populated_dynamic_slots > 0 {
+            let geometry_range = rt.alpha_dynamic_geometry_base as usize
+                ..rt.alpha_dynamic_geometry_base as usize + populated_dynamic_slots;
+            let material_range = rt.alpha_dynamic_material_base as usize
+                ..rt.alpha_dynamic_material_base as usize + populated_dynamic_slots;
             self.queue.write_buffer(
                 &rt.alpha_geometry_buffer,
-                0,
-                bytemuck::cast_slice(rt.alpha_geometries.as_slice()),
+                (geometry_range.start * std::mem::size_of::<RtAlphaGeometryGpu>()) as u64,
+                bytemuck::cast_slice(&rt.alpha_geometries[geometry_range]),
             );
             self.queue.write_buffer(
                 &rt.alpha_material_buffer,
-                0,
-                bytemuck::cast_slice(rt.alpha_materials.as_slice()),
+                (material_range.start * std::mem::size_of::<RtAlphaMaterialGpu>()) as u64,
+                bytemuck::cast_slice(&rt.alpha_materials[material_range]),
             );
         }
 
@@ -15316,7 +16804,7 @@ impl Renderer {
             &self.device,
             &self.shadow_receiver_layout,
             &self.shadow_resources._array_view,
-            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
+            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps {
                 &self.shadow_resources.bevy_sampler
             } else {
                 &self.shadow_resources.legacy_sampler
@@ -15329,42 +16817,79 @@ impl Renderer {
             &self.shadow_resources.weather_surface_buffer,
         );
         if let Some(rt) = self.ray_traced_shadows.as_mut() {
-            rt.receiver_bind_group = create_ray_traced_shadow_receiver_bind_group(
-                &self.device,
-                &rt.receiver_layout,
-                &self.shadow_resources._array_view,
-                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
-                    &self.shadow_resources.bevy_sampler
-                } else {
-                    &self.shadow_resources.legacy_sampler
-                },
-                &self.shadow_resources.sky_array_view,
-                &self.shadow_resources.receiver_buffer,
-                self.weather.fog.legacy_control_buffer(),
-                &self.shadow_resources.weather_height_view,
-                &self.shadow_resources.weather_sampler,
-                &self.shadow_resources.weather_surface_buffer,
-                &rt._tlas,
-                &rt.alpha_vertex_buffer,
-                &rt.alpha_index_buffer,
-                &rt.alpha_geometry_buffer,
-                &rt.alpha_material_buffer,
-                &rt.alpha_texture_buffer,
-                &rt.alpha_texel_buffer,
-                &rt.sun_shadow_history,
-            );
+            rt.receiver_bind_group = create_rt_receiver_bind_group(
+            &self.device,
+            &self.shadow_resources,
+            self.weather.fog.legacy_control_buffer(),
+            self.cascaded_shadow_mode,
+            &rt.receiver_layout,
+            rt.scene(),
+            &rt.sun_shadow_history,
+        );
         }
     }
 
-    fn advance_surface_wetness(&mut self, frame_time: f32) -> bool {
-        self.weather.rain.advance_surface_wetness(frame_time)
+    fn advance_surface_wetness(&mut self, frame_time: f32, camera_position: Vec3) -> bool {
+        self.weather
+            .rain
+            .advance_surface_wetness(frame_time, camera_position.to_array())
     }
 
     fn update_weather_surface_uniform(&self) {
+        let sun = self.active_sun();
+        let wind = self
+            .weather_wind
+            .at(self.weather.rain.surface_wetness_last_time);
         self.weather.rain.write_surface_uniform(
             &self.queue,
             &self.shadow_resources.weather_surface_buffer,
+            &weather::WeatherSurfaceEnvironment {
+                sun_direction: sun.direction,
+                sun_color: sun.color,
+                sun_intensity: sun.intensity,
+                wind,
+                has_sky: self.world.as_ref().is_some_and(|world| world.primary_skybox.is_some()),
+                wake: self.weather.rain.wake.events(),
+            },
         );
+    }
+
+    /// Feeds everyone who may wade (the local player and any player models in the
+    /// scene) to the puddle wake tracker. Runs only while puddles exist.
+    fn update_wake(
+        &mut self,
+        camera: &Camera,
+        player_position: Option<Vec3>,
+        dynamic_models: &[DynamicModelSurface],
+    ) {
+        if self.weather.rain.puddle_amount <= 10.0 * weather::RAIN_PUDDLE_EPSILON
+            && self.weather.rain.wake.events().is_empty()
+        {
+            return;
+        }
+        let sole = |origin: Vec3| origin - Vec3::Y * weather::wake::FEET_BELOW_ORIGIN;
+        let local = player_position.map(sole);
+        let mut people: Vec<(u32, Vec3)> = Vec::new();
+        if let Some(feet) = local {
+            people.push((u32::MAX, feet));
+        }
+        for surface in dynamic_models {
+            if surface.wireframe_class != DynamicWireframeClass::Player {
+                continue;
+            }
+            let Some(origin) = surface.lighting_origin else { continue };
+            let id = u32::from(surface.entity_num);
+            if people.iter().any(|(seen, _)| *seen == id) {
+                continue;
+            }
+            let feet = sole(Vec3::from_array(scene::render_position(origin)));
+            // The local player's own model is submitted in third person.
+            if local.is_some_and(|local| local.distance_squared(feet) < 30.0 * 30.0) {
+                continue;
+            }
+            people.push((id, feet));
+        }
+        self.weather.rain.update_wake(camera.position, people);
     }
 
     fn ensure_weather_occlusion(&mut self) {
@@ -15395,7 +16920,34 @@ impl Renderer {
         }
     }
 
+    /// Collects this frame's water volumes (authored oceans first, then promoted
+    /// BSP water not already covered by one) and finds the surface above the camera.
+    /// Shared by the ocean optics, the rain (which must stop at the surface) and the
+    /// cloud composite (which must be seen through it).
+    fn refresh_water_boxes(&mut self, eye: Vec3) {
+        let mut boxes = std::mem::take(&mut self.water_boxes);
+        boxes.clear();
+        for a in &self.authored_ocean_definitions {
+            if boxes.len() == 8 { break; }
+            boxes.push(([a.mins[0], a.mins[2], -a.maxs[1]], [a.maxs[0], a.height, -a.mins[1]]));
+        }
+        if let Some(world) = &self.world {
+            for s in &world.ocean_surfaces {
+                if boxes.len() == 8 { break; }
+                let centre = [(s.minimum[0]+s.maximum[0])*0.5,s.plane_height,(s.minimum[1]+s.maximum[1])*0.5];
+                if self.authored_ocean_definitions.iter().any(|a| a.contains_render_point(centre)) { continue; }
+                boxes.push(([s.minimum[0], -65536.0, s.minimum[1]], [s.maximum[0], s.plane_height, s.maximum[1]]));
+            }
+        }
+        self.camera_water_surface = boxes.iter()
+            .filter(|(lo, hi)| (0..3).all(|axis| eye[axis] >= lo[axis] && eye[axis] <= hi[axis]))
+            .map(|(_, hi)| hi[1])
+            .fold(NO_WATER_SURFACE, f32::max);
+        self.water_boxes = boxes;
+    }
+
     fn prepare_rain_frame(&mut self, camera: &Camera, frame_time: f32) {
+        self.weather.rain.ensure_render_pipelines(&self.device);
         self.ensure_weather_occlusion();
         let sun = self.active_sun();
         self.weather.rain.prepare_frame(
@@ -15408,6 +16960,9 @@ impl Renderer {
             self.weather_wind,
             sun.color,
             sun.intensity,
+            // Rain only treats water as a surface when the GPU ocean is drawing it.
+            if self.ocean_enabled { &self.water_boxes } else { &[] },
+            self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE,
         );
     }
 
@@ -15430,39 +16985,18 @@ impl Renderer {
         let smaa_changed = self.smaa_enabled != desired_smaa;
         let lut_changed = self.color_lut_preset != effects.color_lut;
         let old_legacy_fog_effective = self.weather.fog.legacy_effective();
-        let rain_history_changed =
-            self.weather.rain.enabled != effects.rain || self.weather.rain.intensity != effects.rain_intensity;
+        let rain_history_changed = self.weather.rain.enabled != effects.rain
+            || self.weather.rain.intensity != effects.rain_intensity
+            || self.weather.rain.puddle_quality != effects.puddle_quality
+            || (self.weather.rain.puddle_scatter - effects.puddle_scatter).abs() > 0.0005;
         let cloud_resolution_changed =
             self.cloud_render_resolution != effects.cloud_render_resolution;
-        let sun_changed = self.sun_override != effects.sun_override
-            || self.sun_visibility != effects.sun_visibility
-            || (self.sun_yaw - effects.sun_yaw).abs() > 0.0001
-            || (self.sun_pitch - effects.sun_pitch).abs() > 0.0001
-            || (self.sun_intensity - effects.sun_intensity).abs() > 0.0001
-            || self.sun_color != effects.sun_color;
-        let cloud_history_changed = sun_changed
-            || self.clouds_enabled != effects.clouds
-            || self.cloud_type != effects.cloud_type
-            || (self.cloud_quality - effects.cloud_quality).abs() > 0.0001
-            || (self.cloud_coverage - effects.cloud_coverage).abs() > 0.0001
-            || (self.cloud_height - effects.cloud_height).abs() > 0.01
-            || (self.cloud_thickness - effects.cloud_thickness).abs() > 0.01
-            || self.weather_wind != effects.weather_wind
-            || cloud_resolution_changed
-            || self.cloud_temporal_enabled != effects.cloud_temporal
-            || self.cloud_temporal_depth_fix != effects.cloud_temporal_depth_fix
-            || (self.cloud_shear - effects.cloud_shear).abs() > 0.0001
-            || (self.cloud_base_variation - effects.cloud_base_variation).abs() > 0.0001
-            || self.cloud_shape_evolution != effects.cloud_shape_evolution
-            || self.cloud_terrain_interaction != effects.cloud_terrain_interaction
-            || self.cloud_empty_skip != effects.cloud_empty_skip
-            || (self.cloud_aerial - effects.cloud_aerial).abs() > 0.0001
-            || self.cloud_sky_ambient_enabled != effects.cloud_sky_ambient
-            || (self.cloud_history_blend - effects.cloud_history_blend).abs() > 0.0001
-            || (self.cloud_motion_reject - effects.cloud_motion_reject).abs() > 0.0001
-            || self.cloud_history_depth_reject != effects.cloud_history_depth_reject
-            || (self.cloud_thickness_variation - effects.cloud_thickness_variation).abs() > 0.0001
-            || (self.cloud_size - effects.cloud_size).abs() > 0.0001;
+        // Anything that changes what the cloud history holds. Built from the
+        // post-sanitised values the renderer actually stores, so an input the
+        // sanitiser rewrites cannot look "changed" on every frame.
+        let cloud_history_key = CloudHistoryKey::of(&effects);
+        let cloud_history_changed = self.cloud_history_key.as_ref() != Some(&cloud_history_key);
+        self.cloud_history_key = Some(cloud_history_key);
         self.hdr_enabled = effects.hdr;
         self.tone_mapping_enabled = effects.tone_mapping;
         self.auto_exposure_enabled = effects.auto_exposure;
@@ -15534,6 +17068,7 @@ impl Renderer {
         self.sun_intensity = effects.sun_intensity.max(0.0);
         self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
         self.sun_visibility = effects.sun_visibility;
+        self.entity_sun_lighting = effects.entity_sun_lighting;
         self.clouds_enabled = effects.clouds;
         self.cloud_type = effects.cloud_type;
         self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);
@@ -15576,6 +17111,9 @@ impl Renderer {
         self.cloud_size = effects.cloud_size;
         self.weather.rain.enabled = effects.rain;
         self.weather.rain.intensity = effects.rain_intensity;
+        self.weather.rain.puddle_quality = effects.puddle_quality;
+        self.weather.rain.puddle_scatter = effects.puddle_scatter.clamp(0.0, 1.0);
+        self.weather.rain.wet_grade = effects.rain_grade.clamp(0.0, 1.0);
         if cloud_history_changed || !self.clouds_enabled {
             self.cloud_history_valid = false;
             self.cloud_history_read_index = 0;
@@ -15611,12 +17149,18 @@ impl Renderer {
         self.color_lut_strength = effects.color_lut_strength.clamp(0.0, 1.0);
         if lut_changed {
             let (texture, view) =
-                create_color_lut_texture(&self.device, &self.queue, effects.color_lut);
+                create_color_lut_texture(
+                    &self.device,
+                    &self.queue,
+                    effects.color_lut,
+                    &self.base,
+                    self.detail_texture_game.as_deref(),
+                );
             self._color_lut_texture = texture;
             self.color_lut_view = view;
             self.color_lut_preset = effects.color_lut;
             println!(
-                "Color LUT: {} (OxiMedia 33^3 bake)",
+                "Color LUT: {}",
                 self.color_lut_preset.label()
             );
         } else {
@@ -15647,7 +17191,7 @@ impl Renderer {
             self.ssr_history_read_index = 0;
             self.ssr_frame_index = 0;
         }
-        if self.scene_format() == wgpu::TextureFormat::Rgba16Float
+        if self.gameplay_scene_format() == wgpu::TextureFormat::Rgba16Float
             && !self.hdr_supported_msaa.contains(&self.msaa_samples)
         {
             self.msaa_samples = 1;
@@ -15714,9 +17258,9 @@ impl Renderer {
             .unwrap_or((0, 0));
         let settings = GpuCullSettings {
             viewport_mips_flags: [
-                self.config.width.max(1),
-                self.config.height.max(1),
-                self.targets.linear_depth_mip_count.max(1),
+                self.targets.hiz_width,
+                self.targets.hiz_height,
+                self.targets.hiz_mip_count.max(1),
                 u32::from(self.gpu_driven_enabled && self.hiz_occlusion_enabled),
             ],
             active_compaction: [
@@ -15738,6 +17282,8 @@ impl Renderer {
     }
 
     fn rebuild_gpu_visibility_resources(&mut self) {
+        self.hiz_build_bind_group =
+            create_hiz_build_bind_group(&self.device, &self.hiz_build_layout, &self.targets);
         self.hiz_reduce_bind_groups =
             create_hiz_reduce_bind_groups(&self.device, &self.hiz_reduce_layout, &self.targets);
         self.update_gpu_cull_settings();
@@ -15747,13 +17293,14 @@ impl Renderer {
                 &self.gpu_cull_layout,
                 &world.cull_records_buffer,
                 &world.indirect_buffer,
-                &self.targets.linear_depth_view,
+                &self.targets.hiz_view,
                 &self.gpu_cull_settings_buffer,
                 &world.active_cull_indices_buffer,
                 &world.compact_indirect_buffer,
                 &world.compact_count_buffer,
                 &world.cull_debug_reason_buffer,
                 &world.cull_debug_count_buffer,
+                &world.early_indirect_buffer,
             ));
         }
     }
@@ -16056,11 +17603,11 @@ impl Renderer {
         let shadowable_local_lights = point_lights || self.emissive_area_lights_enabled;
         WorldShaderVariantKey {
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
-            pom: self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
+            pom: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
             pbr_shared_material_eval: self.pbr_enabled && PBR_PROFILE_SHARED_MATERIAL_EVAL,
             pbr_shared_tangent_frame: self.pbr_enabled && PBR_PROFILE_SHARED_TANGENT_FRAME,
-            pom_mip_aware: self.pbr_enabled && PBR_PROFILE_POM_MIP_AWARE,
-            pom_adaptive_steps: self.pbr_enabled && PBR_PROFILE_POM_ADAPTIVE_STEPS,
+            pom_mip_aware: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_POM_MIP_AWARE,
+            pom_adaptive_steps: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_POM_ADAPTIVE_STEPS,
             pbr_companion_sampler: self.pbr_enabled && PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR,
             pbr_vertex_lightgrid: self.pbr_enabled && PBR_PROFILE_VERTEX_LIGHTGRID,
             point_lights,
@@ -16090,7 +17637,50 @@ impl Renderer {
             // further gated by the camera uniform so jumps never respecialize.
             jump_shade: self.jump_shade.engaged(),
             ocean: self.ocean_enabled,
+            weather_surface: self.weather_surface_needed(),
+            classic_render_flags: self.classic_world_render_flags() != 0,
+            static_bsp_ao: self.static_bsp_ao_enabled,
+            planar_debug: self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off,
+            deluxe: self.deluxe_shader_enabled(),
+            deluxe_specular: self.deluxe_shader_enabled() && self.deluxe_specular > 0.0,
             detail_texture_mode: self.detail_textures_mode.shader_mode(),
+        }
+    }
+
+    /// Deluxe needs the PBR material path; the shader override is what removes its
+    /// cost, so this must match the key, not just the `pbr_settings.deluxe` uniform.
+    fn deluxe_shader_enabled(&self) -> bool {
+        self.pbr_enabled && PBR_PROFILE_MATERIALS && self.deluxe_mapping_enabled
+    }
+
+    /// True while anything could shade wetness or puddles. Thresholds match the
+    /// shader's own early-out (0.001); rain being enabled counts so the variant is
+    /// compiled when the setting changes rather than mid-downpour.
+    fn weather_surface_needed(&self) -> bool {
+        let rain = &self.weather.rain;
+        rain.enabled
+            || rain.surface_wetness > 0.001
+            || rain.puddle_amount > 0.001
+            || rain.puddle_debug_visualization
+    }
+
+    /// Keeps the active world variant in step with the flags whose source can change
+    /// without a pipeline-aware setter: wetness accumulating or drying out, classic
+    /// lighting toggles, cached-AO availability and planar debug views. One compare
+    /// of a few bools per frame; the pipeline is only touched when one flips.
+    fn sync_runtime_variant_flags(&mut self) {
+        let needed = self.weather_surface_needed();
+        let classic = self.classic_world_render_flags() != 0;
+        let static_ao = self.static_bsp_ao_enabled;
+        let planar_debug = self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off;
+        if self.world.as_ref().is_some_and(|world| {
+            let key = &world.active_pipeline_variant;
+            key.weather_surface != needed
+                || key.classic_render_flags != classic
+                || key.static_bsp_ao != static_ao
+                || key.planar_debug != planar_debug
+        }) {
+            self.activate_world_pipeline_variant();
         }
     }
 
@@ -16098,7 +17688,22 @@ impl Renderer {
         self.world_shader_variant_key().family() == WorldShaderFamily::Enhanced
     }
 
+    fn begin_settings_batch(&mut self) {
+        self.settings_batch_open = true;
+    }
+
+    fn end_settings_batch(&mut self) {
+        self.settings_batch_open = false;
+        if std::mem::take(&mut self.variant_activation_pending) {
+            self.activate_world_pipeline_variant();
+        }
+    }
+
     fn activate_world_pipeline_variant(&mut self) {
+        if self.settings_batch_open {
+            self.variant_activation_pending = true;
+            return;
+        }
         let mut key = self.world_shader_variant_key();
         if key.ray_traced_shadows && !self.ensure_ray_traced_shadow_resources() {
             // Preserve a valid raster pipeline if the adapter exposes the feature
@@ -16153,6 +17758,7 @@ impl Renderer {
             "Renderer pipeline cache: miss {} -> compiling lazily",
             key.short_label()
         );
+        let compile_started = Instant::now();
         let (
             pipelines,
             legacy_dlight_pipelines,
@@ -16248,9 +17854,10 @@ impl Renderer {
             );
             world.active_pipeline_variant = key;
             println!(
-                "Renderer pipeline cache: ready {} ({} cached variant(s))",
+                "Renderer pipeline cache: ready {} ({} cached variant(s)) in {:.1} ms",
                 key.short_label(),
-                world.pipeline_variants.len()
+                world.pipeline_variants.len(),
+                compile_started.elapsed().as_secs_f64() * 1000.0
             );
         }
     }
@@ -16284,7 +17891,7 @@ impl Renderer {
         self.ocean_settings = settings;
         if self.ocean_enabled {
             if recreate {
-                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, self.ocean_settings);
+                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.ocean_spray_albedo.view, self.ocean_settings);
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);
             } else if let Some(ocean) = &mut self.ocean {
@@ -16311,7 +17918,7 @@ impl Renderer {
                 previous.swap_remove(index).1
             } else {
                 crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout,
-                    &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, settings)
+                    &self.ocean_spray_albedo.view, settings)
             };
             gpu.set_settings(&self.queue, settings);
             gpu.set_enabled(&self.queue, self.ocean_enabled);
@@ -16335,7 +17942,7 @@ impl Renderer {
         self.set_authored_oceans(self.authored_ocean_definitions.clone());
         if enabled {
             if self.ocean.is_none() {
-                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.camera_layout, &self.ocean_spray_albedo.view, self.scene_format(), self.msaa_samples, self.ocean_settings);
+                let mut ocean = crate::ocean::OceanGpu::new(&self.device, &self.queue, &self.ocean_layout, &self.ocean_spray_albedo.view, self.ocean_settings);
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);
             } else if let Some(ocean) = &mut self.ocean {
@@ -16370,6 +17977,13 @@ impl Renderer {
 
     fn set_ghoul2_batch_draws(&mut self, mode: Ghoul2BatchMode) {
         self.dynamic_model_renderer.set_ghoul2_batch_draws(mode);
+    }
+
+    fn set_dynamic_light_falloff(&mut self, mode: u32) {
+        let mode = mode.min(1);
+        if self.dynamic_light_falloff == mode { return; }
+        self.dynamic_light_falloff = mode;
+        self.update_lighting_settings();
     }
 
     fn set_rt_samples(&mut self, samples: u32) {
@@ -16473,6 +18087,22 @@ impl Renderer {
             .set_model_brightness(&self.queue, brightness);
     }
 
+    /// Feeds the entity depth prepass the sun direction used by the projected
+    /// cloud shadow, so models give post a smooth sun-facing value instead of a
+    /// per-triangle depth-derived one. Off (w = 0) unless clouds and cloud
+    /// shadows are both on; the GPU write is skipped while nothing changed.
+    fn sync_entity_cloud_shadow_sun(&mut self) {
+        let sun = if self.clouds_enabled && self.cloud_shadows_enabled {
+            let toward_sun = -Vec3::from_array(self.active_sun().direction);
+            toward_sun
+                .try_normalize()
+                .map_or([0.0; 4], |d| [d.x, d.y, d.z, 1.0])
+        } else {
+            [0.0; 4]
+        };
+        self.dynamic_model_renderer.set_cloud_shadow_sun(&self.queue, sun);
+    }
+
     fn set_dynamic_light_brightness(&mut self, brightness: f32) {
         let brightness = if brightness.is_finite() { brightness.max(0.0) } else { 1.0 };
         if (self.dynamic_light_brightness - brightness).abs() < f32::EPSILON {
@@ -16511,7 +18141,7 @@ impl Renderer {
         let settings = PbrSettings {
             values: [
                 u32::from(self.pbr_enabled && PBR_PROFILE_MATERIALS),
-                u32::from(self.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+                u32::from(self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
                 40,
                 0,
             ],
@@ -16527,6 +18157,17 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&settings),
         );
+    }
+
+    fn set_pom_enabled(&mut self, enabled: bool) {
+        if self.pom_enabled == enabled {
+            return;
+        }
+        self.pom_enabled = enabled;
+        self.write_material_enhancement_settings();
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
+        println!("POM: {}", if enabled { "ON" } else { "OFF" });
     }
 
     fn set_pbr_settings(&mut self, enabled: bool, deluxe_mapping: bool, deluxe_specular: f32) {
@@ -16547,26 +18188,66 @@ impl Renderer {
             "PBR profile: {} (companions={} POM={} deluxe={} deluxe_spec={:.2})",
             if enabled { "ON" } else { "OFF" },
             u8::from(enabled && PBR_PROFILE_MATERIALS),
-            u8::from(enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
+            u8::from(enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
             u8::from(enabled && deluxe_mapping),
             self.deluxe_specular,
         );
     }
 
+    /// OpenJK marks blob shadows onto the *rendered* surfaces (CG_ImpactMark ->
+    /// R_MarkFragments): the shadow polygon is clipped against every nearby facing
+    /// markable triangle, so it follows slopes, steps and floor detail that sits
+    /// off the collision floor, and skips nomarks/noimpact/fog shaders and model
+    /// triangle soup. This is the same projector the saber marks use; only the
+    /// quad set-up and the dynamic-mesh output are blob specific. One small
+    /// query per blob, batched into one mesh. Costs nothing without blobs.
+    fn build_blob_shadow_marks(&mut self, dynamic_models: &[DynamicModelSurface]) {
+        let mut vertices = std::mem::take(&mut self.dynamic_model_renderer.blob_mesh_vertices);
+        let mut indices = std::mem::take(&mut self.dynamic_model_renderer.blob_mesh_indices);
+        vertices.clear();
+        indices.clear();
+        let surfaces = self.world.as_ref().and_then(|world| world.mark_surfaces.clone());
+        if let Some(surfaces) = surfaces {
+            for surface in dynamic_models {
+                let Some(sprites) = surface.fx_gpu_sprites.as_ref().filter(|sprites| sprites.blob_shadow) else {
+                    continue;
+                };
+                for request in sprites.instances.iter() {
+                    project_blob_shadow_mark(
+                        &surfaces,
+                        &mut self.blob_mark_buffer,
+                        Vec3::new(request.origin[0], request.origin[1], request.origin[2]),
+                        Vec3::new(request.left[0], request.left[1], request.left[2]),
+                        Vec3::new(request.up[0], request.up[1], request.up[2]),
+                        request.origin[3],
+                        &mut vertices,
+                        &mut indices,
+                    );
+                }
+            }
+        }
+        self.dynamic_model_renderer.blob_mesh_vertices = vertices;
+        self.dynamic_model_renderer.blob_mesh_indices = indices;
+    }
+
     fn inspect_surface(
         &mut self,
         camera: &Camera,
+        dynamic_models: &[DynamicModelSurface],
         x: f32,
         y: f32,
         width: u32,
         height: u32,
+        entity_hint: Option<InspectorEntityHint>,
     ) -> Option<SurfaceInspectorInfo> {
         let Some(world) = &self.world else {
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         };
         if width == 0 || height == 0 {
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         }
 
@@ -16579,6 +18260,7 @@ impl Renderer {
         let world_near = inv_view_proj * ndc;
         if world_near.w.abs() <= 1e-6 {
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         }
         let ray_point = world_near.truncate() / world_near.w;
@@ -16586,6 +18268,7 @@ impl Renderer {
         let ray_direction = (ray_point - ray_origin).normalize_or_zero();
         if ray_direction.length_squared() <= 1e-8 {
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         }
 
@@ -16637,15 +18320,171 @@ impl Renderer {
             }
         }
 
+        // Dynamic entity geometry is not part of the BSP CPU inspector copy.
+        // Trace the final CPU-presented MD3/GLM triangles too so `trace` can
+        // identify visible entities and their material instead of always
+        // falling through to the wall behind them. GPU-skinned Ghoul2 surfaces
+        // are intentionally not guessed from bind-pose data; the CGame collision
+        // hint below still identifies those entities.
+        let mut dynamic_best: Option<(f32, usize, usize, Vec3)> = None;
+        for (surface_index, surface) in dynamic_models.iter().enumerate() {
+            if !surface.raster_visible || surface.wireframe_class == DynamicWireframeClass::Effect {
+                continue;
+            }
+            if surface.ghoul2_gpu.is_some() || surface.fx_gpu_sprites.is_some() {
+                continue;
+            }
+            for (triangle_index, triangle) in surface.indices.chunks_exact(3).enumerate() {
+                let Some(a) = surface.vertices.get(triangle[0] as usize) else { continue };
+                let Some(b) = surface.vertices.get(triangle[1] as usize) else { continue };
+                let Some(c) = surface.vertices.get(triangle[2] as usize) else { continue };
+                let Some(distance) = ray_triangle_distance(
+                    ray_origin,
+                    ray_direction,
+                    Vec3::from_array(a.position),
+                    Vec3::from_array(b.position),
+                    Vec3::from_array(c.position),
+                ) else {
+                    continue;
+                };
+                if dynamic_best.is_none_or(|(best_distance, _, _, _)| distance < best_distance) {
+                    dynamic_best = Some((
+                        distance,
+                        surface_index,
+                        triangle_index,
+                        ray_origin + ray_direction * distance,
+                    ));
+                }
+            }
+        }
+
+        let world_distance = best.map_or(f32::INFINITY, |entry| entry.0);
+        let dynamic_distance = dynamic_best.map_or(f32::INFINITY, |entry| entry.0);
+
+        // The OpenJK-style CGame collision trace supplies protocol entity ownership
+        // for solid hits. This catches inline bmodels and GPU-skinned players even
+        // when their final raster triangles are unavailable to this CPU path.
+        let hinted_entity = entity_hint.filter(|hint| {
+            hint.distance <= world_distance + 0.5
+                && hint.distance <= dynamic_distance + 8.0
+        });
+
+        let dynamic_wins = dynamic_best.is_some_and(|(distance, surface_index, _, _)| {
+            let entity_matches_hint = entity_hint.is_none_or(|hint| {
+                dynamic_models
+                    .get(surface_index)
+                    .is_some_and(|surface| surface.entity_num == hint.entity_num)
+            });
+            entity_matches_hint && distance <= world_distance + 0.001
+        });
+
+        if dynamic_wins {
+            let (distance, surface_index, triangle_index, hit) = dynamic_best.unwrap();
+            let surface = &dynamic_models[surface_index];
+            if self.inspector_entity_num == Some(surface.entity_num) && self.inspector_vertex_range.is_none() {
+                self.inspector_entity_num = None;
+                return None;
+            }
+            self.inspector_vertex_range = None;
+            self.inspector_entity_num = Some(surface.entity_num);
+            let texture = surface.texture.as_ref();
+            let texture_name = texture.map_or("<untextured / generated>", |texture| texture.label.as_str());
+            let entity_kind = match surface.wireframe_class {
+                DynamicWireframeClass::Player => "PLAYER MODEL",
+                DynamicWireframeClass::Entity => "ENTITY MODEL",
+                DynamicWireframeClass::Effect => "EFFECT GEOMETRY",
+            };
+            let mut lines = vec![
+                format!("ENTITY: #{}    GEOMETRY: {}", surface.entity_num, entity_kind),
+                format!("DISTANCE: {distance:.2}    HIT: {:.1}, {:.1}, {:.1}", hit.x, hit.y, hit.z),
+                format!("TRIANGLE: {triangle_index}    SURFACE SLOT: {surface_index}"),
+                format!("VERTICES: {}    INDICES: {}    TRIANGLES: {}", surface.vertex_count(), surface.index_count(), surface.index_count() / 3),
+                format!("ALPHA MODE: {:?}    WIREFRAME CLASS: {:?}", surface.alpha_mode, surface.wireframe_class),
+                format!("TEXTURE: {texture_name}"),
+            ];
+            if let Some(texture) = texture {
+                lines.push(format!(
+                    "TEXTURE DETAIL: {}x{}    MIPS {}    {} {}",
+                    texture.width,
+                    texture.height,
+                    texture.mip_level_count,
+                    if texture.srgb { "sRGB" } else { "linear" },
+                    if texture.clamp { "clamp" } else { "repeat" },
+                ));
+                lines.push(format!(
+                    "IMAGE PROVIDER: {}",
+                    texture.source.as_deref().map_or_else(
+                        || "<generated / unknown>".to_owned(),
+                        |path| path.display().to_string(),
+                    )
+                ));
+            }
+            return Some(SurfaceInspectorInfo {
+                kind: entity_kind.into(),
+                title: format!("ENTITY #{}", surface.entity_num),
+                summary: vec![
+                    ("ENTITY".into(), format!("#{} · {}", surface.entity_num, entity_kind)),
+                    ("DISTANCE".into(), format!("{distance:.2} u")),
+                    ("MATERIAL".into(), texture_name.to_owned()),
+                    ("GEOMETRY".into(), format!("{} tris · {} verts", surface.index_count() / 3, surface.vertex_count())),
+                ],
+                sections: vec![SurfaceInspectorSection {
+                    title: "RENDER GEOMETRY".into(),
+                    lines: vec![
+                        format!("Hit triangle {triangle_index} at {:.1}, {:.1}, {:.1}", hit.x, hit.y, hit.z),
+                        format!("Blend/alpha: {:?}", surface.alpha_mode),
+                        format!("Texture: {texture_name}"),
+                    ],
+                }],
+                lines,
+                hit_entity_num: (surface.entity_num < 1022).then_some(surface.entity_num),
+                hit_inline_model: None,
+            });
+        }
+
+        if let Some(hint) = hinted_entity {
+            if self.inspector_entity_num == Some(hint.entity_num) && self.inspector_vertex_range.is_none() {
+                self.inspector_entity_num = None;
+                return None;
+            }
+            self.inspector_vertex_range = None;
+            self.inspector_entity_num = Some(hint.entity_num);
+            let hit = Vec3::from_array(hint.hit);
+            let lines = vec![
+                format!("ENTITY: #{}", hint.entity_num),
+                format!("DISTANCE: {:.2}    HIT: {:.1}, {:.1}, {:.1}", hint.distance, hit.x, hit.y, hit.z),
+                "GEOMETRY: protocol collision trace (exact bmodel or encoded entity bounds)".into(),
+            ];
+            return Some(SurfaceInspectorInfo {
+                kind: "ENTITY".into(),
+                title: format!("ENTITY #{}", hint.entity_num),
+                summary: vec![
+                    ("ENTITY".into(), format!("#{}", hint.entity_num)),
+                    ("DISTANCE".into(), format!("{:.2} u", hint.distance)),
+                    ("HIT".into(), format!("{:.1}, {:.1}, {:.1}", hit.x, hit.y, hit.z)),
+                ],
+                sections: vec![SurfaceInspectorSection {
+                    title: "TRACE".into(),
+                    lines: vec!["OpenJK-style CGame collision hit; entity state is resolved on the game thread.".into()],
+                }],
+                lines,
+                hit_entity_num: Some(hint.entity_num),
+                hit_inline_model: None,
+            });
+        }
+
         let Some((distance, batch_index, triangle_start, hit)) = best else {
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         };
+        self.inspector_entity_num = None;
         let hit_range = triangle_start..triangle_start.saturating_add(3);
         if self.inspector_vertex_range.as_ref() == Some(&hit_range) {
             // `trace` is a selection toggle: tracing the already-selected BSP
             // triangle exits inspection and removes its highlight.
             self.inspector_vertex_range = None;
+            self.inspector_entity_num = None;
             return None;
         }
         self.inspector_vertex_range = Some(hit_range);
@@ -17109,7 +18948,62 @@ impl Renderer {
             lines.push("SHADER SOURCE: <no direct material-debug match>".into());
         }
 
-        Some(SurfaceInspectorInfo { title, lines })
+        let texture_summary = texture
+            .map(|texture| texture.label.clone())
+            .or_else(|| source.texture_is_lightmap.then(|| "$lightmap".into()))
+            .unwrap_or_else(|| "<generated / white>".into());
+        let lighting_summary = if let Some(lightmap) = lightmap {
+            format!("lightmap {}", lightmap.label)
+        } else if source.vertex_lit {
+            "vertex-lit".into()
+        } else {
+            format!("lightmap {:?}", source.lightmap)
+        };
+        let summary = vec![
+            ("MATERIAL".into(), title.clone()),
+            ("DISTANCE".into(), format!("{distance:.2} u")),
+            (
+                "DRAW".into(),
+                format!("{:?} · {:?} · {:?}", source.pipeline.class, source.pipeline.blend, source.pipeline.cull),
+            ),
+            ("TEXTURE".into(), texture_summary.clone()),
+            ("LIGHTING".into(), lighting_summary.clone()),
+        ];
+        let sections = vec![
+            SurfaceInspectorSection {
+                title: "SURFACE".into(),
+                lines: vec![
+                    format!("Batch {batch_index} · {} triangles · {vertex_count} vertices", vertex_count / 3),
+                    format!("Hit {:.1}, {:.1}, {:.1}", hit.x, hit.y, hit.z),
+                    format!(
+                        "Depth: write={} equal={} offset={}",
+                        source.pipeline.depth_write, source.pipeline.depth_equal, source.pipeline.offset
+                    ),
+                ],
+            },
+            SurfaceInspectorSection {
+                title: "MATERIAL / LIGHTING".into(),
+                lines: vec![
+                    format!("Texture: {texture_summary}"),
+                    format!("Lighting: {lighting_summary}"),
+                    format!("Fog: {fog_assignment} · PVS visible: {}", if pvs_visible { "YES" } else { "NO" }),
+                    format!(
+                        "Planar: {} · env candidate: {} · probe: {:?}",
+                        source.planar_reflection, source.planar_environment_candidate, source.reflection_probe
+                    ),
+                ],
+            },
+        ];
+
+        Some(SurfaceInspectorInfo {
+            kind: "WORLD SURFACE".into(),
+            title,
+            summary,
+            sections,
+            lines,
+            hit_entity_num: None,
+            hit_inline_model: None,
+        })
     }
 
     fn dump_materials(&self, filter: Option<&str>, all: bool) {
@@ -17267,10 +19161,14 @@ impl Renderer {
     fn set_cascaded_shadows(&mut self, mode: DynamicShadowsMode) {
         self.cascaded_shadow_mode = mode;
         self.update_lighting_settings();
+        // The Entity map is receiver-compatible with the cascade path (same
+        // shader variant, one cascade), so it shares the enabled flag.
         self.cascaded_shadows_enabled = matches!(
             mode,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::EntityMap
         );
+        // Re-aim on entry instead of easing from a stale light.
+        self.entity_shadow.initialized = false;
         let rt_active = if mode == DynamicShadowsMode::RayTraced {
             let active = self.ensure_ray_traced_shadow_resources();
             if active {
@@ -17328,6 +19226,18 @@ impl Renderer {
         self.rebuild_frame_plan();
     }
 
+    fn set_entity_markers(&mut self, mesh: Option<jka_assets::bsp::DebugVolumeMesh>) {
+        self.debug_volumes.set_entity_markers(&self.device, mesh.as_ref());
+    }
+
+    fn set_force_unified_world(&mut self, force: bool) {
+        if self.force_unified_world == force {
+            return;
+        }
+        self.force_unified_world = force;
+        self.rebuild_frame_plan();
+    }
+
     fn set_cull_debug(&mut self, mode: CullDebugMode) {
         if self.cull_debug_mode == mode {
             return;
@@ -17345,6 +19255,246 @@ impl Renderer {
         }
         self.rebuild_frame_plan();
         self.update_gpu_cull_settings();
+    }
+
+    /// Direction the Entity map's light travels and how visible its shadow
+    /// should be, taken from the baked lightgrid at the local player (camera
+    /// when there is none). The lightgrid stores one dominant light direction
+    /// per probe, which is exactly what the original renderer aimed entity
+    /// shadows with. With entity sun lighting on, the runtime sun competes with
+    /// the remaining baked light and the brighter one wins.
+    ///
+    /// With `EntityShadowLight::Authored`, a non-sun dominant light is replaced by
+    /// the direction to the best authored map light (see
+    /// `authored_light_direction`), keeping the lightgrid's strength estimate.
+    /// Maps with no lightgrid cast a sun shadow only if the map has a sun.
+    fn entity_shadow_target(&self, camera: &Camera, player_position: Option<Vec3>) -> (Vec3, f32) {
+        const STANDING_VIEW_HEIGHT: f32 = 36.0;
+        let focus = player_position
+            .map(|origin| origin + Vec3::Y * STANDING_VIEW_HEIGHT)
+            .unwrap_or(camera.position);
+        let luma = |rgb: [f32; 3]| rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let smoothstep = |edge0: f32, edge1: f32, value: f32| {
+            let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let sampled = self
+            .world
+            .as_ref()
+            .and_then(|world| world.entity_light_grid.as_ref())
+            .and_then(|grid| {
+                sample_entity_classic_light(
+                    grid,
+                    scene::jka_position(focus.to_array()),
+                    self.entity_sun_relight(),
+                )
+            });
+        let from_grid = sampled.and_then(|light| {
+            let sun_dominant = luma(light.sun_directed) > luma(light.directed);
+            let (toward, directed) = if sun_dominant {
+                (light.sun_direction, light.sun_directed)
+            } else {
+                (light.direction, light.directed)
+            };
+            let mut toward = Vec3::from_array(toward).try_normalize()?;
+            let directed_luma = luma(directed);
+            let ambient = luma(light.ambient);
+            // Light units are 0..255. Contrast is how much of the local light is
+            // directional (a shadow needs something to be missing); presence fades
+            // the shadow out in near-black probes where it would be invisible;
+            // coherence fades it where neighbouring probes disagree on direction.
+            let contrast = directed_luma / (directed_luma + ambient).max(1.0);
+            let coherence = if sun_dominant { 1.0 } else { smoothstep(0.35, 0.8, light.direction_coherence) };
+            let strength = smoothstep(0.15, 0.6, contrast) * smoothstep(2.0, 16.0, directed_luma) * coherence;
+            // A baked sun share at least half of the directed light means the
+            // direction is already the exact sun direction: nothing to refine.
+            let sun_like = sun_dominant || luma(light.baked_sun) >= 0.5 * luma(light.directed).max(1.0e-3);
+            if self.entity_shadow_light == EntityShadowLight::Authored && !sun_like {
+                if let Some(authored) = self.authored_light_direction(focus, Some(toward)) {
+                    toward = authored;
+                }
+            }
+            Some((toward, strength))
+        });
+        let from_world = || {
+            // No lightgrid sample: only a map sun gives a believable direction, and
+            // with `Authored` the best authored light can still be used.
+            let world = self.world.as_ref()?;
+            if self.entity_shadow_light == EntityShadowLight::Authored {
+                if let Some(authored) = self.authored_light_direction(focus, None) {
+                    return Some((authored, 0.6));
+                }
+            }
+            world.sun?;
+            let toward = -Vec3::from_array(self.active_sun().direction);
+            Some((toward.try_normalize().unwrap_or(Vec3::Y), 0.6))
+        };
+        let Some((mut toward_light, strength)) = from_grid.or_else(from_world) else {
+            return (self.entity_shadow.direction, 0.0);
+        };
+        if toward_light.y < ENTITY_SHADOW_MIN_ELEVATION {
+            toward_light.y = ENTITY_SHADOW_MIN_ELEVATION;
+            toward_light = toward_light.normalize();
+        }
+        (-toward_light, strength)
+    }
+
+    /// Unit direction from `focus` toward the authored map light most likely to be
+    /// lighting it. Score is irradiance at the focus (brightness over distance
+    /// squared). The map stores no light visibility, so when a lightgrid direction
+    /// is available it stands in for one: q3map2 traced occlusion when it baked
+    /// that direction, so a lamp only qualifies if it lies within about 60 degrees
+    /// of it, which rejects lamps in other rooms.
+    fn authored_light_direction(&self, focus: Vec3, grid_toward: Option<Vec3>) -> Option<Vec3> {
+        let world = self.world.as_ref()?;
+        best_authored_light_direction(&world.dynamic_lights, focus, grid_toward)
+    }
+
+    fn set_entity_shadow_light(&mut self, source: EntityShadowLight) {
+        self.entity_shadow_light = source;
+        // Re-aim immediately instead of easing from the previous source's light.
+        self.entity_shadow.initialized = false;
+    }
+
+    /// Smooths the light, builds the texel-snapped orthographic light matrix
+    /// around the view, and reports whether a visible shadow is wanted at all.
+    fn prepare_entity_shadow(
+        &mut self,
+        camera: &Camera,
+        player_position: Option<Vec3>,
+        frame_delta: f32,
+    ) -> EntityShadowFrame {
+        let (target_direction, target_strength) = self.entity_shadow_target(camera, player_position);
+        let state = &mut self.entity_shadow;
+        if state.initialized {
+            let alpha = 1.0 - (-frame_delta / ENTITY_SHADOW_SMOOTHING_SECONDS).exp();
+            state.direction = state
+                .direction
+                .lerp(target_direction, alpha)
+                .try_normalize()
+                .unwrap_or(target_direction);
+            state.strength += (target_strength - state.strength) * alpha;
+        } else {
+            state.direction = target_direction;
+            state.strength = target_strength;
+            state.initialized = true;
+        }
+        let direction = state.direction;
+        let reference_up = if direction.dot(Vec3::Y).abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+        let right = direction.cross(reference_up).normalize_or_zero();
+        let light_up = right.cross(direction).normalize_or_zero();
+        let radius = ENTITY_SHADOW_RADIUS;
+        // Bias the window toward where the camera is looking; characters behind
+        // the viewer cast onto nothing visible.
+        let centre = camera.position + camera.forward() * (radius * 0.45);
+        let texel_size = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+        let centre_right = centre.dot(right);
+        let centre_up = centre.dot(light_up);
+        let snapped_centre = centre
+            + right * ((centre_right / texel_size).round() * texel_size - centre_right)
+            + light_up * ((centre_up / texel_size).round() * texel_size - centre_up);
+        let eye = snapped_centre - direction * (radius * 2.0);
+        let view = Mat4::look_at_rh(eye, snapped_centre, reference_up);
+        let projection = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 4.0);
+        EntityShadowFrame {
+            view_proj: projection * view,
+            active: state.strength > 0.02,
+        }
+    }
+
+    /// Receiver uniform for the Entity map: one cascade (layer 0) that every
+    /// receiver treats as the only slice, with sky admission off because the map
+    /// holds no world geometry. `enabled` is false when there is nothing to cast,
+    /// which turns every receiver's 9-tap lookup into a single uniform branch.
+    fn write_entity_shadow_uniforms(&self, frame: &EntityShadowFrame, camera: &Camera, enabled: bool) {
+        let direction = self.entity_shadow.direction;
+        let forward = camera.forward();
+        let texel_size = (2.0 * ENTITY_SHADOW_RADIUS) / SHADOW_MAP_SIZE as f32;
+        let receiver = ShadowReceiverUniform {
+            view_proj: std::array::from_fn(|index| {
+                if index == 0 { frame.view_proj } else { Mat4::IDENTITY }.to_cols_array_2d()
+            }),
+            // Past this eye depth the window cannot cover the fragment, so the
+            // receivers return lit without a matrix multiply or any taps.
+            split_depths: [ENTITY_SHADOW_RADIUS * 1.6; SHADOW_CASCADES],
+            light_direction_enabled: [
+                direction.x,
+                direction.y,
+                direction.z,
+                if enabled { 1.0 } else { 0.0 },
+            ],
+            params: [
+                SHADOW_MAP_SIZE as f32,
+                0.00025,
+                ENTITY_SHADOW_MAX_STRENGTH * self.entity_shadow.strength,
+                0.0,
+            ],
+            camera_forward: [forward.x, forward.y, forward.z, 0.0],
+            cascade_texel_sizes: [texel_size; SHADOW_CASCADES],
+            bevy_params: [
+                BEVY_CSM_SHADOW_DEPTH_BIAS,
+                BEVY_CSM_SHADOW_NORMAL_BIAS,
+                BEVY_CSM_OVERLAP_PROPORTION,
+                1.0,
+            ],
+        };
+        self.queue.write_buffer(
+            &self.shadow_resources.receiver_buffer,
+            0,
+            bytemuck::bytes_of(&receiver),
+        );
+    }
+
+    /// Renders this frame's entities into shadow layer 0. Needs the dynamic
+    /// models already prepared. Frames with nothing to cast skip the pass (the
+    /// receivers are disabled for them), so there is no clear either.
+    fn encode_entity_shadow_pass(&mut self, encoder: &mut wgpu::CommandEncoder, frame: &EntityShadowFrame) {
+        if !frame.active || !self.dynamic_model_renderer.has_depth_casters() {
+            return;
+        }
+        let unclipped = self.entity_shadow_unclipped_depth();
+        self.dynamic_model_renderer
+            .ensure_entity_shadow_pipelines(&self.device, false, unclipped);
+        self.entity_shadow.write_camera(&self.queue, 0, frame.view_proj);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("JKA entity shadow map"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.shadow_resources.layer_views[0],
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.dynamic_model_renderer
+            .draw_entity_shadow(&mut pass, &self.entity_shadow.cameras[0].1, false);
+    }
+
+    /// Same depth-clip behaviour as the BSP cascade casters.
+    fn entity_shadow_unclipped_depth(&self) -> bool {
+        self.device.features().contains(wgpu::Features::DEPTH_CLIP_CONTROL)
+    }
+
+    /// Entity casters for the CSM modes: entities are also drawn into cascades 0
+    /// and 1 (near and mid range; farther characters are too small to matter and
+    /// every extra cascade repeats the entity draws). Writes the light cameras and
+    /// builds the pipelines; returns whether the cascade loop should draw them.
+    fn prepare_entity_cascade_casters(&mut self, matrices: &[Mat4; SHADOW_CASCADES]) -> bool {
+        if !self.dynamic_model_renderer.has_depth_casters() {
+            return false;
+        }
+        let unclipped = self.entity_shadow_unclipped_depth();
+        self.dynamic_model_renderer
+            .ensure_entity_shadow_pipelines(&self.device, true, unclipped);
+        for index in 0..ENTITY_SHADOW_CAMERAS {
+            self.entity_shadow.write_camera(&self.queue, index, matrices[index]);
+        }
+        true
     }
 
     fn write_shadow_uniforms(
@@ -17378,25 +19528,20 @@ impl Renderer {
             camera_forward: [camera_forward.x, camera_forward.y, camera_forward.z, self.sun_visibility.shader_value()],
             cascade_texel_sizes: *texel_sizes,
             bevy_params: if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
-                // RT interpretation:
-                // x = cos(max directional-light cone half-angle), matching Bevy Solari
-                // y = visibility rays per shaded fragment (kept at 1 for RT performance)
-                // z = temporal sampling enabled (existing Bevy-style TAA accumulates the result)
-                // w = reserved for future generic emitter sampling controls
+                // RT interpretation: only x is read, as cos(max directional-light
+                // cone half-angle), matching Bevy Solari. y/z/w stay zero; w in
+                // particular is the CSM cascade count other receivers (grass)
+                // read, and zero makes them skip the unrendered shadow maps.
+                // The visibility ray count comes from LightingSettings.
                 let half_angle_radians =
                     0.5 * RT_SUN_ANGULAR_DIAMETER_RADIANS;
-                [
-                    half_angle_radians.cos(),
-                    RT_SHADOW_SAMPLES_PER_PIXEL,
-                    if self.taa_enabled { 1.0 } else { 0.0 },
-                    0.0,
-                ]
+                [half_angle_radians.cos(), 0.0, 0.0, 0.0]
             } else {
                 [
                     BEVY_CSM_SHADOW_DEPTH_BIAS,
                     BEVY_CSM_SHADOW_NORMAL_BIAS,
                     BEVY_CSM_OVERLAP_PROPORTION,
-                    if bevy_mode { SHADOW_CASCADES as f32 } else { LEGACY_SHADOW_CASCADES as f32 },
+                    SHADOW_CASCADES as f32,
                 ]
             },
         };
@@ -17469,11 +19614,7 @@ impl Renderer {
                 0.0,
             ],
             shadow_view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
-            split_depths: if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy {
-                bevy_cascade_bounds()
-            } else {
-                [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0]
-            },
+            split_depths: bevy_cascade_bounds(),
             shadow_params: [
                 SHADOW_MAP_SIZE as f32,
                 0.0006,
@@ -17482,7 +19623,7 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy { 1.0 } else { 0.0 },
+                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps { 1.0 } else { 0.0 },
             ],
             grid: [weather::FROXEL_X, weather::FROXEL_Y, weather::FROXEL_Z, self.sun_visibility.shader_value() as u32],
         };
@@ -17531,7 +19672,8 @@ impl Renderer {
         // hundreds of times per frame/per draw. This path intentionally matches
         // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
         // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
-        let fast_baseline = !self.hdr_enabled
+        let fast_baseline = !self.force_unified_world
+            && !self.hdr_enabled
             && !self.tone_mapping_enabled
             && !self.bloom_enabled
             && !self.halation_enabled
@@ -17574,6 +19716,23 @@ impl Renderer {
             && !self.planar_reflection.active
             && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
             && !self.jump_shade.engaged();
+        // Hi-Z reads the camera depth buffer, so it no longer forces the full
+        // linear-depth prepass: with no other consumer it runs a cheaper
+        // depth-only early pass instead (see `FramePlan::hiz_early`).
+        let needs_linear_depth = self.ssao_enabled
+            || (self.rt_reduced_shadows
+                && self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+                && self.ray_tracing_supported)
+            || self.taa_enabled
+            || self.contact_shadows_enabled
+            || fog_enabled
+            || legacy1_global_post
+            || self.clouds_enabled
+            || self.weather.rain.enabled
+            || self.ssr_enabled
+            || self.reflection_debug_enabled
+            || self.motion_blur_strength > 0.001
+            || self.depth_of_field_strength > 0.001;
         self.frame_plan = FramePlan {
             world_path: if fast_baseline {
                 WorldRenderPath::FastBaseline
@@ -17587,20 +19746,9 @@ impl Renderer {
             // LUT sample. If that path is already required it also applies the
             // vignette, but vignette alone does not force an offscreen scene copy.
             gamma_only_post: (gamma_enabled || lut_enabled) && !full_post_effects,
-            needs_linear_depth: self.ssao_enabled
-                || (self.rt_reduced_shadows && self.hardware_rt_requested() && self.ray_tracing_supported)
-                || self.taa_enabled
-                || self.contact_shadows_enabled
-                || fog_enabled
-                || legacy1_global_post
-                || self.clouds_enabled
-                || self.weather.rain.enabled
-                || self.ssr_enabled
-                || self.reflection_debug_enabled
-                || self.motion_blur_strength > 0.001
-                || self.depth_of_field_strength > 0.001
-                || use_hiz,
+            needs_linear_depth,
             use_hiz,
+            hiz_early: use_hiz && !needs_linear_depth,
             use_gpu_culling: self.gpu_driven_enabled || self.cull_debug_mode != CullDebugMode::Off,
             // Area lights use the same clustered lists as entity/point lights,
             // but remain independently toggleable. The active BSP pipeline is
@@ -17609,6 +19757,31 @@ impl Renderer {
                 || self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite
                 || self.emissive_area_lights_enabled,
         };
+        let plan = self.frame_plan;
+        self.ensure_post_pipeline(plan.use_post && !plan.gamma_only_post);
+    }
+
+    /// Takes the background-compiled full post pipeline once it is done. With
+    /// `block`, waits for it (or compiles inline if the worker failed): used when
+    /// the frame plan needs the full post pass, so a draw never lacks it.
+    fn ensure_post_pipeline(&mut self, block: bool) {
+        if self.post_pipeline.is_some() {
+            return;
+        }
+        if let Some(task) = self
+            .post_pipeline_task
+            .take_if(|task| block || task.is_finished())
+        {
+            self.post_pipeline = task.join().ok();
+        }
+        if block && self.post_pipeline.is_none() && self.post_pipeline_task.is_none() {
+            self.post_pipeline = Some(create_post_pipeline(
+                &self.device,
+                &self.post_pipeline_layout,
+                &self.post_shader,
+                self.config.format,
+            ));
+        }
     }
 
     fn transient_dlight_clusters_enabled(&self) -> bool {
@@ -17741,6 +19914,77 @@ impl Renderer {
         stats
     }
 
+    fn set_cloud_foreground(&mut self, blades: &[CloudForegroundBlade]) {
+        if self.cloud_foreground != blades {
+            self.cloud_foreground.clear();
+            self.cloud_foreground.extend_from_slice(blades);
+        }
+    }
+
+    /// Screen-space capsules for the blades in `cloud_foreground`, packed for
+    /// the post uniform: two vec4 per blade, `[ax, ay, bx, by]` in pixels then
+    /// `[glow radius px, nearest distance, 0, 0]`. Blades behind the camera or
+    /// off the frame are dropped, and the nearest `MAX_CLOUD_FOREGROUND_BLADES`
+    /// survive. Returns the packed array and its blade count.
+    fn cloud_foreground_uniform(
+        &self,
+        view_proj: Mat4,
+        camera_position: Vec3,
+    ) -> ([[f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2], f32) {
+        let mut packed = [[0.0f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2];
+        if !self.clouds_enabled || self.cloud_foreground.is_empty() {
+            return (packed, 0.0);
+        }
+        let width = self.config.width.max(1) as f32;
+        let height = self.config.height.max(1) as f32;
+        // Rows of a perspective view-projection scale view space by the focal
+        // length, so the y row's length is the vertical focal factor.
+        let focal_y = view_proj.row(1).truncate().length();
+        // Clip w is the view-space depth. Blade points nearer than this are
+        // pulled back onto the plane instead of dropping the whole blade.
+        const NEAR_W: f32 = 1.0;
+        let mut blades: Vec<(f32, [f32; 4], [f32; 4])> = Vec::with_capacity(MAX_CLOUD_FOREGROUND_BLADES);
+        for blade in self.cloud_foreground.iter() {
+            let start = Vec3::from(blade.start);
+            let end = Vec3::from(blade.end);
+            let mut clip_start = view_proj * start.extend(1.0);
+            let mut clip_end = view_proj * end.extend(1.0);
+            if clip_start.w < NEAR_W && clip_end.w < NEAR_W {
+                continue;
+            }
+            if clip_start.w < NEAR_W {
+                clip_start = clip_start.lerp(clip_end, (NEAR_W - clip_start.w) / (clip_end.w - clip_start.w));
+            } else if clip_end.w < NEAR_W {
+                clip_end = clip_end.lerp(clip_start, (NEAR_W - clip_end.w) / (clip_start.w - clip_end.w));
+            }
+            let pixel = |clip: glam::Vec4| {
+                let ndc = clip.truncate().truncate() / clip.w;
+                [(ndc.x * 0.5 + 0.5) * width, (0.5 - ndc.y * 0.5) * height]
+            };
+            let a = pixel(clip_start);
+            let b = pixel(clip_end);
+            // Glow half-width: the shaders draw the blade line at 1.8x the
+            // radius and the halo fades out beyond that.
+            let mid_w = ((clip_start.w + clip_end.w) * 0.5).max(NEAR_W);
+            let radius_px = blade.radius * 2.0 * focal_y * height * 0.5 / mid_w;
+            let margin = radius_px + 4.0;
+            let (min_x, max_x) = (a[0].min(b[0]) - margin, a[0].max(b[0]) + margin);
+            let (min_y, max_y) = (a[1].min(b[1]) - margin, a[1].max(b[1]) + margin);
+            if max_x < 0.0 || min_x > width || max_y < 0.0 || min_y > height {
+                continue;
+            }
+            let nearest = (start - camera_position).length().min((end - camera_position).length());
+            blades.push((nearest, [a[0], a[1], b[0], b[1]], [radius_px, nearest, 0.0, 0.0]));
+        }
+        blades.sort_by(|left, right| left.0.total_cmp(&right.0));
+        blades.truncate(MAX_CLOUD_FOREGROUND_BLADES);
+        for (index, (_, segment, extent)) in blades.iter().enumerate() {
+            packed[index * 2] = *segment;
+            packed[index * 2 + 1] = *extent;
+        }
+        (packed, blades.len() as f32)
+    }
+
     fn set_transient_lights(&mut self, lights: &[TransientLight]) {
         if self.transient_lights == lights {
             return;
@@ -17856,13 +20100,17 @@ impl Renderer {
         let remaining = MAX_DYNAMIC_LIGHTS.saturating_sub(gpu_lights.len());
         if self.runtime_transient_lights_enabled() {
             // RenderSnapshot::transient_lights currently comes directly from
-            // authored FX `Light {}` primitives. Full Forward+ intentionally
-            // gives those runtime FX lights 2x source intensity; static map and
-            // emissive-area lights above keep their authored intensity.
+            // authored FX `Light {}` primitives. Full Forward+/RT give those
+            // runtime FX lights a mode gain so the saber lights a wall as strongly
+            // as Legacy does (calibrated by screenshot at brightness 1.0, using
+            // Legacy as the reference); static map and emissive-area lights above
+            // keep their authored intensity. Brightness scales intensity only, in
+            // every mode, so total added light stays proportional to it and the
+            // modes stay equal at any brightness.
             let transient_intensity_scale = self.dynamic_light_brightness
                 * if matches!(self.dynamic_lights_mode,
                     DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware) {
-                    2.0
+                    2.43
                 } else {
                     1.0
                 };
@@ -17871,7 +20119,9 @@ impl Renderer {
                     .iter()
                     .flat_map(|light| transient_light_samples(light, self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware))
                     .take(remaining)
-                    .map(|light| transient_light_gpu(&light, transient_intensity_scale, self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)),
+                    .map(|light| {
+                        transient_light_gpu(&light, transient_intensity_scale, self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)
+                    }),
             );
         }
         if gpu_lights.is_empty() {
@@ -17894,7 +20144,6 @@ impl Renderer {
                 DynamicLightsMode::Legacy | DynamicLightsMode::Vertex | DynamicLightsMode::ClusteredLite
             )
             || self.emissive_area_lights_enabled;
-        let source_map_world = self.world.as_ref().is_some_and(|world| world.source_map);
         let source_map_lighting = self
             .world
             .as_ref()
@@ -17947,27 +20196,47 @@ impl Renderer {
                 source_map_lighting.minlight[0],
                 source_map_lighting.minlight[1],
                 source_map_lighting.minlight[2],
-                0.0,
+                self.dynamic_light_falloff as f32,
             ],
         };
         let settings_bytes = bytemuck::bytes_of(&settings);
-        // Ordinary BSP keeps its common upload. RT reads its sample count from
-        // existing ambient padding; the uniform buffer ABI is unchanged.
-        let upload_bytes = if source_map_world || self.hardware_rt_requested() {
-            settings_bytes
-        } else {
-            &settings_bytes[..48]
-        };
+        // RT reads its sample count and every consumer the dlight falloff mode from
+        // existing padding; the uniform buffer ABI is unchanged. Always upload the
+        // whole struct so a mode change back to 0 cannot leave a stale value.
+        let upload_bytes = settings_bytes;
         self.queue
             .write_buffer(&self.lighting_settings_buffer, 0, upload_bytes);
         self.update_legacy_dlight_surface_masks();
     }
 
-    fn scene_format(&self) -> wgpu::TextureFormat {
+    /// Format the gameplay scene renders into, ignoring the asset viewer.
+    fn gameplay_scene_format(&self) -> wgpu::TextureFormat {
         if self.hdr_enabled || self.bloom_enabled || self.halation_enabled {
             wgpu::TextureFormat::Rgba16Float
         } else {
             self.config.format
+        }
+    }
+
+    /// The asset viewer draws its model straight into the swapchain image with
+    /// no post pass, so its pipelines and MSAA target must use the surface
+    /// format even while HDR / bloom / halation are configured.
+    fn scene_format(&self) -> wgpu::TextureFormat {
+        if self.asset_preview_mode {
+            self.config.format
+        } else {
+            self.gameplay_scene_format()
+        }
+    }
+
+    fn set_asset_preview_mode(&mut self, enabled: bool) {
+        let old_scene_format = self.scene_format();
+        self.asset_preview_mode = enabled;
+        if !enabled {
+            self.asset_preview_viewport = None;
+        }
+        if old_scene_format != self.scene_format() {
+            self.request_scene_rebuild();
         }
     }
 
@@ -18182,24 +20451,9 @@ impl Renderer {
             .rebuild_pipelines(&self.device, scene_format, samples);
         self.dynamic_model_renderer
             .rebuild_pipelines(&self.device, scene_format, samples);
-        if let Some(ocean) = &mut self.ocean {
-            ocean.rebuild_spray_pipeline(
-                &self.device,
-                &self.camera_layout,
-                &self.ocean_layout,
-                scene_format,
-                samples,
-            );
-        }
-        for (_, ocean) in &mut self.authored_oceans {
-            ocean.rebuild_spray_pipeline(
-                &self.device,
-                &self.camera_layout,
-                &self.ocean_layout,
-                scene_format,
-                samples,
-            );
-        }
+        // One shared spray pipeline serves every ocean; recompiled on demand by
+        // ensure_lazy_scene_pipelines only while some ocean has sea spray on.
+        self.ocean_spray_pipeline = None;
         self.rebuild_planar_reflection_resources();
         // TAA resolve and diagnostic pipelines depend on the scene target
         // format/MSAA; drop them and let ensure_lazy_scene_pipelines recompile
@@ -18256,6 +20510,18 @@ impl Renderer {
                 samples,
             ));
         }
+        if self.ocean_spray_pipeline.is_none()
+            && (self.ocean.as_ref().is_some_and(|ocean| ocean.spray_active())
+                || self.authored_oceans.iter().any(|(_, ocean)| ocean.spray_active()))
+        {
+            self.ocean_spray_pipeline = Some(crate::ocean::create_spray_pipeline(
+                &self.device,
+                &self.camera_layout,
+                &self.ocean_layout,
+                scene_format,
+                samples,
+            ));
+        }
         if self.cull_debug_mode == CullDebugMode::RejectionReasons
             && self.cull_debug_pipeline.is_none()
         {
@@ -18295,6 +20561,10 @@ impl Renderer {
         camera_pos_time: [f32; 4],
         history_valid: bool,
     ) {
+        let (cloud_blades, cloud_blade_count) = self.cloud_foreground_uniform(
+            view_proj,
+            Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]),
+        );
         let legacy1_global_fog = self.weather.fog.legacy1_global_post_params();
         let (legacy_fog, legacy_fog_scale) = legacy1_global_fog.map_or(
             ([0.0; 4], 0.0),
@@ -18323,8 +20593,15 @@ impl Renderer {
                 legacy_fog_scale,
             ],
             scene: PostSceneSettings {
-                contact_shadows: if self.contact_shadows_enabled {
-                    1.0
+                // Contact shadows march toward the sun, so a map with no authored
+                // sun (and no override) has nothing to march toward.
+                contact_shadows: if self.contact_shadows_enabled
+                    && (self.sun_override
+                        || self.world.as_ref().is_some_and(|world| world.sun.is_some()))
+                {
+                    // r_contactShadowDebug shows the pass's per-pixel decision
+                    // instead of the scene.
+                    1.0 + f32::from(self.contact_shadow_debug)
                 } else {
                     0.0
                 },
@@ -18451,8 +20728,23 @@ impl Renderer {
                     },
                     if self.cloud_history_valid { 1.0 } else { 0.0 },
                     (self.cloud_temporal_frame_index & 3) as f32,
-                    2.0,
+                    CLOUD_INTERLEAVE_GRID as f32,
                 ],
+            },
+            cloud_wind: if self.clouds_enabled {
+                cloud_wind::terms(
+                    cloud_wind::CloudWind {
+                        angle: self.weather_wind.direction.to_radians(),
+                        speed: self.weather_wind.speed,
+                        gust: self.weather_wind.gust,
+                        shift: self.weather_wind.shift.to_radians(),
+                    },
+                    camera_pos_time[3],
+                    if self.cloud_history_valid { self.previous_frame_time } else { camera_pos_time[3] },
+                )
+                .into()
+            } else {
+                PostCloudWindSettings::zeroed()
             },
             rain: [
                 if self.weather.rain.enabled { 1.0 } else { 0.0 },
@@ -18469,6 +20761,22 @@ impl Renderer {
                 ],
                 WeatherOcclusionCache::Pending(_) | WeatherOcclusionCache::Building(_) | WeatherOcclusionCache::Unavailable => [0.0; 4],
             },
+            weather_look: [
+                self.weather.rain.puddle_scatter,
+                self.weather.rain.grade_amount(),
+                if self.weather.rain.puddle_quality.is_high() { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            // The optics only exist with the GPU ocean; a plain BSP water
+            // shader gets no underwater treatment, so clouds are left alone.
+            underwater: [
+                if self.ocean_enabled { self.camera_water_surface } else { NO_WATER_SURFACE },
+                self.ocean_settings.optics.absorption_distance(),
+                0.0,
+                0.0,
+            ],
+            cloud_foreground: [cloud_blade_count, 0.0, 0.0, 0.0],
+            cloud_blades,
             camera_pos_time,
             prev_camera_pos_time: if self.cloud_history_valid {
                 [
@@ -18813,6 +21121,7 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.present();
         let present_completed_at = Instant::now();
+        self.model_frame_log.presented_without_scene(present_completed_at, camera.position, [self.config.width, self.config.height]);
         info.cpu_present_ms = present_completed_at
             .saturating_duration_since(present_started)
             .as_secs_f64()
@@ -18866,12 +21175,23 @@ impl Renderer {
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         }
         self.ensure_wireframe_pipelines();
+        self.update_sun_ray_preview(&render_camera, player_position);
 
-        let mut info = FrameInfo::default();
+        let mut info = FrameInfo {
+            world_path: "fast-baseline",
+            ..FrameInfo::default()
+        };
         let snow_deform_center = self.surface_deformation.field_center();
         let mut prepared_grass = None;
         let mut prepared_surface_sprite_effects = None;
         if let Some(world) = &mut self.world {
+            // Shell fragments are discarded unless footprints are in 3D mode, so
+            // outside it there is nothing to build, hold or draw.
+            if self.surface_deformation.mode() == FootprintMode::ThreeD {
+                world.snow_shell.stream(&self.device, snow_deform_center);
+            } else {
+                world.snow_shell.release();
+            }
             if needs_early_latch {
                 update_visibility(world, &render_camera);
                 let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
@@ -18920,6 +21240,8 @@ impl Renderer {
             }
         }
         let dynamic_prepare_started = Instant::now();
+        self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
+        self.sync_entity_cloud_shadow_sun();
         let entity_light_grid = self
             .world
             .as_ref()
@@ -19008,11 +21330,16 @@ impl Renderer {
         info.late_latch = late_view_sample;
 
         let encode_started = Instant::now();
+        // Profiler hooks are no-ops unless r_gpuTimings is on; they let the
+        // baseline's world/post passes be timed directly against the unified path.
+        self.gpu_profiler.begin_frame(&self.device);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("JKA fast baseline frame encoder"),
             });
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
         let use_gamma_post = (self.gamma - 1.0).abs() > 0.001;
         let menu_backdrop_active = self.menu_backdrop_requested();
         let presentation_output = if menu_backdrop_active {
@@ -19054,6 +21381,8 @@ impl Renderer {
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
 
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -19087,7 +21416,7 @@ impl Renderer {
             for &batch_index in active.indices {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
-                if self.ocean_enabled && batch.source.water { continue; }
+                if ocean_suppresses_batch(self.ocean_enabled, batch) { continue; }
                 // OpenJK does not stop at PVS: R_RecursiveWorldNode frustum-culls
                 // BSP node bounds before adding leaf surfaces. Compiled BSP worlds
                 // need the same second-stage rejection. The old source_map guard
@@ -19181,9 +21510,9 @@ impl Renderer {
                 );
             }
             if let Some(ocean) = self.ocean.as_ref() {
-                ocean.draw_spray(&mut pass, &self.camera_bind_group);
+                ocean.draw_spray(&mut pass, &self.camera_bind_group, self.ocean_spray_pipeline.as_ref());
             }
-            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group, self.ocean_spray_pipeline.as_ref()); }
             self.gpu_profiler.write_render_pass_timestamp(
                 &mut pass,
                 GpuPass::DynamicModels,
@@ -19233,19 +21562,23 @@ impl Renderer {
                     if let Some(pipeline) = &self.fast_world_wireframe_pipeline {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
-                        pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
                         pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
-                        for draw in &world.snow_shell.draws {
-                            if !snow_shell_draw_near_center(draw, snow_deform_center)
-                                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
-                            {
-                                continue;
+                        for chunk in world.snow_shell.chunks.values() {
+                            let Some(vertex_buffer) = &chunk.vertex_buffer else { continue };
+                            if !chunk.near_center(snow_deform_center) { continue }
+                            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                            for draw in &chunk.draws {
+                                if !snow_shell_draw_near_center(draw, snow_deform_center)
+                                    || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+                                {
+                                    continue;
+                                }
+                                let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
+                                    continue;
+                                };
+                                pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                                pass.draw(draw.vertices.clone(), 1..2);
                             }
-                            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
-                                continue;
-                            };
-                            pass.set_bind_group(1, &batch.fast_bind_group, &[]);
-                            pass.draw(draw.vertices.clone(), 1..2);
                         }
                     }
                 }
@@ -19320,7 +21653,11 @@ impl Renderer {
             });
         }
 
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::World, true);
         if use_gamma_post {
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA gamma post (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -19340,6 +21677,9 @@ impl Renderer {
             pass.set_pipeline(&self.fast_post_pipeline);
             pass.set_bind_group(0, &self.fast_post_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            drop(pass);
+            self.gpu_profiler
+                .write_encoder_timestamp(&mut encoder, GpuPass::Post, true);
         }
 
         // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
@@ -19405,11 +21745,19 @@ impl Renderer {
                 readback.inline_copy = true;
             }
         }
+        self.gpu_profiler
+            .write_encoder_timestamp(&mut encoder, GpuPass::Frame, true);
+        self.gpu_profiler.resolve(&mut encoder);
         let command_buffer = encoder.finish();
+        let profiler_readback_copy = self.gpu_profiler.encode_readback_copy(&self.device);
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
         info.submit_call_at = Some(submit_started);
-        let frame_submission = self.queue.submit([command_buffer]);
+        let frame_submission = if let Some(readback_copy) = profiler_readback_copy {
+            self.queue.submit([command_buffer, readback_copy])
+        } else {
+            self.queue.submit([command_buffer])
+        };
         if let Some(readback) = screenshot_readback
             .as_mut()
             .filter(|readback| readback.inline_copy)
@@ -19434,6 +21782,7 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.present();
         let present_completed_at = Instant::now();
+        self.model_frame_log.presented(present_completed_at, view_proj, view_proj, render_camera.position, [self.config.width, self.config.height]);
         info.cpu_present_ms = present_completed_at
             .saturating_duration_since(present_started)
             .as_secs_f64()
@@ -19442,6 +21791,8 @@ impl Renderer {
         if let Some(readback) = screenshot_readback {
             self.finish_screenshot_readback(readback);
         }
+        self.gpu_profiler.submit();
+        info.gpu_ms = self.gpu_profiler.latest_frame_ms();
         info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         Ok(info)
     }
@@ -19456,7 +21807,6 @@ impl Renderer {
             inline_models,
             coarse_batches,
             full_batches,
-            auto2_batches,
             auto4_batches,
             auto4_inline_start,
             auto4_inline_full_start,
@@ -19513,21 +21863,6 @@ impl Renderer {
                     );
                 }
             }
-            // AUTO 2 aliases the same cull records/resources, but it owns a
-            // shallow CPU copy of each WorldBatch so keep mover bounds in sync.
-            let full_offset = coarse_batches.len();
-            for &index in &model.coarse_batches {
-                if let Some(batch) = auto2_batches.get_mut(index) {
-                    batch.bounds_min = minimum;
-                    batch.bounds_max = maximum;
-                }
-            }
-            for &index in &model.full_batches {
-                if let Some(batch) = auto2_batches.get_mut(full_offset + index) {
-                    batch.bounds_min = minimum;
-                    batch.bounds_max = maximum;
-                }
-            }
             // AUTO 4 keeps static portal-plan geometry first and appends one
             // shallow copy of the FULL inline-model tail. The cull record itself
             // is shared with FULL; keep only the CPU bounds alias in sync here.
@@ -19565,6 +21900,7 @@ impl Renderer {
         if self.asset_preview_mode {
             return self.render_asset_preview(camera, dynamic_models);
         }
+        self.build_blob_shadow_marks(dynamic_models);
 
         // Resolved before any pass borrows the renderer mutably.
         let ocean_clipmap = self.ocean_clipmap_quality();
@@ -19573,11 +21909,14 @@ impl Renderer {
             || self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON;
         if update_weather_surface {
             let wetness_time = self.started.elapsed().as_secs_f32();
-            if self.advance_surface_wetness(wetness_time) {
+            if self.advance_surface_wetness(wetness_time, camera.position) {
                 self.update_weather_surface_uniform();
                 self.rebuild_frame_plan();
             }
+            self.update_wake(camera, player_position, dynamic_models);
         }
+
+        self.sync_runtime_variant_flags();
 
         let menu_backdrop_active = self.menu_backdrop_requested();
         if menu_backdrop_active {
@@ -19591,15 +21930,15 @@ impl Renderer {
         // Snowflow state advances only when new brushes/window movement/relaxation
         // require it. This is deliberately before the fast-path early return.
         self.surface_deformation.prepare_frame(&self.device, &self.queue);
+        self.update_world_videos();
         self.ensure_lazy_scene_pipelines();
 
         // Pipeline/render-plan selection happens only when settings change. The
         // hot frame path can therefore jump directly into the known-fast renderer
-        // without walking every advanced feature branch. GPU timestamp/surface
-        // diagnostics deliberately use the full path so their instrumentation
-        // remains available when explicitly requested.
+        // without walking every advanced feature branch. Surface/frame
+        // diagnostics deliberately use the full path; GPU timestamps are
+        // recorded by both paths so they can be compared.
         if self.frame_plan.world_path == WorldRenderPath::FastBaseline
-            && !self.gpu_profiler.enabled()
             && !self.surface_diag_pending
             && !self.frame_diag_pending
         {
@@ -19671,6 +22010,7 @@ impl Renderer {
         } else {
             camera.view_projection(self.config.width, self.config.height)
         };
+        self.refresh_water_boxes(camera.position);
         let mut optical_volumes = None;
         if self.ocean_enabled && self.world.as_ref().is_some_and(|w| !w.ocean_surfaces.is_empty()) {
             let key = (self.config.width.max(1), self.config.height.max(1), self.msaa_samples, self.scene_format());
@@ -19688,24 +22028,11 @@ impl Renderer {
                 params: [optical.absorption_distance() * optical.depth_darkening, optical.refraction, optical.caustics, 0.0],
                 minimum: [[0.0;4];8], maximum: [[0.0;4];8],
             };
-            let mut count = 0;
-            for a in &self.authored_ocean_definitions {
-                if count == 8 { break; }
-                uniform.minimum[count] = [a.mins[0], a.mins[2], -a.maxs[1], 0.0];
-                uniform.maximum[count] = [a.maxs[0], a.height, -a.mins[1], 0.0];
-                count += 1;
+            for (i, (lo, hi)) in self.water_boxes.iter().enumerate() {
+                uniform.minimum[i] = [lo[0], lo[1], lo[2], 0.0];
+                uniform.maximum[i] = [hi[0], hi[1], hi[2], 0.0];
             }
-            if let Some(world) = &self.world {
-                for s in &world.ocean_surfaces {
-                    if count == 8 { break; }
-                    let centre = [(s.minimum[0]+s.maximum[0])*0.5,s.plane_height,(s.minimum[1]+s.maximum[1])*0.5];
-                    if self.authored_ocean_definitions.iter().any(|a| a.contains_render_point(centre)) { continue; }
-                    uniform.minimum[count] = [s.minimum[0], -65536.0, s.minimum[1], 0.0];
-                    uniform.maximum[count] = [s.maximum[0], s.plane_height, s.maximum[1], 0.0];
-                    count += 1;
-                }
-            }
-            uniform.params[3] = count as f32;
+            uniform.params[3] = self.water_boxes.len() as f32;
             self.queue.write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&uniform));
             optical_volumes = Some(uniform);
         }
@@ -19768,7 +22095,36 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        // `misc_skyportal`: the same view re-anchored at the sky camera. Only the
+        // translation differs from the main view, so shifting the (possibly
+        // jittered) main matrix keeps TAA jitter and projection identical.
+        let sky_portal_view = self
+            .world
+            .as_ref()
+            .and_then(|world| world.sky_portal)
+            .map(|portal| {
+                let position =
+                    Vec3::from_array(portal.camera_position(camera.position.to_array()));
+                let shift = Mat4::from_translation(camera.position - position);
+                let portal_view_proj = view_proj * shift;
+                let portal_unjittered = (unjittered_view_proj * shift).to_cols_array_2d();
+                let portal_uniform = CameraUniform {
+                    view_proj: portal_view_proj.to_cols_array_2d(),
+                    camera_pos_time: [position.x, position.y, position.z, frame_time],
+                    previous_unjittered_view_proj: portal_unjittered,
+                    unjittered_view_proj: portal_unjittered,
+                    jump_shade: [0.0; 4],
+                    ..uniform
+                };
+                self.queue.write_buffer(
+                    &self.sky_portal_camera_buffer,
+                    0,
+                    bytemuck::bytes_of(&portal_uniform),
+                );
+                (position, portal_view_proj)
+            });
         self.ensure_wireframe_pipelines();
+        self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_sun_shadow(view_proj);
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
@@ -19802,31 +22158,26 @@ impl Renderer {
             self.write_ssr_temporal_uniform(view_proj, inv_view_proj, camera_pos_time);
         }
 
-        let shadow_matrices = if self.cascaded_shadows_enabled {
+        let prep_shadow_started = Instant::now();
+        let prep_camera_ms = prep_shadow_started.duration_since(frame_started).as_secs_f64() * 1000.0;
+        let entity_shadow_frame = (self.cascaded_shadow_mode == DynamicShadowsMode::EntityMap)
+            .then(|| self.prepare_entity_shadow(camera, player_position, frame_delta));
+        let shadow_matrices = if entity_shadow_frame.is_some() {
+            // No cascades: the map is entity-only, so froxel fog and the BSP/grass
+            // caster loop below correctly see "no cascade matrices". The receiver
+            // uniform is written after dynamic models are prepared, because
+            // whether anything casts decides if receivers sample the map at all.
+            None
+        } else if self.cascaded_shadows_enabled {
             let sun = self.active_sun();
-            let bevy_mode = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy;
-            let (matrices, splits, texel_sizes) = if bevy_mode {
-                bevy_cascade_shadow_matrices(
-                    camera,
-                    self.config.width,
-                    self.config.height,
-                    Vec3::from_array(sun.direction),
-                )
-            } else {
-                let matrices = legacy_cascade_shadow_matrices(
-                    camera,
-                    self.config.width,
-                    self.config.height,
-                    Vec3::from_array(sun.direction),
-                );
-                (
-                    matrices,
-                    [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0],
-                    [0.0; SHADOW_CASCADES],
-                )
-            };
+            let (matrices, splits, texel_sizes) = bevy_cascade_shadow_matrices(
+                camera,
+                self.config.width,
+                self.config.height,
+                Vec3::from_array(sun.direction),
+            );
             self.write_shadow_uniforms(
-                &matrices, &splits, &texel_sizes, true, camera.forward(), camera_pos_time, bevy_mode
+                &matrices, &splits, &texel_sizes, true, camera.forward(), camera_pos_time, true
             );
             Some(matrices)
         } else if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
@@ -19851,7 +22202,13 @@ impl Renderer {
             self.write_froxel_uniform(inv_view_proj, camera_pos_time, shadow_matrices.as_ref());
         }
 
-        let mut info = FrameInfo::default();
+        let prep_world_started = Instant::now();
+        let mut prep_shadow_ms = prep_world_started.duration_since(prep_shadow_started).as_secs_f64() * 1000.0;
+        let mut info = FrameInfo {
+            world_path: "unified",
+            prep_camera_ms,
+            ..FrameInfo::default()
+        };
         info.late_latch = late_view_sample;
         info.gpu_ms = self.gpu_profiler.latest_frame_ms();
         if self.cull_debug_mode != CullDebugMode::Off {
@@ -19864,6 +22221,13 @@ impl Renderer {
         let mut prepared_surface_sprite_effects = None;
         let snow_deform_center = self.surface_deformation.field_center();
         if let Some(world) = &mut self.world {
+            // Shell fragments are discarded unless footprints are in 3D mode, so
+            // outside it there is nothing to build, hold or draw.
+            if self.surface_deformation.mode() == FootprintMode::ThreeD {
+                world.snow_shell.stream(&self.device, snow_deform_center);
+            } else {
+                world.snow_shell.release();
+            }
             update_visibility(world, camera);
             let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
             refresh_auto4_lazy_collapse(
@@ -19939,6 +22303,8 @@ impl Renderer {
         if active_selection_changed {
             self.update_gpu_cull_settings();
         }
+        let prep_reflection_started = Instant::now();
+        info.prep_world_ms = prep_reflection_started.duration_since(prep_world_started).as_secs_f64() * 1000.0;
 
         let planar_views = if self.planar_reflection.active {
             self.world
@@ -20095,14 +22461,23 @@ impl Renderer {
             );
         }
 
+        let prep_local_shadow_started = Instant::now();
+        info.prep_reflection_ms = prep_local_shadow_started
+            .duration_since(prep_reflection_started)
+            .as_secs_f64()
+            * 1000.0;
         self.update_local_shadow_selection(camera);
         self.ensure_local_shadow_cache();
+        prep_shadow_ms += prep_local_shadow_started.elapsed().as_secs_f64() * 1000.0;
+        info.prep_shadow_ms = prep_shadow_ms;
 
         // Prepare dynamic geometry before command encoding. With RT Shadows enabled,
         // Ghoul2 is compute-skinned once into the shared raster/BLAS buffer; the
         // ordinary RT-off vertex-shader skinning path remains unchanged.
         let dynamic_prepare_started = Instant::now();
         self.ensure_rt_model_receivers();
+        self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
+        self.sync_entity_cloud_shadow_sun();
         let entity_light_grid = self
             .world
             .as_ref()
@@ -20245,10 +22620,12 @@ impl Renderer {
                 world.sky_average,
                 world.primary_skybox.is_some(),
                 world.ocean_surfaces.clone(),
+                Arc::clone(&world.ocean_masks),
             )
         });
         if let Some(ocean) = &mut self.ocean {
-            if let Some((sky_average, has_skybox, surfaces)) = ocean_scene_context.as_ref() {
+            if let Some((sky_average, has_skybox, surfaces, masks)) = ocean_scene_context.as_ref() {
+                ocean.set_masks(&self.queue, masks);
                 ocean.set_environment(
                     &self.queue,
                     ocean_sun.direction,
@@ -20276,7 +22653,7 @@ impl Renderer {
             ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
         }
         for (authored, ocean) in &mut self.authored_oceans {
-            if let Some((sky_average, has_skybox, _)) = ocean_scene_context.as_ref() {
+            if let Some((sky_average, has_skybox, _, _)) = ocean_scene_context.as_ref() {
                 ocean.set_environment(&self.queue, ocean_sun.direction, ocean_sun.color,
                     ocean_sun.intensity, *sky_average, *has_skybox);
                 let selected = [crate::ocean::OceanSurface {plane_height:authored.height,
@@ -20315,11 +22692,19 @@ impl Renderer {
             }
         }
 
+        if let Some(frame) = entity_shadow_frame.as_ref() {
+            let casters = frame.active && self.dynamic_model_renderer.has_depth_casters();
+            self.write_entity_shadow_uniforms(frame, camera, casters);
+            self.encode_entity_shadow_pass(&mut encoder, frame);
+        }
+        let csm_entity_casters = match shadow_matrices.as_ref() {
+            Some(matrices) => self.prepare_entity_cascade_casters(matrices),
+            None => false,
+        };
+
         if let Some(shadow_matrices) = shadow_matrices.as_ref() {
             if let Some(world) = &self.world {
-                let bevy_mode = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsBevy;
-                let cascade_count = if bevy_mode { SHADOW_CASCADES } else { LEGACY_SHADOW_CASCADES };
-                for cascade in 0..cascade_count {
+                for cascade in 0..SHADOW_CASCADES {
                     if self.sun_visibility != SunVisibilityMode::Legacy {
                         let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("JKA shader-sun sky admission"),
@@ -20327,7 +22712,7 @@ impl Renderer {
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                                 view: &self.shadow_resources.sky_layer_views[cascade],
                                 depth_ops: Some(wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(if bevy_mode { 0.0 } else { 1.0 }),
+                                    load: wgpu::LoadOp::Clear(0.0),
                                     store: wgpu::StoreOp::Store,
                                 }),
                                 stencil_ops: None,
@@ -20336,13 +22721,17 @@ impl Renderer {
                             occlusion_query_set: None,
                             multiview_mask: None,
                         });
-                        sky_pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_sky_pipeline } else { &self.shadow_resources.sky_pipeline });
+                        sky_pass.set_pipeline(&self.shadow_resources.bevy_sky_pipeline);
                         sky_pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
                         sky_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                         sky_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                         sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         for batch in &world.coarse_batches {
-                            if batch.source.pipeline.class != DrawClass::Sky {
+                            // Cloud-layer batches share the outer box's geometry;
+                            // one admission draw per sky surface is enough.
+                            if batch.source.pipeline.class != DrawClass::Sky
+                                || matches!(batch.source.tc_gen, TcGen::SkyCloud(_))
+                            {
                                 continue;
                             }
                             draw_world_batch(&mut sky_pass, batch, 0..1, None);
@@ -20355,7 +22744,7 @@ impl Renderer {
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &self.shadow_resources.layer_views[cascade],
                             depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(if bevy_mode { 0.0 } else { 1.0 }),
+                                load: wgpu::LoadOp::Clear(0.0),
                                 store: wgpu::StoreOp::Store,
                             }),
                             stencil_ops: None,
@@ -20364,7 +22753,7 @@ impl Renderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_pipeline } else { &self.shadow_resources.pipeline });
+                    pass.set_pipeline(&self.shadow_resources.bevy_pipeline);
                     pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                     pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
@@ -20373,10 +22762,11 @@ impl Renderer {
                     for batch in &world.coarse_batches {
                         if (batch.source.pipeline.blend != BlendMode::Opaque
                                 && self.sun_visibility != SunVisibilityMode::Filtered)
-                            || !aabb_intersects_clip_frustum(
+                            || !aabb_intersects_shadow_frustum(
                                 batch.bounds_min,
                                 batch.bounds_max,
                                 shadow_matrices[cascade],
+                                true,
                             )
                         {
                             continue;
@@ -20384,25 +22774,21 @@ impl Renderer {
                         match batch.source.pipeline.class {
                             DrawClass::Opaque if batch.source.alpha_cutoff <= 0.0 => {
                                 if mask_pipeline_active {
-                                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_pipeline } else { &self.shadow_resources.pipeline });
+                                    pass.set_pipeline(&self.shadow_resources.bevy_pipeline);
                                     mask_pipeline_active = false;
                                 }
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
                             DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
                                 if !mask_pipeline_active {
-                                    pass.set_pipeline(if bevy_mode { &self.shadow_resources.bevy_mask_pipeline } else { &self.shadow_resources.mask_pipeline });
+                                    pass.set_pipeline(&self.shadow_resources.bevy_mask_pipeline);
                                     mask_pipeline_active = true;
                                 }
                                 pass.set_bind_group(1, &batch.bind_group, &[]);
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
                             DrawClass::Transparent if self.sun_visibility == SunVisibilityMode::Filtered => {
-                                pass.set_pipeline(if bevy_mode {
-                                    &self.shadow_resources.bevy_translucent_pipeline
-                                } else {
-                                    &self.shadow_resources.translucent_pipeline
-                                });
+                                pass.set_pipeline(&self.shadow_resources.bevy_translucent_pipeline);
                                 mask_pipeline_active = true;
                                 pass.set_bind_group(1, &batch.bind_group, &[]);
                                 draw_world_batch(&mut pass, batch, 0..1, None);
@@ -20424,9 +22810,18 @@ impl Renderer {
                                 &self.shadow_resources.caster_bind_groups[cascade],
                                 grass,
                                 prepared,
-                                bevy_mode,
+                                true,
                             );
                         }
+                    }
+
+                    // Players, NPCs and models cast into the near/mid cascades too.
+                    if csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS {
+                        self.dynamic_model_renderer.draw_entity_shadow(
+                            &mut pass,
+                            &self.entity_shadow.cameras[cascade].1,
+                            true,
+                        );
                     }
                 }
             }
@@ -20501,7 +22896,7 @@ impl Renderer {
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
                     if !batch_area_visible(batch, effective_area_mask) { continue; }
-                    if self.ocean_enabled && batch.source.water { continue; }
+                    if ocean_suppresses_batch(self.ocean_enabled, batch) { continue; }
                     if batch.source.pipeline.class != DrawClass::Sky
                         && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
                     {
@@ -20548,13 +22943,109 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::Depth, true);
         }
 
-        if plan.use_hiz && plan.needs_linear_depth {
+        let hiz_world_active = self
+            .world
+            .as_ref()
+            .is_some_and(|world| world.active_cull_count > 0 && world.cull_bind_group.is_some());
+
+        // Bevy-style early phase. Hi-Z is the only depth consumer, so instead
+        // of the full prepass draw just last frame's visible batches (a
+        // compute pass turns the visibility `cs_main` left in `instance_count`
+        // into an indirect draw list) into the depth buffer, depth-only. The
+        // pyramid built from that is a conservative subset of the true depth,
+        // and everything the main-pass cull then keeps is drawn by the main
+        // pass itself; there is no late prepass because nothing reads it.
+        if plan.hiz_early && hiz_world_active {
+            if let Some(world) = &self.world {
+                if let Some(cull_bind_group) = &world.cull_bind_group {
+                    self.gpu_profiler
+                        .write_encoder_timestamp(&mut encoder, GpuPass::Depth, false);
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("JKA Hi-Z early draw list"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.gpu_cull_early_pipeline);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        pass.set_bind_group(1, cull_bind_group, &[]);
+                        pass.dispatch_workgroups(world.active_cull_count.div_ceil(64), 1, 1);
+                    }
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("JKA Hi-Z early depth"),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.targets.ao_depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    let active = active_batch_selection(world, self.pvs_mode);
+                    let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+                    let mut current_is_mask: Option<bool> = None;
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if !batch_area_visible(batch, effective_area_mask) { continue; }
+                        if ocean_suppresses_batch(self.ocean_enabled, batch) { continue; }
+                        if !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj) {
+                            continue;
+                        }
+                        let is_mask = match batch.source.pipeline.class {
+                            DrawClass::Opaque => false,
+                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => true,
+                            _ => continue,
+                        };
+                        if current_is_mask != Some(is_mask) {
+                            pass.set_pipeline(if is_mask {
+                                &self.hiz_prepass_mask_pipeline
+                            } else {
+                                &self.hiz_prepass_pipeline
+                            });
+                            current_is_mask = Some(is_mask);
+                        }
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        pass.draw_indexed_indirect(
+                            &world.early_indirect_buffer,
+                            u64::from(batch.cull_index)
+                                * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                        );
+                    }
+                    drop(pass);
+                    self.gpu_profiler
+                        .write_encoder_timestamp(&mut encoder, GpuPass::Depth, true);
+                }
+            }
+        }
+
+        if plan.use_hiz && hiz_world_active {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::HiZ, false);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("JKA Hi-Z build"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.hiz_build_pipeline);
+                pass.set_bind_group(0, &self.hiz_build_bind_group, &[]);
+                pass.dispatch_workgroups(
+                    self.targets.hiz_width.div_ceil(8),
+                    self.targets.hiz_height.div_ceil(8),
+                    1,
+                );
+            }
             for (mip_index, bind_group) in self.hiz_reduce_bind_groups.iter().enumerate() {
                 let destination_mip = u32::try_from(mip_index + 1).unwrap_or(u32::MAX);
-                let width = (self.config.width.max(1) >> destination_mip).max(1);
-                let height = (self.config.height.max(1) >> destination_mip).max(1);
+                let width = (self.targets.hiz_width >> destination_mip).max(1);
+                let height = (self.targets.hiz_height >> destination_mip).max(1);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("JKA Hi-Z reduce"),
                     timestamp_writes: None,
@@ -20696,7 +23187,7 @@ impl Renderer {
                 let reflection_visible = |batch: &WorldBatch| {
                     let sky = batch.source.pipeline.class == DrawClass::Sky;
                     batch_area_visible(batch, reflection_area_mask)
-                        && !(ocean_enabled && batch.source.water)
+                        && !ocean_suppresses_batch(ocean_enabled, batch)
                         // The reflection shader discards every fragment behind
                         // the mirror plane (OpenJK's portal clip plane), so a
                         // batch wholly behind it cannot contribute a pixel.
@@ -20854,7 +23345,6 @@ impl Renderer {
                         if inline_grouping
                             && batch.is_inline_entity
                             && batch.inline_group != u32::MAX
-                            && !inline_batch_needs_fog(&self.weather.fog, batch)
                         {
                             inline_visible.push(batch_index);
                             continue;
@@ -20972,7 +23462,12 @@ impl Renderer {
                         (0..inline_visible.len() as u32).map(|position| (position, 1)).collect()
                     };
                     let runs: &[(u32, u32)] = if packed { &scratch.runs } else { &fallback };
-                    for &(first, count) in runs {
+                    let fallback_kinds = if packed {
+                        Vec::new()
+                    } else {
+                        inline_stage_info(&world.coarse_batches, &inline_visible).1
+                    };
+                    for (run_index, &(first, count)) in runs.iter().enumerate() {
                         let position = if packed { scratch.order[first as usize] } else { first };
                         let batch = &world.coarse_batches[inline_visible[position as usize]];
                         if current_pipeline != Some(batch.source.pipeline) {
@@ -20995,6 +23490,29 @@ impl Renderer {
                                 u64::from(region_base + first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
                                 count,
                             );
+                        }
+                        // Legacy fog redraws every surface whose last stage is in
+                        // this run, so the run repeats as one multi-draw.
+                        let kind = if packed { scratch.run_class[run_index] as u8 & 3 } else { fallback_kinds[position as usize] };
+                        if let Some(writes_depth) = inline_run_fog_depth(&self.weather.fog, self.ocean_enabled, batch, kind) {
+                            if let Some(fog_pipeline) = active_pipeline_variant
+                                .reflection_fog_pass_pipelines
+                                .get(&(batch.source.pipeline, writes_depth))
+                            {
+                                pass.set_pipeline(fog_pipeline);
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
+                                if count == 1 {
+                                    pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                                } else {
+                                    pass.multi_draw_indexed_indirect(
+                                        &world.inline_indirect_buffer,
+                                        u64::from(region_base + first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                        count,
+                                    );
+                                }
+                                current_pipeline = None;
+                            }
                         }
                     }
                 }
@@ -21138,6 +23656,109 @@ impl Renderer {
                 }
             }
 
+            // Sky portal view (OpenJK renders it before the main scene and the
+            // main view sky surfaces then draw nothing). It owns its own PVS
+            // cluster and depth; the main pass loads its color.
+            let sky_portal_drawn = if let Some((portal_position, portal_view_proj)) = sky_portal_view {
+                let cluster = world.visibility.as_ref().and_then(|vis| {
+                    vis.cluster_at(scene::jka_position(portal_position.to_array()))
+                });
+                let indices: &[usize] = match cluster {
+                    Some(cluster) if self.pvs_mode != PvsMode::Off => world
+                        .coarse_visible_batches_by_cluster
+                        .get(cluster)
+                        .unwrap_or(&world.coarse_all_batches),
+                    _ => &world.coarse_all_batches,
+                };
+                let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA sky portal"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                sky_pass.set_bind_group(0, &self.sky_portal_camera_bind_group, &[]);
+                sky_pass.set_bind_group(
+                    2,
+                    if enhanced_world_shader {
+                        &world.lighting_bind_group
+                    } else {
+                        &world.lighting_bind_group_lean
+                    },
+                    &[],
+                );
+                sky_pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                sky_pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                if enhanced_world_shader {
+                    let ocean_bind_group = self
+                        .ocean
+                        .as_ref()
+                        .map(|ocean| &ocean.render_bind_group)
+                        .unwrap_or(&self.ocean_inert_bind_group);
+                    sky_pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                    sky_pass.set_bind_group(6, ocean_bind_group, &[]);
+                }
+                sky_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                sky_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                let mut current_pipeline = None;
+                for &batch_index in indices {
+                    let batch = &world.coarse_batches[batch_index];
+                    if batch.is_inline_entity
+                        || ocean_suppresses_batch(self.ocean_enabled, batch)
+                        || (batch.source.pipeline.class != DrawClass::Sky
+                            && !aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                portal_view_proj,
+                            ))
+                    {
+                        continue;
+                    }
+                    if current_pipeline != Some(batch.source.pipeline) {
+                        let Some(pipeline) =
+                            active_pipeline_variant.pipelines.get(&batch.source.pipeline)
+                        else {
+                            continue;
+                        };
+                        sky_pass.set_pipeline(pipeline);
+                        current_pipeline = Some(batch.source.pipeline);
+                    }
+                    sky_pass.set_bind_group(1, &batch.bind_group, &[]);
+                    if enhanced_world_shader {
+                        sky_pass.set_bind_group(
+                            6,
+                            Self::ocean_bind_group_for(
+                                batch,
+                                &self.authored_oceans,
+                                &self.ocean,
+                                &self.ocean_inert_bind_group,
+                            ),
+                            &[],
+                        );
+                    }
+                    draw_world_batch(&mut sky_pass, batch, 0..1, None);
+                }
+                true
+            } else {
+                false
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -21145,7 +23766,11 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        load: if sky_portal_drawn {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(self.weather.fog.clear_color())
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -21186,7 +23811,10 @@ impl Renderer {
             pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             let mut current_pipeline = None;
-            let mut grass_drawn = false;
+            // Grass no longer interleaves mid-loop (see the comment at its one
+            // remaining call site below), so this never flips true inside the
+            // loop; it only gates that single post-loop draw.
+            let grass_drawn = false;
             let mut snow_shell_drawn = false;
             // A separate OpenJK-style fog redraw must occur after the final
             // material stage of each surface. GPU compaction can merge/reorder
@@ -21232,7 +23860,9 @@ impl Renderer {
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) { continue; }
-                if self.ocean_enabled && batch.source.water { continue; }
+                if ocean_suppresses_batch(self.ocean_enabled, batch) { continue; }
+                // The sky portal view already filled the background.
+                if sky_portal_drawn && batch.source.pipeline.class == DrawClass::Sky { continue; }
                 // OpenJK performs view-frustum rejection after PVS marking.
                 // Do the CPU equivalent whenever indirect GPU culling is off.
                 // This must apply to compiled BSP maps too; limiting it to the
@@ -21257,76 +23887,34 @@ impl Renderer {
                 if inline_grouping
                     && batch.is_inline_entity
                     && batch.inline_group != u32::MAX
-                    && !inline_batch_needs_fog(&self.weather.fog, batch)
                 {
                     inline_visible.push(batch_index);
                     continue;
                 }
-                if !grass_drawn && batch.source.pipeline.class == DrawClass::Transparent {
-                    if !snow_shell_drawn {
-                        draw_snow_shell(
-                            &mut pass,
-                            world,
-                            &active_pipeline_variant.pipelines,
-                            view_proj,
-                            snow_deform_center,
-                            &mut current_pipeline,
-                        );
-                        snow_shell_drawn = true;
-                    }
-                    if self.grass_enabled {
-                        if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
-                            self.gpu_profiler.write_render_pass_timestamp(
-                                &mut pass,
-                                GpuPass::Grass,
-                                false,
-                            );
-                            info.grass = self.grass_renderer.draw(
-                                &mut pass,
-                                &self.camera_bind_group,
-                                &self.shadow_resources.receiver_bind_group,
-                                grass,
-                                prepared,
-                            );
-                            self.gpu_profiler.write_render_pass_timestamp(
-                                &mut pass,
-                                GpuPass::Grass,
-                                true,
-                            );
-                            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
-                            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
-                            pass.set_index_buffer(
-                                world.index_buffer.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            // Grass owns bind-group slot 2 while its pipeline is active
-                            // (cascaded-shadow receiver). Restore the world pipeline's
-                            // lighting/shadow/reflection bindings before the next BSP draw;
-                            // RenderPass bind groups persist across pipeline switches.
-                            pass.set_bind_group(
-                                2,
-                                if enhanced_world_shader {
-                                    &world.lighting_bind_group
-                                } else {
-                                    &world.lighting_bind_group_lean
-                                },
-                                &[],
-                            );
-                            pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
-                            pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
-                            if enhanced_world_shader {
-                                let ocean_bind_group = self
-                                    .ocean
-                                    .as_ref()
-                                    .map(|ocean| &ocean.render_bind_group)
-                                    .unwrap_or(&self.ocean_inert_bind_group);
-                                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
-                                pass.set_bind_group(6, ocean_bind_group, &[]);
-                            }
-                            current_pipeline = None;
-                        }
-                    }
-                    grass_drawn = true;
+                // Grass previously interleaved its draw here, at the first
+                // transparent batch, sharing this RenderPass's bind-group slots
+                // with the BSP batch-draw state machine below (compact groups,
+                // cpu compaction, inline grouping) right as it switches pipelines
+                // and bind groups for other batches. That interleaving is a
+                // reproducible source of a wgpu bind-group/pipeline mismatch
+                // panic (grass's pipeline left paired with a stale BSP surface
+                // bind group), which a double-panic during the resulting cleanup
+                // then escalates to a hard process abort. Keep grass fully out of
+                // this loop; the unconditional `!grass_drawn` draw after the loop
+                // (below) is now its only call site. Grass now draws just after
+                // the world's opaque+masked geometry instead of mid-transparency;
+                // since grass blades are alpha-tested/depth-writing, not blended,
+                // this is a minor depth-sort difference, not a visual regression.
+                if !snow_shell_drawn && batch.source.pipeline.class == DrawClass::Transparent {
+                    draw_snow_shell(
+                        &mut pass,
+                        world,
+                        &active_pipeline_variant.pipelines,
+                        view_proj,
+                        snow_deform_center,
+                        &mut current_pipeline,
+                    );
+                    snow_shell_drawn = true;
                 }
                 if matches!(
                     self.planar_reflection_debug_mode,
@@ -21469,7 +24057,7 @@ impl Renderer {
                 pass.set_bind_group(1, &batch.bind_group, &[]);
                 if enhanced_world_shader { pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]); }
                 if self.gpu_driven_enabled
-                    && !(self.ocean_enabled && batch.source.water_primary)
+                    && !(self.ocean_enabled && batch.ocean_clipmap.is_some())
                 {
                     let offset = u64::from(batch.cull_index)
                         * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
@@ -21526,7 +24114,7 @@ impl Renderer {
                             );
                         }
                         if self.gpu_driven_enabled
-                            && !(self.ocean_enabled && batch.source.water_primary)
+                            && !(self.ocean_enabled && batch.ocean_clipmap.is_some())
                         {
                             let offset = u64::from(batch.cull_index)
                                 * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
@@ -21587,6 +24175,10 @@ impl Renderer {
                     );
                     pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                     pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                    // Grass replaces the RenderPass pipeline, so the cached BSP key is
+                    // no longer authoritative. Force the next BSP/inline draw to bind
+                    // its pipeline even when its PipelineKey matches the pre-grass one.
+                    current_pipeline = None;
                     if enhanced_world_shader {
                         let ocean_bind_group = self
                             .ocean
@@ -21611,7 +24203,7 @@ impl Renderer {
                 );
                 let scratch = &self.inline_draw_scratch;
                 if packed {
-                    for &(first, count) in &scratch.runs {
+                    for (run_index, &(first, count)) in scratch.runs.iter().enumerate() {
                         let batch = &active.batches[inline_visible[scratch.order[first as usize] as usize]];
                         if current_pipeline != Some(batch.source.pipeline) {
                             pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
@@ -21631,9 +24223,35 @@ impl Renderer {
                             );
                         }
                         info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
+                        // Legacy fog redraws every surface whose last stage is in
+                        // this run, so the run repeats as one multi-draw.
+                        if let Some(writes_depth) = inline_run_fog_depth(&self.weather.fog, self.ocean_enabled, batch, scratch.run_class[run_index] as u8 & 3) {
+                            if let Some(fog_pipeline) = active_pipeline_variant
+                                .fog_pass_pipelines
+                                .get(&(batch.source.pipeline, writes_depth))
+                            {
+                                pass.set_pipeline(fog_pipeline);
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if enhanced_world_shader {
+                                    pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                                }
+                                if count == 1 {
+                                    pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                                } else {
+                                    pass.multi_draw_indexed_indirect(
+                                        &world.inline_indirect_buffer,
+                                        u64::from(first) * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                        count,
+                                    );
+                                }
+                                current_pipeline = None;
+                                info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
+                            }
+                        }
                     }
                 } else {
-                    for &batch_index in &inline_visible {
+                    let kinds = inline_stage_info(active.batches, &inline_visible).1;
+                    for (position, &batch_index) in inline_visible.iter().enumerate() {
                         let batch = &active.batches[batch_index];
                         if current_pipeline != Some(batch.source.pipeline) {
                             pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
@@ -21645,6 +24263,20 @@ impl Renderer {
                         }
                         pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
                         info.world_encoded_batches = info.world_encoded_batches.saturating_add(1);
+                        if let Some(writes_depth) = inline_run_fog_depth(&self.weather.fog, self.ocean_enabled, batch, kinds[position]) {
+                            if let Some(fog_pipeline) = active_pipeline_variant
+                                .fog_pass_pipelines
+                                .get(&(batch.source.pipeline, writes_depth))
+                            {
+                                pass.set_pipeline(fog_pipeline);
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if enhanced_world_shader {
+                                    pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                                }
+                                pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                                current_pipeline = None;
+                            }
+                        }
                     }
                 }
             }
@@ -21689,7 +24321,7 @@ impl Renderer {
                             let batch = &dlight_active.batches[batch_index];
                             if !legacy_dlight_receives(&batch.source)
                                 || !batch_area_visible(batch, effective_area_mask)
-                                || (self.ocean_enabled && batch.source.water)
+                                || ocean_suppresses_batch(self.ocean_enabled, batch)
                                 || !aabb_intersects_clip_frustum(
                                     batch.bounds_min,
                                     batch.bounds_max,
@@ -21842,6 +24474,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                let mut ocean_drawn = 0u8;
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
                     if batch.ocean_clipmap.is_none() || !batch_area_visible(batch, effective_area_mask) { continue; }
@@ -21849,6 +24482,7 @@ impl Renderer {
                     {
                         continue;
                     }
+                    if !claim_ocean_clipmap(&mut ocean_drawn, batch) { continue; }
                     pass.set_bind_group(1, &batch.bind_group, &[]);
                     pass.set_bind_group(6, Self::ocean_bind_group_for(batch, &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
                     draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
@@ -21856,9 +24490,9 @@ impl Renderer {
             }
 
             if let Some(ocean) = self.ocean.as_ref() {
-                ocean.draw_spray(&mut pass, &self.camera_bind_group);
+                ocean.draw_spray(&mut pass, &self.camera_bind_group, self.ocean_spray_pipeline.as_ref());
             }
-            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group); }
+            for (_, ocean) in &self.authored_oceans { ocean.draw_spray(&mut pass, &self.camera_bind_group, self.ocean_spray_pipeline.as_ref()); }
 
             if split_dynamic_for_ocean {
                 self.gpu_profiler.write_render_pass_timestamp(
@@ -21926,11 +24560,13 @@ impl Renderer {
                         pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                         pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                         pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        let mut ocean_drawn = 0u8;
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
                             if batch.ocean_clipmap.is_none()
                                 || !batch_area_visible(batch, effective_area_mask)
                                 || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                                || !claim_ocean_clipmap(&mut ocean_drawn, batch)
                             {
                                 continue;
                             }
@@ -21963,31 +24599,35 @@ impl Renderer {
                         }
                         pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
-                        pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
                         pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
-                        for draw in &world.snow_shell.draws {
-                            if !snow_shell_draw_near_center(draw, snow_deform_center)
-                                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
-                            {
-                                continue;
+                        for chunk in world.snow_shell.chunks.values() {
+                            let Some(vertex_buffer) = &chunk.vertex_buffer else { continue };
+                            if !chunk.near_center(snow_deform_center) { continue }
+                            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                            for draw in &chunk.draws {
+                                if !snow_shell_draw_near_center(draw, snow_deform_center)
+                                    || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+                                {
+                                    continue;
+                                }
+                                let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
+                                    continue;
+                                };
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if variant_family == WorldShaderFamily::Enhanced {
+                                    pass.set_bind_group(
+                                        6,
+                                        Self::ocean_bind_group_for(
+                                            batch,
+                                            &self.authored_oceans,
+                                            &self.ocean,
+                                            &self.ocean_inert_bind_group,
+                                        ),
+                                        &[],
+                                    );
+                                }
+                                pass.draw(draw.vertices.clone(), 1..2);
                             }
-                            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
-                                continue;
-                            };
-                            pass.set_bind_group(1, &batch.bind_group, &[]);
-                            if variant_family == WorldShaderFamily::Enhanced {
-                                pass.set_bind_group(
-                                    6,
-                                    Self::ocean_bind_group_for(
-                                        batch,
-                                        &self.authored_oceans,
-                                        &self.ocean,
-                                        &self.ocean_inert_bind_group,
-                                    ),
-                                    &[],
-                                );
-                            }
-                            pass.draw(draw.vertices.clone(), 1..2);
                         }
                     }
                 }
@@ -22308,6 +24948,7 @@ impl Renderer {
             // Always ping-pong because sampling and writing one texture in the
             // same render pass is invalid in wgpu regardless of shader control
             // flow.
+            self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::Clouds, false);
             let cloud_write_index = 1 - self.cloud_history_read_index;
             let post_bind_group = &self.post_bind_groups[self.history_read_index]
                 [self.ssao_history_read_index][self.ssr_history_read_index]
@@ -22340,6 +24981,16 @@ impl Renderer {
             });
             pass.set_pipeline(&self.cloud_march_pipeline);
             pass.set_bind_group(0, post_bind_group, &[]);
+            if self.cloud_temporal_enabled && self.cloud_history_valid {
+                // Interleaved: draw only the compact block grid so every lane
+                // in every wave does a real march (see fs_cloud_march). The
+                // grid size is the same constant the post uniform carries.
+                let grid = CLOUD_INTERLEAVE_GRID;
+                let blocks_x = self.targets.cloud_width().div_ceil(grid).max(1);
+                let blocks_y = self.targets.cloud_height().div_ceil(grid).max(1);
+                pass.set_viewport(0.0, 0.0, blocks_x as f32, blocks_y as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, blocks_x, blocks_y);
+            }
             pass.draw(0..3, 0..1);
             drop(pass);
 
@@ -22365,6 +25016,7 @@ impl Renderer {
             pass.set_bind_group(1, &self.cloud_resolve_bind_group, &[]);
             pass.draw(0..3, 0..1);
             drop(pass);
+            self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::Clouds, true);
 
             self.cloud_history_read_index = cloud_write_index;
             self.cloud_history_valid = true;
@@ -22443,7 +25095,11 @@ impl Renderer {
                     pass.set_pipeline(&self.gamma_post_pipeline);
                     pass.set_bind_group(0, &self.gamma_post_bind_group, &[]);
                 } else {
-                    pass.set_pipeline(&self.post_pipeline);
+                    pass.set_pipeline(
+                        self.post_pipeline
+                            .as_ref()
+                            .expect("rebuild_frame_plan ensures the full post pipeline"),
+                    );
                     pass.set_bind_group(
                         0,
                         &self.post_bind_groups[self.history_read_index]
@@ -22654,6 +25310,7 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.present();
         let present_completed_at = Instant::now();
+        self.model_frame_log.presented(present_completed_at, view_proj, unjittered_view_proj, camera.position, [self.config.width, self.config.height]);
         info.cpu_present_ms = present_completed_at
             .saturating_duration_since(present_started)
             .as_secs_f64()
@@ -22700,7 +25357,13 @@ struct IndexedGeometryBuilder<'a> {
     // A shared geometric vertex may belong to different authored BSP surfaces.
     // Keep those identities distinct so the Legacy-only flat surface-id stream
     // remains exact without enlarging GpuVertex for every renderer mode.
-    lookup: BTreeMap<([u32; 15], u32), u32>,
+    // Open-addressing table of indices into `vertices` (`u32::MAX` = empty). A
+    // slot is matched by comparing the stored vertex's key and surface id, so no
+    // 64-byte keys are stored: the table is a few MiB instead of ~100 MiB of
+    // scattered map entries. Indices are assigned in first-seen order, so the
+    // lookup structure cannot change the result.
+    table: Vec<u32>,
+    table_mask: usize,
     indices: Vec<u32>,
     cache: BTreeMap<(u32, u32, u32), std::ops::Range<u32>>,
     source_to_index: Vec<Option<u32>>,
@@ -22708,12 +25371,15 @@ struct IndexedGeometryBuilder<'a> {
 
 impl<'a> IndexedGeometryBuilder<'a> {
     fn new(source: &'a [GpuVertex], source_triangle_surfaces: &'a [u32]) -> Self {
+        // At most one entry per source vertex, so this keeps the load under 2/3.
+        let slots = (source.len() * 3 / 2).max(16).next_power_of_two();
         Self {
             source,
             source_triangle_surfaces,
             vertices: Vec::new(),
             legacy_dlight_surface_ids: Vec::new(),
-            lookup: BTreeMap::new(),
+            table: vec![u32::MAX; slots],
+            table_mask: slots - 1,
             indices: Vec::new(),
             cache: BTreeMap::new(),
             source_to_index: vec![None; source.len()],
@@ -22721,14 +25387,31 @@ impl<'a> IndexedGeometryBuilder<'a> {
     }
 
     fn intern(&mut self, vertex: GpuVertex, surface_id: u32) -> u32 {
-        let key = (gpu_vertex_key(&vertex), surface_id);
-        if let Some(&index) = self.lookup.get(&key) {
-            return index;
+        use std::hash::Hasher;
+        let key = gpu_vertex_key(&vertex);
+        let mut words = [0_u32; 16];
+        words[..15].copy_from_slice(&key);
+        words[15] = surface_id;
+        let mut hasher = crate::scene::FoldHasher::default();
+        hasher.write(bytemuck::cast_slice(&words));
+        let mut slot = hasher.finish() as usize & self.table_mask;
+        loop {
+            let existing = self.table[slot];
+            if existing == u32::MAX {
+                break;
+            }
+            let candidate = existing as usize;
+            if self.legacy_dlight_surface_ids[candidate] == surface_id
+                && gpu_vertex_key(&self.vertices[candidate]) == key
+            {
+                return existing;
+            }
+            slot = (slot + 1) & self.table_mask;
         }
         let index = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
         self.vertices.push(vertex);
         self.legacy_dlight_surface_ids.push(surface_id);
-        self.lookup.insert(key, index);
+        self.table[slot] = index;
         index
     }
 
@@ -22766,23 +25449,29 @@ impl<'a> IndexedGeometryBuilder<'a> {
 
         let start = batch.vertices.start as usize;
         let end = batch.vertices.end as usize;
-        let slice = self.source[start..end].to_vec();
-        let mut values = Vec::new();
-        {
-            values.reserve(slice.len());
-            for (offset, &vertex) in slice.iter().enumerate() {
-                let source_index = start + offset;
-                let surface_id = self
-                    .source_triangle_surfaces
-                    .get(source_index / 3)
-                    .copied()
-                    .unwrap_or(u32::MAX);
-                let index = self.intern(vertex, surface_id);
-                if let Some(slot) = self.source_to_index.get_mut(source_index) {
-                    *slot = Some(index);
+        let source = self.source;
+        let mut values = Vec::with_capacity(end.saturating_sub(start));
+        for source_index in start..end {
+            // FULL pieces re-cover the coarse batches' source vertices. A source
+            // index always interns to the same result, so repeat visits reuse it
+            // instead of hashing the vertex again.
+            let known = self.source_to_index.get(source_index).copied().flatten();
+            let index = match known {
+                Some(index) => index,
+                None => {
+                    let surface_id = self
+                        .source_triangle_surfaces
+                        .get(source_index / 3)
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                    let index = self.intern(source[source_index], surface_id);
+                    if let Some(slot) = self.source_to_index.get_mut(source_index) {
+                        *slot = Some(index);
+                    }
+                    index
                 }
-                values.push(index);
-            }
+            };
+            values.push(index);
         }
         let range = self.append_indices(&values);
         self.cache.insert(key, range.clone());
@@ -22869,6 +25558,7 @@ fn instantiate_portal_draw_plans(
         batch.source.area_signature = variant.area_signature;
         batch.is_inline_entity = false;
         batch.ocean_clipmap = None;
+        batch.ocean_clipmap_id = u8::MAX;
         batch.compact_group = None;
         batch.bounds_min = variant.bounds_min;
         batch.bounds_max = variant.bounds_max;
@@ -22997,13 +25687,32 @@ fn midpoint_gpu_vertex(a: GpuVertex, b: GpuVertex) -> GpuVertex {
     }
 }
 
-fn append_static_snow_triangle(
-    chunks: &mut BTreeMap<(usize, i32, i32), Vec<GpuVertex>>,
-    coarse_batch_index: usize,
+/// Tessellate `triangle` down to the shell lattice, appending only the leaf
+/// triangles whose centroid lies in `cell`. Sub-triangles whose bounding box
+/// misses the cell cannot contain such a leaf (every leaf centroid is inside its
+/// ancestor's box), so they are skipped; the leaves and their order are exactly
+/// what an unpruned walk would assign to this cell.
+fn append_snow_triangle_in_cell(
+    out: &mut Vec<GpuVertex>,
+    cell: (i32, i32),
     triangle: [GpuVertex; 3],
     depth: u32,
 ) {
     let positions = triangle.map(|vertex| Vec3::from_array(vertex.position));
+    // Margin keeps float rounding at a cell edge from pruning a leaf that the
+    // exact centroid test below would still assign here.
+    let lo_x = cell.0 as f32 * SNOW_SHELL_CHUNK_SIZE - 0.01;
+    let hi_x = (cell.0 + 1) as f32 * SNOW_SHELL_CHUNK_SIZE + 0.01;
+    let lo_z = cell.1 as f32 * SNOW_SHELL_CHUNK_SIZE - 0.01;
+    let hi_z = (cell.1 + 1) as f32 * SNOW_SHELL_CHUNK_SIZE + 0.01;
+    let min_x = positions[0].x.min(positions[1].x).min(positions[2].x);
+    let max_x = positions[0].x.max(positions[1].x).max(positions[2].x);
+    let min_z = positions[0].z.min(positions[1].z).min(positions[2].z);
+    let max_z = positions[0].z.max(positions[1].z).max(positions[2].z);
+    if max_x < lo_x || min_x > hi_x || max_z < lo_z || min_z > hi_z {
+        return;
+    }
+
     let max_edge_sq = (positions[0] - positions[1])
         .length_squared()
         .max((positions[1] - positions[2]).length_squared())
@@ -23013,29 +25722,39 @@ fn append_static_snow_triangle(
         let centroid = (positions[0] + positions[1] + positions[2]) / 3.0;
         let chunk_x = (centroid.x / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
         let chunk_z = (centroid.z / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
-        chunks
-            .entry((coarse_batch_index, chunk_x, chunk_z))
-            .or_default()
-            .extend_from_slice(&triangle);
+        if (chunk_x, chunk_z) == cell {
+            out.extend_from_slice(&triangle);
+        }
         return;
     }
 
     let ab = midpoint_gpu_vertex(triangle[0], triangle[1]);
     let bc = midpoint_gpu_vertex(triangle[1], triangle[2]);
     let ca = midpoint_gpu_vertex(triangle[2], triangle[0]);
-    append_static_snow_triangle(chunks, coarse_batch_index, [triangle[0], ab, ca], depth + 1);
-    append_static_snow_triangle(chunks, coarse_batch_index, [ab, triangle[1], bc], depth + 1);
-    append_static_snow_triangle(chunks, coarse_batch_index, [ca, bc, triangle[2]], depth + 1);
-    append_static_snow_triangle(chunks, coarse_batch_index, [ab, bc, ca], depth + 1);
+    append_snow_triangle_in_cell(out, cell, [triangle[0], ab, ca], depth + 1);
+    append_snow_triangle_in_cell(out, cell, [ab, triangle[1], bc], depth + 1);
+    append_snow_triangle_in_cell(out, cell, [ca, bc, triangle[2]], depth + 1);
+    append_snow_triangle_in_cell(out, cell, [ab, bc, ca], depth + 1);
 }
 
+fn snow_id_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    let ids = vec![u32::MAX; capacity.max(1)];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA Snowflow Legacy dlight surface-id fallback"),
+        contents: bytemuck::cast_slice(&ids),
+        usage: wgpu::BufferUsages::VERTEX,
+    })
+}
 
+/// Index the map's snow triangles. This is a pass over the snow batches only and
+/// builds no tessellation; chunks are tessellated on demand by `SnowShellGpu::stream`.
 fn create_snow_shell_gpu(
     device: &wgpu::Device,
     vertices: &[GpuVertex],
     coarse_sources: &[DrawBatch],
 ) -> SnowShellGpu {
-    let mut chunks = BTreeMap::<(usize, i32, i32), Vec<GpuVertex>>::new();
+    let mut source_triangles = Vec::<SnowSourceTriangle>::new();
+    let mut cells = HashMap::<(i32, i32), Vec<u32>>::new();
     for (coarse_batch_index, source) in coarse_sources.iter().enumerate() {
         if u32::from(source.surface_material) != MATERIAL_SNOW || source.pipeline.class == DrawClass::Sky {
             continue;
@@ -23050,20 +25769,93 @@ fn create_snow_shell_gpu(
                 + Vec3::from_array(triangle[2].normal))
                 .normalize_or_zero();
             if normal.y <= 0.35 { continue; }
-            append_static_snow_triangle(&mut chunks, coarse_batch_index, triangle, 0);
+            let index = source_triangles.len() as u32;
+            let xs = triangle.map(|vertex| vertex.position[0]);
+            let zs = triangle.map(|vertex| vertex.position[2]);
+            let cell_of = |value: f32| (value / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+            let (min_x, max_x) = (xs[0].min(xs[1]).min(xs[2]), xs[0].max(xs[1]).max(xs[2]));
+            let (min_z, max_z) = (zs[0].min(zs[1]).min(zs[2]), zs[0].max(zs[1]).max(zs[2]));
+            // Every leaf centroid lies inside the source triangle's box, so these
+            // are all the cells that can receive a leaf of this triangle.
+            for cell_x in cell_of(min_x)..=cell_of(max_x) {
+                for cell_z in cell_of(min_z)..=cell_of(max_z) {
+                    cells.entry((cell_x, cell_z)).or_default().push(index);
+                }
+            }
+            source_triangles.push(SnowSourceTriangle { coarse_batch_index, vertices: triangle });
         }
     }
 
-    let total_vertices = chunks.values().map(Vec::len).sum::<usize>();
-    let mut packed = Vec::<GpuVertex>::with_capacity(total_vertices);
-    let mut draws = Vec::<SnowShellDraw>::with_capacity(chunks.len());
-    for ((coarse_batch_index, _, _), chunk_vertices) in chunks {
-        let start = packed.len();
-        packed.extend_from_slice(&chunk_vertices);
-        let end = packed.len();
+    let id_capacity = 1 << 16;
+    let (results_tx, results_rx) = mpsc::channel();
+    println!(
+        "Snowflow overlay: {} source triangle(s) in {} chunk cell(s); {:.0}u chunks tessellated to a {:.1}u lattice on demand within {:.0}u of the field centre",
+        source_triangles.len(),
+        cells.len(),
+        SNOW_SHELL_CHUNK_SIZE,
+        SNOW_SHELL_TESSELLATION,
+        SNOW_SHELL_DRAW_RADIUS,
+    );
+    SnowShellGpu {
+        source: Arc::new(SnowSource { triangles: source_triangles, cells }),
+        chunks: BTreeMap::new(),
+        pending: HashSet::new(),
+        results_tx,
+        results_rx: Mutex::new(results_rx),
+        legacy_dlight_surface_id_buffer: snow_id_buffer(device, id_capacity),
+        id_capacity,
+        stats: SnowShellStats::default(),
+    }
+}
+
+/// How far beyond the draw radius chunks are prepared, so a moving player finds
+/// them already built, and how much farther they must drift before eviction.
+const SNOW_SHELL_PREFETCH_MARGIN: f32 = 160.0;
+const SNOW_SHELL_EVICT_MARGIN: f32 = 352.0;
+/// Chunks tessellating on the worker pool at once. Requests are re-sorted
+/// nearest-first every frame, so a small window keeps the queue from going
+/// stale when the field centre moves quickly.
+const SNOW_SHELL_MAX_IN_FLIGHT: usize = 12;
+/// Render-thread budget per frame for turning finished chunks into GPU buffers
+/// (one is always taken so progress is guaranteed).
+const SNOW_SHELL_UPLOAD_BUDGET: Duration = Duration::from_micros(600);
+
+static SNOW_SHELL_WORKER_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
+    std::sync::OnceLock::new();
+
+/// Run `job` off the render thread. The shell tessellation is the only user, so
+/// it gets its own small pool instead of competing with frame-critical pools.
+fn spawn_snow_shell_job(job: impl FnOnce() + Send + 'static) {
+    let pool = SNOW_SHELL_WORKER_POOL
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|index| format!("jka-snow-shell-{index}"))
+                .build()
+                .map_err(|error| eprintln!("Snow shell worker pool unavailable: {error}"))
+                .ok()
+        })
+        .as_ref();
+    match pool {
+        Some(pool) => pool.spawn(job),
+        None => {
+            std::thread::spawn(job);
+        }
+    }
+}
+
+/// Tessellate one chunk cell. Pure function of the shared source, so it runs on
+/// a worker; the render thread only has to create the GPU buffer.
+fn tessellate_snow_cell(source: &SnowSource, cell: (i32, i32)) -> (Vec<GpuVertex>, Vec<SnowShellDraw>) {
+    let mut packed = Vec::<GpuVertex>::new();
+    let mut draws = Vec::<SnowShellDraw>::new();
+    let mut open: Option<(usize, usize)> = None;
+    let close = |packed: &Vec<GpuVertex>, open: &mut Option<(usize, usize)>, draws: &mut Vec<SnowShellDraw>| {
+        let Some((batch, start)) = open.take() else { return };
+        if start >= packed.len() { return; }
         let mut bounds_min = Vec3::splat(f32::INFINITY);
         let mut bounds_max = Vec3::splat(f32::NEG_INFINITY);
-        for vertex in &packed[start..end] {
+        for vertex in &packed[start..] {
             let p = Vec3::from_array(vertex.position);
             bounds_min = bounds_min.min(p);
             bounds_max = bounds_max.max(p);
@@ -23071,30 +25863,171 @@ fn create_snow_shell_gpu(
         // Snowflow source allows +0.34 m of berm; keep conservative JKA-unit padding.
         bounds_max.y += 16.0;
         draws.push(SnowShellDraw {
-            coarse_batch_index,
-            vertices: u32::try_from(start).unwrap_or(u32::MAX)..u32::try_from(end).unwrap_or(u32::MAX),
+            coarse_batch_index: batch,
+            vertices: u32::try_from(start).unwrap_or(u32::MAX)
+                ..u32::try_from(packed.len()).unwrap_or(u32::MAX),
             bounds_min: bounds_min.to_array(),
             bounds_max: bounds_max.to_array(),
         });
+    };
+    if let Some(indices) = source.cells.get(&cell) {
+        // Source triangles are stored batch by batch, so each batch's leaves are
+        // contiguous and one draw covers them.
+        for &index in indices {
+            let triangle = &source.triangles[index as usize];
+            let before = packed.len();
+            if open.is_some_and(|(batch, _)| batch != triangle.coarse_batch_index) {
+                close(&packed, &mut open, &mut draws);
+            }
+            if open.is_none() {
+                open = Some((triangle.coarse_batch_index, before));
+            }
+            append_snow_triangle_in_cell(&mut packed, cell, triangle.vertices, 0);
+        }
+        close(&packed, &mut open, &mut draws);
+    }
+    (packed, draws)
+}
+
+impl SnowShellGpu {
+    fn has_snow(&self) -> bool {
+        !self.source.triangles.is_empty()
     }
 
-    let bytes = (packed.len() * std::mem::size_of::<GpuVertex>()).max(1) as u64;
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("JKA static Snowflow snow overlay vertices"),
-        contents: if packed.is_empty() { &[0u8][..] } else { bytemuck::cast_slice(&packed) },
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let snow_surface_ids = vec![u32::MAX; packed.len().max(1)];
-    let legacy_dlight_surface_id_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("JKA Snowflow Legacy dlight surface-id fallback"),
-        contents: bytemuck::cast_slice(&snow_surface_ids),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    println!(
-        "Snowflow overlay: {} static chunks, {} vertices ({:.1} MiB), {:.1}u lattice",
-        draws.len(), packed.len(), bytes as f64 / (1024.0 * 1024.0), SNOW_SHELL_TESSELLATION
-    );
-    SnowShellGpu { vertex_buffer, legacy_dlight_surface_id_buffer, draws }
+    /// Drop every resident chunk (footprints are not in 3D mode, so the shell is
+    /// not drawn). Chunks still in flight are collected and discarded or reused
+    /// by the next `stream`.
+    fn release(&mut self) {
+        self.chunks.clear();
+    }
+
+    fn cell_distance(cell: (i32, i32), center: Vec2) -> f32 {
+        let min = Vec2::new(cell.0 as f32, cell.1 as f32) * SNOW_SHELL_CHUNK_SIZE;
+        let max = min + Vec2::splat(SNOW_SHELL_CHUNK_SIZE);
+        (center.clamp(min, max) - center).length()
+    }
+
+    /// Keep the chunks around `center` resident without touching the frame time
+    /// much: finished worker results become GPU buffers (within a small budget),
+    /// far chunks are dropped, and missing near ones are queued nearest-first.
+    fn stream(&mut self, device: &wgpu::Device, center: Vec2) {
+        if !self.has_snow() {
+            return;
+        }
+        let evict_distance = SNOW_SHELL_DRAW_RADIUS + SNOW_SHELL_EVICT_MARGIN;
+        self.chunks
+            .retain(|&cell, _| Self::cell_distance(cell, center) <= evict_distance);
+
+        // Finished chunks -> GPU buffers.
+        let upload_started = Instant::now();
+        let mut uploaded = 0_u32;
+        loop {
+            if uploaded > 0 && upload_started.elapsed() >= SNOW_SHELL_UPLOAD_BUDGET {
+                break;
+            }
+            let receiver = self
+                .results_rx
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(built) = receiver.try_recv() else { break };
+            self.pending.remove(&built.cell);
+            // The player may have moved on while the worker was busy.
+            if Self::cell_distance(built.cell, center) > evict_distance {
+                continue;
+            }
+            let chunk_started = Instant::now();
+            if built.vertices.len() > self.id_capacity {
+                self.id_capacity = built.vertices.len().next_power_of_two();
+                self.legacy_dlight_surface_id_buffer = snow_id_buffer(device, self.id_capacity);
+            }
+            let vertex_buffer = (!built.vertices.is_empty()).then(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("JKA Snowflow snow overlay chunk"),
+                    contents: bytemuck::cast_slice(&built.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+            });
+            let min = Vec2::new(built.cell.0 as f32, built.cell.1 as f32) * SNOW_SHELL_CHUNK_SIZE;
+            self.chunks.insert(
+                built.cell,
+                SnowShellChunk {
+                    vertex_buffer,
+                    draws: built.draws,
+                    min,
+                    max: min + Vec2::splat(SNOW_SHELL_CHUNK_SIZE),
+                },
+            );
+            let upload_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
+            self.stats.chunks += 1;
+            self.stats.build_ms_sum += built.build_ms;
+            self.stats.build_ms_max = self.stats.build_ms_max.max(built.build_ms);
+            self.stats.upload_ms_sum += upload_ms;
+            self.stats.upload_ms_max = self.stats.upload_ms_max.max(upload_ms);
+            uploaded += 1;
+        }
+
+        // Queue missing chunks near the centre, nearest first.
+        if self.pending.len() < SNOW_SHELL_MAX_IN_FLIGHT {
+            let reach = SNOW_SHELL_DRAW_RADIUS + SNOW_SHELL_PREFETCH_MARGIN;
+            let first_x = ((center.x - reach) / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+            let last_x = ((center.x + reach) / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+            let first_z = ((center.y - reach) / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+            let last_z = ((center.y + reach) / SNOW_SHELL_CHUNK_SIZE).floor() as i32;
+            let mut missing = Vec::<(f32, (i32, i32))>::new();
+            for cell_x in first_x..=last_x {
+                for cell_z in first_z..=last_z {
+                    let cell = (cell_x, cell_z);
+                    if self.chunks.contains_key(&cell)
+                        || self.pending.contains(&cell)
+                        || !self.source.cells.contains_key(&cell)
+                    {
+                        continue;
+                    }
+                    let distance = Self::cell_distance(cell, center);
+                    if distance <= reach {
+                        missing.push((distance, cell));
+                    }
+                }
+            }
+            missing.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, cell) in missing {
+                if self.pending.len() >= SNOW_SHELL_MAX_IN_FLIGHT {
+                    break;
+                }
+                let source = Arc::clone(&self.source);
+                let results = self.results_tx.clone();
+                self.pending.insert(cell);
+                spawn_snow_shell_job(move || {
+                    let started = Instant::now();
+                    let (vertices, draws) = tessellate_snow_cell(&source, cell);
+                    let build_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    // The shell is gone (map unloaded) when the receiver is.
+                    let _ = results.send(SnowChunkBuild { cell, vertices, draws, build_ms });
+                });
+            }
+        }
+
+        // One summary line per fill (spawn, teleport, a burst) or any slow chunk;
+        // a chunk border crossed while walking stays quiet.
+        let stats = self.stats;
+        if self.pending.is_empty()
+            && stats.chunks > 0
+            && (stats.chunks >= 8 || stats.build_ms_max >= 2.0 || stats.upload_ms_max >= 1.0)
+        {
+            println!(
+                "[SNOW STREAM] {} chunk(s) | worker build avg {:.2} max {:.2} ms (off the render thread) | render-thread buffer create avg {:.2} max {:.2} ms | {} resident",
+                stats.chunks,
+                stats.build_ms_sum / f64::from(stats.chunks),
+                stats.build_ms_max,
+                stats.upload_ms_sum / f64::from(stats.chunks),
+                stats.upload_ms_max,
+                self.chunks.len(),
+            );
+        }
+        if self.pending.is_empty() {
+            self.stats = SnowShellStats::default();
+        }
+    }
 }
 
 fn snow_shell_draw_near_center(draw: &SnowShellDraw, center: Vec2) -> bool {
@@ -23111,20 +26044,24 @@ fn draw_snow_shell_fast<'a>(
     deform_center: Vec2,
     current_pipeline: &mut Option<PipelineKey>,
 ) {
-    if world.snow_shell.draws.is_empty() { return; }
-    pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    if world.snow_shell.chunks.is_empty() { return; }
     pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
-    for draw in &world.snow_shell.draws {
-        if !snow_shell_draw_near_center(draw, deform_center)
-            || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
-        { continue; }
-        let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
-        if *current_pipeline != Some(batch.source.pipeline) {
-            pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
-            *current_pipeline = Some(batch.source.pipeline);
+    for chunk in world.snow_shell.chunks.values() {
+        let Some(vertex_buffer) = &chunk.vertex_buffer else { continue; };
+        if !chunk.near_center(deform_center) { continue; }
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        for draw in &chunk.draws {
+            if !snow_shell_draw_near_center(draw, deform_center)
+                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+            { continue; }
+            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
+            if *current_pipeline != Some(batch.source.pipeline) {
+                pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
+                *current_pipeline = Some(batch.source.pipeline);
+            }
+            pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+            pass.draw(draw.vertices.clone(), 1..2);
         }
-        pass.set_bind_group(1, &batch.fast_bind_group, &[]);
-        pass.draw(draw.vertices.clone(), 1..2);
     }
     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
     pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
@@ -23140,20 +26077,24 @@ fn draw_snow_shell<'a>(
     deform_center: Vec2,
     current_pipeline: &mut Option<PipelineKey>,
 ) {
-    if world.snow_shell.draws.is_empty() { return; }
-    pass.set_vertex_buffer(0, world.snow_shell.vertex_buffer.slice(..));
+    if world.snow_shell.chunks.is_empty() { return; }
     pass.set_vertex_buffer(1, world.snow_shell.legacy_dlight_surface_id_buffer.slice(..));
-    for draw in &world.snow_shell.draws {
-        if !snow_shell_draw_near_center(draw, deform_center)
-            || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
-        { continue; }
-        let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
-        if *current_pipeline != Some(batch.source.pipeline) {
-            pass.set_pipeline(&pipelines[&batch.source.pipeline]);
-            *current_pipeline = Some(batch.source.pipeline);
+    for chunk in world.snow_shell.chunks.values() {
+        let Some(vertex_buffer) = &chunk.vertex_buffer else { continue; };
+        if !chunk.near_center(deform_center) { continue; }
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        for draw in &chunk.draws {
+            if !snow_shell_draw_near_center(draw, deform_center)
+                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+            { continue; }
+            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else { continue; };
+            if *current_pipeline != Some(batch.source.pipeline) {
+                pass.set_pipeline(&pipelines[&batch.source.pipeline]);
+                *current_pipeline = Some(batch.source.pipeline);
+            }
+            pass.set_bind_group(1, &batch.bind_group, &[]);
+            pass.draw(draw.vertices.clone(), 1..2);
         }
-        pass.set_bind_group(1, &batch.bind_group, &[]);
-        pass.draw(draw.vertices.clone(), 1..2);
     }
     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
     pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
@@ -23209,14 +26150,61 @@ fn is_upward_water_face(source: &DrawBatch, vertices: &[GpuVertex]) -> bool {
 /// Promoted water draws the shared camera-centred ocean clipmap in place of its
 /// authored brush face. The clipmap is one mesh for the whole world, so the
 /// range comes from the renderer rather than from per-batch state.
-/// Legacy fog redraws follow each surface's final stage, so a mover batch that
-/// needs one keeps the ordered per-batch path.
+/// Legacy fog redraws follow each surface's final stage.
 fn inline_batch_needs_fog(fog: &weather::FogSystem, batch: &WorldBatch) -> bool {
     fog.legacy_uses_separate_pass(
         batch.source.fog_is_global,
         batch.source.legacy2_fog_in_stage_safe,
         batch.source.global_fog_post_eligible,
     ) && (batch.source.fog[3] > 0.001 || fog.legacy_drawfog_value() == 1)
+}
+
+/// Per visible mover batch: whether it continues the previous batch's surface,
+/// and its fog kind. Bit 0 of the kind marks the surface's last visible stage,
+/// bit 1 (last stages only) that some stage of the surface writes depth. These
+/// pick the legacy fog redraw, so they belong to the run class.
+fn inline_stage_info(batches: &[WorldBatch], visible: &[usize]) -> (Vec<bool>, Vec<u8>) {
+    let continues: Vec<bool> = visible
+        .iter()
+        .enumerate()
+        .map(|(position, &index)| {
+            position > 0 && same_world_surface(&batches[index], &batches[visible[position - 1]])
+        })
+        .collect();
+    let kinds = (0..visible.len())
+        .map(|position| {
+            if continues.get(position + 1).copied().unwrap_or(false) {
+                return 0;
+            }
+            let mut writes_depth = false;
+            let mut member = position;
+            loop {
+                writes_depth |= batches[visible[member]].source.pipeline.depth_write;
+                if !continues[member] {
+                    break;
+                }
+                member -= 1;
+            }
+            1 | (u8::from(writes_depth) << 1)
+        })
+        .collect();
+    (continues, kinds)
+}
+
+/// `Some(surface_writes_depth)` when the run led by `batch` (fog kind `kind`)
+/// needs a legacy fog redraw after it.
+fn inline_run_fog_depth(
+    fog: &weather::FogSystem,
+    ocean_enabled: bool,
+    batch: &WorldBatch,
+    kind: u8,
+) -> Option<bool> {
+    (kind & 1 != 0
+        && batch.source.pipeline.class != DrawClass::Sky
+        // GodotOcean fogs itself (bsp.wgsl apply_ocean_legacy_fog).
+        && !(ocean_enabled && batch.ocean_clipmap.is_some())
+        && inline_batch_needs_fog(fog, batch))
+    .then_some(kind & 2 != 0)
 }
 
 /// Retained scratch for `plan_inline_runs` / `pack_inline_draws`.
@@ -23229,6 +26217,8 @@ struct InlineDrawScratch {
     order: Vec<u32>,
     /// `(first index into order, count)` of each multi-draw.
     runs: Vec<(u32, u32)>,
+    /// State class of each run.
+    run_class: Vec<u32>,
     args: Vec<DrawIndexedIndirectArgs>,
 }
 
@@ -23268,6 +26258,7 @@ fn plan_inline_runs(
     scratch.done.resize(n, false);
     scratch.order.clear();
     scratch.runs.clear();
+    scratch.run_class.clear();
     for position in 0..n {
         if scratch.done[position] {
             continue;
@@ -23284,6 +26275,7 @@ fn plan_inline_runs(
             scratch.order.push(member as u32);
         }
         scratch.runs.push((first, scratch.order.len() as u32 - first));
+        scratch.run_class.push(group as u32);
     }
 }
 
@@ -23304,15 +26296,15 @@ fn pack_inline_draws(
     if visible.len() > region_capacity as usize {
         return false;
     }
-    let group_of: Vec<u32> = visible.iter().map(|&index| batches[index].inline_group).collect();
-    let continues: Vec<bool> = visible
+    // The class also carries the fog kind (see `inline_stage_info`) so a run is
+    // fog-homogeneous: its fog redraw is one more multi-draw over the same range.
+    let (continues, kinds) = inline_stage_info(batches, visible);
+    let group_of: Vec<u32> = visible
         .iter()
-        .enumerate()
-        .map(|(position, &index)| {
-            position > 0 && same_world_surface(&batches[index], &batches[visible[position - 1]])
-        })
+        .zip(&kinds)
+        .map(|(&index, &kind)| batches[index].inline_group * 4 + u32::from(kind))
         .collect();
-    plan_inline_runs(&group_of, &continues, group_count, scratch);
+    plan_inline_runs(&group_of, &continues, group_count * 4, scratch);
     let mut args = std::mem::take(&mut scratch.args);
     args.clear();
     args.extend(scratch.order.iter().map(|&position| {
@@ -23334,6 +26326,30 @@ fn pack_inline_draws(
     }
     scratch.args = args;
     true
+}
+
+/// Whether the FFT ocean owns this authored water batch, so the ordinary passes
+/// must not draw it. The promoted face draws through its clipmap; sibling
+/// stages, undersides and sides are dropped on purpose. Water that qualified
+/// for promotion but got no clipmap (past the surface cap) is the one case the
+/// ocean does not own: it keeps its authored draw instead of vanishing.
+fn ocean_suppresses_batch(ocean_enabled: bool, batch: &WorldBatch) -> bool {
+    ocean_enabled
+        && batch.source.water
+        && !(batch.source.water_primary && batch.ocean_clipmap.is_none())
+}
+
+/// Every face merged into one ocean surface points at the same clipmap, so a
+/// pass must draw it once. `drawn` is a per-pass bit set of surface ids; batches
+/// without a clipmap always pass.
+fn claim_ocean_clipmap(drawn: &mut u8, batch: &WorldBatch) -> bool {
+    if batch.ocean_clipmap.is_none() || batch.ocean_clipmap_id >= 8 {
+        return true;
+    }
+    let bit = 1u8 << batch.ocean_clipmap_id;
+    let first = *drawn & bit == 0;
+    *drawn |= bit;
+    first
 }
 
 fn draw_world_batch<'a>(
@@ -23480,6 +26496,7 @@ fn build_world(
     map: PreparedMap,
 ) -> (WorldGpu, WorldUploadTimings) {
     let source_map = map.map_file_stats.is_some();
+    let sky_portal = map.sky_portal;
     let PreparedMap {
         vertices,
         legacy_dlight_triangle_surfaces,
@@ -23505,9 +26522,13 @@ fn build_world(
         inline_vertices,
         inline_batches: inline_batch_sources,
         inline_models: inline_model_sources,
+        mark_surfaces,
         ..
     } = map;
+    let snow_started = Instant::now();
     let snow_shell = create_snow_shell_gpu(device, &vertices, &coarse_sources);
+    let snow_shell_ms = snow_started.elapsed().as_secs_f64() * 1000.0;
+    let prelude_started = Instant::now();
     let inspector_vertices = vertices
         .iter()
         .map(|vertex| InspectorVertex {
@@ -23546,6 +26567,8 @@ fn build_world(
     let static_ao_cache_source = static_bsp_ao_cache;
 
     let mut upload_timings = WorldUploadTimings::default();
+    upload_timings.snow_shell_ms = snow_shell_ms;
+    upload_timings.prelude_ms = prelude_started.elapsed().as_secs_f64() * 1000.0;
 
     let vertex_started = Instant::now();
     let mut indexed_builder = IndexedGeometryBuilder::new(&vertices, &legacy_dlight_triangle_surfaces);
@@ -23565,48 +26588,99 @@ fn build_world(
     // camera-centred clipmap, so the authored brush footprint no longer has to
     // be subdivided per map. `build_ocean_meshes` only decides whether the
     // clipmap is worth uploading at all.
-    // One clipmap per distinct promoted water surface. Each bakes in that
-    // surface's plane height and footprint, so the vertex shader needs nothing
-    // from the material uniform and cannot end up placing the ocean somewhere
-    // the draw call did not intend.
-    let mut ocean_clipmaps = BTreeMap::<[u32; 5], [std::ops::Range<u32>; 2]>::new();
+    // Contiguous water on one plane is one ocean surface, and the surface cap
+    // goes to the biggest ones first. Each surface gets one clipmap that bakes in
+    // its plane height and footprint, so the vertex shader needs nothing from the
+    // material uniform and cannot end up placing the ocean somewhere the draw
+    // call did not intend. The footprint is only the bounding box; the real
+    // outline travels as triangle masks the fragment shader cuts back to.
+    let mut ocean_clipmaps = BTreeMap::<[u32; 5], ([std::ops::Range<u32>; 2], u8)>::new();
     let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
+    let mut ocean_masks = crate::ocean::OceanMasks::default();
     let mut ocean_coarsest_spacing = 0.0f32;
     if build_ocean_meshes {
+        let mut water_faces = Vec::<crate::ocean::WaterFace>::new();
+        let mut water_face_keys = Vec::<[u32; 5]>::new();
+        let mut water_face_triangles = Vec::<Vec<crate::ocean::MaskTriangle>>::new();
+        let mut seen_faces = BTreeSet::<[u32; 5]>::new();
         for source in coarse_sources.iter().chain(full_sources.iter()) {
             if !source.water_primary || !is_upward_water_face(source, &vertices) {
                 continue;
             }
             let (plane, minimum, maximum) = water_surface_extent(source, &vertices);
             let key = ocean_surface_key(plane, minimum, maximum);
-            if ocean_clipmaps.contains_key(&key) {
+            if !seen_faces.insert(key) {
                 continue;
             }
-            if ocean_clipmaps.len() >= MAX_OCEAN_SURFACES {
-                println!(
-                    "Ocean: more than {MAX_OCEAN_SURFACES} promoted water surfaces; plane {plane:.0} left on its authored face"
-                );
-                continue;
-            }
+            let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
+            water_face_triangles.push(
+                slice
+                    .chunks_exact(3)
+                    .map(|t| [0, 1, 2].map(|i| [t[i].position[0], t[i].position[2]]))
+                    .collect(),
+            );
+            water_face_keys.push(key);
+            water_faces.push(crate::ocean::WaterFace {
+                plane,
+                minimum,
+                maximum,
+                authored_ocean: source.authored_ocean,
+            });
+        }
+        let clusters = crate::ocean::cluster_water_faces(&water_faces);
+        if clusters.len() > MAX_OCEAN_SURFACES {
+            println!(
+                "Ocean: {} promoted water surfaces from {} faces; the {} smallest stay on their authored faces",
+                clusters.len(),
+                water_faces.len(),
+                clusters.len() - MAX_OCEAN_SURFACES,
+            );
+        }
+        for (slot, cluster) in clusters.iter().take(MAX_OCEAN_SURFACES).enumerate() {
+            let authored = water_faces[cluster.members[0]].authored_ocean.is_some();
+            // A map-authored ocean carries its own bounds, so it takes no mask.
+            let mask_slot = if authored {
+                None
+            } else {
+                let triangles: Vec<crate::ocean::MaskTriangle> = cluster
+                    .members
+                    .iter()
+                    .flat_map(|&member| water_face_triangles[member].iter().copied())
+                    .collect();
+                ocean_masks.push_surface(slot, &triangles).then_some(slot)
+            };
             // Both mesh qualities are uploaded so the quality setting stays a
             // live switch instead of needing a map reload.
             let low = crate::ocean::build_clipmap(
-                crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS, plane, minimum, maximum);
+                crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
+                cluster.plane,
+                cluster.minimum,
+                cluster.maximum,
+                mask_slot,
+            );
             let high = crate::ocean::build_clipmap(
-                crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS, plane, minimum, maximum);
+                crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
+                cluster.plane,
+                cluster.minimum,
+                cluster.maximum,
+                mask_slot,
+            );
             ocean_coarsest_spacing = low.coarsest_spacing;
             upload_timings.ocean_clipmap_vertices += (low.vertices.len() + high.vertices.len()) as u64;
-            upload_timings.ocean_clipmap_tris = (high.indices.len() / 3) as u64;
+            upload_timings.ocean_clipmap_tris += (high.indices.len() / 3) as u64;
             upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
             upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
-            ocean_clipmaps.insert(key, [
+            let ranges = [
                 indexed_builder.append_clipmap(&low.vertices, &low.indices),
                 indexed_builder.append_clipmap(&high.vertices, &high.indices),
-            ]);
+            ];
+            for &member in &cluster.members {
+                ocean_clipmaps.insert(water_face_keys[member], (ranges.clone(), slot as u8));
+            }
             ocean_surfaces.push(crate::ocean::OceanSurface {
-                plane_height: plane,
-                minimum,
-                maximum,
+                plane_height: cluster.plane,
+                minimum: cluster.minimum,
+                maximum: cluster.maximum,
             });
         }
     }
@@ -23868,9 +26942,12 @@ fn build_world(
                     source.water_primary = false;
                 }
             }
-            let ocean_clipmap = water_plane.and_then(|(plane, minimum, maximum)| {
+            let (ocean_clipmap, ocean_clipmap_id) = match water_plane.and_then(|(plane, minimum, maximum)| {
                 ocean_clipmaps.get(&ocean_surface_key(plane, minimum, maximum)).cloned()
-            });
+            }) {
+                Some((ranges, id)) => (Some(ranges), id),
+                None => (None, u8::MAX),
+            };
             if let Some((plane, _, _)) = water_plane {
                 source.planar_plane = [0.0, 1.0, 0.0, -plane];
             }
@@ -23973,6 +27050,7 @@ fn build_world(
                 is_inline_entity: false,
                 inline_group: u32::MAX,
                 ocean_clipmap,
+                ocean_clipmap_id,
                 source,
                 bind_group,
                 fast_bind_group,
@@ -24264,6 +27342,12 @@ fn build_world(
             | wgpu::BufferUsages::INDIRECT
             | wgpu::BufferUsages::COPY_DST,
     });
+    let early_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA Hi-Z early indirect draw arguments"),
+        size: (cull_records.len().max(1) * std::mem::size_of::<DrawIndexedIndirectArgs>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        mapped_at_creation: false,
+    });
     let active_cull_indices = vec![0_u32; usize::try_from(cull_count.max(1)).unwrap_or(1)];
     let active_cull_indices_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA active GPU cull indices"),
@@ -24347,7 +27431,12 @@ fn build_world(
     });
     let local_shadows = create_local_shadow_resources(device, shadow_caster_layout);
     let static_light_grid_gpu = upload_static_light_grid(device, queue, static_light_grid.as_ref());
-    let entity_light_grid = static_light_grid.map(scene::StaticLightGrid::into_classic_entity_grid);
+    let entity_light_grid = static_light_grid.map(scene::StaticLightGrid::into_classic_entity_grid).map(|mut grid| {
+        if let Some(sun) = sun {
+            grid.estimate_sun_weights(sun.direction, sun.color);
+        }
+        grid
+    });
     let voxel_probe_gi = upload_voxel_probe_gi(device, queue, voxel_probe_gi_data.as_ref());
     if light_count != 0 {
         println!(
@@ -24608,37 +27697,6 @@ fn build_world(
         .filter(|_| !full_batches.is_empty())
         .map(|vis| visible_batches_by_cluster(&full_batches, vis))
         .unwrap_or_default();
-    let auto_use_full_by_cluster = if full_visible_batches_by_cluster.is_empty() {
-        Vec::new()
-    } else {
-        coarse_visible_batches_by_cluster
-            .iter()
-            .zip(&full_visible_batches_by_cluster)
-            .map(|(coarse, full)| {
-                estimated_batch_cost(&full_batches, full)
-                    < estimated_batch_cost(&coarse_batches, coarse)
-            })
-            .collect()
-    };
-    let (
-        auto2_visible_batches_by_cluster,
-        auto2_candidate_batches_by_cluster,
-        auto3_visible_batches_by_cluster,
-        auto3_candidate_batches_by_cluster,
-    ) = build_auto2_visibility_tables(
-        &coarse_batches,
-        &full_batches,
-        &coarse_visible_batches_by_cluster,
-        &full_visible_batches_by_cluster,
-    );
-    // Clone only WGPU handles/CPU metadata after compaction assignment. No GPU
-    // geometry, index data, uniforms or textures are duplicated for AUTO 2.
-    let auto2_batches = coarse_batches
-        .iter()
-        .cloned()
-        .chain(full_batches.iter().cloned())
-        .collect::<Vec<_>>();
-
     if let (Some(auto4), false) = (&auto4, coarse_visible_batches_by_cluster.is_empty()) {
         let plan_stats = |batches: &[WorldBatch], plans: &[Vec<usize>], by_cluster: Option<&[usize]>| {
             let mut total_batches = 0usize;
@@ -24804,11 +27862,14 @@ fn build_world(
 
     (
         WorldGpu {
+            mark_surfaces,
             source_map,
             source_map_lighting,
             sky_average,
+            sky_portal,
             primary_skybox,
             ocean_surfaces,
+            ocean_masks: Arc::new(ocean_masks),
             inline_models,
             vertex_buffer,
             index_buffer,
@@ -24818,6 +27879,7 @@ fn build_world(
             ocean_coarsest_spacing: upload_timings.ocean_coarsest_spacing,
             cull_records_buffer,
             indirect_buffer,
+            early_indirect_buffer,
             active_cull_indices_buffer,
             compact_indirect_buffer,
             compact_count_buffer,
@@ -24861,15 +27923,9 @@ fn build_world(
             planar_reflectors,
             coarse_batches,
             full_batches,
-            auto2_batches,
             visibility,
             coarse_visible_batches_by_cluster,
             full_visible_batches_by_cluster,
-            auto_use_full_by_cluster,
-            auto2_visible_batches_by_cluster,
-            auto2_candidate_batches_by_cluster,
-            auto3_visible_batches_by_cluster,
-            auto3_candidate_batches_by_cluster,
             auto4_batches,
             auto4_plan_refs,
             auto4_plan_by_cluster,
@@ -25352,235 +28408,6 @@ fn visible_batches_by_cluster(
     by_cluster
 }
 
-fn estimated_world_batch_cost(batch: &WorldBatch) -> u64 {
-    let vertices = u64::from(batch.source.vertices.end - batch.source.vertices.start);
-    vertices.saturating_add(AUTO_DRAW_VERTEX_EQUIVALENT)
-}
-
-fn estimated_batch_cost(batches: &[WorldBatch], indices: &[usize]) -> u64 {
-    indices.iter().fold(0_u64, |cost, &index| {
-        cost.saturating_add(estimated_world_batch_cost(&batches[index]))
-    })
-}
-
-/// Build AUTO 2 and AUTO 3 hybrid representations once at map upload.
-/// Existing AUTO makes one coarse-vs-full decision for the whole camera cluster;
-/// AUTO 2 applies the same cost comparison per coarse material/surface group.
-/// AUTO 3 is stricter: it only substitutes the coarse parent when that parent is
-/// visibility-equivalent to Full for the current cluster and for every possible
-/// runtime areamask state.
-///
-/// Returned indices address `coarse_batches` followed by `full_batches`, which
-/// lets the renderer use one ordinary WorldBatch slice in every pass.
-fn build_auto2_visibility_tables(
-    coarse_batches: &[WorldBatch],
-    full_batches: &[WorldBatch],
-    coarse_visible_by_cluster: &[Vec<usize>],
-    full_visible_by_cluster: &[Vec<usize>],
-) -> (Vec<Vec<usize>>, Vec<usize>, Vec<Vec<usize>>, Vec<usize>) {
-    if full_batches.is_empty()
-        || coarse_visible_by_cluster.len() != full_visible_by_cluster.len()
-    {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    }
-
-    struct SurfaceGroup {
-        coarse: std::ops::Range<usize>,
-        full_indices: Vec<usize>,
-        vertex_start: u32,
-        vertex_end: u32,
-        bsp_shader_index: u32,
-    }
-
-    // Multi-stage shader passes sharing one authored geometry range must make
-    // the decision together; mixing stages from coarse and full would break
-    // authored ordering/fog semantics.
-    let mut groups = Vec::<SurfaceGroup>::new();
-    let mut start = 0usize;
-    while start < coarse_batches.len() {
-        let mut end = start + 1;
-        while end < coarse_batches.len()
-            && same_world_surface(&coarse_batches[start], &coarse_batches[end])
-        {
-            end += 1;
-        }
-        groups.push(SurfaceGroup {
-            coarse: start..end,
-            full_indices: Vec::new(),
-            vertex_start: coarse_batches[start].source.vertices.start,
-            vertex_end: coarse_batches[start].source.vertices.end,
-            bsp_shader_index: coarse_batches[start].source.bsp_shader_index,
-        });
-        start = end;
-    }
-
-    // Full pieces are subranges of exactly one coarse geometry range. Index the
-    // parents by shader/range so this mapping is O(n log n), not coarse*full.
-    let mut groups_by_shader = BTreeMap::<u32, Vec<(u32, u32, usize)>>::new();
-    for (group_index, group) in groups.iter().enumerate() {
-        groups_by_shader
-            .entry(group.bsp_shader_index)
-            .or_default()
-            .push((group.vertex_start, group.vertex_end, group_index));
-    }
-    for ranges in groups_by_shader.values_mut() {
-        ranges.sort_unstable_by_key(|entry| entry.0);
-    }
-    for (full_index, batch) in full_batches.iter().enumerate() {
-        let Some(ranges) = groups_by_shader.get(&batch.source.bsp_shader_index) else {
-            continue;
-        };
-        let slot = ranges.partition_point(|entry| entry.0 <= batch.source.vertices.start);
-        if slot == 0 {
-            continue;
-        }
-        let (parent_start, parent_end, group_index) = ranges[slot - 1];
-        if batch.source.vertices.start >= parent_start
-            && batch.source.vertices.end <= parent_end
-        {
-            groups[group_index].full_indices.push(full_index);
-        }
-    }
-
-    let full_offset = coarse_batches.len();
-    let mut auto2_visible = Vec::with_capacity(coarse_visible_by_cluster.len());
-    let mut auto2_candidates = Vec::with_capacity(coarse_visible_by_cluster.len());
-    let mut auto3_visible = Vec::with_capacity(coarse_visible_by_cluster.len());
-    let mut auto3_candidates = Vec::with_capacity(coarse_visible_by_cluster.len());
-    let mut coarse_visible_flags = vec![false; coarse_batches.len()];
-    let mut full_visible_flags = vec![false; full_batches.len()];
-
-    for (coarse_visible, full_visible) in coarse_visible_by_cluster
-        .iter()
-        .zip(full_visible_by_cluster)
-    {
-        for &index in coarse_visible {
-            if let Some(flag) = coarse_visible_flags.get_mut(index) {
-                *flag = true;
-            }
-        }
-        for &index in full_visible {
-            if let Some(flag) = full_visible_flags.get_mut(index) {
-                *flag = true;
-            }
-        }
-
-        let mut selected2 = Vec::<usize>::with_capacity(coarse_visible.len());
-        let mut selected3 = Vec::<usize>::with_capacity(coarse_visible.len());
-        let mut candidate2 = 0usize;
-        let mut candidate3 = 0usize;
-
-        for group in &groups {
-            let coarse_group_visible = group.coarse.clone().any(|index| coarse_visible_flags[index]);
-            if !coarse_group_visible {
-                candidate2 = candidate2.saturating_add(group.coarse.len());
-                candidate3 = candidate3.saturating_add(group.coarse.len());
-                continue;
-            }
-
-            let coarse_cost = group
-                .coarse
-                .clone()
-                .filter(|&index| coarse_visible_flags[index])
-                .fold(0_u64, |cost, index| {
-                    cost.saturating_add(estimated_world_batch_cost(&coarse_batches[index]))
-                });
-            let mut full_cost = 0_u64;
-            let mut visible_full_count = 0usize;
-            for &index in &group.full_indices {
-                if full_visible_flags[index] {
-                    visible_full_count += 1;
-                    full_cost = full_cost
-                        .saturating_add(estimated_world_batch_cost(&full_batches[index]));
-                }
-            }
-
-            // AUTO 2: retain the original per-group cost heuristic exactly.
-            if visible_full_count != 0 && full_cost < coarse_cost {
-                candidate2 = candidate2.saturating_add(group.full_indices.len());
-                selected2.extend(
-                    group
-                        .full_indices
-                        .iter()
-                        .copied()
-                        .filter(|&index| full_visible_flags[index])
-                        .map(|index| full_offset + index),
-                );
-            } else {
-                candidate2 = candidate2.saturating_add(group.coarse.len());
-                selected2.extend(
-                    group
-                        .coarse
-                        .clone()
-                        .filter(|&index| coarse_visible_flags[index]),
-                );
-            }
-
-            // AUTO 3: collapse only if doing so is *exactly* equivalent to Full.
-            // All Full children must be PVS-visible for this camera cluster, and
-            // all of them must have identical area membership. If area membership
-            // differs, an areamask can hide only some children, so using the
-            // coarse OR-mask would re-open hidden portal geometry.
-            let all_full_visible = !group.full_indices.is_empty()
-                && visible_full_count == group.full_indices.len();
-            let same_area_membership = group
-                .full_indices
-                .first()
-                .map(|&first| {
-                    let signature = full_batches[first].source.area_signature;
-                    group.full_indices.iter().all(|&index| {
-                        full_batches[index].source.area_signature == signature
-                    })
-                })
-                .unwrap_or(false);
-
-            if group.full_indices.is_empty() || (all_full_visible && same_area_membership) {
-                // Missing parent mapping falls back conservatively to the coarse
-                // representation rather than dropping geometry.
-                candidate3 = candidate3.saturating_add(group.coarse.len());
-                selected3.extend(
-                    group
-                        .coarse
-                        .clone()
-                        .filter(|&index| coarse_visible_flags[index]),
-                );
-            } else {
-                candidate3 = candidate3.saturating_add(group.full_indices.len());
-                selected3.extend(
-                    group
-                        .full_indices
-                        .iter()
-                        .copied()
-                        .filter(|&index| full_visible_flags[index])
-                        .map(|index| full_offset + index),
-                );
-            }
-        }
-
-        for &index in coarse_visible {
-            if let Some(flag) = coarse_visible_flags.get_mut(index) {
-                *flag = false;
-            }
-        }
-        for &index in full_visible {
-            if let Some(flag) = full_visible_flags.get_mut(index) {
-                *flag = false;
-            }
-        }
-        auto2_visible.push(selected2);
-        auto2_candidates.push(candidate2);
-        auto3_visible.push(selected3);
-        auto3_candidates.push(candidate3);
-    }
-
-    (
-        auto2_visible,
-        auto2_candidates,
-        auto3_visible,
-        auto3_candidates,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn create_fast_world_bind_group(
     device: &wgpu::Device,
@@ -25990,7 +28817,6 @@ fn rebuild_world_bind_groups(
     let WorldGpu {
         coarse_batches,
         full_batches,
-        auto2_batches,
         textures,
         lightmaps,
         deluxemaps,
@@ -26009,7 +28835,6 @@ fn rebuild_world_bind_groups(
     for batch in coarse_batches
         .iter_mut()
         .chain(full_batches.iter_mut())
-        .chain(auto2_batches.iter_mut())
     {
         let selected_detail_texture = detail_texture_for_source(
             &batch.source,
@@ -26082,6 +28907,12 @@ fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> Materi
             out.vector_t = [t[0], t[2], -t[1], 0.0];
         }
         TcGen::Environment => out.header[0] = 3,
+        TcGen::SkyCloud(height) => {
+            // Per-pixel view-direction projection onto the cloud layer; the
+            // sky fragment shader consumes the height from params[2].
+            out.header[0] = 4;
+            out.params[2] = height;
+        }
     }
     let count = source.tc_mods.len().min(4);
     out.header[1] = count as u32;
@@ -26105,6 +28936,18 @@ fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> Materi
         out.header[2] |= 1048576;
     } else if matches!(source.alpha_gen, AlphaGen::OneMinusVertex) {
         out.header[2] |= 2097152;
+    }
+
+    // Waveform generators replace the stage's RGB / alpha in the shader.
+    if let RgbGen::Wave(wave) = source.rgb_gen {
+        out.header[2] |= 134217728;
+        out.wave_rgb = [wave.base, wave.amplitude, wave.phase, wave.frequency];
+        out.wave_funcs[0] = wave.func.id();
+    }
+    if let AlphaGen::Wave(wave) = source.alpha_gen {
+        out.header[2] |= 268435456;
+        out.wave_alpha = [wave.base, wave.amplitude, wave.phase, wave.frequency];
+        out.wave_funcs[1] = wave.func.id();
     }
 
     if source.modulate_lightmap {
@@ -26175,8 +29018,11 @@ fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> Materi
             TcMod::Scale(x, y) => out.mods[a] = [2.0, x, y, 0.0],
             TcMod::Rotate(degrees) => out.mods[a] = [3.0, degrees, 0.0, 0.0],
             TcMod::Transform(v) => {
-                out.mods[a] = [4.0, v[0], v[1], v[4]];
-                out.mods[a + 1] = [v[2], v[3], v[5], 0.0];
+                // `tcMod transform m00 m01 m10 m11 t0 t1` is applied by the
+                // engine as s' = s*m00 + t*m10 + t0, t' = s*m01 + t*m11 + t1,
+                // so the shader's first row is (m00, m10) and second (m01, m11).
+                out.mods[a] = [4.0, v[0], v[2], v[4]];
+                out.mods[a + 1] = [v[1], v[3], v[5], 0.0];
             }
             TcMod::Turb {
                 base,
@@ -26197,6 +29043,9 @@ fn material_uniform(source: &DrawBatch, detail_texture_eligible: bool) -> Materi
     }
     if source.skybox.is_some() {
         out.header[3] |= 1;
+    }
+    if source.dlight_in_lightmap_stage {
+        out.header[3] |= 1 << 16;
     }
     if detail_texture_eligible {
         out.header[3] |= 2;
@@ -26273,28 +29122,121 @@ fn create_world_pipelines(
         key.legacy_dlights = false;
         key
     });
-    let mut pipelines = BTreeMap::new();
-    for batch in batches {
-        pipelines.entry(batch.source.pipeline).or_insert_with(|| {
-            create_world_pipeline(
-                device,
-                layout,
-                shader,
-                surface_format,
-                batch.source.pipeline,
-                msaa_samples,
-                legacy_fog,
-                false,
-                base_shader_variant,
-                false,
-            )
-        });
-    }
+    let mut jobs = batches
+        .iter()
+        .map(|batch| batch.source.pipeline)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|key| (key, legacy_fog))
+        .collect::<Vec<_>>();
     if shader_variant.is_some_and(|key| key.ocean) {
-        pipelines.insert(ocean_pipeline_key(), create_world_pipeline(device, layout, shader,
-            surface_format, ocean_pipeline_key(), msaa_samples, false, false, base_shader_variant, false));
+        // Ocean never uses the legacy-fog entry point; appended last so it
+        // replaces any batch pipeline that shares its key, as before.
+        jobs.push((ocean_pipeline_key(), false));
     }
-    pipelines
+    let keys = jobs.iter().map(|&(key, _)| key).collect::<Vec<_>>();
+    let compiled = compile_pipeline_jobs("world", jobs, |&(key, fog)| {
+        create_world_pipeline(
+            device,
+            layout,
+            shader,
+            surface_format,
+            key,
+            msaa_samples,
+            fog,
+            false,
+            base_shader_variant,
+            false,
+        )
+    });
+    keys.into_iter().zip(compiled).collect()
+}
+
+/// Worker count for parallel pipeline compilation. `JKA_PIPELINE_COMPILE_THREADS`
+/// overrides it (1 = serial) for A/B timing; otherwise use most logical cores while
+/// leaving one for the game thread.
+fn pipeline_compile_workers(jobs: usize) -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    let configured = *CONFIGURED.get_or_init(|| {
+        std::env::var("JKA_PIPELINE_COMPILE_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&count| count > 0)
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map_or(4, |count| count.get())
+                    .saturating_sub(1)
+                    .clamp(1, 12)
+            })
+    });
+    configured.min(jobs).max(1)
+}
+
+/// Runs `create` for every job, in parallel across scoped worker threads, and returns
+/// the results in job order. wgpu pipeline creation is thread-safe, so the driver
+/// compiles overlap instead of stalling the render thread one after another.
+/// Logs the pipeline count and wall/summed/slowest compile times.
+fn compile_pipeline_jobs<K, T>(
+    label: &str,
+    jobs: Vec<K>,
+    create: impl Fn(&K) -> T + Sync,
+) -> Vec<T>
+where
+    K: Sync,
+    T: Send,
+{
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let started = Instant::now();
+    let workers = pipeline_compile_workers(jobs.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let run_worker = || {
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(job) = jobs.get(index) else {
+                break;
+            };
+            let job_started = Instant::now();
+            let value = create(job);
+            done.push((index, value, job_started.elapsed()));
+        }
+        done
+    };
+    let mut finished = if workers <= 1 {
+        run_worker()
+    } else {
+        thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|_| scope.spawn(&run_worker))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("pipeline compile worker panicked"))
+                .collect::<Vec<_>>()
+        })
+    };
+    finished.sort_unstable_by_key(|&(index, ..)| index);
+    let summed = finished
+        .iter()
+        .map(|(_, _, elapsed)| elapsed.as_secs_f64() * 1000.0)
+        .sum::<f64>();
+    let slowest = finished
+        .iter()
+        .map(|(_, _, elapsed)| elapsed.as_secs_f64() * 1000.0)
+        .fold(0.0_f64, f64::max);
+    println!(
+        "Renderer pipeline compile [{}]: {} pipeline(s) on {} worker(s) in {:.1} ms wall ({:.1} ms summed, {:.1} ms slowest, {:.1} ms avg)",
+        label,
+        finished.len(),
+        workers,
+        started.elapsed().as_secs_f64() * 1000.0,
+        summed,
+        slowest,
+        summed / finished.len() as f64,
+    );
+    finished.into_iter().map(|(_, value, _)| value).collect()
 }
 
 fn legacy_dlight_receives(source: &DrawBatch) -> bool {
@@ -26312,31 +29254,56 @@ fn create_legacy_dlight_pass_pipelines(
     batches: &[WorldBatch],
     shader_variant: WorldShaderVariantKey,
 ) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
-    let mut pipelines = BTreeMap::new();
-    for batch in batches {
-        if !legacy_dlight_receives(&batch.source) {
-            continue;
+    let originals = batches
+        .iter()
+        .filter(|batch| legacy_dlight_receives(&batch.source))
+        .map(|batch| batch.source.pipeline)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let compiled = compile_pipeline_jobs("legacy-dlight", originals.clone(), |&original| {
+        let mut dlight_key = original;
+        dlight_key.depth_write = false;
+        dlight_key.depth_equal = true;
+        create_world_pipeline(
+            device,
+            layout,
+            shader,
+            surface_format,
+            dlight_key,
+            msaa_samples,
+            false,
+            false,
+            Some(shader_variant),
+            true,
+        )
+    });
+    originals.into_iter().zip(compiled).collect()
+}
+
+/// Distinct `(pipeline, surface_writes_depth)` pairs of the legacy fog passes, in the
+/// order the batches first introduce them. Sky is skipped, as the passes never fog it.
+fn legacy_fog_pass_jobs(batches: &[WorldBatch]) -> Vec<(PipelineKey, bool)> {
+    let mut seen = BTreeSet::new();
+    let mut jobs = Vec::new();
+    let mut start = 0usize;
+    while start < batches.len() {
+        let mut end = start + 1;
+        while end < batches.len() && same_world_surface(&batches[start], &batches[end]) {
+            end += 1;
         }
-        let original = batch.source.pipeline;
-        pipelines.entry(original).or_insert_with(|| {
-            let mut dlight_key = original;
-            dlight_key.depth_write = false;
-            dlight_key.depth_equal = true;
-            create_world_pipeline(
-                device,
-                layout,
-                shader,
-                surface_format,
-                dlight_key,
-                msaa_samples,
-                false,
-                false,
-                Some(shader_variant),
-                true,
-            )
-        });
+        let surface_writes_depth = batches[start..end]
+            .iter()
+            .any(|batch| batch.source.pipeline.depth_write);
+        for batch in &batches[start..end] {
+            let original = batch.source.pipeline;
+            if original.class != DrawClass::Sky && seen.insert((original, surface_writes_depth)) {
+                jobs.push((original, surface_writes_depth));
+            }
+        }
+        start = end;
     }
-    pipelines
+    jobs
 }
 
 fn legacy_fog_pass_pipeline_key(source: PipelineKey, depth_equal: bool) -> PipelineKey {
@@ -26366,41 +29333,22 @@ fn create_legacy_fog_pass_pipelines(
     batches: &[WorldBatch],
     shader_variant: Option<WorldShaderVariantKey>,
 ) -> BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline> {
-    let mut pipelines = BTreeMap::new();
-    let mut start = 0usize;
-    while start < batches.len() {
-        let mut end = start + 1;
-        while end < batches.len() && same_world_surface(&batches[start], &batches[end]) {
-            end += 1;
-        }
-        let surface_writes_depth = batches[start..end]
-            .iter()
-            .any(|batch| batch.source.pipeline.depth_write);
-        for batch in &batches[start..end] {
-            let original = batch.source.pipeline;
-            if original.class == DrawClass::Sky {
-                continue;
-            }
-            pipelines
-                .entry((original, surface_writes_depth))
-                .or_insert_with(|| {
-                    create_world_pipeline(
-                        device,
-                        layout,
-                        shader,
-                        surface_format,
-                        legacy_fog_pass_pipeline_key(original, surface_writes_depth),
-                        msaa_samples,
-                        true,
-                        true,
-                        shader_variant,
-                        false,
-                    )
-                });
-        }
-        start = end;
-    }
-    pipelines
+    let jobs = legacy_fog_pass_jobs(batches);
+    let compiled = compile_pipeline_jobs("legacy-fog-pass", jobs.clone(), |&(original, writes_depth)| {
+        create_world_pipeline(
+            device,
+            layout,
+            shader,
+            surface_format,
+            legacy_fog_pass_pipeline_key(original, writes_depth),
+            msaa_samples,
+            true,
+            true,
+            shader_variant,
+            false,
+        )
+    });
+    jobs.into_iter().zip(compiled).collect()
 }
 
 fn ocean_pipeline_key() -> PipelineKey {
@@ -26417,31 +29365,33 @@ fn create_reflection_pipelines(
     legacy_fog: bool,
     shader_variant: WorldShaderVariantKey,
 ) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
-    let mut pipelines = BTreeMap::new();
-    for batch in batches {
-        let original = batch.source.pipeline;
-        pipelines.entry(original).or_insert_with(|| {
-            let mut reflected = original;
-            reflected.cull = match reflected.cull {
-                CullMode::None => CullMode::None,
-                CullMode::Front => CullMode::Back,
-                CullMode::Back => CullMode::Front,
-            };
-            create_world_pipeline(
-                device,
-                layout,
-                shader,
-                surface_format,
-                reflected,
-                1,
-                legacy_fog,
-                false,
-                Some(shader_variant),
-                false,
-            )
-        });
-    }
-    pipelines
+    let originals = batches
+        .iter()
+        .map(|batch| batch.source.pipeline)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let compiled = compile_pipeline_jobs("reflection", originals.clone(), |&original| {
+        let mut reflected = original;
+        reflected.cull = match reflected.cull {
+            CullMode::None => CullMode::None,
+            CullMode::Front => CullMode::Back,
+            CullMode::Back => CullMode::Front,
+        };
+        create_world_pipeline(
+            device,
+            layout,
+            shader,
+            surface_format,
+            reflected,
+            1,
+            legacy_fog,
+            false,
+            Some(shader_variant),
+            false,
+        )
+    });
+    originals.into_iter().zip(compiled).collect()
 }
 
 fn create_reflection_fog_pass_pipelines(
@@ -26452,48 +29402,28 @@ fn create_reflection_fog_pass_pipelines(
     batches: &[WorldBatch],
     shader_variant: WorldShaderVariantKey,
 ) -> BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline> {
-    let mut pipelines = BTreeMap::new();
-    let mut start = 0usize;
-    while start < batches.len() {
-        let mut end = start + 1;
-        while end < batches.len() && same_world_surface(&batches[start], &batches[end]) {
-            end += 1;
-        }
-        let surface_writes_depth = batches[start..end]
-            .iter()
-            .any(|batch| batch.source.pipeline.depth_write);
-        for batch in &batches[start..end] {
-            let original = batch.source.pipeline;
-            if original.class == DrawClass::Sky {
-                continue;
-            }
-            pipelines
-                .entry((original, surface_writes_depth))
-                .or_insert_with(|| {
-                    let mut reflected =
-                        legacy_fog_pass_pipeline_key(original, surface_writes_depth);
-                    reflected.cull = match reflected.cull {
-                        CullMode::None => CullMode::None,
-                        CullMode::Front => CullMode::Back,
-                        CullMode::Back => CullMode::Front,
-                    };
-                    create_world_pipeline(
-                        device,
-                        layout,
-                        shader,
-                        surface_format,
-                        reflected,
-                        1,
-                        true,
-                        true,
-                        Some(shader_variant),
-                        false,
-                    )
-                });
-        }
-        start = end;
-    }
-    pipelines
+    let jobs = legacy_fog_pass_jobs(batches);
+    let compiled = compile_pipeline_jobs("reflection-fog-pass", jobs.clone(), |&(original, writes_depth)| {
+        let mut reflected = legacy_fog_pass_pipeline_key(original, writes_depth);
+        reflected.cull = match reflected.cull {
+            CullMode::None => CullMode::None,
+            CullMode::Front => CullMode::Back,
+            CullMode::Back => CullMode::Front,
+        };
+        create_world_pipeline(
+            device,
+            layout,
+            shader,
+            surface_format,
+            reflected,
+            1,
+            true,
+            true,
+            Some(shader_variant),
+            false,
+        )
+    });
+    jobs.into_iter().zip(compiled).collect()
 }
 
 fn planar_reflector_enabled(mode: PlanarReflectionMode, kind: PlanarReflectorKind) -> bool {
@@ -27253,7 +30183,7 @@ fn refresh_auto4_lazy_collapse(
     area_mask: Option<[u8; 32]>,
     log: bool,
 ) {
-    if mode != PvsMode::Auto4 || world.auto4_plan_refs.is_empty() {
+    if mode != PvsMode::Auto || world.auto4_plan_refs.is_empty() {
         return;
     }
     let plan_id = world
@@ -27451,45 +30381,7 @@ fn active_batch_selection(world: &WorldGpu, mode: PvsMode) -> ActiveBatchSelecti
     };
     match mode {
         PvsMode::Full => full,
-        PvsMode::Auto
-            if world
-                .auto_use_full_by_cluster
-                .get(cluster)
-                .copied()
-                .unwrap_or(false) =>
-        {
-            full
-        }
-        PvsMode::Auto => coarse,
-        PvsMode::Auto2 => {
-            let Some(indices) = world.auto2_visible_batches_by_cluster.get(cluster) else {
-                return coarse;
-            };
-            ActiveBatchSelection {
-                batches: &world.auto2_batches,
-                indices,
-                candidate_count: world
-                    .auto2_candidate_batches_by_cluster
-                    .get(cluster)
-                    .copied()
-                    .unwrap_or(world.coarse_batches.len()),
-            }
-        }
-        PvsMode::Auto3 => {
-            let Some(indices) = world.auto3_visible_batches_by_cluster.get(cluster) else {
-                return full;
-            };
-            ActiveBatchSelection {
-                batches: &world.auto2_batches,
-                indices,
-                candidate_count: world
-                    .auto3_candidate_batches_by_cluster
-                    .get(cluster)
-                    .copied()
-                    .unwrap_or(world.full_batches.len()),
-            }
-        }
-        PvsMode::Auto4 => {
+        PvsMode::Auto => {
             if world.auto4_batches.is_empty() || world.auto4_active_plan.is_empty() {
                 return full;
             }
@@ -27973,16 +30865,43 @@ fn create_targets(
     let ssr_visibility_view = ssr_visibility_texture
         .as_ref()
         .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
-    let max_depth_dimension = width.max(height).max(1);
-    let linear_depth_mip_count = 32 - max_depth_dimension.leading_zeros();
+    let previous_power_of_two = |value: u32| 1_u32 << (31 - value.max(1).leading_zeros());
+    let hiz_width = previous_power_of_two(width);
+    let hiz_height = previous_power_of_two(height);
+    let hiz_mip_count = 32 - hiz_width.max(hiz_height).leading_zeros();
+    let hiz_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA Hi-Z depth pyramid"),
+        size: wgpu::Extent3d {
+            width: hiz_width,
+            height: hiz_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: hiz_mip_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let hiz_view = hiz_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let hiz_mip_views = (0..hiz_mip_count)
+        .map(|mip| {
+            hiz_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA Hi-Z mip view"),
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
     let linear_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("JKA linear depth / Hi-Z pyramid"),
+        label: Some("JKA linear depth"),
         size: wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
             depth_or_array_layers: 1,
         },
-        mip_level_count: linear_depth_mip_count,
+        mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R32Float,
@@ -28000,16 +30919,6 @@ fn create_targets(
         usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING),
         ..Default::default()
     });
-    let linear_depth_mip_views = (0..linear_depth_mip_count)
-        .map(|mip| {
-            linear_depth_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("JKA Hi-Z mip view"),
-                base_mip_level: mip,
-                mip_level_count: Some(1),
-                ..Default::default()
-            })
-        })
-        .collect();
     let (rain_haze_mask_width, rain_haze_mask_height) =
         weather::rain_haze_mask_dimensions(width.max(1), height.max(1));
     let rain_haze_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -28056,8 +30965,12 @@ fn create_targets(
         reflection_mask_view,
         _ssr_visibility_texture: ssr_visibility_texture,
         ssr_visibility_view,
-        linear_depth_mip_views,
-        linear_depth_mip_count,
+        _hiz_texture: hiz_texture,
+        hiz_view,
+        hiz_mip_views,
+        hiz_mip_count,
+        hiz_width,
+        hiz_height,
         _rain_haze_mask_texture: rain_haze_mask_texture,
         rain_haze_mask_view,
         rain_haze_mask_width,
@@ -28523,17 +31436,10 @@ fn create_color_lut_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     preset: ColorLutPreset,
+    base: &Path,
+    game: Option<&Path>,
 ) -> (wgpu::Texture, wgpu::TextureView) {
-    let size = if preset == ColorLutPreset::Off {
-        2
-    } else {
-        color_lut::LUT_SIZE
-    };
-    let data = if preset == ColorLutPreset::Off {
-        color_lut::identity_rgba8(size)
-    } else {
-        color_lut::bake_rgba8(preset)
-    };
+    let (size, data) = color_lut::build_rgba8(preset, base, game);
     let texture = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -28763,12 +31669,33 @@ fn storage_buffer_entry(
     }
 }
 
+fn create_hiz_build_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    targets: &RenderTargets,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA Hi-Z build bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&targets.ao_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&targets.hiz_mip_views[0]),
+            },
+        ],
+    })
+}
+
 fn create_hiz_reduce_bind_groups(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     targets: &RenderTargets,
 ) -> Vec<wgpu::BindGroup> {
-    (1..targets.linear_depth_mip_count)
+    (1..targets.hiz_mip_count)
         .map(|mip| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("JKA Hi-Z reduce bind group"),
@@ -28777,13 +31704,13 @@ fn create_hiz_reduce_bind_groups(
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::TextureView(
-                            &targets.linear_depth_mip_views[(mip - 1) as usize],
+                            &targets.hiz_mip_views[(mip - 1) as usize],
                         ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::TextureView(
-                            &targets.linear_depth_mip_views[mip as usize],
+                            &targets.hiz_mip_views[mip as usize],
                         ),
                     },
                 ],
@@ -28819,6 +31746,7 @@ fn create_gpu_cull_bind_group(
     compact_counts: &wgpu::Buffer,
     debug_reasons: &wgpu::Buffer,
     debug_counts: &wgpu::Buffer,
+    early_indirect: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA GPU cull bind group"),
@@ -28859,6 +31787,10 @@ fn create_gpu_cull_bind_group(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: debug_counts.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: early_indirect.as_entire_binding(),
             },
         ],
     })
@@ -29334,12 +32266,16 @@ fn try_load_ui_font_asset(assets: &mut AssetSearchPath, path: &str) -> Option<Te
         match crate::materials::decode_texture_data(&name, &asset.bytes, true, false) {
             Ok(data) => {
                 let data = normalize_ui_font(data);
-                println!(
-                    "UI font: {}x{} {} from {}",
-                    data.width,
-                    data.height,
-                    name,
-                    asset.source.display()
+                crate::logging::write_line_with_path(
+                    crate::logging::Level::Info,
+                    format_args!(
+                        "UI font: {}x{} {} from {}",
+                        data.width,
+                        data.height,
+                        name,
+                        asset.source.display()
+                    ),
+                    asset.source.clone(),
                 );
                 return Some(data);
             }
@@ -29387,12 +32323,16 @@ fn try_load_texture_asset_from_search_path(
             srgb,
         ) {
             Ok(data) => {
-                println!(
-                    "{log_prefix}: {}x{} {} from {}",
-                    data.width,
-                    data.height,
-                    name,
-                    asset.source.display()
+                crate::logging::write_line_with_path(
+                    crate::logging::Level::Info,
+                    format_args!(
+                        "{log_prefix}: {}x{} {} from {}",
+                        data.width,
+                        data.height,
+                        name,
+                        asset.source.display()
+                    ),
+                    asset.source.clone(),
                 );
                 return Some(data);
             }
@@ -29422,6 +32362,36 @@ fn try_load_texture_asset(
         &mut assets, path, clamp, mipmaps, srgb, log_prefix,
     )
 }
+/// Runs one startup step and logs it when it is slow enough to matter. Used for
+/// pipeline compiles, which run on worker threads where the per-phase marks in
+/// `Renderer::new` cannot see them.
+fn timed_init_step<T>(name: &str, step: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let value = step();
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if ms >= 4.0 {
+        println!("[RENDER INIT] {name} {ms:.1} ms");
+    }
+    value
+}
+
+/// `Device::create_shader_module` that logs modules slow enough to matter at
+/// startup (naga parse + validation of large WGSL), so the "[RENDER INIT]" lines
+/// show which module to split, trim or build off-thread.
+fn create_shader_module_timed(
+    device: &wgpu::Device,
+    descriptor: wgpu::ShaderModuleDescriptor<'_>,
+) -> wgpu::ShaderModule {
+    let label = descriptor.label.unwrap_or("unlabeled").to_owned();
+    let started = Instant::now();
+    let module = device.create_shader_module(descriptor);
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if ms >= 4.0 {
+        println!("[RENDER INIT] shader module '{label}' {ms:.1} ms");
+    }
+    module
+}
+
 fn load_texture_asset_or_missing(
     base: &Path,
     game: Option<&Path>,
@@ -29438,6 +32408,116 @@ fn load_texture_asset_or_missing(
         );
         missing.clone()
     })
+}
+
+/// Packs the 27 `gfx/hud/keys/*` images `DF_DrawMovementKeys` draws into one
+/// `ui::KEY_ATLAS_COLUMNS`-wide atlas, in `ui::MOVEMENT_KEY_ART` order. They come
+/// from `japro-assets.pk3`, which is required in base, so the normal asset
+/// search path finds them for every mod. A missing image leaves its cell
+/// transparent.
+fn load_ui_key_atlas(base: &Path, game: Option<&Path>) -> TextureData {
+    let cell = ui::KEY_ART_SIZE;
+    let columns = ui::KEY_ATLAS_COLUMNS;
+    let rows = (ui::MOVEMENT_KEY_ART.len() as u32).div_ceil(columns);
+    let (width, height) = (columns * cell, rows * cell);
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+    let mut missing = 0usize;
+    match AssetSearchPath::open_game(base, game) {
+        Ok(mut assets) => {
+            for (index, name) in ui::MOVEMENT_KEY_ART.iter().enumerate() {
+                let path = format!("gfx/hud/keys/{name}");
+                let Some(image) = try_load_texture_asset_from_search_path(
+                    &mut assets, &path, true, false, true, "UI movement key",
+                ) else {
+                    missing += 1;
+                    continue;
+                };
+                if image.width != cell || image.height != cell {
+                    eprintln!("UI movement key {path}: expected {cell}x{cell}, got {}x{}", image.width, image.height);
+                    missing += 1;
+                    continue;
+                }
+                let (column, row) = (index as u32 % columns, index as u32 / columns);
+                for y in 0..cell {
+                    let src = (y * cell * 4) as usize;
+                    let dst = (((row * cell + y) * width + column * cell) * 4) as usize;
+                    rgba[dst..dst + (cell * 4) as usize]
+                        .copy_from_slice(&image.rgba[src..src + (cell * 4) as usize]);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("UI movement keys asset search: {error}");
+            missing = ui::MOVEMENT_KEY_ART.len();
+        }
+    }
+    if missing > 0 {
+        eprintln!("UI movement keys: {missing} gfx/hud/keys image(s) not found (japro-assets.pk3 belongs in base)");
+    }
+    TextureData {
+        label: "JKA UI movement key atlas".into(),
+        source: None,
+        width,
+        height,
+        rgba,
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    }
+}
+
+/// Packs the stock 2D images in `ui::ICON_NAMES` (the lagometer's graph frame and phone
+/// jack, then the `crosshaira..j` image crosshairs) into one row of `ui::ICON_CELL`
+/// squares. The retail images are 32x32, so they are resampled up to the cell; a missing
+/// image (`crosshairj` needs japro-assets.pk3) leaves its cell transparent.
+fn load_ui_icon_atlas(base: &Path, game: Option<&Path>) -> TextureData {
+    let cell = ui::ICON_CELL;
+    let (width, height) = (ui::ICON_NAMES.len() as u32 * cell, cell);
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+    match AssetSearchPath::open_game(base, game) {
+        Ok(mut assets) => {
+            for (index, name) in ui::ICON_NAMES.iter().enumerate() {
+                let Some(image) =
+                    try_load_texture_asset_from_search_path(&mut assets, name, true, false, true, "UI icon")
+                else {
+                    eprintln!("UI icon {name}: not found");
+                    continue;
+                };
+                let (source_w, source_h) = (image.width, image.height);
+                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba) else {
+                    eprintln!("UI icon {name}: unexpected pixel format");
+                    continue;
+                };
+                let cell_image = if source_w == cell && source_h == cell {
+                    source
+                } else {
+                    image::imageops::resize(&source, cell, cell, image::imageops::FilterType::Triangle)
+                };
+                let pixels = cell_image.as_raw();
+                let row_bytes = (cell * 4) as usize;
+                for y in 0..cell {
+                    let src = y as usize * row_bytes;
+                    let dst = (((y * width) + index as u32 * cell) * 4) as usize;
+                    rgba[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+                }
+            }
+        }
+        Err(error) => eprintln!("UI icon asset search: {error}"),
+    }
+    TextureData {
+        label: "JKA UI icon atlas".into(),
+        source: None,
+        width,
+        height,
+        rgba,
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    }
 }
 
 fn load_ui_font_texture(base: &Path, game: Option<&Path>) -> TextureData {
@@ -29612,12 +32692,16 @@ fn load_ui_proportional_font(
     let metrics = match assets.read(&metrics_path, 64 * 1024) {
         Ok(Some(asset)) => match ui::parse_fontdat(&asset.bytes) {
             Ok(font) => {
-                println!(
-                    "UI proportional font: {} point / {} px, {} from {}",
-                    font.point_size,
-                    font.height,
-                    metrics_path,
-                    asset.source.display()
+                crate::logging::write_line_with_path(
+                    crate::logging::Level::Info,
+                    format_args!(
+                        "UI proportional font: {} point / {} px, {} from {}",
+                        font.point_size,
+                        font.height,
+                        metrics_path,
+                        asset.source.display()
+                    ),
+                    asset.source.clone(),
                 );
                 Some(font)
             }
@@ -30020,6 +33104,70 @@ fn fx_sprite_blend(alpha_mode: DynamicModelAlphaMode) -> Option<wgpu::BlendState
             alpha: wgpu::BlendComponent::OVER,
         }),
         _ => None,
+    }
+}
+
+/// CG_ImpactMark for one blob shadow. The request is in render space: `center`
+/// on the collision plane, `left`/`up` the in-plane half axes (length = radius)
+/// with `left x up` the plane normal. The shared projector works in JKA space,
+/// which is a pure rotation away, so handedness carries over. UVs follow
+/// CG_ImpactMark: 0.5 + delta . axis * 0.5 / radius.
+#[allow(clippy::too_many_arguments)]
+fn project_blob_shadow_mark(
+    surfaces: &jka_assets::bsp::MarkSurfaces,
+    buffer: &mut jka_assets::bsp::MarkBuffer,
+    center: Vec3,
+    left: Vec3,
+    up: Vec3,
+    shade: f32,
+    vertices: &mut Vec<DynamicModelVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let radius = left.length();
+    let normal = left.cross(up).normalize_or_zero();
+    if radius <= 0.0 || normal == Vec3::ZERO {
+        return;
+    }
+    let to_jka = |v: Vec3| Vec3::from_array(scene::jka_position(v.to_array()));
+    let to_render = |v: Vec3| Vec3::from_array(scene::render_position(v.to_array()));
+    let (center_jka, u_axis, v_axis, normal_jka) = (to_jka(center), to_jka(left / radius), to_jka(up / radius), to_jka(normal));
+    // CG_ImpactMark winds its quad with axis1 x axis2 = -normal.
+    let (a1, a2) = (u_axis * radius, -v_axis * radius);
+    let quad = [
+        center_jka - a1 - a2,
+        center_jka + a1 - a2,
+        center_jka + a1 + a2,
+        center_jka - a1 + a2,
+    ]
+    .map(|point| point.to_array());
+    surfaces.project(&quad, (normal_jka * -BLOB_MARK_PROJECTION).to_array(), buffer);
+    let inverse_diameter = 0.5 / radius;
+    for (polygon, surface_normal) in buffer.iter() {
+        let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        let render_normal = to_render(Vec3::from_array(surface_normal));
+        for point in polygon {
+            let world = Vec3::from_array(*point);
+            let delta = world - center_jka;
+            vertices.push(DynamicModelVertex {
+                position: (to_render(world) + render_normal * BLOB_MARK_SURFACE_LIFT).to_array(),
+                normal: render_normal.to_array(),
+                uv: [0.5 + delta.dot(u_axis) * inverse_diameter, 0.5 + delta.dot(v_axis) * inverse_diameter],
+                color: [shade, shade, shade, 1.0],
+            });
+        }
+        // The mark index keeps the world mesh's OpenJK (clockwise) winding for BSP
+        // maps but already-reversed render winding for source-map worlds, and the
+        // dynamic-model pipeline culls back faces. Wind each triangle to face along
+        // the surface normal so both come out visible.
+        for fan in 1..polygon.len() as u32 - 1 {
+            let corner = |offset: u32| Vec3::from_array(vertices[(base + offset) as usize].position);
+            let facing = (corner(fan) - corner(0)).cross(corner(fan + 1) - corner(0)).dot(render_normal);
+            if facing < 0.0 {
+                indices.extend_from_slice(&[base, base + fan + 1, base + fan]);
+            } else {
+                indices.extend_from_slice(&[base, base + fan, base + fan + 1]);
+            }
+        }
     }
 }
 
@@ -30702,11 +33850,7 @@ fn create_world_pipeline(
             }),
             stencil: wgpu::StencilState::default(),
             bias: if key.offset {
-                wgpu::DepthBiasState {
-                    constant: -1,
-                    slope_scale: -1.0,
-                    clamp: 0.0,
-                }
+                polygon_offset_depth_bias()
             } else {
                 wgpu::DepthBiasState::default()
             },
@@ -30746,6 +33890,7 @@ fn create_shadow_pipeline(
     shader: &wgpu::ShaderModule,
     bevy_reverse_z: bool,
     cull_mode: Option<wgpu::Face>,
+    unclipped_depth: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA cascaded-shadow caster pipeline"),
@@ -30764,6 +33909,7 @@ fn create_shadow_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode,
+            unclipped_depth,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -30793,6 +33939,7 @@ fn create_shadow_translucent_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     bevy_reverse_z: bool,
+    unclipped_depth: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA filtered translucent sun-shadow caster pipeline"),
@@ -30811,6 +33958,7 @@ fn create_shadow_translucent_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: None,
+            unclipped_depth,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -30888,6 +34036,7 @@ fn create_shadow_mask_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     bevy_reverse_z: bool,
+    unclipped_depth: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA alpha-tested shadow caster pipeline"),
@@ -30909,6 +34058,7 @@ fn create_shadow_mask_pipeline(
             // Matching their visible silhouette is more important than saving a
             // small amount of shadow-map raster work here.
             cull_mode: None,
+            unclipped_depth,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -31282,6 +34432,44 @@ fn aabb_intersects_clip_frustum(minimum: [f32; 3], maximum: [f32; 3], view_proj:
     !(outside_left || outside_right || outside_bottom || outside_top || outside_near || outside_far)
 }
 
+/// Culls a caster against a directional cascade. Only the sides of the box are
+/// tested against the sun-facing depth range: anything between the sun and the
+/// cascade can still shadow it (the caster pipelines run with unclipped depth),
+/// so rejecting on the sunward plane deleted roofs whenever the view frustum's
+/// light-space extent happened to end below them. Only the plane beyond the
+/// cascade, away from the sun, may cull. `reverse_z` selects which clip-z end
+/// that is (Bevy cascades are reverse-Z, the legacy ones are not).
+fn aabb_intersects_shadow_frustum(
+    minimum: [f32; 3],
+    maximum: [f32; 3],
+    view_proj: Mat4,
+    reverse_z: bool,
+) -> bool {
+    let corners = [
+        Vec3::new(minimum[0], minimum[1], minimum[2]),
+        Vec3::new(maximum[0], minimum[1], minimum[2]),
+        Vec3::new(minimum[0], maximum[1], minimum[2]),
+        Vec3::new(maximum[0], maximum[1], minimum[2]),
+        Vec3::new(minimum[0], minimum[1], maximum[2]),
+        Vec3::new(maximum[0], minimum[1], maximum[2]),
+        Vec3::new(minimum[0], maximum[1], maximum[2]),
+        Vec3::new(maximum[0], maximum[1], maximum[2]),
+    ];
+    let clip = corners.map(|corner| view_proj * corner.extend(1.0));
+
+    let outside_left = clip.iter().all(|point| point.x < -point.w);
+    let outside_right = clip.iter().all(|point| point.x > point.w);
+    let outside_bottom = clip.iter().all(|point| point.y < -point.w);
+    let outside_top = clip.iter().all(|point| point.y > point.w);
+    let beyond_cascade = if reverse_z {
+        clip.iter().all(|point| point.z < 0.0)
+    } else {
+        clip.iter().all(|point| point.z > point.w)
+    };
+
+    !(outside_left || outside_right || outside_bottom || outside_top || beyond_cascade)
+}
+
 /// Produce the hardware-ray-query BSP shader from the authoritative raster BSP
 /// shader. Keeping this as a narrow source transform means the RT variant shares
 /// every JKA lighting/material rule with the normal shader; sun and local-light
@@ -31314,6 +34502,17 @@ fn rt_sampled_light_loops(source: &str) -> Result<String, String> {
         result.replace_range(start..end, &format!("{LOOP}\n        let rt_source = dynamic_lights[cluster.indices[i]];\n        let rt_count = rt_local_sample_count(rt_source);\n        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{{sampled}\n        }}\n    "));
     }
     Ok(result)
+}
+
+/// A complete world shader: a variant's base source plus the modules every world
+/// variant shares (the weather maths and forward weather shading, and surface
+/// deformation).
+fn compose_world_shader(base: &str) -> String {
+    format!(
+        "{}\n{}",
+        weather::with_world_weather(base),
+        include_str!("surface_deformation.wgsl")
+    )
 }
 
 fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
@@ -31354,363 +34553,10 @@ fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
         1,
     );
 
-    let rt_visibility = r#"// Ported from Bevy Solari directional-light sampling:
-// - bevy_solari/src/scene/sampling.wesl::resolve_light_sample
-// - bevy_pbr/src/render/utils.wesl::{rand_f, rand_vec2f}
-// - bevy_render/src/maths.wesl::orthonormalize
-//
-// The sampler itself is generic for finite angular directional emitters. The
-// current RT Shadows caller supplies the JKA authored sun direction and an
-// Earth-like angular extent through shadow_settings.bevy_params.x.
-fn rt_rand_f(state: ptr<function, u32>) -> f32 {
-    *state = *state * 747796405u + 2891336453u;
-    let word = ((*state >> ((*state >> 28u) + 4u)) ^ *state) * 277803737u;
-    return f32((word >> 22u) ^ word) * bitcast<f32>(0x2f800004u);
-}
-
-fn rt_rand_vec2f(state: ptr<function, u32>) -> vec2<f32> {
-    return vec2<f32>(rt_rand_f(state), rt_rand_f(state));
-}
-
-fn rt_sample_count() -> u32 {
-    return u32(clamp(lighting_settings.map_ambient.w, 1.0, 4.0));
-}
-
-fn rt_local_sample_count(light: PointLight) -> u32 {
-    // Point lights and q3map metadata need one visibility query, regardless of quality.
-    return select(1u, rt_sample_count(), light.emitter.w < -0.5 && light.shadow.w >= 0.5);
-}
-
-fn rt_sample_local_emitter(light: PointLight, input: VertexOut, light_index: u32, sample_index: u32, sample_count: u32) -> PointLight {
-    // Negative emitter.w also encodes authored q3map angle attenuation. Only
-    // transient lights may use it as a finite-emitter marker.
-    if (light.emitter.w >= -0.5 || light.shadow.w < 0.5) {
-        return light;
-    }
-    // Uniform line-source integration: use a normalized distribution along the
-    // authored visible blade, preserving the existing total light strength.
-    // The entire lighting evaluation (distance, BRDF and visibility) consumes
-    // this same sample. Sampling only visibility would leave a point-light BRDF.
-    let pixel = vec2<u32>(max(input.clip_position.xy, vec2<f32>(0.0)));
-    let width = max(lighting_settings.values.z, 1u);
-    var rng = (pixel.x + pixel.y * width) ^ (light_index * 2246822519u) ^ (camera.render_flags.w * 3266489917u);
-    rng ^= sample_index * 668265263u;
-    // One jittered sample per equal interval (PBRT stratified sampling).
-    let sample_t = (f32(sample_index) + rt_rand_f(&rng)) / f32(sample_count);
-    var sampled = light;
-    sampled.position_radius = vec4<f32>(
-        light.position_radius.xyz + light.emitter.xyz * (2.0 * sample_t - 1.0),
-        light.position_radius.w
-    );
-    sampled.emitter = vec4<f32>(0.0);
-    sampled.color_intensity = vec4<f32>(light.color_intensity.rgb / f32(sample_count), light.color_intensity.a);
-    return sampled;
-}
-
-fn rt_copysign(a: f32, b: f32) -> f32 {
-    return bitcast<f32>((bitcast<u32>(a) & 0x7fffffffu) | (bitcast<u32>(b) & 0x80000000u));
-}
-
-fn rt_orthonormalize(z_basis: vec3<f32>) -> mat3x3<f32> {
-    let sign = rt_copysign(1.0, z_basis.z);
-    let a = -1.0 / (sign + z_basis.z);
-    let b = z_basis.x * z_basis.y * a;
-    let x_basis = vec3<f32>(1.0 + sign * z_basis.x * z_basis.x * a, sign * b, -sign * z_basis.x);
-    let y_basis = vec3<f32>(b, sign + z_basis.y * z_basis.y * a, -z_basis.y);
-    return mat3x3<f32>(x_basis, y_basis, z_basis);
-}
-
-fn rt_sample_directional_emitter(
-    direction_to_light: vec3<f32>,
-    cos_theta_max: f32,
-    rng: ptr<function, u32>,
-    sample_index: u32,
-    sample_count: u32,
-) -> vec3<f32> {
-    // Bevy Solari: sample uniformly in solid angle inside the directional
-    // light's cone, then rotate that local +Z cone onto the light direction.
-    var random = rt_rand_vec2f(rng);
-    let columns = select(1u, 2u, sample_count > 1u);
-    let rows = max(sample_count / columns, 1u);
-    random = (vec2<f32>(f32(sample_index % columns), f32(sample_index / columns)) + random)
-        / vec2<f32>(f32(columns), f32(rows));
-    let cos_theta = (1.0 - random.x) + random.x * cos_theta_max;
-    let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
-    let phi = random.y * 6.28318530717958647692;
-    let local_direction = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-    return rt_orthonormalize(direction_to_light) * local_direction;
-}
-
-fn rt_alpha_repeat_coord(value: i32, size: i32) -> i32 {
-    let remainder = value % size;
-    return select(remainder + size, remainder, remainder >= 0);
-}
-
-fn rt_alpha_texel(texture: RtAlphaTexture, x: i32, y: i32) -> f32 {
-    let width = max(i32(texture.values.y), 1);
-    let height = max(i32(texture.values.z), 1);
-    var sx = x;
-    var sy = y;
-    if (texture.values.w != 0u) {
-        sx = clamp(sx, 0, width - 1);
-        sy = clamp(sy, 0, height - 1);
-    } else {
-        sx = rt_alpha_repeat_coord(sx, width);
-        sy = rt_alpha_repeat_coord(sy, height);
-    }
-    let linear_index = u32(sy * width + sx);
-    let packed = rt_alpha_texels[texture.values.x + linear_index / 4u];
-    let shift = (linear_index & 3u) * 8u;
-    return f32((packed >> shift) & 0xffu) * (1.0 / 255.0);
-}
-
-fn rt_sample_alpha(texture_index: u32, uv: vec2<f32>) -> f32 {
-    let texture = rt_alpha_textures[texture_index];
-    let size = vec2<f32>(f32(max(texture.values.y, 1u)), f32(max(texture.values.z, 1u)));
-    let sample_position = uv * size - vec2<f32>(0.5);
-    let base = vec2<i32>(floor(sample_position));
-    let fraction = fract(sample_position);
-    let a00 = rt_alpha_texel(texture, base.x, base.y);
-    let a10 = rt_alpha_texel(texture, base.x + 1, base.y);
-    let a01 = rt_alpha_texel(texture, base.x, base.y + 1);
-    let a11 = rt_alpha_texel(texture, base.x + 1, base.y + 1);
-    return mix(mix(a00, a10, fraction.x), mix(a01, a11, fraction.x), fraction.y);
-}
-
-fn rt_alpha_generated_uv(
-    material: RtAlphaMaterial,
-    base_uv: vec2<f32>,
-    lightmap_uv: vec2<f32>,
-    world_position: vec3<f32>,
-    world_normal: vec3<f32>,
-) -> vec2<f32> {
-    var uv = base_uv;
-    if (material.header.x == 1u) {
-        uv = lightmap_uv;
-    }
-    if (material.header.x == 2u) {
-        uv = vec2<f32>(
-            dot(world_position, material.vector_s.xyz),
-            dot(world_position, material.vector_t.xyz)
-        );
-    }
-    if (material.header.x == 3u) {
-        let n = normalize(world_normal);
-        let view = normalize(camera.camera_pos_time.xyz - world_position);
-        let reflected = reflect(-view, n);
-        uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
-    }
-
-    let time = camera.camera_pos_time.w;
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        if (i >= material.header.y) {
-            break;
-        }
-        let a = material.mods[i * 2u];
-        let b = material.mods[i * 2u + 1u];
-        let kind = u32(a.x + 0.5);
-        if (kind == 1u) {
-            uv = uv + a.yz * time;
-        }
-        if (kind == 2u) {
-            uv = uv * a.yz;
-        }
-        if (kind == 3u) {
-            let radians = a.y * time * 0.017453292519943295;
-            let c = cos(radians);
-            let sn = sin(radians);
-            let p = uv - vec2<f32>(0.5);
-            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
-        }
-        if (kind == 4u) {
-            uv = vec2<f32>(
-                uv.x * a.y + uv.y * a.z + a.w,
-                uv.x * b.x + uv.y * b.y + b.z
-            );
-        }
-        if (kind == 5u) {
-            let wave = a.y
-                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
-            uv = uv + vec2<f32>(wave);
-        }
-    }
-    return uv;
-}
-
-fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
-    let geometry_index = candidate.instance_custom_data + candidate.geometry_index;
-    let geometry = rt_alpha_geometries[geometry_index];
-    let material = rt_alpha_materials[geometry.values.z];
-    let first_index = geometry.values.y + candidate.primitive_index * 3u;
-    let first_vertex = geometry.values.x;
-    let i0 = first_vertex + rt_alpha_indices[first_index];
-    let i1 = first_vertex + rt_alpha_indices[first_index + 1u];
-    let i2 = first_vertex + rt_alpha_indices[first_index + 2u];
-    let v0 = rt_alpha_vertices[i0];
-    let v1 = rt_alpha_vertices[i1];
-    let v2 = rt_alpha_vertices[i2];
-    let bary = vec3<f32>(
-        1.0 - candidate.barycentrics.x - candidate.barycentrics.y,
-        candidate.barycentrics.x,
-        candidate.barycentrics.y
-    );
-    let object_position = v0.position_u.xyz * bary.x
-        + v1.position_u.xyz * bary.y
-        + v2.position_u.xyz * bary.z;
-    let object_normal = v0.normal_v.xyz * bary.x
-        + v1.normal_v.xyz * bary.y
-        + v2.normal_v.xyz * bary.z;
-    let base_uv = vec2<f32>(
-        v0.position_u.w * bary.x + v1.position_u.w * bary.y + v2.position_u.w * bary.z,
-        v0.normal_v.w * bary.x + v1.normal_v.w * bary.y + v2.normal_v.w * bary.z
-    );
-    let lightmap_uv = v0.lightmap_alpha.xy * bary.x
-        + v1.lightmap_alpha.xy * bary.y
-        + v2.lightmap_alpha.xy * bary.z;
-    let vertex_alpha = v0.lightmap_alpha.z * bary.x
-        + v1.lightmap_alpha.z * bary.y
-        + v2.lightmap_alpha.z * bary.z;
-    let world_position = candidate.object_to_world * vec4<f32>(object_position, 1.0);
-    let world_normal = candidate.object_to_world * vec4<f32>(object_normal, 0.0);
-    let uv = rt_alpha_generated_uv(material, base_uv, lightmap_uv, world_position, world_normal);
-    var alpha_multiplier = material.color.a;
-    // Match the existing BSP shader's alphaGen semantics exactly. RGB generation
-    // uses different bits; RT candidate rejection must only follow alphaGen.
-    if ((material.header.z & 1048576u) != 0u) {
-        alpha_multiplier *= vertex_alpha;
-    } else if ((material.header.z & 2097152u) != 0u) {
-        alpha_multiplier *= (1.0 - vertex_alpha);
-    }
-    let alpha = rt_sample_alpha(material.texture.x, uv) * alpha_multiplier;
-    return alpha >= material.params.x;
-}
-
-fn rt_trace_shadow_visibility(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> f32 {
-    // RayDesc requires t_max >= t_min. Very close emitters have no traceable
-    // segment after the receiver and emitter endpoint biases are applied.
-    if (max_distance <= 0.25) {
-        return 1.0;
-    }
-    var query: ray_query;
-    // TERMINATE_ON_FIRST_HIT | SKIP_AABBS. Opaque BLAS triangles auto-commit;
-    // non-opaque mask triangles interrupt traversal as candidates so their
-    // authored alpha test can decide whether traversal continues.
-    rayQueryInitialize(
-        &query,
-        rt_shadow_scene,
-        RayDesc(0x204u, 0xffu, 0.25, max_distance, origin, direction_to_light)
-    );
-    loop {
-        let has_candidate = rayQueryProceed(&query);
-        if (!has_candidate) {
-            break;
-        }
-        let candidate = rayQueryGetCandidateIntersection(&query);
-        if (candidate.kind == 1u && rt_alpha_candidate_blocks(candidate)) {
-            rayQueryConfirmIntersection(&query);
-            rayQueryTerminate(&query);
-        }
-    }
-    let hit = rayQueryGetCommittedIntersection(&query);
-    return select(1.0, 0.0, hit.kind != 0u);
-}
-
-fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
-    // Local shadows remain independently switchable. The cubemap slot/count
-    // are deliberately irrelevant here, including for transient FX lights.
-    if (!ENABLE_LOCAL_SHADOWS || camera.render_flags.x != 0u) {
-        return 1.0;
-    }
-    let delta = light.position_radius.xyz - world_position;
-    let distance_squared = dot(delta, delta);
-    let radius = max(light.position_radius.w, 0.0);
-    if (distance_squared <= 1e-8 || distance_squared >= radius * radius) {
-        return 1.0;
-    }
-    let direction = delta * inverseSqrt(distance_squared);
-    // Match the contribution rules shared by the existing clustered callers.
-    // Ordinary lights contribute neither diffuse nor specular on the back side.
-    // Authored q3map lighting has different angle rules, so preserve that path.
-    let ndotl = max(dot(normal, direction), 0.0);
-    if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
-        let scalar = q3map_light_scalar(light, sqrt(distance_squared), q3map_surface_angle(light, ndotl));
-        if (!q3map_fast_contribution_visible(scalar)) {
-            return 1.0;
-        }
-    } else if (ndotl <= 0.0 || light.color_intensity.a == 0.0) {
-        return 1.0;
-    }
-    if (emitter_visibility(light, direction) <= 0.0) {
-        return 1.0;
-    }
-    return rt_trace_local_visibility(light, world_position, normal);
-}
-
-fn rt_trace_local_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
-    let delta = light.position_radius.xyz - world_position;
-    let distance_squared = dot(delta, delta);
-    let radius = max(light.position_radius.w, 0.0);
-    if (distance_squared <= 1e-8 || distance_squared >= radius * radius) { return 1.0; }
-    let direction = delta * inverseSqrt(distance_squared);
-    let surface_normal = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
-    let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction) >= 0.0);
-    // Limit the offset near an emitter, and recompute the direction from the
-    // biased origin so the finite segment still ends exactly at that emitter.
-    let origin = world_position + oriented_normal * min(0.5, sqrt(distance_squared) * 0.25);
-    let to_emitter = light.position_radius.xyz - origin;
-    let distance = length(to_emitter);
-    if (distance <= 0.5) {
-        return 1.0;
-    }
-    return rt_trace_shadow_visibility(origin, to_emitter / distance, distance - 0.25);
-}
-
-fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
-    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) { return 1.0; }
-    let cached = rt_cached_sun_visibility(input);
-    if (cached >= 0.0) { return cached; }
-    return rt_uncached_sun_visibility(input, normal);
-}
-
-fn rt_uncached_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
-    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) {
-        return 1.0;
-    }
-
-    // ShadowSettings stores the direction the authored light travels. Receiver
-    // rays travel in the opposite direction, toward the finite emitter.
-    let toward_light = -shadow_settings.light_direction_enabled.xyz;
-    let light_len_sq = dot(toward_light, toward_light);
-    if (light_len_sq < 1e-8) {
-        return 1.0;
-    }
-    let direction_to_light = toward_light * inverseSqrt(light_len_sq);
-    let normal_len_sq = max(dot(normal, normal), 1e-12);
-    let surface_normal = normal * inverseSqrt(normal_len_sq);
-    let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction_to_light) >= 0.0);
-    let origin = input.world_position + oriented_normal * 0.5;
-
-    // Seed layout follows Bevy's per-pixel/per-frame stochastic approach. With
-    // TAA enabled render_flags.w advances every frame so the existing temporal
-    // resolve integrates a new sun-disc sample. Without TAA the frame term is
-    // held at zero: each pixel keeps one deterministic sample, avoiding temporal
-    // sparkle without multiplying hardware ray traversal cost.
-    let px = u32(max(input.clip_position.x, 0.0));
-    let py = u32(max(input.clip_position.y, 0.0));
-    let viewport_width = max(lighting_settings.values.z, 1u);
-    let pixel_index = px + py * viewport_width;
-    var rng = pixel_index + camera.render_flags.w;
-    let cos_theta_max = clamp(shadow_settings.bevy_params.x, 0.0, 1.0);
-    let samples = rt_sample_count();
-    var visibility = 0.0;
-    for (var sample_index = 0u; sample_index < samples; sample_index += 1u) {
-        let sampled_direction = rt_sample_directional_emitter(direction_to_light, cos_theta_max, &rng, sample_index, samples);
-        visibility += rt_trace_shadow_visibility(origin, sampled_direction, 1000000.0);
-    }
-    return visibility / f32(samples);
-}
-
-"#;
+    // The shared ray-query core (sampling, alpha-tested candidate handling,
+    // shadow-ray helpers). Lives in its own file so the world shader, the sun
+    // compute pass and the model receivers all read one reviewable source.
+    let rt_visibility = include_str!("rt_core.wgsl").replace("\r\n", "\n");
     source = source.replacen(
         CASCADE_FN,
         &format!(
@@ -31724,6 +34570,15 @@ fn rt_uncached_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
         &format!(
             "{LOCAL_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS) {{\n        return ray_traced_local_shadow_visibility(light, world_position, receiver_normal);\n    }}"
         ),
+        1,
+    );
+
+    // The lean shader compiles the sun-shadow darkening out unless a cascade is
+    // enabled. The RT sun is not a cascade, so open that gate for it. Absent in
+    // bsp.wgsl, which keeps the block unconditional; the no-op replace is fine.
+    source = source.replacen(
+        "    if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {\n        let shadow_visibility = cascaded_shadow_visibility(",
+        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material.header.z & 4u) != 0u) {\n        let shadow_visibility = cascaded_shadow_visibility(",
         1,
     );
 
@@ -31818,27 +34673,64 @@ fn create_ray_traced_shadow_receiver_layout(device: &wgpu::Device) -> wgpu::Bind
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_ray_traced_shadow_receiver_bind_group(
+impl RayTracedShadowResources {
+    fn scene(&self) -> RtReceiverScene<'_> {
+        RtReceiverScene {
+            tlas: &self._tlas,
+            alpha_vertices: &self.alpha_vertex_buffer,
+            alpha_indices: &self.alpha_index_buffer,
+            alpha_geometries: &self.alpha_geometry_buffer,
+            alpha_materials: &self.alpha_material_buffer,
+            alpha_textures: &self.alpha_texture_buffer,
+            alpha_texels: &self.alpha_texel_buffer,
+        }
+    }
+}
+
+/// The ray-query scene the receivers (and the sun compute pass) trace against.
+struct RtReceiverScene<'a> {
+    tlas: &'a wgpu::Tlas,
+    alpha_vertices: &'a wgpu::Buffer,
+    alpha_indices: &'a wgpu::Buffer,
+    alpha_geometries: &'a wgpu::Buffer,
+    alpha_materials: &'a wgpu::Buffer,
+    alpha_textures: &'a wgpu::Buffer,
+    alpha_texels: &'a wgpu::Buffer,
+}
+
+/// Group 3 of every ray-traced world/model pipeline: the ordinary sun-shadow
+/// receiver resources plus the scene and the published sun-visibility cache.
+/// One builder, because all three places that recreate it (initial build, alpha
+/// table growth, receiver rebuild) must produce identical bindings.
+fn create_rt_receiver_bind_group(
     device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    shadow_array_view: &wgpu::TextureView,
-    shadow_sampler: &wgpu::Sampler,
-    sky_array_view: &wgpu::TextureView,
-    receiver_buffer: &wgpu::Buffer,
+    shadow: &ShadowResources,
     fog_control_buffer: &wgpu::Buffer,
-    weather_height_view: &wgpu::TextureView,
-    weather_sampler: &wgpu::Sampler,
-    weather_surface_buffer: &wgpu::Buffer,
-    tlas: &wgpu::Tlas,
-    alpha_vertex_buffer: &wgpu::Buffer,
-    alpha_index_buffer: &wgpu::Buffer,
-    alpha_geometry_buffer: &wgpu::Buffer,
-    alpha_material_buffer: &wgpu::Buffer,
-    alpha_texture_buffer: &wgpu::Buffer,
-    alpha_texel_buffer: &wgpu::Buffer,
+    cascaded_shadow_mode: DynamicShadowsMode,
+    layout: &wgpu::BindGroupLayout,
+    scene: RtReceiverScene<'_>,
     sun_shadow_history: &rt_resolution::RtSunShadowHistory,
 ) -> wgpu::BindGroup {
+    let shadow_sampler = if cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps {
+        &shadow.bevy_sampler
+    } else {
+        &shadow.legacy_sampler
+    };
+    let shadow_array_view = &shadow._array_view;
+    let sky_array_view = &shadow.sky_array_view;
+    let receiver_buffer = &shadow.receiver_buffer;
+    let weather_height_view = &shadow.weather_height_view;
+    let weather_sampler = &shadow.weather_sampler;
+    let weather_surface_buffer = &shadow.weather_surface_buffer;
+    let RtReceiverScene {
+        tlas,
+        alpha_vertices: alpha_vertex_buffer,
+        alpha_indices: alpha_index_buffer,
+        alpha_geometries: alpha_geometry_buffer,
+        alpha_materials: alpha_material_buffer,
+        alpha_textures: alpha_texture_buffer,
+        alpha_texels: alpha_texel_buffer,
+    } = scene;
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
         layout,
@@ -31922,8 +34814,6 @@ fn create_shadow_resources(
     caster_layout: &wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
-    translucent_pipeline: wgpu::RenderPipeline,
-    sky_pipeline: wgpu::RenderPipeline,
     bevy_pipeline: wgpu::RenderPipeline,
     bevy_mask_pipeline: wgpu::RenderPipeline,
     bevy_translucent_pipeline: wgpu::RenderPipeline,
@@ -32064,7 +34954,7 @@ fn create_shadow_resources(
     });
     let receiver = ShadowReceiverUniform {
         view_proj: [Mat4::IDENTITY.to_cols_array_2d(); SHADOW_CASCADES],
-        split_depths: [LEGACY_SHADOW_SPLITS[0], LEGACY_SHADOW_SPLITS[1], LEGACY_SHADOW_SPLITS[2], 0.0],
+        split_depths: bevy_cascade_bounds(),
         light_direction_enabled: [
             FALLBACK_SUN_DIRECTION[0],
             FALLBACK_SUN_DIRECTION[1],
@@ -32074,7 +34964,7 @@ fn create_shadow_resources(
         params: [SHADOW_MAP_SIZE as f32, 0.00035, 0.30, 0.0],
         camera_forward: [0.0, 0.0, -1.0, 0.0],
         cascade_texel_sizes: [0.0; 4],
-        bevy_params: [BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS, BEVY_CSM_OVERLAP_PROPORTION, LEGACY_SHADOW_CASCADES as f32],
+        bevy_params: [BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS, BEVY_CSM_OVERLAP_PROPORTION, SHADOW_CASCADES as f32],
     };
     let receiver_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA cascaded sun shadow receiver uniform"),
@@ -32085,9 +34975,10 @@ fn create_shadow_resources(
         label: Some("JKA weather surface uniform"),
         contents: bytemuck::bytes_of(&WeatherSurfaceUniform {
             amount_distance: [0.0, weather::RAIN_WETNESS_FADE_START, weather::RAIN_WETNESS_FADE_END, 1.0],
-            puddle: [0.0; 4],
-            occlusion_uv: [0.0; 4],
-            occlusion_size: [0; 4],
+            // The film fade is rewritten with the rest of the look on first use;
+            // a non-zero range keeps the shader's smoothstep well defined until then.
+            film_fade: [1.0, 2.0, 0.0, 0.0],
+            ..bytemuck::Zeroable::zeroed()
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -32166,66 +35057,11 @@ fn create_shadow_resources(
         caster_bind_groups,
         pipeline,
         mask_pipeline,
-        translucent_pipeline,
-        sky_pipeline,
         bevy_pipeline,
         bevy_mask_pipeline,
         bevy_translucent_pipeline,
         bevy_sky_pipeline,
     }
-}
-
-fn legacy_cascade_shadow_matrices(
-    camera: &Camera,
-    width: u32,
-    height: u32,
-    light_direction: Vec3,
-) -> [Mat4; SHADOW_CASCADES] {
-    let light_direction = light_direction.normalize_or_zero();
-    let reference_up = if light_direction.dot(Vec3::Y).abs() > 0.95 {
-        Vec3::Z
-    } else {
-        Vec3::Y
-    };
-    let right = light_direction.cross(reference_up).normalize_or_zero();
-    let light_up = right.cross(light_direction).normalize_or_zero();
-    let mut matrices = [Mat4::IDENTITY; SHADOW_CASCADES];
-    for (cascade, far_distance) in LEGACY_SHADOW_SPLITS.iter().copied().enumerate() {
-        let nominal_near = if cascade == 0 {
-            1.0
-        } else {
-            LEGACY_SHADOW_SPLITS[cascade - 1]
-        };
-        let near_distance = if cascade == 0 {
-            nominal_near
-        } else {
-            (nominal_near - shadow_cascade_blend_width(nominal_near)).max(1.0)
-        };
-        let corners = camera.frustum_corners(width, height, near_distance, far_distance);
-        let centre = corners
-            .iter()
-            .copied()
-            .fold(Vec3::ZERO, |sum, point| sum + point)
-            / 8.0;
-        let mut radius = corners
-            .iter()
-            .map(|corner| corner.distance(centre))
-            .fold(1.0_f32, f32::max);
-        radius = (radius * 16.0).ceil() / 16.0;
-        let texel_size = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
-        let centre_right = centre.dot(right);
-        let centre_up = centre.dot(light_up);
-        let snapped_right = (centre_right / texel_size).round() * texel_size;
-        let snapped_up = (centre_up / texel_size).round() * texel_size;
-        let snapped_centre =
-            centre + right * (snapped_right - centre_right) + light_up * (snapped_up - centre_up);
-        let eye_distance = radius * 4.0;
-        let eye = snapped_centre - light_direction * eye_distance;
-        let view = Mat4::look_at_rh(eye, snapped_centre, reference_up);
-        let projection = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 8.0);
-        matrices[cascade] = projection * view;
-    }
-    matrices
 }
 
 fn bevy_cascade_bounds() -> [f32; SHADOW_CASCADES] {
@@ -32300,10 +35136,6 @@ fn bevy_cascade_shadow_matrices(
     }
 
     (matrices, bounds, texel_sizes)
-}
-
-fn shadow_cascade_blend_width(split: f32) -> f32 {
-    (split * SHADOW_CASCADE_BLEND_FRACTION).max(SHADOW_CASCADE_MIN_BLEND)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32842,6 +35674,55 @@ fn create_depth_prepass_pipeline(
     })
 }
 
+/// Depth-only world pipeline for the Hi-Z early pass. Opaque surfaces have no
+/// fragment stage at all; alpha-tested ones run only the cutout test.
+fn create_hiz_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    alpha_test: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if alpha_test {
+            "JKA Hi-Z early alpha-tested depth pipeline"
+        } else {
+            "JKA Hi-Z early depth pipeline"
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(if alpha_test { "vs_mask" } else { "vs_main" }),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: alpha_test.then(|| wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_depth_mask"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_depth_prepass_mask_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -32959,6 +35840,96 @@ fn create_entity_prepass_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// Depth-only entity pipeline for the Entity map shadow pass. Reuses each entity
+/// shader's `vs_prepass` (same skinning as the colour pass) with the light's
+/// view-projection in the camera slot. Opaque casters have no fragment stage;
+/// alpha-tested ones discard through `fs_shadow_mask`. Two-sided with the same
+/// slope-scaled bias as the BSP cascade casters, so thin open Ghoul2 surfaces
+/// (hair, cloth, robes) still cast.
+fn create_entity_shadow_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vertex_layout: wgpu::VertexBufferLayout<'_>,
+    alpha_test: bool,
+    reverse_z: bool,
+    unclipped_depth: bool,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_prepass"),
+            compilation_options: Default::default(),
+            buffers: &[vertex_layout],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: SHADOW_CASTER_CULL,
+            unclipped_depth,
+            ..Default::default()
+        },
+        // Same depth convention and bias as `create_shadow_pipeline`, so entities
+        // and BSP casters agree inside one cascade layer.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(if reverse_z {
+                wgpu::CompareFunction::GreaterEqual
+            } else {
+                wgpu::CompareFunction::LessEqual
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: if reverse_z {
+                wgpu::DepthBiasState::default()
+            } else {
+                wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 }
+            },
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: alpha_test.then(|| wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_shadow_mask"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Picks the authored light that best explains the lighting at `focus` and returns
+/// the unit direction toward it; see `Renderer::authored_light_direction`.
+fn best_authored_light_direction(
+    lights: &[scene::DynamicLight],
+    focus: Vec3,
+    grid_toward: Option<Vec3>,
+) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    for light in lights {
+        let to_light = Vec3::from_array(light.position) - focus;
+        let distance = to_light.length();
+        if !(16.0..=ENTITY_SHADOW_LIGHT_RANGE).contains(&distance) {
+            continue;
+        }
+        let direction = to_light / distance;
+        let alignment = grid_toward.map_or(1.0, |toward| direction.dot(toward).max(0.0));
+        if alignment < 0.5 {
+            continue;
+        }
+        let brightness = (light.color[0] * 0.2126 + light.color[1] * 0.7152 + light.color[2] * 0.0722)
+            * light.intensity;
+        let score = brightness / (distance * distance).max(64.0 * 64.0) * alignment * alignment;
+        if best.map_or(true, |(top, _)| score > top) {
+            best = Some((score, direction));
+        }
+    }
+    best.map(|(_, direction)| direction)
 }
 
 fn create_planar_debug_pipeline(
@@ -33513,13 +36484,90 @@ struct DebugVolumeRenderer {
     clips_enabled: bool,
     triggers: Option<DebugVolumeMeshGpu>,
     clips: Option<DebugVolumeMeshGpu>,
+    /// `r_drawEntities` boxes + link lines. Unlike `triggers`/`clips` this is
+    /// replaced wholesale every time a new mesh arrives (built fresh on the
+    /// app thread each tick) rather than uploaded once and left alone.
+    entities_enabled: bool,
+    entities: Option<DebugVolumeMeshGpu>,
     fill_pipeline: Option<wgpu::RenderPipeline>,
     line_pipeline: Option<wgpu::RenderPipeline>,
+    /// Sun-to-head beam shown while the sun angles are being edited. Unlike the
+    /// brush volumes this is rebuilt every frame (it follows the camera), but it
+    /// is a dozen vertices and only exists while `sun_ray_enabled`.
+    sun_ray_enabled: bool,
+    sun_ray_buffer: Option<wgpu::Buffer>,
+    sun_ray_pipeline: Option<wgpu::RenderPipeline>,
+    sun_ray_ghost_pipeline: Option<wgpu::RenderPipeline>,
+}
+
+/// World units from the head to the drawn sun marker.
+const SUN_RAY_LENGTH: f32 = 4096.0;
+const SUN_RAY_MARKER_RADIUS: f32 = 112.0;
+const SUN_RAY_VERTEX_COUNT: usize = 12;
+
+/// Two camera-facing quads: the beam from the sun down to the head, and a
+/// diamond marking where the sun is. `toward_sun` is the (renderer-space) unit
+/// vector from the head to the sun, i.e. the negated light travel direction.
+fn sun_ray_vertices(head: Vec3, toward_sun: Vec3, eye: Vec3) -> [DebugVolumeVertex; SUN_RAY_VERTEX_COUNT] {
+    const COLOR: [u8; 4] = [255, 214, 72, 255];
+    let toward_sun = toward_sun.normalize_or_zero();
+    let sun = head + toward_sun * SUN_RAY_LENGTH;
+    let vertex = |position: Vec3| DebugVolumeVertex { position: position.to_array(), color: COLOR };
+
+    // Keep the beam a roughly constant few pixels wide at any distance.
+    let half_width = |point: Vec3| (eye.distance(point) * 0.0035).max(0.6);
+    let mid = (head + sun) * 0.5;
+    let axis = (head - sun).normalize_or_zero();
+    let mut side = axis.cross(eye - mid).normalize_or_zero();
+    if side == Vec3::ZERO {
+        side = axis.any_orthonormal_vector();
+    }
+    let (sun_a, sun_b) = (sun - side * half_width(sun), sun + side * half_width(sun));
+    let (head_a, head_b) = (head - side * half_width(head), head + side * half_width(head));
+
+    let view = (sun - eye).normalize_or_zero();
+    let mut right = view.cross(Vec3::Y).normalize_or_zero();
+    if right == Vec3::ZERO {
+        right = Vec3::X;
+    }
+    let up = right.cross(view).normalize_or_zero();
+    let (l, r) = (sun - right * SUN_RAY_MARKER_RADIUS, sun + right * SUN_RAY_MARKER_RADIUS);
+    let (d, u) = (sun - up * SUN_RAY_MARKER_RADIUS, sun + up * SUN_RAY_MARKER_RADIUS);
+
+    [
+        vertex(sun_a), vertex(sun_b), vertex(head_b),
+        vertex(sun_a), vertex(head_b), vertex(head_a),
+        vertex(l), vertex(d), vertex(r),
+        vertex(l), vertex(r), vertex(u),
+    ]
 }
 
 impl DebugVolumeRenderer {
     fn any_enabled(&self) -> bool {
-        self.triggers_enabled || self.clips_enabled
+        self.triggers_enabled || self.clips_enabled || self.entities_enabled || self.sun_ray_enabled
+    }
+
+    fn update_sun_ray(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        head: Vec3,
+        light_direction: Vec3,
+        eye: Vec3,
+    ) {
+        if !self.sun_ray_enabled {
+            return;
+        }
+        let vertices = sun_ray_vertices(head, -light_direction, eye);
+        let buffer = self.sun_ray_buffer.get_or_insert_with(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA sun ray preview"),
+                size: std::mem::size_of_val(&vertices) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
     }
 
     fn set_map(&mut self, volumes: Arc<jka_assets::bsp::DebugVolumes>) {
@@ -33528,9 +36576,18 @@ impl DebugVolumeRenderer {
         self.clips = None;
     }
 
+    /// Replaces the entity-marker mesh immediately (not lazily like
+    /// `triggers`/`clips`, since this is rebuilt fresh every tick while enabled).
+    fn set_entity_markers(&mut self, device: &wgpu::Device, mesh: Option<&jka_assets::bsp::DebugVolumeMesh>) {
+        self.entities_enabled = mesh.is_some();
+        self.entities = mesh.and_then(|mesh| Self::upload(device, mesh, "entities"));
+    }
+
     fn clear_pipelines(&mut self) {
         self.fill_pipeline = None;
         self.line_pipeline = None;
+        self.sun_ray_pipeline = None;
+        self.sun_ray_ghost_pipeline = None;
     }
 
     fn upload(
@@ -33581,6 +36638,21 @@ impl DebugVolumeRenderer {
         if !self.any_enabled() {
             return;
         }
+        if self.sun_ray_enabled {
+            if self.sun_ray_pipeline.is_none() {
+                self.sun_ray_pipeline = Some(create_sun_ray_pipeline(
+                    device, layout, shader, surface_format, msaa_samples, false,
+                ));
+            }
+            if self.sun_ray_ghost_pipeline.is_none() {
+                self.sun_ray_ghost_pipeline = Some(create_sun_ray_pipeline(
+                    device, layout, shader, surface_format, msaa_samples, true,
+                ));
+            }
+        }
+        if !(self.triggers_enabled || self.clips_enabled || self.entities_enabled) {
+            return;
+        }
         if self.triggers_enabled && self.triggers.is_none() {
             self.triggers = Self::upload(device, &self.cpu.triggers, "triggers");
         }
@@ -33606,23 +36678,40 @@ impl DebugVolumeRenderer {
         pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
     ) -> bool {
-        let (Some(fill), Some(line)) = (&self.fill_pipeline, &self.line_pipeline) else {
-            return false;
-        };
-        let meshes = [
-            self.triggers.as_ref().filter(|_| self.triggers_enabled),
-            self.clips.as_ref().filter(|_| self.clips_enabled),
-        ];
         let mut drew = false;
-        for mesh in meshes.into_iter().flatten() {
+        if let (Some(fill), Some(line)) = (&self.fill_pipeline, &self.line_pipeline) {
+            let meshes = [
+                self.triggers.as_ref().filter(|_| self.triggers_enabled),
+                self.clips.as_ref().filter(|_| self.clips_enabled),
+                self.entities.as_ref().filter(|_| self.entities_enabled),
+            ];
+            for mesh in meshes.into_iter().flatten() {
+                pass.set_bind_group(0, camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_pipeline(fill);
+                pass.set_index_buffer(mesh.triangles.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.triangle_count, 0, 0..1);
+                pass.set_pipeline(line);
+                pass.set_index_buffer(mesh.lines.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.line_count, 0, 0..1);
+                drew = true;
+            }
+        }
+        if let (true, Some(buffer), Some(solid), Some(ghost)) = (
+            self.sun_ray_enabled,
+            &self.sun_ray_buffer,
+            &self.sun_ray_pipeline,
+            &self.sun_ray_ghost_pipeline,
+        ) {
             pass.set_bind_group(0, camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_pipeline(fill);
-            pass.set_index_buffer(mesh.triangles.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.triangle_count, 0, 0..1);
-            pass.set_pipeline(line);
-            pass.set_index_buffer(mesh.lines.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.line_count, 0, 0..1);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            // The faint always-on-top copy shows where the beam goes behind
+            // geometry; the solid copy disappears wherever the world blocks it,
+            // which is exactly the occlusion the sun shadow should reproduce.
+            pass.set_pipeline(ghost);
+            pass.draw(0..SUN_RAY_VERTEX_COUNT as u32, 0..1);
+            pass.set_pipeline(solid);
+            pass.draw(0..SUN_RAY_VERTEX_COUNT as u32, 0..1);
             drew = true;
         }
         drew
@@ -33682,6 +36771,68 @@ fn create_debug_volume_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some(if outline { "fs_line" } else { "fs_fill" }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Sun-ray preview pipeline: same vertex layout and shader as the debug
+/// volumes. `ghost` ignores scene depth so the beam stays visible through walls.
+fn create_sun_ray_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    ghost: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if ghost {
+            "JKA sun ray ghost pipeline"
+        } else {
+            "JKA sun ray pipeline"
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<DebugVolumeVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &DEBUG_VOLUME_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(if ghost {
+                wgpu::CompareFunction::Always
+            } else {
+                camera_depth_compare()
+            }),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if ghost { "fs_ray_ghost" } else { "fs_ray" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -33880,6 +37031,50 @@ fn create_ui_pipeline(
     })
 }
 #[cfg(test)]
+mod sun_shadow_tests {
+    use super::*;
+
+    fn box_at(z: f32) -> ([f32; 3], [f32; 3]) {
+        ([-1.0, -1.0, z - 1.0], [1.0, 1.0, z + 1.0])
+    }
+
+    #[test]
+    fn sunward_casters_are_kept_for_forward_and_reverse_cascades() {
+        // Forward-Z cascade: clip z = -view z, so z < 0 is toward the sun.
+        let forward = Mat4::orthographic_rh(-10.0, 10.0, -10.0, 10.0, 0.1, 50.0);
+        let (min, max) = box_at(500.0); // 500 units behind the eye, sunward of it
+        assert!(aabb_intersects_shadow_frustum(min, max, forward, false));
+        let (min, max) = box_at(-500.0); // far beyond the cascade, away from the sun
+        assert!(!aabb_intersects_shadow_frustum(min, max, forward, false));
+
+        // Reverse-Z cascade: z = 1 at the near (sunward) plane, 0 at the far plane.
+        let reverse = Mat4::from_cols(
+            Vec4::new(0.1, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.1, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.02, 0.0),
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+        );
+        let (min, max) = box_at(500.0); // clip z >> 1: sunward of the near plane
+        assert!(aabb_intersects_shadow_frustum(min, max, reverse, true));
+        let (min, max) = box_at(-500.0); // clip z << 0: beyond the far plane
+        assert!(!aabb_intersects_shadow_frustum(min, max, reverse, true));
+    }
+
+    #[test]
+    fn sun_ray_runs_from_the_head_toward_the_sun() {
+        let head = Vec3::new(100.0, 40.0, -20.0);
+        let toward_sun = Vec3::new(0.0, 0.6, 0.8);
+        let vertices = sun_ray_vertices(head, toward_sun, head + Vec3::new(0.0, 0.0, 300.0));
+        let sun = head + toward_sun * SUN_RAY_LENGTH;
+        let beam_start = Vec3::from_array(vertices[0].position).lerp(Vec3::from_array(vertices[1].position), 0.5);
+        let beam_end = Vec3::from_array(vertices[4].position).lerp(Vec3::from_array(vertices[5].position), 0.5);
+        assert!(beam_start.distance(sun) < 1.0);
+        assert!(beam_end.distance(head) < 1.0);
+        assert!(vertices.iter().all(|v| v.position.iter().all(|c| c.is_finite())));
+    }
+}
+
+#[cfg(test)]
 mod inline_run_tests {
     use super::*;
 
@@ -33917,6 +37112,22 @@ mod inline_run_tests {
     }
 
     #[test]
+    fn last_stage_runs_carry_their_fog_class_after_every_earlier_stage() {
+        // Class = state * 4 + fog kind (bit 0: surface's last stage). Two
+        // two-stage surfaces: the fog redraw of run 1 (last stages) must come
+        // after run 0 (first stages), and the classes stay separate.
+        let mut scratch = InlineDrawScratch::default();
+        plan_inline_runs(&[0, 5, 0, 5], &[false, true, false, true], 8, &mut scratch);
+        assert_eq!(scratch.runs, vec![(0, 2), (2, 2)]);
+        assert_eq!(scratch.run_class, vec![0, 5]);
+        // A last stage (class 1) never joins a first-stage run (class 0) of
+        // the same state, so fog is only redrawn for finished surfaces.
+        plan_inline_runs(&[0, 1, 0], &[false, false, false], 8, &mut scratch);
+        assert_eq!(scratch.runs, vec![(0, 2), (2, 1)]);
+        assert_eq!(scratch.run_class, vec![0, 1]);
+    }
+
+    #[test]
     fn every_batch_is_drawn_exactly_once_in_a_valid_order() {
         // Pseudo-random layouts: each position appears once, and no stage is
         // drawn before the earlier stage of its surface.
@@ -33947,6 +37158,7 @@ mod inline_run_tests {
             }
             let run_total: u32 = scratch.runs.iter().map(|&(_, count)| count).sum();
             assert_eq!(run_total as usize, n);
+            assert_eq!(scratch.run_class.len(), scratch.runs.len());
             // Every run holds a single state.
             for &(first, count) in &scratch.runs {
                 let states: std::collections::BTreeSet<u32> = scratch.order[first as usize..(first + count) as usize]
@@ -33962,6 +37174,58 @@ mod inline_run_tests {
 #[cfg(test)]
 mod shader_tests {
     use super::*;
+
+    /// Every shader that binds the post buffer reads it through one shared WGSL
+    /// struct. If a field is added on one side only, everything after it shifts;
+    /// rain_haze_mask.wgsl once kept a private, stale copy for exactly that reason.
+    #[test]
+    fn post_uniform_matches_the_shared_wgsl_struct() {
+        use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
+        use std::mem::{offset_of, size_of};
+        let (size, members) =
+            wgsl_struct_layout(include_str!("post_settings.wgsl"), "PostSettings");
+        assert_eq!(size as usize, size_of::<PostUniform>());
+        for (name, rust_offset) in [
+            ("color", offset_of!(PostUniform, color)),
+            ("aa", offset_of!(PostUniform, aa)),
+            ("taa_params", offset_of!(PostUniform, taa_params)),
+            ("scene", offset_of!(PostUniform, scene)),
+            ("film", offset_of!(PostUniform, film)),
+            ("grain", offset_of!(PostUniform, grain)),
+            ("camera_fx", offset_of!(PostUniform, camera_fx)),
+            ("legacy_fog", offset_of!(PostUniform, legacy_fog)),
+            ("clouds", offset_of!(PostUniform, clouds)),
+            ("cloud_layer", offset_of!(PostUniform, cloud_layer)),
+            ("cloud_sun_direction", offset_of!(PostUniform, cloud_sun)),
+            ("cloud_shadow", offset_of!(PostUniform, cloud_shadow)),
+            ("cloud_shaping", offset_of!(PostUniform, cloud_shaping)),
+            ("cloud_sky_ambient", offset_of!(PostUniform, cloud_sky_ambient)),
+            ("cloud_temporal_tuning", offset_of!(PostUniform, cloud_temporal_tuning)),
+            ("cloud_variation", offset_of!(PostUniform, cloud_variation)),
+            ("cloud_temporal", offset_of!(PostUniform, cloud_temporal)),
+            ("cloud_wind_dir", offset_of!(PostUniform, cloud_wind) + offset_of!(PostCloudWindSettings, direction)),
+            ("cloud_wind_offset", offset_of!(PostUniform, cloud_wind) + offset_of!(PostCloudWindSettings, offset)),
+            ("cloud_wind_delta", offset_of!(PostUniform, cloud_wind) + offset_of!(PostCloudWindSettings, delta)),
+            ("cloud_detail_slip", offset_of!(PostUniform, cloud_wind) + offset_of!(PostCloudWindSettings, detail_slip)),
+            ("cloud_detail_billow", offset_of!(PostUniform, cloud_wind) + offset_of!(PostCloudWindSettings, detail_billow)),
+            ("rain", offset_of!(PostUniform, rain)),
+            ("rain_occlusion", offset_of!(PostUniform, weather_occlusion)),
+            ("weather_look", offset_of!(PostUniform, weather_look)),
+            ("underwater", offset_of!(PostUniform, underwater)),
+            ("cloud_foreground", offset_of!(PostUniform, cloud_foreground)),
+            ("cloud_blades", offset_of!(PostUniform, cloud_blades)),
+            ("camera_pos_time", offset_of!(PostUniform, camera_pos_time)),
+            ("prev_camera_pos_time", offset_of!(PostUniform, prev_camera_pos_time)),
+            ("view_proj", offset_of!(PostUniform, view_proj)),
+            ("inv_view_proj", offset_of!(PostUniform, inv_view_proj)),
+            ("cloud_inv_view_proj", offset_of!(PostUniform, cloud_inv_view_proj)),
+            ("cloud_prev_view_proj", offset_of!(PostUniform, cloud_prev_view_proj)),
+            ("prev_view_proj", offset_of!(PostUniform, prev_view_proj)),
+            ("motion_prev_view_proj", offset_of!(PostUniform, motion_prev_view_proj)),
+        ] {
+            assert_eq!(offset_of_member(&members, name) as usize, rust_offset, "{name}");
+        }
+    }
 
     #[test]
     fn rt_segment_light_preserves_power_and_point_mode() {
@@ -34029,7 +37293,7 @@ mod shader_tests {
         ];
         let entries = rt_alpha_storage_entries();
         for base in [include_str!("bsp.wgsl"), include_str!("bsp_lean.wgsl")] {
-            let source = format!("{}\n{}", ray_traced_world_shader_source(base).unwrap(), include_str!("surface_deformation.wgsl"));
+            let source = compose_world_shader(&ray_traced_world_shader_source(base).unwrap());
             let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
             for (entry, descriptor) in entries.iter().zip(&descriptors) {
                 let global = module.global_variables.iter().map(|(_, global)| global)
@@ -34084,13 +37348,136 @@ mod shader_tests {
     }
 
     #[test]
+    fn sky_cloud_stages_become_ordered_sky_batches_with_view_direction_coordinates() {
+        use crate::materials::{MaterialStage, StageTexture, SurfaceMaterial};
+        use jka_assets::shader::{AlphaGen, RgbGen};
+
+        let cloud = |texture: usize, blend: Option<crate::materials::BlendFunc>, mods: Vec<TcMod>| MaterialStage {
+            texture: StageTexture::Image(texture),
+            enhancements: Default::default(),
+            blend,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: mods,
+            depth_write: false,
+            depth_equal: false,
+        };
+        let material = SurfaceMaterial {
+            sky: true,
+            sky_cloud_height: 2048.0,
+            explicit: true,
+            stages: vec![
+                cloud(3, None, vec![TcMod::Transform([0.25, 0.5, 0.75, 1.0, 0.1, 0.2])]),
+                cloud(
+                    4,
+                    Some(crate::materials::BlendFunc {
+                        src: crate::materials::BlendFactor::One,
+                        dst: crate::materials::BlendFactor::One,
+                    }),
+                    Vec::new(),
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut batches = Vec::new();
+        crate::scene::append_sky_batches(
+            &mut batches, &material, Some(0), None, false, 0..6, None, &[], [0; 4], [0.0; 4], false,
+        );
+
+        // Outer box first, then one batch per authored cloud stage, in order.
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.pipeline.class == DrawClass::Sky));
+        assert!(matches!(batches[0].tc_gen, TcGen::Base));
+        assert!(matches!(batches[1].tc_gen, TcGen::SkyCloud(h) if h == 2048.0));
+        assert_eq!((batches[1].texture, batches[2].texture), (Some(3), Some(4)));
+        assert_eq!(batches[1].pipeline.blend, BlendMode::Opaque);
+        assert_ne!(batches[2].pipeline.blend, BlendMode::Opaque);
+        // Only the first opaque layer seeds depth; a later blended layer must not.
+        assert!(batches[1].pipeline.depth_write);
+        assert!(!batches[2].pipeline.depth_write);
+
+        let uniform = material_uniform(&batches[1], false);
+        assert_eq!(uniform.header[0], 4);
+        assert_eq!(uniform.params[2], 2048.0);
+        assert_eq!(uniform.header[1], 1);
+        // Engine: s' = s*m00 + t*m10 + t0, t' = s*m01 + t*m11 + t1.
+        assert_eq!(uniform.mods[0], [4.0, 0.25, 0.75, 0.1]);
+        assert_eq!(uniform.mods[1], [0.5, 1.0, 0.2, 0.0]);
+        assert_eq!(material_uniform(&batches[0], false).header[0], 0);
+
+        // A sky without cloud stages is still just its outer box.
+        let plain = SurfaceMaterial { sky: true, explicit: true, ..Default::default() };
+        let mut plain_batches = Vec::new();
+        crate::scene::append_sky_batches(
+            &mut plain_batches, &plain, Some(0), None, false, 0..6, None, &[], [0; 4], [0.0; 4], false,
+        );
+        assert_eq!(plain_batches.len(), 1);
+    }
+
+    #[test]
+    fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
+        use crate::materials::{MaterialStage, StageTexture, SurfaceMaterial};
+        use jka_assets::shader::{Wave, WaveFunc};
+
+        let stage = MaterialStage {
+            texture: StageTexture::Image(1),
+            enhancements: Default::default(),
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Wave(Wave {
+                func: WaveFunc::Sin,
+                base: 0.2,
+                amplitude: 0.03,
+                phase: 0.5,
+                frequency: 0.04,
+            }),
+            alpha_gen: AlphaGen::Wave(Wave {
+                func: WaveFunc::InverseSawtooth,
+                base: 0.5,
+                amplitude: 0.25,
+                phase: 0.1,
+                frequency: 2.0,
+            }),
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+        };
+        let material = SurfaceMaterial {
+            sky: true,
+            sky_cloud_height: 512.0,
+            explicit: true,
+            stages: vec![stage],
+            ..Default::default()
+        };
+        let mut batches = Vec::new();
+        crate::scene::append_sky_batches(
+            &mut batches, &material, Some(0), None, false, 0..6, None, &[], [0; 4], [0.0; 4], false,
+        );
+        let uniform = material_uniform(&batches[1], false);
+        assert_ne!(uniform.header[2] & 134217728, 0);
+        assert_ne!(uniform.header[2] & 268435456, 0);
+        assert_eq!(uniform.wave_rgb, [0.2, 0.03, 0.5, 0.04]);
+        assert_eq!(uniform.wave_alpha, [0.5, 0.25, 0.1, 2.0]);
+        assert_eq!(uniform.wave_funcs[..2], [0, 4]);
+        // The outer box (no generators) leaves the wave flags clear.
+        assert_eq!(material_uniform(&batches[0], false).header[2] & (134217728 | 268435456), 0);
+    }
+
+    #[test]
     fn jump_shade_world_variants_specialize_and_validate() {
         use wgpu::naga;
         for (name, base) in [
             ("bsp", include_str!("bsp.wgsl")),
             ("bsp_lean", include_str!("bsp_lean.wgsl")),
         ] {
-            let source = format!("{base}\n{}", include_str!("surface_deformation.wgsl"));
+            let source = compose_world_shader(base);
             let module = naga::front::wgsl::parse_str(&source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
             let info = naga::valid::Validator::new(
@@ -34119,7 +37506,7 @@ mod shader_tests {
     fn rt_shader_variants_specialize_and_emit_spirv() {
         use wgpu::naga;
         for base in [include_str!("bsp.wgsl"), include_str!("bsp_lean.wgsl")] {
-            let source = format!("{}\n{}", ray_traced_world_shader_source(base).unwrap(), include_str!("surface_deformation.wgsl"));
+            let source = compose_world_shader(&ray_traced_world_shader_source(base).unwrap());
             let module = naga::front::wgsl::parse_str(&source).unwrap();
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all(),
@@ -34348,36 +37735,56 @@ mod shader_tests {
         assert!(opaque < saber);
     }
 
+    /// The occlusion-culling shaders validate on their own, so a failure in an
+    /// unrelated shader cannot hide a Hi-Z regression.
+    #[test]
+    fn hiz_occlusion_shaders_validate() {
+        for (name, source) in [
+            ("depth_prepass", include_str!("depth_prepass.wgsl")),
+            ("gpu_cull", include_str!("gpu_cull.wgsl")),
+            ("hiz_build", include_str!("hiz_build.wgsl")),
+            ("hiz_reduce", include_str!("hiz_reduce.wgsl")),
+        ] {
+            let module = wgpu::naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+        }
+    }
+
     #[test]
     fn all_renderer_shaders_validate() {
-        let bsp = format!(
-            "{}\n{}",
-            include_str!("bsp.wgsl"),
-            include_str!("surface_deformation.wgsl")
-        );
-        let bsp_lean = format!(
-            "{}\n{}",
-            include_str!("bsp_lean.wgsl"),
-            include_str!("surface_deformation.wgsl")
-        );
+        let bsp = compose_world_shader(include_str!("bsp.wgsl"));
+        let bsp_lean = compose_world_shader(include_str!("bsp_lean.wgsl"));
         let bsp_fast = format!(
             "{}\n{}",
             include_str!("bsp_fast.wgsl"),
             include_str!("surface_deformation.wgsl")
         );
+        let post = weather::with_weather_surface(&weather::with_post_settings(include_str!("post.wgsl")));
+        let ssr_temporal = weather::with_bound_weather_surface(include_str!("ssr_temporal.wgsl"));
+        let rain = weather::with_weather_surface(include_str!("rain.wgsl"));
+        let rain_haze_mask = weather::with_post_settings(include_str!("rain_haze_mask.wgsl"));
         for (name, source) in [
             ("bsp", bsp.as_str()),
             ("bsp_lean", bsp_lean.as_str()),
             ("bsp_fast", bsp_fast.as_str()),
-            ("post", include_str!("post.wgsl")),
-            ("rain_haze_mask", include_str!("rain_haze_mask.wgsl")),
+            ("post", post.as_str()),
+            ("rain", rain.as_str()),
+            ("rain_sim", include_str!("rain_sim.wgsl")),
+            ("rain_haze_mask", rain_haze_mask.as_str()),
             ("post_gamma", include_str!("post_gamma.wgsl")),
             ("depth_prepass", include_str!("depth_prepass.wgsl")),
-            ("ssr_temporal", include_str!("ssr_temporal.wgsl")),
+            ("ssr_temporal", ssr_temporal.as_str()),
             ("ssr_visibility", include_str!("ssr_visibility.wgsl")),
             ("ssr_visibility_msaa", include_str!("ssr_visibility_msaa.wgsl")),
             ("gpu_cull", include_str!("gpu_cull.wgsl")),
             ("cull_debug", include_str!("cull_debug.wgsl")),
+            ("hiz_build", include_str!("hiz_build.wgsl")),
             ("hiz_reduce", include_str!("hiz_reduce.wgsl")),
             ("cluster_lights", include_str!("cluster_lights.wgsl")),
             ("froxel_fog", include_str!("froxel_fog.wgsl")),
@@ -34410,7 +37817,7 @@ mod shader_tests {
         ] {
             let transformed = ray_traced_world_shader_source(base)
                 .unwrap_or_else(|error| panic!("{name}: RT source transform failed: {error}"));
-            let source = format!("{}\n{}", transformed, include_str!("surface_deformation.wgsl"));
+            let source = compose_world_shader(&transformed);
             let module = wgpu::naga::front::wgsl::parse_str(&source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
             wgpu::naga::valid::Validator::new(
@@ -34420,5 +37827,255 @@ mod shader_tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
         }
+    }
+
+
+    /// Draws one opaque MD3-style triangle through the Entity map pipelines into a
+    /// real depth target and reads the depth back: proves the light-space pipelines
+    /// are valid against the entity layouts and that the pass writes caster depth.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn entity_shadow_pass_writes_caster_depth() {
+        block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.unwrap();
+            println!("entity shadow GPU test: {:?}", adapter.get_info());
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("entity shadow test"),
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+            let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let white = upload_texture(
+                &device,
+                &queue,
+                &TextureData {
+                    label: "white".into(),
+                    source: None,
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255; 4],
+                    rgba16f: None,
+                    mip_level_count: 1,
+                    clamp: true,
+                    srgb: true,
+                },
+            );
+            let mut models = DynamicModelRenderer::new(&device, &camera_layout, wgpu::TextureFormat::Bgra8UnormSrgb, 1, &white);
+            let vertex = |x: f32, z: f32| DynamicModelVertex {
+                position: [x, 0.0, z],
+                normal: [0.0, 1.0, 0.0],
+                uv: [0.0, 0.0],
+                color: [1.0; 4],
+            };
+            let surface = DynamicModelSurface {
+                entity_num: 1,
+                wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
+                vertices: Arc::new(vec![vertex(-100.0, -100.0), vertex(100.0, -100.0), vertex(0.0, 100.0)]),
+                indices: Arc::new(vec![0, 1, 2]),
+                lighting_origin: None,
+                rt_rigid: None,
+                rt_skinned_key: None,
+                ghoul2_gpu: None,
+                fx_gpu_sprites: None,
+                texture: None,
+                alpha_mode: DynamicModelAlphaMode::Opaque,
+            };
+            models.prepare(&device, &queue, &[surface], None, false, false, false);
+            assert!(models.has_depth_casters(), "opaque triangle is a shadow caster");
+            models.ensure_entity_shadow_pipelines(&device, false, false);
+            models.ensure_entity_shadow_pipelines(&device, true, false);
+
+            // Light straight down at the origin; the triangle lies in y = 0.
+            let view = Mat4::look_at_rh(Vec3::new(0.0, 1000.0, 0.0), Vec3::ZERO, Vec3::Z);
+            let projection = Mat4::orthographic_rh(-256.0, 256.0, -256.0, 256.0, 0.1, 2000.0);
+            let state = EntityShadowState::new(&device, &camera_layout);
+            state.write_camera(&queue, 0, projection * view);
+
+            for reverse_z in [false, true] {
+            const SIZE: u32 = 256;
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("entity shadow test depth"),
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let depth_view = depth.create_view(&Default::default());
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(SIZE * SIZE * 4),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("entity shadow test pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(if reverse_z { 0.0 } else { 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                models.draw_entity_shadow(&mut pass, &state.cameras[0].1, reverse_z);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &depth,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(SIZE * 4),
+                        rows_per_image: Some(SIZE),
+                    },
+                },
+                wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            );
+            let submission = queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(30)),
+                })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            let data = readback.slice(..).get_mapped_range();
+            let texels = bytemuck::cast_slice::<u8, f32>(&data);
+            let at = |x: u32, y: u32| texels[(y * SIZE + x) as usize];
+            let centre = at(SIZE / 2, SIZE / 2);
+            let cleared = if reverse_z { 0.0 } else { 1.0 };
+            assert_ne!(centre, cleared, "triangle depth written at the map centre (reverse_z {reverse_z})");
+            assert_eq!(at(2, 2), cleared, "uncovered corner keeps the cleared depth (reverse_z {reverse_z})");
+            // 1000 units from the eye inside a 0.1..2000 ortho range.
+            assert!((centre - 1000.0 / 2000.0).abs() < 0.01, "ortho depth of a y = 0 caster, got {centre}");
+            drop(data);
+            }
+            assert!(block_on(error_scope.pop()).is_none(), "no wgpu validation errors");
+        });
+    }
+
+
+    #[test]
+    fn blob_shadow_request_projects_onto_a_render_space_floor() {
+        // Render space is (x, z, -y). The floor is y = 0 (JKA z = 0), the request
+        // sits on it with left = +x, up = -z_render so that left x up = +y (up).
+        let big = 500.0;
+        let surfaces = jka_assets::bsp::MarkSurfaces::from_world_triangles([
+            (
+                [[-big, -big, 0.0], [big, -big, 0.0], [big, big, 0.0]],
+                [0.0, 0.0, 1.0],
+            ),
+            (
+                [[-big, -big, 0.0], [big, big, 0.0], [-big, big, 0.0]],
+                [0.0, 0.0, 1.0],
+            ),
+        ]);
+        let radius = 24.0;
+        let (left, up) = (Vec3::new(radius, 0.0, 0.0), Vec3::new(0.0, 0.0, -radius));
+        assert_eq!(left.cross(up).normalize(), Vec3::Y, "render-space normal points up");
+        let (mut buffer, mut vertices, mut indices) = (jka_assets::bsp::MarkBuffer::default(), Vec::new(), Vec::new());
+        project_blob_shadow_mark(&surfaces, &mut buffer, Vec3::ZERO, left, up, 0.5, &mut vertices, &mut indices);
+        assert!(!indices.is_empty());
+        for vertex in &vertices {
+            assert!(vertex.position[0].abs() <= 24.01 && vertex.position[2].abs() <= 24.01);
+            assert!((vertex.position[1] - BLOB_MARK_SURFACE_LIFT).abs() < 1.0e-4, "lifted along render up");
+            assert!((0.0..=1.0).contains(&vertex.uv[0]) && (0.0..=1.0).contains(&vertex.uv[1]));
+        }
+        // Dynamic-model pipelines cull back faces (CCW front): every triangle must
+        // face along the surface normal, whichever winding the source triangles had.
+        for tri in indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from_array(vertices[i as usize].position));
+            assert!((b - a).cross(c - a).y > 0.0, "blob triangle is wound away from the camera");
+        }
+        let mut area = 0.0;
+        for tri in indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| vertices[i as usize].uv);
+            area += 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs();
+        }
+        assert!((area - 1.0).abs() < 1.0e-3, "the square is fully covered, uv area {area}");
+    }
+}
+
+#[cfg(test)]
+mod entity_shadow_tests {
+    use super::*;
+
+    fn lamp(position: [f32; 3], intensity: f32) -> scene::DynamicLight {
+        scene::DynamicLight {
+            position,
+            color: [1.0; 3],
+            radius: 300.0,
+            intensity,
+            falloff: scene::DynamicLightFalloff::InverseSquare,
+            surface_lighting: true,
+            emitter_normal: [0.0; 3],
+            emitter_two_sided: false,
+            angle_attenuation: true,
+            angle_scale: 0.0,
+            extra_distance: 0.0,
+        }
+    }
+
+    #[test]
+    fn authored_light_must_agree_with_the_baked_direction() {
+        let focus = Vec3::ZERO;
+        // The baked direction points up and to +x. A brighter lamp on the opposite
+        // side (behind a wall, as far as the bake is concerned) must lose.
+        let grid = Vec3::new(1.0, 1.0, 0.0).normalize();
+        let lights = [lamp([-200.0, 200.0, 0.0], 8.0), lamp([200.0, 200.0, 0.0], 1.0)];
+        let picked = best_authored_light_direction(&lights, focus, Some(grid)).unwrap();
+        assert!(picked.dot(Vec3::new(1.0, 1.0, 0.0).normalize()) > 0.99, "picked {picked:?}");
+        // Without a lightgrid sample there is no visibility proxy: brightest wins.
+        let picked = best_authored_light_direction(&lights, focus, None).unwrap();
+        assert!(picked.x < 0.0, "picked {picked:?}");
+    }
+
+    #[test]
+    fn authored_light_rejects_out_of_range_and_perpendicular_lamps() {
+        let focus = Vec3::ZERO;
+        let grid = Vec3::Y;
+        assert!(best_authored_light_direction(&[lamp([0.0, 5000.0, 0.0], 8.0)], focus, Some(grid)).is_none());
+        assert!(best_authored_light_direction(&[lamp([0.0, 4.0, 0.0], 8.0)], focus, Some(grid)).is_none());
+        assert!(best_authored_light_direction(&[lamp([300.0, 0.0, 0.0], 8.0)], focus, Some(grid)).is_none());
+        assert!(best_authored_light_direction(&[], focus, None).is_none());
     }
 }

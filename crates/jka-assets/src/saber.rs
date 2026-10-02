@@ -14,6 +14,8 @@ const SABER_EXTENSION: &str = ".sab";
 const MAX_SABER_DATA_SIZE: usize = 0x80000;
 const MAX_SABER_BLADES: usize = 8;
 const DEFAULT_SABER_MODEL: &str = "models/weapons2/saber_reborn/saber_w.glm";
+/// OpenJK DEFAULT_SABER (bg_public.h).
+pub const DEFAULT_SABER: &str = "Kyle";
 
 // OpenJK saber_styles_t values.
 const SS_NONE: i32 = 0;
@@ -157,10 +159,23 @@ pub struct SaberDefinition {
     pub ready_anim: i32,
     pub draw_anim: i32,
     pub putaway_anim: i32,
+    /// `singleBladeStyle`: the stance used while only the first blade is lit
+    /// (`SS_NONE` when the saber does not override it).
+    pub single_blade_style: i32,
+    /// SFL2_NO_MANUAL_DEACTIVATE / SFL2_NO_MANUAL_DEACTIVATE2: the primary or
+    /// secondary blade set cannot be toggled off with saberAttackCycle.
+    pub no_manual_deactivate: bool,
+    pub no_manual_deactivate2: bool,
     /// SFL_RETURN_DAMAGE: retain angular motion while the saber returns.
     pub return_damage: bool,
+    /// `notInMP`: WP_SaberValidForPlayerInMP substitutes DEFAULT_SABER for a
+    /// multiplayer client that selects this definition.
+    pub not_in_mp: bool,
     /// `soundLoop`: the hum CGame adds as a looping sound while a blade is lit.
     pub sound_loop: String,
+    /// `soundOn` / `soundOff`: played by EV_SABER_UNHOLSTER (on) when the blade lights.
+    pub sound_on: String,
+    pub sound_off: String,
     /// `swingSound1..3`: optional authored replacements used by EV_SABER_ATTACK.
     /// OpenJK falls back to saberhup1..8 unless swingSound1 is present.
     pub swing_sounds: [Option<String>; 3],
@@ -206,9 +221,15 @@ impl SaberDefinition {
             ready_anim: -1,
             draw_anim: -1,
             putaway_anim: -1,
+            single_blade_style: SS_NONE,
+            no_manual_deactivate: false,
+            no_manual_deactivate2: false,
             return_damage: false,
+            not_in_mp: false,
             // OpenJK MP WP_SaberSetDefaults.
             sound_loop: "sound/weapons/saber/saberhum3.wav".to_owned(),
+            sound_on: "sound/weapons/saber/enemy_saber_on.wav".to_owned(),
+            sound_off: "sound/weapons/saber/enemy_saber_off.wav".to_owned(),
             swing_sounds: [None, None, None],
             hit_sounds: [None, None, None],
             hit2_sounds: [None, None, None],
@@ -251,6 +272,62 @@ impl SaberDefinitions {
 
     pub fn len(&self) -> usize {
         self.definitions.len()
+    }
+
+    /// WP_SaberValidForPlayerInMP: a definition is valid unless it authors a
+    /// non-zero `notInMP`.
+    fn valid_for_player_in_mp(&self, saber_name: &str) -> bool {
+        self.get(saber_name).is_none_or(|definition| !definition.not_in_mp)
+    }
+
+    /// The definition WP_SetSaber actually parses for `saber_name`. Player
+    /// clients (entNum < MAX_CLIENTS) fall back to DEFAULT_SABER when the
+    /// selection is not allowed in multiplayer.
+    fn parsed_definition(&self, saber_name: &str, player_client: bool) -> SaberDefinition {
+        if player_client && !self.valid_for_player_in_mp(saber_name) {
+            self.definition_or_default(DEFAULT_SABER)
+        } else {
+            self.definition_or_default(saber_name)
+        }
+    }
+
+    /// Which of the two saber slots exist after OpenJK `WP_SetSaber`:
+    /// saber 0 can never be removed; saber 1 is dropped for "none"/"remove",
+    /// when it is itself two-handed, or when saber 0 is two-handed.
+    pub fn equipped_slots(&self, saber_names: [&str; 2], player_client: bool) -> [bool; 2] {
+        let removed = |name: &str| {
+            name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("remove")
+        };
+        let two_handed = |name: &str| {
+            let name = if player_client && !self.valid_for_player_in_mp(name) {
+                DEFAULT_SABER
+            } else {
+                name
+            };
+            self.get(name)
+                .is_some_and(|definition| definition.saber_flags & SFL_TWO_HANDED != 0)
+        };
+        let primary = !removed(saber_names[0]);
+        let mut secondary = !saber_names[1].is_empty() && !removed(saber_names[1]);
+        if secondary
+            && (two_handed(saber_names[1]) || (primary && two_handed(saber_names[0])))
+        {
+            secondary = false;
+        }
+        [primary, secondary]
+    }
+
+    /// The `clientInfo_t::saber[]` pair OpenJK ends up with for the two
+    /// configured saber names (see [`Self::equipped_slots`]).
+    pub fn equip(
+        &self,
+        saber_names: [&str; 2],
+        player_client: bool,
+    ) -> [Option<SaberDefinition>; 2] {
+        let slots = self.equipped_slots(saber_names, player_client);
+        [0, 1].map(|slot| {
+            slots[slot].then(|| self.parsed_definition(saber_names[slot], player_client))
+        })
     }
 
     /// Visible saber definitions in the active VFS, in deterministic key order.
@@ -405,6 +482,21 @@ fn parse_saber_file(
                         definition.styles_forbidden |= 1 << translate_saber_style(&value);
                     }
                 }
+                "singlebladestyle" => {
+                    if let Some(value) = parser.token(false)? {
+                        definition.single_blade_style = translate_saber_style(&value);
+                    }
+                }
+                "nomanualdeactivate" | "nomanualdeactivate2" => {
+                    if let Some(value) = parser.token(false)? {
+                        let enabled = matches!(value.parse::<i32>(), Ok(value) if value != 0);
+                        if lower == "nomanualdeactivate2" {
+                            definition.no_manual_deactivate2 = enabled;
+                        } else {
+                            definition.no_manual_deactivate = enabled;
+                        }
+                    }
+                }
                 "lockable" | "throwable" | "disarmable" | "blocking" => {
                     if let Some(value) = parser.token(false)? {
                         if value.parse::<i32>().ok() == Some(0) {
@@ -517,6 +609,18 @@ fn parse_saber_file(
                         definition.no_dlight = matches!(value.parse::<i32>(), Ok(value) if value != 0);
                     }
                 }
+                "soundon" | "soundoff" => {
+                    if let Some(value) = parser.token(false)? {
+                        if !value.is_empty() {
+                            let value = value.replace('\\', "/");
+                            if lower == "soundon" {
+                                definition.sound_on = value;
+                            } else {
+                                definition.sound_off = value;
+                            }
+                        }
+                    }
+                }
                 "soundloop" => {
                     if let Some(value) = parser.token(false)? {
                         if !value.is_empty() {
@@ -587,6 +691,13 @@ fn parse_saber_file(
                             } else {
                                 definition.no_clash_flare = value != 0;
                             }
+                        }
+                    }
+                }
+                "notinmp" => {
+                    if let Some(value) = parser.token(false)? {
+                        if let Ok(parsed) = value.parse::<i32>() {
+                            definition.not_in_mp = parsed != 0;
                         }
                     }
                 }
@@ -804,6 +915,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blade_toggle_gameplay_keys_are_parsed() {
+        let mut scales = BTreeMap::new();
+        let mut defs = BTreeMap::new();
+        parse_saber_file(
+            br#"
+                staff_1 {
+                    numBlades 2
+                    singleBladeStyle medium
+                    noManualDeactivate 1
+                    noManualDeactivate2 0
+                }
+                plain_1 {
+                }
+            "#,
+            &mut scales,
+            &mut defs,
+        )
+        .unwrap();
+        let staff = &defs["staff_1"];
+        assert_eq!(staff.single_blade_style, SS_MEDIUM);
+        assert!(staff.no_manual_deactivate);
+        assert!(!staff.no_manual_deactivate2);
+        let plain = &defs["plain_1"];
+        assert_eq!(plain.single_blade_style, SS_NONE);
+        assert!(!plain.no_manual_deactivate && !plain.no_manual_deactivate2);
+    }
+
+    #[test]
     fn defaults_and_render_fields_match_openjk_subset() {
         let mut scales = BTreeMap::new();
         let mut defs = BTreeMap::new();
@@ -904,5 +1043,50 @@ mod tests {
         assert_eq!((def.blade(0).color, def.blade(1).color), (SABER_PURPLE, 2));
         assert_eq!(defs.get("defaultish").unwrap().blade(0).color, SABER_RED);
         assert_eq!(defs.get("defaultish").unwrap().sound_loop, "sound/weapons/saber/saberhum3.wav");
+    }
+
+    fn equip_fixture() -> SaberDefinitions {
+        let mut scales = BTreeMap::new();
+        let mut definitions = BTreeMap::new();
+        parse_saber_file(
+            br#"
+                Kyle { saberModel models/weapons2/saber/saber_w.glm }
+                single_a { saberModel models/weapons2/saber_a/saber_w.glm }
+                staff_a { saberModel models/weapons2/staff/saber_w.glm numBlades 2 twoHanded 1 }
+                staff_free { saberModel models/weapons2/staff/saber_w.glm numBlades 2 }
+                secret { saberModel models/weapons2/secret/saber_w.glm notInMP 1 }
+            "#,
+            &mut scales,
+            &mut definitions,
+        )
+        .unwrap();
+        SaberDefinitions { definitions }
+    }
+
+    #[test]
+    fn equip_follows_wp_setsaber_slot_rules() {
+        let defs = equip_fixture();
+        // Plain dual sabers.
+        assert_eq!(defs.equipped_slots(["single_a", "single_a"], true), [true, true]);
+        // "none"/"remove"/empty never produce a second saber.
+        for second in ["none", "REMOVE", ""] {
+            assert_eq!(defs.equipped_slots(["single_a", second], true), [true, false]);
+        }
+        // A two-handed saber cannot be the second saber, nor coexist with one.
+        assert_eq!(defs.equipped_slots(["single_a", "staff_a"], true), [true, false]);
+        assert_eq!(defs.equipped_slots(["staff_a", "single_a"], true), [true, false]);
+        assert_eq!(defs.equipped_slots(["staff_a", "none"], true), [true, false]);
+        // A staff that is not flagged two-handed may be paired.
+        assert_eq!(defs.equipped_slots(["staff_free", "single_a"], true), [true, true]);
+    }
+
+    #[test]
+    fn equip_substitutes_default_saber_for_not_in_mp_selections() {
+        let defs = equip_fixture();
+        let [player, _] = defs.equip(["secret", "none"], true);
+        assert_eq!(player.unwrap().model, "models/weapons2/saber/saber_w.glm");
+        // NPCs (entNum >= MAX_CLIENTS) keep the authored definition.
+        let [npc, _] = defs.equip(["secret", "none"], false);
+        assert_eq!(npc.unwrap().model, "models/weapons2/secret/saber_w.glm");
     }
 }

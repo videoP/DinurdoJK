@@ -46,9 +46,29 @@ pub struct RenderStats {
 }
 
 #[derive(Debug, Clone)]
-pub struct SurfaceInspectorInfo {
+pub struct SurfaceInspectorSection {
     pub title: String,
     pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SurfaceInspectorInfo {
+    /// Human-facing category shown in the trace panel (WORLD SURFACE, ENTITY, ...).
+    pub kind: String,
+    /// Primary identity: material name, entity/model label, etc.
+    pub title: String,
+    /// Small set of high-value fields rendered prominently as label/value rows.
+    pub summary: Vec<(String, String)>,
+    /// Human-oriented grouped details. The raw diagnostic dump stays in `lines`.
+    pub sections: Vec<SurfaceInspectorSection>,
+    /// Complete diagnostic dump copied by Ctrl+C and printed for scripted traces.
+    pub lines: Vec<String>,
+    /// Protocol entity hit by the trace, when applicable. App-side enrichment uses
+    /// this to add classname/spawn vars/client state without moving game state to
+    /// the render thread.
+    pub hit_entity_num: Option<u16>,
+    /// Inline BSP model number (`*N`) for brush-model hits.
+    pub hit_inline_model: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,6 +84,20 @@ pub struct WorldUploadTimings {
     pub visibility_tables_ms: f64,
     pub grass_upload_ms: f64,
     pub finalize_ms: f64,
+    /// `load_map` work before `build_world` (fog install, detail textures).
+    pub pre_build_ms: f64,
+    /// Snow-shell mesh build at the top of `build_world`.
+    pub snow_shell_ms: f64,
+    /// CPU-side copies for the inspector and static AO, before the vertex upload.
+    pub prelude_ms: f64,
+    /// Cull and froxel bind groups created after `build_world` returns.
+    pub post_bind_groups_ms: f64,
+    /// Videos, light buffer, static AO request, weather and fog sync.
+    pub post_misc_ms: f64,
+    /// Planar reflection resources and `rebuild_frame_plan`.
+    pub frame_plan_ms: f64,
+    /// `activate_world_pipeline_variant`.
+    pub variant_ms: f64,
     /// FFT-ocean geometry report. The promoted water surface only shows wave
     /// displacement if it carries the dense replacement index range, so these
     /// distinguish "wrong spectrum" from "never tessellated".
@@ -74,14 +108,23 @@ pub struct WorldUploadTimings {
     pub ocean_coarsest_spacing: f32,
 }
 
+#[derive(Debug)]
+pub enum ScreenshotOutput {
+    Saved(PathBuf),
+    Clipboard,
+}
+
 pub enum UserEvent {
     ConsoleCommand(String),
-    ScreenshotFinished(Result<(PathBuf, Option<String>), String>),
+    ScreenshotFinished(Result<ScreenshotOutput, String>),
     RendererReady {
         supported_msaa: Vec<u32>,
         wireframe_supported: bool,
     },
     RendererFirstFrame,
+    /// Footsteps and landings the renderer found in standing water; the game
+    /// thread plays the engine's own splash effects for them.
+    WaterSplashes(Vec<crate::weather::wake::WaterSplash>),
     RenderStats(RenderStats),
     RendererError(String),
     SurfaceInspected(Option<SurfaceInspectorInfo>),
@@ -111,6 +154,12 @@ pub enum UserEvent {
         started: Instant,
         name: String,
         map: Box<PreparedMap>,
+    },
+    /// Rapier static-world mesh built on a worker after client physics was
+    /// enabled on an already-loaded map.
+    PhysicsMeshReady {
+        label: String,
+        result: Result<crate::cgame::ragdoll::PhysicsMapMesh, String>,
     },
     MapFailed {
         request_id: u64,

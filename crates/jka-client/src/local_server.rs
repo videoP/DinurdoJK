@@ -6,6 +6,7 @@
 //! server produces after netchan decoding.  CGame/presentation therefore sees
 //! local and remote play through the same boundary.
 
+mod game;
 mod movers;
 
 use std::{
@@ -20,7 +21,7 @@ use jka_assets::saber::{SaberDefinition, SaberDefinitions};
 
 use crate::{
     camera::Camera,
-    cgame::{ClientInfo, CS_EFFECTS, CS_MODELS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
+    cgame::{ambient_sets::CS_AMBIENT_SET, ClientInfo, CS_EFFECTS, CS_MODELS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
     player::{LocalPlayer, MouseInputSettings},
     scene::{MapBrushEntity, MapFxRunner, SpawnPoint},
     surface_deformation::SurfaceDeformationStamp,
@@ -47,13 +48,16 @@ const MAX_GENTITIES: u16 = 1024;
 /// socket or protocol-26 re-encoding here: this sits immediately after the
 /// network decoder and feeds the exact semantic objects consumed by CGame.
 pub struct LocalServer {
+    diagnostic_epoch: std::time::Instant,
     player: LocalPlayer,
     map_name: String,
     configstrings: BTreeMap<u16, Vec<u8>>,
     map_effects: Vec<String>,
-    map_entities: Vec<EntityState>,
-    /// func_trains that move; `entity` indexes `map_entities`.
-    trains: Vec<movers::Train>,
+    /// The fx_runner entities.
+    fx_entities: Vec<EntityState>,
+    /// Doors, plats, triggers and every other brush entity, running on the
+    /// player's timeline.
+    game: game::MoverGame,
     /// `model2` names published as CS_MODELS entries 1..
     map_models: Vec<String>,
     next_message_num: i32,
@@ -64,6 +68,9 @@ pub struct LocalServer {
     last_snapshot_time: Option<i32>,
     /// Point -> portal area lookup for SV_BuildClientSnapshot's areamask.
     areas: Option<jka_assets::bsp::AreaLocator>,
+    /// `ps.customRGBA`: G_ClientUserinfoChanged builds it from `char_color_*`
+    /// with alpha 255. The player shim leaves it zero, so it is stamped here.
+    custom_rgba: [i32; 4],
 }
 
 impl LocalServer {
@@ -81,40 +88,37 @@ impl LocalServer {
         let mut player = LocalPlayer::new(movement, world, spawn)?;
         player.set_saber_movement_info(saber_movement)?;
         let map_name = normalize_map_name(map_name);
-        let (map_effects, mut map_entities) = build_map_fx_entities(fx_runners);
+        let (map_effects, fx_entities) = build_map_fx_entities(fx_runners);
         let movers = movers::build_brush_mover_entities(
             brush_entities,
-            LOCAL_MAP_ENTITY_BASE.saturating_add(map_entities.len() as u16),
+            LOCAL_MAP_ENTITY_BASE.saturating_add(fx_entities.len() as u16),
             MAX_GENTITIES,
         );
-        if !movers.entities.is_empty() {
+        let game = game::MoverGame::new(movers.entities, movers.sources, movers.trains, brush_entities, areas.clone());
+        if game.published().next().is_some() {
             println!(
-                "LOCAL SERVER MOVERS: {} of {} brush entities spawned as ET_MOVER ({} moving train(s), {} model2)",
-                movers.entities.len(),
+                "LOCAL SERVER MOVERS: {} of {} brush entities spawned as ET_MOVER ({}; {} model2)",
+                game.published().count(),
                 brush_entities.len(),
-                movers.trains.len(),
+                game.summary(),
                 movers.models.len()
             );
         }
-        let mover_base = map_entities.len();
-        let mut trains = movers.trains;
-        for train in &mut trains {
-            train.entity += mover_base;
-        }
         let map_models = movers.models;
-        map_entities.extend(movers.entities);
         let mut server = Self {
+            diagnostic_epoch: std::time::Instant::now(),
             player,
             map_name,
             configstrings: BTreeMap::new(),
             map_effects,
-            map_entities,
-            trains,
+            fx_entities,
+            game,
             map_models,
             next_message_num: 1,
             player_time_offset: 0,
             last_snapshot_time: None,
             areas,
+            custom_rgba: [255; 4],
         };
         server.rebuild_gamestate(client_info);
         Ok(server)
@@ -122,6 +126,10 @@ impl LocalServer {
 
     pub fn map_name(&self) -> &str {
         &self.map_name
+    }
+
+    pub(crate) fn diagnostic_epoch(&self) -> std::time::Instant {
+        self.diagnostic_epoch
     }
 
     /// Server-side `generic_cmd` cases currently owned by this lightweight
@@ -139,6 +147,11 @@ impl LocalServer {
         self.configstrings.get(&CS_PLAYERS).map(Vec::as_slice)
     }
 
+    /// `char_color_red/green/blue` of the local client, as `ps.customRGBA`.
+    pub fn set_char_color(&mut self, rgb: [u8; 3]) {
+        self.custom_rgba = [i32::from(rgb[0]), i32::from(rgb[1]), i32::from(rgb[2]), 255];
+    }
+
     pub fn set_client_info(&mut self, info: &ClientInfo) {
         self.configstrings
             .insert(CS_PLAYERS, client_info_string(info).into_bytes());
@@ -149,6 +162,11 @@ impl LocalServer {
         sabers: [SaberMovementInfo; 2],
     ) -> Result<(), String> {
         self.player.set_saber_movement_info(sabers)
+    }
+
+    /// See `LocalPlayer::set_foot_bolts`.
+    pub fn set_foot_bolts(&mut self, bolts: Option<[[f32; 3]; 2]>) {
+        self.player.set_foot_bolts(bolts);
     }
 
     fn rebuild_gamestate(&mut self, info: &ClientInfo) {
@@ -169,6 +187,11 @@ impl LocalServer {
             let Ok(slot) = u16::try_from(slot + 1) else { break };
             self.configstrings
                 .insert(CS_MODELS + slot, model.as_bytes().to_vec());
+        }
+        // G_SoundSetIndex: the bmodelSets of movers (door and lift sounds).
+        for (slot, set) in self.game.sound_sets().iter().enumerate() {
+            let Some(index) = u16::try_from(slot + 1).ok().and_then(|slot| CS_AMBIENT_SET.checked_add(slot)) else { break };
+            self.configstrings.insert(index, set.as_bytes().to_vec());
         }
         for (slot, effect) in self.map_effects.iter().enumerate() {
             let Ok(slot) = u16::try_from(slot + 1) else { break };
@@ -201,12 +224,6 @@ impl LocalServer {
             return None;
         }
 
-        for train in &mut self.trains {
-            if let Some(state) = self.map_entities.get_mut(train.entity) {
-                train.advance(state, server_time);
-            }
-        }
-
         let network = self.player.network_state();
         let mut player_state = ProtocolPlayerState::default();
         player_state.fields = network.fields;
@@ -214,6 +231,9 @@ impl LocalServer {
         player_state.persistant = network.persistant;
         player_state.ammo = network.ammo;
         player_state.powerups = network.powerups;
+        for (index, value) in self.custom_rgba.into_iter().enumerate() {
+            player_state.set_field_bits(&format!("customRGBA[{index}]"), value as u32);
+        }
 
         let message_num = self.next_message_num;
         self.next_message_num = self.next_message_num.saturating_add(1).max(1);
@@ -225,6 +245,7 @@ impl LocalServer {
             message_num,
             delta_num,
             snap_flags: 0,
+            ping: 0,
             server_command_num: 0,
             area_mask: self.area_mask(),
             player_state,
@@ -233,26 +254,26 @@ impl LocalServer {
             // predicted/followed client on a remote server. Map-authored entities
             // are published through this same snapshot boundary; CGame does not
             // need a special Solo Game presentation path.
-            entities: self.map_entities.clone(),
+            entities: self
+                .fx_entities
+                .iter()
+                .chain(self.game.published())
+                .cloned()
+                .collect(),
         })
     }
 
     /// SV_BuildClientSnapshot: CM_WriteAreaBits for the area holding the
     /// view origin, inverted onto the wire (a set bit hides an area). Every
-    /// areaportal starts closed (cm.areaPortals is zeroed at load) and only a
-    /// mover opening moves it; the shim's movers never open, so the flood
-    /// reaches the viewer's own area alone. A view in solid (area -1) sees
-    /// every area, as in CM_WriteAreaBits.
+    /// areaportal starts closed (cm.areaPortals is zeroed at load) and opens
+    /// with the door that guards it, so the flood reaches the viewer's own
+    /// area plus whatever open portals lead to. A view in solid (area -1)
+    /// sees every area, as in CM_WriteAreaBits.
     fn area_mask(&self) -> [u8; 32] {
         let Some(areas) = &self.areas else {
             return [0; 32];
         };
-        let Some(area) = areas.area_at(self.player.view().eye_origin()).filter(|&area| area < 256) else {
-            return [0; 32];
-        };
-        let mut mask = [0xff; 32];
-        mask[area / 8] &= !(1 << (area % 8));
-        mask
+        self.game.area_mask(areas.area_at(self.player.view().eye_origin()))
     }
 
     pub fn update(
@@ -262,7 +283,9 @@ impl LocalServer {
         mouse: (f64, f64),
         client_cmd: jka_movement::UserCmd,
     ) -> Result<Vec<SurfaceDeformationStamp>, String> {
-        self.player.update(elapsed, keys, mouse, client_cmd)?;
+        // Movers run on the snapshot timeline, which player time resets rebase.
+        self.game.set_time_offset(self.player_time_offset.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+        self.player.update_with_game(elapsed, keys, mouse, client_cmd, &mut self.game)?;
         Ok(self.player.take_deformation_stamps())
     }
 
@@ -274,18 +297,22 @@ impl LocalServer {
         self.player.view()
     }
 
-    /// `fd.saberAnimLevel` (playerState field 23 in the protocol-26 schema).
+    /// `fd.saberDrawAnimLevel` (playerState field 25 in the protocol-26 schema).
+    /// Unlike `fd.saberAnimLevel` this follows a style cycled mid-swing at once,
+    /// which is what the cgame HUD shows.
     pub fn saber_style(&self) -> i32 {
-        const SABER_ANIM_LEVEL_FIELD: usize = 23;
+        const SABER_DRAW_ANIM_LEVEL_FIELD: usize = 25;
         self.player
             .network_state()
             .fields
-            .get(SABER_ANIM_LEVEL_FIELD)
+            .get(SABER_DRAW_ANIM_LEVEL_FIELD)
             .map_or(0, |bits| *bits as i32)
     }
 
     pub fn entity_view(&self) -> PlayerEntityView {
-        self.player.entity_view()
+        let mut view = self.player.entity_view();
+        view.custom_rgba = self.custom_rgba;
+        view
     }
 
     pub fn presentation_time(&self) -> i32 {
@@ -364,6 +391,12 @@ impl LocalServer {
         self.player.teleport(origin, angles)
     }
 
+    /// `/trace` menu's "USE / TOGGLE" action: fires a mover/trigger-logic
+    /// entity by its live entity number, as if the player had used it.
+    pub fn use_entity(&mut self, entity_num: u16) -> Result<(), String> {
+        self.game.use_entity(entity_num)
+    }
+
     pub fn apply_mouse_look_timed(&mut self, mouse: (f64, f64), elapsed: Duration) {
         self.player.apply_mouse_look_timed(mouse, elapsed);
     }
@@ -387,13 +420,18 @@ impl DerefMut for LocalServer {
     }
 }
 
+/// The `saberInfo_t` gameplay data OpenJK's `WP_SetSaber` leaves in
+/// `clientInfo_t::saber[]` for the two configured saber names. The local
+/// authority and networked prediction share this so every Pmove sees the same
+/// equipment the server does (two-handed and `notInMP` rules included).
 pub fn saber_movement_loadout(
     definitions: &SaberDefinitions,
-    info: &ClientInfo,
+    saber_names: [&str; 2],
+    player_client: bool,
 ) -> [SaberMovementInfo; 2] {
-    fn converted(definition: SaberDefinition, present: bool) -> SaberMovementInfo {
+    fn converted(definition: &SaberDefinition) -> SaberMovementInfo {
         SaberMovementInfo {
-            present: i32::from(present),
+            present: 1,
             num_blades: definition.num_blades.clamp(1, 8) as i32,
             styles_learned: definition.styles_learned,
             styles_forbidden: definition.styles_forbidden,
@@ -403,20 +441,17 @@ pub fn saber_movement_loadout(
             ready_anim: definition.ready_anim,
             draw_anim: definition.draw_anim,
             putaway_anim: definition.putaway_anim,
+            owns_entity_slot: 1,
+            no_manual_deactivate: i32::from(definition.no_manual_deactivate),
+            no_manual_deactivate2: i32::from(definition.no_manual_deactivate2),
+            blade_style2_start: definition.blade_style2_start.min(8) as i32,
+            single_blade_style: definition.single_blade_style,
         }
     }
 
-    let primary_removed = info.saber_name.eq_ignore_ascii_case("none")
-        || info.saber_name.eq_ignore_ascii_case("remove");
-    let primary = definitions.definition_or_default(&info.saber_name);
-    let secondary_present = !info.saber2_name.is_empty()
-        && !info.saber2_name.eq_ignore_ascii_case("none")
-        && !info.saber2_name.eq_ignore_ascii_case("remove");
-    let secondary = definitions.definition_or_default(&info.saber2_name);
-    [
-        converted(primary, !primary_removed),
-        converted(secondary, secondary_present),
-    ]
+    definitions
+        .equip(saber_names, player_client)
+        .map(|slot| slot.as_ref().map_or_else(SaberMovementInfo::default, converted))
 }
 
 fn entity_field_index(name: &str) -> Option<usize> {

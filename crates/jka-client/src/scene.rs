@@ -125,6 +125,11 @@ pub struct DrawBatch {
     pub lightmap: Option<usize>,
     /// True only for the compact implicit material path.
     pub modulate_lightmap: bool,
+    /// Multi-stage material with an explicit `$lightmap` stage and no PBR
+    /// companion maps: point/RT local lights are added once in the lightmap
+    /// stage (which every other stage is multiplied by) instead of in the base
+    /// stage, where later stages would overwrite them.
+    pub dlight_in_lightmap_stage: bool,
     /// True when q3map stored this surface's baked lighting in BSP vertex colors
     /// (`LIGHTMAP_BY_VERTEX`), including compiled static-model/MD3 geometry.
     pub vertex_lit: bool,
@@ -242,10 +247,56 @@ pub struct PreparedPortalDrawPlan {
     pub reused_plan_hits: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SpawnPoint {
     pub position: [f32; 3],
     pub yaw: f32,
+    /// `info_player_deathmatch` spawnflag 1 ("initial").
+    pub initial: bool,
+    /// `nohumans 1`: bot-only spot.
+    pub no_humans: bool,
+}
+
+/// OpenJK's FFA spawn choice for a human player (`SelectInitialSpawnPoint` /
+/// `SelectRandomFurthestSpawnPoint`). `avoid` is the position to stay away
+/// from (`ps.origin`; JKA passes the world origin for the initial spawn).
+/// Returns an index into `spawns`. `random` yields a value in `[0, 1)`.
+///
+/// Initial: the first non-`nohumans` spot flagged initial, otherwise the
+/// furthest-spot rule. Furthest: rank every usable spot by distance from
+/// `avoid` and pick randomly from the furthest half. Spots do not telefrag in
+/// solo, so `SpotWouldTelefrag` has nothing to reject.
+pub fn select_spawn_index(
+    spawns: &[SpawnPoint],
+    avoid: [f32; 3],
+    initial: bool,
+    random: f32,
+) -> Option<usize> {
+    const MAX_SPAWN_POINTS: usize = 128;
+    let usable = |spawn: &SpawnPoint| !spawn.no_humans;
+    if initial {
+        if let Some(index) = spawns.iter().position(|spawn| usable(spawn) && spawn.initial) {
+            return Some(index);
+        }
+    }
+    let mut ranked: Vec<(f32, usize)> = spawns
+        .iter()
+        .enumerate()
+        .filter(|(_, spawn)| usable(spawn))
+        .take(MAX_SPAWN_POINTS)
+        .map(|(index, spawn)| {
+            let delta = std::array::from_fn::<f32, 3, _>(|axis| spawn.position[axis] - avoid[axis]);
+            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2], index)
+        })
+        .collect();
+    if ranked.is_empty() {
+        // JKA falls back to the first spot rather than refusing to spawn.
+        return (!spawns.is_empty()).then_some(0);
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let half = (ranked.len() / 2).max(1);
+    let pick = ((random.clamp(0.0, 0.999_999) * half as f32) as usize).min(half - 1);
+    Some(ranked[pick].1)
 }
 
 /// Server-facing representation of a map-authored `fx_runner`. Values remain
@@ -264,7 +315,9 @@ pub struct MapFxRunner {
 /// A BSP entity whose `model` key names an inline model (`*N`), kept as the
 /// spawn variables the game module would see. The local server shim runs its
 /// port of the OpenJK spawn functions over these; a remote server sends the
-/// resulting ET_MOVER entities in its snapshots instead.
+/// resulting ET_MOVER entities in its snapshots instead. The point entities
+/// that pass a use along to movers (target_relay, trigger_always, ...) are
+/// kept too, with `model` 0 and no bounds.
 #[derive(Debug, Clone)]
 pub struct MapBrushEntity {
     pub model: u32,
@@ -434,6 +487,9 @@ pub struct BspMapStats {
     /// (`*N`, entity `modelindex`). CGame places brush-model loop sounds at
     /// `lerpOrigin + midpoint`, since mover origins are relative offsets.
     pub inline_model_midpoints: std::sync::Arc<[[f32; 3]]>,
+    /// `(mins, maxs)` of each inline model, indexed like the midpoints. CGame's
+    /// glass shatter tessellates the brush's face from these.
+    pub inline_model_bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>,
     pub brushes: usize,
     pub brush_sides: usize,
     pub planes: usize,
@@ -461,6 +517,8 @@ pub struct MapLoadTimings {
     pub texture_decode_ms: f64,
     pub texture_mip_ms: f64,
     pub texture_images: usize,
+    pub generated_normal_ms: f64,
+    pub generated_normals: usize,
     pub lightmap_ms: f64,
     pub material_ms: f64,
     pub geometry_ms: f64,
@@ -471,6 +529,47 @@ pub struct MapLoadTimings {
     pub steam_audio_ms: f64,
     pub portal_plans_ms: f64,
     pub worker_count: usize,
+    /// Wall time of each consecutive `prepare_internal` phase on the loader
+    /// thread (including any worker joins it blocks on); see `PREP_PHASES`.
+    pub phase_ms: [f64; PREP_PHASES.len()],
+    /// Inside the geometry phase: dlight surfaces, surface walk (including the
+    /// vertex expansion), PVS signatures (part of the walk), piece pack, and
+    /// piece ordering (part of the pack).
+    pub geometry_detail_ms: [f64; 5],
+    /// Preloaded texture count and decode CPU by file type (tga, jpg, png).
+    pub texture_format_images: [u32; 3],
+    pub texture_format_decode_ms: [f64; 3],
+    /// Archive handles opened (not reused from the idle pool) during this
+    /// preparation, and the time that took summed over all threads.
+    pub archive_opens: u32,
+    pub archive_open_ms: f64,
+}
+
+/// Labels for `MapLoadTimings::phase_ms`, in execution order. Together they
+/// cover the whole of `prepare_internal`, so they sum to `prepare_wall_ms`.
+pub const PREP_PHASES: [&str; 16] = [
+    "startup (index/parse/shaders)",
+    "tex submit+collision+meshes+fog",
+    "lightmaps",
+    "spawns/entities",
+    "texture wait",
+    "materials",
+    "grass setup",
+    "geometry+inline",
+    "lights/probes/planar",
+    "ocean+plan submit",
+    "lightmap pages",
+    "grass join",
+    "gi/audio join",
+    "footprints+tex hashes",
+    "plan join",
+    "debug volumes/final",
+];
+
+/// Charge the time since the previous lap to `phase` and restart the clock.
+fn phase_lap(timings: &mut MapLoadTimings, phase: usize, clock: &mut Instant) {
+    timings.phase_ms[phase] += clock.elapsed().as_secs_f64() * 1000.0;
+    *clock = Instant::now();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +764,10 @@ struct ClassicLightGridCell {
     ambient: [f32; 3],
     directed: [f32; 3],
     direction: [f32; 3],
+    /// Fraction (0..1) of `directed` that is the map's baked sun. Filled by
+    /// `ClassicEntityLightGrid::estimate_sun_weights`; zero until then, so an
+    /// unestimated grid behaves exactly like the stock lightgrid.
+    sun_weight: f32,
     valid: bool,
 }
 
@@ -676,6 +779,56 @@ pub struct ClassicEntityLight {
     pub directed: [f32; 3],
     /// Unit incoming-light direction in renderer coordinates [x,z,-y].
     pub direction: [f32; 3],
+    /// Part of `directed` that is the baked map sun, same units. Already
+    /// included in `directed` until `relight_sun` moves it out.
+    pub baked_sun: [f32; 3],
+    /// Second directional light: the runtime sun after `relight_sun`. Zero
+    /// (and ignored by the shaders) otherwise.
+    pub sun_directed: [f32; 3],
+    /// Unit incoming-light direction of `sun_directed`, renderer coordinates.
+    pub sun_direction: [f32; 3],
+    /// 0..1 agreement between the probes blended into `direction` (length of the
+    /// blended direction over the total weight). Low means neighbouring probes
+    /// point different ways, so the blended direction is unreliable. It cannot
+    /// see lights cancelling inside one probe: q3map2 bakes only the normalized
+    /// sum, so that disagreement is gone from the data.
+    pub direction_coherence: f32,
+}
+
+impl ClassicEntityLight {
+    /// Moves the baked sun share out of the lightgrid's directed term and
+    /// replaces it with a separate directional light: `baked_sun` scaled by the
+    /// per-channel `gain` (runtime sun radiance / map sun radiance), arriving
+    /// from `toward_sun` (unit, renderer coordinates).
+    ///
+    /// The remaining directed light keeps its own direction, recovered by
+    /// subtracting the map sun's luminance-weighted direction from the probe's
+    /// blended one, so torch and skylight shading does not swing toward the
+    /// removed sun.
+    pub fn relight_sun(&mut self, map_toward_sun: [f32; 3], toward_sun: [f32; 3], gain: [f32; 3]) {
+        let sun_luma = light_luminance(self.baked_sun);
+        if sun_luma <= 1e-4 {
+            return;
+        }
+        let total_luma = light_luminance(self.directed).max(sun_luma);
+        let mut rest_direction = [0.0_f32; 3];
+        for axis in 0..3 {
+            rest_direction[axis] =
+                self.direction[axis] * total_luma - map_toward_sun[axis] * sun_luma;
+        }
+        let rest_len_sq: f32 = rest_direction.iter().map(|v| v * v).sum();
+        // With nothing left over the remainder direction is irrelevant; keep the
+        // probe direction so the shader never sees a zero vector for a live term.
+        if rest_len_sq > 1e-8 {
+            let inv = rest_len_sq.sqrt().recip();
+            self.direction = rest_direction.map(|v| v * inv);
+        }
+        for channel in 0..3 {
+            self.directed[channel] = (self.directed[channel] - self.baked_sun[channel]).max(0.0);
+            self.sun_directed[channel] = self.baked_sun[channel] * gain[channel];
+        }
+        self.sun_direction = toward_sun;
+    }
 }
 
 /// Compact CPU-only subset retained after the renderer uploads the static
@@ -688,6 +841,9 @@ pub struct ClassicEntityLightGrid {
     bounds: [u32; 3],
     external_hdr: bool,
     cells: Vec<ClassicLightGridCell>,
+    /// Unit direction toward the map's baked sun once `estimate_sun_weights`
+    /// has run; `None` means no sun share is known for this grid.
+    map_toward_sun: Option<[f32; 3]>,
 }
 
 impl StaticLightGrid {
@@ -697,6 +853,52 @@ impl StaticLightGrid {
 }
 
 impl ClassicEntityLightGrid {
+    /// Direction toward the baked map sun, if `estimate_sun_weights` found one.
+    pub fn map_toward_sun(&self) -> Option<[f32; 3]> {
+        self.map_toward_sun
+    }
+
+    /// Fills each probe's `sun_weight`: how much of its directed light is the
+    /// map's baked sun. The lightgrid stores one blended direction and color per
+    /// probe, so the sun share is inferred rather than read:
+    ///  - a sunlit probe's blended direction lies close to the sun, while torch
+    ///    or skylight-dominated probes point elsewhere, and
+    ///  - its directed color matches the sun color, which separates it from
+    ///    differently tinted sky fill.
+    /// This is the single seam for the estimate. A map-load bake that traces the
+    /// sun from each probe can replace the body and write exact weights; the
+    /// sampler and the shaders only ever consume `sun_weight`.
+    ///
+    /// `sun_direction` is the direction the light travels (renderer coordinates,
+    /// as in `DirectionalSun::direction`); `sun_color` is its chromaticity.
+    pub fn estimate_sun_weights(&mut self, sun_direction: [f32; 3], sun_color: [f32; 3]) {
+        let length = sun_direction.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if length <= 1e-6 {
+            self.map_toward_sun = None;
+            return;
+        }
+        let toward_sun = sun_direction.map(|v| -v / length);
+        let sun_chroma_len = sun_color.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        let sun_chroma = sun_color.map(|v| v.max(0.0) / sun_chroma_len);
+        for cell in &mut self.cells {
+            cell.sun_weight = 0.0;
+            if !cell.valid {
+                continue;
+            }
+            let directed_len = cell.directed.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if directed_len < 1.0 {
+                continue;
+            }
+            let alignment: f32 = (0..3).map(|axis| cell.direction[axis] * toward_sun[axis]).sum();
+            let chroma: f32 = (0..3)
+                .map(|axis| cell.directed[axis] / directed_len * sun_chroma[axis])
+                .sum();
+            cell.sun_weight = smoothstep_range(0.6, 0.95, alignment)
+                * smoothstep_range(0.85, 0.98, chroma);
+        }
+        self.map_toward_sun = Some(toward_sun);
+    }
+
     /// Match OpenJK's R_SetupEntityLightingGrid: sample the eight neighboring
     /// BSP probes with trilinear weights, ignore invalid/in-wall probes, and
     /// renormalize the surviving ambient/directed contribution near walls.
@@ -731,6 +933,7 @@ impl ClassicEntityLightGrid {
         let mut ambient = [0.0_f32; 3];
         let mut directed = [0.0_f32; 3];
         let mut direction = [0.0_f32; 3];
+        let mut baked_sun = [0.0_f32; 3];
         let mut total_factor = 0.0_f32;
 
         for corner in 0..8_usize {
@@ -756,6 +959,7 @@ impl ClassicEntityLightGrid {
             for channel in 0..3 {
                 ambient[channel] += factor * cell.ambient[channel];
                 directed[channel] += factor * cell.directed[channel];
+                baked_sun[channel] += factor * cell.directed[channel] * cell.sun_weight;
                 direction[channel] += factor * cell.direction[channel];
             }
         }
@@ -767,6 +971,7 @@ impl ClassicEntityLightGrid {
             let inv = total_factor.recip();
             ambient = ambient.map(|value| value * inv);
             directed = directed.map(|value| value * inv);
+            baked_sun = baked_sun.map(|value| value * inv);
         }
 
         // OpenJK defaults: r_ambientScale=0.6 and r_directedScale=1.0.
@@ -782,6 +987,11 @@ impl ClassicEntityLightGrid {
         }
 
         let length_sq = direction.into_iter().map(|value| value * value).sum::<f32>();
+        let direction_coherence = if total_factor > 0.0 && length_sq > 1.0e-12 {
+            (length_sq.sqrt() / total_factor).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if length_sq > 1.0e-12 {
             let inv_length = length_sq.sqrt().recip();
             direction = direction.map(|value| value * inv_length);
@@ -793,6 +1003,10 @@ impl ClassicEntityLightGrid {
             ambient,
             directed,
             direction,
+            baked_sun,
+            sun_directed: [0.0; 3],
+            sun_direction: [0.0; 3],
+            direction_coherence,
         })
     }
 }
@@ -841,6 +1055,10 @@ pub struct WeatherOcclusionBrush {
 #[derive(Debug, Clone, Copy)]
 pub struct WeatherOcclusionTriangle {
     pub positions: [[f32; 3]; 3],
+    /// False for surfaces that cannot hold a scattered puddle: open water and
+    /// lava, or materials that soak rain up (grass, sand, snow, foliage, cloth).
+    /// Only the scattered-puddle score honours this; basins and rain cover do not.
+    pub holds_puddles: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -902,6 +1120,13 @@ pub struct PreparedMap {
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     pub movement: Option<jka_movement::PmoveContext>,
     pub collision: Option<jka_movement::CollisionWorld>,
+    /// Drawn-and-markable world surfaces (OpenJK R_MarkFragments), shared by
+    /// saber marks and blob shadows. Source-.map previews build it from their
+    /// render triangles because they have no BSP surface table.
+    pub mark_surfaces: Option<Arc<jka_assets::bsp::MarkSurfaces>>,
+    /// `misc_model_static` props the client places from the BSP entity string
+    /// (the game module frees them, so they never arrive in a snapshot).
+    pub static_models: Arc<Vec<jka_assets::bsp::StaticModel>>,
     /// Compact static world surface used only by client-side Rapier visuals.
     /// It stays in JKA coordinates; the Rapier layer owns unit conversion.
     pub physics_collision: crate::cgame::ragdoll::PhysicsMapMesh,
@@ -933,6 +1158,8 @@ pub struct PreparedMap {
     pub inline_batches: Vec<DrawBatch>,
     pub inline_models: Vec<InlineModelGeometry>,
     pub textures: Vec<TextureData>,
+    /// `videoMap` cinematics streamed into entries of `textures`.
+    pub videos: Vec<materials::VideoSource>,
     pub footprint_mark_textures: [Option<usize>; 2],
     pub footprint_mark_blend_modes: [u8; 2],
     pub lightmaps: Vec<TextureData>,
@@ -981,9 +1208,14 @@ pub struct PreparedMap {
     pub fx_runners: Vec<MapFxRunner>,
     /// Entities that own inline BSP models, for the local server shim.
     pub brush_entities: Vec<MapBrushEntity>,
+    /// Entity blueprint (entities, target links, floor plan) for the
+    /// `entities` overlay. Shared so the restart cache clone stays cheap.
+    pub entity_graph: Option<Arc<crate::entity_graph::EntityGraph>>,
     /// Authored worldspawn far-plane / visibility distance in JKA map units.
     /// `None` means the map did not provide a usable distancecull-style key.
     pub distance_cull: Option<f32>,
+    /// `misc_skyportal` camera plus its optional `misc_skyportal_orient`.
+    pub sky_portal: Option<SkyPortal>,
     pub triangles: usize,
     pub lightmap_pages: usize,
     pub source: PathBuf,
@@ -991,6 +1223,12 @@ pub struct PreparedMap {
     pub bsp_stats: Option<BspMapStats>,
     pub load_timings: MapLoadTimings,
     pub material_debug: MaterialDebugInfo,
+    /// Content hash of the BSP this was prepared from (0 for source `.map` worlds).
+    pub map_hash: u64,
+    /// Inputs of the reusable stages, for the next preparation of this map.
+    pub stage_keys: PrepStageKeys,
+    /// Per-texture decode hashes aligned with `textures` (0 = not a plain decode).
+    pub texture_hashes: Vec<u64>,
 }
 
 
@@ -1103,12 +1341,70 @@ struct PlanarGroupKey {
     distance: i32,
 }
 
+/// Markable-surface index for a source-.map world, which has no BSP surface
+/// table to read shader flags from: every opaque/mask render triangle that faces
+/// up enough is treated like an `SF_FACE`, as the old renderer-side gather did.
+fn mark_surfaces_from_batches(vertices: &[GpuVertex], batches: &[DrawBatch]) -> Arc<jka_assets::bsp::MarkSurfaces> {
+    let mut triangles = Vec::new();
+    for batch in batches {
+        if !matches!(batch.pipeline.class, DrawClass::Opaque | DrawClass::Mask) {
+            continue;
+        }
+        let start = batch.vertices.start as usize;
+        let end = (batch.vertices.end as usize).min(vertices.len());
+        if start >= end {
+            continue;
+        }
+        for triangle in vertices[start..end].chunks_exact(3) {
+            let normal = Vec3::from_array(triangle[0].normal)
+                + Vec3::from_array(triangle[1].normal)
+                + Vec3::from_array(triangle[2].normal);
+            let normal = normal.normalize_or_zero();
+            if normal == Vec3::ZERO {
+                continue;
+            }
+            triangles.push((
+                [triangle[0].position, triangle[1].position, triangle[2].position].map(jka_position),
+                jka_position(normal.to_array()),
+            ));
+        }
+    }
+    Arc::new(jka_assets::bsp::MarkSurfaces::from_world_triangles(triangles))
+}
+
 pub fn render_position([x, y, z]: [f32; 3]) -> [f32; 3] {
     [x, z, -y]
 }
 
 pub fn jka_position([x, y, z]: [f32; 3]) -> [f32; 3] {
     [x, -z, y]
+}
+
+/// Build only the Rapier static-world mesh for an already-running BSP map.
+///
+/// Client physics is enabled after load far more often than it changes the
+/// map's render data, and the mesh depends on nothing but the BSP surfaces, so
+/// enabling it must not force a renderer restart or a full map re-prepare.
+pub fn prepare_physics_collision(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    allow_asset_overrides: bool,
+) -> Result<crate::cgame::ragdoll::PhysicsMapMesh, String> {
+    let MapSource::Bsp(name) = source else {
+        // Source-map preparation never produced a physics mesh either.
+        return Ok(crate::cgame::ragdoll::PhysicsMapMesh::default());
+    };
+    let asset_name = map_asset_name(name, "bsp")?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
+    assets.set_allow_asset_overrides(allow_asset_overrides);
+    let asset = assets
+        .read(&asset_name, MAX_FILE_BYTES)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Map {asset_name} not found on the game/base asset search path"))?;
+    let bsp = Bsp::parse(&asset.bytes).map_err(|error| error.to_string())?;
+    let mesh = bsp.world_mesh(4).map_err(|error| error.to_string())?;
+    Ok(bsp_physics_collision_mesh(&bsp, &mesh))
 }
 
 fn bsp_physics_collision_mesh(
@@ -1164,6 +1460,33 @@ fn bsp_physics_collision_mesh(
             crate::cgame::ragdoll::PhysicsMapMesh::default()
         }
     }
+}
+
+/// Whether rain can pool on a surface with these shader contents/flags.
+/// `MATERIAL_*` ids come from JKA `surfaceflags.h` (see `jka_assets::bsp`).
+fn surface_holds_puddles(contents: u32, surface_flags: u32) -> bool {
+    const CONTENTS_LAVA: u32 = 0x0000_0002;
+    const CONTENTS_WATER: u32 = 0x0000_0004;
+    const ABSORBENT_MATERIALS: [u32; 13] = [
+        5,  // short grass
+        6,  // long grass
+        8,  // sand
+        9,  // gravel
+        13, // water
+        14, // snow
+        15, // ice
+        16, // flesh
+        19, // dry leaves
+        20, // green leaves
+        21, // fabric
+        22, // canvas
+        27, // carpet
+    ];
+    if contents & (CONTENTS_LAVA | CONTENTS_WATER) != 0 {
+        return false;
+    }
+    let material = surface_flags & jka_assets::bsp::MATERIAL_MASK;
+    !ABSORBENT_MATERIALS.contains(&material)
 }
 
 fn bsp_weather_occlusion_source(
@@ -1252,6 +1575,7 @@ fn bsp_weather_occlusion_source(
             continue;
         }
         let blocks_rain = shader.contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) != 0;
+        let holds_puddles = surface_holds_puddles(shader.contents, shader.surface_flags);
         for indices in mesh.indices[batch.indices.clone()].chunks_exact(3) {
             let (Some(a), Some(b), Some(c)) = (
                 mesh.vertices.get(indices[0] as usize).map(|v| v.position),
@@ -1275,6 +1599,7 @@ fn bsp_weather_occlusion_source(
             }
             let triangle = WeatherOcclusionTriangle {
                 positions: [a, b, c],
+                holds_puddles,
             };
             topography_triangles.push(triangle);
             if blocks_rain && matches!(surface.kind, SurfaceKind::Patch | SurfaceKind::Triangles) {
@@ -1669,6 +1994,41 @@ fn collect_grass_emitters(
     (emitters, signatures)
 }
 
+/// Fingerprint of everything blade generation reads: each emitter triangle, the
+/// PVS signatures its `signature_id`s resolve to, and the sampled lightmap pixels.
+fn grass_fingerprint(
+    emitters: &[GrassEmitterTriangle],
+    signatures: &[Vec<u64>],
+    lightmaps: &GrassLightmapSources,
+) -> u64 {
+    let mut fingerprint = StageFingerprint::new("grass");
+    fingerprint.pod(&[emitters.len() as u64]);
+    for emitter in emitters {
+        fingerprint
+            .pod(&emitter.positions)
+            .pod(&emitter.colors)
+            .pod(&[
+                emitter.signature_id,
+                emitter.triangle_seed,
+                emitter.height.to_bits(),
+                emitter.density.to_bits(),
+                u32::from_le_bytes(emitter.ground_tint_rgba),
+            ])
+            .debug(&emitter.lightmap_uv)
+            .debug(&emitter.lightmap_page);
+    }
+    for signature in signatures {
+        fingerprint.pod(signature);
+    }
+    fingerprint.bytes(&lightmaps.embedded);
+    for (page, image) in lightmaps.external.iter() {
+        fingerprint
+            .pod(&[*page as u64, u64::from(image.width), u64::from(image.height)])
+            .bytes(&image.rgba);
+    }
+    fingerprint.finish()
+}
+
 fn grass_lightmap_sources(
     bsp: &Bsp,
     external_lightmaps: &[TextureData],
@@ -1896,6 +2256,60 @@ fn finish_grass_patches_with_jobs(
         ordered.into_iter().map(|(_, patch)| patch).collect(),
         cpu_ms,
     ))
+}
+
+/// Renderer-space sky portal camera (cgame `CG_DrawSkyBoxPortal`): the sky view
+/// sits at `origin` plus the player's offset from `orient_origin`, scaled by
+/// `scale`. Without a `misc_skyportal_orient` the scale is zero, so the sky
+/// camera stays fixed at `origin`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyPortal {
+    pub origin: [f32; 3],
+    pub orient_origin: [f32; 3],
+    pub scale: f32,
+}
+
+impl SkyPortal {
+    pub fn camera_position(&self, view: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|axis| {
+            self.origin[axis] + (view[axis] - self.orient_origin[axis]) * self.scale
+        })
+    }
+}
+
+fn bsp_sky_portal(bsp: &Bsp) -> Option<SkyPortal> {
+    let mut portal: Option<[f32; 3]> = None;
+    let mut orient: Option<([f32; 3], f32)> = None;
+    for entity in &bsp.entities {
+        let Some(classname) = entity
+            .get(b"classname")
+            .and_then(|value| std::str::from_utf8(value).ok())
+        else {
+            continue;
+        };
+        let origin = entity
+            .get(b"origin")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(parse_light_triplet)
+            .unwrap_or([0.0; 3]);
+        if classname.eq_ignore_ascii_case("misc_skyportal") {
+            portal.get_or_insert(origin);
+        } else if classname.eq_ignore_ascii_case("misc_skyportal_orient") {
+            let scale = entity
+                .get(b"modelscale")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(parse_leading_f32)
+                .unwrap_or(0.0);
+            orient.get_or_insert((origin, scale));
+        }
+    }
+    let origin = portal?;
+    let (orient_origin, scale) = orient.unwrap_or(([0.0; 3], 0.0));
+    Some(SkyPortal {
+        origin: render_position(origin),
+        orient_origin: render_position(orient_origin),
+        scale,
+    })
 }
 
 const DISTANCE_CULL_KEYS: [&str; 4] = ["distancecull", "_distancecull", "_farplanedist", "fogclip"];
@@ -2163,6 +2577,23 @@ fn resolved_bsp_surface_fog(
     (authored, false)
 }
 
+/// See `DrawBatch::dlight_in_lightmap_stage`. Materials with any PBR companion
+/// keep the base-stage light so their microfacet response is unchanged.
+fn material_dlight_in_lightmap_stage(material: &SurfaceMaterial) -> bool {
+    material.stages.iter().any(|stage| matches!(stage.texture, StageTexture::Lightmap))
+        && !material.stages.iter().any(|stage| {
+            let e = &stage.enhancements;
+            e.normal_texture.is_some()
+                || e.roughness_texture.is_some()
+                || e.height_texture.is_some()
+                || e.metallic_texture.is_some()
+                || e.specular_texture.is_some()
+                || e.emissive_texture.is_some()
+                || e.roughness_override.is_some()
+                || e.specular_reflectance.is_some()
+        })
+}
+
 fn stage_batch(
     material: &SurfaceMaterial,
     stage: &MaterialStage,
@@ -2215,6 +2646,7 @@ fn stage_batch(
         parallax_depth: stage.enhancements.parallax_depth,
         lightmap,
         modulate_lightmap: false,
+        dlight_in_lightmap_stage: material_dlight_in_lightmap_stage(material),
         vertex_lit,
         pipeline,
         tc_gen: stage.tc_gen,
@@ -2231,12 +2663,21 @@ fn stage_batch(
         fog,
         fog_is_global,
         fog_color_override: stage_fog_color_override(stage, first),
-        legacy2_fog_in_stage_safe: material_legacy2_in_stage_safe(&material.stages),
-        global_fog_post_eligible: material
-            .stages
-            .iter()
-            .enumerate()
-            .any(|(index, candidate)| stage_pipeline(material, candidate, index == 0).depth_write),
+        // A sky's stages are cloud layers drawn as extra batches; they must not
+        // change the fog eligibility the sky had when it was a single batch.
+        legacy2_fog_in_stage_safe: material_legacy2_in_stage_safe(if material.sky {
+            &[]
+        } else {
+            &material.stages
+        }),
+        global_fog_post_eligible: !material.sky
+            && material
+                .stages
+                .iter()
+                .enumerate()
+                .any(|(index, candidate)| {
+                    stage_pipeline(material, candidate, index == 0).depth_write
+                }),
         planar_reflection: material.planar_reflection && first,
         water: material.water,
         alpha_shadow: material.alpha_shadow,
@@ -2257,13 +2698,7 @@ fn stage_batch(
 }
 
 fn pvs_signature(vis: &Visibility, target_clusters: &[usize]) -> Vec<u64> {
-    let mut signature = vec![0_u64; vis.clusters.div_ceil(64)];
-    for from in 0..vis.clusters {
-        if vis.visible(Some(from), target_clusters) {
-            signature[from / 64] |= 1_u64 << (from % 64);
-        }
-    }
-    signature
+    vis.pvs_signature(target_clusters)
 }
 
 fn portal_batch_visible_from_cluster(source: &DrawBatch, cluster: usize) -> bool {
@@ -2413,6 +2848,7 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         && a.parallax_depth == b.parallax_depth
         && a.lightmap == b.lightmap
         && a.modulate_lightmap == b.modulate_lightmap
+        && a.dlight_in_lightmap_stage == b.dlight_in_lightmap_stage
         && a.vertex_lit == b.vertex_lit
         && a.tc_gen == b.tc_gen
         && a.tc_mods == b.tc_mods
@@ -2462,14 +2898,39 @@ where
         .collect::<Vec<_>>();
     let piece_len = |index: usize| full[index].vertices.end.saturating_sub(full[index].vertices.start) as usize;
 
+    // Pieces visible from each cluster, ascending by piece index (the order the
+    // per-cluster loop must see them in). Built by walking each piece's set bits
+    // once instead of testing every piece against every cluster.
+    let mut visible_pieces = vec![Vec::<u32>::new(); cluster_count];
+    for (index, piece) in full.iter().enumerate() {
+        let index = index as u32;
+        if piece.pvs_signature.is_empty() {
+            for list in &mut visible_pieces {
+                list.push(index);
+            }
+            continue;
+        }
+        for (word_index, &word) in piece.pvs_signature.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let cluster = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(list) = visible_pieces.get_mut(cluster) {
+                    list.push(index);
+                }
+            }
+        }
+    }
+
+    type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FoldHasher>>;
     let mut members_by_owner = vec![Vec::<usize>::new(); coarse.len()];
     let mut slots = Vec::<Slot>::new();
     let mut variants = Vec::<PreparedPortalMergedVariant>::new();
-    let mut variant_lookup = HashMap::<Vec<usize>, usize>::new();
+    let mut variant_lookup = FastMap::<Vec<usize>, usize>::default();
     let mut geometries = Vec::<PreparedPortalGeometry>::new();
-    let mut geometry_lookup = HashMap::<Vec<(u32, u32)>, usize>::new();
+    let mut geometry_lookup = FastMap::<Vec<(u32, u32)>, usize>::default();
     let mut plans = Vec::<Vec<PreparedPortalPlanBatchRef>>::new();
-    let mut plan_lookup = HashMap::<Vec<PreparedPortalPlanBatchRef>, usize>::new();
+    let mut plan_lookup = FastMap::<Vec<PreparedPortalPlanBatchRef>, usize>::default();
     let mut plan_by_cluster = Vec::with_capacity(cluster_count);
     let mut packed_index_count = 0usize;
     let mut reused_variant_hits = 0usize;
@@ -2479,17 +2940,12 @@ where
     let progress_stride = cluster_count.div_ceil(128).max(1);
 
     for cluster in 0..cluster_count {
-        let word = cluster / 64;
-        let bit = 1_u64 << (cluster % 64);
         // Pieces are in MINIMAL submission order, so first-touch order of each
         // owner reproduces MINIMAL's draw order exactly.
         slots.clear();
-        for (index, piece) in full.iter().enumerate() {
-            let visible = piece.pvs_signature.is_empty()
-                || piece.pvs_signature.get(word).is_some_and(|value| value & bit != 0);
-            if !visible {
-                continue;
-            }
+        for &visible_index in &visible_pieces[cluster] {
+            let index = visible_index as usize;
+            let piece = &full[index];
             match owners[index] {
                 Some(owner) if auto4_collapsible(piece) => {
                     let list = &mut members_by_owner[owner];
@@ -2943,19 +3399,21 @@ fn order_pvs_pieces<T>(pieces: BTreeMap<(Vec<u64>, [u64; 4]), T>) -> Vec<((Vec<u
     if count <= 2 || count > MAX_ORDERED_PIECES {
         return pieces;
     }
+    // Signatures in one contiguous matrix, zero-padded to a common width. A
+    // missing word counts as zero, so xor with the padding equals the old
+    // "popcount of the longer tail" and every distance is unchanged.
+    let stride = pieces.iter().map(|piece| piece.0 .0.len()).max().unwrap_or(0);
+    let mut matrix = vec![0_u64; count * stride];
+    for (index, piece) in pieces.iter().enumerate() {
+        matrix[index * stride..index * stride + piece.0 .0.len()].copy_from_slice(&piece.0 .0);
+    }
+    let signature = |piece: usize| &matrix[piece * stride..(piece + 1) * stride];
     let distance = |a: &[u64], b: &[u64]| -> u32 {
-        let shared = a.len().min(b.len());
-        let tail = a[shared..].iter().chain(&b[shared..]).map(|word| word.count_ones()).sum::<u32>();
-        a[..shared]
-            .iter()
-            .zip(&b[..shared])
-            .map(|(x, y)| (x ^ y).count_ones())
-            .sum::<u32>()
-            + tail
+        a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>()
     };
     // Start from the most narrowly visible piece: it is a natural path end.
     let mut current = (0..count)
-        .min_by_key(|&index| pieces[index].0 .0.iter().map(|word| word.count_ones()).sum::<u32>())
+        .min_by_key(|&index| signature(index).iter().map(|word| word.count_ones()).sum::<u32>())
         .unwrap_or(0);
     let mut visited = vec![false; count];
     let mut order = Vec::with_capacity(count);
@@ -2964,14 +3422,13 @@ fn order_pvs_pieces<T>(pieces: BTreeMap<(Vec<u64>, [u64; 4]), T>) -> Vec<((Vec<u
     for _ in 1..count {
         let next = (0..count)
             .filter(|&index| !visited[index])
-            .min_by_key(|&index| distance(&pieces[current].0 .0, &pieces[index].0 .0))
+            .min_by_key(|&index| distance(signature(current), signature(index)))
             .expect("unvisited piece remains");
         visited[next] = true;
         order.push(next);
         current = next;
     }
     // 2-opt: reverse any segment whose endpoints then join more cheaply.
-    let signature = |piece: usize| pieces[piece].0 .0.as_slice();
     for _ in 0..8 {
         let mut improved = false;
         for i in 0..count.saturating_sub(2) {
@@ -3225,6 +3682,11 @@ fn light_luminance(rgb: [f32; 3]) -> f32 {
     rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
 }
 
+fn smoothstep_range(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn encode_unit_channel(value: f32) -> u8 {
     ((value.clamp(0.0, 1.0) * 255.0) + 0.5) as u8
 }
@@ -3372,6 +3834,7 @@ fn prepare_static_light_grid(
             ambient: classic_ambient,
             directed: classic_directed,
             direction,
+            sun_weight: 0.0,
             valid: classic_valid,
         });
 
@@ -3491,6 +3954,7 @@ fn prepare_static_light_grid(
             ],
             external_hdr: external_values.is_some(),
             cells: classic_cells,
+            map_toward_sun: None,
         },
     }))
 }
@@ -4425,6 +4889,72 @@ fn can_fold_jka_lightmap_pair(
         && !material_stage.depth_equal
 }
 
+/// A sky surface is the outer box (discarded by the shader when the sky has
+/// none) followed by one cloud batch per stage of the sky shader. The engine
+/// draws them in that order, with each stage's coordinates generated from the
+/// view direction. Ordinary same-surface batch ordering keeps the box first
+/// and the stages in authored order.
+pub(crate) fn append_sky_batches(
+    out: &mut Vec<DrawBatch>,
+    material: &SurfaceMaterial,
+    bsp_shader_index: Option<usize>,
+    material_debug_index: Option<usize>,
+    vertex_lit: bool,
+    range: Range<u32>,
+    lightmap: Option<usize>,
+    pvs_signature: &[u64],
+    area_signature: [u64; 4],
+    fog: [f32; 4],
+    fog_is_global: bool,
+) {
+    let box_stage = MaterialStage {
+        texture: StageTexture::White,
+        enhancements: Default::default(),
+        blend: None,
+        alpha_cutoff: 0.0,
+        opacity: 1.0,
+        color: [1.0; 3],
+        rgb_gen: RgbGen::Identity,
+        alpha_gen: AlphaGen::Identity,
+        tc_gen: TcGen::Base,
+        tc_mods: Vec::new(),
+        depth_write: true,
+        depth_equal: false,
+    };
+    out.push(stage_batch(
+        material,
+        &box_stage,
+        true,
+        vertex_lit,
+        range.clone(),
+        bsp_shader_index,
+        material_debug_index,
+        lightmap,
+        pvs_signature,
+        area_signature,
+        fog,
+        fog_is_global,
+    ));
+    for (stage_index, stage) in material.stages.iter().enumerate() {
+        let mut cloud = stage.clone();
+        cloud.tc_gen = TcGen::SkyCloud(material.sky_cloud_height);
+        out.push(stage_batch(
+            material,
+            &cloud,
+            stage_index == 0,
+            vertex_lit,
+            range.clone(),
+            bsp_shader_index,
+            material_debug_index,
+            lightmap,
+            pvs_signature,
+            area_signature,
+            fog,
+            fog_is_global,
+        ));
+    }
+}
+
 fn append_material_batches(
     out: &mut Vec<DrawBatch>,
     material: &SurfaceMaterial,
@@ -4438,35 +4968,60 @@ fn append_material_batches(
     fog: [f32; 4],
     fog_is_global: bool,
 ) {
+    let start = out.len();
+    append_material_batches_unflagged(
+        out,
+        material,
+        bsp_shader_index,
+        material_debug_index,
+        vertex_lit,
+        range,
+        lightmap,
+        pvs_signature,
+        area_signature,
+        fog,
+        fog_is_global,
+    );
+    // `dlight_in_lightmap_stage` is derived from the authored stages, but the
+    // `$lightmap` stage can be folded into the diffuse pass (GL_DST_COLOR pair)
+    // or replaced by vertex color. With no lightmap-stage batch left, the
+    // shader would skip the base-stage light and nothing would add it: the
+    // surface would ignore every runtime/per-pixel light.
+    let emitted = &mut out[start..];
+    if !emitted.iter().any(|batch| batch.texture_is_lightmap) {
+        for batch in emitted {
+            batch.dlight_in_lightmap_stage = false;
+        }
+    }
+}
+
+fn append_material_batches_unflagged(
+    out: &mut Vec<DrawBatch>,
+    material: &SurfaceMaterial,
+    bsp_shader_index: usize,
+    material_debug_index: Option<usize>,
+    vertex_lit: bool,
+    range: Range<u32>,
+    lightmap: Option<usize>,
+    pvs_signature: &[u64],
+    area_signature: [u64; 4],
+    fog: [f32; 4],
+    fog_is_global: bool,
+) {
     if material.sky {
-        let stage = MaterialStage {
-            texture: StageTexture::White,
-            enhancements: Default::default(),
-            blend: None,
-            alpha_cutoff: 0.0,
-            opacity: 1.0,
-            color: [1.0; 3],
-            rgb_gen: RgbGen::Identity,
-            alpha_gen: AlphaGen::Identity,
-            tc_gen: TcGen::Base,
-            tc_mods: Vec::new(),
-            depth_write: true,
-            depth_equal: false,
-        };
-        out.push(stage_batch(
+        append_sky_batches(
+            out,
             material,
-            &stage,
-            true,
-            vertex_lit,
-            range,
             Some(bsp_shader_index),
             material_debug_index,
+            vertex_lit,
+            range,
             lightmap,
             pvs_signature,
             area_signature,
             fog,
             fog_is_global,
-        ));
+        );
         return;
     }
 
@@ -5157,24 +5712,150 @@ fn map_content_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Fingerprints of the option-dependent stage inputs a prepared map was built
+/// from. A later preparation of the same map compares its own inputs against
+/// these and, on a match, copies the finished result out of the previous map
+/// (the app's restart cache) instead of recomputing it. A hit is therefore
+/// bit-identical to a rebuild; a changed input recomputes only that stage.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrepStageKeys {
+    pub grass: Option<u64>,
+    pub gi: Option<u64>,
+    pub portal: Option<u64>,
+}
+
+/// Input fingerprint for a reusable stage. `DefaultHasher::new()` is
+/// deterministic within a process, which is all an in-memory comparison needs.
+struct StageFingerprint(FoldHasher);
+
+/// 64-bit multiply-fold hasher (wyhash style): one 128-bit multiply per eight
+/// bytes. Fingerprints only ever compare against another fingerprint made by
+/// this process, so speed matters and stability across builds does not; SipHash
+/// was the bulk of the time spent keying stages over millions of vertices.
+#[derive(Default)]
+pub(crate) struct FoldHasher {
+    state: u64,
+    length: u64,
+}
+
+impl FoldHasher {
+    const K1: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K2: u64 = 0xd6e8_feb8_6659_fd93;
+
+    #[inline]
+    fn round(&mut self, word: u64) {
+        let product = u128::from(self.state ^ word ^ Self::K1) * u128::from(Self::K2);
+        self.state = (product as u64) ^ ((product >> 64) as u64);
+    }
+}
+
+impl std::hash::Hasher for FoldHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.length = self.length.wrapping_add(bytes.len() as u64);
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.round(u64::from_le_bytes(chunk.try_into().expect("chunk of eight")));
+        }
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let mut padded = [0_u8; 8];
+            padded[..tail.len()].copy_from_slice(tail);
+            // The tail length keeps "ab" and "ab\0" apart.
+            self.round(u64::from_le_bytes(padded) ^ ((tail.len() as u64) << 59));
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        let product = u128::from(self.state ^ self.length) * u128::from(Self::K2);
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+}
+
+impl StageFingerprint {
+    fn new(stage: &str) -> Self {
+        use std::hash::Hasher;
+        let mut hasher = FoldHasher::default();
+        hasher.write(stage.as_bytes());
+        Self(hasher)
+    }
+
+    /// Hash draw batches. Their `Debug` text is cheap except for the PVS
+    /// signature (dozens of words per batch), so each signature is set aside,
+    /// hashed as raw bytes, and put back.
+    fn draw_batches(&mut self, batches: &mut [DrawBatch]) -> &mut Self {
+        use std::hash::Hasher;
+        self.0.write_usize(batches.len());
+        for batch in batches {
+            let signature = std::mem::take(&mut batch.pvs_signature);
+            self.debug(&*batch);
+            self.pod(&signature);
+            batch.pvs_signature = signature;
+        }
+        self
+    }
+
+    /// Hash vertex positions only, in blocks so the hasher sees large writes.
+    fn positions(&mut self, vertices: &[GpuVertex]) -> &mut Self {
+        let mut block = [[0.0_f32; 3]; 512];
+        for chunk in vertices.chunks(block.len()) {
+            for (slot, vertex) in block.iter_mut().zip(chunk) {
+                *slot = vertex.position;
+            }
+            self.pod(&block[..chunk.len()]);
+        }
+        self
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        use std::hash::Hasher;
+        self.0.write_usize(bytes.len());
+        self.0.write(bytes);
+        self
+    }
+
+    fn pod<T: Pod>(&mut self, values: &[T]) -> &mut Self {
+        self.bytes(bytemuck::cast_slice(values))
+    }
+
+    /// Hash a value through its `Debug` text without allocating it.
+    fn debug<T: std::fmt::Debug + ?Sized>(&mut self, value: &T) -> &mut Self {
+        use std::fmt::Write;
+        let _ = write!(self, "{value:?}");
+        self
+    }
+
+    fn finish(&self) -> u64 {
+        use std::hash::Hasher;
+        self.0.finish()
+    }
+}
+
+impl std::fmt::Write for StageFingerprint {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        use std::hash::Hasher;
+        self.0.write(text.as_bytes());
+        Ok(())
+    }
+}
+
 fn static_bsp_ao_cache_info(
     root: &Path,
     game: Option<&Path>,
     name: &str,
-    map_bytes: &[u8],
+    map_hash: u64,
 ) -> StaticBspAoCacheInfo {
     StaticBspAoCacheInfo {
         directory: active_game_directory(root, game)
             .join("jka-rust-cache")
             .join("static-bsp-ao"),
         map_name: name.to_string(),
-        map_hash: map_content_hash(map_bytes),
+        map_hash,
         version: STATIC_BSP_AO_CACHE_VERSION,
     }
 }
 
 pub fn prepare(root: &Path, game: Option<&Path>, name: &str) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, None, MapPrepareOptions::default())
+    prepare_internal(root, game, name, None, MapPrepareOptions::default(), None)
 }
 
 pub fn prepare_with_options(
@@ -5183,7 +5864,19 @@ pub fn prepare_with_options(
     name: &str,
     options: MapPrepareOptions,
 ) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, None, options)
+    prepare_internal(root, game, name, None, options, None)
+}
+
+/// `prepare_with_options` that reuses unchanged stages of an earlier preparation.
+#[cfg(test)]
+pub fn prepare_with_seed(
+    root: &Path,
+    game: Option<&Path>,
+    name: &str,
+    options: MapPrepareOptions,
+    seed: &Arc<PreparedMap>,
+) -> Result<PreparedMap, String> {
+    prepare_internal(root, game, name, None, options, Some(seed))
 }
 
 pub fn prepare_with_jobs_options(
@@ -5192,8 +5885,22 @@ pub fn prepare_with_jobs_options(
     name: &str,
     jobs: &MapJobPool,
     options: MapPrepareOptions,
+    seed: Option<&Arc<PreparedMap>>,
 ) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, Some(jobs), options)
+    prepare_internal(root, game, name, Some(jobs), options, seed)
+}
+
+/// Records a stage lent by the seed and shows it as finished on the loading panel.
+fn note_reused_stage(
+    jobs: Option<&MapJobPool>,
+    reused: &mut Vec<&'static str>,
+    label: &'static str,
+    task: Task,
+) {
+    reused.push(label);
+    if let Some(jobs) = jobs {
+        jobs.mark_reused(task);
+    }
 }
 
 fn prepare_internal(
@@ -5202,6 +5909,7 @@ fn prepare_internal(
     name: &str,
     jobs: Option<&MapJobPool>,
     options: MapPrepareOptions,
+    seed: Option<&Arc<PreparedMap>>,
 ) -> Result<PreparedMap, String> {
     let prepare_started = Instant::now();
     let mut load_timings = MapLoadTimings {
@@ -5209,6 +5917,7 @@ fn prepare_internal(
         ..Default::default()
     };
     let asset_name = map_asset_name(name, "bsp")?;
+    let archive_opens_before = jka_assets::pk3::archive_open_stats();
 
     let stage = Instant::now();
     let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
@@ -5223,20 +5932,38 @@ fn prepare_internal(
     load_timings.bsp_read_ms = stage.elapsed().as_secs_f64() * 1000.0;
     let asset_source = asset.source.clone();
     let bytes = Arc::new(asset.bytes);
-    let static_bsp_ao_cache = Some(static_bsp_ao_cache_info(
-        root,
-        game,
-        name,
-        bytes.as_slice(),
-    ));
-    let steam_audio_bake_cache = options.steam_audio.then(|| {
-        crate::steam_audio::cache_info(root, game, name, map_content_hash(bytes.as_slice()))
-    });
+    // FNV-1a over the whole BSP is a serial byte chain (tens of ms on a big map),
+    // and its value names on-disk caches so it cannot change. With a worker pool
+    // and no seed to validate, it runs beside the BSP parse on an idle worker and
+    // is joined once the parse is done; otherwise it is computed right here.
+    let hash_job = match jobs {
+        Some(jobs) if seed.is_none() => {
+            let hash_bytes = Arc::clone(&bytes);
+            Some(jobs.submit(Task::MapPrepare, move || map_content_hash(hash_bytes.as_slice()))?)
+        }
+        _ => None,
+    };
+    let inline_hash = hash_job.is_none().then(|| map_content_hash(bytes.as_slice()));
 
     let mut warnings = Vec::new();
+    // A previous preparation of this same map (the app's restart cache) lends
+    // every stage whose inputs are unchanged, so a forced re-prepare does not
+    // redo them. Nothing extra is stored: the seed is data the app already holds.
+    let seed = seed.filter(|seed| inline_hash == Some(seed.map_hash));
+    let mut reused = Vec::<&'static str>::new();
+    // Collision and the acoustic mesh read only the BSP bytes.
+    let seed_collision = seed.and_then(|seed| seed.collision.clone());
+    let seed_acoustic = seed.and_then(|seed| seed.steam_audio_acoustic_mesh.clone());
+    if seed_collision.is_some() {
+        note_reused_stage(jobs, &mut reused, "collision", Task::MapCollision);
+    }
 
     let mut steam_audio_job = None;
     let mut steam_audio_sync = None;
+    // The collision world is not needed until after texture preload has been
+    // queued, so with a worker pool it is joined later (see below) instead of
+    // stalling the loader right after the BSP parse.
+    let mut collision_pending = None;
     let (bsp, mesh, collision) = if let Some(jobs) = jobs {
         let parse_bytes = Arc::clone(&bytes);
         let parse = jobs.submit(Task::MapBspParse, move || {
@@ -5245,17 +5972,19 @@ fn prepare_internal(
                 .map_err(|error| error.to_string())
                 .and_then(|bsp| {
                     let mesh = bsp.world_mesh(4).map_err(|error| error.to_string())?;
-                    Ok((Arc::new(bsp), mesh))
+                    Ok((Arc::new(bsp), Arc::new(mesh)))
                 });
             (result, started.elapsed().as_secs_f64() * 1000.0)
         })?;
 
-        let collision_bytes = Arc::clone(&bytes);
-        let collision_job = jobs.submit(Task::MapCollision, move || {
-            let started = Instant::now();
-            let result = jka_movement::CollisionWorld::from_bsp(collision_bytes.as_slice());
-            (result, started.elapsed().as_secs_f64() * 1000.0)
-        })?;
+        if seed_collision.is_none() {
+            let collision_bytes = Arc::clone(&bytes);
+            collision_pending = Some(jobs.submit(Task::MapCollision, move || {
+                let started = Instant::now();
+                let result = jka_movement::CollisionWorld::from_bsp(collision_bytes.as_slice());
+                (result, started.elapsed().as_secs_f64() * 1000.0)
+            })?);
+        }
 
         // While BSP/collision CPU work is running, keep the loader thread useful:
         // animation.cfg IO and shader-file reads overlap those worker jobs.
@@ -5268,54 +5997,69 @@ fn prepare_internal(
         load_timings.shader_parse_wall_ms = library_debug.parse_wall_ms;
         load_timings.shader_parse_cpu_ms = library_debug.parse_cpu_ms;
 
+        // Workers idle while the parse finishes. Have a few open the retail
+        // archives so the parallel texture reads that follow find ready handles
+        // (opening one parses its whole central directory). Queued after the
+        // shader library so it cannot delay shader parsing.
+        for _ in 0..jobs.worker_count().saturating_sub(3).min(5) {
+            let mut warm = assets.fork();
+            jobs.submit(Task::MapPrepare, move || warm.warm_stock_archives())?;
+        }
         let (parsed, parse_ms) = parse.join()?;
         load_timings.bsp_parse_ms = parse_ms;
         let (bsp, mesh) = parsed?;
         if options.steam_audio {
-            let acoustic_bsp = Arc::clone(&bsp);
-            steam_audio_job = Some(jobs.submit(Task::MapAcoustics, move || {
-                let started = Instant::now();
-                let result = acoustic_bsp
-                    .world_acoustic_mesh(4)
-                    .map_err(|error| error.to_string());
-                (result, started.elapsed().as_secs_f64() * 1000.0)
-            })?);
-        }
-        let (collision_result, collision_ms) = collision_job.join()?;
-        load_timings.collision_ms = collision_ms;
-        let collision = match collision_result {
-            Ok(world) => Some(world),
-            Err(error) => {
-                warnings.push(format!("Player collision unavailable: {error}"));
-                None
+            if let Some(hit) = seed_acoustic.clone() {
+                note_reused_stage(Some(jobs), &mut reused, "acoustic mesh", Task::MapAcoustics);
+                steam_audio_sync = Some((Ok(hit), 0.0));
+            } else {
+                let acoustic_bsp = Arc::clone(&bsp);
+                steam_audio_job = Some(jobs.submit(Task::MapAcoustics, move || {
+                    let started = Instant::now();
+                    let result = acoustic_bsp
+                        .world_acoustic_mesh(4)
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string());
+                    (result, started.elapsed().as_secs_f64() * 1000.0)
+                })?);
             }
-        };
-        (bsp, mesh, (collision, movement, library, library_debug))
+        }
+        (bsp, mesh, (seed_collision, movement, library, library_debug))
     } else {
         let stage = Instant::now();
         let bsp = Arc::new(Bsp::parse(bytes.as_slice()).map_err(|e| e.to_string())?);
-        let mesh = bsp.world_mesh(4).map_err(|e| e.to_string())?;
+        let mesh = Arc::new(bsp.world_mesh(4).map_err(|e| e.to_string())?);
         load_timings.bsp_parse_ms = stage.elapsed().as_secs_f64() * 1000.0;
 
         let stage = Instant::now();
-        let collision = match jka_movement::CollisionWorld::from_bsp(bytes.as_slice()) {
-            Ok(world) => Some(world),
-            Err(error) => {
-                warnings.push(format!("Player collision unavailable: {error}"));
-                None
+        let collision = if let Some(hit) = seed_collision {
+            Some(hit)
+        } else {
+            match jka_movement::CollisionWorld::from_bsp(bytes.as_slice()) {
+                Ok(world) => Some(world),
+                Err(error) => {
+                    warnings.push(format!("Player collision unavailable: {error}"));
+                    None
+                }
             }
         };
         load_timings.collision_ms = stage.elapsed().as_secs_f64() * 1000.0;
 
         if options.steam_audio {
-            let acoustic_stage = Instant::now();
-            let result = bsp
-                .world_acoustic_mesh(4)
-                .map_err(|error| error.to_string());
-            steam_audio_sync = Some((
-                result,
-                acoustic_stage.elapsed().as_secs_f64() * 1000.0,
-            ));
+            if let Some(hit) = seed_acoustic.clone() {
+                note_reused_stage(jobs, &mut reused, "acoustic mesh", Task::MapAcoustics);
+                steam_audio_sync = Some((Ok(hit), 0.0));
+            } else {
+                let acoustic_stage = Instant::now();
+                let result = bsp
+                    .world_acoustic_mesh(4)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string());
+                steam_audio_sync = Some((
+                    result,
+                    acoustic_stage.elapsed().as_secs_f64() * 1000.0,
+                ));
+            }
         }
 
         let stage = Instant::now();
@@ -5328,8 +6072,61 @@ fn prepare_internal(
         (bsp, mesh, (collision, movement, library, library_debug))
     };
     let (collision, movement, library, library_debug) = collision;
+    let map_hash = match hash_job {
+        Some(job) => job.join()?,
+        None => inline_hash.expect("map hash computed inline without a hash job"),
+    };
+    let static_bsp_ao_cache = Some(static_bsp_ao_cache_info(root, game, name, map_hash));
+    let steam_audio_bake_cache = options
+        .steam_audio
+        .then(|| crate::steam_audio::cache_info(root, game, name, map_hash));
+    let mut phase_clock = prepare_started;
+    phase_lap(&mut load_timings, 0, &mut phase_clock);
     let (inline_mesh, inline_batch_models) =
         bsp.inline_models_mesh(4).map_err(|error| error.to_string())?;
+
+    // Which shaders (and so which textures) the map uses needs only the meshes and
+    // the shader library. Queue texture reads and decodes on the workers right now
+    // so they overlap everything the loader does until `preload_finish`.
+    let used: BTreeSet<_> = mesh
+        .batches
+        .iter()
+        .chain(&inline_mesh.batches)
+        .map(|batch| batch.shader)
+        .collect();
+    let used_shader_names: Vec<String> = used
+        .iter()
+        .filter_map(|&index| bsp.shaders.get(index))
+        .map(|shader| String::from_utf8_lossy(&shader.name).to_ascii_lowercase())
+        .collect();
+    let mut textures = Textures::new();
+    if let Some(seed) = seed {
+        textures.set_seed(materials::TextureSeed::new(seed));
+    }
+    let texture_preload = if let Some(jobs) = jobs {
+        let requests = materials::primary_texture_requests(
+            &used_shader_names,
+            &library,
+            options.omit_environment_stages,
+        );
+        Some(textures.preload_start(&assets, &requests, jobs)?)
+    } else {
+        None
+    };
+    // By now the collision job has had the whole mesh build to finish.
+    let collision = if let Some(job) = collision_pending {
+        let (collision_result, collision_ms) = job.join()?;
+        load_timings.collision_ms = collision_ms;
+        match collision_result {
+            Ok(world) => Some(world),
+            Err(error) => {
+                warnings.push(format!("Player collision unavailable: {error}"));
+                None
+            }
+        }
+    } else {
+        collision
+    };
 
     let physics_collision = if options.client_physics {
         bsp_physics_collision_mesh(&bsp, &mesh)
@@ -5339,6 +6136,19 @@ fn prepare_internal(
     let weather_occlusion = collision
         .as_ref()
         .and_then(|_| bsp_weather_occlusion_source(&bsp, &mesh));
+    // R_MarkFragments reads the runtime shader's flags, so the scripts win over
+    // the flags compiled into the BSP shader lump.
+    let mark_shader_flags: Vec<(u32, u32)> = bsp
+        .shaders
+        .iter()
+        .map(|shader| {
+            let name = String::from_utf8_lossy(&shader.name).to_ascii_lowercase();
+            library.get(&name).map_or((shader.surface_flags, shader.contents), |script| {
+                (script.collision_surface_flags_add, script.collision_contents_add)
+            })
+        })
+        .collect();
+    let mark_surfaces = Arc::new(jka_assets::bsp::MarkSurfaces::from_bsp(&bsp, &mesh, &mark_shader_flags));
 
     let bsp_stats = BspMapStats {
         inline_model_midpoints: bsp
@@ -5346,6 +6156,7 @@ fn prepare_internal(
             .iter()
             .map(|model| std::array::from_fn(|i| (model.mins[i] + model.maxs[i]) * 0.5))
             .collect(),
+        inline_model_bounds: bsp.models.iter().map(|model| (model.mins, model.maxs)).collect(),
         brushes: bsp.brushes.len(),
         brush_sides: bsp.brush_sides.len(),
         planes: bsp.planes.len(),
@@ -5360,6 +6171,7 @@ fn prepare_internal(
             .map_or(0, |visibility| visibility.clusters),
     };
     let distance_cull = bsp_worldspawn_distance_cull(&bsp, &mut warnings);
+    let sky_portal = bsp_sky_portal(&bsp);
     let global_fog_num = bsp_global_fog_num(&bsp);
     let global_fog = bsp_global_fog_params(&bsp, &library);
     if let Some(fog) = global_fog {
@@ -5368,7 +6180,7 @@ fn prepare_internal(
             fog[0], fog[1], fog[2], fog[3]
         );
     }
-    let mut textures = Textures::new();
+    phase_lap(&mut load_timings, 1, &mut phase_clock);
     let lightmap_stage = Instant::now();
     let embedded_lightmap_pages = bsp.lightmaps.len() / (128 * 128 * 3);
     let mut referenced_lightmaps = external_lightmap_pages(&mesh);
@@ -5469,31 +6281,57 @@ fn prepare_internal(
     };
     let static_light_grid = prepare_static_light_grid(&bsp, &mut assets, name, &mut warnings)?;
     load_timings.lightmap_ms = lightmap_stage.elapsed().as_secs_f64() * 1000.0;
+    phase_lap(&mut load_timings, 2, &mut phase_clock);
 
-    let used: BTreeSet<_> = mesh
-        .batches
-        .iter()
-        .chain(&inline_mesh.batches)
-        .map(|batch| batch.shader)
+    // Spawns, FX runners, brush entities and the entity graph read only the BSP,
+    // so they run here while the workers are still decoding textures.
+    let static_models = Arc::new(bsp.static_models());
+    let mut spawns: Vec<_> = bsp
+        .deathmatch_spawns()
+        .into_iter()
+        .map(|spawn| SpawnPoint {
+            position: {
+                let mut p = render_position(spawn.origin);
+                p[1] += 9.0;
+                p
+            },
+            yaw: spawn.yaw.to_radians(),
+            initial: spawn.initial,
+            no_humans: spawn.no_humans,
+        })
         .collect();
-    let used_shader_names: Vec<String> = used
-        .iter()
-        .filter_map(|&index| bsp.shaders.get(index))
-        .map(|shader| String::from_utf8_lossy(&shader.name).to_ascii_lowercase())
-        .collect();
-    if let Some(jobs) = jobs {
-        let requests = materials::primary_texture_requests(
-            &used_shader_names,
-            &library,
-            options.omit_environment_stages,
-        );
-        textures.preload(&mut assets, &requests, jobs)?;
+    if spawns.is_empty() {
+        let model = &bsp.models[0];
+        let center = std::array::from_fn(|i| (model.mins[i] + model.maxs[i]) * 0.5);
+        let mut position = render_position(center);
+        position[1] += 9.0;
+        spawns.push(SpawnPoint { position, yaw: 0.0, ..SpawnPoint::default() });
     }
+    let fx_runners = bsp_fx_runners(&bsp, &mut warnings);
+    let brush_entities = bsp_brush_entities(&bsp);
+    let entity_graph = Some(Arc::new(crate::entity_graph::EntityGraph::build(&bsp)));
+    phase_lap(&mut load_timings, 3, &mut phase_clock);
+    if let Some(preload) = texture_preload {
+        // Everything above overlapped the workers; this is only the remainder.
+        textures.preload_finish(preload)?;
+    }
+    phase_lap(&mut load_timings, 4, &mut phase_clock);
     let material_stage = Instant::now();
+    if let Some(jobs) = jobs {
+        jobs.mark_started(Task::MapMaterials);
+    }
     let sun = authored_sun(
         used_shader_names.iter().map(String::as_str),
         &library,
         &mut warnings,
+    );
+    let describe_started = Instant::now();
+    let stats_before = (
+        textures.load_stats.read_ms,
+        textures.load_stats.decode_ms,
+        textures.load_stats.mip_ms,
+        textures.load_stats.decoded_images,
+        textures.images.len(),
     );
     let surface_materials: Vec<_> = bsp
         .shaders
@@ -5519,6 +6357,8 @@ fn prepare_internal(
             )
         })
         .collect();
+    let describe_ms = describe_started.elapsed().as_secs_f64() * 1000.0;
+    let tints_started = Instant::now();
 
     let grass_ground_tints: Vec<[u8; 4]> = surface_materials
         .iter()
@@ -5529,9 +6369,13 @@ fn prepare_internal(
                 .unwrap_or([0, 0, 0, 0])
         })
         .collect();
+    let tints_ms = tints_started.elapsed().as_secs_f64() * 1000.0;
 
+    let lights_started = Instant::now();
     let (surface_lights, surface_light_candidates) = bsp_surface_lights(&mesh, &surface_materials);
+    let surface_lights_ms = lights_started.elapsed().as_secs_f64() * 1000.0;
 
+    let debug_started = Instant::now();
     let material_debug = material_debug_info(
         &library_debug,
         used.iter().filter_map(|&index| {
@@ -5543,6 +6387,24 @@ fn prepare_internal(
         &textures,
     );
     load_timings.material_ms = material_stage.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "[MAP MATERIALS] total {:.1} ms | describe {:.1} (of which texture read/probe {:.1}, decode {:.1}, mip {:.1}; {} decoded, {} new image slot(s); light-image averaging {:.1}) | grass tints {:.1} | surface lights {:.1} | material debug {:.1}",
+        load_timings.material_ms,
+        describe_ms,
+        textures.load_stats.read_ms - stats_before.0,
+        textures.load_stats.decode_ms - stats_before.1,
+        textures.load_stats.mip_ms - stats_before.2,
+        textures.load_stats.decoded_images - stats_before.3,
+        textures.images.len() - stats_before.4,
+        materials::LIGHT_IMAGE_AVERAGE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6,
+        tints_ms,
+        surface_lights_ms,
+        debug_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    if let Some(jobs) = jobs {
+        jobs.mark_done(Task::MapMaterials);
+    }
+    phase_lap(&mut load_timings, 5, &mut phase_clock);
 
     let surface_sprite_effects =
         collect_surface_sprite_effect_emitters(&bsp, &mesh, &surface_materials);
@@ -5568,13 +6430,28 @@ fn prepare_internal(
     };
     let mut grass_jobs = Vec::new();
     let mut grass_sync = None;
-    if !grass_emitters.is_empty() {
-        let lightmaps = Arc::new(grass_lightmap_sources(
-            &bsp,
-            &external_lightmaps,
-            &external_lightmap_lookup,
-        ));
-        let clump_data = Arc::new(crate::grass::godot_clump_noise());
+    // Blade generation is a pure function of the emitter triangles and the
+    // lightmap pixels they sample, so an unchanged fingerprint reuses the patches.
+    let mut grass_key = None;
+    let mut grass_memo_hit = None;
+    let grass_lightmaps = (!grass_emitters.is_empty()).then(|| {
+        Arc::new(grass_lightmap_sources(&bsp, &external_lightmaps, &external_lightmap_lookup))
+    });
+    if let Some(lightmaps) = &grass_lightmaps {
+        let key = grass_fingerprint(&grass_emitters, &grass_signatures, lightmaps);
+        grass_key = Some(key);
+        grass_memo_hit = seed
+            .filter(|seed| seed.stage_keys.grass == Some(key))
+            .map(|seed| {
+                let blades = seed.grass_patches.iter().map(|patch| patch.instances.len()).sum();
+                (seed.grass_patches.clone(), blades)
+            });
+        if grass_memo_hit.is_some() {
+            note_reused_stage(jobs, &mut reused, "grass", Task::MapGrass);
+        }
+    }
+    if let Some(lightmaps) = grass_lightmaps.filter(|_| grass_memo_hit.is_none()) {
+        let clump_data = crate::grass::godot_clump_noise();
         if let Some(jobs) = jobs {
             let worker_count = jobs.worker_count().min(grass_emitters.len()).max(1);
             let chunk_size = grass_emitters.len().div_ceil(worker_count);
@@ -5600,14 +6477,20 @@ fn prepare_internal(
         }
     }
 
+    phase_lap(&mut load_timings, 6, &mut phase_clock);
     let geometry_stage = Instant::now();
-    let mut alpha_discard_culled_batches = 0usize;
-    let mut alpha_discard_culled_triangles = 0usize;
-    let mut alpha_discard_culled_vertices = 0usize;
+    if let Some(jobs) = jobs {
+        jobs.mark_started(Task::MapGeometry);
+    }
+    // Atomic so `batch_geometry` is `Fn` and the world walk can run it on rayon.
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    let alpha_discard_culled_batches = AtomicUsize::new(0);
+    let alpha_discard_culled_triangles = AtomicUsize::new(0);
+    let alpha_discard_culled_vertices = AtomicUsize::new(0);
     // One BSP mesh batch -> its material/lightmap group and render vertices.
     // Shared by the world and inline models so a mover's surfaces resolve
     // lightmaps, vertex lighting and fog exactly like the world's.
-    let mut batch_geometry = |mesh: &jka_assets::bsp::Mesh,
+    let batch_geometry = |mesh: &jka_assets::bsp::Mesh,
                               batch_index: usize,
                               batch: &jka_assets::bsp::DrawBatch|
      -> Option<(GroupKey, WorldGeometryChunk)> {
@@ -5622,11 +6505,12 @@ fn prepare_internal(
             .find(|&i| batch.lightmaps[i] == LIGHTMAP_BY_VERTEX && surface.vertex_styles[i] < 254);
         let vertex_lit = vertex_lit_slot.is_some();
         if material_render_is_guaranteed_discarded(material, vertex_lit) {
-            alpha_discard_culled_batches += 1;
-            alpha_discard_culled_triangles += batch.indices.len() / 3;
+            alpha_discard_culled_batches.fetch_add(1, AtomicOrdering::Relaxed);
+            alpha_discard_culled_triangles
+                .fetch_add(batch.indices.len() / 3, AtomicOrdering::Relaxed);
             // World geometry is expanded to one GPU vertex per source index,
             // so this is the exact number of render vertices we avoid packing.
-            alpha_discard_culled_vertices += batch.indices.len();
+            alpha_discard_culled_vertices.fetch_add(batch.indices.len(), AtomicOrdering::Relaxed);
             return None;
         }
         let class = class_for(material);
@@ -5723,6 +6607,7 @@ fn prepare_internal(
     // lighting. Retain equivalent immutable surface data so the WGPU path can
     // build a small per-surface bitmask each frame instead of testing every
     // runtime light in every fragment.
+    let dlight_stage = Instant::now();
     let legacy_dlight_surfaces = bsp
         .surfaces
         .iter()
@@ -5773,23 +6658,42 @@ fn prepare_internal(
             }
         })
         .collect::<Vec<_>>();
+    let dlight_surfaces_ms = dlight_stage.elapsed().as_secs_f64() * 1000.0;
 
     let mut groups: BTreeMap<GroupKey, Geometry> = BTreeMap::new();
     let mut triangles = 0usize;
-    for (batch_index, batch) in mesh.batches.iter().enumerate() {
-        let Some((key, batch_geometry)) = batch_geometry(&mesh, batch_index, batch) else {
-            continue;
-        };
-        let signature = bsp
-            .visibility
-            .as_ref()
-            .map(|vis| pvs_signature(vis, &vis.surface_clusters[batch.surface]))
-            .unwrap_or_default();
-        let area_signature = bsp
-            .visibility
-            .as_ref()
-            .and_then(|vis| vis.surface_area_masks.get(batch.surface).copied())
-            .unwrap_or([0_u64; 4]);
+    let walk_stage = Instant::now();
+    let mut signature_time = std::time::Duration::ZERO;
+    // Each BSP batch expands to its render vertices and PVS signature
+    // independently, so that runs on rayon; the results come back in batch order
+    // and are merged sequentially, which keeps every group's contents identical.
+    let walked = {
+        use rayon::prelude::*;
+        mesh.batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_index, batch)| {
+                let (key, chunk) = batch_geometry(&mesh, batch_index, batch)?;
+                let signature_started = Instant::now();
+                let signature = bsp
+                    .visibility
+                    .as_ref()
+                    .map(|vis| pvs_signature(vis, &vis.surface_clusters[batch.surface]))
+                    .unwrap_or_default();
+                let signature_elapsed = signature_started.elapsed();
+                let area_signature = bsp
+                    .visibility
+                    .as_ref()
+                    .and_then(|vis| vis.surface_area_masks.get(batch.surface).copied())
+                    .unwrap_or([0_u64; 4]);
+                Some((key, chunk, signature, area_signature, signature_elapsed))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (key, batch_geometry, signature, area_signature, signature_elapsed) in
+        walked.into_iter().flatten()
+    {
+        signature_time += signature_elapsed;
         triangles += batch_geometry.vertices.len() / 3;
         let chunk = groups
             .entry(key)
@@ -5800,13 +6704,27 @@ fn prepare_internal(
         chunk.vertices.extend_from_slice(&batch_geometry.vertices);
         chunk.surface_ids.extend_from_slice(&batch_geometry.surface_ids);
     }
+    let walk_ms = walk_stage.elapsed().as_secs_f64() * 1000.0;
 
-
+    let pack_stage = Instant::now();
+    // Ordering is a pure function of one group's pieces, so every group is
+    // ordered at once; the groups stay in key order for the sequential pack below.
+    let order_started = Instant::now();
+    let ordered_groups = {
+        use rayon::prelude::*;
+        groups
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(key, geometry)| (key, order_pvs_pieces(geometry.by_pvs_signature)))
+            .collect::<Vec<_>>()
+    };
+    let order_time = order_started.elapsed();
     let mut vertices = Vec::new();
     let mut legacy_dlight_triangle_surfaces = Vec::new();
     let mut batches = Vec::new();
     let mut pvs_batches = Vec::new();
-    for (key, geometry) in groups {
+    for (key, ordered_pieces) in ordered_groups {
         let material = &surface_materials[key.shader];
         let material_debug_index = bsp.shaders.get(key.shader).and_then(|shader| {
             let shader_name = String::from_utf8_lossy(&shader.name);
@@ -5820,7 +6738,7 @@ fn prepare_internal(
         let mut coarse_signature = Vec::<u64>::new();
         let mut coarse_area_signature = [0_u64; 4];
 
-        for ((signature, area_signature), piece) in order_pvs_pieces(geometry.by_pvs_signature) {
+        for ((signature, area_signature), piece) in ordered_pieces {
             let piece_start =
                 u32::try_from(vertices.len()).map_err(|_| "world vertex count exceeds u32")?;
 
@@ -5886,6 +6804,13 @@ fn prepare_internal(
             fog_is_global,
         );
     }
+    load_timings.geometry_detail_ms = [
+        dlight_surfaces_ms,
+        walk_ms,
+        signature_time.as_secs_f64() * 1000.0,
+        pack_stage.elapsed().as_secs_f64() * 1000.0,
+        order_time.as_secs_f64() * 1000.0,
+    ];
 
     let mut inline_vertices = Vec::new();
     let mut inline_batches = Vec::new();
@@ -5971,12 +6896,16 @@ fn prepare_internal(
             inline_batches.len()
         );
     }
+    let alpha_discard_culled_batches = alpha_discard_culled_batches.into_inner();
     if alpha_discard_culled_batches > 0 {
         println!(
-            "{name}: guaranteed alpha-discard render cull: {alpha_discard_culled_batches} BSP batch(es), {alpha_discard_culled_triangles} triangle(s), {alpha_discard_culled_vertices} GPU render vertices omitted; source BSP geometry retained for semantic extraction"
+            "{name}: guaranteed alpha-discard render cull: {alpha_discard_culled_batches} BSP batch(es), {} triangle(s), {} GPU render vertices omitted; source BSP geometry retained for semantic extraction",
+            alpha_discard_culled_triangles.into_inner(),
+            alpha_discard_culled_vertices.into_inner(),
         );
     }
 
+    phase_lap(&mut load_timings, 7, &mut phase_clock);
     let mut lights = bsp_dynamic_lights(&bsp);
     let entity_light_count = lights.len();
     let surface_light_count = surface_lights.len();
@@ -5989,7 +6918,26 @@ fn prepare_internal(
     // GI reads immutable world geometry/lights only. Clone the modest render mesh
     // snapshot and let a map worker voxelize/propagate while the loader continues
     // reflection/planar/lightmap/spawn finalization on the map-loader thread.
-    let gi_job = if options.voxel_probe_gi {
+    let gi_key = options.voxel_probe_gi.then(|| {
+        let mut fingerprint = StageFingerprint::new("voxel-probe-gi");
+        fingerprint
+            .pod(&vertices)
+            .draw_batches(&mut batches)
+            .debug(&lights)
+            .debug(&sun);
+        fingerprint.finish()
+    });
+    let gi_memo_hit = gi_key.and_then(|key| {
+        seed.filter(|seed| seed.stage_keys.gi == Some(key))
+            .map(|seed| seed.voxel_probe_gi.clone())
+    });
+    if gi_memo_hit.is_some() {
+        note_reused_stage(jobs, &mut reused, "voxel GI", Task::MapGi);
+    }
+    // Without a worker pool GI runs right here: the geometry vectors are handed to
+    // the PVS plan job further down, so nothing after this point may read them.
+    let mut gi_sync = None;
+    let gi_job = if options.voxel_probe_gi && gi_memo_hit.is_none() {
         if let Some(jobs) = jobs {
             let gi_vertices = vertices.clone();
             let gi_batches = batches.clone();
@@ -6000,6 +6948,9 @@ fn prepare_internal(
                 (grid, started.elapsed().as_secs_f64() * 1000.0)
             })?)
         } else {
+            let gi_stage = Instant::now();
+            let grid = build_voxel_probe_gi(&vertices, &batches, &lights, sun);
+            gi_sync = Some((grid, gi_stage.elapsed().as_secs_f64() * 1000.0));
             None
         }
     } else {
@@ -6055,6 +7006,72 @@ fn prepare_internal(
         ));
     }
     load_timings.geometry_ms = geometry_stage.elapsed().as_secs_f64() * 1000.0;
+    if let Some(jobs) = jobs {
+        jobs.mark_done(Task::MapGeometry);
+    }
+    phase_lap(&mut load_timings, 8, &mut phase_clock);
+
+    // The authored ocean planes were the last thing that edited the batch lists
+    // before the plan, and they read only the BSP, so they run here and the plan
+    // can start now instead of after lightmaps, grass, GI and audio.
+    let authored_oceans = crate::ocean::authoring::AuthoredOcean::from_bsp(&bsp);
+    append_authored_ocean_planes(
+        &authored_oceans,
+        &mut vertices,
+        &mut batches,
+        &mut pvs_batches,
+    );
+
+    // AUTO 4 is pure CPU map preprocessing. Keep its potentially expensive
+    // per-cluster PVS/group search off the renderer thread and expose it as its
+    // own loading-screen stage. The plan reads only batch draw state, PVS/area
+    // signatures and vertex positions (never decoded textures, GI, grass or
+    // lightmap pixels), so the worker is started as soon as those are final and
+    // joined after the unrelated stages below. It owns the vectors in the
+    // meantime and returns them unchanged alongside the immutable draw plan.
+    let visibility = bsp.visibility.clone();
+    let plan_wanted = visibility.is_some() && !pvs_batches.is_empty();
+    // The plan reads the draw-state of both batch lists and the vertex positions
+    // (for bounds); visibility is fixed by the BSP bytes the memo is keyed on.
+    let portal_key = plan_wanted.then(|| {
+        let mut fingerprint = StageFingerprint::new("auto4-portal-plan");
+        fingerprint
+            .draw_batches(&mut batches)
+            .draw_batches(&mut pvs_batches)
+            .positions(&vertices);
+        fingerprint.finish()
+    });
+    let portal_memo_hit = portal_key.and_then(|key| {
+        seed.filter(|seed| seed.stage_keys.portal == Some(key))
+            .map(|seed| seed.portal_draw_plan.clone())
+    });
+    if portal_memo_hit.is_some() {
+        note_reused_stage(jobs, &mut reused, "PVS plans", Task::MapPortalPlans);
+    }
+    let mut portal_inputs = Some((vertices, batches, pvs_batches, visibility));
+    let mut portal_job = None;
+    if portal_memo_hit.is_none() && plan_wanted {
+        if let Some(jobs) = jobs {
+            let (vertices, batches, pvs_batches, visibility) =
+                portal_inputs.take().expect("plan inputs are taken once");
+            let total = u32::try_from(visibility.as_ref().map_or(0, |vis| vis.clusters))
+                .unwrap_or(u32::MAX)
+                .max(1);
+            portal_job = Some(jobs.submit_progress(Task::MapPortalPlans, total, move |progress| {
+                let started = Instant::now();
+                let plan = build_prepared_portal_draw_plan(
+                    &batches,
+                    &pvs_batches,
+                    visibility.as_ref().expect("visibility checked before AUTO 4 job"),
+                    &vertices,
+                    |completed| progress.set_completed(completed),
+                );
+                let plan_ms = started.elapsed().as_secs_f64() * 1000.0;
+                (vertices, batches, pvs_batches, visibility, plan, plan_ms)
+            })?);
+        }
+    }
+    phase_lap(&mut load_timings, 9, &mut phase_clock);
 
     let (lightmaps, deluxemaps) = if !external_lightmaps.is_empty() {
         (external_lightmaps, external_deluxemaps)
@@ -6115,28 +7132,7 @@ fn prepare_internal(
         (lightmaps, deluxemaps)
     };
 
-    let mut spawns: Vec<_> = bsp
-        .deathmatch_spawns()
-        .into_iter()
-        .map(|spawn| SpawnPoint {
-            position: {
-                let mut p = render_position(spawn.origin);
-                p[1] += 9.0;
-                p
-            },
-            yaw: spawn.yaw.to_radians(),
-        })
-        .collect();
-    if spawns.is_empty() {
-        let model = &bsp.models[0];
-        let center = std::array::from_fn(|i| (model.mins[i] + model.maxs[i]) * 0.5);
-        let mut position = render_position(center);
-        position[1] += 9.0;
-        spawns.push(SpawnPoint { position, yaw: 0.0 });
-    }
-    let fx_runners = bsp_fx_runners(&bsp, &mut warnings);
-    let brush_entities = bsp_brush_entities(&bsp);
-
+    phase_lap(&mut load_timings, 10, &mut phase_clock);
     // Grass generation jobs were launched before the main geometry walk. Resolve and
     // merge them before joining GI so patch-finalization jobs can use the remaining
     // map workers while the queued/running GI job occupies at most one worker.
@@ -6186,9 +7182,14 @@ fn prepare_internal(
             }
         }
     }
-    let (grass_patches, grass_finalize_cpu_ms) =
-        finish_grass_patches_with_jobs(grass_groups, jobs)?;
-    load_timings.grass_cpu_ms += grass_finalize_cpu_ms;
+    let grass_patches = if let Some((patches, blades)) = grass_memo_hit {
+        grass_blades = blades;
+        patches
+    } else {
+        let (patches, grass_finalize_cpu_ms) = finish_grass_patches_with_jobs(grass_groups, jobs)?;
+        load_timings.grass_cpu_ms += grass_finalize_cpu_ms;
+        patches
+    };
     load_timings.grass_ms = grass_stage.elapsed().as_secs_f64() * 1000.0;
     if grass_blades != 0 {
         let grass_cpu_bytes = grass_blades * std::mem::size_of::<GrassInstance>();
@@ -6202,19 +7203,20 @@ fn prepare_internal(
         );
     }
 
+    phase_lap(&mut load_timings, 11, &mut phase_clock);
     // GI was queued after geometry became immutable. Joining it only after grass
     // finalization allows the worker pool to overlap both CPU-heavy finishing stages.
-    let voxel_probe_gi = if let Some(handle) = gi_job {
+    let voxel_probe_gi = if let Some(hit) = gi_memo_hit {
+        hit
+    } else if let Some(handle) = gi_job {
         let (grid, cpu_ms) = handle.join()?;
         load_timings.gi_ms = cpu_ms;
         grid
-    } else if !options.voxel_probe_gi {
-        None
-    } else {
-        let gi_stage = Instant::now();
-        let grid = build_voxel_probe_gi(&vertices, &batches, &lights, sun);
-        load_timings.gi_ms = gi_stage.elapsed().as_secs_f64() * 1000.0;
+    } else if let Some((grid, gi_ms)) = gi_sync {
+        load_timings.gi_ms = gi_ms;
         grid
+    } else {
+        None
     };
     if let Some(grid) = &voxel_probe_gi {
         println!(
@@ -6237,7 +7239,7 @@ fn prepare_internal(
                 mesh.triangles.len(),
                 cpu_ms,
             );
-            Some(Arc::new(mesh))
+            Some(mesh)
         }
         Some((Err(error), cpu_ms)) => {
             load_timings.steam_audio_ms = cpu_ms;
@@ -6291,67 +7293,64 @@ fn prepare_internal(
         }
     }
 
+    phase_lap(&mut load_timings, 12, &mut phase_clock);
     let (footprint_mark_textures, footprint_mark_blend_modes) =
         load_legacy_footprint_marks(&library, &mut assets, &mut textures);
 
     let texture_stats = textures.load_stats;
+    let texture_hashes = textures.content_hashes();
+    load_timings.texture_format_images = texture_stats.format_images;
+    load_timings.texture_format_decode_ms = texture_stats.format_decode_ms;
     load_timings.texture_preload_wall_ms = texture_stats.preload_wall_ms;
     load_timings.texture_read_ms = texture_stats.read_ms;
     load_timings.texture_decode_ms = texture_stats.decode_ms;
     load_timings.texture_mip_ms = texture_stats.mip_ms;
     load_timings.texture_images = texture_stats.decoded_images;
+    load_timings.generated_normal_ms = texture_stats.generated_normal_ms;
+    load_timings.generated_normals = texture_stats.generated_normals;
     warnings.extend(textures.warnings);
     warnings.sort();
     warnings.dedup();
 
-    let authored_oceans = crate::ocean::authoring::AuthoredOcean::from_bsp(&bsp);
-    append_authored_ocean_planes(
-        &authored_oceans,
-        &mut vertices,
-        &mut batches,
-        &mut pvs_batches,
-    );
-
-    // AUTO 4 is pure CPU map preprocessing. Keep its potentially expensive
-    // per-cluster PVS/group search off the renderer thread and expose it as its
-    // own loading-screen stage. The worker owns these vectors temporarily and
-    // returns them unchanged alongside the immutable draw plan.
-    let visibility = bsp.visibility.clone();
-    let portal_plan_started = Instant::now();
+    phase_lap(&mut load_timings, 13, &mut phase_clock);
+    // Join the plan started after the geometry stage. `portal_plans_ms` is the
+    // plan's own compute time; `portal_wait_ms` is how long the loader stalled.
+    let portal_wait_started = Instant::now();
     let (vertices, batches, pvs_batches, visibility, portal_draw_plan) =
-        if visibility.is_some() && !pvs_batches.is_empty() {
-            if let Some(jobs) = jobs {
-                let total = u32::try_from(visibility.as_ref().map_or(0, |vis| vis.clusters))
-                    .unwrap_or(u32::MAX)
-                    .max(1);
-                jobs.submit_progress(Task::MapPortalPlans, total, move |progress| {
-                    let plan = build_prepared_portal_draw_plan(
-                        &batches,
-                        &pvs_batches,
-                        visibility.as_ref().expect("visibility checked before AUTO 4 job"),
-                        &vertices,
-                        |completed| progress.set_completed(completed),
-                    );
-                    (vertices, batches, pvs_batches, visibility, plan)
-                })?
-                .join()?
-            } else {
-                let plan = build_prepared_portal_draw_plan(
-                    &batches,
-                    &pvs_batches,
-                    visibility.as_ref().expect("visibility checked before AUTO 4 build"),
-                    &vertices,
-                    |_| {},
-                );
-                (vertices, batches, pvs_batches, visibility, plan)
-            }
+        if let Some(plan) = portal_memo_hit {
+            let (vertices, batches, pvs_batches, visibility) =
+                portal_inputs.take().expect("plan inputs kept on a memo hit");
+            (vertices, batches, pvs_batches, visibility, plan)
+        } else if let Some(handle) = portal_job {
+            let (vertices, batches, pvs_batches, visibility, plan, plan_ms) = handle.join()?;
+            load_timings.portal_plans_ms = plan_ms;
+            (vertices, batches, pvs_batches, visibility, plan)
+        } else if plan_wanted {
+            let (vertices, batches, pvs_batches, visibility) =
+                portal_inputs.take().expect("plan inputs kept without a worker pool");
+            let plan_stage = Instant::now();
+            let plan = build_prepared_portal_draw_plan(
+                &batches,
+                &pvs_batches,
+                visibility.as_ref().expect("visibility checked before AUTO 4 build"),
+                &vertices,
+                |_| {},
+            );
+            load_timings.portal_plans_ms = plan_stage.elapsed().as_secs_f64() * 1000.0;
+            (vertices, batches, pvs_batches, visibility, plan)
         } else {
+            let (vertices, batches, pvs_batches, visibility) =
+                portal_inputs.take().expect("plan inputs kept when no plan is wanted");
             (vertices, batches, pvs_batches, visibility, PreparedPortalDrawPlan::default())
         };
-    load_timings.portal_plans_ms = portal_plan_started.elapsed().as_secs_f64() * 1000.0;
+    let portal_wait_ms = portal_wait_started.elapsed().as_secs_f64() * 1000.0;
+    phase_lap(&mut load_timings, 14, &mut phase_clock);
+    if !reused.is_empty() {
+        println!("{name}: re-prepare reused unchanged stage(s): {}", reused.join(", "));
+    }
     if !portal_draw_plan.plan_by_cluster.is_empty() {
         println!(
-            "{name}: AUTO 4 map-worker plans: {} FULL piece(s), {} collapsed recipe(s) over {} physical geometr(ies) ({} already contiguous, {:.2} MiB to build lazily), {} unique plan(s) for {} cluster(s); {} recipe reuse hit(s), {} whole-plan reuse hit(s), {:.1} ms",
+            "{name}: AUTO 4 map-worker plans: {} FULL piece(s), {} collapsed recipe(s) over {} physical geometr(ies) ({} already contiguous, {:.2} MiB to build lazily), {} unique plan(s) for {} cluster(s); {} recipe reuse hit(s), {} whole-plan reuse hit(s), {:.1} ms (loader waited {:.1} ms)",
             pvs_batches.len(),
             portal_draw_plan.variants.len(),
             portal_draw_plan.geometries.len(),
@@ -6362,6 +7361,7 @@ fn prepare_internal(
             portal_draw_plan.reused_variant_hits,
             portal_draw_plan.reused_plan_hits,
             load_timings.portal_plans_ms,
+            portal_wait_ms,
         );
     }
     let debug_volumes = match bsp.debug_volumes() {
@@ -6371,6 +7371,10 @@ fn prepare_internal(
             Arc::new(jka_assets::bsp::DebugVolumes::default())
         }
     };
+    phase_lap(&mut load_timings, 15, &mut phase_clock);
+    let archive_opens_after = jka_assets::pk3::archive_open_stats();
+    load_timings.archive_opens = (archive_opens_after.0 - archive_opens_before.0) as u32;
+    load_timings.archive_open_ms = archive_opens_after.1 - archive_opens_before.1;
     load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
 
     Ok(PreparedMap {
@@ -6378,6 +7382,8 @@ fn prepare_internal(
         authored_oceans,
         movement,
         collision,
+        mark_surfaces: Some(mark_surfaces),
+        static_models,
         physics_collision,
         weather_occlusion,
         vertices,
@@ -6389,6 +7395,7 @@ fn prepare_internal(
         inline_vertices,
         inline_batches,
         inline_models,
+        videos: textures.videos,
         textures: textures.images,
         footprint_mark_textures,
         footprint_mark_blend_modes,
@@ -6412,7 +7419,9 @@ fn prepare_internal(
         spawns,
         fx_runners,
         brush_entities,
+        entity_graph,
         distance_cull,
+        sky_portal,
         triangles,
         lightmap_pages,
         source: asset_source,
@@ -6420,6 +7429,9 @@ fn prepare_internal(
         bsp_stats: Some(bsp_stats),
         load_timings,
         material_debug,
+        map_hash,
+        stage_keys: PrepStageKeys { grass: grass_key, gi: gi_key, portal: portal_key },
+        texture_hashes,
     })
 }
 
@@ -6624,14 +7636,10 @@ fn bsp_train_corners(bsp: &Bsp, target: &[u8]) -> Vec<TrainCorner> {
     corners
 }
 
-fn bsp_brush_entities(bsp: &Bsp) -> Vec<MapBrushEntity> {
+pub(crate) fn bsp_brush_entities(bsp: &Bsp) -> Vec<MapBrushEntity> {
     bsp.entities
         .iter()
         .filter_map(|entity| {
-            // SV_SetBrushModel: `*N` is atoi(name + 1); model 0 is the world.
-            let name = std::str::from_utf8(bsp_entity_value(entity, b"model")?).ok()?.trim();
-            let model = name.strip_prefix('*')?.parse::<u32>().ok().filter(|&model| model > 0)?;
-            let bounds = bsp.models.get(model as usize)?;
             let spawn_vars = entity
                 .properties
                 .iter()
@@ -6642,6 +7650,34 @@ fn bsp_brush_entities(bsp: &Bsp) -> Vec<MapBrushEntity> {
                     )
                 })
                 .collect();
+            // SV_SetBrushModel: `*N` is atoi(name + 1); model 0 is the world.
+            let brush_model = bsp_entity_value(entity, b"model")
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .and_then(|name| name.trim().strip_prefix('*')?.parse::<u32>().ok())
+                .filter(|&model| model > 0);
+            let Some(model) = brush_model else {
+                // The point entities that carry a use from triggers to movers.
+                let logic = bsp_entity_value(entity, b"classname").is_some_and(|class| {
+                    [
+                        &b"target_relay"[..],
+                        b"target_delay",
+                        b"target_activate",
+                        b"target_deactivate",
+                        b"target_counter",
+                        b"trigger_always",
+                    ]
+                    .iter()
+                    .any(|logic| class.eq_ignore_ascii_case(logic))
+                });
+                return logic.then_some(MapBrushEntity {
+                    model: 0,
+                    mins: [0.0; 3],
+                    maxs: [0.0; 3],
+                    train_corners: Vec::new(),
+                    spawn_vars,
+                });
+            };
+            let bounds = bsp.models.get(model as usize)?;
             let is_train = bsp_entity_value(entity, b"classname")
                 .is_some_and(|class| class.eq_ignore_ascii_case(b"func_train"));
             let train_corners = if is_train {
@@ -7620,11 +8656,23 @@ fn parse_map_triplet(value: Option<&String>) -> Option<[f32; 3]> {
     (values.next().is_none() && result.iter().all(|value| value.is_finite())).then_some(result)
 }
 
+/// FFA spawns only (`info_player_start` is an `info_player_deathmatch` alias);
+/// duel/siege spots are used only when a map has nothing else.
 fn map_spawn_points(document: &MapDocument) -> Vec<SpawnPoint> {
+    let ffa = map_spawn_points_of(document, |classname| {
+        matches!(classname, "info_player_deathmatch" | "info_player_start")
+    });
+    if !ffa.is_empty() {
+        return ffa;
+    }
+    map_spawn_points_of(document, |classname| {
+        matches!(classname, "info_player_duel" | "info_player_siegeteam1" | "info_player_siegeteam2")
+    })
+}
+
+fn map_spawn_points_of(document: &MapDocument, accepts: impl Fn(&str) -> bool) -> Vec<SpawnPoint> {
     document.entities.iter().filter_map(|entity| {
-        if !matches!(entity.classname(),
-            Some("info_player_deathmatch" | "info_player_start" | "info_player_duel" | "info_player_siegeteam1" | "info_player_siegeteam2"))
-        {
+        if !entity.classname().is_some_and(&accepts) {
             return None;
         }
         let mut origin = parse_map_triplet(entity.properties.get("origin"))?;
@@ -7635,7 +8683,15 @@ fn map_spawn_points(document: &MapDocument) -> Vec<SpawnPoint> {
             .filter(|value| value.is_finite())
             .or_else(|| parse_map_triplet(entity.properties.get("angles")).map(|angles| angles[1]))
             .unwrap_or(0.0);
-        Some(SpawnPoint { position: render_position(origin), yaw: yaw.to_radians() })
+        let integer = |key: &str| {
+            entity.properties.get(key).and_then(|value| value.trim().parse::<i32>().ok()).unwrap_or(0)
+        };
+        Some(SpawnPoint {
+            position: render_position(origin),
+            yaw: yaw.to_radians(),
+            initial: integer("spawnflags") & 1 != 0,
+            no_humans: integer("nohumans") != 0,
+        })
     }).collect()
 }
 
@@ -7732,9 +8788,10 @@ pub fn prepare_source_with_jobs(
     source: &MapSource,
     jobs: &MapJobPool,
     options: MapPrepareOptions,
+    seed: Option<&Arc<PreparedMap>>,
 ) -> Result<PreparedMap, String> {
     match source {
-        MapSource::Bsp(name) => prepare_with_jobs_options(root, game, name, jobs, options),
+        MapSource::Bsp(name) => prepare_with_jobs_options(root, game, name, jobs, options, seed),
         MapSource::Map(name) => prepare_map_asset_with_jobs(root, game, name, jobs, options),
         MapSource::MapFile(path) => prepare_map_file_with_jobs(root, game, path, jobs, options),
         MapSource::MapEditPreview { path, text } => {
@@ -8159,34 +9216,19 @@ fn prepare_map_document_with_assets_options(
         let material = &map_materials[key.material].material;
 
         if material.sky {
-            let stage = MaterialStage {
-                texture: StageTexture::White,
-                enhancements: Default::default(),
-                blend: None,
-                alpha_cutoff: 0.0,
-                opacity: 1.0,
-                color: [1.0; 3],
-                rgb_gen: RgbGen::Identity,
-                alpha_gen: AlphaGen::Identity,
-                tc_gen: TcGen::Base,
-                tc_mods: Vec::new(),
-                depth_write: true,
-                depth_equal: false,
-            };
-            batches.push(stage_batch(
+            append_sky_batches(
+                &mut batches,
                 material,
-                &stage,
-                true,
+                None,
+                None,
                 false,
                 range,
-                None,
-                None,
                 None,
                 &[],
                 [0_u64; 4],
                 [0.0; 4],
                 false,
-            ));
+            );
             continue;
         }
 
@@ -8223,7 +9265,7 @@ fn prepare_map_document_with_assets_options(
             diffuse.blend = None;
             diffuse.depth_write = true;
             diffuse.depth_equal = false;
-            batches.push(stage_batch(
+            let mut folded = stage_batch(
                 material,
                 &diffuse,
                 true,
@@ -8236,7 +9278,10 @@ fn prepare_map_document_with_assets_options(
                 [0_u64; 4],
                 [0.0; 4],
                 false,
-            ));
+            );
+            // The `$lightmap` stage is folded away, so this batch is the receiver.
+            folded.dlight_in_lightmap_stage = false;
+            batches.push(folded);
             for stage in stages.iter().skip(2) {
                 batches.push(stage_batch(
                     material,
@@ -8328,6 +9373,7 @@ fn prepare_map_document_with_assets_options(
         spawns.push(SpawnPoint {
             position: render_position(spawn_jka.to_array().map(|value| value as f32)),
             yaw: 0.0,
+            ..SpawnPoint::default()
         });
     }
 
@@ -8345,6 +9391,7 @@ fn prepare_map_document_with_assets_options(
         .then(|| build_voxel_probe_gi(&vertices, &batches, &lights, sun))
         .flatten();
 
+    let mark_surfaces = mark_surfaces_from_batches(&vertices, &batches);
     Ok(PreparedMap {
         authored_oceans: Vec::new(),
         vertices,
@@ -8359,8 +9406,11 @@ fn prepare_map_document_with_assets_options(
         inline_models: Vec::new(),
         movement,
         collision,
+        mark_surfaces: Some(mark_surfaces),
+        static_models: Arc::default(),
         physics_collision: crate::cgame::ragdoll::PhysicsMapMesh::default(),
         weather_occlusion: None,
+        videos: textures.videos,
         textures: textures.images,
         footprint_mark_textures: [None; 2],
         footprint_mark_blend_modes: [0; 2],
@@ -8384,11 +9434,16 @@ fn prepare_map_document_with_assets_options(
         spawns,
         fx_runners: Vec::new(),
         brush_entities: Vec::new(),
+        entity_graph: None,
         distance_cull,
+        sky_portal: None,
         triangles,
         lightmap_pages: 0,
         source: path.to_path_buf(),
         material_debug,
+        map_hash: 0,
+        stage_keys: PrepStageKeys::default(),
+        texture_hashes: Vec::new(),
         bsp_stats: None,
         load_timings: MapLoadTimings {
             geometry_ms: reconstruction_ms,
@@ -8419,6 +9474,140 @@ fn prepare_map_document_with_assets_options(
 
 #[cfg(test)]
 mod tests {
+    /// The original ordering implementation, kept to prove the matrix version
+    /// returns exactly the same sequence.
+    fn order_pvs_pieces_reference<T>(
+        pieces: std::collections::BTreeMap<(Vec<u64>, [u64; 4]), T>,
+    ) -> Vec<((Vec<u64>, [u64; 4]), T)> {
+        const MAX_ORDERED_PIECES: usize = 4096;
+        let mut pieces = pieces.into_iter().collect::<Vec<_>>();
+        let count = pieces.len();
+        if count <= 2 || count > MAX_ORDERED_PIECES {
+            return pieces;
+        }
+        let distance = |a: &[u64], b: &[u64]| -> u32 {
+            let shared = a.len().min(b.len());
+            let tail = a[shared..].iter().chain(&b[shared..]).map(|word| word.count_ones()).sum::<u32>();
+            a[..shared].iter().zip(&b[..shared]).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() + tail
+        };
+        let mut current = (0..count)
+            .min_by_key(|&index| pieces[index].0 .0.iter().map(|word| word.count_ones()).sum::<u32>())
+            .unwrap_or(0);
+        let mut visited = vec![false; count];
+        let mut order = Vec::with_capacity(count);
+        visited[current] = true;
+        order.push(current);
+        for _ in 1..count {
+            let next = (0..count)
+                .filter(|&index| !visited[index])
+                .min_by_key(|&index| distance(&pieces[current].0 .0, &pieces[index].0 .0))
+                .unwrap();
+            visited[next] = true;
+            order.push(next);
+            current = next;
+        }
+        let signature = |piece: usize| pieces[piece].0 .0.as_slice();
+        for _ in 0..8 {
+            let mut improved = false;
+            for i in 0..count.saturating_sub(2) {
+                for j in i + 2..count {
+                    let (a, b, c) = (order[i], order[i + 1], order[j]);
+                    let d = order.get(j + 1).copied();
+                    let before = distance(signature(a), signature(b))
+                        + d.map_or(0, |d| distance(signature(c), signature(d)));
+                    let after = distance(signature(a), signature(c))
+                        + d.map_or(0, |d| distance(signature(b), signature(d)));
+                    if after < before {
+                        order[i + 1..=j].reverse();
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        let mut slots = pieces.drain(..).map(Some).collect::<Vec<_>>();
+        order.into_iter().map(|index| slots[index].take().unwrap()).collect()
+    }
+
+    #[test]
+    fn piece_ordering_matches_the_reference() {
+        let mut state = 0x1234_5678_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for (count, words) in [(3, 1), (17, 2), (60, 3), (150, 5), (40, 0)] {
+            let mut pieces = std::collections::BTreeMap::new();
+            for index in 0..count {
+                let signature = (0..words)
+                    .map(|_| u64::from(next()) << 32 | u64::from(next() & next()))
+                    .collect::<Vec<_>>();
+                pieces.insert((signature, [index as u64, 0, 0, 0]), index);
+            }
+            let fast = super::order_pvs_pieces(pieces.clone());
+            let reference = order_pvs_pieces_reference(pieces);
+            assert_eq!(fast, reference, "{count} pieces x {words} words");
+        }
+    }
+
+    /// A second preparation that only changes options the heavy stages do not
+    /// read must reuse them and still return an identical world.
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock PK3s"]
+    fn reprepare_reuses_unchanged_stages_and_matches_a_fresh_build() {
+        let base = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE"));
+        let name = std::env::var("JKA_TEST_MAP").unwrap_or_else(|_| "mp/duel3".into());
+
+        let first_options = MapPrepareOptions { ocean: true, steam_audio: false, ..Default::default() };
+        let started = Instant::now();
+        let first = Arc::new(prepare_with_options(&base, None, &name, first_options).unwrap());
+        let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // Ocean/physics do not feed the reusable stages, so everything is lent by `first`.
+        let second_options = MapPrepareOptions { ocean: false, client_physics: true, ..first_options };
+        let started = Instant::now();
+        let second = prepare_with_seed(&base, None, &name, second_options, &first).unwrap();
+        let second_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // Reflection topology changes the batches, so the PVS plan must be rebuilt.
+        let third_options = MapPrepareOptions { planar_reflections: false, planar_environment: false, ..first_options };
+        let third = prepare_with_seed(&base, None, &name, third_options, &first).unwrap();
+
+        // Ground truth: the same options as `second`, built with no seed at all.
+        let fresh = prepare_with_options(&base, None, &name, second_options).unwrap();
+
+        println!(
+            "first {first_ms:.0} ms, second {second_ms:.0} ms (plans {:.0}, gi {:.0}, bsp {:.0}), third plans {:.0} ms",
+            second.load_timings.portal_plans_ms,
+            second.load_timings.gi_ms,
+            second.load_timings.bsp_parse_ms,
+            third.load_timings.portal_plans_ms,
+        );
+        println!("first timings {:?}
+second timings {:?}", first.load_timings, second.load_timings);
+        assert!(second_ms < first_ms, "re-prepare should be faster than the first build");
+        assert_eq!(second.vertices.len(), fresh.vertices.len(), "vertices");
+        assert_eq!(second.batches.len(), fresh.batches.len(), "batches");
+        assert_eq!(second.pvs_batches.len(), fresh.pvs_batches.len(), "pvs batches");
+        assert_eq!(format!("{:?}", second.portal_draw_plan), format!("{:?}", fresh.portal_draw_plan), "plan");
+        assert_eq!(format!("{:?}", second.voxel_probe_gi), format!("{:?}", fresh.voxel_probe_gi), "gi");
+        assert_eq!(second.grass_patches.len(), fresh.grass_patches.len(), "grass");
+        assert_eq!(second.textures.len(), fresh.textures.len(), "textures");
+        assert!(
+            second.textures.iter().zip(&fresh.textures).all(|(a, b)| a.rgba == b.rgba && a.label == b.label),
+            "texture pixels"
+        );
+        assert_ne!(
+            format!("{:?}", third.portal_draw_plan),
+            format!("{:?}", first.portal_draw_plan),
+            "a batch-topology change must not reuse the old plan"
+        );
+    }
+
     /// Full headless map preparation of a demo's map: inline BSP models must
     /// come out as self-consistent mover geometry sharing the world's
     /// material and lightmap resources.
@@ -8465,6 +9654,91 @@ mod tests {
     }
 
     use super::*;
+
+    fn sun_test_grid(cells: Vec<ClassicLightGridCell>) -> ClassicEntityLightGrid {
+        ClassicEntityLightGrid {
+            origin: [0.0; 3],
+            size: [64.0, 64.0, 128.0],
+            bounds: [cells.len() as u32, 1, 1],
+            external_hdr: false,
+            cells,
+            map_toward_sun: None,
+        }
+    }
+
+    /// Coherence is the length of the blended probe direction: 1 when neighbouring
+    /// probes agree, 0 when they point opposite ways and cancel.
+    #[test]
+    fn direction_coherence_reports_disagreeing_probes() {
+        let cell = |direction: [f32; 3]| ClassicLightGridCell {
+            ambient: [40.0; 3],
+            directed: [100.0; 3],
+            direction,
+            sun_weight: 0.0,
+            valid: true,
+        };
+        let agree = sun_test_grid(vec![cell([0.0, 1.0, 0.0]), cell([0.0, 1.0, 0.0])]);
+        let oppose = sun_test_grid(vec![cell([0.0, 1.0, 0.0]), cell([0.0, -1.0, 0.0])]);
+        // Halfway between the two probes (64-unit spacing in x).
+        let midpoint = [32.0, 0.0, 0.0];
+        let agreeing = agree.sample_classic_entity_light(midpoint).unwrap();
+        let opposing = oppose.sample_classic_entity_light(midpoint).unwrap();
+        assert!(agreeing.direction_coherence > 0.99, "{}", agreeing.direction_coherence);
+        assert!(opposing.direction_coherence < 0.05, "{}", opposing.direction_coherence);
+    }
+
+    /// The estimate must separate a sunlit probe (blended direction on the sun,
+    /// directed color equal to the sun color) from torch-lit and skylit probes,
+    /// and the relight must move exactly the sun share to the new sun.
+    #[test]
+    fn entity_sun_weights_split_sunlit_from_torch_and_sky_probes() {
+        let toward_sun = [0.0, 1.0, 0.0];
+        let warm = [255.0, 200.0, 120.0];
+        let cell = |directed: [f32; 3], direction: [f32; 3]| ClassicLightGridCell {
+            ambient: [40.0; 3],
+            directed,
+            direction,
+            sun_weight: 0.0,
+            valid: true,
+        };
+        let mut grid = sun_test_grid(vec![
+            cell(warm, toward_sun),                 // sunlit
+            cell(warm, [1.0, 0.0, 0.0]),            // warm torch from the side
+            cell([60.0, 90.0, 255.0], toward_sun),  // blue sky fill from above
+            cell([0.0; 3], toward_sun),             // unlit
+        ]);
+        // Travel direction is the negated toward-sun direction.
+        grid.estimate_sun_weights([0.0, -1.0, 0.0], [warm[0] / 255.0, warm[1] / 255.0, warm[2] / 255.0]);
+        let weights = grid.cells.iter().map(|c| c.sun_weight).collect::<Vec<_>>();
+        assert!(weights[0] > 0.99, "sunlit probe: {weights:?}");
+        assert!(weights[1] < 0.01, "side torch: {weights:?}");
+        assert!(weights[2] < 0.01, "blue skylight: {weights:?}");
+        assert!(weights[3] == 0.0, "unlit probe: {weights:?}");
+        assert_eq!(grid.map_toward_sun(), Some(toward_sun));
+
+        let mut light = ClassicEntityLight {
+            ambient: [40.0; 3],
+            directed: [100.0, 80.0, 48.0],
+            direction: toward_sun,
+            baked_sun: [100.0, 80.0, 48.0],
+            ..Default::default()
+        };
+        let new_toward = [1.0, 0.0, 0.0];
+        light.relight_sun(toward_sun, new_toward, [0.5, 1.0, 2.0]);
+        assert_eq!(light.directed, [0.0; 3], "all directed light was sun");
+        assert_eq!(light.sun_directed, [50.0, 80.0, 96.0]);
+        assert_eq!(light.sun_direction, new_toward);
+
+        // A probe with no sun share is left exactly as sampled.
+        let mut torch = ClassicEntityLight {
+            directed: [30.0; 3],
+            direction: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        torch.relight_sun(toward_sun, new_toward, [9.0; 3]);
+        assert_eq!(torch.directed, [30.0; 3]);
+        assert_eq!(torch.sun_directed, [0.0; 3]);
+    }
 
     fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
         let lightmap = MaterialStage {
@@ -9075,6 +10349,29 @@ mod tests {
         assert_eq!(light.extra_distance, 0.0);
         assert!((light.intensity - photons / Q3MAP_LIGHTMAP_BYTE_SCALE).abs() < 1e-3);
         assert!((light.radius - photons.sqrt()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn spawn_selection_follows_jka_rules() {
+        let at = |x: f32, initial: bool, no_humans: bool| SpawnPoint {
+            position: [x, 0.0, 0.0],
+            initial,
+            no_humans,
+            ..SpawnPoint::default()
+        };
+        let spawns = [at(0.0, false, false), at(100.0, true, false), at(200.0, false, false), at(300.0, false, false)];
+        // The initial spot wins for the first spawn, whatever the roll.
+        assert_eq!(select_spawn_index(&spawns, [0.0; 3], true, 0.9), Some(1));
+        // Bot-only initial spots are skipped, falling back to the furthest half.
+        let bot_only = [at(0.0, false, false), at(100.0, true, true), at(200.0, false, false), at(300.0, false, false)];
+        assert_eq!(select_spawn_index(&bot_only, [0.0; 3], true, 0.0), Some(3));
+        // Later spawns pick from the furthest half (300 and 200 from the origin).
+        assert_eq!(select_spawn_index(&spawns, [0.0; 3], false, 0.0), Some(3));
+        assert_eq!(select_spawn_index(&spawns, [0.0; 3], false, 0.99), Some(2));
+        // Avoiding the far end flips the ranking.
+        assert_eq!(select_spawn_index(&spawns, [300.0, 0.0, 0.0], false, 0.0), Some(0));
+        assert_eq!(select_spawn_index(&[], [0.0; 3], true, 0.0), None);
+        assert_eq!(select_spawn_index(&spawns[..1], [0.0; 3], false, 0.5), Some(0));
     }
 
     #[test]

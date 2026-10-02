@@ -399,3 +399,145 @@ fn equipped_saber_drives_stock_idle_stance_style_and_crouch_torso() {
     assert_eq!(crouch.legs_animation_name(), "BOTH_CROUCH1WALK");
     assert_eq!(crouch.torso_animation_name(), "BOTH_SABERFAST_STANCE");
 }
+
+mod local_saber_stance {
+    use super::support::*;
+    use jka_movement::CollisionWorld;
+    use jka_movement::{
+        PlayerState, SaberMovementInfo, UserCmd, BUTTON_ATTACK, GENCMD_SABERATTACKCYCLE, TICK_MSEC,
+    };
+
+    // protocol-26 playerStateFields slots.
+    const SABER_ANIM_LEVEL: usize = 23;
+    const SABER_DRAW_ANIM_LEVEL: usize = 25;
+    const SS_FAST: u32 = 1;
+    const SS_MEDIUM: u32 = 2;
+    const SS_STRONG: u32 = 3;
+    const SS_DUAL: u32 = 6;
+    const SS_STAFF: u32 = 7;
+    const SFL_TWO_HANDED: i32 = 1 << 4;
+
+    fn levels(p: &PlayerState) -> (u32, u32) {
+        let fields = p.network().fields;
+        (fields[SABER_ANIM_LEVEL], fields[SABER_DRAW_ANIM_LEVEL])
+    }
+
+    fn holstered(p: &PlayerState) -> i32 {
+        p.entity_view().saber_holstered
+    }
+
+    fn cycle(movement: &jka_movement::PmoveContext, p: &mut PlayerState, world: &mut CollisionWorld) {
+        let cmd = UserCmd {
+            server_time: p.view().command_time + TICK_MSEC,
+            generic_command: GENCMD_SABERATTACKCYCLE,
+            ..UserCmd::default()
+        };
+        movement.step(p, cmd, world).unwrap();
+        // Let the stock 300 ms generic-command debounce expire and settle.
+        for _ in 0..40 {
+            tick(movement, p, world, 0, 0, 0);
+        }
+    }
+
+    fn equip(p: &mut PlayerState, first: SaberMovementInfo, second: SaberMovementInfo) {
+        p.set_saber_movement_info(0, first).unwrap();
+        p.set_saber_movement_info(1, second).unwrap();
+    }
+
+    #[test]
+    fn dual_loadout_starts_in_dual_and_cycle_toggles_the_second_saber() {
+        let movement = animations();
+        let mut world = Map::floor().world();
+        let mut p = player(24.125);
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::equipped_default());
+        assert_eq!(levels(&p), (SS_DUAL, SS_DUAL));
+
+        tick(&movement, &mut p, &mut world, 0, 0, 0);
+        assert_eq!((holstered(&p), levels(&p)), (0, (SS_DUAL, SS_DUAL)));
+
+        cycle(&movement, &mut p, &mut world);
+        assert_eq!((holstered(&p), levels(&p)), (1, (SS_FAST, SS_FAST)));
+
+        cycle(&movement, &mut p, &mut world);
+        assert_eq!((holstered(&p), levels(&p)), (0, (SS_DUAL, SS_DUAL)));
+    }
+
+    #[test]
+    fn dual_second_saber_with_no_manual_deactivate_stays_lit() {
+        let movement = animations();
+        let mut world = Map::floor().world();
+        let mut p = player(24.125);
+        equip(
+            &mut p,
+            SaberMovementInfo::equipped_default(),
+            SaberMovementInfo { no_manual_deactivate: 1, ..SaberMovementInfo::equipped_default() },
+        );
+        cycle(&movement, &mut p, &mut world);
+        assert_eq!((holstered(&p), levels(&p)), (0, (SS_DUAL, SS_DUAL)));
+    }
+
+    #[test]
+    fn staff_cycle_toggles_the_second_blade_and_uses_single_blade_style() {
+        let movement = animations();
+        let mut world = Map::floor().world();
+        let mut p = player(24.125);
+        let staff = SaberMovementInfo {
+            num_blades: 2,
+            styles_learned: 1 << SS_STAFF,
+            saber_flags: SFL_TWO_HANDED,
+            single_blade_style: SS_MEDIUM as i32,
+            ..SaberMovementInfo::equipped_default()
+        };
+        equip(&mut p, staff, SaberMovementInfo::default());
+        assert_eq!(levels(&p), (SS_STAFF, SS_STAFF));
+
+        cycle(&movement, &mut p, &mut world);
+        assert_eq!((holstered(&p), levels(&p)), (1, (SS_MEDIUM, SS_MEDIUM)));
+
+        cycle(&movement, &mut p, &mut world);
+        assert_eq!((holstered(&p), levels(&p)), (0, (SS_STAFF, SS_STAFF)));
+    }
+
+    #[test]
+    fn switching_back_to_a_single_saber_restores_a_single_stance() {
+        let mut p = player(24.125);
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::default());
+        assert_eq!(levels(&p), (SS_MEDIUM, SS_MEDIUM));
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::equipped_default());
+        assert_eq!(levels(&p), (SS_DUAL, SS_DUAL));
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::default());
+        assert_eq!(levels(&p), (SS_MEDIUM, SS_MEDIUM));
+    }
+
+    #[test]
+    fn cycling_mid_swing_shows_at_once_but_applies_after_the_swing() {
+        let movement = animations();
+        let mut world = Map::floor().world();
+        let mut p = player(24.125);
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::default());
+        tick(&movement, &mut p, &mut world, 0, 0, 0);
+
+        // Start a swing and keep the button held so weaponTime stays non-zero.
+        let attack = |p: &PlayerState, generic_command| UserCmd {
+            server_time: p.view().command_time + TICK_MSEC,
+            buttons: BUTTON_ATTACK,
+            generic_command,
+            ..UserCmd::default()
+        };
+        for _ in 0..4 {
+            let cmd = attack(&p, 0);
+            movement.step(&mut p, cmd, &mut world).unwrap();
+        }
+        let cmd = attack(&p, GENCMD_SABERATTACKCYCLE);
+        movement.step(&mut p, cmd, &mut world).unwrap();
+
+        // Draw level is the queued style right away; the real stance waits.
+        assert_eq!(levels(&p), (SS_MEDIUM, SS_STRONG));
+
+        // Once the swing is over the queued stance is applied.
+        for _ in 0..500 {
+            tick(&movement, &mut p, &mut world, 0, 0, 0);
+        }
+        assert_eq!(levels(&p), (SS_STRONG, SS_STRONG));
+    }
+}

@@ -51,9 +51,11 @@ architecture, or server binary.
 - JAPRO userinfo negotiation after gamestate, refreshed when serverinfo or user
   preferences change. `cjp_client=1.4JAPRO` and `cp_pluginDisable` are sent only
   to JAPRO. The latter is archived through the existing network cvar system.
-- The top-level **Mod** menu exposes movement-related preference bits. Other
-  bits remain intact when a checkbox changes. `cp_pluginDisable` also works in
-  the console/config. Tribes' dash/ski input uses the existing `+button13` bind.
+- The top-level **Mod** menu exposes TaystJK's complete jaPRO `pluginDisable`
+  set (bit 3 and bits 19-28) in a scrollable page. Other/legacy bits remain
+  intact when a checkbox changes. `/plugin` and `/pluginDisable` list/toggle
+  the same central table; `cp_pluginDisable` still works directly in the
+  console/config. Tribes' dash/ski input uses the existing `+button13` bind.
 
 ## Review items and next phases
 
@@ -64,10 +66,11 @@ This is the first movement integration, not complete JAPRO client parity.
    slopes, steps, walls, water, race restrictions, and style changes. Current
    synthetic replay tests establish isolation and determinism, not full server
    parity or all special-move combinations.
-2. **Mover timing:** DinurdoJK currently traces presented entity transforms. The
-   reference also uses `cg.physicsTime` for mover evaluation, with an OCPM cap.
-   Port that timeline and mover adjustment together; changing only command times
-   would be incorrect. Moving-platform edge cases remain a compatibility limit.
+2. **Mover timing:** prediction now clips against mover brush models at
+   `cg.physicsTime` (with the OCPM cap) and applies `CG_AdjustPositionForMover`
+   to the replayed and displayed states. Riding a *rotating* mover still does
+   not carry the origin around it, exactly like the reference ("FIXME: origin
+   change when on a rotating object").
 3. **Duel/combat events:** JAPRO's `EV_PRIVATE_DUEL` type tracking, gun-duel
    overrides, full/no-force duel behavior, and speculative projectile knockback
    need the Rust event layer connected to the native inputs. Duel passthrough is

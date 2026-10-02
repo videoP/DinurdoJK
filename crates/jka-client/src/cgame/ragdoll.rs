@@ -17,7 +17,8 @@ use std::collections::{HashMap, HashSet};
 /// improves solver tolerances without changing anything visible to the game.
 const JKA_TO_RAPIER: f32 = 1.0 / 32.0;
 const RAPIER_TO_JKA: f32 = 1.0 / JKA_TO_RAPIER;
-const FORCE_GRIP_RECOVERY_MS: i32 = 180;
+const LIVING_RAGDOLL_RECOVERY_MS: i32 = 180;
+const KNOCKDOWN_RAGDOLL_RECOVERY_MS: i32 = 240;
 const JKA_GRAVITY: f32 = 800.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +31,9 @@ pub struct RagdollConfig {
     pub max_ragdolls: u32,
     pub lifetime_seconds: f32,
     pub self_collision: bool,
+    pub weapon_impulses: bool,
+    pub explosion_impulses: bool,
+    pub force_impulses: bool,
     pub debug: bool,
     pub stats: bool,
 }
@@ -45,6 +49,9 @@ impl Default for RagdollConfig {
             max_ragdolls: 8,
             lifetime_seconds: 20.0,
             self_collision: false,
+            weapon_impulses: true,
+            explosion_impulses: true,
+            force_impulses: true,
             debug: false,
             stats: false,
         }
@@ -135,10 +142,16 @@ struct DrivenBone {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RagdollKind {
+pub enum RagdollMode {
     Corpse,
     ForceGrip,
+    /// Living articulated reaction with the thoracic body kinematically
+    /// attached to the authoritative player transform. Limbs/head remain
+    /// dynamic and therefore lag/react to server-owned knockback.
+    Impulse,
 }
+
+type RagdollKind = RagdollMode;
 
 #[derive(Debug, Clone, Copy)]
 struct GripAnchor {
@@ -146,6 +159,14 @@ struct GripAnchor {
     body: RigidBodyHandle,
     /// Frozen cervical/neck position in unscaled Ghoul2 model space.
     neck_model_position: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TorsoAnchor {
+    /// The thoracic rigid body itself is kinematic for impulse ragdolls.
+    body: RigidBodyHandle,
+    /// Frozen unscaled model-space thoracic transform at handoff.
+    torso_model_rigid: Matrix3x4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,9 +179,10 @@ struct CorpseGeneration {
 }
 
 #[derive(Debug, Clone)]
-struct ForceGripRecovery {
+struct LivingRagdollRecovery {
     model_key: String,
     started_at: i32,
+    duration_ms: i32,
     from_pose: Vec<Matrix3x4>,
 }
 
@@ -171,6 +193,7 @@ struct RagdollInstance {
     generation: CorpseGeneration,
     kind: RagdollKind,
     grip_anchor: Option<GripAnchor>,
+    torso_anchor: Option<TorsoAnchor>,
     spawned_at: i32,
     /// Last authoritative/interpolated entity origin supplied by cgame. Rapier
     /// owns the articulation, but the server remains authoritative for gross
@@ -182,7 +205,7 @@ struct RagdollInstance {
     /// otherwise re-normalize the character's skinning pose.
     spawn_pose: Vec<Matrix3x4>,
     /// Most recent fully solved Ghoul2 pose actually submitted for this
-    /// ragdoll. Force Grip release captures this exact visual pose and blends
+    /// ragdoll. Living ragdoll release captures this exact visual pose and blends
     /// it back to live animation instead of snapping on the first non-grip
     /// frame.
     last_applied_pose: Vec<Matrix3x4>,
@@ -204,7 +227,7 @@ pub struct RagdollWorld {
     static_world_ready: bool,
     previous_body_poses: HashMap<RigidBodyHandle, Pose>,
     instances: HashMap<u16, RagdollInstance>,
-    force_grip_recoveries: HashMap<u16, ForceGripRecovery>,
+    living_recoveries: HashMap<u16, LivingRagdollRecovery>,
     retired: HashMap<u16, (String, CorpseGeneration)>,
     last_time: Option<i32>,
     accumulator: f32,
@@ -235,7 +258,7 @@ impl RagdollWorld {
             static_world_ready: false,
             previous_body_poses: HashMap::new(),
             instances: HashMap::new(),
-            force_grip_recoveries: HashMap::new(),
+            living_recoveries: HashMap::new(),
             retired: HashMap::new(),
             last_time: None,
             accumulator: 0.0,
@@ -252,11 +275,23 @@ impl RagdollWorld {
         self.config.debug
     }
 
+    pub fn weapon_impulses_enabled(&self) -> bool {
+        self.config.weapon_impulses
+    }
+
+    pub fn explosion_impulses_enabled(&self) -> bool {
+        self.config.explosion_impulses
+    }
+
+    pub fn force_impulses_enabled(&self) -> bool {
+        self.config.force_impulses
+    }
+
     /// Drop only dynamic ragdoll state; keep the map collider and configuration.
     pub fn reset_dynamic_for_seek(&mut self) {
         self.clear_instances();
         self.previous_body_poses.clear();
-        self.force_grip_recoveries.clear();
+        self.living_recoveries.clear();
         self.last_time = None;
         self.accumulator = 0.0;
     }
@@ -342,8 +377,8 @@ impl RagdollWorld {
     }
 
     pub fn begin_frame(&mut self, current_time: i32) {
-        self.force_grip_recoveries.retain(|_, recovery| {
-            current_time.saturating_sub(recovery.started_at) < FORCE_GRIP_RECOVERY_MS
+        self.living_recoveries.retain(|_, recovery| {
+            current_time.saturating_sub(recovery.started_at) < recovery.duration_ms
         });
         let Some(previous) = self.last_time.replace(current_time) else {
             return;
@@ -430,14 +465,15 @@ impl RagdollWorld {
         axis: [[f32; 3]; 3],
         origin: [f32; 3],
         model_scale: f32,
-        force_grip: bool,
+        mode: RagdollMode,
+        initial_velocity_override: Option<[f32; 3]>,
         current_time: i32,
     ) -> Result<bool, String> {
         let generation = corpse_generation(entity);
-        let kind = if force_grip { RagdollKind::ForceGrip } else { RagdollKind::Corpse };
+        let kind = mode;
         // Any new physics takeover supersedes a pending live-animation
         // recovery for this entity (re-grip or death during recovery).
-        self.force_grip_recoveries.remove(&entity.number);
+        self.living_recoveries.remove(&entity.number);
         if !self.active() || self.config.max_ragdolls == 0 {
             let first_report = self
                 .debug_candidates
@@ -524,15 +560,17 @@ impl RagdollWorld {
             // velocity, so seed exactly that velocity and let the neck anchor
             // pull the articulation from there.
             let velocity_scale = match kind {
-                RagdollKind::ForceGrip => 1.0,
+                RagdollKind::ForceGrip | RagdollKind::Impulse => 1.0,
                 RagdollKind::Corpse if grounded => 0.0,
                 RagdollKind::Corpse => 2.0,
             };
-            let velocity = Vector::new(
+            let seed_velocity = initial_velocity_override.unwrap_or([
                 entity.state.field_f32("pos.trDelta[0]").unwrap_or(0.0),
                 entity.state.field_f32("pos.trDelta[1]").unwrap_or(0.0),
                 entity.state.field_f32("pos.trDelta[2]").unwrap_or(0.0),
-            ) * (JKA_TO_RAPIER * velocity_scale);
+            ]);
+            let velocity = Vector::new(seed_velocity[0], seed_velocity[1], seed_velocity[2])
+                * (JKA_TO_RAPIER * velocity_scale);
             let instance = self.spawn_instance(
                 model_key,
                 gla,
@@ -578,6 +616,8 @@ impl RagdollWorld {
 
         if kind == RagdollKind::ForceGrip {
             self.update_grip_anchor(entity.number, axis, origin, model_scale);
+        } else if kind == RagdollKind::Impulse {
+            self.update_torso_anchor(entity.number, axis, origin, model_scale);
         }
 
         let entity_matrix = entity_matrix(axis, origin);
@@ -652,27 +692,46 @@ impl RagdollWorld {
         Ok(true)
     }
 
-    /// Begin a short visual recovery from the final Force-grip ragdoll pose to
+    /// Begin a short visual recovery from the final living ragdoll pose to
     /// the authoritative live Ghoul2 animation. Gameplay state changes
     /// immediately; only presentation is blended.
-    pub fn begin_force_grip_recovery(&mut self, entity: u16, current_time: i32) {
+    pub fn begin_living_recovery(&mut self, entity: u16, current_time: i32) {
+        self.begin_living_recovery_for(entity, current_time, LIVING_RAGDOLL_RECOVERY_MS);
+    }
+
+    /// Knockdowns deserve a slightly softer handoff than ordinary grip/impulse
+    /// release. The hidden Ghoul2 animation continues advancing while physics
+    /// owns the pose, so this blends toward the authoritative knockdown frame
+    /// that is current *now* rather than restarting the animation at frame 0.
+    pub fn begin_knockdown_recovery(&mut self, entity: u16, current_time: i32) {
+        self.begin_living_recovery_for(entity, current_time, KNOCKDOWN_RAGDOLL_RECOVERY_MS);
+    }
+
+    pub fn has_instance(&self, entity: u16) -> bool {
+        self.instances.contains_key(&entity)
+    }
+
+    fn begin_living_recovery_for(&mut self, entity: u16, current_time: i32, duration_ms: i32) {
         let Some(instance) = self.instances.get(&entity) else {
             return;
         };
-        if instance.kind != RagdollKind::ForceGrip || instance.last_applied_pose.is_empty() {
+        if !matches!(instance.kind, RagdollKind::ForceGrip | RagdollKind::Impulse)
+            || instance.last_applied_pose.is_empty()
+        {
             return;
         }
-        let recovery = ForceGripRecovery {
+        let recovery = LivingRagdollRecovery {
             model_key: instance.model_key.clone(),
             started_at: current_time,
+            duration_ms,
             from_pose: instance.last_applied_pose.clone(),
         };
-        self.force_grip_recoveries.insert(entity, recovery);
+        self.living_recoveries.insert(entity, recovery);
         self.remove_instance(entity);
         if self.config.debug {
             println!(
-                "RAPIER FORCE GRIP RECOVERY: victim={} durationMs={}",
-                entity, FORCE_GRIP_RECOVERY_MS
+                "RAPIER LIVING RAGDOLL RECOVERY: victim={} durationMs={}",
+                entity, duration_ms
             );
         }
     }
@@ -680,27 +739,27 @@ impl RagdollWorld {
     /// Blend the exact final rendered ragdoll pose into this frame's normal
     /// living animation. Ghoul2 itself uses component-wise 3x4 matrix lerps
     /// for animation blends; use the same convention here for a brief handoff.
-    pub fn apply_force_grip_recovery(
+    pub fn apply_living_recovery(
         &mut self,
         entity: u16,
         model_key: &str,
         pose: &mut [Matrix3x4],
         current_time: i32,
     ) -> bool {
-        let Some(recovery) = self.force_grip_recoveries.get(&entity).cloned() else {
+        let Some(recovery) = self.living_recoveries.get(&entity).cloned() else {
             return false;
         };
         if recovery.model_key != model_key || recovery.from_pose.len() != pose.len() {
-            self.force_grip_recoveries.remove(&entity);
+            self.living_recoveries.remove(&entity);
             return false;
         }
 
         let elapsed = current_time.saturating_sub(recovery.started_at);
-        if elapsed >= FORCE_GRIP_RECOVERY_MS {
-            self.force_grip_recoveries.remove(&entity);
+        if elapsed >= recovery.duration_ms {
+            self.living_recoveries.remove(&entity);
             return false;
         }
-        let t = (elapsed.max(0) as f32 / FORCE_GRIP_RECOVERY_MS as f32).clamp(0.0, 1.0);
+        let t = (elapsed.max(0) as f32 / recovery.duration_ms as f32).clamp(0.0, 1.0);
         let blend = t * t * (3.0 - 2.0 * t);
         for (target, from) in pose.iter_mut().zip(recovery.from_pose.iter()) {
             *target = lerp_matrix3x4(from, target, blend);
@@ -762,7 +821,13 @@ impl RagdollWorld {
             let scaled_bone_pose = scale_bone_translation(&bone_pose, model_scale);
             let world_matrix = multiply_3x4(&entity_matrix, &scaled_bone_pose);
             let world_pose = matrix_to_pose(&world_matrix);
-            let body = self.bodies.insert(
+            let body_builder = if kind == RagdollKind::Impulse && spec.name == "thoracic" {
+                // Unlike Force Grip, impulse ragdolls are attached through the
+                // chest itself. Keeping this one body kinematic follows the
+                // authoritative player while every connected segment remains
+                // a real dynamic rigid body.
+                RigidBodyBuilder::kinematic_position_based().pose(world_pose)
+            } else {
                 RigidBodyBuilder::dynamic()
                     .pose(world_pose)
                     .linvel(velocity)
@@ -770,8 +835,9 @@ impl RagdollWorld {
                     .angular_damping(4.5)
                     .ccd_enabled(self.config.ccd)
                     .can_sleep(self.config.sleeping)
-                    .additional_solver_iterations(8),
-            );
+                    .additional_solver_iterations(8)
+            };
+            let body = self.bodies.insert(body_builder);
 
             if let Some(spawned) = self.bodies.get(body) {
                 self.previous_body_poses
@@ -886,6 +952,17 @@ impl RagdollWorld {
             None
         };
 
+        let torso_anchor = if kind == RagdollKind::Impulse {
+            bone_index(gla, "thoracic")
+                .and_then(|thoracic_index| {
+                    let body = handles_by_bone.get(&thoracic_index).copied()?;
+                    let torso_model_rigid = spawn_bones.get(thoracic_index).copied()?;
+                    Some(TorsoAnchor { body, torso_model_rigid: rigidify_affine(&torso_model_rigid) })
+                })
+        } else {
+            None
+        };
+
         // Join every driven segment to its nearest driven skeleton ancestor.
         // This follows the actual model hierarchy instead of assuming all custom
         // player GLAs have identical intermediary twist bones.
@@ -945,6 +1022,7 @@ impl RagdollWorld {
             generation,
             kind,
             grip_anchor,
+            torso_anchor,
             spawned_at: current_time,
             last_authoritative_origin: origin,
             last_applied_pose: spawn_pose.clone(),
@@ -979,6 +1057,30 @@ impl RagdollWorld {
         let target = Vector::new(world_jka[0], world_jka[1], world_jka[2]) * JKA_TO_RAPIER;
         if let Some(body) = self.bodies.get_mut(anchor.body) {
             body.set_next_kinematic_translation(target);
+        }
+    }
+
+    /// Drive the thoracic kinematic body from the authoritative living-player
+    /// transform. Translation and orientation both follow the server-owned
+    /// player; connected head/arms/spine/pelvis/legs remain dynamic.
+    fn update_torso_anchor(
+        &mut self,
+        entity: u16,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        model_scale: f32,
+    ) {
+        let Some(instance) = self.instances.get(&entity) else {
+            return;
+        };
+        let Some(anchor) = instance.torso_anchor else {
+            return;
+        };
+        let torso_model = scale_bone_translation(&anchor.torso_model_rigid, model_scale);
+        let world = multiply_3x4(&entity_matrix(axis, origin), &torso_model);
+        let target = matrix_to_pose(&world);
+        if let Some(body) = self.bodies.get_mut(anchor.body) {
+            body.set_next_kinematic_position(target);
         }
     }
 
@@ -1086,7 +1188,7 @@ impl RagdollWorld {
             self.remove_instance(entity);
         }
         self.retired.clear();
-        self.force_grip_recoveries.clear();
+        self.living_recoveries.clear();
     }
 
     fn retire_instance(&mut self, entity: u16) {
@@ -1136,7 +1238,7 @@ impl RagdollWorld {
         self.static_world_ready = false;
         self.previous_body_poses.clear();
         self.instances.clear();
-        self.force_grip_recoveries.clear();
+        self.living_recoveries.clear();
         self.retired.clear();
         self.last_time = None;
         self.accumulator = 0.0;

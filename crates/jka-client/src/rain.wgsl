@@ -16,6 +16,7 @@ struct RainRenderUniform {
     appearance: vec4<f32>, // streak length world units, feather width world units, opacity, splash size world units
     splash: vec4<f32>,     // splash duration, viewport width, viewport height, puddle accumulation
     color: vec4<f32>,
+    look: vec4<f32>,       // scattered puddle amount, camera underwater, remaining lanes reserved
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -36,7 +37,8 @@ fn vs_drop(
 ) -> DropOut {
     var out: DropOut;
     let particle = particles[instance_index];
-    if (particle.position_state.w < 0.5 || particle.position_state.w > 1.5) {
+    // Under water every drop is above the surface; none of it is visible from below.
+    if (rain.look.y > 0.5 || particle.position_state.w < 0.5 || particle.position_state.w > 1.5) {
         out.position = vec4<f32>(2.5, 2.5, 0.0, 1.0);
         out.across = 0.0;
         out.along = 0.0;
@@ -48,14 +50,25 @@ fn vs_drop(
     let speed = max(length(particle.velocity_age.xyz), 1.0);
     let velocity = particle.velocity_age.xyz / speed;
 
-    // V6.8.4: the drop's dimensions are physical/world-space again. Perspective is
-    // allowed to make nearby drops larger and distant drops smaller. Screen-space
-    // math is used only by the fragment shader for antialiased coverage.
-    let length_world = rain.appearance.x * clamp(speed / 1650.0, 0.96, 1.04);
-    let half_streak = velocity * length_world * 0.5;
-
     let to_camera_raw = camera.camera_pos_time.xyz - position;
     let to_camera_len = max(length(to_camera_raw), 0.001);
+    let distance = to_camera_len;
+
+    // The drop's dimensions are physical/world-space; perspective makes nearby
+    // drops larger and distant ones smaller. Two limits keep that from looking
+    // wrong. A drop right at the lens would smear across a quarter of the screen
+    // as a long sideways streak, so a streak may cover at most ~10% of the screen
+    // height. And a drop far away would shrink below a pixel and vanish, leaving
+    // the middle distance empty, so it is never thinner than about a pixel (its
+    // opacity gives back part of the width it gained, so it stays a fine line).
+    let focal = max(camera.view_proj[1][1], 0.1);
+    let pixel_world = 2.0 * distance / (focal * max(rain.splash.z, 1.0));
+    let length_world = min(
+        rain.appearance.x * clamp(speed / 1650.0, 0.96, 1.04),
+        0.20 * distance / focal
+    );
+    let width_world = max(rain.appearance.y, pixel_world * 1.25);
+    let half_streak = velocity * length_world * 0.5;
     let to_camera = to_camera_raw / to_camera_len;
     var side_world = cross(velocity, to_camera);
     if (dot(side_world, side_world) < 1e-6) {
@@ -65,7 +78,7 @@ fn vs_drop(
         }
     }
     side_world = normalize(side_world);
-    let half_width = side_world * rain.appearance.y * 0.5;
+    let half_width = side_world * width_world * 0.5;
 
     var endpoint_world = position - half_streak;
     var side = -1.0;
@@ -86,15 +99,18 @@ fn vs_drop(
         return out;
     }
 
-    let distance = length(position - camera.camera_pos_time.xyz);
-    // Do not distort physical size to hide the pathological near-camera case.
-    // Fade particles as they nearly intersect the camera instead.
-    let near_fade = smoothstep(56.0, 144.0, distance);
+    // Fade drops out as they near the lens, and keep the middle distance readable:
+    // thin drops keep most of their opacity and gain a little with range to make
+    // up for the haze that would otherwise swallow them.
+    let near_fade = smoothstep(90.0, 240.0, distance);
     let distance_fade = 1.0 - smoothstep(1500.0, 2300.0, distance);
+    let thinness = rain.appearance.y / width_world;
+    let mid_range = 1.0 + 0.55 * smoothstep(250.0, 800.0, distance);
     out.position = clip;
     out.across = side;
     out.along = along;
-    out.opacity = rain.color.a * rain.appearance.z * near_fade * distance_fade;
+    out.opacity = rain.color.a * rain.appearance.z * near_fade * distance_fade
+        * mix(1.0, sqrt(thinness), 0.6) * mid_range;
     return out;
 }
 
@@ -122,6 +138,8 @@ struct SplashOut {
     @location(0) local: vec2<f32>,
     @location(1) age: f32,
     @location(2) world_xz: vec2<f32>,
+    // Flat-area score and basin score of the surface the drop landed on.
+    @location(3) field: vec2<f32>,
 };
 
 @vertex
@@ -131,11 +149,12 @@ fn vs_splash(
 ) -> SplashOut {
     var out: SplashOut;
     let particle = particles[instance_index];
-    if (particle.position_state.w < 1.5) {
+    if (rain.look.y > 0.5 || particle.position_state.w < 1.5) {
         out.position = vec4<f32>(2.5, 2.5, 0.0, 1.0);
         out.local = vec2<f32>(0.0);
         out.age = 1.0;
         out.world_xz = vec2<f32>(0.0);
+        out.field = vec2<f32>(0.0);
         return out;
     }
 
@@ -155,34 +174,10 @@ fn vs_splash(
     out.local = local;
     out.age = age;
     out.world_xz = particle.position_state.xz;
+    out.field = particle.misc.zy;
     return out;
 }
 
-
-fn puddle_hash12(p: vec2<f32>) -> f32 {
-    let p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    let q = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
-    return fract((q.x + q.y) * q.z);
-}
-
-fn puddle_noise(world_xz: vec2<f32>) -> f32 {
-    let p = world_xz / 170.0;
-    let cell = floor(p);
-    let f = fract(p);
-    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);
-    let n00 = puddle_hash12(cell);
-    let n10 = puddle_hash12(cell + vec2<f32>(1.0, 0.0));
-    let n01 = puddle_hash12(cell + vec2<f32>(0.0, 1.0));
-    let n11 = puddle_hash12(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(n00, n10, u.x), mix(n01, n11, u.x), u.y);
-}
-
-fn puddle_mask(world_xz: vec2<f32>, accumulation: f32) -> f32 {
-    let threshold = mix(0.74, 0.22, accumulation);
-    let softness = mix(0.18, 0.26, accumulation);
-    let basin = smoothstep(threshold, threshold + softness, puddle_noise(world_xz));
-    return pow(clamp(basin, 0.0, 1.0), 0.82);
-}
 
 @fragment
 fn fs_splash(input: SplashOut) -> @location(0) vec4<f32> {
@@ -198,13 +193,16 @@ fn fs_splash(input: SplashOut) -> @location(0) vec4<f32> {
     let fade = (1.0 - input.age) * (1.0 - input.age);
 
     // Reuse the existing impact particles as puddle ripples instead of adding a
-    // second particle system. Accumulation lowers the procedural basin threshold
-    // over time, so circular rings become cleaner/stronger only where puddles
-    // are likely to have formed.
+    // second particle system. The impact carries the weather field's scores for
+    // the surface it hit, and the shape is the very one the material pass draws,
+    // so circular rings appear exactly where standing water is.
     let accumulation = clamp(rain.splash.w, 0.0, 1.0);
     var puddle = 0.0;
     if (accumulation > 0.001) {
-        puddle = accumulation * puddle_mask(input.world_xz, accumulation);
+        var field = weather_default_field();
+        field.flat_area = input.field.x;
+        field.basin = input.field.y;
+        puddle = weather_puddle_shape(field, input.world_xz, accumulation, rain.look.x).coverage;
     }
     // The source wetness technique changes the surface normal/smoothness; it does
     // not paint bright white ripple decals over the scene. Keep only a restrained

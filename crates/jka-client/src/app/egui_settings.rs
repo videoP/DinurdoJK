@@ -17,244 +17,222 @@ use super::*;
 
 impl App {
     pub(super) fn egui_mod_settings(&mut self, ui: &mut egui::Ui) {
-        use crate::net::mod_support::{server_info, ServerMod};
+        use crate::net::mod_support::ServerMod;
 
-        theme::page_title(ui, "MOD", "Settings for the connected server's mod.");
-        let active = self
-            .net
-            .as_ref()
-            .map(|net| ServerMod::detect(server_info(&net.session().decoder().configstrings)));
+        theme::page_title(ui, "MOD", "Settings for the active mod.");
+        egui::ScrollArea::vertical()
+            .id_salt("jka_mod_settings")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let active = self.ui_mod();
 
-        theme::section(ui, "SERVER MOD", "Detected from the current server's game state.");
-        theme::row(
-            ui,
-            "Active mod",
-            "The server mod detected from its advertised/configstring state.",
-            theme::Reset::None,
-            |ui| {
-                theme::glow_label(
-                    ui,
-                    active.map_or("Not connected", ServerMod::label),
-                    12.5,
-                    theme::TEXT_DIM,
-                );
-            },
-        );
-
-        match active {
-            Some(ServerMod::Japro) => {}
-            Some(_) => {
                 theme::section(
                     ui,
-                    "SETTINGS",
-                    "No client-side settings are available for this server mod yet.",
+                    "ACTIVE MOD",
+                    "Detected from the connected server's game state, or the game directory of a local game.",
                 );
-                return;
-            }
-            None => {
+                theme::row(
+                    ui,
+                    "Active mod",
+                    "The server mod detected from its advertised/configstring state.",
+                    theme::Reset::None,
+                    |ui| {
+                        theme::glow_label(
+                            ui,
+                            active.map_or("Not connected", ServerMod::label),
+                            12.5,
+                            theme::TEXT_DIM,
+                        );
+                    },
+                );
+
+                match active {
+                    Some(ServerMod::Japro) => {}
+                    Some(_) => {
+                        theme::section(
+                            ui,
+                            "SETTINGS",
+                            "No client-side settings are available for this server mod yet.",
+                        );
+                        return;
+                    }
+                    None => {
+                        theme::section(
+                            ui,
+                            "SETTINGS",
+                            "Connect to a server or start a local game to view settings for its active mod.",
+                        );
+                        return;
+                    }
+                }
+
+                self.egui_japro_account(ui);
+
                 theme::section(
                     ui,
-                    "SETTINGS",
-                    "Connect to a server to view settings for its active mod.",
+                    "JAPRO CONTROLS",
+                    "jaPRO-specific bindings. Base JKA controls remain on the Controls page.",
                 );
-                return;
-            }
-        }
 
-        theme::section(
-            ui,
-            "JAPRO CONTROLS",
-            "jaPRO-specific bindings. Base JKA controls remain on the Controls page.",
-        );
+                if self.controls_waiting_for_key
+                    && crate::keybinds::is_japro_selection(self.controls_selected)
+                {
+                    theme::banner(
+                        ui,
+                        "Press any key, mouse button or wheel direction…  ESC cancels.",
+                        theme::WARNING,
+                    );
+                    ui.add_space(6.0);
+                }
 
-        if self.controls_waiting_for_key
-            && crate::keybinds::is_japro_selection(self.controls_selected)
-        {
-            theme::banner(
-                ui,
-                "Press any key, mouse button or wheel direction…  ESC cancels.",
-                theme::WARNING,
-            );
-            ui.add_space(6.0);
-        }
+                let mut rebind = None;
+                let mut clear = None;
+                for (index, action) in crate::keybinds::JAPRO_CONTROL_ACTIONS.iter().enumerate() {
+                    let selection = crate::keybinds::japro_selection(index);
+                    let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
+                    let binding = self.bindings.display_for_command(action.command);
+                    let tip = format!("Bound to the \"{}\" command.", action.command);
+                    theme::row(
+                        ui,
+                        &super::egui_menu::title_case(action.label),
+                        &tip,
+                        theme::Reset::None,
+                        |ui| {
+                            let (text, color) = if waiting {
+                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                            } else if binding == "UNBOUND" {
+                                ("Unbound".to_owned(), theme::TEXT_DISABLED)
+                            } else {
+                                (binding.clone(), theme::ACCENT)
+                            };
+                            let response =
+                                super::egui_menu::binding_slot(ui, &text, color, waiting);
+                            if response.clicked() {
+                                rebind = Some(selection);
+                            }
+                            if response.secondary_clicked() {
+                                clear = Some(selection);
+                            }
+                        },
+                    );
+                }
 
-        let mut rebind = None;
-        let mut clear = None;
-        for (index, action) in crate::keybinds::JAPRO_CONTROL_ACTIONS.iter().enumerate() {
-            let selection = crate::keybinds::japro_selection(index);
-            let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
-            let binding = self.bindings.display_for_command(action.command);
-            let tip = format!("Bound to the \"{}\" command.", action.command);
-            theme::row(
-                ui,
-                &super::egui_menu::title_case(action.label),
-                &tip,
-                theme::Reset::None,
-                |ui| {
-                    let (text, color) = if waiting {
-                        ("PRESS A KEY…".to_owned(), theme::WARNING)
-                    } else if binding == "UNBOUND" {
-                        ("Unbound".to_owned(), theme::TEXT_DISABLED)
-                    } else {
-                        (binding.clone(), theme::ACCENT)
-                    };
-                    let response =
-                        super::egui_menu::binding_slot(ui, &text, color, waiting);
-                    if response.clicked() {
-                        rebind = Some(selection);
-                    }
-                    if response.secondary_clicked() {
-                        clear = Some(selection);
-                    }
-                },
-            );
-        }
+                if let Some(selection) = rebind {
+                    self.controls_selected = selection;
+                    self.controls_waiting_for_key = true;
+                    self.publish_ui();
+                } else if let Some(selection) = clear {
+                    self.controls_selected = selection;
+                    self.unbind_selected_control();
+                }
 
-        if let Some(selection) = rebind {
-            self.controls_selected = selection;
-            self.controls_waiting_for_key = true;
-            self.publish_ui();
-        } else if let Some(selection) = clear {
-            self.controls_selected = selection;
-            self.unbind_selected_control();
-        }
-
-        theme::section(
-            ui,
-            "JAPRO MOVEMENT PREFERENCES",
-            "Saved locally and sent when you join a JAPRO server. Server rules still apply.",
-        );
-        let mut bits = self.network.plugin_disable;
-        for (bit, label) in [
-            (15, "Disable katas"),
-            (16, "Disable butterflies"),
-            (17, "Disable backstabs and roll stabs"),
-            (18, "Disable DFA attacks"),
-            (19, "Only bunny hop"),
-            (20, "Disable rolls"),
-            (21, "Disable cartwheels"),
-            (22, "Use Jawa run animation"),
-        ] {
-            let enabled = bits & (1 << bit) != 0;
-            theme::row(
-                ui,
-                label,
-                "JAPRO cp_pluginDisable preference. This is a client preference; server rules still take precedence.",
-                theme::Reset::None,
-                |ui| {
-                    if let Some(enabled) = theme::switch(ui, enabled) {
-                        if enabled {
-                            bits |= 1 << bit;
-                        } else {
-                            bits &= !(1 << bit);
-                        }
-                    }
-                },
-            );
-        }
-        if bits != self.network.plugin_disable {
-            if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
-                self.push_console_line(error);
-            }
-        }
-
-        theme::section(ui, "JAPRO HELPERS", "Visual aids for jaPRO movement styles.");
-        theme::row(
-            ui,
-            "Show jump height helper for SP physics mode",
-            "r_jumpHeightShade. While airborne in jaPRO's SP movement style, tints flat surfaces by \
-             where you would land: green just below your jump height (speed kept), fading to red \
-             the lower it is, and dim blue to cyan above it up to your reachable height (speed \
-             halved). Draws nothing in other movement styles.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.jump_height_shade) {
-                    if let Err(error) =
-                        self.set_console_cvar("r_jumpHeightShade", if enabled { "1" } else { "0" })
-                    {
+                theme::section(
+                    ui,
+                    "JAPRO PLUGIN DISABLE",
+                    "Complete TaystJK/jaPRO cp_pluginDisable preferences. Saved locally and sent in userinfo when you join a jaPRO server.",
+                );
+                let mut bits = self.network.plugin_disable;
+                for option in crate::japro_cg::JAPRO_PLUGIN_DISABLE_OPTIONS {
+                    let enabled = option.enabled(bits);
+                    theme::row(
+                        ui,
+                        option.label,
+                        option.tooltip,
+                        theme::Reset::None,
+                        |ui| {
+                            if let Some(enabled) = theme::switch(ui, enabled) {
+                                if enabled {
+                                    bits |= option.mask();
+                                } else {
+                                    bits &= !option.mask();
+                                }
+                            }
+                        },
+                    );
+                }
+                if bits != self.network.plugin_disable {
+                    if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
                         self.push_console_line(error);
                     }
                 }
-            },
-        );
+
+                theme::section(ui, "JAPRO HELPERS", "Visual aids for jaPRO movement styles.");
+                theme::row(
+                    ui,
+                    "Jump height shade",
+                    "r_jumpHeightShade. While airborne in jaPRO's SP movement style, tints flat surfaces by \
+                     where you would land: green just below your jump height (speed kept), fading to red \
+                     the lower it is, and dim blue to cyan above it up to your reachable height (speed \
+                     halved). Draws nothing in other movement styles.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(enabled) = theme::switch(ui, self.jump_height_shade) {
+                            if let Err(error) =
+                                self.set_console_cvar("r_jumpHeightShade", if enabled { "1" } else { "0" })
+                            {
+                                self.push_console_line(error);
+                            }
+                        }
+                    },
+                );
+            });
     }
 
     pub(super) fn egui_game_settings(&mut self, ui: &mut egui::Ui) {
         theme::page_title(
             ui,
             "GAME / VIEW",
-            "OpenJK local-player model and third-person camera controls.",
+            "Weapon, view-effect and jaPRO gameplay options. Camera controls live on the Camera tab.",
         );
 
         egui::ScrollArea::vertical()
             .id_salt("jka_game_view_settings")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                theme::section(ui, "PLAYER", "Local Solo Game presentation.");
-                theme::row(
+                theme::section(ui, "WEAPONS", "Weapon selection helpers.");
+                if let Some(value) = segmented_row(
                     ui,
-                    "Player model",
-                    "OpenJK model cvar in model[/skin] form. Solo Game defaults to kyle; omitted skin means default.",
+                    "Auto switch",
+                    "cg_autoSwitch. Switch to a weapon you pick up if it is better than the current one (never away from the saber), and to your best weapon when one runs dry. Safe skips rockets, thermal detonators and mines.",
                     theme::Reset::None,
-                    |ui| {
-                        if !self.player_model_editing {
-                            self.player_model_input = self.solo_client_info.model_cvar();
-                        }
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.player_model_input)
-                                .desired_width(theme::track_width(ui))
-                                .hint_text("kyle"),
-                        );
-                        if response.gained_focus() {
-                            self.player_model_editing = true;
-                        }
-                        let enter_pressed =
-                            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if response.lost_focus() || enter_pressed {
-                            let model = self.player_model_input.clone();
-                            let _ = self.set_console_cvar("model", &model);
-                            self.player_model_editing = false;
-                            self.player_model_input = self.solo_client_info.model_cvar();
-                            if enter_pressed {
-                                ui.memory_mut(|memory| memory.surrender_focus(response.id));
-                            }
-                        }
-                    },
-                );
+                    self.audio.game.auto_switch,
+                    &[(0, "Never"), (1, "Safe weapons"), (2, "Any weapon")],
+                ) {
+                    let _ = self.set_console_cvar("cg_autoSwitch", &value.to_string());
+                }
 
-                theme::section(
-                    ui,
-                    "THIRD PERSON",
-                    "Stock OpenJK MP cg_thirdPerson camera cvars.",
-                );
+                theme::section(ui, "VIEW EFFECTS", "Camera effects driven by the game.");
                 theme::row(
                     ui,
-                    "Third person",
-                    "Toggles cg_thirdPerson. With First-person saber / melee enabled, turning this off also keeps saber/melee in first person; special forced-camera states remain separate.",
+                    "Score numbers",
+                    "cg_scorePlums. Floating score numbers where you score.",
                     theme::Reset::None,
                     |ui| {
-                        if let Some(value) = theme::switch(ui, self.third_person.enabled) {
-                            let _ = self.set_console_cvar(
-                                "cg_thirdPerson",
-                                if value { "1" } else { "0" },
-                            );
+                        if let Some(value) = theme::switch(ui, self.audio.game.score_plums) {
+                            let _ = self.set_console_cvar("cg_scorePlums", if value { "1" } else { "0" });
                         }
                     },
                 );
-                theme::row(
+                if let Some(value) = segmented_row(
                     ui,
-                    "First-person saber / melee",
-                    "cg_fpls. Allow cg_thirdPerson 0 to remain first person with saber/melee. DinurdoJK defaults this on and archives the choice.",
+                    "Gibs",
+                    "cg_blood. Gibbed players: off (a death voice plays instead), skull or brain only, or full gibs. Needs the jaPRO models/gibs assets; jaPRO itself defaults to off.",
                     theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.first_person_lightsaber) {
-                            let _ = self.set_console_cvar(
-                                "cg_fpls",
-                                if value { "1" } else { "0" },
-                            );
-                        }
-                    },
-                );
+                    self.audio.game.blood,
+                    &[(0, "Off"), (1, "Skull / brain"), (2, "Full")],
+                ) {
+                    let _ = self.set_console_cvar("cg_blood", &value.to_string());
+                }
+                if let Some(value) = segmented_row(
+                    ui,
+                    "Screen shake",
+                    "cg_screenShake. Effects: shake from explosions and creature stomps. Effects + weapons: also the kick of firing rockets, alt repeater, flechette and charged bryar/demp2/bowcaster shots. Server-triggered shake events (rancors, scripted quakes) are unaffected, as in OpenJK.",
+                    theme::Reset::None,
+                    self.screen_shake,
+                    &[(0, "Off"), (1, "Effects"), (2, "Effects + weapons")],
+                ) {
+                    let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
+                }
 
                 theme::section(
                     ui,
@@ -269,17 +247,6 @@ impl App {
                     |ui| {
                         if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_player_origin) {
                             let _ = self.set_console_cvar("cg_smoothPlayerOrigin", if value { "1" } else { "0" });
-                        }
-                    },
-                );
-                theme::row(
-                    ui,
-                    "Smooth third-person target",
-                    "cg_smoothThirdPersonOrigin. Feed the third-person camera the same interpolated movement timeline instead of the latest stepped pmove origin.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_third_person_origin) {
-                            let _ = self.set_console_cvar("cg_smoothThirdPersonOrigin", if value { "1" } else { "0" });
                         }
                     },
                 );
@@ -305,107 +272,7 @@ impl App {
                         }
                     },
                 );
-                theme::row(
-                    ui,
-                    "Smooth third-person camera time",
-                    "cg_smoothThirdPersonTime. Run camera damping from the continuous presentation clock instead of stepped commandTime.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_third_person_time) {
-                            let _ = self.set_console_cvar("cg_smoothThirdPersonTime", if value { "1" } else { "0" });
-                        }
-                    },
-                );
-
-                macro_rules! third_person_number {
-                    ($label:literal, $tip:literal, $field:ident, $cvar:literal, $speed:expr) => {
-                        theme::row(ui, $label, $tip, theme::Reset::None, |ui| {
-                            let mut value = self.third_person.$field;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut value)
-                                        .speed($speed)
-                                        .max_decimals(3)
-                                        .update_while_editing(false),
-                                )
-                                .changed()
-                            {
-                                let _ = self.set_console_cvar($cvar, &value.to_string());
-                            }
-                        });
-                    };
-                }
-
-                third_person_number!(
-                    "Range",
-                    "cg_thirdPersonRange: distance behind the player.",
-                    range,
-                    "cg_thirdPersonRange",
-                    1.0
-                );
-                third_person_number!(
-                    "Orbit angle",
-                    "cg_thirdPersonAngle: yaw offset around the player in degrees.",
-                    angle,
-                    "cg_thirdPersonAngle",
-                    1.0
-                );
-                third_person_number!(
-                    "Vertical offset",
-                    "cg_thirdPersonVertOffset: target height above the player origin.",
-                    vert_offset,
-                    "cg_thirdPersonVertOffset",
-                    0.5
-                );
-                third_person_number!(
-                    "Horizontal offset",
-                    "cg_thirdPersonHorzOffset: left/right camera offset.",
-                    horz_offset,
-                    "cg_thirdPersonHorzOffset",
-                    0.5
-                );
-                third_person_number!(
-                    "Pitch offset",
-                    "cg_thirdPersonPitchOffset: camera pitch offset in degrees.",
-                    pitch_offset,
-                    "cg_thirdPersonPitchOffset",
-                    0.5
-                );
-                third_person_number!(
-                    "Camera damping",
-                    "cg_thirdPersonCameraDamp: OpenJK camera-position smoothing factor.",
-                    camera_damp,
-                    "cg_thirdPersonCameraDamp",
-                    0.01
-                );
-                third_person_number!(
-                    "Target damping",
-                    "cg_thirdPersonTargetDamp: OpenJK camera-target smoothing factor.",
-                    target_damp,
-                    "cg_thirdPersonTargetDamp",
-                    0.01
-                );
-                third_person_number!(
-                    "Player alpha",
-                    "cg_thirdPersonAlpha stock cvar. Preserved for the OpenJK player-rendering path.",
-                    alpha,
-                    "cg_thirdPersonAlpha",
-                    0.01
-                );
-                theme::row(
-                    ui,
-                    "Special camera",
-                    "cg_thirdPersonSpecialCam. In TaystJK this switches to CG_ThirdPersonActionCam during saber special moves and falls back to the normal third-person camera if that action cam cannot be used. The Rust action-camera branch is not ported yet, so this switch is currently inert.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.third_person.special_cam) {
-                            let _ = self.set_console_cvar(
-                                "cg_thirdPersonSpecialCam",
-                                if value { "1" } else { "0" },
-                            );
-                        }
-                    },
-                );
+                self.egui_japro_game_settings(ui);
             });
     }
 
@@ -444,39 +311,58 @@ impl App {
                 theme::section(
                     ui,
                     "CROSSHAIR",
-                    "JKA/TaystJK-compatible local crosshair cvars with a native picker.",
+                    "Click a crosshair to use it; click it again to turn the crosshair off.",
                 );
 
-                const SHAPES: [(u8, &str); 7] = [
-                    (0, "Off"),
-                    (1, "Classic"),
-                    (2, "Dot"),
-                    (3, "Plus"),
-                    (4, "+ Dot"),
-                    (5, "Brackets"),
-                    (6, "Box"),
-                ];
-                if let Some(style) = segmented_row(
-                    ui,
-                    "Shape",
-                    "cg_drawCrosshair. Zero disables it; the other values select the local crosshair geometry.",
-                    theme::Reset::None,
-                    self.crosshair.style,
-                    &SHAPES,
-                ) {
-                    let _ = self.set_console_cvar("cg_drawCrosshair", &style.to_string());
+                if self.strafe_helper.flags & crate::ui::SHELPER_CROSSHAIR != 0 {
+                    theme::banner(
+                        ui,
+                        "cg_strafeHelper bit 16384 is set: jaPRO's line crosshair replaces these settings.",
+                        theme::WARNING,
+                    );
+                }
+
+                self.draw_crosshair_picker(ui);
+
+                if self.crosshair.style == crate::ui::CROSSHAIR_STYLE_LINE && self.crosshair.image == 0 {
+                    theme::row(
+                        ui,
+                        "Line width",
+                        "cg_strafeHelperLineWidth, in 640x480 units. jaPRO draws its line crosshair with the strafehelper line width, so this also sets the strafehelper lines. Size stretches the line's length.",
+                        theme::Reset::None,
+                        |ui| {
+                            let mut value = self.strafe_helper.line_width;
+                            let readout = format!("{value:.2}");
+                            if theme::slider(ui, &mut value, 0.25..=5.0, &readout) {
+                                let _ = self.set_console_cvar("cg_strafeHelperLineWidth", &value.to_string());
+                            }
+                        },
+                    );
                 }
 
                 theme::row(
                     ui,
                     "Size",
-                    "cg_crosshairSize. Uses JKA's stock default of 24; procedural geometry compensates for the transparent padding present in the original crosshair artwork.",
+                    "cg_crosshairSize. Uses JKA's stock default of 24. Shapes and images are sized in pixels, compensating for the transparent padding in the original artwork; the line stretches with it.",
                     theme::Reset::None,
                     |ui| {
                         let mut value = self.crosshair.size;
                         let readout = format!("{value:.0}");
                         if theme::slider(ui, &mut value, 4.0..=96.0, &readout) {
                             let _ = self.set_console_cvar("cg_crosshairSize", &value.to_string());
+                        }
+                    },
+                );
+                theme::row(
+                    ui,
+                    "Strength",
+                    "cg_crosshairStrength. 100% is the crosshair as authored. Below that it fades; above it the faint stock image crosshairs are drawn stronger (shapes are already solid, so only fade).",
+                    theme::Reset::None,
+                    |ui| {
+                        let mut value = self.crosshair.strength;
+                        let readout = percent(value);
+                        if theme::slider(ui, &mut value, 0.0..=crate::ui::CROSSHAIR_STRENGTH_MAX, &readout) {
+                            let _ = self.set_console_cvar("cg_crosshairStrength", &value.to_string());
                         }
                     },
                 );
@@ -516,19 +402,53 @@ impl App {
                         );
                     },
                 );
-                theme::section(
+                theme::row(
                     ui,
-                    "PREVIEW",
-                    "Live center-screen sample of the current crosshair settings.",
+                    "Color by target",
+                    "cg_crosshairIdentifyTarget. jaPRO: the crosshair turns red on enemies, green on teammates, yellow on neutral objects and grey on other duelists. Off keeps the color above.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(enabled) = theme::switch(ui, self.crosshair.identify_target) {
+                            let _ = self.set_console_cvar("cg_crosshairIdentifyTarget", if enabled { "1" } else { "0" });
+                        }
+                    },
                 );
-                draw_crosshair_preview(ui, self.crosshair);
-                theme::glow_label(
+                const NAMES: [(f32, &str); 5] =
+                    [(0.0, "Off"), (-1.0, "While aimed"), (1.0, "1 s"), (3.0, "3 s"), (5.0, "5 s")];
+                if let Some(names) = segmented_row(
                     ui,
-                    "Preview scales to fit the menu box; in-game placement remains dead-center.",
-                    11.5,
-                    theme::TEXT_FAINT,
+                    "Player names",
+                    "cg_drawCrosshairNames. Off; only while the crosshair is on a player; or for that many seconds after. The console takes any value (negative = while aimed).",
+                    theme::Reset::None,
+                    self.crosshair.names,
+                    &NAMES,
+                ) {
+                    let _ = self.set_console_cvar("cg_drawCrosshairNames", &names.to_string());
+                }
+                theme::row(
+                    ui,
+                    "Name colors",
+                    "cg_drawCrosshairNamesColours. On draws the name with its own color codes; off strips them and colors it red or green by friend or foe.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(enabled) = theme::switch(ui, self.crosshair.names_colours) {
+                            let _ = self.set_console_cvar("cg_drawCrosshairNamesColours", if enabled { "1" } else { "0" });
+                        }
+                    },
                 );
-
+                theme::row(
+                    ui,
+                    "Name opacity",
+                    "cg_drawCrosshairNamesOpacity.",
+                    theme::Reset::None,
+                    |ui| {
+                        let mut value = self.crosshair.names_opacity;
+                        let readout = format!("{:.0}%", value * 100.0);
+                        if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                            let _ = self.set_console_cvar("cg_drawCrosshairNamesOpacity", &value.to_string());
+                        }
+                    },
+                );
 
                 theme::section(
                     ui,
@@ -663,6 +583,19 @@ impl App {
                     }
                 });
 
+                theme::section(ui, "CHAT", "The say / say_team input line.");
+                theme::row(
+                    ui,
+                    "Name completion",
+                    "cg_chatboxCompletion. Tab completes the word before the caret to a player name (colours ignored, matches anywhere in the name). Several matches are listed instead.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.chatbox_completion) {
+                            let _ = self.set_console_cvar("cg_chatboxCompletion", if value { "1" } else { "0" });
+                        }
+                    },
+                );
+
                 theme::section(ui, "CONSOLE", "The ` console. Also switchable from the SUGGEST chip in the console header.");
                 theme::row(
                     ui,
@@ -690,6 +623,16 @@ impl App {
     }
 
     pub(super) fn egui_video_page(&mut self, ui: &mut egui::Ui) {
+        // Install the pending-row palette before building the page. The list is
+        // derived from App's authoritative applied/prepared state, not a second
+        // UI dirty bit, so orange always means the next Apply will consume it.
+        let pending_resets = self
+            .pending_video_changes()
+            .iter()
+            .filter_map(|change| pending_video_reset(&change.key))
+            .collect();
+        theme::set_pending_resets(ui.ctx(), pending_resets);
+
         let (title, detail) = match self.video_section {
             VideoSection::Display => ("DISPLAY & FRAME PACING", "Window mode, timing and output."),
             VideoSection::ImageQuality => (
@@ -716,14 +659,12 @@ impl App {
             ),
             VideoSection::PostProcessing => (
                 "POST PROCESSING",
-                "Effects applied to the finished frame.",
+                "Effects applied to the finished frame, plus film-style grading.",
             ),
-            VideoSection::Film => ("FILM EMULATION", "Photochemical-inspired finishing."),
             VideoSection::DebugTools => (
                 "DEBUG & TOOLS",
                 "Renderer diagnostics and instrumentation.",
             ),
-            VideoSection::BakedAo => ("BAKED AO", "Quality of the cached ambient occlusion bake."),
             VideoSection::Physics => (
                 "PHYSICS",
                 "Client-side visual simulation for ragdolls, dynamic props and debris.",
@@ -758,9 +699,7 @@ impl App {
                 VideoSection::Shadows => self.egui_shadows(ui),
                 VideoSection::Reflections => self.egui_reflections(ui),
                 VideoSection::PostProcessing => self.egui_post_processing(ui),
-                VideoSection::Film => self.egui_film(ui),
                 VideoSection::DebugTools => self.egui_debug_tools(ui),
-                VideoSection::BakedAo => self.egui_baked_ao(ui),
                 VideoSection::Physics => self.egui_physics(ui),
                 VideoSection::Sun => self.egui_sun(ui),
                 VideoSection::Clouds => self.egui_clouds(ui),
@@ -775,13 +714,15 @@ impl App {
         if let Some(reset) = theme::take_reset(ui.ctx()) {
             self.apply_setting_reset(reset);
         }
+        theme::clear_pending_resets(ui.ctx());
     }
 
     // ------------------------------------------------------------ rendering --
 
     fn egui_display_settings(&mut self, ui: &mut egui::Ui) {
-        const PRESETS: [(QualityPreset, &str); 4] = [
-            (QualityPreset::Minimal, "Minimal"),
+        const PRESETS: [(QualityPreset, &str); 5] = [
+            (QualityPreset::Minimal, "Minimal (Legacy)"),
+            (QualityPreset::MinimalUnified, "Minimal (Unified)"),
             (QualityPreset::Low, "Low"),
             (QualityPreset::Medium, "Medium"),
             (QualityPreset::High, "High"),
@@ -791,7 +732,9 @@ impl App {
             "Quality preset",
             "Sets every rendering cost lever at once. Resolution, display mode, \
              render backend, vsync, frame queue, FPS cap and the debug toggles are left \
-             alone. The bar becomes Custom once you change a preset-controlled setting.",
+             alone. The bar becomes Custom once you change a preset-controlled setting. \
+             Minimal (Legacy) and Minimal (Unified) have identical settings; Legacy uses \
+             the known-fast world renderer and Unified the general one, for comparison.",
             theme::Reset::Video(ui::VIDEO_ROW_QUALITY_PRESET),
             self.active_quality_preset(),
             &PRESETS,
@@ -820,6 +763,9 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_RENDER_BACKEND;
             self.change_video_setting(next as i32 - current as i32);
         }
+        if self.video.renderer_backend != self.applied_renderer_backend {
+            theme::hint(ui, "Render backend changed: needs Apply", theme::WARNING);
+        }
 
         const DISPLAY_MODES: [(FullscreenMode, &str); 3] = [
             (FullscreenMode::Windowed, "Windowed"),
@@ -841,6 +787,9 @@ impl App {
             let next = index_of(&DISPLAY_MODES, target, current);
             self.video_selected = ui::VIDEO_ROW_FULLSCREEN;
             self.change_video_setting(next as i32 - current as i32);
+        }
+        if self.video.fullscreen != self.applied_fullscreen {
+            theme::hint(ui, "Display mode changed: needs Apply", theme::WARNING);
         }
 
         let resolutions = Self::available_resolutions(self.window.as_deref(), self.video.resolution);
@@ -971,32 +920,6 @@ impl App {
 
         theme::row(
             ui,
-            "Player movement rate",
-            "Fixed OpenJK/JKA player movement tick. Stock Jedi Academy runs 125 Hz; \
-             changing it changes movement feel, including strafe jump behaviour. \
-             This is separate from client-side Rapier visual physics.",
-            theme::Reset::Video(ui::VIDEO_ROW_PHYSICS_FPS),
-            |ui| {
-                let mut fps = config::physics_fps_from_msec(self.video.physics_msec);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut fps)
-                            .range(20..=1000)
-                            .speed(1.0)
-                            .suffix(" Hz")
-                            .update_while_editing(false),
-                    )
-                    .changed()
-                {
-                    let msec =
-                        config::physics_msec_from_fps(&fps.to_string(), self.video.physics_msec);
-                    self.set_physics_msec(msec);
-                }
-            },
-        );
-
-        theme::row(
-            ui,
             "Brightness / gamma",
             "Output gamma curve. Raise it if dark corners of a map are \
              unreadable; it does not affect how the scene is lit.",
@@ -1015,7 +938,7 @@ impl App {
         theme::row(
             ui,
             "Model brightness",
-            "Brightness of players, NPCs and props, like r_ambientScale. Locked, it              follows the master slider and adds nothing of its own. Unlock it to set              models brighter or darker than the rest of the scene.",
+            "Brightness of players, NPCs and props, like r_ambientScale. Locked, it follows the master slider and adds nothing of its own. Unlock it to set models brighter or darker than the rest of the scene.",
             theme::Reset::Video(ui::VIDEO_ROW_MODEL_BRIGHTNESS),
             |ui| {
                 let locked = self.video.model_brightness_locked;
@@ -1035,7 +958,7 @@ impl App {
         theme::row(
             ui,
             "Dynamic light brightness",
-            "Brightness of runtime lights such as blaster bolts, sabers and explosions.              Locked, it follows the master slider and adds nothing of its own. Unlock it              to make dynamic lights stronger or weaker than the rest of the scene.",
+            "Brightness of runtime lights such as blaster bolts, sabers and explosions. Locked, it follows the master slider and adds nothing of its own. Unlock it to make dynamic lights stronger or weaker than the rest of the scene.",
             theme::Reset::Video(ui::VIDEO_ROW_DLIGHT_BRIGHTNESS),
             |ui| {
                 let locked = self.video.dynamic_light_brightness_locked;
@@ -1125,6 +1048,7 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        ui.add_enabled_ui(self.video.detail_textures != DetailTextureMode::Off, |ui| {
         theme::row(
             ui,
             "Detail distance fade",
@@ -1142,8 +1066,9 @@ impl App {
                 }
             },
         );
+        });
 
-        if self.video.detail_texture_fade {
+        if self.video.detail_texture_fade && self.video.detail_textures != DetailTextureMode::Off {
             theme::row(
                 ui,
                 "Detail fade distance",
@@ -1175,37 +1100,30 @@ impl App {
             ui::VIDEO_ROW_HDR,
             self.video.hdr,
         );
+        ui.add_enabled_ui(self.video.hdr, |ui| {
         self.egui_toggle_row(
             ui,
             "Float lightmaps",
             "Rend2-compatible HDR baked lighting. While HDR rendering is enabled, \
              load maps/<map>/lm_XXXX.hdr companions into FP16 when they exist; \
-             ordinary JKA lightmaps are promoted to FP16 as the fallback. Requires Apply Video Settings / vid_restart while a map is loaded.",
+             ordinary JKA lightmaps are promoted to FP16 as the fallback. While a map is loaded, Apply Video Settings reloads it with the new setting.",
             ui::VIDEO_ROW_FLOAT_LIGHTMAP,
             self.video.float_lightmap,
         );
+        });
     }
 
     fn egui_visibility(&mut self, ui: &mut egui::Ui) {
-        const PVS: [(PvsMode, &str); 7] = [
+        const PVS: [(PvsMode, &str); 4] = [
             (PvsMode::Off, "Off"),
             (PvsMode::Minimal, "Minimal"),
             (PvsMode::Full, "Full"),
             (PvsMode::Auto, "Auto"),
-            (PvsMode::Auto2, "Auto 2"),
-            (PvsMode::Auto3, "Auto 3"),
-            (PvsMode::Auto4, "Auto 4"),
         ];
         if let Some(target) = segmented_row(
             ui,
             "PVS portal culling",
-            "Uses the map's precomputed visibility set to skip rooms the camera \
-             cannot see. Auto keeps the existing whole-cluster coarse/full choice; \
-             Auto 2 chooses coarse or full independently per material surface group. Auto 3 uses\
-             coarse only when it is exactly equivalent to the currently visible Full children. Auto 4\
-             builds portal/cluster-owned base batches at map load, precomputes the exact visible batch\
-             recipe for every camera cluster, merges compatible batches there, and reuses identical\
-             merged batches and whole recipes across clusters.",
+            "Uses the map's precomputed visibility set to skip rooms the camera cannot see. Off draws everything. Minimal draws the fewest batches; Full keeps every triangle of each visible batch. Auto precomputes merged batches per camera cluster at map load: the minimal draw count with the exact visible triangles. If a map shows missing geometry, try Full.",
             theme::Reset::Video(ui::VIDEO_ROW_PVS),
             self.video.pvs_mode,
             &PVS,
@@ -1242,6 +1160,7 @@ impl App {
             ui::VIDEO_ROW_GPU_DRIVEN,
             self.video.gpu_driven,
         );
+        ui.add_enabled_ui(self.video.gpu_driven, |ui| {
         self.egui_toggle_row(
             ui,
             "Hi-Z occlusion",
@@ -1250,6 +1169,7 @@ impl App {
             ui::VIDEO_ROW_HIZ,
             self.video.hiz_occlusion,
         );
+        });
     }
 
     fn egui_lighting(&mut self, ui: &mut egui::Ui) {
@@ -1301,16 +1221,17 @@ impl App {
              and loose files may replace assets from retail assets0.pk3 through assets3.pk3. \
              When disabled, ordinary lookups protect those retail qpaths. Active PBR .mtr \
              materials may still load their explicitly referenced base/normal/RMO/etc. \
-             textures from the same package as the material. Applies next map load / vid_restart.",
+             textures from the same package as the material. While a map is loaded, Apply Video Settings reloads it with the new setting.",
             ui::VIDEO_ROW_ASSET_OVERRIDES,
             self.video.allow_asset_overrides,
         );
         self.egui_toggle_row(
             ui,
             "Generate normal maps",
-            "Rend2 compatibility fallback. On the next renderer restart or map load, \
-             synthesize a normal map from diffuse luminance only when no authored \
-             normal map exists. Useful for old assets, but authored normals are better.",
+            "Rend2 compatibility fallback. Synthesize a normal map from diffuse luminance \
+             only when no authored normal map exists; with a map loaded, Apply Video \
+             Settings reloads it with the new setting. Useful for old assets, \
+             but authored normals are better.",
             ui::VIDEO_ROW_GEN_NORMAL_MAPS,
             self.video.gen_normal_maps,
         );
@@ -1350,11 +1271,11 @@ impl App {
         } else {
             2
         };
-        const WORLD_LIGHTING: [&str; 3] = ["Off", "Vertex light", "BSP lightmaps"];
+        const WORLD_LIGHTING: [&str; 3] = ["Fullbright", "Vertex light", "BSP lightmaps"];
         if let Some(target) = quality_row(
             ui,
             "World lighting",
-            "Master for classic BSP world lighting. Off is vanilla r_fullbright 1. \
+            "Master for classic BSP world lighting. Fullbright is vanilla r_fullbright 1: every surface is drawn at full brightness with no lighting, so the map looks flatter and brighter, not darker. \
              When enabled, Vertex light uses BSP vertex colors (r_vertexLight 1); \
              BSP lightmaps uses the normal authored baked-lightmap path (r_vertexLight 0).",
             theme::Reset::Video(ui::VIDEO_ROW_WORLD_LIGHTING),
@@ -1411,27 +1332,6 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
-        if self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware
-            || self.video.dynamic_shadows == DynamicShadowsMode::RayTraced {
-            const RT_RESOLUTION: [(bool, &str, &str); 2] = [
-                (true, "Half", "Half width and height for RT visibility. Edges use full-resolution rays where needed."),
-                (false, "Full", "Trace visibility at every shaded pixel. Sharpest result; higher ray cost."),
-            ];
-            if let Some(index) = mode_row(ui, "RT resolution", "Changes ray-traced visibility resolution without changing the scene resolution. Half adds a depth pass and may not be faster in every scene.",
-                theme::Reset::None, self.video.rt_half_resolution, &RT_RESOLUTION) {
-                let _ = self.set_console_cvar("r_rtResolution", if RT_RESOLUTION[index].0 { "half" } else { "full" });
-            }
-            const RT_SAMPLES: [(u32, &str, &str); 3] = [
-                (1, "1", "Current ray budget. Fastest; more visible grain."),
-                (2, "2", "Two samples per soft source. Less grain, higher GPU cost."),
-                (4, "4", "Four samples per soft source. Highest quality and GPU cost."),
-            ];
-            if let Some(index) = mode_row(ui, "RT samples", "Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.",
-                theme::Reset::None, self.video.rt_samples, &RT_SAMPLES) {
-                let _ = self.set_console_cvar("r_rtSamples", &RT_SAMPLES[index].0.to_string());
-            }
-        }
-
         self.egui_toggle_row(
             ui,
             ".map light simulation",
@@ -1470,12 +1370,15 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_AMBIENT_OCCLUSION;
             self.change_video_setting(target as i32 - ao_mode as i32);
         }
+        if ao_mode == 2 {
+            self.egui_baked_ao(ui);
+        }
         self.egui_toggle_row(
             ui,
             "Voxel / probe GI",
             "Bounced indirect light gathered into a voxel or probe volume, so \
              lit surfaces spill colour onto their surroundings. Enabling it on a \
-             map prepared without GI requires Apply Video Settings / vid_restart.",
+             map prepared without GI needs Apply Video Settings, which reloads the map.",
             ui::VIDEO_ROW_VOXEL_PROBE_GI,
             self.video.voxel_probe_gi,
         );
@@ -1519,6 +1422,82 @@ impl App {
             },
         );
 
+        ui.add_enabled_ui(self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu, |ui| {
+        if let Some(value) = segmented_row(
+            ui,
+            "Burn marks",
+            "cg_ghoul2Marks. Scorch marks left on player models by blaster, rocket and thermal hits, kept per model (jaPRO defaults to 16). They follow the animation and fade after 10-20 seconds. Needs GPU Ghoul2 skinning (Video > Models).",
+            theme::Reset::None,
+            self.audio.game.g2_marks,
+            &[(0, "Off"), (4, "4"), (16, "16"), (32, "32")],
+        ) {
+            let _ = self.set_console_cvar("cg_ghoul2Marks", &value.to_string());
+        }
+        });
+
+        const FX_PHYSICS: [(u32, &str); 3] = [
+            (crate::fx::FX_PHYSICS_OFF, "Off"),
+            (crate::fx::FX_PHYSICS_AUTHORED, "Authored"),
+            (crate::fx::FX_PHYSICS_ALL, "All"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "FX physics",
+            "World collision for bouncing EFX debris (fx_physics, as in TaystJK). Particles, tails and \
+             emitters bounce off the map using the exact OpenJK collision world, spawn their authored \
+             impact effects and stop when they settle. Off lets them fly through walls. Authored (default) \
+             traces only primitives the effect author marked expensivePhysics (rock falls, dust, \
+             debris). All forces the trace on every primitive that has physics enabled (glass, sparks), which costs one collision trace per such particle per frame on the FX thread. \
+             Stock level 1 behaves like Off.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_PHYSICS),
+            self.video.fx_physics,
+            &FX_PHYSICS,
+        ) {
+            let index_of_mode = |mode: u32| FX_PHYSICS.iter().position(|(value, _)| *value == mode).unwrap_or(1);
+            self.video_selected = ui::VIDEO_ROW_FX_PHYSICS;
+            self.change_video_setting(
+                index_of_mode(target) as i32 - index_of_mode(self.video.fx_physics) as i32,
+            );
+        }
+
+        const FX_LOD: [(u32, &str); 3] = [
+            (crate::fx::FX_LOD_OFF, "Off"),
+            (crate::fx::FX_LOD_AUTHORED, "Authored"),
+            (crate::fx::FX_LOD_ADAPTIVE, "Adaptive"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "FX LOD",
+            "Spawn-time EFX level of detail (fx_lod); live particles are never thinned. Off is stock. Authored honors the cullRange that effect authors put on smoke, sparks, fire and impacts (stock OpenJK ignores it), skipping those primitives when the effect is farther than the authored range. Adaptive (default) also spawns fewer particles/tails for populations whose individual elements project to only a few pixels; near or large effects stay exactly as authored. Sounds, camera shakes, lights and single sparks are never reduced.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_LOD),
+            self.video.fx_lod,
+            &FX_LOD,
+        ) {
+            let index_of_mode = |mode: u32| FX_LOD.iter().position(|(value, _)| *value == mode).unwrap_or(2);
+            self.video_selected = ui::VIDEO_ROW_FX_LOD;
+            self.change_video_setting(
+                index_of_mode(target) as i32 - index_of_mode(self.video.fx_lod) as i32,
+            );
+        }
+
+        ui.add_enabled_ui(self.video.fx_lod != crate::fx::FX_LOD_OFF, |ui| {
+        theme::row(
+            ui,
+            "FX LOD scale",
+            "r_fxLodScale: multiplies every authored EFX cullRange, like r_lodscale does for models (default 5; 1 is the raw authored range, which is short). Also shifts where Adaptive FX LOD starts thinning particles. Needs FX LOD set to Authored or Adaptive.",
+            theme::Reset::None,
+            |ui| {
+                let mut scale = self.video.fx_lod_scale;
+                if ui
+                    .add(egui::DragValue::new(&mut scale).range(0.5..=20.0).speed(0.1).update_while_editing(false))
+                    .changed()
+                {
+                    let _ = self.set_console_cvar("r_fxLodScale", &scale.to_string());
+                }
+            },
+        );
+        });
+
         const FX_GEOMETRY: [(FxGeometryMode, &str); 3] = [
             (FxGeometryMode::Cpu, "CPU"),
             (FxGeometryMode::CpuWorkers, "CPU workers"),
@@ -1544,6 +1523,7 @@ impl App {
             self.change_video_setting(next as i32 - current as i32);
         }
 
+        ui.add_enabled_ui(self.video.fx_geometry == FxGeometryMode::Gpu, |ui| {
         self.egui_toggle_row(
             ui,
             "FX zero-alpha discard",
@@ -1551,6 +1531,7 @@ impl App {
             ui::VIDEO_ROW_FX_ZERO_ALPHA_DISCARD,
             self.video.fx_zero_alpha_discard,
         );
+        });
 
         self.egui_toggle_row(
             ui,
@@ -1609,7 +1590,7 @@ impl App {
     }
 
     fn egui_shadows(&mut self, ui: &mut egui::Ui) {
-        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 6] = [
+        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 5] = [
             (
                 DynamicShadowsMode::Off,
                 "Off",
@@ -1621,18 +1602,13 @@ impl App {
                 "OpenJK cg_shadows 1 drop shadow: the stock markShadow decal projected onto the floor beneath players and NPCs.",
             ),
             (
-                DynamicShadowsMode::Stencil,
-                "Stencil",
-                "Legacy stencil shadow volumes. WIP — currently behaves as Off.",
+                DynamicShadowsMode::EntityMap,
+                "Entity map",
+                "One small shadow map that only draws players, NPCs and models; the map is not re-rendered, so it costs a few depth-only draws. It is aimed by the baked lightgrid's dominant light direction at the camera (or the runtime sun), and fades out where the baked light is mostly ambient.",
             ),
             (
                 DynamicShadowsMode::CascadedShadowMaps,
                 "Cascaded maps (CSM)",
-                "Multi-resolution depth textures along view-frustum slices for crisp rasterized shadows.",
-            ),
-            (
-                DynamicShadowsMode::CascadedShadowMapsBevy,
-                "Cascaded maps (Bevy)",
                 "Bevy 0.19.1 directional-light CSM: four exponential cascades, stable texel snapping, reverse-Z and Bevy shadow filtering.",
             ),
             (
@@ -1653,24 +1629,94 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_DYNAMIC_SHADOWS;
             self.change_video_setting(target as i32 - current as i32);
         }
-        self.egui_toggle_row(
-            ui,
-            "Local light shadows",
-            "Adds shadows to local lights. With RT Shadows, uses hard ray-traced \
-             shadows for clustered lights, including moving FX lights. Other \
-             shadow modes use cached shadow cubemaps. Hardware RT dynamic lighting \
-             always includes local visibility, independently of this toggle.",
-            ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS,
-            self.video.local_light_shadows,
-        );
+        ui.add_enabled_ui(self.video.dynamic_shadows == DynamicShadowsMode::EntityMap, |ui| {
+            const ENTITY_SHADOW_LIGHT_OPTIONS: [(EntityShadowLight, &str); 2] = [
+                (EntityShadowLight::Lightgrid, "Lightgrid"),
+                (EntityShadowLight::Authored, "Authored light"),
+            ];
+            if let Some(target) = segmented_row(
+                ui,
+                "Entity shadow light",
+                "Where the Entity map aims its light. Lightgrid uses the baked dominant direction \
+                 at the player: cheap and always available, but it is an average of every lamp in \
+                 range, so several lamps give a compromise direction. Authored light picks the \
+                 strongest map light that agrees with the lightgrid and shadows from its real \
+                 position. Both cast a single shadow. Only used by Dynamic shadows = Entity map.",
+                theme::Reset::Video(ui::VIDEO_ROW_ENTITY_SHADOW_LIGHT),
+                self.video.entity_shadow_light,
+                &ENTITY_SHADOW_LIGHT_OPTIONS,
+            ) {
+                let current = index_of(&ENTITY_SHADOW_LIGHT_OPTIONS, self.video.entity_shadow_light, 0);
+                let next = index_of(&ENTITY_SHADOW_LIGHT_OPTIONS, target, current);
+                self.video_selected = ui::VIDEO_ROW_ENTITY_SHADOW_LIGHT;
+                self.change_video_setting(next as i32 - current as i32);
+            }
+        });
+        // Only Forward+ consults this toggle. Ray-traced lights always trace
+        // local visibility, and the lower tiers never shadow local lights.
+        let local_shadows_applies = self.video.dynamic_lights == DynamicLightsMode::PerPixelForwardPlus;
+        let local_shadows_note = match self.video.dynamic_lights {
+            DynamicLightsMode::PerPixelForwardPlus => "",
+            DynamicLightsMode::RayTracedHardware => {
+                "
+
+Not used: Ray traced dynamic lights always trace local-light visibility."
+            }
+            _ => "
+
+Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ to use it.",
+        };
+        ui.add_enabled_ui(local_shadows_applies, |ui| {
+            self.egui_toggle_row(
+                ui,
+                "Local light shadows",
+                &format!(
+                    "Adds shadows to local lights. With RT Shadows, uses hard ray-traced shadows for clustered lights, including moving FX lights. Other shadow modes use cached shadow cubemaps. Hardware RT dynamic lighting always includes local visibility, independently of this toggle.{local_shadows_note}"
+                ),
+                ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS,
+                self.video.local_light_shadows,
+            );
+        });
         self.egui_toggle_row(
             ui,
             "Contact shadows",
-            "A short screen-space depth trace that fills in the fine contact \
-             darkening shadow maps are too coarse to resolve.",
+            "Marches a short ray from each pixel toward the map's sun through the \
+             depth buffer and darkens pixels where a nearby on-screen surface blocks \
+             it, filling in the fine darkening where objects meet the ground. \
+             Screen-space: it only sees what is on screen, so occluders past the \
+             screen edge cast nothing. Needs a map with an authored sun.",
             ui::VIDEO_ROW_CONTACT_SHADOWS,
             self.video.contact_shadows,
         );
+
+        // Grey out (rather than hide) the RT tuning rows when nothing ray-traced
+        // is active, matching the other dependent rows on this page.
+        let rt_sun = self.video.dynamic_shadows == DynamicShadowsMode::RayTraced;
+        let rt_lights = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
+        const RT_RESOLUTION: [(bool, &str, &str); 2] = [
+            (true, "Reduced", "Traces each pixel's sun shadow once every four frames and carries the rest forward by motion vectors. Shadow edges and newly revealed pixels still trace every frame."),
+            (false, "Full", "Trace sun visibility at every shaded pixel, every frame. Reference quality; highest ray cost."),
+        ];
+        // The reduced schedule only exists for the sun; local lights are always traced directly.
+        ui.add_enabled_ui(rt_sun, |ui| {
+            let note = if rt_sun { "" } else { "\n\nNot used: set Dynamic shadows to RT Shadows." };
+            if let Some(index) = mode_row(ui, "RT sun rate", &format!("How often the ray-traced sun shadow is retraced. Runs at full screen resolution either way; this trades ray count against how quickly a moving shadow caster's interior updates. Needs a depth pass.{note}"),
+                theme::Reset::None, self.video.rt_half_resolution, &RT_RESOLUTION) {
+                let _ = self.set_console_cvar("r_rtResolution", if RT_RESOLUTION[index].0 { "half" } else { "full" });
+            }
+        });
+        const RT_SAMPLES: [(u32, &str, &str); 3] = [
+            (1, "1", "Current ray budget. Fastest; more visible grain."),
+            (2, "2", "Two samples per soft source. Less grain, higher GPU cost."),
+            (4, "4", "Four samples per soft source. Highest quality and GPU cost."),
+        ];
+        ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
+            let note = if rt_sun || rt_lights { "" } else { "\n\nNot used: needs RT Shadows or Ray traced dynamic lights." };
+            if let Some(index) = mode_row(ui, "RT samples", &format!("Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.{note}"),
+                theme::Reset::None, self.video.rt_samples, &RT_SAMPLES) {
+                let _ = self.set_console_cvar("r_rtSamples", &RT_SAMPLES[index].0.to_string());
+            }
+        });
     }
 
     fn egui_reflections(&mut self, ui: &mut egui::Ui) {
@@ -1689,10 +1735,12 @@ impl App {
              Legacy preserves those vanilla environment-mapped stages but enables no enhanced \
              reflection technique. Low uses reflection probes only; Medium adds temporal \
              screen-space reflections; High adds one dynamically selected planar reflector; \
-             Ultra raises SSR quality and allows up to four planar reflectors. Reflection \
-             quality is applied on vid_restart because Off specializes the prepared material \
-             set and planar modes preserve reflection-plane BSP topology. Expensive techniques \
-             fall back to cheaper ones automatically.",
+             Ultra raises SSR quality and allows up to four planar reflectors. Changes apply \
+             live, except that raising to High/Ultra or crossing Off needs the map prepared \
+             again (Off specializes the material set and planar modes preserve \
+             reflection-plane BSP topology); until Apply Video Settings the renderer runs the \
+             nearest quality the loaded map supports. Expensive techniques fall back to \
+             cheaper ones automatically.",
             theme::Reset::Video(ui::VIDEO_ROW_SSR),
             self.video.reflection_quality,
             &REFLECTION_QUALITY,
@@ -1703,50 +1751,10 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
-        self.egui_toggle_row(
-            ui,
-            "Reflection resolver debug",
-            "Shows the reflection source selected for each visible opaque/masked world surface. \
-             Magenta = planar, green = valid SSR hit, blue = cubemap/probe fallback, \
-             gray = SSR-eligible surface with no valid hit, black = no enhanced reflection path.",
-            ui::VIDEO_ROW_PLANAR_REFLECTIONS,
-            self.video.reflection_debug,
-        );
-
-        theme::row(
-            ui,
-            "Planar reflection debug",
-            "Specialised planar-pass diagnostics: candidates, selected plane, render target, applied sample or binding test.",
-            theme::Reset::Video(ui::VIDEO_ROW_PLANAR_REFLECTION_DEBUG),
-            |ui| {
-                egui::ComboBox::from_id_salt("planar_debug")
-                    .selected_text(self.video.planar_reflection_debug.label())
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        for (index, mode) in
-                            PlanarReflectionDebugMode::ALL.iter().copied().enumerate()
-                        {
-                            if ui
-                                .selectable_label(
-                                    mode == self.video.planar_reflection_debug,
-                                    mode.label(),
-                                )
-                                .clicked()
-                            {
-                                let current = PlanarReflectionDebugMode::ALL
-                                    .iter()
-                                    .position(|value| *value == self.video.planar_reflection_debug)
-                                    .unwrap_or(0);
-                                self.video_selected = ui::VIDEO_ROW_PLANAR_REFLECTION_DEBUG;
-                                self.change_video_setting(index as i32 - current as i32);
-                            }
-                        }
-                    });
-            },
-        );
     }
 
     fn egui_post_processing(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.video.hdr, |ui| {
         self.egui_toggle_row(
             ui,
             "Tone mapping",
@@ -1756,6 +1764,8 @@ impl App {
             ui::VIDEO_ROW_TONE_MAPPING,
             self.video.tone_mapping,
         );
+        });
+        ui.add_enabled_ui(self.video.hdr && self.video.tone_mapping, |ui| {
         self.egui_toggle_row(
             ui,
             "Auto exposure",
@@ -1765,6 +1775,7 @@ impl App {
             ui::VIDEO_ROW_AUTO_EXPOSURE,
             self.video.auto_exposure,
         );
+        });
         self.egui_toggle_row(
             ui,
             "Bloom",
@@ -1822,9 +1833,12 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_DOF_QUALITY;
             self.change_video_setting(target as i32 - current as i32);
         }
+
+        self.egui_film(ui);
     }
 
     fn egui_film(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "FILM EMULATION", "Photochemical-inspired finishing.");
         theme::row(
             ui,
             "Color LUT",
@@ -1836,7 +1850,7 @@ impl App {
                     .selected_text(self.video.color_lut.label())
                     .width(230.0)
                     .show_ui(ui, |ui| {
-                        for preset in ColorLutPreset::ALL {
+                        for preset in ColorLutPreset::all() {
                             if ui
                                 .selectable_label(preset == self.video.color_lut, preset.label())
                                 .clicked()
@@ -1862,7 +1876,6 @@ impl App {
             },
         );
 
-        theme::section(ui, "LENS & STOCK", "");
         self.egui_toggle_row(
             ui,
             "Film halation",
@@ -1873,7 +1886,7 @@ impl App {
         );
         theme::row(
             ui,
-            "Purple fringing",
+            "Chromatic aberration",
             "Chromatic aberration: colour channels are offset slightly toward \
              the frame edges, as a real lens does.",
             theme::Reset::Video(ui::VIDEO_ROW_CHROMATIC_ABERRATION),
@@ -1913,7 +1926,7 @@ impl App {
         self.egui_toggle_row(
             ui,
             "Map models",
-            "Draws MD3 props the map's entities place in the world (misc_model_* and              func_static models). Off removes them for a cleaner or faster view. Brush              models such as doors and platforms, and any model geometry already compiled              into the BSP by the map compiler, are always drawn.",
+            "Draws MD3 props the map's entities place in the world (misc_model_* and func_static models). Off removes them for a cleaner or faster view. Brush models such as doors and platforms, and any model geometry already compiled into the BSP by the map compiler, are always drawn.",
             ui::VIDEO_ROW_DRAW_MAP_MODELS,
             self.video.draw_map_models,
         );
@@ -1970,24 +1983,34 @@ impl App {
 
         theme::row(
             ui,
-            "Model LOD bias",
-            "JKA r_lodbias for authored model/Ghoul2 LODs. 0 uses projected screen size normally; higher values bias toward cheaper GLM LODs. OpenJK defaults to 0.",
-            theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
+            "Model LOD scale",
+            "OpenJK r_lodscale for Ghoul2 model LODs (default 5). Larger keeps higher-detail GLM LODs at greater distances; smaller drops to cheaper LODs sooner. Model LOD bias is added afterward.",
+            theme::Reset::None,
             |ui| {
-                let mut bias = self.video.ghoul2_lod_bias;
+                let mut scale = self.video.lod_scale;
                 if ui
-                    .add(
-                        egui::DragValue::new(&mut bias)
-                            .range(0..=8)
-                            .speed(1.0)
-                            .update_while_editing(false),
-                    )
+                    .add(egui::DragValue::new(&mut scale).range(0.5..=20.0).speed(0.1).update_while_editing(false))
                     .changed()
                 {
-                    let _ = self.set_console_cvar("r_lodbias", &bias.to_string());
+                    let _ = self.set_console_cvar("r_lodScale", &scale.to_string());
                 }
             },
         );
+
+        // Cheapest first, like the other quality meters; the quality presets only
+        // use 0..=3, and the console still takes up to 8 (shown as Low).
+        const MODEL_DETAIL: [(i32, &str); 4] = [(3, "Low"), (2, "Medium"), (1, "High"), (0, "Highest")];
+        if let Some(index) = quality_table_row(
+            ui,
+            "Model detail",
+            "r_lodbias. How early Ghoul2 models drop to their cheaper authored LODs. Highest (0) uses projected screen size normally and is the OpenJK default; lower settings bias toward cheaper GLM LODs. Model LOD scale is applied first.",
+            theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
+            self.video.ghoul2_lod_bias,
+            &MODEL_DETAIL,
+            0,
+        ) {
+            let _ = self.set_console_cvar("r_lodbias", &MODEL_DETAIL[index].0.to_string());
+        }
 
         self.egui_toggle_row(
             ui,
@@ -2043,16 +2066,23 @@ impl App {
         self.egui_toggle_row(
             ui,
             "Draw triggers",
-            "Draws every trigger_* volume as a translucent colored brush with an outline: push green,              teleport purple, hurt red, multiple blue, once cyan, other yellow. Built once per map              and drawn from static buffers in two draws, so it costs nothing while off and very              little while on. Not saved between sessions.",
+            "Draws every trigger_* volume as a translucent colored brush with an outline: push green, teleport purple, hurt red, multiple blue, once cyan, other yellow. Built once per map and drawn from static buffers in two draws, so it costs nothing while off and very little while on. Not saved between sessions.",
             ui::VIDEO_ROW_DRAW_TRIGGERS,
             self.video.draw_triggers,
         );
         self.egui_toggle_row(
             ui,
             "Draw clip brushes",
-            "Draws clip-only brushes (invisible collision the compiler leaves out of the render              mesh): player clip orange, shot clip magenta, monster/bot clip yellow. Static buffers,              two draws, no cost while off. Not saved between sessions.",
+            "Draws clip-only brushes (invisible collision the compiler leaves out of the render mesh): player clip orange, shot clip magenta, monster/bot clip yellow. Static buffers, two draws, no cost while off. Not saved between sessions.",
             ui::VIDEO_ROW_DRAW_CLIP_BRUSHES,
             self.video.draw_clip_brushes,
+        );
+        self.egui_toggle_row(
+            ui,
+            "Draw entities",
+            "NetRadiant-style overlay: a colored box and classname label above every map entity, colored by category, with lines to its target/targetname links. Rebuilt every tick while on (map entity counts are small), and keeps egui ticking every frame like any other overlay. Not saved between sessions.",
+            ui::VIDEO_ROW_DRAW_ENTITIES,
+            self.video.draw_entities,
         );
 
         const CULL: [(CullDebugMode, &str); 2] = [
@@ -2097,6 +2127,77 @@ impl App {
             ui::VIDEO_ROW_PERF_TRACE,
             self.video.perf_trace,
         );
+
+        theme::section(
+            ui,
+            "PREDICTION",
+            "Client-prediction diagnostics. These switches do not change Pmove results.",
+        );
+        theme::row(
+            ui,
+            "Prediction diagnostics",
+            "cg_predictionDebug. Shows the current predicted origin/ground state, view correction, the OpenJK 0.25-unit ground trace and 64-unit ground probe, plus the last prediction miss. Rich miss details are also printed to the console.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.network.prediction_debug) {
+                    let _ = self.set_console_cvar("cg_predictionDebug", if value { "1" } else { "0" });
+                    self.publish_transient_ui();
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Print prediction misses",
+            "cg_showMiss. Keeps the compact OpenJK-style prediction-miss line in the console. Prediction diagnostics adds richer state/trace lines.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.network.show_miss) {
+                    let _ = self.set_console_cvar("cg_showMiss", if value { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Highlight prediction misses",
+            "cg_predictionMissHighlight. Flashes a red border for 350 ms when a correction exceeds the threshold, making rare one/few-frame failures easy to spot while reproducing them.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.network.prediction_miss_highlight) {
+                    let _ = self.set_console_cvar("cg_predictionMissHighlight", if value { "1" } else { "0" });
+                    self.publish_transient_ui();
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Miss highlight threshold",
+            "cg_predictionMissThreshold. Correction distance in JKA units. 8 filters tiny routine corrections while still catching visible positional failures.",
+            theme::Reset::None,
+            |ui| {
+                let mut value = self.network.prediction_miss_threshold;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut value)
+                            .range(0.0..=4096.0)
+                            .speed(1.0)
+                            .suffix(" u")
+                            .update_while_editing(false),
+                    )
+                    .changed()
+                {
+                    let _ = self.set_console_cvar("cg_predictionMissThreshold", &format!("{value:.2}"));
+                    self.publish_transient_ui();
+                }
+            },
+        );
+        if self.network.no_predict {
+            theme::hint(
+                ui,
+                "cg_noPredict is enabled, so the live predictor and its ground traces are inactive.",
+                theme::TEXT_DISABLED,
+            );
+        }
+
         theme::row(
             ui,
             "Event worker queue",
@@ -2117,23 +2218,57 @@ impl App {
             self.video.gpu_timings,
         );
 
+        theme::section(ui, "REFLECTIONS", "Diagnostics for the Reflections page.");
+        self.egui_toggle_row(
+            ui,
+            "Reflection resolver debug",
+            "Shows the reflection source selected for each visible opaque/masked world surface. \
+             Magenta = planar, green = valid SSR hit, blue = cubemap/probe fallback, \
+             gray = SSR-eligible surface with no valid hit, black = no enhanced reflection path.",
+            ui::VIDEO_ROW_PLANAR_REFLECTIONS,
+            self.video.reflection_debug,
+        );
+        theme::row(
+            ui,
+            "Planar reflection debug",
+            "Specialised planar-pass diagnostics: candidates, selected plane, render target, applied sample or binding test.",
+            theme::Reset::Video(ui::VIDEO_ROW_PLANAR_REFLECTION_DEBUG),
+            |ui| {
+                egui::ComboBox::from_id_salt("planar_debug")
+                    .selected_text(self.video.planar_reflection_debug.label())
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        for (index, mode) in
+                            PlanarReflectionDebugMode::ALL.iter().copied().enumerate()
+                        {
+                            if ui
+                                .selectable_label(
+                                    mode == self.video.planar_reflection_debug,
+                                    mode.label(),
+                                )
+                                .clicked()
+                            {
+                                let current = PlanarReflectionDebugMode::ALL
+                                    .iter()
+                                    .position(|value| *value == self.video.planar_reflection_debug)
+                                    .unwrap_or(0);
+                                self.video_selected = ui::VIDEO_ROW_PLANAR_REFLECTION_DEBUG;
+                                self.change_video_setting(index as i32 - current as i32);
+                            }
+                        }
+                    });
+            },
+        );
+
     }
 
+    /// Bake settings, shown under the Ambient occlusion row while Baked is selected.
     fn egui_baked_ao(&mut self, ui: &mut egui::Ui) {
-        if !self.video.static_bsp_ao {
-            theme::banner(
-                ui,
-                "Baked ambient occlusion is off. Enable it under Lighting to use these settings.",
-                theme::TEXT_FAINT,
-            );
-            ui.add_space(6.0);
-        }
-
         const SAMPLES: [(u32, &str); 5] =
             [(8, "8"), (16, "16"), (32, "32"), (64, "64"), (128, "128")];
         if let Some(target) = quality_table_row(
             ui,
-            "Samples per point",
+            "Baked AO samples",
             "Rays cast per bake point. More samples remove the blotchiness in \
              the result and make the bake take proportionally longer.",
             theme::Reset::Video(ui::VIDEO_ROW_BAKED_AO_SAMPLES),
@@ -2149,7 +2284,7 @@ impl App {
         const RESOLUTIONS: [(u32, &str); 3] = [(1, "1×"), (3, "3×"), (5, "5×")];
         if let Some(target) = quality_table_row(
             ui,
-            "Bake resolution",
+            "Baked AO resolution",
             "Density of bake points across a surface. Higher resolves occlusion \
              around small detail geometry at the cost of memory.",
             theme::Reset::Video(ui::VIDEO_ROW_BAKED_AO_RESOLUTION),
@@ -2165,7 +2300,7 @@ impl App {
         const STRENGTHS: [(u32, &str); 4] = [(25, "25%"), (50, "50%"), (75, "75%"), (100, "100%")];
         if let Some(target) = quality_table_row(
             ui,
-            "Strength",
+            "Baked AO strength",
             "How dark the baked occlusion is allowed to get before it is applied \
              to the lightmap.",
             theme::Reset::Video(ui::VIDEO_ROW_BAKED_AO_STRENGTH),
@@ -2181,7 +2316,7 @@ impl App {
         const RANGES: [(u32, &str); 4] = [(50, "0.5×"), (100, "1×"), (150, "1.5×"), (200, "2×")];
         if let Some(target) = quality_table_row(
             ui,
-            "Range",
+            "Baked AO range",
             "World distance the occlusion rays reach. Longer range darkens whole \
              rooms; shorter keeps it to creases and corners.",
             theme::Reset::Video(ui::VIDEO_ROW_BAKED_AO_RANGE),
@@ -2196,7 +2331,7 @@ impl App {
 
         self.egui_toggle_row(
             ui,
-            "Only bake the current cell",
+            "Bake current cell only",
             "Bakes just the PVS cell the camera stands in. Fast to iterate on \
              while tuning the settings above.",
             ui::VIDEO_ROW_BAKED_AO_CURRENT_CELL,
@@ -2207,6 +2342,17 @@ impl App {
     // ---------------------------------------------------------- environment --
 
     fn egui_sun(&mut self, ui: &mut egui::Ui) {
+        // A held slider that isn't moving produces no change events, so keep the
+        // sun-to-head beam alive for as long as the yaw/pitch drag continues.
+        if self.sun_ray_until.is_some()
+            && ui.ctx().dragged_id().is_some()
+            && matches!(
+                self.environment_selected,
+                ui::ENV_ROW_SUN_YAW | ui::ENV_ROW_SUN_PITCH
+            )
+        {
+            self.touch_sun_ray();
+        }
         const SOURCES: [(bool, &str); 2] = [(false, "Map shader"), (true, "Custom")];
         if let Some(target) = segmented_row(
             ui,
@@ -2239,6 +2385,23 @@ impl App {
             self.sync_post_effects();
             self.mark_config_dirty();
         }
+
+        const ENTITY_SUN: [(bool, &str); 2] = [(false, "Baked"), (true, "Runtime sun")];
+        ui.add_enabled_ui(self.video.entity_ambient_lighting == EntityAmbientLightingMode::BspLightgridClassic, |ui| {
+        if let Some(target) = segmented_row(
+            ui,
+            "Entity sun",
+            "Baked keeps the stock lightgrid on players and models. Runtime sun estimates how much of each lightgrid probe is the map's baked sun, removes it, and lights entities with the runtime sun instead (color, intensity and direction, including the Custom sun above). Indoor and torch-lit probes are left alone. Requires Entity ambient lighting = BSP lightgrid.",
+            theme::Reset::Environment(ui::ENV_ROW_ENTITY_SUN_LIGHTING),
+            self.video.entity_sun_lighting,
+            &ENTITY_SUN,
+        ) {
+            self.environment_selected = ui::ENV_ROW_ENTITY_SUN_LIGHTING;
+            self.video.entity_sun_lighting = target;
+            self.sync_post_effects();
+            self.mark_config_dirty();
+        }
+        });
 
         if !self.video.sun_override {
             if let Some((yaw, pitch, intensity, color)) = authored {
@@ -2372,6 +2535,7 @@ impl App {
             self.video.clouds,
         );
 
+        ui.add_enabled_ui(self.video.clouds, |ui| {
         const TYPES: [(CloudType, &str); 3] = [
             (CloudType::Cumulus, "Cumulus"),
             (CloudType::Stratus, "Stratus"),
@@ -2497,6 +2661,7 @@ impl App {
 
         theme::section(ui, "TUNING", "Fine control over the cloud model.");
         self.egui_cloud_tuning(ui);
+        });
     }
 
     fn egui_cloud_tuning(&mut self, ui: &mut egui::Ui) {
@@ -2649,7 +2814,7 @@ impl App {
         theme::row(
             ui,
             "History blend",
-            "How much of the previous frame each temporal sample keeps. Higher              is smoother and cheaper to converge, but holds onto mistakes for              more frames.",
+            "How much of the previous frame each temporal sample keeps. Higher is smoother and cheaper to converge, but holds onto mistakes for more frames.",
             theme::Reset::CloudTuning(ui::CLOUD_ROW_HISTORY_BLEND),
             |ui| {
                 let mut value = self.video.cloud_history_blend;
@@ -2662,7 +2827,7 @@ impl App {
         theme::row(
             ui,
             "Motion reject",
-            "How strongly camera movement throws history away. At 100% any real              movement falls back to a full march, which is what the reference              implementation does and cannot smear; lower keeps the interleave              running while you move, at the cost of trails.",
+            "How strongly camera movement throws history away. At 100% any real movement falls back to a full march, which is what the reference implementation does and cannot smear; lower keeps the interleave running while you move, at the cost of trails.",
             theme::Reset::CloudTuning(ui::CLOUD_ROW_MOTION_REJECT),
             |ui| {
                 let mut value = self.video.cloud_motion_reject;
@@ -2675,7 +2840,7 @@ impl App {
         theme::row(
             ui,
             "History depth reject",
-            "Discards history on pixels where solid geometry sits in front of              the cloud layer, which stops world geometry and the player model              dragging their silhouettes across the sky.",
+            "Discards history on pixels where solid geometry sits in front of the cloud layer, which stops world geometry and the player model dragging their silhouettes across the sky.",
             theme::Reset::CloudTuning(ui::CLOUD_ROW_HISTORY_DEPTH_REJECT),
             |ui| {
                 if theme::switch(ui, self.video.cloud_history_depth_reject).is_some() {
@@ -2772,6 +2937,7 @@ impl App {
             ui::ENV_ROW_RAIN,
             self.video.rain,
         );
+        ui.add_enabled_ui(self.video.rain, |ui| {
         const RAIN: [(RainIntensity, &str); 3] = [
             (RainIntensity::Light, "Light"),
             (RainIntensity::Rain, "Rain"),
@@ -2791,6 +2957,55 @@ impl App {
             self.environment_selected = ui::ENV_ROW_RAIN_INTENSITY;
             self.change_environment_setting(next as i32 - current as i32);
         }
+
+        const PUDDLE_WATER: [(PuddleQuality, &str); 2] = [
+            (PuddleQuality::Standard, "Standard"),
+            (PuddleQuality::High, "High"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Puddle water",
+            "How puddles and wet ground are shaded. High uses the ocean's water \
+             response (Fresnel, sun and light glints) and streaked reflections \
+             of neon and lit surfaces. The cost is only paid on wet pixels.",
+            theme::Reset::Environment(ui::ENV_ROW_PUDDLE_WATER),
+            self.video.puddle_quality,
+            &PUDDLE_WATER,
+        ) {
+            let current = index_of(&PUDDLE_WATER, self.video.puddle_quality, 1);
+            let next = index_of(&PUDDLE_WATER, target, current);
+            self.environment_selected = ui::ENV_ROW_PUDDLE_WATER;
+            self.change_environment_setting(next as i32 - current as i32);
+        }
+        theme::row(
+            ui,
+            "Scattered puddles",
+            "How readily rain collects in small puddles on large, level ground \
+             such as plazas and roads. Enclosed basins flood regardless.",
+            theme::Reset::Environment(ui::ENV_ROW_PUDDLE_SCATTER),
+            |ui| {
+                let mut value = self.video.puddle_scatter;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_puddle_scatter(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Rain color grade",
+            "A wet-weather grade that fades in with the rain: cooler shadows, \
+             warmer highlights and richer neon. 0% leaves the picture untouched.",
+            theme::Reset::Environment(ui::ENV_ROW_RAIN_GRADE),
+            |ui| {
+                let mut value = self.video.rain_grade;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_rain_grade(value);
+                }
+            },
+        );
+        });
     }
 
     fn egui_surface(&mut self, ui: &mut egui::Ui) {
@@ -2802,8 +3017,8 @@ impl App {
         if let Some(target) = quality_table_row(
             ui,
             "Footprints",
-            "Tracks left in snow, sand and mud. The 2D stamp is a decal; the 3D \
-             mode also displaces the surface so prints have real depth.",
+            "Tracks left in snow, sand and mud. The 2D stamp is a decal; the 3D mode \
+             also displaces the local player's snow so prints have real depth.",
             theme::Reset::Environment(ui::ENV_ROW_FOOTPRINTS),
             self.video.footprints,
             &FOOTPRINTS,
@@ -2831,9 +3046,10 @@ impl App {
     fn egui_water(&mut self, ui: &mut egui::Ui) {
         self.egui_environment_toggle(
             ui,
-            "Godot ocean waves",
-            "Replaces flat water surfaces with an FFT wave simulation ported \
-             from GodotOceanWaves, including displacement and foam.",
+            "Simulated ocean",
+            "Replaces flat water surfaces with real rolling waves that move, \
+             catch the light and form foam on their crests. Costs GPU time. \
+             (An FFT wave simulation ported from GodotOceanWaves.)",
             ui::ENV_ROW_OCEAN,
             self.video.ocean,
         );
@@ -3154,6 +3370,33 @@ impl App {
             theme::TEXT_FAINT,
         );
 
+        theme::section(ui, "PLAYER MOVEMENT", "Gameplay, not visuals: the fixed tick the local player is simulated at.");
+        theme::row(
+            ui,
+            "Player movement rate",
+            "Fixed OpenJK/JKA player movement tick. Stock Jedi Academy runs 125 Hz; \
+             changing it changes movement feel, including strafe jump behaviour. \
+             This is separate from client-side Rapier visual physics.",
+            theme::Reset::Video(ui::VIDEO_ROW_PHYSICS_FPS),
+            |ui| {
+                let mut fps = config::physics_fps_from_msec(self.video.physics_msec);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut fps)
+                            .range(20..=1000)
+                            .speed(1.0)
+                            .suffix(" Hz")
+                            .update_while_editing(false),
+                    )
+                    .changed()
+                {
+                    let msec =
+                        config::physics_msec_from_fps(&fps.to_string(), self.video.physics_msec);
+                    self.set_physics_msec(msec);
+                }
+            },
+        );
+
         theme::section(ui, "SIMULATION", "Independent from authoritative player movement and server snapshots.");
         self.egui_physics_toggle(
             ui,
@@ -3214,8 +3457,8 @@ impl App {
         self.egui_physics_toggle(
             ui,
             "Ragdolls",
-            "Allow player/NPC corpses to transition from snapshot-driven animation to a client-only \
-             Rapier ragdoll after the authoritative death event.",
+            "Allow corpses, Force Grip victims and short living knockback reactions to use the client-only \
+             articulated Rapier presentation while server movement remains authoritative.",
             PHYS_RAGDOLLS,
             self.video.ragdolls,
         );
@@ -3255,6 +3498,31 @@ impl App {
              solver work and can make constrained skeletons less stable.",
             PHYS_RAGDOLL_SELF_COLLISION,
             self.video.ragdoll_self_collision,
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Weapon knockback ragdolls",
+            "Let authoritative saber/projectile impacts temporarily hand a living victim's limbs/head \
+             to Rapier when the corresponding trajectory shows real knockback. The thorax stays attached \
+             to the server-owned player transform.",
+            PHYS_WEAPON_IMPULSES,
+            self.video.physics_weapon_impulses,
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Explosion knockback ragdolls",
+            "Let explosion impact events open a short candidate window for nearby players; only players \
+             whose authoritative trajectory actually receives a matching impulse are ragdolled.",
+            PHYS_EXPLOSION_IMPULSES,
+            self.video.physics_explosion_impulses,
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Force push/pull ragdolls",
+            "Use networked Force Push/Pull presentation plus the victim's authoritative trajectory change \
+             to drive temporary torso-anchored impulse ragdolls. Force Grip keeps its separate neck anchor.",
+            PHYS_FORCE_IMPULSES,
+            self.video.physics_force_impulses,
         );
 
         theme::section(ui, "PROPS", "Client-only dynamic objects layered over the server world.");
@@ -3316,7 +3584,7 @@ impl App {
             self.physics_menu_changed();
         }
 
-        theme::section(ui, "INTERACTION", "One-way impulses into visual physics; gameplay remains server authoritative.");
+        theme::section(ui, "PROP INTERACTION", "Future one-way contact between server-owned players and client-only props.");
         self.egui_physics_toggle(
             ui,
             "Player pushes props",
@@ -3324,29 +3592,6 @@ impl App {
              push visual props without letting those props alter JKA player movement.",
             PHYS_PLAYER_PUSH,
             self.video.physics_player_push,
-        );
-        self.egui_physics_toggle(
-            ui,
-            "Weapon impacts",
-            "Apply client-visible saber, projectile and hitscan impact impulses to ragdolls, props \
-             and debris when corresponding game events are observed.",
-            PHYS_WEAPON_IMPULSES,
-            self.video.physics_weapon_impulses,
-        );
-        self.egui_physics_toggle(
-            ui,
-            "Explosion impulses",
-            "Apply radial impulses from observed explosion events to client physics bodies.",
-            PHYS_EXPLOSION_IMPULSES,
-            self.video.physics_explosion_impulses,
-        );
-        self.egui_physics_toggle(
-            ui,
-            "Force power impulses",
-            "Feed observed Force push/pull style events into the visual physics layer where the \
-             protocol exposes enough information to do so faithfully.",
-            PHYS_FORCE_IMPULSES,
-            self.video.physics_force_impulses,
         );
 
         theme::section(ui, "DEBUG", "Development-only diagnostics for the Rapier world.");
@@ -3403,10 +3648,7 @@ impl App {
 
     fn physics_menu_changed(&mut self) {
         self.mark_config_dirty();
-        if self.map_prepare_restart_required() {
-            self.console_status =
-                "CLIENT PHYSICS: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART TO BUILD MAP COLLISION".into();
-        }
+        self.ensure_map_physics_mesh();
         self.egui_repaint_requested = true;
         self.publish_ui();
     }
@@ -3505,6 +3747,23 @@ const OCEAN_SEA_SPRAY: u8 = 7;
 const OCEAN_WIND_FOAM: u8 = 8;
 
 
+fn pending_video_reset(key: &str) -> Option<theme::Reset> {
+    Some(match key {
+        "render_backend" => theme::Reset::Video(ui::VIDEO_ROW_RENDER_BACKEND),
+        "display_mode" => theme::Reset::Video(ui::VIDEO_ROW_FULLSCREEN),
+        "resolution" => theme::Reset::Video(ui::VIDEO_ROW_RESOLUTION),
+        "voxel_probe_gi" => theme::Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI),
+        "gen_normal_maps" => theme::Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS),
+        "float_lightmap" => theme::Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP),
+        "reflections" => theme::Reset::Video(ui::VIDEO_ROW_SSR),
+        "pbr" => theme::Reset::Video(ui::VIDEO_ROW_PBR),
+        "asset_overrides" => theme::Reset::Video(ui::VIDEO_ROW_ASSET_OVERRIDES),
+        "grass" => theme::Reset::Environment(ui::ENV_ROW_GRASS),
+        "ocean" => theme::Reset::Environment(ui::ENV_ROW_OCEAN),
+        _ => return None,
+    })
+}
+
 fn percent(value: f32) -> String {
     format!("{:.0}%", value * 100.0)
 }
@@ -3524,7 +3783,7 @@ fn mode_index<T: Copy + PartialEq>(options: &[(T, &str, &str)], value: T) -> usi
 }
 
 /// Mutually exclusive options with no cost ordering: flat chips.
-fn segmented_row<T: Copy + PartialEq>(
+pub(super) fn segmented_row<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     label: &str,
     tip: &str,
@@ -3657,6 +3916,93 @@ fn ocean_slider(
     });
 }
 
+impl App {
+    /// jaPRO account login, the same fields as jaPRO's own login menu: username and
+    /// password, then `login`, `register` or `logout` sent to the server.
+    fn egui_japro_account(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "ACCOUNT",
+            "Log in to your jaPRO account on the connected server. Register creates one if the server allows it.",
+        );
+        // jaPRO keeps both at 15 characters and takes them as single arguments.
+        const LIMIT: usize = 15;
+        let clean = |text: &mut String| {
+            text.retain(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\\'));
+        };
+
+        let mut username_changed = false;
+        theme::row(
+            ui,
+            "Username",
+            "ui_username. Up to 15 characters, no spaces. Saved to the config.",
+            theme::Reset::None,
+            |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.network.ui_username)
+                        .char_limit(LIMIT)
+                        .desired_width(220.0),
+                );
+                username_changed = response.changed();
+            },
+        );
+        let mut submit = false;
+        theme::row(
+            ui,
+            "Password",
+            "ui_password. Up to 15 characters, no spaces. Kept for this session only and never written to the config.",
+            theme::Reset::None,
+            |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.network.ui_password)
+                        .password(true)
+                        .char_limit(LIMIT)
+                        .desired_width(220.0),
+                );
+                submit = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            },
+        );
+        clean(&mut self.network.ui_username);
+        clean(&mut self.network.ui_password);
+        if username_changed {
+            self.mark_config_dirty();
+        }
+
+        let connected = self.live_connected();
+        let ready = !self.network.ui_username.is_empty() && !self.network.ui_password.is_empty();
+        let mut command = None;
+        theme::row(ui, "Account", "", theme::Reset::None, |ui| {
+            ui.add_enabled_ui(connected, |ui| {
+                ui.add_enabled_ui(ready, |ui| {
+                    if theme::primary_button(ui, "LOG IN").clicked() || (submit && ready && connected) {
+                        command = Some(format!(
+                            "login {} {}",
+                            self.network.ui_username, self.network.ui_password
+                        ));
+                    }
+                    ui.add_space(8.0);
+                    if theme::ghost_button(ui, "REGISTER").clicked() {
+                        command = Some(format!(
+                            "register {} {}",
+                            self.network.ui_username, self.network.ui_password
+                        ));
+                    }
+                });
+                ui.add_space(8.0);
+                if theme::ghost_button(ui, "LOG OUT").clicked() {
+                    command = Some("logout".to_owned());
+                }
+            });
+        });
+        if !connected {
+            theme::label(ui, theme::plain("Join a jaPRO server to log in.", 11.5, theme::TEXT_FAINT));
+        }
+        if let Some(command) = command {
+            self.forward_command_to_server(&command);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- resets --
 
 impl App {
@@ -3721,6 +4067,9 @@ impl App {
             ui::VIDEO_ROW_DRAW_CLIP_BRUSHES => {
                 self.video.draw_clip_brushes = defaults.draw_clip_brushes;
                 self.sync_debug_volumes();
+            }
+            ui::VIDEO_ROW_DRAW_ENTITIES => {
+                self.set_draw_entities(defaults.draw_entities);
             }
             ui::VIDEO_ROW_DRAW_MAP_MODELS => {
                 self.video.draw_map_models = defaults.draw_map_models;
@@ -3839,6 +4188,18 @@ impl App {
                 self.mark_config_dirty();
                 self.console_status = format!("FX FPS: {} HZ", self.video.fx_fps);
             }
+            ui::VIDEO_ROW_FX_LOD => {
+                self.video.fx_lod = defaults.fx_lod;
+                self.apply_fx_lod();
+                self.mark_config_dirty();
+                self.console_status = format!("FX LOD: {}", crate::fx::lod_label(self.video.fx_lod));
+            }
+            ui::VIDEO_ROW_FX_PHYSICS => {
+                self.video.fx_physics = defaults.fx_physics;
+                self.apply_fx_physics();
+                self.mark_config_dirty();
+                self.console_status = format!("FX PHYSICS: {}", crate::fx::physics_label(self.video.fx_physics));
+            }
             ui::VIDEO_ROW_MODERN_SABERS => {
                 self.video.modern_sabers = defaults.modern_sabers;
                 self.mark_config_dirty();
@@ -3880,11 +4241,14 @@ impl App {
             }
             ui::VIDEO_ROW_DYNAMIC_SHADOWS => {
                 self.video.dynamic_shadows = defaults.dynamic_shadows;
-                self.video.cascaded_shadows = matches!(
-                    self.video.dynamic_shadows,
-                    DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsBevy
-                );
+                self.video.cascaded_shadows =
+                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
                 self.sync_cascaded_shadows();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_ENTITY_SHADOW_LIGHT => {
+                self.video.entity_shadow_light = defaults.entity_shadow_light;
+                self.sync_entity_shadow_light();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS => {
@@ -3899,11 +4263,7 @@ impl App {
             }
             ui::VIDEO_ROW_SSR => {
                 self.video.reflection_quality = defaults.reflection_quality;
-                self.mark_config_dirty();
-                self.console_status = format!(
-                    "REFLECTION QUALITY: {} - PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART",
-                    self.video.reflection_quality.label()
-                );
+                self.reflection_quality_changed();
             }
             ui::VIDEO_ROW_PLANAR_REFLECTIONS => {
                 self.video.reflection_debug = defaults.reflection_debug;
@@ -4094,6 +4454,11 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
+            ui::ENV_ROW_ENTITY_SUN_LIGHTING => {
+                self.video.entity_sun_lighting = defaults.entity_sun_lighting;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
             ui::ENV_ROW_SUN_YAW => {
                 let yaw = self.map_sun_editor_values().map(|v| v.0).unwrap_or(defaults.sun_yaw);
                 self.set_sun_yaw(yaw);
@@ -4159,9 +4524,17 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
+            ui::ENV_ROW_PUDDLE_WATER => {
+                self.video.puddle_quality = defaults.puddle_quality;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
+            ui::ENV_ROW_PUDDLE_SCATTER => self.set_puddle_scatter(defaults.puddle_scatter),
+            ui::ENV_ROW_RAIN_GRADE => self.set_rain_grade(defaults.rain_grade),
             ui::ENV_ROW_FOOTPRINTS => {
                 self.video.footprints = defaults.footprints;
                 self.render_command(RenderCommand::SetFootprintMode(self.video.footprints));
+                self.footprints_chosen();
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_GRASS => {
@@ -4291,87 +4664,215 @@ impl App {
     }
 }
 
-fn draw_crosshair_preview(ui: &mut egui::Ui, crosshair: crate::ui::CrosshairSettings) {
-    let width = theme::track_width(ui).max(180.0) + 96.0;
-    let desired = egui::vec2(width, 118.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let panel = rect.shrink(1.0);
-    painter.rect_filled(panel, egui::CornerRadius::ZERO, theme::INSET);
-    painter.rect_stroke(
-        panel,
-        egui::CornerRadius::ZERO,
-        egui::Stroke::new(1.0_f32, theme::LINE),
-        egui::StrokeKind::Inside,
-    );
-
-    let view = panel.shrink2(egui::vec2(14.0, 12.0));
-    let center = view.center();
-    let guide = theme::HAIRLINE;
-    painter.line_segment(
-        [egui::pos2(view.left(), center.y), egui::pos2(view.right(), center.y)],
-        egui::Stroke::new(1.0_f32, guide),
-    );
-    painter.line_segment(
-        [egui::pos2(center.x, view.top()), egui::pos2(center.x, view.bottom())],
-        egui::Stroke::new(1.0_f32, guide),
-    );
-
-    let font = egui::FontId::proportional(11.5);
-    theme::glow_text(
-        &painter,
-        egui::pos2(view.left(), view.top() - 2.0),
-        egui::Align2::LEFT_TOP,
-        "LIVE PREVIEW",
-        font.clone(),
-        theme::TEXT_FAINT,
-    );
-    let detail = format!(
-        "shape {}   size {:.0}   rgb {} {} {}",
-        crosshair.style,
-        crosshair.size,
-        crosshair.color[0],
-        crosshair.color[1],
-        crosshair.color[2]
-    );
-    theme::glow_text(
-        &painter,
-        egui::pos2(view.right(), view.bottom() + 2.0),
-        egui::Align2::RIGHT_BOTTOM,
-        &detail,
-        font,
-        theme::TEXT_FAINT,
-    );
-
-    draw_crosshair_preview_shape(&painter, center, view, crosshair);
-}
-
-fn draw_crosshair_preview_shape(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    bounds: egui::Rect,
-    crosshair: crate::ui::CrosshairSettings,
-) {
-    if crosshair.style == 0 {
-        theme::glow_text(
-            painter,
-            center,
-            egui::Align2::CENTER_CENTER,
-            "CROSSHAIR OFF",
-            egui::FontId::proportional(13.0),
-            theme::TEXT_DISABLED,
-        );
-        return;
+impl App {
+    pub(super) fn crosshair_image_key(index: u8) -> String {
+        format!("crosshair-image:{index}")
     }
 
-    let color = egui::Color32::from_rgba_premultiplied(
+    /// Thumbnail of image crosshair `index` (1..=10). The first call for an image
+    /// asks the catalog worker to read it off-thread; it shows up on a later frame.
+    fn crosshair_image_texture(&mut self, index: u8) -> Option<egui::TextureHandle> {
+        if let Some(texture) = self.crosshair_image_textures.get(&index) {
+            return Some(texture.clone());
+        }
+        let key = Self::crosshair_image_key(index);
+        if self.ui_catalog.icons_missing.contains(&key) || self.ui_catalog.icons_inflight.contains(&key) {
+            return None;
+        }
+        self.ui_catalog.icons_inflight.insert(key);
+        self.ui_catalog.request(
+            &self.base,
+            self.game.as_deref(),
+            ui_catalog::CatalogRequest::CrosshairImage { index },
+        );
+        None
+    }
+
+    /// One row of tiles: the stock `gfx/2d/crosshair{a..j}` images, then the
+    /// built-in shapes. Each tile draws the crosshair itself in the current color,
+    /// so there is no preview pane and no labels; hover names a tile. Clicking the
+    /// selected tile turns the crosshair off.
+    fn draw_crosshair_picker(&mut self, ui: &mut egui::Ui) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pick {
+            Off,
+            Image(u8),
+            Shape(u8),
+        }
+        // Box (6) stays an accepted cg_drawCrosshair value but is not offered, so
+        // every tile fits on one row.
+        const SHAPES: [(u8, &str); 6] = [
+            (1, "Classic"),
+            (2, "Dot"),
+            (3, "Plus"),
+            (4, "Plus with dot"),
+            (5, "Brackets"),
+            (crate::ui::CROSSHAIR_STYLE_LINE, "Line"),
+        ];
+        const GAP: f32 = 6.0;
+
+        let style = self.crosshair.style;
+        let image = self.crosshair.image;
+        let current = if style == 0 {
+            Pick::Off
+        } else if image != 0 {
+            Pick::Image(image)
+        } else {
+            Pick::Shape(style)
+        };
+
+        // J only ships in japro-assets.pk3; drop tiles for art that is not there.
+        let mut tiles = Vec::new();
+        for index in 1..=crate::ui::CROSSHAIR_IMAGE_COUNT {
+            if !self.ui_catalog.icons_missing.contains(&Self::crosshair_image_key(index)) {
+                tiles.push((Pick::Image(index), format!("Stock crosshair {}", char::from(b'A' + index - 1))));
+            }
+        }
+        tiles.extend(SHAPES.iter().map(|&(id, name)| (Pick::Shape(id), name.to_owned())));
+
+        let count = tiles.len() as f32;
+        let tile = ((ui.available_width() - GAP * (count - 1.0)) / count).clamp(34.0, 52.0);
+        let mut picked = None;
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+            for (pick, name) in &tiles {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::click());
+                let selected = *pick == current;
+                ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::INSET);
+                let (stroke_width, stroke_color) = if selected {
+                    (2.0_f32, theme::ACCENT)
+                } else if response.hovered() {
+                    (1.0_f32, theme::TEXT_FAINT)
+                } else {
+                    (1.0_f32, theme::LINE)
+                };
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(stroke_width, stroke_color),
+                    egui::StrokeKind::Inside,
+                );
+                match *pick {
+                    Pick::Off => {}
+                    Pick::Image(index) => {
+                        let texture = self.crosshair_image_texture(index);
+                        let sample = crate::ui::CrosshairSettings {
+                            style: style.max(1),
+                            image: index,
+                            size: 40.0,
+                            ..self.crosshair
+                        };
+                        draw_crosshair_glyph(
+                            &ui.painter().clone(),
+                            rect.center(),
+                            tile - 6.0,
+                            sample,
+                            texture.as_ref(),
+                            self.strafe_helper.line_width,
+                        );
+                    }
+                    Pick::Shape(id) => {
+                        let sample = crate::ui::CrosshairSettings {
+                            style: id,
+                            image: 0,
+                            size: 40.0,
+                            ..self.crosshair
+                        };
+                        draw_crosshair_glyph(
+                            &ui.painter().clone(),
+                            rect.center(),
+                            tile - 6.0,
+                            sample,
+                            None,
+                            self.strafe_helper.line_width,
+                        );
+                    }
+                }
+                let response = response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(name.as_str());
+                if response.clicked() {
+                    // Clicking the active crosshair turns it off.
+                    picked = Some(if selected { Pick::Off } else { *pick });
+                }
+            }
+        });
+        ui.add_space(4.0);
+
+        let Some(pick) = picked else { return };
+        // cg_drawCrosshair stays the on/off switch in every mode, so picking
+        // anything while Off turns it back on.
+        let (next_style, next_image) = match pick {
+            Pick::Off => (0, image),
+            Pick::Image(index) => (style.max(1), index),
+            Pick::Shape(id) => (id, 0),
+        };
+        if next_style != style {
+            let _ = self.set_console_cvar("cg_drawCrosshair", &next_style.to_string());
+        }
+        if next_image != image {
+            let _ = self.set_console_cvar("cg_crosshairImage", &next_image.to_string());
+        }
+    }
+}
+
+/// Draws one crosshair (shape or stock image) centered in a square of at most
+/// `extent` px. `crosshair.style` must be non-zero.
+fn draw_crosshair_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    extent: f32,
+    crosshair: crate::ui::CrosshairSettings,
+    image: Option<&egui::TextureHandle>,
+    line_width: f32,
+) {
+    // Mirrors build_crosshair: strength fades below 100%, and above it layers the
+    // faint stock images.
+    let strength = crosshair.strength.clamp(0.0, crate::ui::CROSSHAIR_STRENGTH_MAX);
+    let alpha = (f32::from(crosshair.color[3]) * strength.min(1.0)).round() as u8;
+    let color = egui::Color32::from_rgba_unmultiplied(
         crosshair.color[0],
         crosshair.color[1],
         crosshair.color[2],
-        crosshair.color[3],
+        alpha,
     );
-    let max_preview = bounds.width().min(bounds.height()) - 26.0;
+    let max_preview = extent;
+    if crosshair.image != 0 {
+        // Same pixel size the game uses; the stock artwork is padded, so it reads
+        // like the shapes at the same size.
+        let side = crosshair.size.clamp(4.0, 96.0).min(max_preview.max(8.0));
+        if let Some(texture) = image {
+            let extra = (strength - 1.0).max(0.0) * 3.0;
+            for pass in 0..1 + extra.ceil() as usize {
+                let weight = if pass == 0 { 1.0 } else { (extra - (pass - 1) as f32).min(1.0) };
+                painter.image(
+                    texture.id(),
+                    egui::Rect::from_center_size(center, egui::vec2(side, side)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_rgba_unmultiplied(
+                        crosshair.color[0],
+                        crosshair.color[1],
+                        crosshair.color[2],
+                        (f32::from(alpha) * weight).round() as u8,
+                    ),
+                );
+            }
+        }
+        return;
+    }
     let size = (crosshair.size.clamp(4.0, 96.0) * (2.0 / 3.0)).min(max_preview.max(8.0));
+    if crosshair.style == crate::ui::CROSSHAIR_STYLE_LINE {
+        // Roughly a 2 px per 640x480-unit view, like the game at 960x720.
+        let line_w = line_width.clamp(0.25, 5.0) * 2.0;
+        let line_h = (size * 1.25).min(max_preview.max(8.0));
+        painter.rect_filled(
+            egui::Rect::from_center_size(center, egui::vec2(line_w, line_h)),
+            egui::CornerRadius::ZERO,
+            color,
+        );
+        return;
+    }
     let half = size * 0.5;
     let thickness = (size / 8.0).clamp(1.0, 4.0);
     let gap_max = (half - thickness * 0.5).max(0.5);

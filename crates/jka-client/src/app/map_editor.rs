@@ -10,7 +10,25 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant, SystemTime},
 };
+
+const EXTERNAL_MAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const EXTERNAL_MAP_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskStamp {
+    Present { len: u64, modified: Option<SystemTime> },
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ExternalMapChange {
+    None,
+    Reloaded,
+    Conflict(String),
+    Error(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MapEditTool {
@@ -76,6 +94,14 @@ pub(super) struct MapEditor {
     pub status: String,
     drag: Option<MapEditDrag>,
     preview_visible: bool,
+    /// Disk identity that `source_text` was read from. We watch only the one
+    /// loose source file backing this editor; package/VFS changes belong to
+    /// `fs_refresh`, not this hot-reload path.
+    disk_stamp: DiskStamp,
+    last_disk_poll: Instant,
+    pending_disk_stamp: Option<DiskStamp>,
+    pending_disk_since: Option<Instant>,
+    reported_disk_stamp: Option<DiskStamp>,
 }
 
 impl MapEditor {
@@ -84,6 +110,7 @@ impl MapEditor {
             .map_err(|error| format!("Could not read editable source map {}: {error}", path.display()))?;
         let document = jka_assets::map::parse(&source_text)
             .map_err(|error| format!("Could not parse editable source map {}: {error}", path.display()))?;
+        let disk_stamp = Self::disk_stamp(path)?;
         Ok(Self {
             source_path: path.to_owned(),
             baseline_document: document.clone(),
@@ -97,7 +124,160 @@ impl MapEditor {
             status: "Click a brush to select and drag it.".into(),
             drag: None,
             preview_visible: false,
+            disk_stamp,
+            last_disk_poll: Instant::now(),
+            pending_disk_stamp: None,
+            pending_disk_since: None,
+            reported_disk_stamp: None,
         })
+    }
+
+    fn disk_stamp(path: &Path) -> Result<DiskStamp, String> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(DiskStamp::Present {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DiskStamp::Missing),
+            Err(error) => Err(format!(
+                "Could not inspect editable source map {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn note_accepted_disk_state(&mut self, stamp: DiskStamp) {
+        self.disk_stamp = stamp;
+        self.pending_disk_stamp = None;
+        self.pending_disk_since = None;
+        self.reported_disk_stamp = None;
+        self.last_disk_poll = Instant::now();
+    }
+
+    /// Poll the loose source file for an external editor save. This deliberately
+    /// uses metadata rather than a platform watcher: only one file is active,
+    /// the cost is negligible at 10 Hz, and atomic-save/rename behavior is the
+    /// same on Windows, Linux and macOS. A changed stamp must remain stable for
+    /// a short debounce window before we read it, avoiding half-written saves.
+    pub(super) fn poll_external_change(&mut self, now: Instant) -> ExternalMapChange {
+        if now.saturating_duration_since(self.last_disk_poll) < EXTERNAL_MAP_POLL_INTERVAL {
+            return ExternalMapChange::None;
+        }
+        self.last_disk_poll = now;
+
+        let observed = match Self::disk_stamp(&self.source_path) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                if self.reported_disk_stamp != Some(DiskStamp::Missing) {
+                    self.reported_disk_stamp = Some(DiskStamp::Missing);
+                    return ExternalMapChange::Error(error);
+                }
+                return ExternalMapChange::None;
+            }
+        };
+
+        if observed == self.disk_stamp {
+            self.pending_disk_stamp = None;
+            self.pending_disk_since = None;
+            self.reported_disk_stamp = None;
+            return ExternalMapChange::None;
+        }
+
+        if self.pending_disk_stamp != Some(observed) {
+            self.pending_disk_stamp = Some(observed);
+            self.pending_disk_since = Some(now);
+            return ExternalMapChange::None;
+        }
+        if self
+            .pending_disk_since
+            .is_none_or(|since| now.saturating_duration_since(since) < EXTERNAL_MAP_SAVE_DEBOUNCE)
+        {
+            return ExternalMapChange::None;
+        }
+
+        if observed == DiskStamp::Missing {
+            if self.reported_disk_stamp != Some(observed) {
+                self.reported_disk_stamp = Some(observed);
+                return ExternalMapChange::Error(format!(
+                    "Source map {} is temporarily missing; keeping the current world until it reappears.",
+                    self.source_path.display()
+                ));
+            }
+            return ExternalMapChange::None;
+        }
+
+        let source_text = match fs::read_to_string(&self.source_path) {
+            Ok(text) => text,
+            Err(error) => {
+                if self.reported_disk_stamp != Some(observed) {
+                    self.reported_disk_stamp = Some(observed);
+                    return ExternalMapChange::Error(format!(
+                        "Could not read externally modified source map {}: {error}",
+                        self.source_path.display()
+                    ));
+                }
+                return ExternalMapChange::None;
+            }
+        };
+
+        // A save can replace the file while it is being read. Do not parse or
+        // commit bytes unless the metadata remained stable across the read.
+        let after_read = match Self::disk_stamp(&self.source_path) {
+            Ok(stamp) => stamp,
+            Err(error) => return ExternalMapChange::Error(error),
+        };
+        if after_read != observed {
+            self.pending_disk_stamp = Some(after_read);
+            self.pending_disk_since = Some(now);
+            return ExternalMapChange::None;
+        }
+
+        // Some editors rewrite the file without changing its contents. Accept
+        // the new stamp without spending a source-map rebuild on identical text.
+        if source_text == self.source_text {
+            self.note_accepted_disk_state(after_read);
+            return ExternalMapChange::None;
+        }
+
+        if self.has_pending_changes() {
+            if self.reported_disk_stamp != Some(after_read) {
+                self.reported_disk_stamp = Some(after_read);
+                let message = format!(
+                    "{} changed externally while DinurdoJK has unsaved brush edits. Revert the local edits to accept the disk version, or save elsewhere before continuing.",
+                    self.source_path.display()
+                );
+                self.status = message.clone();
+                return ExternalMapChange::Conflict(message);
+            }
+            return ExternalMapChange::None;
+        }
+
+        let document = match jka_assets::map::parse(&source_text) {
+            Ok(document) => document,
+            Err(error) => {
+                if self.reported_disk_stamp != Some(after_read) {
+                    self.reported_disk_stamp = Some(after_read);
+                    let message = format!(
+                        "External source-map edit did not parse: {error}. Keeping the current world.",
+                    );
+                    self.status = message.clone();
+                    return ExternalMapChange::Error(message);
+                }
+                return ExternalMapChange::None;
+            }
+        };
+
+        self.source_text = source_text;
+        self.document = document.clone();
+        self.baseline_document = document;
+        self.pending_changes = 0;
+        self.changed_brushes.clear();
+        self.selected = None;
+        self.drag = None;
+        self.preview_visible = false;
+        self.note_accepted_disk_state(after_read);
+        self.status = "External source-map change detected; rebuilding textured world...".into();
+        ExternalMapChange::Reloaded
     }
 
     pub(super) fn has_pending_changes(&self) -> bool {
@@ -129,6 +309,23 @@ impl MapEditor {
             self.status = "No pending changes.".into();
             return Ok(());
         }
+
+        // Never overwrite an external Radiant/editor save with stale in-memory
+        // brush spans. Metadata alone can produce false positives, so compare
+        // the actual baseline bytes before refusing the save.
+        let disk_text = fs::read_to_string(&self.source_path).map_err(|error| {
+            format!(
+                "Could not verify {} before saving: {error}",
+                self.source_path.display()
+            )
+        })?;
+        if disk_text != self.source_text {
+            return Err(format!(
+                "{} changed externally while local brush edits are pending. Revert the local edits to load the disk version before saving.",
+                self.source_path.display()
+            ));
+        }
+
         let rendered = self.render_source_text()?;
         // Validate the exact text that will hit disk before replacing the source,
         // and retain the reparsed document so future edits use byte spans from
@@ -153,6 +350,8 @@ impl MapEditor {
         self.baseline_document = reparsed;
         self.pending_changes = 0;
         self.changed_brushes.clear();
+        let stamp = Self::disk_stamp(&self.source_path)?;
+        self.note_accepted_disk_state(stamp);
         self.status = format!("Saved {}", self.source_path.display());
         Ok(())
     }
@@ -330,6 +529,8 @@ impl MapEditor {
                 self.pending_changes,
                 if self.pending_changes == 1 { "" } else { "s" }
             );
+        } else {
+            self.status = "Source map and textured world are up to date.".into();
         }
     }
 
@@ -726,5 +927,59 @@ mod tests {
         let plane = jka_assets::map::plane_from_points(a, b, c).unwrap();
         assert!((plane.normal[0] - 1.0).abs() < 1e-9);
         assert!((plane.distance - 128.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod disk_reload_tests {
+    use super::*;
+
+    const SOURCE_A: &str = "{\n\"classname\" \"worldspawn\"\n\"message\" \"a\"\n}\n";
+    const SOURCE_B: &str = "{\n\"classname\" \"worldspawn\"\n\"message\" \"external-change\"\n}\n";
+
+    fn temp_map(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dinurdojk-map-editor-{name}-{}-{:?}.map",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn external_save_reloads_after_stable_debounce() {
+        let path = temp_map("external-reload");
+        fs::write(&path, SOURCE_A).unwrap();
+        let mut editor = MapEditor::open(&path).unwrap();
+        fs::write(&path, SOURCE_B).unwrap();
+
+        let first = editor.last_disk_poll + EXTERNAL_MAP_POLL_INTERVAL + Duration::from_millis(1);
+        assert_eq!(editor.poll_external_change(first), ExternalMapChange::None);
+        let stable = first + EXTERNAL_MAP_SAVE_DEBOUNCE + Duration::from_millis(1);
+        assert_eq!(editor.poll_external_change(stable), ExternalMapChange::Reloaded);
+        assert_eq!(editor.source_text, SOURCE_B);
+        assert!(!editor.has_pending_changes());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn external_save_does_not_overwrite_pending_local_edits() {
+        let path = temp_map("external-conflict");
+        fs::write(&path, SOURCE_A).unwrap();
+        let mut editor = MapEditor::open(&path).unwrap();
+        editor.pending_changes = 1;
+        fs::write(&path, SOURCE_B).unwrap();
+
+        let first = editor.last_disk_poll + EXTERNAL_MAP_POLL_INTERVAL + Duration::from_millis(1);
+        assert_eq!(editor.poll_external_change(first), ExternalMapChange::None);
+        let stable = first + EXTERNAL_MAP_SAVE_DEBOUNCE + Duration::from_millis(1);
+        assert!(matches!(
+            editor.poll_external_change(stable),
+            ExternalMapChange::Conflict(_)
+        ));
+        assert_eq!(editor.source_text, SOURCE_A);
+        assert_eq!(editor.pending_changes, 1);
+
+        let _ = fs::remove_file(path);
     }
 }

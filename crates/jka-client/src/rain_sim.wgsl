@@ -1,7 +1,7 @@
 struct RainParticle {
     position_state: vec4<f32>, // xyz world position, w: 0 uninitialized, 1 falling, 2 splash
     velocity_age: vec4<f32>,   // xyz velocity, w: splash age seconds
-    misc: vec4<f32>,           // x: respawn generation, remaining reserved
+    misc: vec4<f32>,           // x: respawn generation, y: basin score, z: flat-area score of the impact surface
 };
 
 struct RainSimUniform {
@@ -11,6 +11,9 @@ struct RainSimUniform {
     weather: vec4<f32>,        // base weather wind X/Z JKA/s, remaining lanes reserved
     collision_uv: vec4<f32>,   // min render X/Z, inverse map width/depth
     counts: vec4<u32>,         // active particles, heightfield width/height, splash subset
+    water_info: vec4<f32>,     // x: water volume count
+    water_min: array<vec4<f32>, 8>, // water volume minimum corners (render space)
+    water_max: array<vec4<f32>, 8>, // water volume maximum corners; y is the surface
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<RainParticle>;
@@ -147,16 +150,19 @@ fn respawn(index: u32, generation: f32, wind_velocity: vec2<f32>) -> RainParticl
     return particle;
 }
 
-fn collision_surface_y(position: vec3<f32>) -> f32 {
+// The weather field texel under a position: x rain-blocking height, y top surface
+// height, z flat-area score, w basin score. x is -1e20 where nothing is mapped.
+fn collision_field(position: vec3<f32>) -> vec4<f32> {
     let width = sim.counts.y;
     let height = sim.counts.z;
+    let unmapped = vec4<f32>(-1.0e20, -1.0e20, 0.0, 0.0);
     if (width == 0u || height == 0u) {
-        return -1.0e20;
+        return unmapped;
     }
 
     let uv = (position.xz - sim.collision_uv.xy) * sim.collision_uv.zw;
     if (any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0))) {
-        return -1.0e20;
+        return unmapped;
     }
 
     let pixel_u = min(
@@ -167,7 +173,22 @@ fn collision_surface_y(position: vec3<f32>) -> f32 {
         collision_height,
         vec2<i32>(i32(pixel_u.x), i32(pixel_u.y)),
         0
-    ).x;
+    );
+}
+
+// Top of the water volume this position is inside, or -1e20 when it is in none.
+fn water_surface_containing(position: vec3<f32>) -> f32 {
+    let count = min(u32(sim.water_info.x), 8u);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let lo = sim.water_min[i].xyz;
+        let hi = sim.water_max[i].xyz;
+        if (position.x >= lo.x && position.x <= hi.x
+            && position.z >= lo.z && position.z <= hi.z
+            && position.y >= lo.y && position.y <= hi.y) {
+            return hi.y;
+        }
+    }
+    return -1.0e20;
 }
 
 @compute @workgroup_size(128)
@@ -218,7 +239,26 @@ fn cs_main(
             return;
         }
 
-        let surface_y = collision_surface_y(particle.position_state.xyz);
+        // Water is a floor for rain. A drop that reaches the surface splashes on
+        // it; one that is already inside the volume (spawned there, or carried in
+        // by the camera moving) is recycled instead of raining underwater.
+        let water_top = water_surface_containing(particle.position_state.xyz);
+        if (water_top > -1.0e19) {
+            if (old_y > water_top && index < sim.counts.w) {
+                particle.position_state.y = water_top + 1.5;
+                particle.position_state.w = 2.0;
+                particle.misc.y = 0.0;
+                particle.misc.z = 0.0;
+                particle.velocity_age = vec4<f32>(0.0);
+                particles[index] = particle;
+            } else {
+                particles[index] = respawn(index, particle.misc.x, shared_wind_velocity);
+            }
+            return;
+        }
+
+        let field = collision_field(particle.position_state.xyz);
+        let surface_y = field.x;
         if (surface_y > -1.0e19) {
             // If the camera moves under a roof while a drop is already below
             // that roof, do not let the stale drop rain inside. Put it above
@@ -232,6 +272,12 @@ fn cs_main(
                     // small while impacts still read as dense in heavy rain.
                     particle.position_state.y = surface_y + 1.5;
                     particle.position_state.w = 2.0;
+                    // Puddle scores only describe the surface the drop landed on
+                    // when that surface is the rain-blocking top (not a roof brush
+                    // over a lower floor).
+                    let on_top_surface = abs(field.y - field.x) < 8.0;
+                    particle.misc.y = select(0.0, field.w, on_top_surface);
+                    particle.misc.z = select(0.0, field.z, on_top_surface);
                     particle.velocity_age.x = 0.0;
                     particle.velocity_age.y = 0.0;
                     particle.velocity_age.z = 0.0;

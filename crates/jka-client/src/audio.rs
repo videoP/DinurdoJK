@@ -29,6 +29,9 @@ use rodio::{
 };
 
 const MAX_SOUND_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MUSIC_BYTES: usize = 64 * 1024 * 1024;
+/// Seconds for music to fade in/out or change level.
+const MUSIC_FADE_SECONDS: f32 = 1.5;
 const MAX_DECODED_SAMPLES: usize = 8 * 1024 * 1024;
 const MAX_CACHE_SAMPLES: usize = 32 * 1024 * 1024;
 // OpenJK's software mixer has 32 simultaneously paintable channels. Keeping the
@@ -85,6 +88,8 @@ pub struct SoundRequest {
 pub struct LoopRequest {
     pub qpath: String,
     pub origin: SoundOrigin,
+    /// 0..=1 level of this emitter (an ambient set's `masterVolume / 255`).
+    pub volume: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +188,18 @@ impl SoundAssets {
         }
     }
 
+    /// Raw bytes of a streamed music track (`S_StartBackgroundTrack`). Tracks are
+    /// decoded on the audio thread as they play, not cached as samples.
+    pub fn read_music(&mut self, qpath: &str) -> Result<Arc<[u8]>, String> {
+        let stem = qpath.strip_suffix(".mp3").or_else(|| qpath.strip_suffix(".wav")).unwrap_or(qpath);
+        for candidate in [qpath.to_owned(), format!("{stem}.mp3"), format!("{stem}.wav")] {
+            if let Some(asset) = self.assets.read(&candidate, MAX_MUSIC_BYTES).map_err(|e| e.to_string())? {
+                return Ok(Arc::from(asset.bytes));
+            }
+        }
+        Err(format!("missing music {qpath}"))
+    }
+
     /// Small text sidecar reader used by CGame media registration (for example
     /// models/players/<model>/sounds*.cfg). This deliberately bypasses the
     /// decoded-sound cache because the file is metadata, not an SFX.
@@ -191,6 +208,20 @@ impl SoundAssets {
             return Ok(None);
         };
         Ok(Some(String::from_utf8_lossy(&asset.bytes).into_owned()))
+    }
+
+    /// Re-scan the underlying VFS and forget only failed registrations.
+    /// Successfully decoded sounds remain cached so an explicit filesystem
+    /// refresh does not glitch currently playing/looping audio.
+    pub fn retry_failed_assets(&mut self) -> Result<usize, String> {
+        self.assets
+            .refresh()
+            .map_err(|error| format!("SOUND ASSET REFRESH ERROR: {error}"))?;
+        let retried = self.failed.len() + self.predecode_errors.len();
+        self.failed.clear();
+        self.predecode_errors.clear();
+        self.predecoded.clear();
+        Ok(retried)
     }
 
     pub fn sample_rate_summary(&self) -> String {
@@ -209,22 +240,32 @@ impl SoundAssets {
     /// Stage an uncached direct sound for worker decoding. This performs the
     /// VFS/ZIP read on the owning game thread but deliberately leaves WAV/MP3
     /// codec work for a worker. Cached/previously-failed assets return None.
+    #[allow(dead_code)]
     pub(crate) fn stage_decode(&mut self, qpath: &str) -> Option<SoundDecodeJob> {
-        let key = qpath.replace('\\', "/").to_ascii_lowercase();
-        if self.cache.contains_key(&key)
-            || self.predecoded.contains_key(&key)
-            || self.predecode_errors.contains_key(&key)
-            || self.failed.contains(&key)
-        {
-            return None;
-        }
-        match self.load_bytes(&key) {
-            Ok(bytes) => Some(SoundDecodeJob { key, bytes }),
-            Err(error) => {
-                self.predecode_errors.insert(key, error);
-                None
+        self.stage_first_available(&[qpath.to_owned()])
+    }
+
+    /// Stage the first of `qpaths` that exists, mirroring the order in which
+    /// ordered dispatch will `register()` them (custom voice profile fallback).
+    /// Missing candidates record the same one-shot error `register()` would have
+    /// produced, so the fallback candidate is what ends up decoded.
+    pub(crate) fn stage_first_available(&mut self, qpaths: &[String]) -> Option<SoundDecodeJob> {
+        for qpath in qpaths {
+            let key = qpath.replace('\\', "/").to_ascii_lowercase();
+            if self.cache.contains_key(&key) || self.predecoded.contains_key(&key) {
+                return None;
+            }
+            if self.predecode_errors.contains_key(&key) || self.failed.contains(&key) {
+                continue;
+            }
+            match self.load_bytes(&key) {
+                Ok(bytes) => return Some(SoundDecodeJob { key, bytes }),
+                Err(error) => {
+                    self.predecode_errors.insert(key, error);
+                }
             }
         }
+        None
     }
 
     /// Queue worker codec results without mutating the live cache yet.
@@ -299,7 +340,17 @@ impl SoundAssets {
 }
 
 fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
-    let mut decoder = Decoder::try_from(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    // Gapless playback (rodio's default) trims the encoder delay/padding a
+    // LAME/Xing header claims. JKA's short voice/SFX clips carry headers whose
+    // claimed delay+padding exceeds the clip, so a gapless decode returns zero
+    // samples ("empty sound") and every such sound - character voices, force
+    // powers, weapon selects - was silent. The original engine (mpg123/minimp3)
+    // ignores that trim, so decode the whole stream.
+    let mut decoder = Decoder::builder()
+        .with_data(Cursor::new(bytes))
+        .with_gapless(false)
+        .build()
+        .map_err(|e| e.to_string())?;
     let sample_rate = decoder.sample_rate();
     let channels = usize::from(decoder.channels().get());
     if channels > 2 { return Err("SFX must be mono or stereo".into()); }
@@ -1087,7 +1138,143 @@ impl Source for SteamAudioSource {
     }
 }
 
-struct Voice { player: Player, gains: Arc<Gains>, request: SoundRequest, steam_audio_capable: bool }
+/// Shared state between the game thread and a streaming music source.
+struct MusicControl {
+    /// Target level (f32 bits), already `s_musicvolume * s_musicMult`.
+    target: AtomicU32,
+    stopping: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl MusicControl {
+    fn new(target: f32) -> Arc<Self> {
+        Arc::new(Self {
+            target: AtomicU32::new(target.to_bits()),
+            stopping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        })
+    }
+}
+
+type MusicDecoder = Decoder<Cursor<Arc<[u8]>>>;
+
+fn open_music_decoder(bytes: &Arc<[u8]>) -> Result<MusicDecoder, String> {
+    // Not gapless: see `decode_sound`; also keeps loop seams as the encoder wrote them.
+    Decoder::builder()
+        .with_data(Cursor::new(Arc::clone(bytes)))
+        .with_gapless(false)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// A streamed, optionally looping music track: decodes lazily as the mixer pulls
+/// samples, always emits stereo, and ramps its level linearly (fades).
+struct MusicSource {
+    bytes: Arc<[u8]>,
+    decoder: MusicDecoder,
+    looping: bool,
+    channels: usize,
+    rate: rodio::SampleRate,
+    /// Right sample of a mono frame, waiting to be emitted after the left.
+    pending: Option<f32>,
+    control: Arc<MusicControl>,
+    level: f32,
+    step: f32,
+    finished: bool,
+}
+
+impl MusicSource {
+    fn new(bytes: Arc<[u8]>, looping: bool, control: Arc<MusicControl>) -> Result<Self, String> {
+        let decoder = open_music_decoder(&bytes)?;
+        let channels = usize::from(decoder.channels().get());
+        if channels > 2 {
+            return Err("music must be mono or stereo".into());
+        }
+        let rate = decoder.sample_rate();
+        Ok(Self {
+            bytes,
+            decoder,
+            looping,
+            channels,
+            rate,
+            pending: None,
+            control,
+            level: 0.0,
+            step: 1.0 / (rate.get() as f32 * MUSIC_FADE_SECONDS),
+            finished: false,
+        })
+    }
+
+    fn pull(&mut self) -> Option<f32> {
+        if let Some(sample) = self.decoder.next() {
+            return Some(sample);
+        }
+        if !self.looping {
+            return None;
+        }
+        // Restart the same file; an empty/broken stream ends the track instead of spinning.
+        self.decoder = open_music_decoder(&self.bytes).ok()?;
+        self.decoder.next()
+    }
+}
+
+impl Iterator for MusicSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.finished {
+            return None;
+        }
+        if let Some(sample) = self.pending.take() {
+            return Some(sample * self.level);
+        }
+        let left = match self.pull() {
+            Some(sample) if sample.is_finite() => sample,
+            Some(_) => 0.0,
+            None => {
+                self.finished = true;
+                self.control.finished.store(true, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let right = if self.channels == 2 { self.pull().filter(|s| s.is_finite()).unwrap_or(left) } else { left };
+        // One level update per stereo frame.
+        let target = if self.control.stopping.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.control.target.load(Ordering::Relaxed))
+        };
+        if self.level < target {
+            self.level = (self.level + self.step).min(target);
+        } else if self.level > target {
+            self.level = (self.level - self.step).max(target);
+        }
+        if self.control.stopping.load(Ordering::Relaxed) && self.level <= 0.0 {
+            self.finished = true;
+            self.control.finished.store(true, Ordering::Relaxed);
+            return None;
+        }
+        self.pending = Some(right);
+        Some(left * self.level)
+    }
+}
+
+impl Source for MusicSource {
+    fn current_span_len(&self) -> Option<usize> {
+        if self.finished { Some(0) } else { None }
+    }
+    fn channels(&self) -> rodio::ChannelCount { rodio::nz!(2) }
+    fn sample_rate(&self) -> rodio::SampleRate { self.rate }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
+/// The background track slot. `pending_loop` follows an intro that has finished.
+struct MusicVoice {
+    player: Player,
+    control: Arc<MusicControl>,
+    pending_loop: Option<Arc<[u8]>>,
+}
+
+struct Voice { player: Player, gains: Arc<Gains>, request: SoundRequest, steam_audio_capable: bool, volume: f32 }
 struct LoopVoice { player: Player, gains: Arc<Gains>, steam_audio_capable: bool }
 
 /// Queue `source` on a new Player *before* handing the Player's output to the
@@ -1222,6 +1409,11 @@ pub struct AudioBackend {
     last_environment_submit: Instant,
     steam_audio_acoustic_mesh: Option<Arc<AcousticMesh>>,
     steam_audio_bake: Option<Arc<SteamAudioBakeData>>,
+    music: Option<MusicVoice>,
+    /// Tracks fading out after being replaced or stopped.
+    music_retiring: Vec<(Player, Arc<MusicControl>)>,
+    /// `s_musicvolume * s_musicMult`, fed to every track.
+    music_level: f32,
 }
 
 impl AudioBackend {
@@ -1306,6 +1498,9 @@ impl AudioBackend {
             last_environment_submit: Instant::now(),
             steam_audio_acoustic_mesh: None,
             steam_audio_bake: None,
+            music: None,
+            music_retiring: Vec::new(),
+            music_level: 0.25,
         })
     }
 
@@ -1344,6 +1539,9 @@ impl AudioBackend {
             last_environment_submit: Instant::now(),
             steam_audio_acoustic_mesh: None,
             steam_audio_bake: None,
+            music: None,
+            music_retiring: Vec::new(),
+            music_level: 0.25,
         }
     }
 
@@ -1579,6 +1777,75 @@ impl AudioBackend {
         self.refresh_steam_audio_environmental_runtime();
         self.refresh_voice_gains();
         self.submit_environment_frame();
+        self.update_music();
+    }
+
+    /// `S_StartBackgroundTrack`: fade out whatever plays, then play `intro` once
+    /// (when given) followed by `looped` forever.
+    pub fn start_music(&mut self, intro: Option<Arc<[u8]>>, looped: Arc<[u8]>) -> Result<(), String> {
+        let control = MusicControl::new(self.music_level);
+        let (first, pending_loop) = match intro {
+            Some(intro) => (MusicSource::new(intro, false, Arc::clone(&control))?, Some(looped)),
+            None => (MusicSource::new(looped, true, Arc::clone(&control))?, None),
+        };
+        self.stop_music();
+        let player = connect_player(&self.mixer, first);
+        if self.rate == 0.0 {
+            player.pause();
+        }
+        self.music = Some(MusicVoice { player, control, pending_loop });
+        Ok(())
+    }
+
+    /// `S_StopBackgroundTrack`.
+    pub fn stop_music(&mut self) {
+        if let Some(voice) = self.music.take() {
+            voice.control.stopping.store(true, Ordering::Relaxed);
+            self.music_retiring.push((voice.player, voice.control));
+        }
+    }
+
+    /// Music level after `s_musicvolume` and the unfocused mute.
+    pub fn set_music_level(&mut self, level: f32) {
+        self.music_level = level.clamp(0.0, 1.0);
+        if let Some(voice) = &self.music {
+            voice.control.target.store(self.music_level.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn music_playing(&self) -> bool {
+        self.music.is_some()
+    }
+
+    /// Chain the loop after a finished intro and drop fully faded tracks.
+    fn update_music(&mut self) {
+        self.music_retiring.retain(|(player, control)| !control.finished.load(Ordering::Relaxed) && !player.empty());
+        let Some(voice) = &mut self.music else { return };
+        if !voice.control.finished.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(looped) = voice.pending_loop.take() else {
+            self.music = None;
+            return;
+        };
+        let control = MusicControl::new(self.music_level);
+        match MusicSource::new(looped, true, Arc::clone(&control)) {
+            Ok(source) => {
+                let player = connect_player(&self.mixer, source);
+                if self.rate == 0.0 {
+                    player.pause();
+                }
+                if let Some(voice) = &mut self.music {
+                    voice.player = player;
+                    voice.control = control;
+                }
+            }
+            Err(error) => {
+                eprintln!("AUDIO MUSIC LOOP FAILED: {error}");
+                self.music = None;
+            }
+        }
     }
 
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
@@ -1594,7 +1861,9 @@ impl AudioBackend {
         let voice = self.voice_volume;
         let separation = self.separation;
         for item in &self.voices {
-            let spatial = sound_spatialization(&item.request, listener, effects, voice, separation);
+            let mut spatial = sound_spatialization(&item.request, listener, effects, voice, separation);
+            spatial.stereo = spatial.stereo.map(|gain| gain * item.volume);
+            spatial.mono *= item.volume;
             for (previous, next) in item.gains.get().into_iter().zip(spatial.stereo) {
                 self.largest_gain_step = self.largest_gain_step.max((previous - next).abs());
             }
@@ -1651,9 +1920,9 @@ impl AudioBackend {
                 }
             };
             let total = totals.entry(request.qpath.as_str()).or_default();
-            total.stereo[0] += spatial.stereo[0];
-            total.stereo[1] += spatial.stereo[1];
-            total.mono += spatial.mono;
+            total.stereo[0] += spatial.stereo[0] * request.volume;
+            total.stereo[1] += spatial.stereo[1] * request.volume;
+            total.mono += spatial.mono * request.volume;
             if spatial.hrtf_spatializable {
                 total.has_spatial = true;
                 total.spatial_count += 1;
@@ -1787,9 +2056,16 @@ impl AudioBackend {
         for voice in self.loop_voices.values() {
             if rate == 0.0 { voice.player.pause(); } else { voice.player.play(); }
         }
+        if let Some(music) = &self.music {
+            if rate == 0.0 { music.player.pause(); } else { music.player.play(); }
+        }
     }
 
-    pub fn play(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>) {
+    pub fn play(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>) {
+        self.play_scaled(request, sound, 1.0);
+    }
+
+    fn play_scaled(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
         self.voices.retain(|voice| !voice.player.empty());
         if !matches!(request.channel, 0 | 10) { // CHAN_AUTO / CHAN_LESS_ATTEN auto-pick
             let (stomped, kept): (Vec<_>, Vec<_>) =
@@ -1820,13 +2096,15 @@ impl AudioBackend {
         if let SoundOrigin::Entity(ref mut origin) = request.origin {
             if let Some(current) = self.origins.get(&request.entity) { *origin = *current; }
         }
-        let spatial = sound_spatialization(
+        let mut spatial = sound_spatialization(
             &request,
             self.listener,
             self.effects_volume,
             self.voice_volume,
             self.separation,
         );
+        spatial.stereo = spatial.stereo.map(|gain| gain * volume);
+        spatial.mono *= volume;
         let gains = Arc::new(Gains::new(spatial.stereo));
         gains.set_hrtf(spatial.mono, spatial.direction, spatial.hrtf_spatializable);
 
@@ -1871,7 +2149,30 @@ impl AudioBackend {
             (connect_player(&self.mixer, StereoSource::new(sound, Arc::clone(&gains))), false)
         };
         if self.rate == 0.0 { player.pause(); } else { player.set_speed(self.rate); }
-        self.voices.push(Voice { player, gains, request, steam_audio_capable });
+        self.voices.push(Voice { player, gains, request, steam_audio_capable, volume });
+    }
+
+    /// `S_StartAmbientSound`: a one-shot at `volume` (0..=1 of full).
+    pub fn play_ambient(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
+        self.play_scaled(request, sound, volume.clamp(0.0, 1.0));
+    }
+
+    /// OpenJK S_MuteSound: fade out an entity's one-shot voices on `channel`
+    /// (all channels when negative). Real loops are owned by the presenter.
+    pub fn mute(&mut self, entity: u16, channel: i32) {
+        let (muted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.voices)
+            .into_iter()
+            .filter(|voice| !voice.player.empty())
+            .partition(|voice| voice.request.entity == entity && (channel < 0 || voice.request.channel == channel));
+        self.voices = kept;
+        for voice in muted { self.retire(voice.player, &voice.gains); }
+    }
+
+    /// OpenJK S_GetVoiceVolume(entity) > 0: the entity is mid voice line.
+    pub fn voice_active(&self, entity: u16) -> bool {
+        self.voices.iter().any(|voice| {
+            voice.request.entity == entity && is_voice_channel(voice.request.channel) && !voice.player.empty()
+        })
     }
 
     pub fn clear(&mut self) {
@@ -1879,6 +2180,11 @@ impl AudioBackend {
         for (_, voice) in std::mem::take(&mut self.loop_voices) { self.retire(voice.player, &voice.gains); }
         self.loops.clear();
         self.origins.clear();
+        // Level changes and disconnects end the background track too.
+        self.stop_music();
+        for (player, _) in std::mem::take(&mut self.music_retiring) {
+            player.detach(); // already told to stop; it ends after its fade
+        }
     }
 }
 impl Drop for AudioBackend { fn drop(&mut self) { self.clear(); } }
@@ -2103,6 +2409,49 @@ mod tests {
         assert!(!channels_stomp(2, 3));
     }
 
+    /// A mono 16-bit PCM WAV of a constant value, `frames` long at 8 kHz.
+    fn wav_bytes(value: i16, frames: u32) -> Arc<[u8]> {
+        let data_len = frames * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&8000u32.to_le_bytes());
+        bytes.extend_from_slice(&16000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for _ in 0..frames {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Arc::from(bytes)
+    }
+
+    #[test]
+    fn music_plays_its_intro_then_loops_and_fades_when_replaced() {
+        let (mut backend, mut output) = AudioBackend::offline();
+        backend.set_music_level(1.0);
+        backend.start_music(Some(wav_bytes(16384, 400)), wav_bytes(-16384, 400)).unwrap();
+        assert!(backend.music_playing());
+        // Fade in from silence, then the positive intro reaches the mixer.
+        let intro: Vec<f32> = output.by_ref().take(2 * 48_000).collect();
+        assert!(intro[0].abs() < 0.001, "starts (near) silent and fades in");
+        assert!(intro.iter().any(|&sample| sample > 0.01), "intro audible");
+        // 400 frames at 8 kHz is 50 ms: long finished. The loop must be chained on.
+        backend.frame(backend.listener, std::iter::empty());
+        assert!(backend.music.as_ref().is_some_and(|voice| voice.pending_loop.is_none()), "loop took over");
+        let looped: Vec<f32> = output.by_ref().take(4 * 48_000).collect();
+        assert!(looped.iter().any(|&sample| sample < -0.01), "loop audible and repeating past its own length");
+        // Replacing the track fades the old one rather than cutting it.
+        backend.stop_music();
+        assert!(!backend.music_playing());
+        assert!(backend.music_retiring.iter().all(|(_, control)| control.stopping.load(Ordering::Relaxed)));
+    }
+
     #[test]
     fn offline_mixer_outputs_pcm_and_tracks_entity_movement() {
         let (mut backend, mut output) = AudioBackend::offline();
@@ -2151,7 +2500,7 @@ mod tests {
         let (mut backend, _output) = AudioBackend::offline();
         backend.set_mix(0.5, 1.0, 0.5);
         let hum = Arc::new(RegisteredSound { samples: vec![0.1; 4410].into(), sample_rate: rodio::nz!(44100) });
-        let at = |qpath: &str, origin| (LoopRequest { qpath: qpath.into(), origin }, Arc::clone(&hum));
+        let at = |qpath: &str, origin| (LoopRequest { qpath: qpath.into(), origin, volume: 1.0 }, Arc::clone(&hum));
         // Two sabers humming at the listener plus one hard right: one channel.
         backend.set_loops(vec![
             at("hum.wav", SoundOrigin::Local),
@@ -2211,6 +2560,38 @@ mod tests {
         assert!(tail.len() <= (STOP_FADE_SECONDS * 48000.0) as usize + 1);
         assert!(tail.windows(2).all(|w| w[1] <= w[0]));
         assert_eq!(source.current_span_len(), Some(0));
+    }
+
+    /// Every stock `sound/` file must decode to at least one sample (regression
+    /// for rodio's gapless trimming emptying short MP3s). Slow; ignored by default.
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock assets"]
+    fn every_stock_sound_decodes_to_samples() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        let names: Vec<String> = assets
+            .names()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                (lower.starts_with("sound/") || lower.starts_with("music/"))
+                    && (lower.ends_with(".wav") || lower.ends_with(".mp3"))
+            })
+            .map(str::to_owned)
+            .collect();
+        let mut failures: Vec<String> = Vec::new();
+        let mut ok = 0usize;
+        for name in &names {
+            let Ok(Some(asset)) = assets.read(name, MAX_SOUND_BYTES) else { continue };
+            match decode_sound(asset.bytes) {
+                Ok(_) => ok += 1,
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        println!("decoded {ok}/{} stock sounds; {} failures", names.len(), failures.len());
+        for failure in failures.iter().take(40) {
+            println!("  {failure}");
+        }
+        assert!(failures.len() * 200 < names.len(), "too many undecodable stock sounds");
     }
 
     #[test]

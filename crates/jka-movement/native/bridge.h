@@ -92,6 +92,14 @@ typedef struct jka_saber_movement_info_s {
     int32_t ready_anim;
     int32_t draw_anim;
     int32_t putaway_anim;
+    /* Local authority only: reserve the first non-client entity slot as the
+     * playerState ownership token. Network prediction keeps the snapshot's
+     * saberEntityNum untouched. */
+    int32_t owns_entity_slot;
+    /* Local authority only (Cmd_SaberAttackCycle_f / ClientThink stance rules):
+     * blade toggling limits and the stance used with one blade lit. */
+    int32_t no_manual_deactivate, no_manual_deactivate2;
+    int32_t blade_style2_start, single_blade_style;
 } jka_saber_movement_info;
 
 /* Server-provided Pmove configuration for CG_PredictPlayerState. */

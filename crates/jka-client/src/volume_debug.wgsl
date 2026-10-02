@@ -40,3 +40,14 @@ fn fs_fill(input: VsOut) -> @location(0) vec4<f32> {
 fn fs_line(input: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(input.color, 0.90);
 }
+
+// Sun-ray preview: a solid depth-tested beam plus a faint always-on-top copy.
+@fragment
+fn fs_ray(input: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 0.95);
+}
+
+@fragment
+fn fs_ray_ghost(input: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 0.30);
+}

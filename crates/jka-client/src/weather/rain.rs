@@ -1,7 +1,11 @@
 use crate::{
     camera::Camera,
     scene::WeatherOcclusionSource,
-    ui::RainIntensity,
+    ui::{PuddleQuality, RainIntensity},
+};
+use super::{
+    cpu_field::CpuField,
+    wake::{WakeEvent, WakeTracker, WAKE_LIFETIME, WAKE_MAX_EVENTS, WAKE_RING_SPEED},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -14,15 +18,20 @@ use wgpu::util::DeviceExt;
 
 pub(crate) const RAIN_MAX_PARTICLES: u32 = 32_768;
 pub(crate) const RAIN_COMPUTE_GROUP_SIZE: u32 = 128;
-const WEATHER_OCCLUSION_TARGET_TEXEL: f32 = 8.0;
-const WEATHER_OCCLUSION_MIN_AXIS: u32 = 64;
-const WEATHER_OCCLUSION_MAX_AXIS: u32 = 1024;
 pub(crate) const RAIN_HAZE_MASK_WIDTH: u32 = 64;
 pub(crate) const RAIN_HAZE_MASK_MIN_HEIGHT: u32 = 16;
 pub(crate) const RAIN_HAZE_MASK_MAX_HEIGHT: u32 = 64;
 pub(crate) const WEATHER_NO_SURFACE_HEIGHT: f32 = -1.0e20;
+// Grass reads this short range from the shared uniform: its per-blade wetness is
+// only worth evaluating in the near field.
 pub(crate) const RAIN_WETNESS_FADE_START: f32 = 450.0;
 pub(crate) const RAIN_WETNESS_FADE_END: f32 = 1150.0;
+// Ground and walls stay wet much farther out so a wet street keeps reflecting all
+// the way down its length instead of turning dry a block away.
+const RAIN_FILM_FADE_START: f32 = 1400.0;
+const RAIN_FILM_FADE_END: f32 = 4200.0;
+// Extra reflectivity of a wet film under High puddle water.
+const RAIN_FILM_GLOSS_HIGH: f32 = 1.5;
 pub(crate) const RAIN_WETNESS_RISE_SECONDS: f32 = 2.5;
 pub(crate) const RAIN_WETNESS_DRY_SECONDS: f32 = 12.0;
 pub(crate) const RAIN_WETNESS_EPSILON: f32 = 0.002;
@@ -83,10 +92,37 @@ fn filtering_sampler_entry_compute(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct WeatherSurfaceUniform {
+    /// Wetness, grass fade start/end, rain-intensity response.
     pub amount_distance: [f32; 4],
+    /// Puddle accumulation, ripple time, ripple strength, debug view.
     pub puddle: [f32; 4],
     pub occlusion_uv: [f32; 4],
     pub occlusion_size: [u32; 4],
+    /// Scattered puddle amount, reflection streak strength, high-quality water,
+    /// wet-film gloss.
+    pub look: [f32; 4],
+    /// Wet-film fade start/end in world units.
+    pub film_fade: [f32; 4],
+    /// Light travel direction (render space) and relative intensity (250 = 1).
+    pub sun_direction: [f32; 4],
+    pub sun_radiance: [f32; 4],
+    /// Render-space wind X/Z in world units per second.
+    pub wind: [f32; 4],
+    /// Wake event count, lifetime, ring speed and the current time.
+    pub wake_info: [f32; 4],
+    pub wake_a: [[f32; 4]; WAKE_MAX_EVENTS],
+    pub wake_b: [[f32; 4]; WAKE_MAX_EVENTS],
+}
+
+/// Frame environment the surface shaders need besides the rain state itself.
+pub(crate) struct WeatherSurfaceEnvironment<'a> {
+    pub sun_direction: [f32; 3],
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    pub wind: [f32; 2],
+    /// The map has a real skybox for the water to mirror.
+    pub has_sky: bool,
+    pub wake: &'a [WakeEvent],
 }
 
 #[repr(C)]
@@ -101,10 +137,26 @@ struct RainSimUniform {
     weather: [f32; 4],
     collision_uv: [f32; 4],
     counts: [u32; 4],
+    /// x: number of water volumes. Rain lands on the top of each one.
+    water_info: [f32; 4],
+    water_min: [[f32; 4]; RAIN_MAX_WATER_VOLUMES],
+    water_max: [[f32; 4]; RAIN_MAX_WATER_VOLUMES],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct RainRenderUniform { appearance: [f32; 4], splash: [f32; 4], color: [f32; 4] }
+struct RainRenderUniform {
+    appearance: [f32; 4],
+    splash: [f32; 4],
+    color: [f32; 4],
+    /// Scattered puddle amount for splash rings, 1 while the camera is under
+    /// water (all rain is then above the surface and must not be drawn), reserved.
+    look: [f32; 4],
+}
+
+const RAIN_MAX_WATER_VOLUMES: usize = 8;
+
+// How quickly the camera's exposure settles when it walks under or out from cover.
+const CAMERA_EXPOSURE_SECONDS: f32 = 0.6;
 
 #[derive(Clone, Copy)]
 pub(crate) struct WeatherOcclusionInfo { pub min_xz: [f32; 2], pub inv_extent_xz: [f32; 2], pub width: u32, pub height: u32 }
@@ -134,8 +186,11 @@ pub(crate) struct RainGpuResources {
     pub render_bind_group: wgpu::BindGroup,
     pub render_pipeline_layout: wgpu::PipelineLayout,
     pub render_shader: wgpu::ShaderModule,
-    pub drop_pipeline: wgpu::RenderPipeline,
-    pub splash_pipeline: wgpu::RenderPipeline,
+    /// Compiled on first use while rain is enabled (see `ensure_render_pipelines`).
+    pub drop_pipeline: Option<wgpu::RenderPipeline>,
+    pub splash_pipeline: Option<wgpu::RenderPipeline>,
+    pub render_format: wgpu::TextureFormat,
+    pub render_samples: u32,
 }
 
 pub(crate) struct RainHazeResources {
@@ -153,6 +208,17 @@ pub(crate) struct RainSystem {
     pub surface_wetness: f32,
     pub puddle_amount: f32,
     pub puddle_debug_visualization: bool,
+    pub puddle_quality: PuddleQuality,
+    /// How readily rain collects in scattered puddles on large flat ground, 0..1.
+    pub puddle_scatter: f32,
+    /// User strength of the wet-weather colour grade, 0..1.
+    pub wet_grade: f32,
+    /// CPU copy of the weather field: camera exposure for the grade, and whether
+    /// a footstep landed in water.
+    cpu_field: Option<CpuField>,
+    /// Smoothed 0..1 exposure of the camera to the rain (0 indoors).
+    camera_exposure: f32,
+    pub wake: WakeTracker,
     pub surface_wetness_last_time: f32,
 }
 
@@ -181,14 +247,43 @@ impl RainSystem {
             surface_wetness: 0.0,
             puddle_amount: 0.0,
             puddle_debug_visualization: false,
+            puddle_quality: PuddleQuality::default(),
+            puddle_scatter: 0.0,
+            wet_grade: 0.0,
+            cpu_field: None,
+            camera_exposure: 1.0,
+            wake: WakeTracker::default(),
             surface_wetness_last_time: 0.0,
         }
+    }
+
+    /// Rain-intensity response shared by the wet film and the colour grade.
+    fn intensity_response(&self) -> f32 {
+        match self.intensity {
+            RainIntensity::Light => 0.72,
+            RainIntensity::Rain => 0.88,
+            RainIntensity::Heavy => 1.0,
+        }
+    }
+
+    /// How far the wet-weather colour grade is faded in: it follows the surface
+    /// wetness, so it eases in as the ground darkens and out as it dries, and the
+    /// camera's exposure, so it is absent indoors.
+    pub(crate) fn grade_amount(&self) -> f32 {
+        (self.wet_grade
+            * self.surface_wetness
+            * self.intensity_response()
+            * self.camera_exposure)
+            .clamp(0.0, 1.0)
     }
 
     pub(crate) fn start_map_occlusion(&mut self, source: Option<WeatherOcclusionSource>) {
         self.occlusion = source
             .map(start_weather_occlusion_build)
             .unwrap_or(WeatherOcclusionCache::Unavailable);
+        self.cpu_field = None;
+        self.camera_exposure = 1.0;
+        self.wake.clear();
         self.surface_wetness = 0.0;
         self.puddle_amount = 0.0;
         self.surface_wetness_last_time = 0.0;
@@ -219,20 +314,33 @@ impl RainSystem {
         surface_format: wgpu::TextureFormat,
         sample_count: u32,
     ) {
-        self.gpu.drop_pipeline = create_rain_drop_pipeline(
+        // Rain is off by default; drop the stale pipelines and let
+        // `ensure_render_pipelines` recompile them only while rain is enabled.
+        let _ = device;
+        self.gpu.render_format = surface_format;
+        self.gpu.render_samples = sample_count;
+        self.gpu.drop_pipeline = None;
+        self.gpu.splash_pipeline = None;
+    }
+
+    pub(crate) fn ensure_render_pipelines(&mut self, device: &wgpu::Device) {
+        if self.gpu.drop_pipeline.is_some() && self.gpu.splash_pipeline.is_some() {
+            return;
+        }
+        self.gpu.drop_pipeline = Some(create_rain_drop_pipeline(
             device,
             &self.gpu.render_pipeline_layout,
             &self.gpu.render_shader,
-            surface_format,
-            sample_count,
-        );
-        self.gpu.splash_pipeline = create_rain_splash_pipeline(
+            self.gpu.render_format,
+            self.gpu.render_samples,
+        ));
+        self.gpu.splash_pipeline = Some(create_rain_splash_pipeline(
             device,
             &self.gpu.render_pipeline_layout,
             &self.gpu.render_shader,
-            surface_format,
-            sample_count,
-        );
+            self.gpu.render_format,
+            self.gpu.render_samples,
+        ));
     }
 
     pub(crate) fn collision_view(&self) -> &wgpu::TextureView {
@@ -262,15 +370,41 @@ impl RainSystem {
         if !self.enabled {
             return;
         }
+        let (Some(drop_pipeline), Some(splash_pipeline)) =
+            (self.gpu.drop_pipeline.as_ref(), self.gpu.splash_pipeline.as_ref())
+        else {
+            return;
+        };
         let count = self.intensity.particle_count().min(RAIN_MAX_PARTICLES);
-        pass.set_pipeline(&self.gpu.drop_pipeline);
+        pass.set_pipeline(drop_pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
         pass.set_bind_group(1, &self.gpu.render_bind_group, &[]);
         pass.draw(0..4, 0..count);
 
-        pass.set_pipeline(&self.gpu.splash_pipeline);
+        pass.set_pipeline(splash_pipeline);
         let splash_count = self.intensity.splash_particle_count().min(count);
         pass.draw(0..6, 0..splash_count);
+    }
+
+    /// Advances the footstep/wake tracker. `people` are render-space sole positions
+    /// of everyone who may wade. Tracking only runs while there is standing water
+    /// to disturb, and only footsteps that land in it are kept.
+    pub(crate) fn update_wake(&mut self, camera: Vec3, people: impl IntoIterator<Item = (u32, Vec3)>) {
+        let now = self.surface_wetness_last_time;
+        let Some(field) = self.cpu_field.as_ref().filter(|_| self.puddle_amount > 10.0 * RAIN_PUDDLE_EPSILON)
+        else {
+            self.wake.clear();
+            return;
+        };
+        let (accumulation, scatter) = (self.puddle_amount, self.puddle_scatter);
+        self.wake.update(now, camera, people, &|position: Vec3| {
+            field.puddle_at(position.to_array(), accumulation, scatter)
+        });
+    }
+
+    /// Splashes made since the last call, for the FX system to play.
+    pub(crate) fn take_water_splashes(&mut self) -> Vec<super::wake::WaterSplash> {
+        self.wake.take_splashes()
     }
 
     pub(crate) fn dispatch_haze(
@@ -291,7 +425,7 @@ impl RainSystem {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
-    pub(crate) fn advance_surface_wetness(&mut self, frame_time: f32) -> bool {
+    pub(crate) fn advance_surface_wetness(&mut self, frame_time: f32, camera_position: [f32; 3]) -> bool {
         let was_active = self.surface_wetness > RAIN_WETNESS_EPSILON
             || self.puddle_amount > RAIN_PUDDLE_EPSILON;
         let dt = if self.surface_wetness_last_time > 0.0 {
@@ -300,6 +434,13 @@ impl RainSystem {
             1.0 / 120.0
         };
         self.surface_wetness_last_time = frame_time;
+
+        let exposure_target = self
+            .cpu_field
+            .as_ref()
+            .map_or(1.0, |field| field.exposure_at(camera_position));
+        let settle = 1.0 - (-dt / CAMERA_EXPOSURE_SECONDS).exp();
+        self.camera_exposure += (exposure_target - self.camera_exposure) * settle;
 
         let wet_target = if self.enabled { 1.0 } else { 0.0 };
         if wet_target > self.surface_wetness {
@@ -334,7 +475,12 @@ impl RainSystem {
         was_active && self.surface_wetness == 0.0 && self.puddle_amount == 0.0
     }
 
-    pub(crate) fn write_surface_uniform(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer) {
+    pub(crate) fn write_surface_uniform(
+        &self,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        environment: &WeatherSurfaceEnvironment,
+    ) {
         let (occlusion_uv, width, height, active) = match &self.occlusion {
             WeatherOcclusionCache::Ready(info) => (
                 [info.min_xz[0], info.min_xz[1], info.inv_extent_xz[0], info.inv_extent_xz[1]],
@@ -342,11 +488,7 @@ impl RainSystem {
             ),
             WeatherOcclusionCache::Pending(_) | WeatherOcclusionCache::Building(_) | WeatherOcclusionCache::Unavailable => ([0.0; 4], 0, 0, 0),
         };
-        let intensity = match self.intensity {
-            RainIntensity::Light => 0.72,
-            RainIntensity::Rain => 0.88,
-            RainIntensity::Heavy => 1.0,
-        };
+        let intensity = self.intensity_response();
         let ripple_intensity = match self.intensity {
             RainIntensity::Light => 0.28,
             RainIntensity::Rain => 0.58,
@@ -365,6 +507,41 @@ impl RainSystem {
                 ],
                 occlusion_uv,
                 occlusion_size: [width, height, active, 0],
+                look: {
+                    let high = self.puddle_quality.is_high();
+                    [
+                        self.puddle_scatter,
+                        if high { 1.0 } else { 0.0 },
+                        if high { 1.0 } else { 0.0 },
+                        if high { RAIN_FILM_GLOSS_HIGH } else { 1.0 },
+                    ]
+                },
+                film_fade: [RAIN_FILM_FADE_START, RAIN_FILM_FADE_END, 0.0, 0.0],
+                sun_direction: [
+                    environment.sun_direction[0],
+                    environment.sun_direction[1],
+                    environment.sun_direction[2],
+                    (environment.sun_intensity / 250.0).clamp(0.0, 4.0),
+                ],
+                sun_radiance: [
+                    environment.sun_color[0].max(0.0),
+                    environment.sun_color[1].max(0.0),
+                    environment.sun_color[2].max(0.0),
+                    if environment.has_sky { 1.0 } else { 0.0 },
+                ],
+                wind: [environment.wind[0], environment.wind[1], 0.0, 0.0],
+                wake_info: [
+                    environment.wake.len().min(WAKE_MAX_EVENTS) as f32,
+                    WAKE_LIFETIME,
+                    WAKE_RING_SPEED,
+                    self.surface_wetness_last_time,
+                ],
+                wake_a: std::array::from_fn(|i| {
+                    environment.wake.get(i).map_or([0.0; 4], WakeEvent::packed_position)
+                }),
+                wake_b: std::array::from_fn(|i| {
+                    environment.wake.get(i).map_or([0.0; 4], WakeEvent::packed_shape)
+                }),
             }),
         );
     }
@@ -395,6 +572,7 @@ impl RainSystem {
             return None;
         };
         let basin_cells = built.surface_field.iter().filter(|cell| cell[3] > 0.01).count();
+        let scatter_cells = built.surface_field.iter().filter(|cell| cell[2] > 0.05).count();
         let topography_cells = built
             .surface_field
             .iter()
@@ -420,11 +598,12 @@ impl RainSystem {
         );
         self.gpu._collision_texture = texture;
         self.gpu.collision_view = view;
+        self.cpu_field = Some(CpuField::new(built.info, built.surface_field));
         self.occlusion = WeatherOcclusionCache::Ready(built.info);
         println!(
-            "Weather surface field: background CPU solve {}x{} from {} BSP brush(es), {} blocker triangle(s), {} rendered topography triangle(s); {}/{} top-visible topography texels are puddle basins; CPU {:.1} ms",
+            "Weather surface field: background CPU solve {}x{} from {} BSP brush(es), {} blocker triangle(s), {} rendered topography triangle(s); {}/{} top-visible topography texels are puddle basins, {} are large flat ground for scattered puddles; CPU {:.1} ms",
             built.info.width, built.info.height, built.brush_count, built.triangle_count,
-            built.topography_triangle_count, basin_cells, topography_cells, built.build_ms,
+            built.topography_triangle_count, basin_cells, topography_cells, scatter_cells, built.build_ms,
         );
         Some(weather_height_view)
     }
@@ -441,6 +620,8 @@ impl RainSystem {
         weather_wind: crate::ocean::OceanWind,
         sun_color: [f32; 3],
         sun_intensity: f32,
+        water_boxes: &[([f32; 3], [f32; 3])],
+        camera_underwater: bool,
     ) {
         let (streak_length, streak_width, fall_speed, spawn_radius, below, above, opacity, splash_size, splash_time) = match self.intensity {
             RainIntensity::Light => (30.0, 0.68, 1_400.0, 1_000.0, 300.0, 1_050.0, 0.17, 9.0, 0.22),
@@ -485,6 +666,9 @@ impl RainSystem {
                 collision_height,
                 self.intensity.splash_particle_count().min(RAIN_MAX_PARTICLES),
             ],
+            water_info: [water_boxes.len().min(RAIN_MAX_WATER_VOLUMES) as f32, 0.0, 0.0, 0.0],
+            water_min: water_volume_lanes(water_boxes, |(lo, _)| *lo),
+            water_max: water_volume_lanes(water_boxes, |(_, hi)| *hi),
         };
         queue.write_buffer(&self.gpu.sim_uniform_buffer, 0, bytemuck::bytes_of(&sim));
 
@@ -496,9 +680,22 @@ impl RainSystem {
             appearance: [streak_length, streak_width, opacity, splash_size],
             splash: [splash_time, viewport_width.max(1) as f32, viewport_height.max(1) as f32, self.puddle_amount],
             color: [lit.x, lit.y, lit.z, 1.0],
+            look: [self.puddle_scatter, if camera_underwater { 1.0 } else { 0.0 }, 0.0, 0.0],
         };
         queue.write_buffer(&self.gpu.render_uniform_buffer, 0, bytemuck::bytes_of(&render));
     }
+}
+
+fn water_volume_lanes(
+    boxes: &[([f32; 3], [f32; 3])],
+    pick: impl Fn(&([f32; 3], [f32; 3])) -> [f32; 3],
+) -> [[f32; 4]; RAIN_MAX_WATER_VOLUMES] {
+    let mut lanes = [[0.0; 4]; RAIN_MAX_WATER_VOLUMES];
+    for (lane, water) in lanes.iter_mut().zip(boxes) {
+        let [x, y, z] = pick(water);
+        *lane = [x, y, z, 0.0];
+    }
+    lanes
 }
 
 pub(crate) fn rain_haze_mask_dimensions(viewport_width: u32, viewport_height: u32) -> (u32, u32) {
@@ -534,7 +731,7 @@ fn create_rain_haze_resources(device: &wgpu::Device) -> RainHazeResources {
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("JKA rain haze exposure shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../rain_haze_mask.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(super::with_post_settings(include_str!("../rain_haze_mask.wgsl")).into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("JKA rain haze exposure pipeline layout"),
@@ -615,7 +812,7 @@ pub(crate) fn build_weather_occlusion_cpu(source: &WeatherOcclusionSource) -> Op
     let brush_count = source.brushes.len();
     let triangle_count = source.triangles.len();
     let topography_triangle_count = source.topography_triangles.len();
-    let (info, surface_field) = build_weather_occlusion_heightfield(source)?;
+    let (info, surface_field) = super::field::build_heightfield(source)?;
     Some(WeatherOcclusionBuildResult {
         info,
         surface_field,
@@ -624,483 +821,6 @@ pub(crate) fn build_weather_occlusion_cpu(source: &WeatherOcclusionSource) -> Op
         topography_triangle_count,
         build_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
-}
-
-fn weather_occlusion_axis_size(extent: f32) -> u32 {
-    if !extent.is_finite() || extent <= 1.0 {
-        return WEATHER_OCCLUSION_MIN_AXIS;
-    }
-    ((extent / WEATHER_OCCLUSION_TARGET_TEXEL).ceil() as u32)
-        .clamp(WEATHER_OCCLUSION_MIN_AXIS, WEATHER_OCCLUSION_MAX_AXIS)
-}
-
-fn build_weather_occlusion_heightfield(
-    source: &WeatherOcclusionSource,
-) -> Option<(WeatherOcclusionInfo, Vec<[f32; 4]>)> {
-    let extent_x = source.max_xz[0] - source.min_xz[0];
-    let extent_z = source.max_xz[1] - source.min_xz[1];
-    if !extent_x.is_finite()
-        || !extent_z.is_finite()
-        || extent_x <= 1.0
-        || extent_z <= 1.0
-        || (source.brushes.is_empty()
-            && source.triangles.is_empty()
-            && source.topography_triangles.is_empty())
-    {
-        return None;
-    }
-
-    let width = weather_occlusion_axis_size(extent_x);
-    let height = weather_occlusion_axis_size(extent_z);
-    let step_x = extent_x / width as f32;
-    let step_z = extent_z / height as f32;
-
-    // RGBA32F immutable weather field, generated lazily on the first weather
-    // activation for the current map:
-    //   R = highest rain-blocking Y (used by rain/exposure)
-    //   G = highest physical top-facing rendered surface Y
-    //   B = physical upwardness of that top surface
-    //   A = camera-independent coherent terrace-basin score
-    //
-    // This deliberately separates "blocks rain" from "can hold standing water".
-    // Many authored JKA planar shader faces are real visible floors without being
-    // represented by the collision subset used by the old rain heightfield.
-    let mut field = vec![
-        [WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0];
-        (width as usize) * (height as usize)
-    ];
-
-    // First build the rain blocker height in R from solid/terrain brushes.
-    for brush in &source.brushes {
-        let brush_min_x = brush.mins_xy[0];
-        let brush_max_x = brush.maxs_xy[0];
-        let brush_min_z = -brush.maxs_xy[1];
-        let brush_max_z = -brush.mins_xy[1];
-
-        let px0 = (((brush_min_x - source.min_xz[0]) / step_x).floor() as i32)
-            .clamp(0, width as i32 - 1) as u32;
-        let px1 = (((brush_max_x - source.min_xz[0]) / step_x).ceil() as i32)
-            .clamp(0, width as i32) as u32;
-        let pz0 = (((brush_min_z - source.min_xz[1]) / step_z).floor() as i32)
-            .clamp(0, height as i32 - 1) as u32;
-        let pz1 = (((brush_max_z - source.min_xz[1]) / step_z).ceil() as i32)
-            .clamp(0, height as i32) as u32;
-        if px0 >= px1 || pz0 >= pz1 {
-            continue;
-        }
-
-        for pz in pz0..pz1 {
-            let render_z = source.min_xz[1] + (pz as f32 + 0.5) * step_z;
-            let jka_y = -render_z;
-            for px in px0..px1 {
-                let jka_x = source.min_xz[0] + (px as f32 + 0.5) * step_x;
-                let mut lower = f32::NEG_INFINITY;
-                let mut upper = f32::INFINITY;
-                let mut inside = true;
-
-                for side in &brush.sides {
-                    let [nx, ny, nz] = side.normal;
-                    let remaining = side.distance - nx * jka_x - ny * jka_y;
-                    if nz.abs() <= 1.0e-6 {
-                        if remaining < -0.05 {
-                            inside = false;
-                            break;
-                        }
-                    } else {
-                        let bound = remaining / nz;
-                        if nz > 0.0 {
-                            upper = upper.min(bound);
-                        } else {
-                            lower = lower.max(bound);
-                        }
-                    }
-                }
-
-                if !inside || !upper.is_finite() || lower > upper + 0.05 {
-                    continue;
-                }
-                let offset = pz as usize * width as usize + px as usize;
-                field[offset][0] = field[offset][0].max(upper);
-            }
-        }
-    }
-
-    // Tessellated patch/triangle collision supplements also block rain.
-    for triangle in &source.triangles {
-        let to_render_xz = |p: [f32; 3]| [p[0], -p[1]];
-        let a = to_render_xz(triangle.positions[0]);
-        let b = to_render_xz(triangle.positions[1]);
-        let c = to_render_xz(triangle.positions[2]);
-        let min_tx = a[0].min(b[0]).min(c[0]);
-        let max_tx = a[0].max(b[0]).max(c[0]);
-        let min_tz = a[1].min(b[1]).min(c[1]);
-        let max_tz = a[1].max(b[1]).max(c[1]);
-        let px0 = (((min_tx - source.min_xz[0]) / step_x).floor() as i32)
-            .clamp(0, width as i32 - 1) as u32;
-        let px1 = (((max_tx - source.min_xz[0]) / step_x).ceil() as i32)
-            .clamp(0, width as i32) as u32;
-        let pz0 = (((min_tz - source.min_xz[1]) / step_z).floor() as i32)
-            .clamp(0, height as i32 - 1) as u32;
-        let pz1 = (((max_tz - source.min_xz[1]) / step_z).ceil() as i32)
-            .clamp(0, height as i32) as u32;
-        if px0 >= px1 || pz0 >= pz1 {
-            continue;
-        }
-        let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
-        if denom.abs() <= 1.0e-8 {
-            continue;
-        }
-        for pz in pz0..pz1 {
-            let z = source.min_xz[1] + (pz as f32 + 0.5) * step_z;
-            for px in px0..px1 {
-                let x = source.min_xz[0] + (px as f32 + 0.5) * step_x;
-                let w0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (z - c[1])) / denom;
-                let w1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (z - c[1])) / denom;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
-                    continue;
-                }
-                let surface_y = w0 * triangle.positions[0][2]
-                    + w1 * triangle.positions[1][2]
-                    + w2 * triangle.positions[2][2];
-                let offset = pz as usize * width as usize + px as usize;
-                field[offset][0] = field[offset][0].max(surface_y);
-            }
-        }
-    }
-
-    // Build a small multi-layer topography cache for puddle classification.
-    //
-    // A JKA BSP is not a single terrain heightfield: floors, catwalks, roofs and
-    // trims can overlap at the same X/Z. The old implementation kept only the
-    // highest rendered surface per texel, which made lower-but-exposed terraces
-    // fragment or disappear when a small raised insert crossed them. Keep the
-    // four highest physical TOP-facing layers during this one-time build, then
-    // classify connected same-height terraces as a unit.
-    const PUDDLE_LAYER_CAP: usize = 4;
-    const PUDDLE_LAYER_HEIGHT_TOLERANCE: f32 = 0.75;
-    const PUDDLE_MIN_PHYSICAL_UPNESS: f32 = 0.985;
-    const PUDDLE_BOUNDARY_HEIGHT_EPSILON: f32 = 1.5;
-    const PUDDLE_MAX_RELATED_STEP: f32 = 96.0;
-    const PUDDLE_MIN_COMPONENT_TEXELS: usize = 8;
-
-    #[derive(Clone, Copy)]
-    struct PuddleLayer {
-        height: f32,
-        upness: f32,
-    }
-
-    let empty_layer = PuddleLayer {
-        height: WEATHER_NO_SURFACE_HEIGHT,
-        upness: 0.0,
-    };
-    let mut topography_layers =
-        vec![[empty_layer; PUDDLE_LAYER_CAP]; (width as usize) * (height as usize)];
-
-    let insert_topography_layer =
-        |layers: &mut [PuddleLayer; PUDDLE_LAYER_CAP], height: f32, upness: f32| {
-            // Merge coplanar triangles into the same layer first.
-            for layer in layers.iter_mut() {
-                if layer.height > WEATHER_NO_SURFACE_HEIGHT + 1.0
-                    && (layer.height - height).abs() <= PUDDLE_LAYER_HEIGHT_TOLERANCE
-                {
-                    layer.height = layer.height.max(height);
-                    layer.upness = layer.upness.max(upness);
-                    return;
-                }
-            }
-
-            // Layers are maintained highest -> lowest. If the new surface is
-            // below the retained capacity it is irrelevant to any rain-exposed
-            // puddle and can be discarded.
-            let mut insert_at = PUDDLE_LAYER_CAP;
-            for (index, layer) in layers.iter().enumerate() {
-                if height > layer.height {
-                    insert_at = index;
-                    break;
-                }
-            }
-            if insert_at >= PUDDLE_LAYER_CAP {
-                return;
-            }
-            for index in ((insert_at + 1)..PUDDLE_LAYER_CAP).rev() {
-                layers[index] = layers[index - 1];
-            }
-            layers[insert_at] = PuddleLayer { height, upness };
-        };
-
-    // Rasterize every visible non-sky world surface into the temporary
-    // multi-layer cache. Use signed physical winding here rather than abs(z):
-    // on RBSP world faces a physical upward-facing floor has negative raw-Z
-    // winding. That rejects ceiling undersides from puddle topology while still
-    // allowing explicit planar shader faces such as taspir/landing_pad.
-    for triangle in &source.topography_triangles {
-        let ab3 = Vec3::from_array(triangle.positions[1]) - Vec3::from_array(triangle.positions[0]);
-        let ac3 = Vec3::from_array(triangle.positions[2]) - Vec3::from_array(triangle.positions[0]);
-        let face = ab3.cross(ac3);
-        let face_len = face.length().max(1.0e-6);
-        let physical_upness = (-face.z / face_len).clamp(0.0, 1.0);
-        if physical_upness < PUDDLE_MIN_PHYSICAL_UPNESS {
-            continue;
-        }
-
-        let to_render_xz = |p: [f32; 3]| [p[0], -p[1]];
-        let a = to_render_xz(triangle.positions[0]);
-        let b = to_render_xz(triangle.positions[1]);
-        let c = to_render_xz(triangle.positions[2]);
-        let min_tx = a[0].min(b[0]).min(c[0]);
-        let max_tx = a[0].max(b[0]).max(c[0]);
-        let min_tz = a[1].min(b[1]).min(c[1]);
-        let max_tz = a[1].max(b[1]).max(c[1]);
-        let px0 = (((min_tx - source.min_xz[0]) / step_x).floor() as i32)
-            .clamp(0, width as i32 - 1) as u32;
-        let px1 = (((max_tx - source.min_xz[0]) / step_x).ceil() as i32)
-            .clamp(0, width as i32) as u32;
-        let pz0 = (((min_tz - source.min_xz[1]) / step_z).floor() as i32)
-            .clamp(0, height as i32 - 1) as u32;
-        let pz1 = (((max_tz - source.min_xz[1]) / step_z).ceil() as i32)
-            .clamp(0, height as i32) as u32;
-        if px0 >= px1 || pz0 >= pz1 {
-            continue;
-        }
-        let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
-        if denom.abs() <= 1.0e-8 {
-            continue;
-        }
-
-        for pz in pz0..pz1 {
-            let z = source.min_xz[1] + (pz as f32 + 0.5) * step_z;
-            for px in px0..px1 {
-                let x = source.min_xz[0] + (px as f32 + 0.5) * step_x;
-                let w0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (z - c[1])) / denom;
-                let w1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (z - c[1])) / denom;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
-                    continue;
-                }
-                let surface_y = w0 * triangle.positions[0][2]
-                    + w1 * triangle.positions[1][2]
-                    + w2 * triangle.positions[2][2];
-                let offset = pz as usize * width as usize + px as usize;
-                insert_topography_layer(
-                    &mut topography_layers[offset],
-                    surface_y,
-                    physical_upness,
-                );
-            }
-        }
-    }
-
-    // Publish the highest physical top-facing layer for shader height matching.
-    // The basin score in A is filled below for qualifying geometric terraces;
-    // ordinary wet-film exposure still uses the independent blocker R and the
-    // material shader applies cover against the actual fragment height.
-    for (offset, layers) in topography_layers.iter().enumerate() {
-        let top = layers[0];
-        if top.height > WEATHER_NO_SURFACE_HEIGHT + 1.0 {
-            field[offset][1] = top.height;
-            field[offset][2] = top.upness;
-        }
-    }
-
-    let layer_valid = |layer: PuddleLayer| -> bool {
-        layer.height > WEATHER_NO_SURFACE_HEIGHT + 1.0 && layer.height.is_finite()
-    };
-    let find_matching_layer = |cell: usize, target_height: f32| -> Option<usize> {
-        let mut best_index = None;
-        let mut best_delta = f32::INFINITY;
-        for (index, layer) in topography_layers[cell].iter().enumerate() {
-            if !layer_valid(*layer) {
-                continue;
-            }
-            let delta = (layer.height - target_height).abs();
-            if delta < best_delta {
-                best_delta = delta;
-                best_index = Some(index);
-            }
-        }
-        if best_delta <= PUDDLE_LAYER_HEIGHT_TOLERANCE {
-            best_index
-        } else {
-            None
-        }
-    };
-
-    // Classify coherent flat terraces instead of individual texels. A terrace
-    // qualifies only when essentially its entire perimeter is retained by
-    // nearby higher floor and it has almost no lower/open drainage edges. These
-    // thresholds match the world-model-only classifier verified offline against
-    // ffa5.bsp: landing_pad forms one coherent -16-unit terrace with a 0-unit
-    // spill rim instead of sparse islands.
-    let mut visited = vec![false; topography_layers.len() * PUDDLE_LAYER_CAP];
-    let mut stack = Vec::<usize>::new();
-    let mut members = Vec::<usize>::new();
-    let mut higher_deltas = Vec::<f32>::new();
-    let grid_width = width as usize;
-    let grid_height = height as usize;
-
-    let smooth_unit = |value: f32, low: f32, high: f32| -> f32 {
-        let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-
-    for cell in 0..topography_layers.len() {
-        for layer_index in 0..PUDDLE_LAYER_CAP {
-            let node = cell * PUDDLE_LAYER_CAP + layer_index;
-            if visited[node] || !layer_valid(topography_layers[cell][layer_index]) {
-                continue;
-            }
-
-            visited[node] = true;
-            stack.clear();
-            members.clear();
-            stack.push(node);
-
-            while let Some(current) = stack.pop() {
-                members.push(current);
-                let current_cell = current / PUDDLE_LAYER_CAP;
-                let current_layer = current % PUDDLE_LAYER_CAP;
-                let current_height = topography_layers[current_cell][current_layer].height;
-                let x = current_cell % grid_width;
-                let y = current_cell / grid_width;
-
-                let neighbors = [
-                    (x as i32 - 1, y as i32),
-                    (x as i32 + 1, y as i32),
-                    (x as i32, y as i32 - 1),
-                    (x as i32, y as i32 + 1),
-                ];
-                for (nx, ny) in neighbors {
-                    if nx < 0 || ny < 0 || nx >= grid_width as i32 || ny >= grid_height as i32 {
-                        continue;
-                    }
-                    let neighbor_cell = ny as usize * grid_width + nx as usize;
-                    let Some(neighbor_layer) = find_matching_layer(neighbor_cell, current_height) else {
-                        continue;
-                    };
-                    let neighbor_node = neighbor_cell * PUDDLE_LAYER_CAP + neighbor_layer;
-                    if !visited[neighbor_node] {
-                        visited[neighbor_node] = true;
-                        stack.push(neighbor_node);
-                    }
-                }
-            }
-
-            if members.len() < PUDDLE_MIN_COMPONENT_TEXELS {
-                continue;
-            }
-
-            let mut total_edges = 0_u32;
-            let mut lower_edges = 0_u32;
-            let mut open_edges = 0_u32;
-            higher_deltas.clear();
-
-            for &member in &members {
-                let member_cell = member / PUDDLE_LAYER_CAP;
-                let member_layer = member % PUDDLE_LAYER_CAP;
-                let terrace_height = topography_layers[member_cell][member_layer].height;
-                let x = member_cell % grid_width;
-                let y = member_cell / grid_width;
-                let neighbors = [
-                    (x as i32 - 1, y as i32),
-                    (x as i32 + 1, y as i32),
-                    (x as i32, y as i32 - 1),
-                    (x as i32, y as i32 + 1),
-                ];
-
-                for (nx, ny) in neighbors {
-                    if nx >= 0 && ny >= 0 && nx < grid_width as i32 && ny < grid_height as i32 {
-                        let neighbor_cell = ny as usize * grid_width + nx as usize;
-                        if find_matching_layer(neighbor_cell, terrace_height).is_some() {
-                            // Same terrace continues through this edge, including
-                            // beneath a small higher insert/trim layer.
-                            continue;
-                        }
-                    }
-
-                    total_edges += 1;
-                    if nx < 0 || ny < 0 || nx >= grid_width as i32 || ny >= grid_height as i32 {
-                        open_edges += 1;
-                        continue;
-                    }
-
-                    let neighbor_cell = ny as usize * grid_width + nx as usize;
-                    let mut closest_height = None;
-                    let mut closest_delta = f32::INFINITY;
-                    for layer in topography_layers[neighbor_cell] {
-                        if !layer_valid(layer) {
-                            continue;
-                        }
-                        let delta = (layer.height - terrace_height).abs();
-                        if delta <= PUDDLE_MAX_RELATED_STEP && delta < closest_delta {
-                            closest_delta = delta;
-                            closest_height = Some(layer.height);
-                        }
-                    }
-
-                    let Some(neighbor_height) = closest_height else {
-                        open_edges += 1;
-                        continue;
-                    };
-                    let delta = neighbor_height - terrace_height;
-                    if delta > PUDDLE_BOUNDARY_HEIGHT_EPSILON {
-                        higher_deltas.push(delta);
-                    } else if delta < -PUDDLE_BOUNDARY_HEIGHT_EPSILON {
-                        lower_edges += 1;
-                    }
-                }
-            }
-
-            if total_edges == 0 || higher_deltas.is_empty() {
-                continue;
-            }
-
-            let higher_fraction = higher_deltas.len() as f32 / total_edges as f32;
-            let drain_fraction = (lower_edges + open_edges) as f32 / total_edges as f32;
-            higher_deltas.sort_by(|a, b| a.total_cmp(b));
-            let spill_index = (((higher_deltas.len() - 1) as f32) * 0.10).floor() as usize;
-            let spill_depth = higher_deltas[spill_index];
-
-            if higher_fraction < 0.78 || drain_fraction > 0.05 || spill_depth < 2.0 {
-                continue;
-            }
-
-            // Depth controls how soon the basin becomes visibly flooded as the
-            // global rain accumulation rises. A 16-unit landing_pad depression
-            // reaches full score; a very shallow lip only appears under heavy rain.
-            let basin_score = smooth_unit(spill_depth, 1.5, 10.0);
-
-            for &member in &members {
-                let member_cell = member / PUDDLE_LAYER_CAP;
-                let member_layer = member % PUDDLE_LAYER_CAP;
-                // Only the highest physical top-facing surface at this X/Z is
-                // eligible to receive direct rainfall. Lower terraces remain in
-                // the component solve so small overlying inserts do not fragment
-                // the basin, but they are never rendered as puddles through cover.
-                if member_layer != 0 {
-                    continue;
-                }
-
-                // Store the geometric basin result exactly as classified. Rain
-                // exposure is deliberately NOT baked into the basin channel: the
-                // material shader already evaluates the shared cover height against
-                // the actual fragment height every frame. Baking exposure here was
-                // both redundant and could erase a valid recessed terrace when the
-                // collision roof field differed slightly from the rendered floor.
-                field[member_cell][3] = field[member_cell][3].max(basin_score);
-            }
-        }
-    }
-
-    Some((
-        WeatherOcclusionInfo {
-            min_xz: source.min_xz,
-            inv_extent_xz: [1.0 / extent_x, 1.0 / extent_z],
-            width,
-            height,
-        },
-        field,
-    ))
 }
 
 pub(crate) fn create_rain_height_texture(
@@ -1227,6 +947,9 @@ fn create_rain_gpu_resources(
             weather: [0.0, 0.0, 0.0, 0.0],
             collision_uv: [0.0; 4],
             counts: [14_000, 0, 0, 3_500],
+            water_info: [0.0; 4],
+            water_min: [[0.0; 4]; RAIN_MAX_WATER_VOLUMES],
+            water_max: [[0.0; 4]; RAIN_MAX_WATER_VOLUMES],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -1282,6 +1005,7 @@ fn create_rain_gpu_resources(
             appearance: [18.0, 1.40, 0.21, 11.5],
             splash: [0.26, 1.0, 1.0, 0.0],
             color: [0.82, 0.88, 0.94, 1.0],
+            look: [0.0; 4],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -1313,22 +1037,8 @@ fn create_rain_gpu_resources(
     });
     let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("JKA GPU rain render shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../rain.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(super::with_weather_surface(include_str!("../rain.wgsl")).into()),
     });
-    let drop_pipeline = create_rain_drop_pipeline(
-        device,
-        &render_pipeline_layout,
-        &render_shader,
-        surface_format,
-        sample_count,
-    );
-    let splash_pipeline = create_rain_splash_pipeline(
-        device,
-        &render_pipeline_layout,
-        &render_shader,
-        surface_format,
-        sample_count,
-    );
 
     RainGpuResources {
         _collision_texture: collision_texture,
@@ -1344,8 +1054,10 @@ fn create_rain_gpu_resources(
         render_bind_group,
         render_pipeline_layout,
         render_shader,
-        drop_pipeline,
-        splash_pipeline,
+        drop_pipeline: None,
+        splash_pipeline: None,
+        render_format: surface_format,
+        render_samples: sample_count,
     }
 }
 
@@ -1439,4 +1151,87 @@ fn create_rain_splash_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod layout_tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// Byte size and member offsets of a named WGSL struct, as naga lays it out.
+    pub(crate) fn wgsl_struct_layout(source: &str, name: &str) -> (u32, Vec<(String, u32)>) {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+        let (_, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("WGSL struct {name} not found"));
+        let wgpu::naga::TypeInner::Struct { members, span } = &ty.inner else {
+            panic!("{name} is not a struct");
+        };
+        let offsets = members
+            .iter()
+            .map(|member| (member.name.clone().unwrap_or_default(), member.offset))
+            .collect();
+        (*span, offsets)
+    }
+
+    pub(crate) fn offset_of_member(members: &[(String, u32)], name: &str) -> u32 {
+        members
+            .iter()
+            .find(|(member, _)| member == name)
+            .unwrap_or_else(|| panic!("WGSL member {name} not found"))
+            .1
+    }
+
+    #[test]
+    fn weather_surface_uniform_matches_its_wgsl_struct() {
+        let (size, members) = wgsl_struct_layout(
+            include_str!("../weather_surface.wgsl"),
+            "WeatherSurfaceSettings",
+        );
+        assert_eq!(size as usize, size_of::<WeatherSurfaceUniform>());
+        for (name, rust_offset) in [
+            ("amount_distance", offset_of!(WeatherSurfaceUniform, amount_distance)),
+            ("puddle", offset_of!(WeatherSurfaceUniform, puddle)),
+            ("occlusion_uv", offset_of!(WeatherSurfaceUniform, occlusion_uv)),
+            ("occlusion_size", offset_of!(WeatherSurfaceUniform, occlusion_size)),
+            ("look", offset_of!(WeatherSurfaceUniform, look)),
+            ("film_fade", offset_of!(WeatherSurfaceUniform, film_fade)),
+            ("sun_direction", offset_of!(WeatherSurfaceUniform, sun_direction)),
+            ("sun_radiance", offset_of!(WeatherSurfaceUniform, sun_radiance)),
+            ("wind", offset_of!(WeatherSurfaceUniform, wind)),
+            ("wake_info", offset_of!(WeatherSurfaceUniform, wake_info)),
+            ("wake_a", offset_of!(WeatherSurfaceUniform, wake_a)),
+            ("wake_b", offset_of!(WeatherSurfaceUniform, wake_b)),
+        ] {
+            assert_eq!(offset_of_member(&members, name) as usize, rust_offset, "{name}");
+        }
+    }
+
+    #[test]
+    fn rain_render_uniform_matches_its_wgsl_struct() {
+        let source = super::super::with_weather_surface(include_str!("../rain.wgsl"));
+        let (size, members) = wgsl_struct_layout(&source, "RainRenderUniform");
+        assert_eq!(size as usize, size_of::<RainRenderUniform>());
+        for (name, rust_offset) in [
+            ("appearance", offset_of!(RainRenderUniform, appearance)),
+            ("splash", offset_of!(RainRenderUniform, splash)),
+            ("color", offset_of!(RainRenderUniform, color)),
+            ("look", offset_of!(RainRenderUniform, look)),
+        ] {
+            assert_eq!(offset_of_member(&members, name) as usize, rust_offset, "{name}");
+        }
+    }
+
+    #[test]
+    fn rain_sim_uniform_matches_its_wgsl_struct() {
+        let (size, _) =
+            wgsl_struct_layout(include_str!("../rain_sim.wgsl"), "RainSimUniform");
+        assert_eq!(size as usize, size_of::<RainSimUniform>());
+        let (particle, _) =
+            wgsl_struct_layout(include_str!("../rain_sim.wgsl"), "RainParticle");
+        assert_eq!(particle as usize, size_of::<RainParticle>());
+    }
 }

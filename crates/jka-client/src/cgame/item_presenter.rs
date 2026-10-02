@@ -104,9 +104,17 @@ pub fn auto_yaw(time: i32) -> f32 {
     (time & 2047) as f32 * 360.0 / 2048.0
 }
 
-/// Everything CG_Item submits for one item, in submission order. The
-/// `mp/itemcone.efx` effect under weapon/powerup holos is an FX-runtime
-/// concern and is not represented here.
+/// Where CG_Item plays `mp/itemcone.efx`: the light cone over the pedestal
+/// hologram of a placed weapon or powerup, unless it is greyed out. The effect
+/// belongs to the FX runtime, so it is not part of [`cg_item`]'s draws.
+pub fn item_cone_origin(item: &ItemInfo, input: &ItemInput) -> Option<[f32; 3]> {
+    let dropped = input.e_flags & EF_DROPPEDWEAPON != 0;
+    let spinning = item.item_type == IT_WEAPON || item.item_type == IT_POWERUP;
+    (!item.world_model.is_empty() && spinning && !dropped && !grey_item(item, input.force_side)).then_some(input.origin)
+}
+
+/// Everything CG_Item submits for one item, in submission order, except the
+/// FX-runtime cone of [`item_cone_origin`].
 pub fn cg_item(item: &ItemInfo, input: &ItemInput, angles_to_axis: fn([f32; 3]) -> [[f32; 3]; 3]) -> Vec<ItemDraw> {
     let mut draws = Vec::new();
     let mut e_flags = input.e_flags;
@@ -313,6 +321,21 @@ mod tests {
         assert_eq!(draws[0].rgba[0], 150.0 / 255.0, "holo greyed for the light-side viewer");
         assert_eq!(draws[1].custom_shader, Some("gfx/misc/mp_dark_enlight_disable"));
         assert_eq!(draws[1].rgba[3], 200.0 / 255.0);
+    }
+
+    #[test]
+    fn placed_weapons_and_powerups_get_a_cone_unless_dropped_or_greyed() {
+        let repeater = item("weapon_repeater", "x.glm", IT_WEAPON, 8, 100);
+        assert_eq!(item_cone_origin(&repeater, &input(0)), Some([10.0, 20.0, 30.0]));
+        let mut dropped = input(0);
+        dropped.e_flags = EF_DROPPEDWEAPON;
+        assert_eq!(item_cone_origin(&repeater, &dropped), None);
+        let medpak = item("item_medpak_instant", "models/map_objects/mp/medpac.md3", IT_HEALTH, 0, 25);
+        assert_eq!(item_cone_origin(&medpak, &input(0)), None, "only weapons and powerups have a holo");
+        let dark = item("item_force_enlighten_dark", "x.md3", IT_POWERUP, 13, 25);
+        assert_eq!(item_cone_origin(&dark, &input(0)), None, "greyed for the light-side viewer");
+        let light = item("item_force_enlighten_light", "x.md3", IT_POWERUP, 12, 25);
+        assert!(item_cone_origin(&light, &input(0)).is_some());
     }
 
     #[test]

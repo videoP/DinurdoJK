@@ -160,12 +160,30 @@ pub struct BrowserUiState {
     pub sort: BrowserSort,
     pub sort_ascending: bool,
     pub refreshing: HashSet<ServerSource>,
+    /// Addresses that have answered during the refresh currently in flight.
+    /// We deliberately keep the previous list visible until RefreshFinished,
+    /// then prune entries that did not answer. This avoids the old empty-list
+    /// flash every time Refresh is pressed.
+    refresh_seen: HashMap<ServerSource, HashSet<SocketAddr>>,
     pub status_text: String,
+    pub source_status: HashMap<ServerSource, String>,
     pub details: Option<ServerStatus>,
+    /// Cached getstatus replies used by both the details pane and player-name
+    /// filtering. Entries are refreshed opportunistically while a player
+    /// search is active.
+    pub status_cache: HashMap<SocketAddr, ServerStatus>,
+    pub status_pending: HashSet<SocketAddr>,
+    pub player_search: String,
+    pub player_exact_match: bool,
+    pub player_search_last_query: Option<Instant>,
     pub favorites: Vec<SocketAddr>,
     pub history: Vec<SocketAddr>,
     pub direct_connect: String,
     pub internet_requested_once: bool,
+    /// `(source, address)` for a full server that should be polled until a
+    /// slot opens. The application owns the eventual connect action.
+    pub autojoin: Option<(ServerSource, SocketAddr)>,
+    pub autojoin_last_query: Option<Instant>,
     /// Exact archived TaystJK-compatible `sv_master1`..`sv_master5` values.
     /// Empty slots are disabled.
     pub master_servers: [String; MAX_MASTER_SLOTS],
@@ -210,12 +228,21 @@ impl BrowserUiState {
             sort: BrowserSort::Ping,
             sort_ascending: true,
             refreshing: HashSet::new(),
+            refresh_seen: HashMap::new(),
             status_text: "Ready".to_owned(),
+            source_status: HashMap::new(),
             details: None,
+            status_cache: HashMap::new(),
+            status_pending: HashSet::new(),
+            player_search: String::new(),
+            player_exact_match: false,
+            player_search_last_query: None,
             favorites,
             history,
             direct_connect: String::new(),
             internet_requested_once: false,
+            autojoin: None,
+            autojoin_last_query: None,
             master_servers,
             master_drafts,
             favorites_path,
@@ -227,33 +254,80 @@ impl BrowserUiState {
         match event {
             BrowserEvent::RefreshStarted(source) => {
                 self.refreshing.insert(source);
-                self.status_text = format!("Refreshing {}…", source.label());
-                if matches!(source, ServerSource::Internet | ServerSource::Lan) {
-                    self.source_addresses.entry(source).or_default().clear();
-                }
+                let text = format!("Refreshing {}…", source.label());
+                self.source_status.insert(source, text.clone());
+                self.status_text = text;
+                self.refresh_seen.insert(source, HashSet::new());
             }
             BrowserEvent::Server { source, server } => {
                 let address = server.address;
                 self.servers.insert(address, server);
                 self.source_addresses.entry(source).or_default().insert(address);
-                self.status_text = format!("Receiving {} servers…", source.label());
+                if self.refreshing.contains(&source) {
+                    self.refresh_seen.entry(source).or_default().insert(address);
+                }
+                let text = format!("Receiving {} servers…", source.label());
+                self.source_status.insert(source, text.clone());
+                self.status_text = text;
+            }
+            BrowserEvent::ServerUpdate { source, server, quiet } => {
+                let address = server.address;
+                self.servers.insert(address, server);
+                self.source_addresses.entry(source).or_default().insert(address);
+                if !quiet {
+                    let text = format!("Updated {address}");
+                    self.source_status.insert(source, text.clone());
+                    self.status_text = text;
+                }
             }
             BrowserEvent::RefreshFinished { source, discovered, responded } => {
                 self.refreshing.remove(&source);
-                self.status_text = if discovered == 0 {
+                // Internet/LAN are discovery sources, so a completed refresh is
+                // the authoritative new set. Favorites/history deliberately keep
+                // offline entries so the user can still retry them later.
+                if matches!(source, ServerSource::Internet | ServerSource::Lan) {
+                    if let Some(seen) = self.refresh_seen.remove(&source) {
+                        if let Some(addresses) = self.source_addresses.get_mut(&source) {
+                            addresses.retain(|address| seen.contains(address));
+                        }
+                    }
+                } else {
+                    self.refresh_seen.remove(&source);
+                }
+                let text = if discovered == 0 {
                     format!("{}: no servers found", source.label())
                 } else {
                     format!("{}: {responded}/{discovered} servers responded", source.label())
                 };
+                self.source_status.insert(source, text.clone());
+                self.status_text = text;
             }
             BrowserEvent::Status(status) => {
+                self.status_pending.remove(&status.address);
                 if self.selected == Some(status.address) {
-                    self.details = Some(status);
+                    self.details = Some(status.clone());
+                }
+                self.status_cache.insert(status.address, status);
+            }
+            BrowserEvent::StatusBatchFinished { requested } => {
+                for address in requested {
+                    if self.status_pending.remove(&address) {
+                        // Record a completed no-response/empty result so player
+                        // filtering does not leave that row permanently in the
+                        // optimistic "still querying" state.
+                        self.status_cache.insert(address, ServerStatus {
+                            address,
+                            fields: Vec::new(),
+                            players: Vec::new(),
+                        });
+                    }
                 }
             }
             BrowserEvent::Error { source, message } => {
                 if let Some(source) = source {
                     self.refreshing.remove(&source);
+                    self.refresh_seen.remove(&source);
+                    self.source_status.insert(source, message.clone());
                 }
                 self.status_text = message;
             }
@@ -321,7 +395,14 @@ pub enum BrowserCommand {
         source: ServerSource,
         addresses: Vec<SocketAddr>,
     },
+    /// Refresh one row in place without starting a source-wide refresh.
+    RefreshServer {
+        source: ServerSource,
+        address: SocketAddr,
+        quiet: bool,
+    },
     QueryStatus(SocketAddr),
+    QueryStatusBatch(Vec<SocketAddr>),
 }
 
 #[derive(Debug)]
@@ -331,12 +412,20 @@ pub enum BrowserEvent {
         source: ServerSource,
         server: ServerEntry,
     },
+    ServerUpdate {
+        source: ServerSource,
+        server: ServerEntry,
+        quiet: bool,
+    },
     RefreshFinished {
         source: ServerSource,
         discovered: usize,
         responded: usize,
     },
     Status(ServerStatus),
+    StatusBatchFinished {
+        requested: Vec<SocketAddr>,
+    },
     Error {
         source: Option<ServerSource>,
         message: String,
@@ -361,7 +450,18 @@ fn worker(commands: Receiver<BrowserCommand>, events: Sender<BrowserEvent>) {
             BrowserCommand::RefreshAddresses { source, addresses } => {
                 refresh_addresses(&events, source, addresses)
             }
+            BrowserCommand::RefreshServer { source, address, quiet } => {
+                refresh_server(&events, source, address, quiet)
+            }
             BrowserCommand::QueryStatus(address) => query_status(&events, address),
+            BrowserCommand::QueryStatusBatch(addresses) => {
+                let requested = addresses.clone();
+                let result = query_status_batch(&events, addresses);
+                if result.is_err() {
+                    let _ = events.send(BrowserEvent::StatusBatchFinished { requested });
+                }
+                result
+            }
         };
         if let Err((source, message)) = result {
             if events.send(BrowserEvent::Error { source, message }).is_err() {
@@ -459,6 +559,61 @@ fn refresh_addresses(
         .send(BrowserEvent::RefreshStarted(source))
         .map_err(|_| (Some(source), "browser UI disconnected".to_owned()))?;
     query_info_batch(events, source, addresses)
+}
+
+fn refresh_server(
+    events: &Sender<BrowserEvent>,
+    source: ServerSource,
+    address: SocketAddr,
+    quiet: bool,
+) -> WorkerResult {
+    if !address.is_ipv4() {
+        return Ok(());
+    }
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| (Some(source), format!("server query socket: {e}")))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(80)))
+        .map_err(|e| (Some(source), format!("server query timeout: {e}")))?;
+    let challenge = challenge_token();
+    let request = jka_protocol::getinfo_request(&challenge)
+        .map_err(|e| (Some(source), format!("getinfo: {e}")))?;
+    let sent = Instant::now();
+    socket
+        .send_to(&request, address)
+        .map_err(|e| (Some(source), format!("getinfo {address}: {e}")))?;
+
+    let mut buf = vec![0u8; MAX_PACKET];
+    while sent.elapsed() < STATUS_WAIT {
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) if from == address => {
+                let Ok(info) = parse_info_response(&buf[..len], &challenge) else {
+                    continue;
+                };
+                if info.protocol != PROTOCOL_VERSION {
+                    continue;
+                }
+                let server = server_from_info(address, &info, sent.elapsed());
+                let _ = events.send(BrowserEvent::ServerUpdate { source, server, quiet });
+                // A user-requested one-row refresh should also keep the selected
+                // details/player cache current. Autojoin uses quiet refreshes and
+                // only needs getinfo's slot count, so do not double its polling
+                // cost with a getstatus round-trip every cycle.
+                if !quiet {
+                    let _ = query_status(events, address);
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => return Err((Some(source), format!("getinfo receive: {error}"))),
+        }
+    }
+
+    // Preserve the old row if a single-server refresh times out. Source-wide
+    // refreshes are responsible for pruning stale discovery results.
+    Ok(())
 }
 
 fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String> {
@@ -635,6 +790,55 @@ fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerRes
         }
     }
     Err((None, format!("Server status timed out: {address}")))
+}
+
+fn query_status_batch(events: &Sender<BrowserEvent>, mut addresses: Vec<SocketAddr>) -> WorkerResult {
+    addresses.retain(SocketAddr::is_ipv4);
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        let _ = events.send(BrowserEvent::StatusBatchFinished { requested: addresses });
+        return Ok(());
+    }
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| (None, format!("server status socket: {e}")))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|e| (None, format!("server status timeout: {e}")))?;
+
+    let request = b"\xff\xff\xff\xffgetstatus";
+    let requested = addresses.clone();
+    let wanted: HashSet<_> = addresses.iter().copied().collect();
+    for (index, address) in addresses.iter().copied().enumerate() {
+        let _ = socket.send_to(request, address);
+        if index % 64 == 63 {
+            thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    let started = Instant::now();
+    let mut buf = vec![0u8; MAX_PACKET];
+    let mut responded = HashSet::new();
+    while started.elapsed() < STATUS_WAIT && responded.len() < wanted.len() {
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                if !wanted.contains(&from) || !responded.insert(from) {
+                    continue;
+                }
+                if let Some(status) = parse_status_response(from, &buf[..len]) {
+                    if events.send(BrowserEvent::Status(status)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => return Err((None, format!("getstatus receive: {error}"))),
+        }
+    }
+
+    let _ = events.send(BrowserEvent::StatusBatchFinished { requested });
+    Ok(())
 }
 
 fn challenge_token() -> String {

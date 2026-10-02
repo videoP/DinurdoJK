@@ -1,120 +1,123 @@
 //! Jedi Academy sv_pure checksum negotiation.
 //!
-//! The base-game bypass intentionally mirrors TaystJK's `FS_ReferencedPakPureChecksums`
-//! behaviour: report only stock base assets to a pure server even though the local
-//! filesystem remains free to mount additional client-side PK3s.
+//! Port of TaystJK's `CL_SendPureChecksums` + `FS_ReferencedPakPureChecksums`
+//! (codemp/client/cl_main.cpp, codemp/qcommon/files.cpp) for protocol 26, which is
+//! the only protocol this client speaks (`protocolswitch != 2`).
+//!
+//! The reply is `cp <cgame> <ui> @ <general refs...> <encoded>` with no server id:
+//! `SV_VerifyPaks_f` reads the cgame checksum from argument 1.
+//!
+//! TaystJK marks assets3.pk3 as cgame|ui|general, then walks the search path from
+//! assets3 downwards reporting only paks that carry the general reference bit.
+//! In this client that bit is set when the map's `.bsp` was loaded from that pak
+//! (`FS_FOpenFileRead`) or when the pak lives outside `base`. Everything with
+//! higher priority than assets3 (custom/downloaded PK3s) is never reported.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+};
 
-const STOCK_PAKS_DESCENDING: [&str; 4] = [
-    "assets3.pk3",
-    "assets2.pk3",
-    "assets1.pk3",
-    "assets0.pk3",
-];
-
-// TaystJK uses these ordinary checksums as sentinels for the normal JKA path.
+// FS_ReferencedPakPureChecksums: `lastPack = -1342311474; //assets3.pk3`.
 const ASSETS3_CHECKSUM: i32 = -1_342_311_474;
-const ASSETS0_CHECKSUM: i32 = 1_767_559_464;
 
 #[derive(Debug)]
-pub struct BasePureBypass {
+pub struct PureReply {
     pub command: Vec<u8>,
     pub reported_paks: usize,
+    /// What was reported and why, for the log.
+    pub detail: String,
 }
 
-/// Build the normal JKA `cp` reliable command while limiting the reported
-/// referenced packages to the four retail base archives.
-///
-/// TaystJK starts its bypass walk at assets3 (which it marks as cgame/ui/general)
-/// and prevents higher-priority custom PK3s from entering the response. This
-/// engine does not maintain OpenJK's per-pack reference flags yet, so reporting
-/// all four stock archives is the deterministic equivalent: every checksum is
-/// server-approved base content, while local/custom packages are omitted.
-pub fn build_basejka_bypass_command(
+/// Build the `cp` reliable command TaystJK would send for `map_name`.
+pub fn build_pure_command(
     base_dir: &Path,
-    server_id: i32,
+    game_dir: Option<&Path>,
     checksum_feed: u32,
-) -> Result<BasePureBypass, String> {
-    let mut regular = Vec::with_capacity(STOCK_PAKS_DESCENDING.len());
-    let mut pure = Vec::with_capacity(STOCK_PAKS_DESCENDING.len());
+    map_name: &str,
+) -> Result<PureReply, String> {
+    let order = pk3_search_order(base_dir);
+    let file_name = |path: &Path| path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
-    for name in STOCK_PAKS_DESCENDING {
-        let path = find_case_insensitive(base_dir, name)
-            .ok_or_else(|| format!("required stock PK3 is missing: {name}"))?;
-        let (regular_checksum, pure_checksum) =
-            jka_assets::pak_checksum::pk3_checksums(&path, checksum_feed)
-                .map_err(|error| format!("failed to checksum {}: {error}", path.display()))?;
-        regular.push(regular_checksum);
-        pure.push(pure_checksum);
-    }
-
-    // Refuse to call a modified/repacked install the retail bypass. Apart from
-    // matching TaystJK's sentinels, this keeps an accidental replacement of a
-    // core assets archive from being silently hidden from the server.
-    if regular[0] != ASSETS3_CHECKSUM {
-        return Err(format!(
-            "assets3.pk3 checksum is {}, expected retail JKA {}",
-            regular[0], ASSETS3_CHECKSUM
-        ));
-    }
-    if regular[3] != ASSETS0_CHECKSUM {
-        return Err(format!(
-            "assets0.pk3 checksum is {}, expected retail JKA {}",
-            regular[3], ASSETS0_CHECKSUM
-        ));
-    }
-
-    // JKA pure response format:
-    //   cgame ui @ general-ref... encoded-checksum
-    // assets3 is the stock package TaystJK marks with all three reference bits.
-    let cgame = pure[0];
-    let ui = pure[0];
-    let mut encoded = checksum_feed;
-    for checksum in &pure {
-        encoded ^= *checksum as u32;
-    }
-    encoded ^= pure.len() as u32;
-
-    let refs = pure
+    let assets3_index = order
         .iter()
-        .map(i32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let text = format!(
-        "cp {server_id} {cgame} {ui} @ {refs} {}",
-        encoded as i32
-    );
+        .position(|path| file_name(path).eq_ignore_ascii_case("assets3.pk3"))
+        .ok_or_else(|| "required stock PK3 is missing: assets3.pk3".to_owned())?;
+    let checksums_of = |path: &Path| {
+        jka_assets::pak_checksum::pk3_checksums(path, checksum_feed)
+            .map_err(|error| format!("failed to checksum {}: {error}", path.display()))
+    };
+    let (assets3_regular, assets3_pure) = checksums_of(&order[assets3_index])?;
+    if assets3_regular != ASSETS3_CHECKSUM {
+        return Err(format!(
+            "assets3.pk3 checksum is {assets3_regular}, expected retail JKA {ASSETS3_CHECKSUM}"
+        ));
+    }
 
-    Ok(BasePureBypass {
+    // referenced = 7: cgame, ui and general. The walk starts here, so these are
+    // the first two checksums and the first general reference.
+    let cgame = assets3_pure;
+    let ui = assets3_pure;
+    let mut general = vec![(file_name(&order[assets3_index]), assets3_pure)];
+
+    // FS_FOpenFileRead marks FS_GENERAL_REF on the pak a `.bsp` is read from (the
+    // first pak in search order holding it; fs_game paks outrank base). Only paks
+    // below assets3 can be reached by the walk.
+    let bsp = format!("maps/{}.bsp", map_name.trim_end_matches(".bsp"));
+    let has_bsp = |path: &Path| jka_assets::pak_checksum::pk3_has_entry(path, &[bsp.as_str()]).unwrap_or(false);
+    let bsp_in_game_dir = game_dir
+        .filter(|game| *game != base_dir)
+        .is_some_and(|game| pk3_search_order(game).iter().any(|path| has_bsp(path)));
+    let mut bsp_holder = None;
+    if !bsp_in_game_dir {
+        if let Some(index) = order.iter().position(|path| has_bsp(path)) {
+            let name = file_name(&order[index]);
+            // `noDL*` paks are noref: they never carry a reference.
+            let noref = name.len() >= 4 && name[..4].eq_ignore_ascii_case("nodl");
+            bsp_holder = Some(name.clone());
+            if index > assets3_index && !noref {
+                // The walk's `checksum == 1767559464` (assets0) break ends it after
+                // this pak at the latest; only one pak holds the bsp, so nothing
+                // further can be added either way.
+                let (_, pure) = checksums_of(&order[index])?;
+                general.push((name, pure));
+            }
+        }
+    }
+
+    // checksum = fs_checksumFeed ^ (general pure checksums) ^ numPaks
+    let mut encoded = checksum_feed;
+    for (_, pure) in &general {
+        encoded ^= *pure as u32;
+    }
+    encoded ^= general.len() as u32;
+
+    let refs = general.iter().map(|(_, pure)| pure.to_string()).collect::<Vec<_>>().join(" ");
+    let text = format!("cp {cgame} {ui} @ {refs} {}", encoded as i32);
+
+    let detail = format!(
+        "cgame/ui=assets3.pk3 general=[{}] map_bsp={bsp} bsp_pak={}",
+        general.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", "),
+        if bsp_in_game_dir { "fs_game".to_owned() } else { bsp_holder.unwrap_or_else(|| "none".to_owned()) },
+    );
+    Ok(PureReply {
         command: text.into_bytes(),
-        reported_paks: pure.len(),
+        reported_paks: general.len(),
+        detail,
     })
 }
 
-fn find_case_insensitive(directory: &Path, wanted: &str) -> Option<PathBuf> {
-    let direct = directory.join(wanted);
-    if direct.is_file() {
-        return Some(direct);
-    }
-
-    std::fs::read_dir(directory)
-        .ok()?
+/// PK3s of one game directory in OpenJK search order: sorted case-insensitively,
+/// later names first (a later pak overrides an earlier one).
+fn pk3_search_order(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut paks: Vec<PathBuf> = entries
         .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().eq_ignore_ascii_case(wanted))
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stock_pak_order_matches_taystjk_walk() {
-        assert_eq!(
-            STOCK_PAKS_DESCENDING,
-            ["assets3.pk3", "assets2.pk3", "assets1.pk3", "assets0.pk3"]
-        );
-    }
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
+        })
+        .collect();
+    paks.sort_by_key(|path| Reverse(path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase())));
+    paks
 }

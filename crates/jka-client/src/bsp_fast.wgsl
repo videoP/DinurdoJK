@@ -12,6 +12,13 @@ struct Material {
     mods: array<vec4<f32>, 8>,
     color: vec4<f32>,
     params: vec4<f32>,
+    pbr_params0: vec4<f32>,
+    pbr_params1: vec4<f32>,
+    reflection_probe: vec4<f32>,
+    planar_plane: vec4<f32>,
+    wave_rgb: vec4<f32>,
+    wave_alpha: vec4<f32>,
+    wave_funcs: vec4<u32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -56,29 +63,53 @@ struct VertexOut {
     @location(7) shell_coverage: f32,
 };
 
-fn generated_uv(input: VertexIn) -> vec2<f32> {
-    var uv = input.uv;
-    if (material.header.x == 1u) {
-        uv = input.lightmap_uv;
-    }
-    if (material.header.x == 2u) {
-        uv = vec2<f32>(
-            dot(input.position, material.vector_s.xyz),
-            dot(input.position, material.vector_t.xyz)
-        );
-    }
-    if (material.header.x == 3u) {
-        // Q3/JKA sphere-style environment mapping: view direction reflected by
-        // the surface normal. Coordinates are in this renderer's transformed
-        // [x,z,-y] space, so use render-space Y/Z for the two lookup axes.
-        let n = normalize(input.normal);
-        let view = normalize(camera.camera_pos_time.xyz - input.position);
-        let reflected = reflect(-view, n);
-        // OpenJK computes s from JKA Y and t from JKA Z. The renderer uses
-        // [x,z,-y], therefore JKA Y = -render Z and JKA Z = render Y.
-        uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
-    }
+// Waveform generators (rgbGen wave / alphaGen wave). Same functions as id Tech 3's
+// tables: value = base + func(phase + time * frequency) * amplitude.
+fn wave_noise(t: f32) -> f32 {
+    let i = floor(t);
+    let u = fract(t);
+    let s = u * u * (3.0 - 2.0 * u);
+    let a = fract(sin(i * 127.1) * 43758.5453) * 2.0 - 1.0;
+    let b = fract(sin((i + 1.0) * 127.1) * 43758.5453) * 2.0 - 1.0;
+    return mix(a, b, s);
+}
 
+fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
+    let x = fract(p.z + time * p.w);
+    var v = 0.0;
+    if (func == 0u) {
+        v = sin(x * 6.28318530718);
+    } else if (func == 1u) {
+        v = select(select(2.0 - 4.0 * x, 4.0 * x - 4.0, x >= 0.75), 4.0 * x, x < 0.25);
+    } else if (func == 2u) {
+        v = select(-1.0, 1.0, x < 0.5);
+    } else if (func == 3u) {
+        v = x;
+    } else if (func == 4u) {
+        v = 1.0 - x;
+    } else {
+        v = wave_noise((time + p.z) * p.w);
+    }
+    return p.x + v * p.y;
+}
+
+fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
+    var out = color;
+    let time = camera.camera_pos_time.w;
+    if ((material.header.z & 134217728u) != 0u) {
+        let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
+        out = vec4<f32>(vec3<f32>(g), out.a);
+    }
+    if ((material.header.z & 268435456u) != 0u) {
+        out.a = clamp(wave_value(material.wave_funcs.y, material.wave_alpha, time), 0.0, 1.0);
+    }
+    return out;
+}
+
+// Stage tcMods (scroll/scale/rotate/transform/turb) applied to base coordinates.
+// Shared by the per-vertex generated_uv and the per-pixel sky cloud layer.
+fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
+    var uv = base_uv;
     let time = camera.camera_pos_time.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
@@ -113,6 +144,32 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         }
     }
     return uv;
+}
+
+fn generated_uv(input: VertexIn) -> vec2<f32> {
+    var uv = input.uv;
+    if (material.header.x == 1u) {
+        uv = input.lightmap_uv;
+    }
+    if (material.header.x == 2u) {
+        uv = vec2<f32>(
+            dot(input.position, material.vector_s.xyz),
+            dot(input.position, material.vector_t.xyz)
+        );
+    }
+    if (material.header.x == 3u) {
+        // Q3/JKA sphere-style environment mapping: view direction reflected by
+        // the surface normal. Coordinates are in this renderer's transformed
+        // [x,z,-y] space, so use render-space Y/Z for the two lookup axes.
+        let n = normalize(input.normal);
+        let view = normalize(camera.camera_pos_time.xyz - input.position);
+        let reflected = reflect(-view, n);
+        // OpenJK computes s from JKA Y and t from JKA Z. The renderer uses
+        // [x,z,-y], therefore JKA Y = -render Z and JKA Z = render Y.
+        uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
+    }
+
+    return apply_tc_mods(uv);
 }
 
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
@@ -177,6 +234,7 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
     } else if ((material.header.z & 2097152u) != 0u) {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
+    stage_color = apply_wave_gens(stage_color);
 
     var source_sample = textureSample(base_texture, base_sampler, input.uv);
 
@@ -248,15 +306,61 @@ fn sky_uv(s: f32, t: f32) -> vec2<f32> {
     return clamp(vec2<f32>((s + 1.0) * 0.5, (1.0 - t) * 0.5), vec2<f32>(0.001), vec2<f32>(0.999));
 }
 
+// Cloud layer of a sky shader (R_InitSkyTexCoords). The view direction `d`
+// (JKA axes, z up) is projected onto a spherical shell `height` above a
+// 4096-unit-radius ground sphere, and the direction from the sphere's centre to
+// that point gives the base coordinates as two angles in radians. The stage's
+// tcMods are then applied on top, exactly like any other stage.
+fn sky_cloud_uv(d: vec3<f32>, height: f32) -> vec2<f32> {
+    let radius = 4096.0;
+    let dd = dot(d, d);
+    let discriminant = d.z * d.z * radius * radius + dd * (2.0 * radius * height + height * height);
+    let p = (-2.0 * d.z * radius + 2.0 * sqrt(discriminant)) / (2.0 * dd);
+    var v = d * p;
+    v.z = v.z + radius;
+    v = normalize(v);
+    return vec2<f32>(acos(clamp(v.x, -1.0, 1.0)), acos(clamp(v.y, -1.0, 1.0)));
+}
+
+fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
+    // The engine never draws clouds on the bottom face of the sky box.
+    let a = abs(d);
+    if (d.z < 0.0 && a.z >= a.x && a.z >= a.y) {
+        discard;
+    }
+    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z));
+    var stage_color = material.color;
+    if ((material.header.z & 1u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
+    } else if ((material.header.z & 524288u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb), stage_color.a);
+    }
+    if ((material.header.z & 1048576u) != 0u) {
+        stage_color.a = stage_color.a * input.color.a;
+    } else if ((material.header.z & 2097152u) != 0u) {
+        stage_color.a = stage_color.a * (1.0 - input.color.a);
+    }
+    stage_color = apply_wave_gens(stage_color);
+    let base = textureSample(base_texture, base_sampler, uv) * stage_color;
+    if (material.params.x > 0.0 && base.a < material.params.x) {
+        discard;
+    }
+    return base;
+}
+
 @fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
+    // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
+    let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
+    if (material.header.x == 4u) {
+        // A cloud-layer stage of the sky shader (tcGen sky cloud).
+        return sky_cloud_color(input, d);
+    }
     if ((material.header.w & 1u) == 0u) {
         // skyParms "-" has no outerbox. OpenJK draws no skybox here, so leave
         // the scene clear color visible (global-fog color when the BSP has one).
         discard;
     }
 
-    // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
-    let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
     let a = abs(d);
     if (a.x >= a.y && a.x >= a.z) {
         if (d.x >= 0.0) {

@@ -1,34 +1,3 @@
-struct PostSettings {
-    color: vec4<f32>, // gamma, tone mapping, bloom, ssao
-    aa: vec4<f32>, // fxaa, viewport width, viewport height, taa
-    taa_params: vec4<f32>, // x HDR scene, y reflection debug, z reflection quality, w reserved
-    scene: vec4<f32>, // contact shadows, volumetric fog, ssr, history valid
-    film: vec4<f32>, // halation, chromatic aberration, vignette, LUT strength
-    grain: vec4<f32>, // strength, size, time, exposure
-    camera_fx: vec4<f32>, // motion shutter scale, DOF strength, focus distance, DOF quality
-    legacy_fog: vec4<f32>, // authored display-space RGB, depthForOpaque; taa_params.w = scale/enabled
-    clouds: vec4<f32>, // enabled, type, quality, coverage
-    cloud_layer: vec4<f32>, // base height, thickness, wind speed, wind direction radians
-    cloud_sun_direction: vec4<f32>, // xyz light travel direction, w intensity
-    cloud_sun_color: vec4<f32>, // rgb color, w density scale
-    cloud_shadow: vec4<f32>, // enabled, projected shadow strength, temporal depth-gate fix, terrain interaction
-    cloud_shaping: vec4<f32>, // wind shear, base height variation, empty-space skip gate, aerial perspective
-    cloud_sky_ambient: vec4<f32>, // rgb average of the map skybox, w blend amount
-    cloud_temporal_tuning: vec4<f32>, // history blend, motion reject, depth reject, shape evolution gate
-    cloud_variation: vec4<f32>, // thickness variation, cloud size, weather gust, direction variation radians
-    cloud_temporal: vec4<f32>, // enabled, history valid, active 2x2 pattern, grid size
-    rain: vec4<f32>, // enabled, intensity, distant haze strength, puddle accumulation
-    rain_occlusion: vec4<f32>, // min render X/Z, inverse heightfield extent X/Z
-    camera_pos_time: vec4<f32>,
-    prev_camera_pos_time: vec4<f32>,
-    view_proj: mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    cloud_inv_view_proj: mat4x4<f32>,
-    cloud_prev_view_proj: mat4x4<f32>,
-    prev_view_proj: mat4x4<f32>,
-    motion_prev_view_proj: mat4x4<f32>,
-};
-
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var<uniform> settings: PostSettings;
@@ -169,6 +138,30 @@ fn purple_fringe_color(uv: vec2<f32>, color: vec3<f32>) -> vec3<f32> {
     let violet = vec3<f32>(0.16, 0.035, 0.92);
     return color + violet * fringe;
 }
+// Wet-weather grade: a faint cool cast in the shadows and mids, like the blue-grey
+// of rain-washed air, a little more contrast, and extra pop only for colours that
+// are already vivid (neon, signs, lit windows). It never invents a warm colour:
+// any red or orange in the picture has to come from the lights themselves.
+// `amount` is the wet-weather strength, already faded by how exposed the camera is
+// to the rain, so a dry scene or a sheltered camera is untouched. Display-referred,
+// so it runs after tone mapping/gamma and before the user's LUT.
+fn apply_rain_grade(color: vec3<f32>, amount: f32) -> vec3<f32> {
+    if (amount <= 0.001) {
+        return color;
+    }
+    let luma = luminance(color);
+    // Contrast about a dark mid-grey deepens the blacks a little.
+    var graded = max((color - vec3<f32>(0.40)) * (1.0 + 0.10 * amount) + vec3<f32>(0.40), vec3<f32>(0.0));
+    // Cool cast, strongest in the shadows and fading out toward the highlights.
+    let coolness = 1.0 - smoothstep(0.30, 0.95, luma);
+    graded += vec3<f32>(-0.006, 0.004, 0.016) * (coolness * amount);
+    // Vividness: only genuinely saturated light gets a boost.
+    let chroma = max(graded.r, max(graded.g, graded.b)) - min(graded.r, min(graded.g, graded.b));
+    let vivid = smoothstep(0.55, 0.85, chroma) * smoothstep(0.20, 0.50, luma);
+    graded = mix(vec3<f32>(luminance(graded)), graded, 1.0 + 0.25 * amount * vivid);
+    return clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 const COLOR_LUT_SIZE: f32 = 33.0;
 
 fn apply_color_lut(color: vec3<f32>) -> vec3<f32> {
@@ -266,7 +259,13 @@ fn valid_depth(depth: f32) -> bool {
 }
 
 fn world_ray(uv: vec2<f32>) -> vec3<f32> {
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+    // Camera depth is reversed-Z (near -> 1, far -> 0). Unproject on the FAR
+    // plane: at z = 1 the point is ~1 unit from the camera, so subtracting the
+    // camera position (map coordinates in the thousands, f32 spacing ~5e-4)
+    // left ~1e-3 rad of per-pixel direction noise. That noise is ~0.5 world
+    // units at 500 units of depth, the same size as a one-pixel tangent, so
+    // depth-derived normals (contact shadows, puddles) flickered.
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
     var world_far = settings.inv_view_proj * ndc;
     world_far = world_far / max(abs(world_far.w), 1e-6);
     return normalize(world_far.xyz - settings.camera_pos_time.xyz);
@@ -505,12 +504,14 @@ fn surface_normal(pixel: vec2<i32>) -> vec3<f32> {
     }
     let uvx = (vec2<f32>(px) + vec2<f32>(0.5)) / dims_f;
     let uvy = (vec2<f32>(py) + vec2<f32>(0.5)) / dims_f;
-    let p0 = world_position(uv0, d0);
-    let p1 = world_position(uvx, dx_depth);
-    let p2 = world_position(uvy, dy_depth);
-    var n = normalize(cross(p1 - p0, p2 - p0));
-    let toward_camera = normalize(settings.camera_pos_time.xyz - p0);
-    if (dot(n, toward_camera) < 0.0) {
+    // Camera-relative positions: adding camera_pos (map coordinates in the
+    // thousands) before subtracting quantises the one-pixel tangents to the f32
+    // spacing there, which stair-steps the normal across small surfaces.
+    let r0 = world_ray(uv0) * d0;
+    let r1 = world_ray(uvx) * dx_depth;
+    let r2 = world_ray(uvy) * dy_depth;
+    var n = normalize(cross(r1 - r0, r2 - r0));
+    if (dot(n, -r0) < 0.0) {
         n = -n;
     }
     return n;
@@ -878,122 +879,206 @@ fn ssao_factor(pixel: vec2<i32>, centre_depth: f32) -> f32 {
     return clamp(accumulated.x / accumulated.y, 0.0, 1.0);
 }
 
-fn contact_shadow_factor(world: vec3<f32>, normal: vec3<f32>, centre_depth: f32) -> f32 {
+// Contact shadows: a screen-space depth march toward the map's sun, after Bevy's
+// `ContactShadows` (bevy_pbr contact_shadows.rs / ssr raymarch.wesl).
+//
+// - The ray has a fixed WORLD length, so the shadow is the same size wherever the
+//   camera is. It is marched in SCREEN space (uniform pixel steps), clipped to the
+//   viewport rather than abandoned when a sample leaves it.
+// - `march_behind_surfaces`: a surface further in front of the ray than the
+//   thickness is not an occluder (the ray passes behind it and keeps going), and
+//   a hit that penetrates most of the thickness fades out instead of popping.
+// - Start jitter (interleaved gradient noise) turns step banding into fine noise.
+// - The receiver itself is rejected geometrically: a sample only occludes if it
+//   stands clear of the receiver's tangent plane (CONTACT_SHADOW_MIN_HEIGHT), so one
+//   depth tap per step is enough (Bevy takes a bilinear and a nearest tap).
+// - `r_contactShadowDebug 1` shows why the pass returned for each pixel.
+const CONTACT_SHADOW_STEPS: i32 = 16;
+// Bevy's defaults are length 0.3 m / thickness 0.1 m; at ~32 JKA units per metre
+// (a 56-unit player is ~1.75 m) that is ~10 and ~3.2 units.
+const CONTACT_SHADOW_LENGTH: f32 = 10.0; // world units toward the sun
+const CONTACT_SHADOW_THICKNESS: f32 = 3.2;
+// A sample is only an occluder if it stands at least this far above the receiver's
+// tangent plane (plus a little per unit of depth). On baronshed_share (map origin
+// ~43k units out) the ray's radial depth and the stored depth disagree by a few
+// units that grow with range, so the floor sampled a few pixels along the ray read
+// as "in front of" the ray and shadowed itself. Those false hits sat within ~1 unit
+// of the receiver plane (measured p99 1.15); real occluders stand clear of it. The
+// depth disagreement itself was never explained.
+const CONTACT_SHADOW_MIN_HEIGHT: f32 = 1.5;
+const CONTACT_SHADOW_STRENGTH: f32 = 0.5; // darkest multiplier is 1 - this
+
+// Interleaved gradient noise (Jimenez 2014), static per pixel.
+fn contact_shadow_noise(pixel: vec2<i32>) -> f32 {
+    return fract(52.9829189 * fract(dot(vec2<f32>(pixel), vec2<f32>(0.06711056, 0.00583715))));
+}
+
+// Normal from depth that does not smear across silhouettes: on each axis take the
+// neighbour with the smaller depth step, so a floor texel beside a wall base is
+// not tilted by the wall.
+fn contact_shadow_normal(pixel: vec2<i32>, p0: vec3<f32>, d0: f32) -> vec3<f32> {
+    let dims = textureDimensions(linear_depth_texture);
+    let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
+    let dl = depth_at_pixel(pixel + vec2<i32>(-1, 0));
+    let dr = depth_at_pixel(pixel + vec2<i32>(1, 0));
+    let du = depth_at_pixel(pixel + vec2<i32>(0, -1));
+    let dd = depth_at_pixel(pixel + vec2<i32>(0, 1));
+    let ok_l = valid_depth(dl);
+    let ok_r = valid_depth(dr);
+    let ok_u = valid_depth(du);
+    let ok_d = valid_depth(dd);
+    if (!(ok_l || ok_r) || !(ok_u || ok_d)) {
+        return normalize(settings.camera_pos_time.xyz - p0);
+    }
+    let use_left = ok_l && (!ok_r || abs(dl - d0) < abs(dr - d0));
+    let use_up = ok_u && (!ok_d || abs(du - d0) < abs(dd - d0));
+    let px = select(pixel + vec2<i32>(1, 0), pixel + vec2<i32>(-1, 0), use_left);
+    let py = select(pixel + vec2<i32>(0, 1), pixel + vec2<i32>(0, -1), use_up);
+    // Camera-relative so the one-pixel tangents are not quantised by the f32
+    // spacing at map coordinates (see surface_normal).
+    let r0 = world_ray((vec2<f32>(pixel) + vec2<f32>(0.5)) / dims_f) * d0;
+    let rel_x = world_ray((vec2<f32>(px) + vec2<f32>(0.5)) / dims_f) * select(dr, dl, use_left);
+    let rel_y = world_ray((vec2<f32>(py) + vec2<f32>(0.5)) / dims_f) * select(dd, du, use_up);
+    let tx = select(rel_x - r0, r0 - rel_x, use_left);
+    let ty = select(rel_y - r0, r0 - rel_y, use_up);
+    var n = normalize(cross(tx, ty));
+    if (dot(n, -r0) < 0.0) {
+        n = -n;
+    }
+    return n;
+}
+
+// Diagnostic (r_contactShadowDebug 1): why the pass returned for a pixel.
+// 0 marched (grey = the factor), 1 invalid depth (magenta), 2 faces away from the
+// sun (blue), 3 origin behind the camera (yellow), 4 ray sub-pixel or off screen (red).
+var<private> contact_shadow_reason: f32;
+
+fn contact_shadow_debug_color(factor: f32) -> vec3<f32> {
+    let r = contact_shadow_reason;
+    if (r > 3.5) { return vec3<f32>(1.0, 0.0, 0.0); }
+    if (r > 2.5) { return vec3<f32>(1.0, 1.0, 0.0); }
+    if (r > 1.5) { return vec3<f32>(0.0, 0.2, 1.0); }
+    if (r > 0.5) { return vec3<f32>(1.0, 0.0, 1.0); }
+    return vec3<f32>(factor);
+}
+
+fn contact_shadow_factor(pixel: vec2<i32>, world: vec3<f32>, centre_depth: f32) -> f32 {
+    contact_shadow_reason = 0.0;
     if (settings.scene.x <= 0.5 || !valid_depth(centre_depth)) {
+        contact_shadow_reason = 1.0;
         return 1.0;
     }
-    let light_dir = normalize(vec3<f32>(0.42, 0.78, -0.46));
-    if (dot(normal, light_dir) <= 0.05) {
+    let camera = settings.camera_pos_time.xyz;
+    // cloud_sun_direction is the direction the light travels (sun -> world).
+    let toward_sun = -normalize(settings.cloud_sun_direction.xyz);
+    let n = contact_shadow_normal(pixel, world, centre_depth);
+    // Surfaces turned from the sun are already unlit; darkening them again is
+    // the double-shadowing that made the old pass look dirty.
+    let facing = smoothstep(0.02, 0.30, dot(n, toward_sun));
+    if (facing <= 0.0) {
+        contact_shadow_reason = 2.0;
         return 1.0;
     }
-    let step_length = max(6.0, centre_depth * 0.0045);
-    var shadow = 0.0;
-    for (var i: i32 = 1; i <= 10; i = i + 1) {
-        let sample_world = world + normal * 3.0 + light_dir * step_length * f32(i);
-        let projected = project_uv(sample_world);
-        if (projected.x <= 0.0 || projected.x >= 1.0 || projected.y <= 0.0 || projected.y >= 1.0) {
-            break;
+
+    // Ray endpoints. Lift the origin off the receiver, and pull the far end in
+    // front of the camera plane so the projection below is well defined.
+    let p0 = world + n * (1.0 + centre_depth * 0.001);
+    var p1 = p0 + toward_sun * CONTACT_SHADOW_LENGTH;
+    let c0 = settings.view_proj * vec4<f32>(p0, 1.0);
+    if (c0.w <= 1.0) {
+        contact_shadow_reason = 3.0;
+        return 1.0;
+    }
+    var c1 = settings.view_proj * vec4<f32>(p1, 1.0);
+    if (c1.w < 1.0) {
+        p1 = mix(p0, p1, (c0.w - 1.0) / (c0.w - c1.w));
+        c1 = settings.view_proj * vec4<f32>(p1, 1.0);
+    }
+    let ndc0 = c0.xy / c0.w;
+    let ndc1 = c1.xy / c1.w;
+    let inv_w0 = 1.0 / c0.w;
+    let inv_w1 = 1.0 / max(c1.w, 1.0e-3);
+
+    // Clip the ray to the viewport in screen space; s is the screen-space
+    // parameter (0 at the origin, 1 at the far end).
+    let delta = ndc1 - ndc0;
+    let safe_delta = select(delta, vec2<f32>(1.0e-6), abs(delta) < vec2<f32>(1.0e-6));
+    let edge = select(vec2<f32>(-1.0), vec2<f32>(1.0), safe_delta > vec2<f32>(0.0));
+    let to_edge = (edge - ndc0) / safe_delta;
+    let s_end = clamp(min(to_edge.x, to_edge.y), 0.0, 1.0);
+
+    let dims = textureDimensions(linear_depth_texture);
+    let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
+    let length_px = length(delta * 0.5 * dims_f) * s_end;
+    if (length_px < 2.0) {
+        contact_shadow_reason = 4.0;
+        return 1.0; // sub-pixel at this distance, or the ray is off screen
+    }
+    let steps = clamp(i32(length_px), 2, CONTACT_SHADOW_STEPS);
+    let step_s = s_end / f32(steps);
+
+    // Perspective-correct world interpolation: world/w is affine in screen space.
+    let a0 = p0 * inv_w0;
+    let a1 = p1 * inv_w1;
+    // The distance term covers the ray-vs-surface depth offset, which grows with range.
+    let thickness = CONTACT_SHADOW_THICKNESS + centre_depth * 0.015;
+    let min_height = CONTACT_SHADOW_MIN_HEIGHT + centre_depth * 0.004;
+    let jitter = 0.25 + 0.75 * contact_shadow_noise(pixel);
+
+    var amount = 0.0;
+    for (var i: i32 = 0; i < steps; i = i + 1) {
+        let s = (f32(i) + jitter) * step_s;
+        let ndc = mix(ndc0, ndc1, s);
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        let surface = depth_at_uv(uv);
+        if (!valid_depth(surface)) {
+            continue; // sky never occludes
         }
-        let sampled_depth = depth_at_uv(projected.xy);
-        if (!valid_depth(sampled_depth)) {
+        let ray_world = mix(a0, a1, s) / mix(inv_w0, inv_w1, s);
+        let to_ray = ray_world - camera;
+        let ray_depth = length(to_ray);
+        let penetration = ray_depth - surface;
+        if (penetration <= 0.0 || penetration >= thickness) {
+            continue; // in front of the surface, or passing well behind it
+        }
+        // Is this depth texel just the receiver itself? A genuine occluder stands
+        // clear of the receiver's tangent plane; the floor seen a few pixels along
+        // the ray does not.
+        let sample_world = camera + world_ray(uv) * surface;
+        if (dot(n, sample_world - world) < min_height) {
             continue;
         }
-        let expected_depth = distance(settings.camera_pos_time.xyz, sample_world);
-        let delta = expected_depth - sampled_depth;
-        let thickness = max(10.0, expected_depth * 0.006);
-        if (delta > 2.0 && delta < thickness * 4.0) {
-            shadow = max(shadow, 1.0 - f32(i - 1) / 10.0);
-        }
+        // Bevy: shallow hits are fully dark, hits near the thickness limit fade out.
+        let visibility = clamp((penetration / thickness - 0.5) * 2.0, 0.0, 1.0);
+        // Ease out toward the end of the ray so the shadow has no hard cut-off.
+        let along = clamp(distance(ray_world, p0) / CONTACT_SHADOW_LENGTH, 0.0, 1.0);
+        amount = (1.0 - visibility) * (1.0 - smoothstep(0.55, 1.0, along));
+        break;
     }
-    return 1.0 - shadow * 0.42;
+    return 1.0 - amount * facing * CONTACT_SHADOW_STRENGTH;
 }
 
-fn puddle_weather_load(pixel: vec2<i32>) -> vec4<f32> {
-    let dims = textureDimensions(rain_occlusion_height);
-    let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
-    return textureLoad(rain_occlusion_height, clamp(pixel, vec2<i32>(0), max_pixel), 0);
-}
-
-fn puddle_exposure_from_cover(cover_y: f32, surface_y: f32) -> f32 {
-    if (cover_y <= -1.0e19) {
-        return 1.0;
-    }
-    return 1.0 - smoothstep(6.0, 24.0, cover_y - surface_y);
-}
-
-fn puddle_hash12(p: vec2<f32>) -> f32 {
-    let p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    let q = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
-    return fract((q.x + q.y) * q.z);
-}
-
-fn puddle_edge_noise(world_xz: vec2<f32>) -> f32 {
-    let p = world_xz / 170.0;
-    let cell = floor(p);
-    let f = fract(p);
-    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);
-    let n00 = puddle_hash12(cell);
-    let n10 = puddle_hash12(cell + vec2<f32>(1.0, 0.0));
-    let n01 = puddle_hash12(cell + vec2<f32>(0.0, 1.0));
-    let n11 = puddle_hash12(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(n00, n10, u.x), mix(n01, n11, u.x), u.y);
-}
-
-fn post_puddle_amount(world: vec3<f32>) -> f32 {
+// Standing-water coverage at a world position, from the same field, shape and
+// exposure rules as the material pass (weather_surface.wgsl). Walls and ceilings
+// are rejected before the field is fetched.
+fn post_puddle_amount(world: vec3<f32>, normal_y: f32) -> f32 {
     let accumulation = clamp(settings.rain.w, 0.0, 1.0);
-    if (accumulation <= 0.001) {
+    if (accumulation <= 0.001 || normal_y < 0.75
+        || settings.rain_occlusion.z <= 0.0 || settings.rain_occlusion.w <= 0.0) {
         return 0.0;
     }
-    if (settings.rain_occlusion.z <= 0.0 || settings.rain_occlusion.w <= 0.0) {
-        return 0.0;
-    }
-
-    let uv = (world.xz - settings.rain_occlusion.xy) * settings.rain_occlusion.zw;
-    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
-        return 0.0;
-    }
-
-    let dims_u = textureDimensions(rain_occlusion_height);
-    let dims = vec2<f32>(f32(dims_u.x), f32(dims_u.y));
-    let texel_position = uv * dims - vec2<f32>(0.5);
-    let base = vec2<i32>(floor(texel_position));
-    let f = fract(texel_position);
-
-    let s00 = puddle_weather_load(base);
-    let s10 = puddle_weather_load(base + vec2<i32>(1, 0));
-    let s01 = puddle_weather_load(base + vec2<i32>(0, 1));
-    let s11 = puddle_weather_load(base + vec2<i32>(1, 1));
-
-    let m00 = 1.0 - smoothstep(6.0, 20.0, abs(s00.y - world.y));
-    let m10 = 1.0 - smoothstep(6.0, 20.0, abs(s10.y - world.y));
-    let m01 = 1.0 - smoothstep(6.0, 20.0, abs(s01.y - world.y));
-    let m11 = 1.0 - smoothstep(6.0, 20.0, abs(s11.y - world.y));
-
-    let e00 = puddle_exposure_from_cover(s00.x, world.y);
-    let e10 = puddle_exposure_from_cover(s10.x, world.y);
-    let e01 = puddle_exposure_from_cover(s01.x, world.y);
-    let e11 = puddle_exposure_from_cover(s11.x, world.y);
-    let exposure = mix(mix(e00, e10, f.x), mix(e01, e11, f.x), f.y);
-
-    let physical_upness = mix(
-        mix(s00.z * m00, s10.z * m10, f.x),
-        mix(s01.z * m01, s11.z * m11, f.x),
-        f.y
+    let field = weather_sample_field(
+        rain_occlusion_height,
+        world,
+        settings.rain_occlusion.xy,
+        settings.rain_occlusion.zw,
+        normal_y
     );
-    let depression = mix(
-        mix(s00.w * m00, s10.w * m10, f.x),
-        mix(s01.w * m01, s11.w * m11, f.x),
-        f.y
-    );
-    if (exposure <= 0.001 || physical_upness <= 0.70 || depression <= 0.001) {
+    if (field.exposure <= 0.001) {
         return 0.0;
     }
-
-    let low = mix(0.46, 0.18, accumulation);
-    let high = mix(0.72, 0.34, accumulation);
-    let basin = smoothstep(low, high, depression) * mix(0.82, 1.0, puddle_edge_noise(world.xz));
-    let flatness = smoothstep(0.70, 0.985, physical_upness);
-    return clamp((0.28 + accumulation * 1.04) * exposure * flatness * basin, 0.0, 1.0);
+    let shape = weather_puddle_shape(field, world.xz, accumulation, settings.weather_look.x);
+    return shape.coverage * field.exposure * smoothstep(0.75, 0.95, normal_y);
 }
 
 fn finalize_puddle_film(color: vec3<f32>, world: vec3<f32>, puddle: f32) -> vec3<f32> {
@@ -1131,7 +1216,7 @@ fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, pud
 
     let resolved = accumulated / total_weight;
     let water = smoothstep(0.04, 0.78, puddle);
-    let reflection_weight = clamp(resolved.a * mix(1.0, 1.10, water), 0.0, mix(0.60, 0.86, water));
+    let reflection_weight = clamp(resolved.a, 0.0, mix(0.60, 0.94, water));
     return mix(color, max(resolved.rgb, vec3<f32>(0.0)), reflection_weight);
 }
 
@@ -1373,52 +1458,19 @@ fn cloud_detail(world: vec3<f32>, tile: f32) -> f32 {
     ).r;
 }
 
-fn cloud_base_wind_direction() -> vec3<f32> {
-    let wind_angle = settings.cloud_layer.w;
-    return vec3<f32>(cos(wind_angle), 0.0, sin(wind_angle));
-}
-
-fn cloud_wind_direction_at(time: f32) -> vec3<f32> {
-    let shift_wave = sin(time * 0.13) * 0.7 + sin(time * 0.047 + 2.4) * 0.3;
-    let wind_angle = settings.cloud_layer.w + settings.cloud_variation.w * shift_wave;
-    return vec3<f32>(cos(wind_angle), 0.0, sin(wind_angle));
-}
-
-fn cloud_wind_speed_at(time: f32) -> f32 {
-    let gust_wave = sin(time * 0.83) * 0.65 + sin(time * 1.71 + 1.9) * 0.35;
-    return max(settings.cloud_layer.z, 0.0)
-        * max(0.0, 1.0 + settings.cloud_variation.z * gust_wave);
-}
-
-// Continuous cloud advection driven by the shared weather gust/veer controls.
-// Speed variation is integrated exactly. Angular wandering uses a bounded
-// first-order lateral integral so changing direction does not multiply by the
-// entire elapsed runtime and make the cloud field jump.
-fn cloud_wind_offset_at(time: f32) -> vec3<f32> {
-    let dir = cloud_base_wind_direction();
-    let perp = vec3<f32>(-dir.z, 0.0, dir.x);
-    let speed = max(settings.cloud_layer.z, 0.0);
-    let gust = clamp(settings.cloud_variation.z, 0.0, 1.0);
-    let shift = clamp(settings.cloud_variation.w, 0.0, 3.14159265359);
-
-    let gust_integral =
-        0.65 * (1.0 - cos(time * 0.83)) / 0.83
-        + 0.35 * (cos(1.9) - cos(time * 1.71 + 1.9)) / 1.71;
-    let shift_integral =
-        0.7 * (1.0 - cos(time * 0.13)) / 0.13
-        + 0.3 * (cos(2.4) - cos(time * 0.047 + 2.4)) / 0.047;
-    let along_integral = time + gust * gust_integral;
-    let side_integral = min(shift, 1.2) * shift_integral;
-    return speed * (dir * along_integral + perp * side_integral);
-}
+// The wind's direction, advection and erosion drift depend only on the frame
+// time, so cloud_wind.rs evaluates them once per frame on the CPU and they
+// arrive in the uniform (cloud_wind_dir, cloud_wind_offset, cloud_wind_delta,
+// cloud_detail_slip, cloud_detail_billow). They were previously rebuilt from
+// sin/cos in every density sample.
 
 // Advect the sampling position with the prevailing wind, then shear it with
 // height. The shear term is what stops a thick deck from reading as vertical
 // curtains: the weather map is a 2D field sampled from world.xz, so at every
 // altitude the silhouette is identical unless the lookup itself moves.
 fn cloud_advected_noise_position(world: vec3<f32>, h: f32, thickness: f32) -> vec3<f32> {
-    let wind_dir = cloud_wind_direction_at(settings.camera_pos_time.w);
-    let wind_offset = cloud_wind_offset_at(settings.camera_pos_time.w);
+    let wind_dir = settings.cloud_wind_dir.xyz;
+    let wind_offset = settings.cloud_wind_offset.xyz;
     let shear = settings.cloud_shaping.x * CLOUD_SHEAR_SCALE * thickness * (h - 0.5);
     return world - wind_offset + wind_dir * shear;
 }
@@ -1430,21 +1482,12 @@ fn cloud_evolved_detail_position(p: vec3<f32>, tile: f32) -> vec3<f32> {
     if (settings.cloud_temporal_tuning.w <= 0.5) {
         return p;
     }
-    let t = settings.camera_pos_time.w;
-    let dir = cloud_wind_direction_at(t);
-    let perp = vec3<f32>(-dir.z, 0.0, dir.x);
     // The macro weather field keeps the same path and identity; only the Worley
     // erosion volume slips through it. A small along-wind difference plus the
     // larger cross-wind slip prevents the erosion from looking like a second
-    // conveyor belt pasted over the first one.
-    let speed = max(cloud_wind_speed_at(t), 24.0);
-    let slow_slip = (perp * 0.075 + dir * 0.022) * (speed * t);
-    let billow = vec3<f32>(
-        sin(t * 0.052) + 0.35 * sin(t * 0.019 + 1.1),
-        sin(t * 0.043 + 2.1),
-        cos(t * 0.047 + 0.8) + 0.30 * sin(t * 0.023)
-    ) * (tile * 0.035);
-    return p - slow_slip + billow;
+    // conveyor belt pasted over the first one. Both terms are per-frame values
+    // from cloud_wind.rs; only the tile scale of the wander is per sample.
+    return p - settings.cloud_detail_slip.xyz + settings.cloud_detail_billow.xyz * (tile * 0.035);
 }
 
 fn cloud_terrain_lift_fraction(world: vec3<f32>, thickness: f32) -> f32 {
@@ -1883,7 +1926,26 @@ fn projected_cloud_shadow_density(world: vec3<f32>) -> f32 {
     return cloud_shape_without_terrain(world, cloud_normalized_height(world), 0.0);
 }
 
-fn projected_cloud_shadow_factor(world_position: vec3<f32>) -> f32 {
+// Entities publish their smooth sun-facing value in the prepass policy G channel
+// as code 26..126 of 255 (md3.wgsl cloud_shadow_facing_code); the BSP prepass
+// writes exactly 0 or 1 there. Returns -1 when the pixel did not provide one.
+fn entity_cloud_shadow_facing(pixel: vec2<i32>) -> f32 {
+    let dims = textureDimensions(reflection_policy_texture);
+    let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let code = round(
+        textureLoad(reflection_policy_texture, clamp(pixel, vec2<i32>(0), maximum), 0).g * 255.0
+    );
+    if (code < 26.0 || code > 126.0) {
+        return -1.0;
+    }
+    return (code - 26.0) / 100.0;
+}
+
+fn projected_cloud_shadow_factor(
+    world_position: vec3<f32>,
+    normal: vec3<f32>,
+    pixel: vec2<i32>
+) -> f32 {
     if (settings.cloud_shadow.x <= 0.5) {
         return 1.0;
     }
@@ -1914,7 +1976,19 @@ fn projected_cloud_shadow_factor(world_position: vec3<f32>) -> f32 {
     // attenuation. The previous BSP path had a hidden second limiter (the CPU
     // supplied at most 0.55 here) on top of the visible 0.60 multiplier, which
     // is why even the nominal 60% setting looked much weaker than expected.
-    let strength = clamp(settings.cloud_shadow.y, 0.0, 1.0);
+    // This mask multiplies the finished pixel, so it must only bite where the
+    // sun was actually contributing. A surface turned away from the sun gets no
+    // direct light for a cloud to take away, and dimming its ambient/emissive
+    // colour (a wall, an overhang's underside) was the visible error; ramp the
+    // strength in with how squarely the surface faces the sun.
+    // Models use the facing their shader computed from smooth vertex normals;
+    // a normal rebuilt from depth is flat per triangle and shows as blocks.
+    var sun_facing = smoothstep(0.0, 0.3, dot(normal, toward_sun));
+    let entity_facing = entity_cloud_shadow_facing(pixel);
+    if (entity_facing >= 0.0) {
+        sun_facing = entity_facing;
+    }
+    let strength = clamp(settings.cloud_shadow.y, 0.0, 1.0) * sun_facing;
     return 1.0 - strength * (1.0 - visibility);
 }
 
@@ -2216,9 +2290,7 @@ fn cloud_history_uv(uv: vec2<f32>) -> vec2<f32> {
     // Follow the same advected cloud feature backward to the previous frame.
     // Use the exact displacement delta so the optional varying wind remains
     // temporally stable instead of assuming constant velocity.
-    let current_offset = cloud_wind_offset_at(settings.camera_pos_time.w);
-    let previous_offset = cloud_wind_offset_at(settings.prev_camera_pos_time.w);
-    world -= current_offset - previous_offset;
+    world -= settings.cloud_wind_delta.xyz;
 
     let prev_clip = settings.cloud_prev_view_proj * vec4<f32>(world, 1.0);
     if (prev_clip.w <= 1e-5) {
@@ -2230,19 +2302,24 @@ fn cloud_history_uv(uv: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_cloud_march(input: VertexOut) -> @location(0) vec4<f32> {
-    // Sparse march. With the interleave running, only one pixel per block does
-    // real work; fs_cloud_resolve reconstructs every other pixel from those
-    // samples, so what is written here for the rest is never read.
+    // Sparse march. With the interleave running, the pass is drawn into a
+    // viewport 1/grid the size of the target and each invocation IS one block:
+    // it marches the block's fresh texel and fs_cloud_resolve reconstructs every
+    // other pixel from those samples. Skipping the other pixels inside a
+    // full-size pass instead left one working lane in every 2x2 quad, so every
+    // wave ran the whole march loop at a quarter of its lanes and saved almost
+    // no time. The CPU picks the viewport from the same enabled && history-valid
+    // condition as `temporal` here.
     let temporal = settings.cloud_temporal.x > 0.5 && settings.cloud_temporal.y > 0.5;
+    var uv = input.uv;
     if (temporal) {
         let grid = max(u32(round(settings.cloud_temporal.w)), 1u);
         let pattern = u32(round(settings.cloud_temporal.z)) % (grid * grid);
-        let pixel = vec2<u32>(input.position.xy);
         let fresh_offset = vec2<u32>(pattern % grid, pattern / grid);
-        let block_offset = vec2<u32>(pixel.x % grid, pixel.y % grid);
-        if (any(block_offset != fresh_offset)) {
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        }
+        let size = vec2<u32>(textureDimensions(cloud_transfer_texture));
+        let texel = min(vec2<u32>(input.position.xy) * grid + fresh_offset, size - vec2<u32>(1u));
+        // input.uv spans the small viewport; the ray belongs to the full-size texel.
+        uv = (vec2<f32>(texel) + vec2<f32>(0.5)) / vec2<f32>(size);
     }
 
     // Freeze the jitter the moment the camera moves. The resolve rejects
@@ -2251,13 +2328,13 @@ fn fs_cloud_march(input: VertexOut) -> @location(0) vec4<f32> {
     // in time is a stable pattern instead.
     var animate = false;
     if (temporal) {
-        let prev_uv = cloud_history_uv(input.uv);
+        let prev_uv = cloud_history_uv(uv);
         if (all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))) {
             let viewport = max(settings.aa.yz, vec2<f32>(1.0));
-            animate = length((prev_uv - input.uv) * viewport) < 0.25;
+            animate = length((prev_uv - uv) * viewport) < 0.25;
         }
     }
-    return current_cloud_transfer(input.uv, animate);
+    return current_cloud_transfer(uv, animate);
 }
 
 fn cloud_lattice_texel(block: vec2<i32>, size: vec2<i32>, grid: i32, fresh: vec2<i32>) -> vec2<i32> {
@@ -2271,8 +2348,10 @@ struct CloudLattice {
     maximum: vec4<f32>,
 };
 
-// The sparse march leaves exactly one valid texel per interleave block.
-// Interpolating the four surrounding valid samples gives every pixel a
+// The interleaved march is stored compactly: texel (bx, by) of the march target
+// is the fresh sample of block (bx, by), i.e. full-size texel
+// (bx * grid + fresh.x, by * grid + fresh.y). Interpolating the four
+// surrounding valid samples gives every pixel a
 // current-frame estimate, which is what the single-pass resolve lacked: it
 // returned stale history verbatim for three pixels in four, so those pixels had
 // nothing pulling them back toward what was on screen and drifted until their
@@ -2292,15 +2371,22 @@ fn cloud_sample_lattice(
     let base = vec2<i32>(floor(lattice));
     let frac = fract(lattice);
 
+    // Full-size texel positions of the four samples (for depth lookups) and
+    // their compact block addresses (for the march fetch).
+    let max_block = (size - vec2<i32>(1)) / grid;
+    let b00 = clamp(base, vec2<i32>(0), max_block);
+    let b10 = clamp(base + vec2<i32>(1, 0), vec2<i32>(0), max_block);
+    let b01 = clamp(base + vec2<i32>(0, 1), vec2<i32>(0), max_block);
+    let b11 = clamp(base + vec2<i32>(1, 1), vec2<i32>(0), max_block);
     let t00 = cloud_lattice_texel(base, size, grid, fresh);
     let t10 = cloud_lattice_texel(base + vec2<i32>(1, 0), size, grid, fresh);
     let t01 = cloud_lattice_texel(base + vec2<i32>(0, 1), size, grid, fresh);
     let t11 = cloud_lattice_texel(base + vec2<i32>(1, 1), size, grid, fresh);
 
-    let c00 = textureLoad(cloud_march_texture, t00, 0);
-    let c10 = textureLoad(cloud_march_texture, t10, 0);
-    let c01 = textureLoad(cloud_march_texture, t01, 0);
-    let c11 = textureLoad(cloud_march_texture, t11, 0);
+    let c00 = textureLoad(cloud_march_texture, b00, 0);
+    let c10 = textureLoad(cloud_march_texture, b10, 0);
+    let c01 = textureLoad(cloud_march_texture, b01, 0);
+    let c11 = textureLoad(cloud_march_texture, b11, 0);
 
     var out: CloudLattice;
     out.minimum = min(min(c00, c10), min(c01, c11));
@@ -2416,6 +2502,75 @@ fn fs_cloud_resolve(input: VertexOut) -> @location(0) vec4<f32> {
     return mix(lattice.value, history, blend * confidence);
 }
 
+// The light a lit saber blade adds to this pixel, so the clouds can be
+// composited under it instead of over it. The blade is additive FX light drawn
+// over the sky and it writes no depth, so the cloud composite cannot tell it
+// from sky: it would dim the blade by the cloud's transmittance and bury it
+// under cloud radiance. The CPU projects each blade to a screen-space capsule
+// (see cloud_foreground_uniform).
+//
+// The blade's own contribution is the pixel minus the sky beside the blade, so
+// the estimate samples the scene just outside the glow. Removing the cloud
+// around the blade instead would open a window onto the raw skybox behind it.
+fn saber_glow_over_clouds(uv: vec2<f32>, scene_depth: f32, background: vec3<f32>) -> vec3<f32> {
+    let count = u32(settings.cloud_foreground.x);
+    if (count == 0u) {
+        return vec3<f32>(0.0);
+    }
+    let viewport = max(settings.aa.yz, vec2<f32>(1.0));
+    let pixel = uv * viewport;
+    var weight = 0.0;
+    var sky_centre = pixel;
+    var sky_side = vec2<f32>(1.0, 0.0);
+    var sky_reach = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let segment = settings.cloud_blades[i * 2u];
+        let extent = settings.cloud_blades[i * 2u + 1u];
+        // A blade behind solid geometry is not seen; leave the clouds alone.
+        if (valid_depth(scene_depth) && scene_depth < extent.y - 4.0) {
+            continue;
+        }
+        let along = segment.zw - segment.xy;
+        let from_start = pixel - segment.xy;
+        let h = clamp(dot(from_start, along) / max(dot(along, along), 1.0e-4), 0.0, 1.0);
+        let closest = segment.xy + along * h;
+        let offset = pixel - closest;
+        let distance_px = length(offset);
+        // The core is fully the blade's, the halo fades out over the glow radius.
+        let w = 1.0 - smoothstep(extent.x * 0.35, extent.x, distance_px);
+        if (w > weight) {
+            weight = w;
+            sky_centre = closest;
+            sky_side = vec2<f32>(-along.y, along.x) / max(length(along), 1.0e-3);
+            sky_reach = extent.x * 1.5;
+        }
+    }
+    if (weight <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    // Sky reference: just past the glow on both sides of the blade, averaged so
+    // a sky gradient across the blade cancels instead of tinting one side. A
+    // reference that lands on geometry is not sky and is left out.
+    var sky = vec3<f32>(0.0);
+    var sky_samples = 0.0;
+    for (var side = 0u; side < 2u; side = side + 1u) {
+        let direction = select(-1.0, 1.0, side == 0u);
+        let reference_uv = clamp(
+            (sky_centre + sky_side * sky_reach * direction) / viewport,
+            vec2<f32>(0.0),
+            vec2<f32>(1.0)
+        );
+        if (!valid_depth(depth_at_uv(reference_uv))) {
+            sky += textureSampleLevel(scene_texture, scene_sampler, reference_uv, 0.0).rgb;
+            sky_samples += 1.0;
+        }
+    }
+    if (sky_samples <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    return max(background - sky / sky_samples, vec3<f32>(0.0)) * weight;
+}
+
 fn render_clouds(background: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     if (settings.clouds.x <= 0.5) {
         return background;
@@ -2436,8 +2591,38 @@ fn render_clouds(background: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
         }
     }
 
-    let transfer = textureSample(cloud_transfer_texture, scene_sampler, uv);
-    return background * clamp(transfer.a, 0.0, 1.0) + max(transfer.rgb, vec3<f32>(0.0));
+    var transfer = textureSample(cloud_transfer_texture, scene_sampler, uv);
+    if (settings.underwater.x > -1.0e20) {
+        // The camera is under the ocean, so the sky (and any cloud in it) is seen
+        // through the surface. The background already carries the water's
+        // absorption from the optics pass; the clouds are composited after it
+        // and would otherwise punch through at full strength.
+        let seen = cloud_seen_through_water(cloud_world_ray(uv));
+        transfer = vec4<f32>(transfer.rgb * seen.rgb * seen.a, mix(1.0, transfer.a, seen.a));
+    }
+    // The blade sits in front of the cloud: everything else is dimmed by the
+    // cloud, but the blade's own light is not.
+    let transmittance = clamp(transfer.a, 0.0, 1.0);
+    let blade = saber_glow_over_clouds(uv, scene_depth, background);
+    return background * transmittance + max(transfer.rgb, vec3<f32>(0.0))
+        + blade * (1.0 - transmittance);
+}
+
+// How much of a cloud in direction `rd` reaches a camera under the water surface:
+// Beer-Lambert absorption over the path up to the surface (same channel ratios as
+// ocean_optics.wgsl), and the window of sky that is visible at all. Beyond the
+// critical angle (asin(1/1.333), 48.6 degrees off vertical) the surface is a mirror
+// showing the underwater scene, not the sky. rgb: transmission, a: window.
+fn cloud_seen_through_water(rd: vec3<f32>) -> vec4<f32> {
+    if (rd.y <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let rise = max(settings.underwater.x - settings.camera_pos_time.y, 0.0);
+    let path = rise / max(rd.y, 0.02);
+    let ratios = vec3<f32>(38.0 / 7.5, 38.0 / 22.0, 1.0);
+    let transmission = exp2(-4.321928 * ratios * path / max(settings.underwater.y, 1.0));
+    let window = smoothstep(0.58, 0.72, rd.y);
+    return vec4<f32>(transmission, window);
 }
 
 fn apply_volumetric_fog(
@@ -2503,8 +2688,11 @@ fn apply_rain_haze(color: vec3<f32>, uv: vec2<f32>, world: vec3<f32>, depth: f32
     let maximum = mix(0.31, 0.74, intensity) * mix(1.0, 1.10, heavy) * haze_strength;
     let amount = clamp(extinction, 0.0, maximum) * exposure;
 
+    // Rain air is a cool blue-grey. It only borrows the sun's brightness, never its
+    // colour: a warm sun must not turn distant walls pink.
     let sun_tint = max(settings.cloud_sun_color.rgb, vec3<f32>(0.04));
-    let rain_air = mix(vec3<f32>(0.39, 0.47, 0.57), sun_tint, 0.30);
+    let sun_brightness = clamp(luminance(sun_tint), 0.0, 1.0);
+    let rain_air = vec3<f32>(0.39, 0.47, 0.57) * mix(0.94, 1.0, sun_brightness);
     let scene_luma = luminance(color);
     let haze_color = rain_air * mix(0.62, 1.08, clamp(scene_luma, 0.0, 1.0));
     return mix(color, haze_color, amount);
@@ -2547,12 +2735,16 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
-        color *= projected_cloud_shadow_factor(world);
-        let puddle = post_puddle_amount(world);
-        color = finalize_puddle_film(color, world, puddle);
         let normal = surface_normal(pixel);
+        color *= projected_cloud_shadow_factor(world, normal, pixel);
+        let puddle = post_puddle_amount(world, normal.y);
+        color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);
-        color *= contact_shadow_factor(world, normal, centre_depth);
+        let contact_factor = contact_shadow_factor(pixel, world, centre_depth);
+        if (settings.scene.x > 1.5) {
+            return vec4<f32>(contact_shadow_debug_color(contact_factor), 1.0);
+        }
+        color *= contact_factor;
         if (ssao_enabled) {
             color *= ssao_factor(pixel, centre_depth);
         }
@@ -2566,7 +2758,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 
     if (bloom_enabled) {
         let levels = bloom_levels(input.uv);
-        color += bloom_color(levels) * 0.32;
+        // Rain scatters light: lamps and signs bloom wider in wet air.
+        color += bloom_color(levels) * (0.32 * (1.0 + 0.6 * settings.weather_look.y));
         if (halation_enabled) {
             let red_return = halation_red_levels(levels);
             color = apply_film_halation(color, red_return);
@@ -2584,6 +2777,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = purple_fringe_color(input.uv, color);
+    color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
     if (settings.film.z > 0.5) {
         let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));
@@ -2640,12 +2834,17 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
 
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
-        color *= projected_cloud_shadow_factor(world);
-        let puddle = post_puddle_amount(world);
-        color = finalize_puddle_film(color, world, puddle);
         let normal = surface_normal(pixel);
+        color *= projected_cloud_shadow_factor(world, normal, pixel);
+        let puddle = post_puddle_amount(world, normal.y);
+        color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);
-        color *= contact_shadow_factor(world, normal, centre_depth);
+        let contact_factor = contact_shadow_factor(pixel, world, centre_depth);
+        if (settings.scene.x > 1.5) {
+            let debug_color = vec4<f32>(contact_shadow_debug_color(contact_factor), 1.0);
+            return TaaFragmentOut(debug_color, debug_color);
+        }
+        color *= contact_factor;
         if (ssao_enabled) {
             color *= ssao_factor(pixel, centre_depth);
         }
@@ -2659,7 +2858,8 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
 
     if (bloom_enabled) {
         let levels = bloom_levels(input.uv);
-        color += bloom_color(levels) * 0.32;
+        // Rain scatters light: lamps and signs bloom wider in wet air.
+        color += bloom_color(levels) * (0.32 * (1.0 + 0.6 * settings.weather_look.y));
         if (halation_enabled) {
             let red_return = halation_red_levels(levels);
             color = apply_film_halation(color, red_return);
@@ -2677,6 +2877,7 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = purple_fringe_color(input.uv, color);
+    color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
     if (settings.film.z > 0.5) {
         let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));

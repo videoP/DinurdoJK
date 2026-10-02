@@ -5,19 +5,24 @@
 //! network source both feed the same decoded `Snapshot` values into this layer.
 
 mod player_animation;
+pub(crate) mod footsteps;
 pub(crate) mod ragdoll;
 mod saber_throw;
 pub mod item_presenter;
 pub mod weapon_fx;
 pub(crate) mod saber_melt;
 pub mod sound_presenter;
+pub(crate) mod sound_tables;
+pub(crate) mod ambient_sets;
 pub mod stringed;
 pub mod entity_presenter;
 pub mod event_debug;
 pub mod event_presenter;
 pub(crate) mod event_workers;
 pub mod player_presenter;
+pub(crate) mod player_gore;
 pub mod view;
+pub mod crosshair;
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -33,6 +38,9 @@ use jka_protocol::{
 // OpenJK `bg_public.h` / q_shared configstring layout. CS_PLAYERS evaluates to 1131 in
 // protocol 26 (CS_ICONS + MAX_ICONS). Keep these wire-visible indexes fixed.
 pub const CS_SERVERINFO: u16 = 0;
+pub const CS_SCORES1: u16 = 6;
+pub const CS_SCORES2: u16 = 7;
+pub const CS_LEVEL_START_TIME: u16 = 21;
 pub const CS_ITEMS: u16 = 27; // OpenJK: server-built item precache bitstring
 // OpenJK/TaystJK protocol-26 configstring layout from bg_public.h. Keeping these
 // in the cgame layer lets demos and a future live net source resolve the same
@@ -74,9 +82,14 @@ pub struct ClientInfo {
     /// multiplayer saber colors (invalid/non-saber values fall back to blue).
     pub saber_color: i32,
     pub saber2_color: i32,
+    /// Local cp_pluginDisable used when the final authored/client saber colour is
+    /// chosen. Keeping it on ClientInfo also covers NPC definition blade colours.
+    pub plugin_disable: i32,
     /// CG_AddSaberBlade for an NPC without `boltToPlayer` colors draws each
     /// blade in its saber definition's authored color instead of c1/c2.
     pub definition_saber_colors: bool,
+    /// jaPRO `c5` (relayed `cp_cosmetics`): bit mask of worn cosmetics.
+    pub cosmetics: u32,
 }
 
 impl ClientInfo {
@@ -97,7 +110,9 @@ impl ClientInfo {
             saber2_name: String::new(),
             saber_color: 4, // SABER_BLUE
             saber2_color: 4,
+            plugin_disable: 1536,
             definition_saber_colors: false,
+            cosmetics: 0,
         }
     }
 
@@ -169,6 +184,15 @@ const GIB_HEALTH: i32 = -40;
 const PM_SPECTATOR: i32 = 4;
 const PM_INTERMISSION: i32 = 7;
 const PERS_TEAM: usize = 3;
+const PERS_PLAYEREVENTS: usize = 5;
+const PERS_IMPRESSIVE_COUNT: usize = 9;
+const PERS_EXCELLENT_COUNT: usize = 10;
+const PERS_DEFEND_COUNT: usize = 11;
+const PERS_ASSIST_COUNT: usize = 12;
+const PERS_GAUNTLET_FRAG_COUNT: usize = 13;
+const PERS_CAPTURES: usize = 14;
+const PLAYEREVENT_DENIEDREWARD: i32 = 0x0001;
+const PLAYEREVENT_GAUNTLETREWARD: i32 = 0x0002;
 const TEAM_SPECTATOR: i32 = 3;
 const EF_DEAD: i32 = 1 << 1;
 const EF_SEEKERDRONE: i32 = 1 << 21;
@@ -437,15 +461,78 @@ pub enum Ghoul2ServerCommand {
     },
 }
 
+/// Which server command produced a chat line; jaPRO's `cg_chatSounds` picks the
+/// beep from it (CG_Chat_f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    /// `chat`
+    Say,
+    /// `tchat`
+    Team,
+    /// `lchat` / `ltchat`
+    Located,
+    /// A line synthesised client-side from a VGS event; the game makes no sound.
+    Voice,
+}
+
 /// Text/output state from CG_ServerCommand for the console and HUD UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewardKind {
+    Capture,
+    Impressive,
+    Excellent,
+    Humiliation,
+    Defend,
+    Assist,
+    Denied,
+    GauntletEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewardBaseline {
+    client_num: i32,
+    team: i32,
+    counts: [i32; 6],
+    player_events: i32,
+}
+
+impl RewardBaseline {
+    fn from_player_state(ps: &PlayerState) -> Self {
+        Self {
+            client_num: ps.field_i32("clientNum").unwrap_or(-1),
+            team: ps.persistant[PERS_TEAM],
+            counts: [
+                ps.persistant[PERS_CAPTURES],
+                ps.persistant[PERS_IMPRESSIVE_COUNT],
+                ps.persistant[PERS_EXCELLENT_COUNT],
+                ps.persistant[PERS_GAUNTLET_FRAG_COUNT],
+                ps.persistant[PERS_DEFEND_COUNT],
+                ps.persistant[PERS_ASSIST_COUNT],
+            ],
+            player_events: ps.persistant[PERS_PLAYEREVENTS],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CgameNotice {
     /// `print`: console text (may contain @@@ StringEd references).
     Print(Vec<u8>),
     /// `chat`/`tchat`/`lchat`/`ltchat`: a chat-box line.
-    Chat { team: bool, text: Vec<u8> },
+    Chat { team: bool, kind: ChatKind, text: Vec<u8> },
     /// `cp`: CG_CenterPrint.
     CenterPrint(Vec<u8>),
+    /// TaystJK/jaPRO `cg_killMessage`, generated from EV_OBITUARY for the
+    /// viewer's own non-suicide kills. Localisation/presentation stays app-side.
+    KillMessage {
+        target: String,
+        rank: i32,
+        score: i32,
+        gametype: i32,
+    },
+    /// JKA/TaystJK playerState reward counter transition. The app chooses
+    /// cg_drawRewards mode assets and owns the visual FIFO.
+    Reward { kind: RewardKind, count: i32 },
     /// `scores`: OpenJK scoreboard response.
     Scores {
         team_scores: [i32; 2],
@@ -453,13 +540,32 @@ pub enum CgameNotice {
     },
     /// `map_restart`.
     MapRestart,
+    /// A client-generated StringEd message (`CG_GetStringEdString`), e.g. the
+    /// CTF messages or BEGIN DUEL. `key` is `FILE_REFERENCE`.
+    /// `CG_ItemPickup`'s "Picked up <item>" console line, for a bg_itemlist classname.
+    ItemPickupLine { classname: String },
+    StringEd {
+        key: &'static str,
+        /// Prefixed as `name^7 ` when set.
+        player: Option<String>,
+        /// Substituted for `%s` when set.
+        team: Option<&'static str>,
+        center: bool,
+    },
 }
 
 pub struct ClientGameState {
     entities: Vec<CEntity>,
+    /// jaPRO `cg_entities[client].vChatTime`: until when a client's voice-chat
+    /// icon shows (`EV_VOICECMD_SOUND` time + 1000).
+    vchat_until: [i32; MAX_CLIENTS],
     notices: VecDeque<CgameNotice>,
     big_config: jka_protocol::commands::BigConfigString,
     configstrings: BTreeMap<u16, Vec<u8>>,
+    /// Local `cp_pluginDisable`, needed by client-only jaPRO presentation rules
+    /// such as bit 3 (black-saber suppression). Server-consumed bits still
+    /// travel through userinfo in `NetworkSettings`.
+    plugin_disable: i32,
     queued_server_commands: VecDeque<ServerCommand>,
     executed_server_command: i32,
     current_snapshot: Option<Snapshot>,
@@ -470,6 +576,15 @@ pub struct ClientGameState {
     /// corrections can be recognized without replaying every render frame.
     predicted_event_sequence: i32,
     predictable_events: [i32; MAX_PREDICTED_EVENTS],
+    /// Highest playerState eventSequence already played. Predicted events come
+    /// from the displayed state, which is re-predicted every frame with a
+    /// provisional command, so the previous frame's state alone is not a
+    /// reliable "already played" marker.
+    predicted_event_high: Option<i32>,
+    /// Last authoritative/predicted playerState reward counters seen. This
+    /// de-duplicates the same transition when both snapshot and prediction
+    /// paths observe it while still making demos/follow views work.
+    reward_baseline: Option<RewardBaseline>,
     presentation_events: PresentationEventQueue,
     pending_event_traces: VecDeque<EventCheckTrace>,
     pending_ghoul2_commands: VecDeque<Ghoul2ServerCommand>,
@@ -479,9 +594,11 @@ impl Default for ClientGameState {
     fn default() -> Self {
         Self {
             entities: vec![CEntity::default(); MAX_GENTITIES],
+            vchat_until: [0; MAX_CLIENTS],
             notices: VecDeque::new(),
             big_config: jka_protocol::commands::BigConfigString::default(),
             configstrings: BTreeMap::new(),
+            plugin_disable: 1536,
             queued_server_commands: VecDeque::new(),
             executed_server_command: 0,
             current_snapshot: None,
@@ -489,6 +606,8 @@ impl Default for ClientGameState {
             frame_interpolation: 0.0,
             predicted_event_sequence: 0,
             predictable_events: [0; MAX_PREDICTED_EVENTS],
+            predicted_event_high: None,
+            reward_baseline: None,
             presentation_events: PresentationEventQueue::default(),
             pending_event_traces: VecDeque::new(),
             pending_ghoul2_commands: VecDeque::new(),
@@ -501,12 +620,17 @@ impl ClientGameState {
         Self::default()
     }
 
+    pub fn set_plugin_disable(&mut self, bits: i32) {
+        self.plugin_disable = bits;
+    }
+
     pub fn reset_gamestate(
         &mut self,
         configstrings: &BTreeMap<u16, Vec<u8>>,
         server_command_sequence: i32,
     ) {
         self.entities.fill(CEntity::default());
+        self.vchat_until = [0; MAX_CLIENTS];
         self.big_config = jka_protocol::commands::BigConfigString::default();
         self.configstrings.clone_from(configstrings);
         self.queued_server_commands.clear();
@@ -516,6 +640,8 @@ impl ClientGameState {
         self.frame_interpolation = 0.0;
         self.predicted_event_sequence = 0;
         self.predictable_events = [0; MAX_PREDICTED_EVENTS];
+        self.predicted_event_high = None;
+        self.reward_baseline = None;
         self.presentation_events.clear();
         self.pending_event_traces.clear();
         self.pending_ghoul2_commands.clear();
@@ -523,6 +649,10 @@ impl ClientGameState {
 
     pub fn drain_ghoul2_commands(&mut self) -> Vec<Ghoul2ServerCommand> {
         self.pending_ghoul2_commands.drain(..).collect()
+    }
+
+    pub fn push_notice(&mut self, notice: CgameNotice) {
+        self.notices.push_back(notice);
     }
 
     pub fn drain_notices(&mut self) -> Vec<CgameNotice> {
@@ -559,9 +689,13 @@ impl ClientGameState {
     }
 
     /// OpenJK `CG_TransitionPlayerState` event portion for the local predicted
-    /// player. `ps` and `ops` must be committed predicted states, never the
-    /// display-only provisional command, or high render FPS would replay an
-    /// event before the corresponding usercmd is committed.
+    /// player. `ps` and `ops` are the presented state and the previous frame's
+    /// presented state (stock cgame runs a real usercmd every frame, so its
+    /// predicted state is the presented one). Events must fire with the state
+    /// the eye and model are drawn from; firing them from the trailing
+    /// committed state delayed every predicted effect, and made step smoothing
+    /// cancel a rise that had already been shown. `predicted_event_high` stops
+    /// the per-frame re-prediction from replaying an event.
     pub fn transition_predicted_player_state(
         &mut self,
         ps: &PlayerState,
@@ -574,12 +708,62 @@ impl ClientGameState {
             return Ok(());
         }
 
+        self.check_reward_notices(ps);
         self.check_playerstate_events(ps, ops, server_time)?;
         // Port the correction gate as requested by the live handoff. Current
         // OpenJK keeps this routine available even where a callsite may be
         // disabled; running it after the ordinary transition cannot duplicate
         // events just stored above, but can replace a recently mispredicted one.
         self.check_changed_predictable_events(ps, server_time)
+    }
+
+    /// TaystJK `CG_CheckLocalSounds` reward-counter portion. Award ownership is
+    /// server authoritative (`playerState.persistant[]`), so Excellent/spree
+    /// timing is never guessed client-side.
+    fn check_reward_notices(&mut self, ps: &PlayerState) {
+        let next = RewardBaseline::from_player_state(ps);
+        let Some(previous) = self.reward_baseline.replace(next) else {
+            return;
+        };
+
+        // CG_TransitionPlayerState suppresses local sounds when changing the
+        // followed client/team, in intermission, or while spectating. Keep the
+        // baseline current but do not replay historical counters afterward.
+        if next.client_num != previous.client_num
+            || next.team != previous.team
+            || next.team == TEAM_SPECTATOR
+            || ps.field_i32("pm_type").unwrap_or(0) == PM_INTERMISSION
+        {
+            return;
+        }
+
+        let kinds = [
+            RewardKind::Capture,
+            RewardKind::Impressive,
+            RewardKind::Excellent,
+            RewardKind::Humiliation,
+            RewardKind::Defend,
+            RewardKind::Assist,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            // Counter decreases are respawn/map/reset bookkeeping, not a new
+            // award. Normal TaystJK transitions only ever increment here.
+            if next.counts[index] > previous.counts[index] {
+                self.notices.push_back(CgameNotice::Reward { kind, count: next.counts[index] });
+            }
+        }
+
+        if next.player_events != previous.player_events {
+            if (next.player_events & PLAYEREVENT_DENIEDREWARD)
+                != (previous.player_events & PLAYEREVENT_DENIEDREWARD)
+            {
+                self.notices.push_back(CgameNotice::Reward { kind: RewardKind::Denied, count: 0 });
+            } else if (next.player_events & PLAYEREVENT_GAUNTLETREWARD)
+                != (previous.player_events & PLAYEREVENT_GAUNTLETREWARD)
+            {
+                self.notices.push_back(CgameNotice::Reward { kind: RewardKind::GauntletEvent, count: 0 });
+            }
+        }
     }
 
     /// OpenJK `CG_CheckPlayerstateEvents`.
@@ -597,12 +781,22 @@ impl ClientGameState {
 
         let sequence = ps.field_i32("eventSequence").unwrap_or(0);
         let old_sequence = ops.field_i32("eventSequence").unwrap_or(0);
+        // The provisional command can add or drop an event between frames, so
+        // never replay below what was already played. A larger drop than the
+        // ring holds is a real discontinuity (respawn, new map), not jitter.
+        let played = match self.predicted_event_high {
+            Some(high) if high <= sequence.saturating_add(MAX_PS_EVENTS) => high.max(old_sequence),
+            _ => old_sequence,
+        };
+        self.predicted_event_high = Some(played.max(sequence));
         for index in sequence.saturating_sub(MAX_PS_EVENTS)..sequence {
             let slot = index & (MAX_PS_EVENTS - 1);
             let event = ps.field_i32(&format!("events[{slot}]")).unwrap_or(0);
             let old_event = ops.field_i32(&format!("events[{slot}]")).unwrap_or(0);
-            if index >= old_sequence
-                || (index > old_sequence.saturating_sub(MAX_PS_EVENTS) && event != old_event)
+            if index >= played
+                || (index < old_sequence
+                    && index > old_sequence.saturating_sub(MAX_PS_EVENTS)
+                    && event != old_event)
             {
                 let parm = ps.field_i32(&format!("eventParms[{slot}]")).unwrap_or(0);
                 self.push_predicted_player_event(ps, event, parm, server_time)?;
@@ -674,6 +868,53 @@ impl ClientGameState {
         Ok(())
     }
 
+    /// jaPRO CG_EntityEvent `ci->team == ourTeam || isGlobalVGS(s)`: ourTeam is
+    /// PERS_TEAM, but a follow-cam viewer counts as TEAM_SPECTATOR (the snapshot
+    /// carries the followed player's PERS_TEAM and clientNum). Global VGS families
+    /// bypass the team test. Both the chat line and the voice icon use it.
+    fn voice_command_shown(&self, speaker: usize, sound: &str) -> bool {
+        const PMF_FOLLOW: i32 = 4096;
+        let Some(snapshot) = self.current_snapshot.as_ref() else { return false };
+        let Some(speaker_team) = u16::try_from(speaker)
+            .ok()
+            .and_then(|speaker| CS_PLAYERS.checked_add(speaker))
+            .and_then(|index| self.configstring(index))
+            .and_then(|info| info_value(info, b"t"))
+            .and_then(parse_i32_ascii)
+        else {
+            return false;
+        };
+        let player_state = &snapshot.player_state;
+        let local_team = if player_state.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0 {
+            TEAM_SPECTATOR
+        } else {
+            player_state.persistant[PERS_TEAM]
+        };
+        speaker_team == local_team || crate::vgs::is_global_vgs(sound)
+    }
+
+    /// jaPRO `vChatEnt->vChatTime = cg.time + 1000` for an audible voice command.
+    fn note_voice_command(&mut self, event: &PresentationEvent) {
+        if event.event != EntityEvent::EV_VOICECMD_SOUND {
+            return;
+        }
+        let Some(speaker) = event.state.field_i32("groundEntityNum").and_then(|n| usize::try_from(n).ok()) else {
+            return;
+        };
+        if speaker >= MAX_CLIENTS {
+            return;
+        }
+        let Some(sound) = self.sound_qpath(event.parm) else { return };
+        if self.voice_command_shown(speaker, &sound) {
+            self.vchat_until[speaker] = event.server_time.saturating_add(1000);
+        }
+    }
+
+    /// `cent->vChatTime` for a client; the icon shows while it is `> cg.time`.
+    pub fn voice_chat_until(&self, client: i32) -> i32 {
+        usize::try_from(client).ok().and_then(|client| self.vchat_until.get(client)).copied().unwrap_or(0)
+    }
+
     /// TaystJK `EV_VOICECMD_SOUND`: the server only sends the accepted voice
     /// event.  The cgame turns that event into the teammate chat-box line; it
     /// is not a separate `chat`/`tchat` server command.
@@ -690,19 +931,10 @@ impl ClientGameState {
         let sound = self.sound_qpath(event.parm)?;
         let description = crate::vgs::description_for_sound(&sound)?;
 
-        let snapshot = self.current_snapshot.as_ref()?;
-        let local_client = usize::try_from(snapshot.player_state.field_i32("clientNum")?).ok()?;
-        if local_client >= MAX_CLIENTS {
+        if !self.voice_command_shown(speaker, &sound) {
             return None;
         }
-
         let speaker_info = self.configstring(CS_PLAYERS.checked_add(u16::try_from(speaker).ok()?)?)?;
-        let local_info = self.configstring(CS_PLAYERS.checked_add(u16::try_from(local_client).ok()?)?)?;
-        let speaker_team = info_value(speaker_info, b"t").and_then(parse_i32_ascii)?;
-        let local_team = info_value(local_info, b"t").and_then(parse_i32_ascii)?;
-        if speaker_team != local_team {
-            return None;
-        }
 
         let speaker_name = info_value(speaker_info, b"n")?;
         if speaker_name.is_empty() {
@@ -713,7 +945,7 @@ impl ClientGameState {
         text.extend_from_slice(speaker_name);
         text.extend_from_slice(b"^7: ");
         text.extend_from_slice(description.as_bytes());
-        Some(CgameNotice::Chat { team: true, text })
+        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text })
     }
 
     pub fn presentation_event_count(&self) -> usize {
@@ -725,6 +957,7 @@ impl ClientGameState {
     /// the caller drains this queue after state transitions are complete.
     pub fn pop_presentation_event(&mut self) -> Option<PresentationEvent> {
         let event = self.presentation_events.pop_front()?;
+        self.note_voice_command(&event);
         if let Some(notice) = self.vgs_chat_notice(&event) {
             self.notices.push_back(notice);
         }
@@ -745,11 +978,79 @@ impl ClientGameState {
         self.pending_event_traces.drain(..).collect()
     }
 
+    /// True on a jaPRO server (`gamename`), where the jaPRO-only client rules apply.
+    pub fn is_japro(&self) -> bool {
+        self.configstring(CS_SERVERINFO).is_some_and(|info| {
+            crate::net::mod_support::ServerMod::detect(info) == crate::net::mod_support::ServerMod::Japro
+        })
+    }
+
+    /// jaPRO cgame draws `SABER_RGB` blades only on JA+ / jaPRO servers.
+    pub fn rgb_sabers_supported(&self) -> bool {
+        self.configstring(CS_SERVERINFO)
+            .is_some_and(|info| crate::net::mod_support::ServerMod::detect(info).supports_rgb_sabers())
+    }
+
+    /// `cgs.jcinfo2`.
+    pub fn japro_cinfo2(&self) -> i32 {
+        self.configstring(CS_SERVERINFO)
+            .and_then(|info| info_value(info, b"jcinfo2"))
+            .and_then(parse_i32_ascii)
+            .unwrap_or(0)
+    }
+
+    /// jaPRO `IsRacemode(&cg.predictedPlayerState)`: the viewer is in a timed race
+    /// course (`STAT_RACEMODE`), where cgame skips shake, duel cues and similar.
+    pub fn japro_racemode(&self) -> bool {
+        const STAT_RACEMODE: usize = 11;
+        self.is_japro()
+            && self
+                .current_snapshot()
+                .is_some_and(|snapshot| snapshot.player_state.stats[STAT_RACEMODE] != 0)
+    }
+
+    /// `cgs.svfps`: `sv_fps` from serverinfo, 20 when it is absent or zero
+    /// (`CG_ParseServerinfo`).
+    pub fn server_fps(&self) -> i32 {
+        self.configstring(CS_SERVERINFO)
+            .and_then(|info| info_value(info, b"sv_fps"))
+            .and_then(parse_i32_ascii)
+            .filter(|fps| *fps != 0)
+            .unwrap_or(20)
+    }
+
+    /// `g_synchronousClients`, a systeminfo cvar cgame mirrors (the lagometer labels it "snc").
+    pub fn synchronous_clients(&self) -> bool {
+        self.configstring(jka_protocol::session::CS_SYSTEMINFO)
+            .and_then(|info| info_value(info, b"g_synchronousClients"))
+            .and_then(parse_i32_ascii)
+            .is_some_and(|value| value != 0)
+    }
+
     pub fn gametype(&self) -> i32 {
         self.configstring(CS_SERVERINFO)
             .and_then(|info| info_value(info, b"g_gametype"))
             .and_then(parse_i32_ascii)
             .unwrap_or(0)
+    }
+
+    /// The `cgs.timelimit` / `fraglimit` / `levelStartTime` / `scores1` / `scores2`
+    /// values `CG_ParseServerinfo` and `CG_ConfigStringModified` keep.
+    pub fn match_limits(&self) -> MatchLimits {
+        let info = |key: &[u8]| {
+            self.configstring(CS_SERVERINFO)
+                .and_then(|info| info_value(info, key))
+                .and_then(parse_i32_ascii)
+                .unwrap_or(0)
+        };
+        let cs = |index: u16| self.configstring(index).and_then(parse_i32_ascii).unwrap_or(0);
+        MatchLimits {
+            timelimit: info(b"timelimit"),
+            fraglimit: info(b"fraglimit"),
+            level_start_time: cs(CS_LEVEL_START_TIME),
+            scores1: cs(CS_SCORES1),
+            scores2: cs(CS_SCORES2),
+        }
     }
 
     /// OpenJK `CS_ITEMS`: the server/game module tells cgame which item visuals
@@ -779,6 +1080,14 @@ impl ClientGameState {
             .or_else(|| info_value(info, b"wdisable"))
             .and_then(parse_i32_ascii)
             .unwrap_or(0)
+    }
+
+    /// `cgs.clientinfo[client].name`: CG_NewClientInfo keeps the `n` key of the
+    /// client's `CS_PLAYERS` configstring, which is all this reads.
+    pub fn client_name(&self, client: usize) -> Option<String> {
+        let index = CS_PLAYERS.checked_add(u16::try_from(client).ok()?)?;
+        let name = info_value(self.configstring(index)?, b"n")?;
+        Some(bytes_to_lossless_ascii(name))
     }
 
     /// Visual subset of OpenJK `CG_NewClientInfo` with `cg_forceModel == 0`. Siege model/skin
@@ -816,12 +1125,18 @@ impl ClientGameState {
         let saber2_name = info_value(configstring, b"st2")
             .map(bytes_to_lossless_ascii)
             .unwrap_or_default();
-        let saber_color = info_value(configstring, b"c1")
-            .and_then(parse_i32_ascii)
-            .unwrap_or(4);
-        let saber2_color = info_value(configstring, b"c2")
-            .and_then(parse_i32_ascii)
-            .unwrap_or(4);
+        // jaPRO relays `cp_sbRGB1/2` as c3/c4; they only apply to SABER_RGB.
+        let rgb_capable = self.rgb_sabers_supported();
+        let saber_color = resolve_saber_color(
+            info_value(configstring, b"c1").and_then(parse_i32_ascii).unwrap_or(4),
+            info_value(configstring, b"c3").and_then(parse_i32_ascii).unwrap_or(0),
+            rgb_capable,
+        );
+        let saber2_color = resolve_saber_color(
+            info_value(configstring, b"c2").and_then(parse_i32_ascii).unwrap_or(4),
+            info_value(configstring, b"c4").and_then(parse_i32_ascii).unwrap_or(0),
+            rgb_capable,
+        );
 
         if self.gametype() == GT_SIEGE {
             if let Some(class) = find_siege_class_visual(siege_classes, &siege_class) {
@@ -848,7 +1163,11 @@ impl ClientGameState {
             saber2_name,
             saber_color,
             saber2_color,
+            plugin_disable: self.plugin_disable,
             definition_saber_colors: false,
+            cosmetics: info_value(configstring, b"c5")
+                .and_then(parse_i32_ascii)
+                .map_or(0, |bits| bits as u32),
         })
     }
 
@@ -899,13 +1218,16 @@ impl ClientGameState {
             saber2_name: saber("npcSaber2"),
             saber_color: (bolt_colors & 0x07) - 1,
             saber2_color: ((bolt_colors & 0x38) >> 3) - 1,
+            plugin_disable: self.plugin_disable,
             definition_saber_colors: bolt_colors == 0,
+            cosmetics: 0,
         })
     }
 
     /// OpenJK `CG_SetInitialSnapshot`, limited to the snapshot/entity responsibilities that exist
     /// in this Rust client today. Rendering/Ghoul2 side effects are deliberately not fabricated.
     pub fn set_initial_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), String> {
+        self.reward_baseline = Some(RewardBaseline::from_player_state(&snapshot.player_state));
         self.current_snapshot = Some(snapshot.clone());
         self.next_snapshot = None;
         self.execute_server_commands(snapshot.server_command_num)?;
@@ -970,6 +1292,7 @@ impl ClientGameState {
         }
 
         self.execute_server_commands(next.server_command_num)?;
+        self.check_reward_notices(&next.player_state);
 
         // OpenJK clears currentValid for every entity in the old snapshot first.
         for entity in &current.entities {
@@ -1183,7 +1506,8 @@ impl ClientGameState {
         }
         if name.eq_ignore_ascii_case(b"chat") || name.eq_ignore_ascii_case(b"tchat") {
             let team = name.eq_ignore_ascii_case(b"tchat");
-            self.notices.push_back(CgameNotice::Chat { team, text: strip_escape(arg(1)) });
+            let kind = if team { ChatKind::Team } else { ChatKind::Say };
+            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)) });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"lchat") || name.eq_ignore_ascii_case(b"ltchat") {
@@ -1193,24 +1517,27 @@ impl ClientGameState {
             // "%s^7<%s> ^%s%s": name, location, colour, message.
             let text = [arg(1), b"^7<".to_vec(), arg(2), b"> ^".to_vec(), arg(3), arg(4)].concat();
             let team = name.eq_ignore_ascii_case(b"ltchat");
-            self.notices.push_back(CgameNotice::Chat { team, text: strip_escape(text) });
+            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text) });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"scores") {
             // OpenJK CG_ParseScores / g_cmds.c DeathmatchScoreboardMessage:
-            // argv(1) count, argv(2..=3) red/blue totals, then SCORE_OFFSET
-            // (=14) integer fields for each client.
-            const SCORE_OFFSET: usize = 14;
+            // argv(1) count, argv(2..=3) red/blue totals, then a fixed number
+            // of integer fields for each client. Stock is 14; jaPRO appends a
+            // 15th (deaths) for clients that send cjp_client, which this
+            // client does on jaPRO servers. A wrong stride shifts every record
+            // and scrambles the client numbers (hence names).
             const MAX_SCORE_CLIENTS: usize = 32;
             let integer = |index: usize| {
                 parts.get(index).and_then(|value| parse_i32_ascii(value)).unwrap_or(0)
             };
             let count = integer(1).clamp(0, MAX_SCORE_CLIENTS as i32) as usize;
             let team_scores = [integer(2), integer(3)];
+            let score_offset = score_record_stride(self.is_japro(), count, parts.len());
             let mut entries = Vec::with_capacity(count);
             for score_index in 0..count {
-                let base = 4 + score_index * SCORE_OFFSET;
-                if parts.len() < base + SCORE_OFFSET {
+                let base = 4 + score_index * score_offset;
+                if parts.len() < base + SCORE_FIELDS {
                     break;
                 }
                 let client = integer(base).clamp(0, (MAX_SCORE_CLIENTS - 1) as i32);
@@ -1309,6 +1636,15 @@ impl ClientGameState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchLimits {
+    pub timelimit: i32,
+    pub fraglimit: i32,
+    pub level_start_time: i32,
+    pub scores1: i32,
+    pub scores2: i32,
+}
+
 fn info_value<'a>(info: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let mut fields = info.split(|&byte| byte == b'\\');
     if info.first() == Some(&b'\\') {
@@ -1342,6 +1678,72 @@ fn configstring_resource(
 
 fn parse_i32_ascii(value: &[u8]) -> Option<i32> {
     std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// jaPRO `SABER_RGB`: the blade colour comes from `cp_sbRGB1/2` (`c3/c4`).
+pub const SABER_RGB: i32 = 6;
+/// jaPRO/TaystJK `SABER_BLACK`.
+pub const SABER_BLACK: i32 = 11;
+/// Set on a resolved blade colour that carries a packed `0xBBGGRR` in its low 24
+/// bits, so every blade/trail/light path can take one integer as before.
+pub const SABER_CUSTOM_RGB: i32 = 1 << 24;
+
+/// RGB of a resolved custom blade colour (`SABER_CUSTOM_RGB`), if it is one.
+pub fn custom_saber_rgb(color: i32) -> Option<[u8; 3]> {
+    (color & SABER_CUSTOM_RGB != 0).then(|| [(color & 255) as u8, ((color >> 8) & 255) as u8, ((color >> 16) & 255) as u8])
+}
+
+/// jaPRO ClampSaberColor + CG_NewClientInfo's rgb handling: the effective blade
+/// colour for the protocol `c1`/`c2` value and its `c3`/`c4` RGB.
+pub fn resolve_saber_color(color: i32, packed_rgb: i32, rgb_capable: bool) -> i32 {
+    let color = color.rem_euclid(12);
+    match color {
+        // Flame/electric variants draw as tinted RGB blades in jaPRO too.
+        SABER_RGB..=10 if rgb_capable => {
+            // CG_NewClientInfo: an unset colour is 255, i.e. pure red.
+            let packed = if packed_rgb & 0xFF_FFFF == 0 { 255 } else { packed_rgb & 0xFF_FFFF };
+            SABER_CUSTOM_RGB | packed
+        }
+        // Servers without RGB support roll the extended colours back to the base six.
+        SABER_RGB..=10 => color - SABER_RGB,
+        _ => color,
+    }
+}
+
+/// TaystJK `ClampSaberColor`: jaPRO plugin-disable bit 3 makes a black saber
+/// render as orange. The server does not consume this bit; it is purely a
+/// client presentation preference.
+pub fn apply_plugin_saber_color(color: i32, plugin_disable: i32) -> i32 {
+    if color == SABER_BLACK
+        && plugin_disable & crate::japro_cg::plugin_disable::BLACK_SABERS_DISABLE != 0
+    {
+        1 // SABER_ORANGE
+    } else {
+        color
+    }
+}
+
+/// Integer fields every `scores` record carries (stock OpenJK layout).
+const SCORE_FIELDS: usize = 14;
+/// jaPRO's extended record adds a trailing deaths field.
+const SCORE_FIELDS_JAPRO: usize = 15;
+
+/// Per-client stride of a `scores` command (`token_count` includes the command
+/// name). The mod decides it, as in jaPRO's CG_ParseScores. When the token
+/// count exactly fits only the other layout - e.g. a mod that sends the extended
+/// record to a client it did not detect as jaPRO - trust the wire instead.
+fn score_record_stride(japro: bool, count: usize, token_count: usize) -> usize {
+    let (preferred, other) = if japro {
+        (SCORE_FIELDS_JAPRO, SCORE_FIELDS)
+    } else {
+        (SCORE_FIELDS, SCORE_FIELDS_JAPRO)
+    };
+    let body = token_count.saturating_sub(4);
+    if count == 0 || body == count * preferred || body != count * other {
+        preferred
+    } else {
+        other
+    }
 }
 
 pub fn bytes_to_lossless_ascii(value: &[u8]) -> String {
@@ -1673,13 +2075,26 @@ fn interpolate_entity_position(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Trajectory {
-    kind: i32,
-    time: i32,
-    duration: i32,
-    base: [f32; 3],
-    delta: [f32; 3],
+/// A `trajectory_t`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Trajectory {
+    pub(crate) kind: i32,
+    pub(crate) time: i32,
+    pub(crate) duration: i32,
+    pub(crate) base: [f32; 3],
+    pub(crate) delta: [f32; 3],
+}
+
+impl Trajectory {
+    /// BG_EvaluateTrajectory; a trajectory OpenJK would `Com_Error` on stays at its base.
+    pub(crate) fn evaluate(self, at_time: i32) -> [f32; 3] {
+        evaluate_trajectory(self, at_time).unwrap_or(self.base)
+    }
+
+    /// The `pos` or `apos` trajectory of an entity state.
+    pub(crate) fn of(entity: &EntityState, prefix: &str) -> Self {
+        trajectory(entity, prefix)
+    }
 }
 
 fn trajectory(entity: &EntityState, prefix: &str) -> Trajectory {
@@ -1694,6 +2109,12 @@ fn trajectory(entity: &EntityState, prefix: &str) -> Trajectory {
 
 fn evaluate_trajectory(tr: Trajectory, at_time: i32) -> Result<[f32; 3], String> {
     evaluate_trajectory_at(tr, f64::from(at_time))
+}
+
+/// BG_EvaluateTrajectory of an entity's `pos` or `apos` at `time`. `None` for a
+/// trajectory type OpenJK would `Com_Error` on.
+pub(crate) fn evaluate_entity_trajectory(state: &EntityState, prefix: &str, time: i32) -> Option<[f32; 3]> {
+    evaluate_trajectory(trajectory(state, prefix), time).ok()
 }
 
 fn evaluate_trajectory_at(tr: Trajectory, mut at_time_ms: f64) -> Result<[f32; 3], String> {
@@ -2134,6 +2555,75 @@ mod tests {
     }
 
     #[test]
+    fn japro_scores_use_15_int_records_with_trailing_deaths() {
+        let mut game = ClientGameState::new();
+        game.configstrings.insert(CS_SERVERINFO, br"\gamename\japro 1.4".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 2, br"\n\Alice\t\0".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 5, br"\n\Bob\t\0".to_vec());
+        game.execute_server_command(&ServerCommand {
+            sequence: 81,
+            text: b"scores 2 0 0 \
+                    2 42 55 7 0 0 0 0 0 0 0 0 0 0 9 \
+                    5 10 30 3 0 0 0 0 0 0 0 0 0 0 4"
+                .to_vec(),
+        })
+        .unwrap();
+
+        let notices = game.drain_notices();
+        let CgameNotice::Scores { entries, .. } = &notices[0] else {
+            panic!("expected scores notice");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].client, entries[0].name.as_str(), entries[0].score), (2, "Alice", 42));
+        assert_eq!((entries[1].client, entries[1].name.as_str(), entries[1].score), (5, "Bob", 10));
+    }
+
+    #[test]
+    fn rgb_saber_colours_resolve_like_japro_client_info() {
+        // 0x0000FF packed = pure red channel 255.
+        let rgb = SABER_CUSTOM_RGB | 0x00_FF80;
+        assert_eq!(resolve_saber_color(6, 0x00_FF80, true), rgb);
+        assert_eq!(custom_saber_rgb(rgb), Some([0x80, 0xFF, 0x00]));
+        // An unset colour reads as pure red, like CG_NewClientInfo.
+        assert_eq!(custom_saber_rgb(resolve_saber_color(6, 0, true)), Some([255, 0, 0]));
+        // Stock colours pass through; servers without RGB roll back to the base six.
+        assert_eq!(resolve_saber_color(3, 123, true), 3);
+        assert_eq!(resolve_saber_color(6, 123, false), 0);
+        assert_eq!(resolve_saber_color(9, 123, false), 3);
+
+        let mut game = ClientGameState::new();
+        game.configstrings.insert(CS_SERVERINFO, br"\gamename\japro 1.4".to_vec());
+        game.configstrings.insert(CS_PLAYERS, br"\n\Rgb\t\0\c1\6\c2\4\c3\65280\c4\0".to_vec());
+        let info = game.client_info(0, &[]).unwrap();
+        assert_eq!(custom_saber_rgb(info.saber_color), Some([0, 255, 0]));
+        assert_eq!(info.saber2_color, 4);
+        game.configstrings.insert(CS_SERVERINFO, br"\gamename\basejka".to_vec());
+        assert_eq!(game.client_info(0, &[]).unwrap().saber_color, 0);
+    }
+
+    #[test]
+    fn client_name_tracks_the_players_configstring() {
+        let mut game = ClientGameState::new();
+        assert_eq!(game.client_name(3), None);
+        game.configstrings.insert(CS_PLAYERS + 3, br"\n\^1Old\t\0".to_vec());
+        assert_eq!(game.client_name(3).as_deref(), Some("^1Old"));
+        // A configstring update is visible on the next read, no rescan needed.
+        game.configstrings.insert(CS_PLAYERS + 3, br"\n\New\t\0".to_vec());
+        assert_eq!(game.client_name(3).as_deref(), Some("New"));
+    }
+
+    #[test]
+    fn score_stride_follows_wire_when_mod_guess_does_not_fit() {
+        assert_eq!(score_record_stride(true, 3, 4 + 3 * 15), 15);
+        assert_eq!(score_record_stride(false, 3, 4 + 3 * 14), 14);
+        // Extended records from a server that was not detected as jaPRO.
+        assert_eq!(score_record_stride(false, 3, 4 + 3 * 15), 15);
+        // Truncated command: fall back to the mod's layout.
+        assert_eq!(score_record_stride(true, 20, 4 + 7 * 15), 15);
+        assert_eq!(score_record_stride(false, 0, 4), 14);
+    }
+
+    #[test]
     #[ignore = "requires JKA_TEST_BASE and demos/cheezyVsource.dm_26"]
     fn cheezy_demo_server_commands_reach_eof() {
         use jka_protocol::{demo::DemoReader, server::{Decoder, Event}};
@@ -2236,6 +2726,7 @@ mod tests {
             message_num: 1,
             delta_num: -1,
             snap_flags: 0,
+            ping: 0,
             server_command_num: 0,
             area_mask: [0; 32],
             player_state,
@@ -2292,6 +2783,21 @@ mod tests {
 
         // Re-presenting the same committed state must not replay its event.
         game.transition_predicted_player_state(&next, &next, 1_008).unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+    }
+
+    #[test]
+    fn reprediction_jitter_does_not_replay_a_played_event() {
+        let mut game = ClientGameState::new();
+        let base = predicted_ps(3, 0, 0, 0, 0, 0);
+        let stepped = predicted_ps(3, 1, EntityEvent::EV_STEP_8.as_i32(), 0, 0, 0);
+        game.transition_predicted_player_state(&stepped, &base, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+
+        // The next provisional command does not reproduce the event, the one
+        // after does again: the presented state flickers, the event played once.
+        game.transition_predicted_player_state(&base, &stepped, 1_004).unwrap();
+        game.transition_predicted_player_state(&stepped, &base, 1_008).unwrap();
         assert!(game.drain_presentation_events().is_empty());
     }
 
@@ -2408,6 +2914,7 @@ mod tests {
             message_num: 1,
             delta_num: -1,
             snap_flags: 0,
+            ping: 0,
             server_command_num: 0,
             area_mask: [0; 32],
             player_state: player_state.clone(),
@@ -2425,6 +2932,21 @@ mod tests {
 #[cfg(test)]
 mod client_info_tests {
     use super::*;
+
+    #[test]
+    fn plugin_disable_black_saber_clamps_only_black_to_orange() {
+        use crate::japro_cg::plugin_disable;
+
+        assert_eq!(apply_plugin_saber_color(SABER_BLACK, 0), SABER_BLACK);
+        assert_eq!(
+            apply_plugin_saber_color(SABER_BLACK, plugin_disable::BLACK_SABERS_DISABLE),
+            1
+        );
+        assert_eq!(
+            apply_plugin_saber_color(2, plugin_disable::BLACK_SABERS_DISABLE),
+            2
+        );
+    }
 
     #[test]
     fn missing_model_fallback_uses_gender_and_gametype_without_changing_identity() {

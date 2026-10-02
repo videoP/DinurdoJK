@@ -3,15 +3,19 @@
 //! entity events: EV_MISSILE_HIT/MISS/MISS_METAL and EV_PLAY_EFFECT[_ID].
 //! Vanilla branches only (JA+/JAPRO "tribes" substitutions are not ported).
 
-use super::{event_presenter::EventDispatchResult, ClientGameState, PresentationEvent, PresentedEntity};
+use super::{
+    custom_saber_rgb, event_presenter::EventDispatchResult, ClientGameState, PresentationEvent,
+    PresentedEntity, SABER_BLACK,
+};
+use super::footsteps::{self, FootstepImpact, FootstepStages};
 use super::player_presenter::PlayerFxRequest;
 use super::saber_melt::SaberMelt;
 use crate::{
     fx::{
-        system::{EffectId, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem},
+        system::{EffectId, FxBlade, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem},
         template::Rng,
     },
-    ui::SaberMarkMode,
+    ui::{FootprintMode, SaberMarkMode},
 };
 use jka_assets::{
     pk3::AssetSearchPath,
@@ -104,10 +108,19 @@ struct MissileFxState {
 enum FxWorkerCommand {
     AdjustTime(i32),
     ResetTime(i32),
+    /// `fx_physics` mode (see `crate::fx::FX_PHYSICS_*`).
+    SetPhysics(u32),
+    /// `fx_lod` mode and `fx_countScale` (see `crate::fx::FX_LOD_*`).
+    SetLod { mode: u32, count_scale: f32, lod_scale: f32 },
+    /// Render view for LOD: origin and projected pixels per unit at depth 1.
+    SetLodView { origin: [f32; 3], px_per_unit: f32 },
+    /// Worker-owned clone of the map CM world for FX particle traces.
+    SetCollision(Option<CollisionWorld>),
     PlayDir { name: String, origin: [f32; 3], dir: [f32; 3] },
     PlayDirClass { name: String, origin: [f32; 3], dir: [f32; 3], class: FxClass },
     PlayAxis { name: String, origin: [f32; 3], axis: [[f32; 3]; 3] },
     Frame { saber_impact_fx: bool, reply: mpsc::SyncSender<(FxFrame, FxStats)> },
+    RefreshAssets { reply: mpsc::SyncSender<Result<usize, String>> },
     Shutdown,
 }
 
@@ -130,16 +143,43 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
         match command {
             FxWorkerCommand::AdjustTime(time) => worker.fx.adjust_time(time),
             FxWorkerCommand::ResetTime(time) => worker.fx.reset_time(time),
+            FxWorkerCommand::SetPhysics(mode) => worker.fx.set_physics_mode(mode),
+            FxWorkerCommand::SetLod { mode, count_scale, lod_scale } => worker.fx.set_lod(mode, count_scale, lod_scale),
+            FxWorkerCommand::SetLodView { origin, px_per_unit } => worker.fx.set_lod_view(origin, px_per_unit),
+            FxWorkerCommand::SetCollision(world) => {
+                worker.fx.set_collision(world.map(|world| Box::new(world) as Box<dyn TraceWorld + Send>));
+            }
             FxWorkerCommand::PlayDir { name, origin, dir } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir(id, origin, dir); } }
             FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
             FxWorkerCommand::PlayAxis { name, origin, axis } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect(id, origin, axis); } }
             FxWorkerCommand::Frame { saber_impact_fx, reply } => { let frame = worker.fx.frame_with_visibility(saber_impact_fx); let _ = reply.send((frame, worker.fx.stats())); }
+            FxWorkerCommand::RefreshAssets { reply } => {
+                let retried = worker.missing.len();
+                let result = worker
+                    .assets
+                    .refresh()
+                    .map(|()| {
+                        // Existing FX instances/templates may finish naturally.
+                        // Future effect lookups re-register through the refreshed
+                        // VFS, including names that previously resolved missing.
+                        worker.ids.clear();
+                        worker.missing.clear();
+                        retried
+                    })
+                    .map_err(|error| format!("FX ASSET REFRESH ERROR: {error}"));
+                let _ = reply.send(result);
+            }
             FxWorkerCommand::Shutdown => break,
         }
     }
 }
 
 fn saber_shaders(color: i32) -> (&'static str, &'static str) {
+    if custom_saber_rgb(color).is_some() {
+        // jaPRO's tintable white glow/core (assets/japro sbRGB.shader); the
+        // entity presenter falls back to desaturated stock images without it.
+        return ("gfx/effects/sabers/RGBglow1", "gfx/effects/sabers/RGBcore1");
+    }
     match color {
         0 => ("gfx/effects/sabers/red_glow", "gfx/effects/sabers/red_line"),
         1 => ("gfx/effects/sabers/orange_glow", "gfx/effects/sabers/orange_line"),
@@ -147,6 +187,7 @@ fn saber_shaders(color: i32) -> (&'static str, &'static str) {
         3 => ("gfx/effects/sabers/green_glow", "gfx/effects/sabers/green_line"),
         4 => ("gfx/effects/sabers/blue_glow", "gfx/effects/sabers/blue_line"),
         5 => ("gfx/effects/sabers/purple_glow", "gfx/effects/sabers/purple_line"),
+        SABER_BLACK => ("gfx/effects/sabers/blackglow", "gfx/effects/sabers/blackcore"),
         _ => ("gfx/effects/sabers/blue_glow", "gfx/effects/sabers/blue_line"),
     }
 }
@@ -155,6 +196,9 @@ fn saber_shaders(color: i32) -> (&'static str, &'static str) {
 /// shader lookup because the dynamic-light tint intentionally uses softened
 /// channel values (for example blue = 0.2, 0.4, 1.0).
 fn saber_light_rgb(color: i32) -> Option<[f32; 3]> {
+    if let Some(rgb) = custom_saber_rgb(color) {
+        return Some(rgb.map(|c| f32::from(c) / 255.0));
+    }
     Some(match color {
         0 => [1.0, 0.2, 0.2],
         1 => [1.0, 0.5, 0.1],
@@ -162,8 +206,37 @@ fn saber_light_rgb(color: i32) -> Option<[f32; 3]> {
         3 => [0.2, 1.0, 0.2],
         4 => [0.2, 0.4, 1.0],
         5 => [0.9, 0.2, 1.0],
+        SABER_BLACK => [1.0, 1.0, 1.0],
         _ => return None,
     })
+}
+
+/// Vertex colour of a glow/halo draw: white for the stock colours (their
+/// textures carry the hue), the blade RGB for jaPRO custom colours.
+fn saber_glow_rgba(color: i32, intensity: u8) -> [u8; 4] {
+    let rgb = custom_saber_rgb(color).unwrap_or([255; 3]);
+    let scaled = rgb.map(|c| (f32::from(c) * f32::from(intensity) / 255.0).round() as u8);
+    [scaled[0], scaled[1], scaled[2], 255]
+}
+
+/// CG_DoSaber's per-frame blade flicker. Returns `(glow_radius, core_radius)`.
+/// `glow_rand` / `core_rand` are `Q_flrand(-1, 1)` rolls: the glow radius is
+/// `radius * 0.925 +/- 7.5%`, the hot core `radius / 3 +/- 7.5% of radius`, and
+/// both are widened by `1 + 2 / length` while the blade is shorter than
+/// `lengthMax` (the ignition halo).
+fn saber_flicker_radii(
+    radius: f32,
+    length: f32,
+    length_max: f32,
+    glow_rand: f32,
+    core_rand: f32,
+) -> (f32, f32) {
+    let radius_range = radius * 0.075;
+    let radius_mult = if length < length_max { 1.0 + 2.0 / length } else { 1.0 };
+    (
+        (radius - radius_range + glow_rand * radius_range) * radius_mult,
+        (radius / 3.0 + core_rand * radius_range) * radius_mult,
+    )
 }
 
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
@@ -190,50 +263,58 @@ pub fn profile_saber_blade_draws(
     origin: [f32; 3],
     direction: [f32; 3],
     length: f32,
+    length_max: f32,
     radius: f32,
     color: i32,
     entity_alpha: f32,
     modern_sabers: bool,
+    rng: &mut Rng,
 ) -> Vec<FxDraw> {
     if length < 0.5 || radius <= 0.0 {
         return Vec::new();
     }
+    // Same per-frame CG_DoSaber flicker as the in-game blade.
+    let glow_rand = rng.flrand(-1.0, 1.0);
+    let core_rand = rng.flrand(-1.0, 1.0);
+    let (radius, core_radius) = saber_flicker_radii(radius, length, length_max, glow_rand, core_rand);
     let direction = normalize3(direction);
     let tip = madd3(origin, direction, length);
     let line_base = madd3(origin, direction, -1.0);
     let (glow_shader, line_shader) = saber_shaders(color);
     let intensity = (entity_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
     let white = [intensity, intensity, intensity, 255];
+    let glow_full = saber_glow_rgba(color, intensity);
     let mut draws = Vec::new();
 
     if modern_sabers {
         let soft = (f32::from(intensity) * 0.55).round() as u8;
+        let glow_soft = saber_glow_rgba(color, soft);
         draws.push(FxDraw::Line {
             start: line_base,
             end: tip,
             width: radius * 1.8,
-            rgba: [soft, soft, soft, 255],
+            rgba: glow_soft,
             shader: glow_shader.to_owned(),
         });
         draws.push(FxDraw::Line {
             start: line_base,
             end: tip,
             width: radius * 0.95,
-            rgba: white,
+            rgba: glow_full,
             shader: glow_shader.to_owned(),
         });
         draws.push(FxDraw::Sprite {
             origin,
             radius: (radius * 1.5).max(5.5),
             rotation: 0.0,
-            rgba: [soft, soft, soft, 255],
+            rgba: glow_soft,
             shader: glow_shader.to_owned(),
         });
         draws.push(FxDraw::Sprite {
             origin: tip,
             radius: radius * 0.9,
             rotation: 0.0,
-            rgba: [soft, soft, soft, 255],
+            rgba: glow_soft,
             shader: glow_shader.to_owned(),
         });
     } else {
@@ -244,7 +325,7 @@ pub fn profile_saber_blade_draws(
                 origin: madd3(origin, direction, distance),
                 radius: glow_radius,
                 rotation: 0.0,
-                rgba: white,
+                rgba: glow_full,
                 shader: glow_shader.to_owned(),
             });
             distance -= (glow_radius * 0.65).max(0.05);
@@ -254,14 +335,14 @@ pub fn profile_saber_blade_draws(
             origin,
             radius: 5.5,
             rotation: 0.0,
-            rgba: white,
+            rgba: glow_full,
             shader: glow_shader.to_owned(),
         });
     }
     draws.push(FxDraw::Line {
         start: tip,
         end: line_base,
-        width: (radius / 3.0).max(0.01),
+        width: core_radius.max(0.01),
         rgba: white,
         shader: line_shader.to_owned(),
     });
@@ -296,18 +377,17 @@ fn length3(v: [f32; 3]) -> f32 {
     dot3(v, v).sqrt()
 }
 
-/// OpenJK CG_CreateSaberMarks texture projection. The stock rivet/glow images
-/// are authored around UV 0.5,0.5; mapping a slash to 0..1 made short sampled
-/// segments look like isolated dots. Keep the same centered projection scales
-/// while lifting the polygon slightly because the dynamic FX path does not yet
-/// carry q3 shader polygonOffset/depth bias.
-fn saber_mark_ribbon(
-    start: [f32; 3],
-    end: [f32; 3],
-    normal: [f32; 3],
-    half_width: f32,
-    normal_offset: f32,
-) -> Option<([[f32; 3]; 4], [[f32; 2]; 4])> {
+/// Geometry of one OpenJK CG_CreateSaberMarks slash, before projection.
+struct SaberMarkFrame {
+    /// `originalPoints[4]` in the engine's winding: start-a1-a2, end+a1-a2,
+    /// end+a1+a2, start-a1+a2 with axis1 along the slash and axis2 = axis1 x normal.
+    quad: [[f32; 3]; 4],
+    mid: [f32; 3],
+    tangent: [f32; 3],
+    side: [f32; 3],
+}
+
+fn saber_mark_frame(start: [f32; 3], end: [f32; 3], normal: [f32; 3], half_width: f32) -> Option<SaberMarkFrame> {
     let delta = sub3(end, start);
     let distance = length3(delta);
     if distance < 1.0e-4 {
@@ -322,30 +402,35 @@ fn saber_mark_ribbon(
     let side = scale3(side_raw, 1.0 / side_length);
     let tangent_cap = scale3(tangent, half_width);
     let side_cap = scale3(side, half_width);
-    let push = scale3(normal, normal_offset);
     let start_cap = sub3(start, tangent_cap);
     let end_cap = add3(end, tangent_cap);
-    let positions_unpushed = [
-        sub3(start_cap, side_cap),
-        sub3(end_cap, side_cap),
-        add3(end_cap, side_cap),
-        add3(start_cap, side_cap),
-    ];
-    let positions = positions_unpushed.map(|point| add3(point, push));
-    let mid = scale3(add3(start, end), 0.5);
-    // OpenJK randomizes these within 0.05..0.08 and 0.15..0.20. Midpoints
-    // preserve the same visual frequency without introducing frame-rate RNG.
-    let u_scale = 0.065;
-    let v_scale = 0.175;
-    let uvs = positions_unpushed.map(|point| {
-        let d = sub3(point, mid);
-        [
-            0.5 + dot3(d, tangent) * u_scale,
-            0.5 + dot3(d, side) * v_scale,
-        ]
-    });
-    Some((positions, uvs))
+    Some(SaberMarkFrame {
+        quad: [
+            sub3(start_cap, side_cap),
+            sub3(end_cap, side_cap),
+            add3(end_cap, side_cap),
+            add3(start_cap, side_cap),
+        ],
+        mid: scale3(add3(start, end), 0.5),
+        tangent,
+        side,
+    })
 }
+
+/// CG_CreateSaberMarks texture projection. The stock rivet/glow images are
+/// authored around UV 0.5,0.5; mapping a slash to 0..1 made short sampled
+/// segments look like isolated dots. OpenJK randomizes the scales within
+/// 0.05..0.08 and 0.15..0.20; midpoints keep the same visual frequency without
+/// frame-rate RNG.
+fn saber_mark_uv(frame: &SaberMarkFrame, point: [f32; 3]) -> [f32; 2] {
+    const U_SCALE: f32 = 0.065;
+    const V_SCALE: f32 = 0.175;
+    let d = sub3(point, frame.mid);
+    [0.5 + dot3(d, frame.tangent) * U_SCALE, 0.5 + dot3(d, frame.side) * V_SCALE]
+}
+
+/// The small normal lift substitutes for q3 polygonOffset in the transient FX path.
+const SABER_MARK_LIFT: f32 = 0.24;
 
 /// The refEntity CG_Missile submits for a model-carrying missile.
 #[derive(Clone, Debug, PartialEq)]
@@ -545,10 +630,27 @@ impl Default for SaberContactHistory {
 struct SaberWallMark {
     start_time: i32,
     end_time: i32,
-    positions: [[f32; 3]; 4],
-    uvs: [[f32; 2]; 4],
+    /// Triangle-fan fragments clipped onto the drawn world surfaces (or one
+    /// quad when no surface index is available), already lifted off the surface.
+    positions: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<u32>,
     normal: [f32; 3],
 }
+
+/// One CG_ImpactMark footprint, already projected onto the world.
+#[derive(Clone, Debug)]
+struct FootMark {
+    end_time: i32,
+    positions: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<u32>,
+    /// `footstep_heavy_*` (a run step) rather than `footstep_*`.
+    heavy: bool,
+}
+
+/// The prints kept at once; the oldest give way.
+const FOOT_MARK_MAX: usize = 512;
 
 #[derive(Clone, Debug)]
 struct Puff {
@@ -560,6 +662,129 @@ struct Puff {
     rotation: f32,
     color: [f32; 3],
     shader: &'static str,
+}
+
+/// A `trap->FX_AddLine` beam: width `size1 -> size2` and alpha `alpha1 -> 0`
+/// linearly over `kill_time` (FX_SIZE_LINEAR | FX_ALPHA_LINEAR).
+#[derive(Clone, Debug)]
+pub(crate) struct BeamSpec {
+    start: [f32; 3],
+    end: [f32; 3],
+    size1: f32,
+    size2: f32,
+    kill_time: i32,
+    rgb: [f32; 3],
+    shader: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct Beam {
+    spec: BeamSpec,
+    start_time: i32,
+}
+
+/// One `CG_Chunks` LE_FRAGMENT before it is added to the scene.
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkSpec {
+    qpath: String,
+    origin: [f32; 3],
+    velocity: [f32; 3],
+    angles: [f32; 3],
+    angle_velocity: [f32; 3],
+    life_ms: i32,
+    bounce_factor: f32,
+    scale: f32,
+}
+
+/// A live fragment: `pos` is TR_GRAVITY from (`base`, `trajectory_time`) until it
+/// comes to rest.
+#[derive(Clone, Debug)]
+struct Chunk {
+    spec: ChunkSpec,
+    start_time: i32,
+    end_time: i32,
+    base: [f32; 3],
+    velocity: [f32; 3],
+    trajectory_time: i32,
+    origin: [f32; 3],
+    axis: [[f32; 3]; 3],
+    last_time: i32,
+    stationary: bool,
+}
+
+/// The refEntity a fragment submits this frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkModel {
+    pub qpath: String,
+    pub origin: [f32; 3],
+    /// Axis rows already multiplied by the fragment's scale (ScaleModelAxis).
+    pub axis: [[f32; 3]; 3],
+    pub alpha: f32,
+}
+
+const DEFAULT_GRAVITY: f32 = 800.0;
+const MAX_CHUNKS: usize = 96;
+/// cg_localents.c SINK_TIME: stationary fragments fade over the last 2 * SINK_TIME.
+const CHUNK_FADE_MS: i32 = 2000;
+
+/// Enough randomness for debris; deterministic per event so replays match.
+struct SmallRng(u32);
+
+impl SmallRng {
+    fn new(seed: u32) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B1) | 1)
+    }
+
+    fn unit(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (self.0 >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    fn range(&mut self, low: f32, high: f32) -> f32 {
+        low + (high - low) * self.unit()
+    }
+
+    fn irand(&mut self, low: i32, high: i32) -> i32 {
+        low + (self.unit() * (high - low + 1) as f32) as i32
+    }
+}
+
+/// One glass shard from `CG_DoGlassQuad` (an FX_AddPoly with FX_APPLY_PHYSICS).
+#[derive(Clone, Debug)]
+pub(crate) struct ShardSpec {
+    positions: [[f32; 3]; 4],
+    uvs: [[f32; 2]; 4],
+    velocity: [f32; 3],
+    accel_z: f32,
+    /// Degrees per second, pitch and yaw only.
+    rotation: [f32; 2],
+    bounce: f32,
+    /// Ticks the shard stays put before it starts to move.
+    delay_ms: i32,
+}
+
+#[derive(Clone, Debug)]
+struct Shard {
+    spec: ShardSpec,
+    centre0: [f32; 3],
+    centre: [f32; 3],
+    velocity: [f32; 3],
+    angles: [f32; 2],
+    start_time: i32,
+    last_time: i32,
+    stationary: bool,
+}
+
+const SHARD_LIFE_MS: i32 = 6000;
+const MAX_SHARDS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct Plum {
+    start_time: i32,
+    base: [f32; 3],
+    score: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -586,13 +811,28 @@ pub struct WeaponFx {
     /// `0` is stock JKA: invoke continuous projectile FX every presentation
     /// frame. Non-zero values sample them at a fixed rate independent of FPS.
     continuous_fx_fps: u32,
+    /// Mirrors the worker's `fx_physics` mode (worker starts at the default).
+    fx_physics: u32,
+    /// Mirrors the worker's `fx_lod` mode and `fx_countScale`.
+    fx_lod: (u32, f32, f32),
     runner_rng: Rng,
     puffs: Vec<Puff>,
+    beams: Vec<Beam>,
+    chunks: Vec<Chunk>,
+    plums: Vec<Plum>,
+    last_plum_z: f32,
+    score_plums: bool,
+    /// jaPRO `cg_blood` (0 none, 1 skull/brain, 2 full gibs).
+    gib_level: u8,
+    shards: Vec<Shard>,
+    /// `(mins, maxs)` per inline model, for glass tessellation.
+    inline_model_bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>,
     /// Per-frame presentation primitives that do not live in the FX scheduler
     /// (notably CG_DoSaber's RT_SABER_GLOW / RT_LINE submissions).
     immediate_draws: Vec<FxDraw>,
     immediate_sounds: Vec<FxSound>,
     immediate_lights: Vec<FxLight>,
+    immediate_blades: Vec<FxBlade>,
     /// OpenJK combines 3+ blade sabers into one dynamic light per saber.
     saber_multi_lights: HashMap<SaberLightKey, SaberLightAggregate>,
     modern_sabers: bool,
@@ -603,8 +843,14 @@ pub struct WeaponFx {
     saber_impact_fx: bool,
     saber_marks: SaberMarkMode,
     collision_world: Option<CollisionWorld>,
+    /// Drawn, markable world surfaces (R_MarkFragments). `None` keeps the plain
+    /// collision-plane mark, which is what source-.map previews use.
+    mark_surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>,
     saber_contact_history: HashMap<SaberTrailKey, SaberContactHistory>,
     saber_wall_marks: Vec<SaberWallMark>,
+    /// Footprints (`_PlayerFootStep`'s CG_ImpactMark) and how they are styled.
+    foot_marks: Vec<FootMark>,
+    footprints: FootprintMode,
     melt: SaberMelt,
     last_melt_spark_ms: i32,
     /// OpenJK cg_saberTrail: 0=off, 1=normal, 2=high-frequency/special mode.
@@ -617,6 +863,14 @@ pub struct WeaponFx {
     /// not an FX world sprite, so it is projected after the final camera is known.
     saber_clash_flare: Option<SaberClashFlareState>,
     time: i32,
+    /// True when the current presentation frame runs at the same FX time as the
+    /// previous one (paused demo, or >1000 fps within one millisecond). Per-frame
+    /// spawns whose lifetime is measured in FX time must not repeat on such a
+    /// frame or they pile up and never expire while the clock is frozen.
+    repeated_time: bool,
+    /// The next `begin_frame` follows a seek and is a fresh frame even though
+    /// `reset_for_seek` already stored its time.
+    fresh_time: bool,
     /// cg.refdef.vieworg / viewaxis[1] of the last rendered view.
     view_origin: [f32; 3],
     view_left: [f32; 3],
@@ -638,11 +892,22 @@ impl WeaponFx {
             entity_fx: HashMap::new(),
             missile_fx: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
+            fx_lod: (crate::fx::FX_LOD_DEFAULT, 1.0, crate::fx::LOD_SCALE_DEFAULT),
             runner_rng: Rng::new(0x4658_5255_4E4E_4552),
             puffs: Vec::new(),
+            beams: Vec::new(),
+            chunks: Vec::new(),
+            plums: Vec::new(),
+            last_plum_z: 0.0,
+            score_plums: true,
+            gib_level: 0,
+            shards: Vec::new(),
+            inline_model_bounds: std::sync::Arc::from(Vec::new()),
             immediate_draws: Vec::new(),
             immediate_sounds: Vec::new(),
             immediate_lights: Vec::new(),
+            immediate_blades: Vec::new(),
             saber_multi_lights: HashMap::new(),
             modern_sabers: false,
             rt_lighting: false,
@@ -651,6 +916,9 @@ impl WeaponFx {
             collision_world: None,
             saber_contact_history: HashMap::new(),
             saber_wall_marks: Vec::new(),
+            foot_marks: Vec::new(),
+            footprints: FootprintMode::default(),
+            mark_surfaces: None,
             melt: SaberMelt::new(),
             last_melt_spark_ms: i32::MIN / 2,
             saber_trail: 1,
@@ -658,9 +926,21 @@ impl WeaponFx {
             saber_trail_segments: Vec::new(),
             saber_clash_flare: None,
             time: 0,
+            repeated_time: false,
+            fresh_time: true,
             view_origin: [0.0; 3],
             view_left: [0.0, 1.0, 0.0],
         }
+    }
+
+    pub fn retry_failed_assets(&mut self) -> Result<usize, String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.worker_tx
+            .send(FxWorkerCommand::RefreshAssets { reply: reply_tx })
+            .map_err(|_| "FX ASSET REFRESH ERROR: worker is unavailable".to_owned())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "FX ASSET REFRESH ERROR: worker did not reply".to_owned())?
     }
 
     pub fn stats(&self) -> crate::fx::system::FxStats {
@@ -700,14 +980,51 @@ impl WeaponFx {
 
     /// Presentation-only collision clone used by the saber/world contact pass.
     pub fn set_collision_world(&mut self, world: Option<CollisionWorld>) {
+        // The FX thread traces `fx_physics` particles against its own clone.
+        let _ = self.worker_tx.send(FxWorkerCommand::SetCollision(world.clone()));
         self.collision_world = world;
         self.saber_contact_history.clear();
         self.saber_wall_marks.clear();
         self.melt.clear();
     }
 
+    pub fn set_mark_surfaces(&mut self, surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>) {
+        self.mark_surfaces = surfaces;
+        self.saber_wall_marks.clear();
+        self.foot_marks.clear();
+    }
+
     pub fn set_saber_trail(&mut self, value: i32) {
         self.saber_trail = value.clamp(0, 2);
+    }
+
+    /// `fx_physics`: stock TaystJK particle physics on the CM world.
+    pub fn set_fx_physics(&mut self, mode: u32) {
+        let mode = mode.min(crate::fx::FX_PHYSICS_ALL);
+        if self.fx_physics != mode {
+            self.fx_physics = mode;
+            let _ = self.worker_tx.send(FxWorkerCommand::SetPhysics(mode));
+        }
+    }
+
+    /// `fx_lod` and stock `fx_countScale`: spawn-time EFX density control.
+    pub fn set_fx_lod(&mut self, mode: u32, count_scale: f32, lod_scale: f32) {
+        let value = (
+            mode.min(crate::fx::FX_LOD_ADAPTIVE),
+            count_scale.clamp(0.0, 1.0),
+            lod_scale.clamp(crate::fx::LOD_SCALE_MIN, crate::fx::LOD_SCALE_MAX),
+        );
+        if self.fx_lod != value {
+            self.fx_lod = value;
+            let _ = self.worker_tx.send(FxWorkerCommand::SetLod { mode: value.0, count_scale: value.1, lod_scale: value.2 });
+        }
+    }
+
+    /// Final render view for LOD (`px_per_unit` = viewport height / (2 tan(fov_y / 2))).
+    pub fn set_lod_view(&mut self, origin: [f32; 3], px_per_unit: f32) {
+        if self.fx_lod.0 != crate::fx::FX_LOD_OFF {
+            let _ = self.worker_tx.send(FxWorkerCommand::SetLodView { origin, px_per_unit });
+        }
     }
 
     pub fn set_continuous_fx_fps(&mut self, value: u32) {
@@ -731,9 +1048,15 @@ impl WeaponFx {
         self.entity_fx.clear();
         self.missile_fx.clear();
         self.puffs.clear();
+        self.beams.clear();
+        self.chunks.clear();
+        self.foot_marks.clear();
+        self.plums.clear();
+        self.shards.clear();
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
+        self.immediate_blades.clear();
         self.saber_multi_lights.clear();
         self.saber_trail_history.clear();
         self.saber_trail_segments.clear();
@@ -742,6 +1065,7 @@ impl WeaponFx {
         self.saber_wall_marks.clear();
         self.melt.clear();
         self.time = time;
+        self.fresh_time = true;
     }
 
     /// FX_AdjustTime for this presentation frame (`cg.time`).
@@ -749,9 +1073,12 @@ impl WeaponFx {
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
+        self.immediate_blades.clear();
         self.saber_multi_lights.clear();
         if time < self.time {
             self.puffs.clear();
+            self.beams.clear();
+        self.chunks.clear();
             self.entity_fx.clear();
             self.missile_fx.clear();
             self.saber_trail_history.clear();
@@ -764,6 +1091,8 @@ impl WeaponFx {
         self.missile_fx.retain(|_, state| {
             time <= state.last_time.saturating_add(CONTINUOUS_FX_BACKFILL_MAX_MS * 4)
         });
+        self.repeated_time = time == self.time && !self.fresh_time;
+        self.fresh_time = false;
         self.time = time;
         let _ = self.worker_tx.send(FxWorkerCommand::AdjustTime(time));
     }
@@ -836,6 +1165,243 @@ impl WeaponFx {
         })
     }
 
+    pub fn set_score_plums(&mut self, enabled: bool) {
+        self.score_plums = enabled;
+    }
+
+    /// `CG_ScorePlum`: a floating score number (4 s) at `origin`.
+    pub fn add_score_plum(&mut self, origin: [f32; 3], score: i32) {
+        if !self.score_plums || self.repeated_time {
+            return;
+        }
+        let mut base = origin;
+        // Successive plums at the same height are stacked 20 units apart.
+        if origin[2] >= self.last_plum_z - 20.0 && origin[2] <= self.last_plum_z + 20.0 {
+            base[2] -= 20.0;
+        }
+        self.last_plum_z = origin[2];
+        if self.plums.len() >= 16 {
+            self.plums.remove(0);
+        }
+        self.plums.push(Plum { start_time: self.time, base, score });
+    }
+
+    /// CG_AddScorePlum for every live plum.
+    fn append_score_plums(&mut self, frame: &mut FxFrame) {
+        const NUMBER_SIZE: f32 = 8.0;
+        const LIFE_MS: i32 = 4000;
+        const NAMES: [&str; 11] = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "minus"];
+        let time = self.time;
+        let view = self.view_origin;
+        self.plums.retain(|plum| time - plum.start_time < LIFE_MS && time >= plum.start_time);
+        for plum in &self.plums {
+            let c = (LIFE_MS - (time - plum.start_time)) as f32 / LIFE_MS as f32;
+            let score = plum.score;
+            let rgb: [u8; 3] = if score < 0 {
+                [0xff, 0x11, 0x11]
+            } else if score >= 50 {
+                [0xff, 0, 0xff]
+            } else if score >= 20 {
+                [0, 0, 0xff]
+            } else if score >= 10 {
+                [0xff, 0xff, 0]
+            } else if score >= 2 {
+                [0, 0xff, 0]
+            } else {
+                [0xff; 3]
+            };
+            let alpha = if c < 0.25 { (255.0 * 4.0 * c) as u8 } else { 255 };
+            let mut origin = plum.base;
+            origin[2] += 110.0 - c * 100.0;
+            let dir = sub3(view, origin);
+            let side = normalize3(cross3(dir, [0.0, 0.0, 1.0]));
+            origin = madd3(origin, side, -10.0 + 20.0 * (c * 2.0 * std::f32::consts::PI).sin());
+            if length3(sub3(origin, view)) < 20.0 {
+                continue; // the view would sit inside the sprite
+            }
+            let mut digits: Vec<usize> = Vec::new();
+            let mut value = score.unsigned_abs();
+            loop {
+                digits.push((value % 10) as usize);
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            if score < 0 {
+                digits.push(10);
+            }
+            let count = digits.len();
+            for i in 0..count {
+                let position = madd3(origin, side, (count as f32 / 2.0 - i as f32) * NUMBER_SIZE);
+                frame.draws.push(FxDraw::Sprite {
+                    origin: position,
+                    radius: NUMBER_SIZE / 2.0,
+                    rotation: 0.0,
+                    rgba: [rgb[0], rgb[1], rgb[2], alpha],
+                    shader: format!("gfx/2d/numbers/{}", NAMES[digits[count - 1 - i]]),
+                });
+            }
+        }
+    }
+
+    pub fn set_gib_level(&mut self, level: u8) {
+        self.gib_level = level.min(2);
+    }
+
+    fn add_chunks(&mut self, specs: &[ChunkSpec]) {
+        for spec in specs {
+            if self.chunks.len() >= MAX_CHUNKS {
+                self.chunks.remove(0);
+            }
+            self.chunks.push(Chunk {
+                start_time: self.time,
+                end_time: self.time + spec.life_ms,
+                base: spec.origin,
+                velocity: spec.velocity,
+                trajectory_time: self.time,
+                origin: spec.origin,
+                axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
+                last_time: self.time,
+                stationary: false,
+                spec: spec.clone(),
+            });
+        }
+    }
+
+    pub fn set_inline_model_bounds(&mut self, bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>) {
+        self.inline_model_bounds = bounds;
+    }
+
+    /// Glass shards are FX polys: advance them (delayed start, gravity, tumble,
+    /// bounce) and append their quads to this frame's draws.
+    fn append_glass_shards(&mut self, frame: &mut FxFrame) {
+        let time = self.time;
+        self.shards.retain(|shard| time - shard.start_time < SHARD_LIFE_MS && time >= shard.start_time);
+        let mut world = self.collision_world.take();
+        for shard in &mut self.shards {
+            if time > shard.last_time && !shard.stationary {
+                let dt = (time - shard.last_time) as f32 * 0.001;
+                shard.last_time = time;
+                shard.velocity[2] += shard.spec.accel_z * dt;
+                let target: [f32; 3] = std::array::from_fn(|i| shard.centre[i] + shard.velocity[i] * dt);
+                let trace = world.as_mut().map(|world| {
+                    world.trace(TraceQuery {
+                        start: shard.centre,
+                        mins: [0.0; 3],
+                        maxs: [0.0; 3],
+                        end: target,
+                        pass_entity: -1,
+                        mask: CONTENTS_SOLID,
+                    })
+                });
+                match trace.filter(|trace| trace.fraction < 1.0) {
+                    None => {
+                        shard.centre = target;
+                        shard.angles[0] += shard.spec.rotation[0] * dt;
+                        shard.angles[1] += shard.spec.rotation[1] * dt;
+                    }
+                    Some(trace) => {
+                        let v = shard.velocity;
+                        let dot = v[0] * trace.normal[0] + v[1] * trace.normal[1] + v[2] * trace.normal[2];
+                        shard.velocity = std::array::from_fn(|i| (v[i] - 2.0 * dot * trace.normal[i]) * shard.spec.bounce);
+                        shard.centre = trace.end;
+                        let speed = (shard.velocity[0].powi(2) + shard.velocity[1].powi(2) + shard.velocity[2].powi(2)).sqrt();
+                        if trace.all_solid != 0 || speed < 10.0 {
+                            shard.stationary = true;
+                        }
+                    }
+                }
+            }
+            // FX_ALPHA_NONLINEAR with alphaParm 85: hold 0.15 until 85% of life, then fade out.
+            let life = (time - shard.start_time) as f32 / SHARD_LIFE_MS as f32;
+            let alpha = if life < 0.85 { 0.15 } else { 0.15 * (1.0 - (life - 0.85) / 0.15) };
+            if alpha <= 0.0 {
+                continue;
+            }
+            let axis = angles_to_axis([shard.angles[0], shard.angles[1], 0.0]);
+            let positions = shard.spec.positions.map(|point| {
+                let rel: [f32; 3] = std::array::from_fn(|i| point[i] - shard.centre0[i]);
+                std::array::from_fn(|i| {
+                    shard.centre[i] + axis[0][i] * rel[0] + axis[1][i] * rel[1] + axis[2][i] * rel[2]
+                })
+            });
+            frame.draws.push(FxDraw::Quad {
+                positions,
+                uvs: shard.spec.uvs,
+                rgba: [255, 255, 255, (alpha * 255.0) as u8],
+                shader: "gfx/misc/test_crackle".to_owned(),
+            });
+        }
+        self.collision_world = world;
+    }
+
+    /// CG_AddLocalEntities for LE_FRAGMENT: advance every live chunk to this
+    /// frame's time (gravity, bounce off solids, fade once at rest) and return
+    /// the models to submit.
+    pub fn chunk_models(&mut self) -> Vec<ChunkModel> {
+        let time = self.time;
+        self.chunks.retain(|chunk| time < chunk.end_time && time >= chunk.start_time);
+        let mut models = Vec::with_capacity(self.chunks.len());
+        let mut world = self.collision_world.take();
+        for chunk in &mut self.chunks {
+            if chunk.stationary {
+                let remaining = chunk.end_time - time;
+                let alpha = if remaining < CHUNK_FADE_MS {
+                    (((remaining as f32 / CHUNK_FADE_MS as f32) * 255.0) as i32).clamp(1, 255) as f32 / 255.0
+                } else {
+                    1.0
+                };
+                models.push(ChunkModel { qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha });
+                continue;
+            }
+            let dt = (time - chunk.trajectory_time) as f32 * 0.001;
+            let mut new_origin: [f32; 3] = std::array::from_fn(|i| chunk.base[i] + chunk.velocity[i] * dt);
+            new_origin[2] -= 0.5 * DEFAULT_GRAVITY * dt * dt;
+            let trace = world.as_mut().map(|world| {
+                world.trace(TraceQuery {
+                    start: chunk.origin,
+                    mins: [0.0; 3],
+                    maxs: [0.0; 3],
+                    end: new_origin,
+                    pass_entity: -1,
+                    mask: CONTENTS_SOLID,
+                })
+            });
+            let frame_ms = (time - chunk.last_time).max(0) as f32;
+            match trace.filter(|trace| trace.fraction < 1.0) {
+                None => {
+                    chunk.origin = new_origin;
+                    // LEF_TUMBLE: angles are a linear trajectory from the spawn time.
+                    let elapsed = (time - chunk.start_time) as f32 * 0.001;
+                    let angles = std::array::from_fn(|i| chunk.spec.angles[i] + chunk.spec.angle_velocity[i] * elapsed);
+                    chunk.axis = scale_axis(angles_to_axis(angles), chunk.spec.scale);
+                }
+                Some(trace) if trace.start_solid == 0 => {
+                    // CG_ReflectVelocity.
+                    let hit_time = chunk.last_time as f32 + frame_ms * trace.fraction;
+                    let mut velocity = chunk.velocity;
+                    velocity[2] -= DEFAULT_GRAVITY * (hit_time - chunk.trajectory_time as f32) * 0.001;
+                    let dot = velocity[0] * trace.normal[0] + velocity[1] * trace.normal[1] + velocity[2] * trace.normal[2];
+                    chunk.velocity = std::array::from_fn(|i| (velocity[i] - 2.0 * dot * trace.normal[i]) * chunk.spec.bounce_factor);
+                    chunk.base = trace.end;
+                    chunk.trajectory_time = time;
+                    if trace.all_solid != 0
+                        || (trace.normal[2] > 0.0
+                            && (chunk.velocity[2] < 40.0 || chunk.velocity[2] < -frame_ms * chunk.velocity[2]))
+                    {
+                        chunk.stationary = true;
+                    }
+                }
+                Some(_) => {} // starts inside a solid: leave it where it is
+            }
+            chunk.last_time = time;
+            models.push(ChunkModel { qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha: 1.0 });
+        }
+        self.collision_world = world;
+        models
+    }
+
     /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
     pub fn end_frame(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
@@ -871,6 +1437,9 @@ impl WeaponFx {
         self.saber_contact_history
             .retain(|_, history| time <= history.last_time.saturating_add(2500));
         self.append_saber_wall_marks(&mut frame);
+        self.append_foot_marks(&mut frame);
+        self.append_glass_shards(&mut frame);
+        self.append_score_plums(&mut frame);
         if matches!(self.saber_marks, SaberMarkMode::Enhanced) {
             self.append_enhanced_melt(&mut frame);
         }
@@ -878,6 +1447,28 @@ impl WeaponFx {
         frame.draws.append(&mut self.immediate_draws);
         frame.sounds.append(&mut self.immediate_sounds);
         frame.lights.append(&mut self.immediate_lights);
+        frame.blades.append(&mut self.immediate_blades);
+        self.beams.retain(|beam| {
+            let life = beam.spec.kill_time.max(1);
+            let age = time - beam.start_time;
+            if age > life {
+                return false;
+            }
+            let t = (age.max(0) as f32 / life as f32).clamp(0.0, 1.0);
+            let spec = &beam.spec;
+            // No FX_USE_ALPHA: alpha fades the colour and the alpha byte stays 0
+            // (these shaders are GL_ONE GL_ONE with rgbGen vertex).
+            let fade = 1.0 - t;
+            let byte = |v: f32| (v * fade * 255.0).clamp(0.0, 255.0) as u8;
+            frame.draws.push(FxDraw::Line {
+                start: spec.start,
+                end: spec.end,
+                width: spec.size1 + (spec.size2 - spec.size1) * t,
+                rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 0],
+                shader: spec.shader.to_owned(),
+            });
+            true
+        });
         let view = self.view_origin;
         self.puffs.retain(|puff| {
             if time >= puff.end_time {
@@ -902,6 +1493,165 @@ impl WeaponFx {
             true
         });
         frame
+    }
+
+    /// How footprints are drawn (`r_footprints`): off, or 2D prints, which the
+    /// 3D mode also leaves everywhere its snow field cannot.
+    pub fn set_footprint_mode(&mut self, mode: FootprintMode) {
+        if self.footprints != mode {
+            self.footprints = mode;
+            if mode == FootprintMode::Off {
+                self.foot_marks.clear();
+            }
+        }
+    }
+
+    /// The effect and print halves of `_PlayerFootStep` for one footfall; the
+    /// sound is the caller's. `snowflow_owner` marks a player whose snow the
+    /// Snowflow field deforms in 3D mode, where a flat print would hover over
+    /// the dent.
+    pub fn footstep(&mut self, impact: &FootstepImpact, stages: FootstepStages, snowflow_owner: bool) {
+        let step = footsteps::material_step(impact.material);
+        if stages.effects {
+            if let Some(effect) = step.effect {
+                // FX_PlayEffectID(effect, trace.endpos, trace.plane.normal)
+                self.play(effect, impact.position, normalize_or_up(impact.normal));
+            }
+        }
+        if !stages.marks || !step.mark || self.footprints == FootprintMode::Off || self.repeated_time {
+            return;
+        }
+        let snow = impact.material & 0x1f == footsteps::MATERIAL_SNOW;
+        if snow && snowflow_owner && self.footprints == FootprintMode::ThreeD {
+            return;
+        }
+        self.push_footprint(impact);
+    }
+
+    /// CG_ImpactMark(footMarkShader, pos, normal, yaw, 1, 1, 1, 1, qfalse, 6, qfalse):
+    /// a 12 unit square around the step, its `footstep_*` image turned to the
+    /// legs' yaw and projected onto the drawn world surfaces below it.
+    fn push_footprint(&mut self, impact: &FootstepImpact) -> bool {
+        let axis0 = normalize3(impact.normal);
+        if impact.normal.iter().all(|&c| c == 0.0) {
+            return false;
+        }
+        // PerpendicularVector, then RotatePointAroundVector(axis[2], axis[0], axis[1], orientation).
+        let axis2 = rotate_about3(perpendicular3(axis0), axis0, impact.yaw);
+        let axis1 = cross3(axis0, axis2);
+        let radius = footsteps::FOOTPRINT_RADIUS;
+        let corner = |a: f32, b: f32| add3(impact.position, add3(scale3(axis1, a * radius), scale3(axis2, b * radius)));
+        let quad = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+        // The `_l` shaders are the `_r` image mirrored across u (`tcMod transform -1 0 0 1 1 0`).
+        let mirror = !impact.foot.right_foot();
+        let texcoord_scale = 0.5 / radius;
+        let uv_of = |point: [f32; 3]| {
+            let delta = sub3(point, impact.position);
+            let u = 0.5 + dot3(delta, axis1) * texcoord_scale;
+            [if mirror { 1.0 - u } else { u }, 0.5 + dot3(delta, axis2) * texcoord_scale]
+        };
+        let lift = scale3(axis0, SABER_MARK_LIFT);
+        let (mut positions, mut uvs, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+        if let Some(surfaces) = &self.mark_surfaces {
+            let mut projected = jka_assets::bsp::MarkBuffer::default();
+            surfaces.project(&quad, scale3(axis0, -20.0), &mut projected);
+            for (fragment, _) in projected.iter() {
+                let base = positions.len() as u32;
+                for point in fragment {
+                    uvs.push(uv_of(*point));
+                    positions.push(add3(*point, lift));
+                }
+                for i in 1..fragment.len() as u32 - 1 {
+                    indices.extend_from_slice(&[base, base + i, base + i + 1]);
+                }
+            }
+            if positions.is_empty() {
+                return false;
+            }
+        } else {
+            for point in quad {
+                uvs.push(uv_of(point));
+                positions.push(add3(point, lift));
+            }
+            indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        }
+        self.foot_marks.push(FootMark {
+            end_time: self.time + SABER_MARK_LIFETIME_MS,
+            positions,
+            uvs,
+            indices,
+            heavy: impact.foot.heavy(),
+        });
+        if self.foot_marks.len() > FOOT_MARK_MAX {
+            let excess = self.foot_marks.len() - FOOT_MARK_MAX;
+            self.foot_marks.drain(..excess);
+        }
+        true
+    }
+
+    /// Every live print folded into two meshes (light and heavy steps), so a
+    /// crowd's tracks cost two draws. They fade over their last second the way
+    /// `CG_AddMarks` does without `alphaFade`: the colour, not the alpha.
+    fn append_foot_marks(&mut self, frame: &mut FxFrame) {
+        #[derive(Default)]
+        struct Batch {
+            positions: Vec<[f32; 3]>,
+            uvs: Vec<[f32; 2]>,
+            rgba: Vec<[u8; 4]>,
+            indices: Vec<u32>,
+        }
+        let time = self.time;
+        let mut light = Batch::default();
+        let mut heavy = Batch::default();
+        self.foot_marks.retain(|mark| {
+            if time >= mark.end_time {
+                return false;
+            }
+            let remaining = mark.end_time - time;
+            let fade = if remaining < SABER_MARK_FADE_MS {
+                remaining as f32 / SABER_MARK_FADE_MS as f32
+            } else {
+                1.0
+            };
+            let channel = (255.0 * fade.clamp(0.0, 1.0)).round() as u8;
+            let batch = if mark.heavy { &mut heavy } else { &mut light };
+            let base = batch.positions.len() as u32;
+            batch.positions.extend_from_slice(&mark.positions);
+            batch.uvs.extend_from_slice(&mark.uvs);
+            batch.rgba.resize(batch.positions.len(), [channel, channel, channel, 255]);
+            batch.indices.extend(mark.indices.iter().map(|index| base + index));
+            true
+        });
+        for (batch, shader) in [(light, "footstep_r"), (heavy, "footstep_heavy_r")] {
+            if !batch.indices.is_empty() {
+                frame.draws.push(FxDraw::Mesh {
+                    positions: batch.positions,
+                    uvs: batch.uvs,
+                    rgba: batch.rgba,
+                    indices: batch.indices,
+                    shader: shader.to_owned(),
+                });
+            }
+        }
+    }
+
+    /// CG_Item's `FX_PlayEffectID(cgs.effects.itemCone, origin, up)` under a
+    /// placed weapon or powerup. The stock client replays the 50 ms effect every
+    /// frame; outside legacy mode it is sampled at the continuous-FX rate, which
+    /// keeps its additive brightness independent of the frame rate.
+    pub fn item_cone(&mut self, entity_number: u16, origin: [f32; 3]) {
+        if self.repeated_time {
+            return;
+        }
+        if self.continuous_fx_fps != crate::fx::FX_FPS_LEGACY_JKA {
+            let period = (1000 / self.continuous_fx_fps.max(1)).max(1) as i32;
+            let runtime = self.entity_fx.entry(entity_number).or_default();
+            if runtime.next_time > self.time {
+                return;
+            }
+            runtime.next_time = self.time.saturating_add(period);
+        }
+        self.play("mp/itemcone", origin, [0.0, 0.0, 1.0]);
     }
 
     /// OpenJK CG_FX: consume the fx_runner state carried by an ET_FX snapshot.
@@ -942,7 +1692,10 @@ impl WeaponFx {
         num_blades: u8,
         no_dlight: bool,
     ) {
-        if no_dlight {
+        // CG_DoSaber disables the per-blade light for black sabers. TaystJK's
+        // separate 3+ blade CG_DoSaberLight path still includes black as white
+        // when it builds the combined multiblade light, so keep that distinction.
+        if no_dlight || (num_blades < 3 && color == SABER_BLACK) {
             return;
         }
 
@@ -1056,10 +1809,14 @@ impl WeaponFx {
             PlayerFxRequest::Effect { name, origin, axis } => {
                 let _ = self.worker_tx.send(FxWorkerCommand::PlayAxis { name: (*name).to_owned(), origin: *origin, axis: *axis });
             }
+            PlayerFxRequest::EffectDir { name, origin, dir } => {
+                let _ = self.worker_tx.send(FxWorkerCommand::PlayDir { name: name.clone(), origin: *origin, dir: *dir });
+            }
             PlayerFxRequest::SaberBlade {
                 origin,
                 direction,
                 length,
+                length_max,
                 radius,
                 color,
                 entity_alpha,
@@ -1112,6 +1869,7 @@ impl WeaponFx {
                     *origin,
                     *direction,
                     clipped_length,
+                    *length_max,
                     *radius,
                     *color,
                     *entity_alpha,
@@ -1121,6 +1879,16 @@ impl WeaponFx {
                 // CG_ForcePushBlur (LE_PUFF path).
                 self.puff(*origin, 55.0, 0.0, [24.0, 32.0, 40.0], "gfx/effects/forcePush");
                 self.puff(*origin, -55.0, 180.0, [24.0, 32.0, 40.0], "gfx/effects/forcePush");
+            }
+            PlayerFxRequest::HeadSprite { origin, shader } => {
+                // CG_PlayerFloatSprite: RT_SPRITE, radius 10, opaque white.
+                self.immediate_draws.push(FxDraw::Sprite {
+                    origin: *origin,
+                    radius: 10.0,
+                    rotation: 0.0,
+                    rgba: [255; 4],
+                    shader: (*shader).to_owned(),
+                });
             }
             PlayerFxRequest::GripPuffs { origin } => {
                 // CG_ForceGripEffect.
@@ -1214,7 +1982,13 @@ impl WeaponFx {
                 }
             }
             SaberMarkMode::Enhanced => {
-                if can_mark {
+                // The melt only builds on surfaces the stock mark projector would
+                // also mark (not nomarks/noimpact/fog, not compiled-in model soup).
+                let markable = self
+                    .mark_surfaces
+                    .as_ref()
+                    .is_none_or(|surfaces| surfaces.has_markable_surface(hit.end, hit_normal));
+                if can_mark && markable {
                     let heat = self.melt.contact(
                         melt_stroke_id(key),
                         hit.end,
@@ -1253,17 +2027,47 @@ impl WeaponFx {
         clipped_length
     }
 
+    /// OpenJK CG_CreateSaberMarks. The slash quad is projected onto the drawn world
+    /// surfaces by R_MarkFragments: nothing is produced on nomarks/noimpact/fog
+    /// shaders, on compiled-in model triangle soup, or where no world surface is
+    /// drawn (a hidden clip brush, an entity model's hull).
     fn push_legacy_saber_wall_mark(&mut self, start: [f32; 3], end: [f32; 3], normal: [f32; 3]) -> bool {
-        // Legacy keeps OpenJK's 0.65 radius and centered rivet/glow UVs. The
-        // small normal lift substitutes for q3 polygonOffset in the transient FX path.
-        let Some((positions, uvs)) = saber_mark_ribbon(start, end, normal, 0.65, 0.24) else {
+        let Some(frame) = saber_mark_frame(start, end, normal, 0.65) else {
             return false;
         };
+        let lift = scale3(normal, SABER_MARK_LIFT);
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut indices = Vec::new();
+        if let Some(surfaces) = &self.mark_surfaces {
+            let mut projected = jka_assets::bsp::MarkBuffer::default();
+            surfaces.project(&frame.quad, scale3(normal, -1.0), &mut projected);
+            for (fragment, _) in projected.iter() {
+                let base = positions.len() as u32;
+                for point in fragment {
+                    uvs.push(saber_mark_uv(&frame, *point));
+                    positions.push(add3(*point, lift));
+                }
+                for i in 1..fragment.len() as u32 - 1 {
+                    indices.extend_from_slice(&[base, base + i, base + i + 1]);
+                }
+            }
+            if positions.is_empty() {
+                return false;
+            }
+        } else {
+            for point in frame.quad {
+                uvs.push(saber_mark_uv(&frame, point));
+                positions.push(add3(point, lift));
+            }
+            indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        }
         self.saber_wall_marks.push(SaberWallMark {
             start_time: self.time,
             end_time: self.time + SABER_MARK_LIFETIME_MS,
             positions,
             uvs,
+            indices,
             normal,
         });
         if self.saber_wall_marks.len() > SABER_MARK_MAX {
@@ -1273,12 +2077,31 @@ impl WeaponFx {
         true
     }
 
+    /// Every live mark is folded into two meshes (burn, then glow) with per-vertex
+    /// fade, so a long saber fight costs two draws however many marks it left.
     fn append_saber_wall_marks(&mut self, frame: &mut FxFrame) {
+        #[derive(Default)]
+        struct Batch {
+            positions: Vec<[f32; 3]>,
+            uvs: Vec<[f32; 2]>,
+            rgba: Vec<[u8; 4]>,
+            indices: Vec<u32>,
+        }
+        impl Batch {
+            fn push(&mut self, positions: impl Iterator<Item = [f32; 3]>, mark: &SaberWallMark, rgba: [u8; 4]) {
+                let base = self.positions.len() as u32;
+                self.positions.extend(positions);
+                self.uvs.extend_from_slice(&mark.uvs);
+                self.rgba.resize(self.positions.len(), rgba);
+                self.indices.extend(mark.indices.iter().map(|index| base + index));
+            }
+        }
         let time = self.time;
-        let mut retained = Vec::with_capacity(self.saber_wall_marks.len());
-        for mark in self.saber_wall_marks.drain(..) {
+        let mut burn_batch = Batch::default();
+        let mut glow_batch = Batch::default();
+        self.saber_wall_marks.retain(|mark| {
             if time >= mark.end_time {
-                continue;
+                return false;
             }
             let remaining = mark.end_time - time;
             let burn_fade = if remaining < SABER_MARK_FADE_MS {
@@ -1287,12 +2110,7 @@ impl WeaponFx {
                 1.0
             };
             let burn = (255.0 * burn_fade.clamp(0.0, 1.0)).round() as u8;
-            frame.draws.push(FxDraw::Quad {
-                positions: mark.positions,
-                uvs: mark.uvs,
-                rgba: [burn, burn, burn, burn],
-                shader: "gfx/damage/rivetmark".to_owned(),
-            });
+            burn_batch.push(mark.positions.iter().copied(), mark, [burn, burn, burn, burn]);
 
             let age = (time - mark.start_time).max(0);
             if age < SABER_GLOW_LIFETIME_MS {
@@ -1301,21 +2119,26 @@ impl WeaponFx {
                 } else {
                     1.0 - (age - 500) as f32 / (SABER_GLOW_LIFETIME_MS - 500) as f32
                 };
-                frame.draws.push(FxDraw::Quad {
-                    positions: mark.positions.map(|point| madd3(point, mark.normal, 0.035)),
-                    uvs: mark.uvs,
-                    rgba: [
-                        (235.0 * fade.max(0.0)) as u8,
-                        (118.0 * fade.max(0.0)) as u8,
-                        (12.0 * fade.max(0.0)) as u8,
-                        255,
-                    ],
-                    shader: "gfx/effects/saberDamageGlow".to_owned(),
+                let lift = scale3(mark.normal, 0.035);
+                glow_batch.push(
+                    mark.positions.iter().map(|point| add3(*point, lift)),
+                    mark,
+                    [(235.0 * fade.max(0.0)) as u8, (118.0 * fade.max(0.0)) as u8, (12.0 * fade.max(0.0)) as u8, 255],
+                );
+            }
+            true
+        });
+        for (batch, shader) in [(burn_batch, "gfx/damage/rivetmark"), (glow_batch, "gfx/effects/saberDamageGlow")] {
+            if !batch.indices.is_empty() {
+                frame.draws.push(FxDraw::Mesh {
+                    positions: batch.positions,
+                    uvs: batch.uvs,
+                    rgba: batch.rgba,
+                    indices: batch.indices,
+                    shader: shader.to_owned(),
                 });
             }
-            retained.push(mark);
         }
-        self.saber_wall_marks = retained;
     }
 
     fn append_enhanced_melt(&mut self, frame: &mut FxFrame) {
@@ -1345,9 +2168,15 @@ impl WeaponFx {
         saber_in_flight: bool,
         trail_style: i32,
     ) {
-        if self.saber_trail == 0 || trail_style > 1 || length < 0.5 {
+        if self.saber_trail == 0 || trail_style > 1 || self.repeated_time {
             return;
         }
+        // A blade that is off (holstered staff/dual blade, or still ramping up)
+        // is CG_AddSaberBlade's dontDraw case: no quad, but base/tip/lastTime
+        // are still stored every sample. Skipping that leaves the position from
+        // when the blade went out, and relighting it mid-swing would stretch a
+        // trail quad from there to the current blade.
+        let blade_off = length < 0.5;
 
         let direction = normalize3(direction);
         let tip = madd3(origin, direction, length + 3.0);
@@ -1360,7 +2189,7 @@ impl WeaponFx {
             return;
         }
 
-        if let Some(history) = previous {
+        if let Some(history) = previous.filter(|_| !blade_off) {
             let move_trail_length = jka_movement::saber_move_trail_length(saber_move);
             let super_break = jka_movement::super_break_win_anim(torso_anim);
             let active = super_break || move_trail_length > 0 || saber_in_flight;
@@ -1380,6 +2209,8 @@ impl WeaponFx {
                 let (shader, rgb) = if trail_style == 1 {
                     duration *= 2.0;
                     ("gfx/effects/sabers/swordTrail", [32u8, 32, 32])
+                } else if color == SABER_BLACK {
+                    ("gfx/effects/sabers/blacktrail", saber_trail_rgb(color))
                 } else {
                     ("gfx/effects/sabers/saberBlur", saber_trail_rgb(color))
                 };
@@ -1417,6 +2248,7 @@ impl WeaponFx {
         origin: [f32; 3],
         direction: [f32; 3],
         length: f32,
+        length_max: f32,
         radius: f32,
         color: i32,
         entity_alpha: f32,
@@ -1424,6 +2256,14 @@ impl WeaponFx {
         if length < 0.5 || radius <= 0.0 {
             return;
         }
+        // Rolled per frame like CG_DoSaber, so the glow and core shimmer. The
+        // lighting-side blade keeps the steady authored radius.
+        let glow_rand = self.runner_rng.flrand(-1.0, 1.0);
+        let core_rand = self.runner_rng.flrand(-1.0, 1.0);
+        let (flicker_radius, core_radius) =
+            saber_flicker_radii(radius, length, length_max, glow_rand, core_rand);
+        let steady_radius = radius;
+        let radius = flicker_radius;
         let direction = normalize3(direction);
         let tip = madd3(origin, direction, length);
         let line_base = madd3(origin, direction, -1.0);
@@ -1432,37 +2272,42 @@ impl WeaponFx {
         // fades therefore scale vertex RGB, which is what rgbGen vertex uses.
         let intensity = (entity_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
         let white = [intensity, intensity, intensity, 255];
+        let glow_full = saber_glow_rgba(color, intensity);
+        if intensity >= 8 {
+            self.immediate_blades.push(FxBlade { start: line_base, end: tip, radius: steady_radius });
+        }
 
         if self.modern_sabers {
             // Continuous camera-facing capsule: smoother than the legacy bead
             // chain while still using the stock authored saber materials.
             let soft = (f32::from(intensity) * 0.55).round() as u8;
+            let glow_soft = saber_glow_rgba(color, soft);
             self.immediate_draws.push(FxDraw::Line {
                 start: line_base,
                 end: tip,
                 width: radius * 1.8,
-                rgba: [soft, soft, soft, 255],
+                rgba: glow_soft,
                 shader: glow_shader.to_owned(),
             });
             self.immediate_draws.push(FxDraw::Line {
                 start: line_base,
                 end: tip,
                 width: radius * 0.95,
-                rgba: white,
+                rgba: glow_full,
                 shader: glow_shader.to_owned(),
             });
             self.immediate_draws.push(FxDraw::Sprite {
                 origin,
                 radius: (radius * 1.5).max(5.5),
                 rotation: 0.0,
-                rgba: [soft, soft, soft, 255],
+                rgba: glow_soft,
                 shader: glow_shader.to_owned(),
             });
             self.immediate_draws.push(FxDraw::Sprite {
                 origin: tip,
                 radius: radius * 0.9,
                 rotation: 0.0,
-                rgba: [soft, soft, soft, 255],
+                rgba: glow_soft,
                 shader: glow_shader.to_owned(),
             });
         } else {
@@ -1475,7 +2320,7 @@ impl WeaponFx {
                     origin: madd3(origin, direction, distance),
                     radius: glow_radius,
                     rotation: 0.0,
-                    rgba: white,
+                    rgba: glow_full,
                     shader: glow_shader.to_owned(),
                 });
                 distance -= (glow_radius * 0.65).max(0.05);
@@ -1485,23 +2330,29 @@ impl WeaponFx {
                 origin,
                 radius: 5.5,
                 rotation: 0.0,
-                rgba: white,
+                rgba: glow_full,
                 shader: glow_shader.to_owned(),
             });
         }
 
         // OpenJK CG_DoSaber uses an RT_LINE from blade tip to one unit behind
-        // the hilt origin, at radius / 3, with the color-specific line shader.
+        // the hilt origin, at radius / 3 (flickered), with the color-specific
+        // line shader.
         self.immediate_draws.push(FxDraw::Line {
             start: tip,
             end: line_base,
-            width: (radius / 3.0).max(0.01),
+            width: core_radius.max(0.01),
             rgba: white,
             shader: line_shader.to_owned(),
         });
     }
 
     fn puff(&mut self, origin: [f32; 3], speed: f32, rotation: f32, color: [f32; 3], shader: &'static str) {
+        // Puffs live 120 ms of FX time. A frame at an unchanged time (paused
+        // demo) would add another copy every frame that can never expire.
+        if self.repeated_time {
+            return;
+        }
         self.puffs.push(Puff {
             start_time: self.time,
             end_time: self.time + 120,
@@ -1751,6 +2602,93 @@ impl WeaponFx {
                 }
                 Some(if played { EventDispatchResult::Handled("FX_MISSILE_IMPACT") } else { EventDispatchResult::Partial("FX_MISSILE_IMPACT_NONE") })
             }
+            PreparedFxEvent::GlassBreak { model } => {
+                if self.repeated_time {
+                    return Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"));
+                }
+                let specs = glass_shards(event, *model, &self.inline_model_bounds);
+                for spec in specs {
+                    if self.shards.len() >= MAX_SHARDS {
+                        self.shards.remove(0);
+                    }
+                    let centre = std::array::from_fn(|axis| spec.positions.iter().map(|p| p[axis]).sum::<f32>() * 0.25);
+                    self.shards.push(Shard {
+                        centre0: centre,
+                        centre,
+                        velocity: spec.velocity,
+                        angles: [0.0; 2],
+                        start_time: self.time,
+                        last_time: self.time + spec.delay_ms,
+                        stationary: false,
+                        spec,
+                    });
+                }
+                Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"))
+            }
+            PreparedFxEvent::Gibs { origin, seed } => {
+                let specs = gib_specs(*origin, *seed, self.gib_level);
+                if specs.is_empty() || self.repeated_time {
+                    return Some(EventDispatchResult::Handled("FX_GIBS"));
+                }
+                self.add_chunks(&specs);
+                Some(EventDispatchResult::Handled("FX_GIBS"))
+            }
+            PreparedFxEvent::Chunks(specs) => {
+                if self.repeated_time {
+                    return Some(EventDispatchResult::Handled("FX_CHUNKS"));
+                }
+                for spec in specs {
+                    if self.chunks.len() >= MAX_CHUNKS {
+                        self.chunks.remove(0);
+                    }
+                    self.chunks.push(Chunk {
+                        start_time: self.time,
+                        end_time: self.time + spec.life_ms,
+                        base: spec.origin,
+                        velocity: spec.velocity,
+                        trajectory_time: self.time,
+                        origin: spec.origin,
+                        axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
+                        last_time: self.time,
+                        stationary: false,
+                        spec: spec.clone(),
+                    });
+                }
+                Some(EventDispatchResult::Handled("FX_CHUNKS"))
+            }
+            PreparedFxEvent::PlayEffects { effects, beams, status } => {
+                let mut played = false;
+                for (name, origin, dir) in effects {
+                    played |= self.play(name, *origin, *dir);
+                }
+                if !self.repeated_time {
+                    for spec in beams {
+                        self.beams.push(Beam { spec: spec.clone(), start_time: self.time });
+                        played = true;
+                    }
+                }
+                Some(if played { EventDispatchResult::Handled(status) } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
+            }
+            PreparedFxEvent::GroundEffect { name, entity, position } => {
+                let Some(world) = self.collision_world.as_mut() else {
+                    return Some(EventDispatchResult::Partial("FX_NO_COLLISION_WORLD"));
+                };
+                let mut end = *position;
+                end[2] -= 4096.0;
+                let trace = world.trace(TraceQuery {
+                    start: *position,
+                    mins: PLAYER_HULL_MINS,
+                    maxs: PLAYER_HULL_MAXS,
+                    end,
+                    pass_entity: *entity,
+                    mask: SABER_CONTACT_MASK, // MASK_SOLID
+                });
+                if trace.fraction >= 1.0 {
+                    return Some(EventDispatchResult::Partial("FX_GROUND_EFFECT_NO_FLOOR"));
+                }
+                let played = self.play(name, trace.end, [0.0, 0.0, 1.0]);
+                Some(if played { EventDispatchResult::Handled("FX_GROUND_EFFECT") } else { EventDispatchResult::Partial("FX_EFFECT_MISSING") })
+            }
             PreparedFxEvent::PlayEffect { name, origin, dir } => {
                 let Some(name) = name else {
                     return Some(EventDispatchResult::Partial("FX_PLAY_EFFECT_TYPE_UNKNOWN"));
@@ -1806,7 +2744,32 @@ pub(crate) enum PreparedFxEvent {
         origin: [f32; 3],
         dir: [f32; 3],
     },
+    /// `CG_Chunks` fragments (EV_DEBRIS).
+    Chunks(Vec<ChunkSpec>),
+    /// `CG_GibPlayer` at `origin`; the gib count depends on `cg_blood` at dispatch.
+    Gibs { origin: [f32; 3], seed: u32 },
+    /// `CG_GlassShatter` (EV_GLASS_SHATTER). `model` is the glass entity's inline
+    /// model when its state is still known; shards are built on dispatch, where
+    /// the map's inline model bounds live.
+    GlassBreak { model: Option<usize> },
+    /// A batch of effects for one event (concussion alt-fire rings + impact).
+    PlayEffects {
+        effects: Vec<(String, [f32; 3], [f32; 3])>,
+        beams: Vec<BeamSpec>,
+        status: &'static str,
+    },
+    /// An effect placed where a hull dropped from `position` lands (teleport
+    /// and Jedi Master spawn effects: `CG_Trace(position -> position - 4096)`).
+    GroundEffect {
+        name: &'static str,
+        entity: i32,
+        position: [f32; 3],
+    },
 }
+
+const WHITE: [f32; 3] = [1.0; 3];
+const PLAYER_HULL_MINS: [f32; 3] = [-15.0, -15.0, -24.0 + 8.0]; // DEFAULT_MINS_2 + 8
+const PLAYER_HULL_MAXS: [f32; 3] = [15.0, 15.0, 40.0]; // DEFAULT_MAXS_2
 
 fn impact_saber_definition(
     saber_definitions: &SaberDefinitions,
@@ -1959,6 +2922,139 @@ pub(crate) fn prepare_entity_event(
                 charge,
             }
         }
+        EntityEvent::EV_PLAYER_TELEPORT_IN | EntityEvent::EV_PLAYER_TELEPORT_OUT => {
+            if super::sound_presenter::duel_hides(game, state.field_i32("clientNum").unwrap_or(-1)) {
+                return PreparedFxEvent::None;
+            }
+            PreparedFxEvent::GroundEffect {
+                name: "mp/spawn.efx",
+                entity: i32::from(event.entity_num),
+                position: event.position,
+            }
+        }
+        EntityEvent::EV_BECOME_JEDIMASTER => PreparedFxEvent::GroundEffect {
+            name: "mp/jedispawn.efx",
+            entity: i32::from(event.entity_num),
+            position: event.position,
+        },
+        EntityEvent::EV_CONC_ALT_IMPACT => {
+            // Rings every 64 units along the shot, then the wall impact and the
+            // borrowed disruptor alt-miss burst. (The beam trail itself needs
+            // FX_ConcAltShot's line primitive and is not drawn.)
+            let origin2 = super::entity_vec3(state, "origin2").unwrap_or([0.0; 3]);
+            let mut shot_dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
+            let shot_dist = length3(shot_dir);
+            if shot_dist > 0.0 {
+                shot_dir = shot_dir.map(|v| v / shot_dist);
+            }
+            let ring_dir = super::entity_vec3(state, "angles2").unwrap_or([0.0; 3]);
+            let dir = jka_movement::byte_to_dir(event.parm);
+            let mut effects = Vec::new();
+            let mut travelled = 0.0;
+            // FX_ConcAltShot ends at the last ring `spot`, not at the impact.
+            let mut last_spot = origin2;
+            while travelled < shot_dist && effects.len() < 256 {
+                let spot = std::array::from_fn(|i| origin2[i] + shot_dir[i] * travelled);
+                effects.push(("concussion/alt_ring".to_owned(), spot, ring_dir));
+                last_spot = spot;
+                travelled += 64.0;
+            }
+            effects.push(("concussion/explosion".to_owned(), event.position, dir));
+            effects.push(("disruptor/alt_miss".to_owned(), event.position, dir));
+            const BRIGHT: [f32; 3] = [0.75, 0.5, 1.0];
+            let beams = vec![
+                BeamSpec { start: origin2, end: last_spot, size1: 0.1, size2: 10.0, kill_time: 175, rgb: WHITE, shader: "gfx/effects/blueLine" },
+                BeamSpec { start: origin2, end: last_spot, size1: 0.1, size2: 7.0, kill_time: 150, rgb: BRIGHT, shader: "gfx/misc/whiteline2" },
+            ];
+            PreparedFxEvent::PlayEffects { effects, beams, status: "FX_CONC_ALT_IMPACT" }
+        }
+        EntityEvent::EV_DISRUPTOR_MAIN_SHOT | EntityEvent::EV_DISRUPTOR_SNIPER_SHOT => {
+            // The reference starts the beam at the shooter's weapon muzzle bolt
+            // (first person: last frame's flash point); the server's origin2 is
+            // the muzzle it fired from, used here for every viewpoint.
+            let start = super::entity_vec3(state, "origin2").unwrap_or([0.0; 3]);
+            let end = event.position;
+            let beams = if event.event == EntityEvent::EV_DISRUPTOR_MAIN_SHOT {
+                // FX_DisruptorMainShot (cg_disruptorMainTime default 150).
+                vec![BeamSpec { start, end, size1: 0.1, size2: 6.0, kill_time: 150, rgb: WHITE, shader: "gfx/effects/redLine" }]
+            } else {
+                // FX_DisruptorAltShot (cg_disruptorAltTime default 175); shouldtarget = full charge.
+                let mut beams = vec![BeamSpec { start, end, size1: 0.1, size2: 10.0, kill_time: 175, rgb: WHITE, shader: "gfx/effects/redLine" }];
+                if state.field_i32("shouldtarget").unwrap_or(0) != 0 {
+                    beams.push(BeamSpec { start, end, size1: 0.1, size2: 7.0, kill_time: 175, rgb: [0.8, 0.7, 0.0], shader: "gfx/misc/whiteline2" });
+                }
+                beams
+            };
+            PreparedFxEvent::PlayEffects { effects: Vec::new(), beams, status: "FX_DISRUPTOR_BEAM" }
+        }
+        EntityEvent::EV_DISRUPTOR_SNIPER_MISS | EntityEvent::EV_DISRUPTOR_HIT => {
+            let dir = jka_movement::byte_to_dir(event.parm);
+            let weapon = state.field_i32("weapon").unwrap_or(0) != 0;
+            let name = match (event.event, weapon) {
+                (EntityEvent::EV_DISRUPTOR_SNIPER_MISS, true) | (EntityEvent::EV_DISRUPTOR_HIT, false) => "disruptor/wall_impact",
+                (EntityEvent::EV_DISRUPTOR_SNIPER_MISS, false) => "disruptor/alt_miss",
+                _ => "disruptor/flesh_impact",
+            };
+            PreparedFxEvent::PlayEffects {
+                effects: vec![(name.to_owned(), event.position, dir)],
+                beams: Vec::new(),
+                status: "FX_DISRUPTOR_IMPACT",
+            }
+        }
+        EntityEvent::EV_DEBRIS => prepare_chunks(event, game),
+        EntityEvent::EV_GIB_PLAYER => PreparedFxEvent::Gibs {
+            origin: event.position,
+            seed: (event.receive_sequence as u32) ^ (event.server_time as u32).rotate_left(5),
+        },
+        EntityEvent::EV_GLASS_SHATTER => {
+            let entity = state.field_i32("genericenemyindex").unwrap_or(-1);
+            let model = u16::try_from(entity)
+                .ok()
+                .and_then(|number| game.entity_state(number))
+                .and_then(|glass| usize::try_from(glass.field_i32("modelindex").unwrap_or(0)).ok());
+            PreparedFxEvent::GlassBreak { model }
+        }
+        EntityEvent::EV_MISC_MODEL_EXP => {
+            // CG_MiscModelExplosion: effects scattered through the breakable's bbox.
+            let maxs = super::entity_vec3(state, "origin2").unwrap_or([0.0; 3]);
+            let mins = super::entity_vec3(state, "angles2").unwrap_or([0.0; 3]);
+            let size = state.field_i32("time").unwrap_or(0);
+            let chunk_type = event.parm;
+            // (effect, optional second effect, base chunk count)
+            let (effect, effect2, base): (&str, Option<&str>, i32) = match chunk_type {
+                1 => ("chunks/glassbreak", None, 5),
+                6 => ("chunks/glassbreak", Some("chunks/metalexplode"), 5),
+                2 | 3 => ("chunks/sparkexplode", None, 5),
+                0 | 7 | 10 | 11 | 14 => ("chunks/metalexplode", None, 2),
+                12 => ("chunks/grateexplode", None, 8),
+                13 => ("chunks/ropebreak", None, 20),
+                15 | 4 | 5 | 9 | 16 => (if size == 2 { "chunks/rockbreaklg" } else { "chunks/rockbreakmed" }, None, 13),
+                _ => return PreparedFxEvent::None,
+            };
+            let count = (base + 7 * size).clamp(0, 128);
+            let mut rng = (event.receive_sequence as u32).wrapping_mul(0x9E37_79B1) | 1;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng >> 8) as f32 / (1u32 << 24) as f32
+            };
+            let mid: [f32; 3] = std::array::from_fn(|i| (mins[i] + maxs[i]) * 0.5);
+            let mut effects = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let org: [f32; 3] = std::array::from_fn(|i| {
+                    let r = next() * 0.8 + 0.1;
+                    r * mins[i] + (1.0 - r) * maxs[i]
+                });
+                let dir = normalize_or_up([org[0] - mid[0], org[1] - mid[1], org[2] - mid[2]]);
+                let name = match effect2 {
+                    Some(second) if next() >= 0.5 => second,
+                    _ => effect,
+                };
+                effects.push((name.to_owned(), org, dir));
+            }
+            PreparedFxEvent::PlayEffects { effects, beams: Vec::new(), status: "FX_MISC_MODEL_EXPLOSION" }
+        }
         EntityEvent::EV_PLAY_EFFECT => {
             let mut dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
             if dir == [0.0; 3] { dir[1] = 1.0; }
@@ -1978,7 +3074,255 @@ pub(crate) fn prepare_entity_event(
     }
 }
 
+/// `CG_GibPlayer`: skull or brain at level 1, plus nine body parts at level 2.
+fn gib_specs(origin: [f32; 3], seed: u32, level: u8) -> Vec<ChunkSpec> {
+    if level == 0 {
+        return Vec::new();
+    }
+    const GIB_VELOCITY: f32 = 250.0;
+    const GIB_JUMP: f32 = 250.0;
+    let mut rng = SmallRng::new(seed);
+    let gib = |model: &str, rng: &mut SmallRng| ChunkSpec {
+        qpath: format!("models/gibs/{model}.md3"),
+        origin,
+        velocity: [
+            rng.range(-1.0, 1.0) * GIB_VELOCITY,
+            rng.range(-1.0, 1.0) * GIB_VELOCITY,
+            GIB_JUMP + rng.range(-1.0, 1.0) * GIB_VELOCITY,
+        ],
+        angles: [0.0; 3],
+        angle_velocity: [0.0; 3],
+        life_ms: 5000 + (rng.range(0.0, 1.0) * 3000.0) as i32,
+        bounce_factor: 0.6,
+        scale: 1.0,
+    };
+    let mut specs = vec![gib(if rng.irand(0, 1) != 0 { "skull" } else { "brain" }, &mut rng)];
+    if level >= 2 {
+        for part in ["abdomen", "arm", "chest", "fist", "foot", "forearm", "intestine", "leg", "leg"] {
+            specs.push(gib(part, &mut rng));
+        }
+    }
+    specs
+}
+
+/// CG_Chunks: the LE_FRAGMENT spray for a broken brush/model (material_t in
+/// `trickedentindex`). Glass, sparks, grates and rope only play effects/sounds.
+fn prepare_chunks(event: &PresentationEvent, game: &ClientGameState) -> PreparedFxEvent {
+    let state = &event.state;
+    let chunk_type = state.field_i32("trickedentindex").unwrap_or(8);
+    let num_chunks = state.field_i32("eventParm").unwrap_or(0).clamp(0, MAX_CHUNKS as i32);
+    let (speed_mod, has_models) = match chunk_type {
+        4 | 5 | 9 | 15 | 16 => (0.5, true),
+        0 | 3 | 7 | 10 => (0.8, true),
+        6 | 11 | 14 => (1.0, true),
+        _ => (1.0, false), // MAT_GLASS, ELECTRICAL, GRATE1, ROPE, NONE
+    };
+    if !has_models || num_chunks == 0 {
+        return PreparedFxEvent::None;
+    }
+    let custom = state.field_i32("modelindex").unwrap_or(0);
+    let custom_model = (custom > 0).then(|| game.model_qpath(custom)).flatten();
+    let origin = super::entity_vec3(state, "origin").unwrap_or(event.position);
+    let mins = super::entity_vec3(state, "angles2").unwrap_or([0.0; 3]);
+    let maxs = super::entity_vec3(state, "origin2").unwrap_or([0.0; 3]);
+    let speed = state.field_f32("speed").unwrap_or(0.0);
+    let mut base_scale = state.field_f32("apos.trBase[0]").unwrap_or(0.0);
+    if base_scale <= 0.0 || base_scale.is_nan() {
+        base_scale = 1.0;
+    }
+    let mut rng = SmallRng::new((event.receive_sequence as u32) ^ (event.server_time as u32).rotate_left(11));
+    let mut specs = Vec::with_capacity(num_chunks as usize);
+    for _ in 0..num_chunks {
+        let family = match chunk_type {
+            7 => "metal/metal1",
+            9 => "rock/rock1",
+            5 => "rock/rock2",
+            4 => "rock/rock3",
+            16 => if rng.irand(0, 1) != 0 { "rock/rock1" } else { "rock/rock3" },
+            15 => "metal/wmetal1",
+            11 => "crate/crate1",
+            14 => "crate/crate2",
+            10 => if rng.irand(0, 1) != 0 { "metal/metal2" } else { "metal/metal1" },
+            _ => "metal/metal2", // METAL, ELEC_METAL, GLASS_METAL
+        };
+        let qpath = custom_model
+            .clone()
+            .unwrap_or_else(|| format!("models/chunks/{family}_{}.md3", rng.irand(1, 4)));
+        let spot: [f32; 3] = std::array::from_fn(|i| {
+            let r = rng.range(0.0, 1.0) * 0.8 + 0.1;
+            r * mins[i] + (1.0 - r) * maxs[i]
+        });
+        let dir = normalize_or_up([spot[0] - origin[0], spot[1] - origin[1], spot[2] - origin[2]]);
+        let chunk_speed = rng.range(speed * 0.5, speed * 1.25) * speed_mod;
+        let angles = [rng.range(0.0, 360.0), rng.range(0.0, 360.0), rng.range(0.0, 360.0)];
+        let spin = rng.range(0.0, 1.0) * 600.0 + 200.0;
+        specs.push(ChunkSpec {
+            qpath,
+            origin: spot,
+            velocity: dir.map(|c| c * chunk_speed),
+            angles,
+            angle_velocity: [rng.range(-1.0, 1.0) * spin, rng.range(-1.0, 1.0) * spin, 0.0],
+            life_ms: 1300 + (rng.range(0.0, 1.0) * 900.0) as i32,
+            bounce_factor: 0.2 + rng.range(0.0, 1.0) * 0.2,
+            scale: rng.range(base_scale * 0.75, base_scale * 1.25),
+        });
+    }
+    PreparedFxEvent::Chunks(specs)
+}
+
+/// CG_GlassShatter + CG_DoGlass. The reference fetches the brush face from the
+/// renderer (`R_GetBModelVerts`); the glass is a thin box, so its face is the
+/// bounds' plane across the thinnest axis (width along the horizontal axis,
+/// height along Z when the glass is upright).
+fn glass_shards(
+    event: &PresentationEvent,
+    model: Option<usize>,
+    bounds: &[([f32; 3], [f32; 3])],
+) -> Vec<ShardSpec> {
+    let state = &event.state;
+    let dmg_pt = super::entity_vec3(state, "origin").unwrap_or(event.position);
+    let dmg_dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
+    let dmg_radius = state.field_i32("trickedentindex").unwrap_or(0) as f32;
+    let max_shards = state.field_i32("pos.trTime").unwrap_or(0).max(0) as usize;
+
+    // The glass entity's own model, else the smallest inline model around the damage point.
+    let by_entity = model.and_then(|index| bounds.get(index).copied()).filter(|_| model != Some(0));
+    let by_point = || {
+        bounds
+            .iter()
+            .skip(1) // model 0 is the world
+            .filter(|(mins, maxs)| (0..3).all(|i| dmg_pt[i] >= mins[i] - 16.0 && dmg_pt[i] <= maxs[i] + 16.0))
+            .min_by(|a, b| {
+                let volume = |(mins, maxs): &([f32; 3], [f32; 3])| (0..3).map(|i| maxs[i] - mins[i]).product::<f32>();
+                volume(a).total_cmp(&volume(b))
+            })
+            .copied()
+    };
+    let Some((mins, maxs)) = by_entity.or_else(by_point) else {
+        return Vec::new();
+    };
+
+    let extent: [f32; 3] = std::array::from_fn(|i| maxs[i] - mins[i]);
+    let thin = (0..3).min_by(|&a, &b| extent[a].total_cmp(&extent[b])).unwrap_or(0);
+    let (u_axis, v_axis) = match thin {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let plane = (mins[thin] + maxs[thin]) * 0.5;
+    let corner = |u: f32, v: f32| {
+        let mut point = [0.0; 3];
+        point[thin] = plane;
+        point[u_axis] = u;
+        point[v_axis] = v;
+        point
+    };
+    let verts = [
+        corner(mins[u_axis], mins[v_axis]),
+        corner(maxs[u_axis], mins[v_axis]),
+        corner(maxs[u_axis], maxs[v_axis]),
+        corner(mins[u_axis], maxs[v_axis]),
+    ];
+    let width = extent[u_axis];
+    let height = extent[v_axis];
+
+    let mut rng = SmallRng::new((event.receive_sequence as u32) ^ (event.server_time as u32).rotate_left(7));
+    let mut off_x = [[0.0f32; 20]; 20];
+    let mut off_z = [[0.0f32; 20]; 20];
+    for i in 0..20 {
+        for t in 0..20 {
+            off_x[t][i] = rng.range(-1.0, 1.0) * 0.03;
+            off_z[i][t] = rng.range(-1.0, 1.0) * 0.03;
+        }
+    }
+
+    const TIME_DECAY_SLOW: f32 = 0.1;
+    const TIME_DECAY_MED: f32 = 0.04;
+    const TIME_DECAY_FAST: f32 = 0.009;
+    let (step_height, mx_height, time_decay) = if height < 100.0 {
+        (0.2, 5, TIME_DECAY_SLOW)
+    } else if height > 220.0 {
+        (0.05, 20, TIME_DECAY_FAST)
+    } else {
+        (0.1, 10, TIME_DECAY_MED)
+    };
+    let step_width = (0.25 - width * 0.0002).max(0.01);
+    let mx_width = ((width * 0.2) as i32).max(5);
+    let time_decay = (time_decay + TIME_DECAY_FAST) * 0.5;
+
+    let offx = |i: i32, t: i32| off_x[i.rem_euclid(20) as usize][t.rem_euclid(20) as usize];
+    let offz = |t: i32, i: i32| off_z[t.rem_euclid(20) as usize][i.rem_euclid(20) as usize];
+    let bilerp = |uv: [f32; 2]| -> [f32; 3] {
+        // CG_CalcBiLerp: rows (v0,v1) and (v3,v2), mixed by uv[1].
+        std::array::from_fn(|axis| {
+            let bottom = verts[0][axis] * (1.0 - uv[0]) + verts[1][axis] * uv[0];
+            let top = verts[3][axis] * (1.0 - uv[0]) + verts[2][axis] * uv[0];
+            bottom * (1.0 - uv[1]) + top * uv[1]
+        })
+    };
+
+    let mut specs = Vec::new();
+    let mut z = 0.0f32;
+    let mut i = 0i32;
+    'rows: while z < 1.0 {
+        let mut x = 0.0f32;
+        let mut t = 0i32;
+        while x < 1.0 {
+            let jitter_x = |t_index: i32, i_index: i32, base: f32| {
+                if t_index > 0 && t_index < mx_width { base - offx(i_index, t_index) } else { base }
+            };
+            let jitter_z = |t_index: i32, i_index: i32, base: f32| {
+                if i_index > 0 && i_index < mx_height { base - offz(t_index, i_index) } else { base }
+            };
+            let uv = [
+                [jitter_x(t, i, x), jitter_z(t, i, z)],
+                [jitter_x(t + 1, i, x) + step_width, jitter_z(t + 1, i, z)],
+                [jitter_x(t + 1, i + 1, x) + step_width, jitter_z(t + 1, i + 1, z) + step_height],
+                [jitter_x(t, i + 1, x), jitter_z(t, i + 1, z) + step_height],
+            ];
+            let sub: [[f32; 3]; 4] = uv.map(bilerp);
+
+            let mut dif = (0..3).map(|k| (sub[0][k] - dmg_pt[k]).powi(2)).sum::<f32>() * time_decay
+                - rng.range(0.0, 1.0) * 32.0;
+            dif -= dmg_radius * dmg_radius;
+            let (stick, delay_ms) = if dif > 1.0 {
+                (true, (dif + rng.range(0.0, 1.0) * 200.0) as i32)
+            } else {
+                (false, 0)
+            };
+
+            // CG_DoGlassQuad.
+            let mut velocity = [rng.range(-12.0, 12.0), rng.range(-12.0, 12.0), -1.0];
+            if !stick {
+                for k in 0..3 {
+                    velocity[k] += 0.3 * dmg_dir[k];
+                }
+            }
+            specs.push(ShardSpec {
+                positions: sub,
+                uvs: uv,
+                velocity,
+                accel_z: -(600.0 + rng.range(0.0, 1.0) * 100.0),
+                rotation: [rng.range(-40.0, 40.0), rng.range(-40.0, 40.0)],
+                bounce: rng.range(0.0, 1.0) * 0.2 + 0.15,
+                delay_ms,
+            });
+            if max_shards != 0 && specs.len() >= max_shards {
+                break 'rows;
+            }
+            x += step_width;
+            t += 1;
+        }
+        z += step_height;
+        i += 1;
+    }
+    specs
+}
+
 fn saber_trail_rgb(color: i32) -> [u8; 3] {
+    if let Some(rgb) = custom_saber_rgb(color) {
+        return rgb;
+    }
     match color {
         0 => [255, 0, 0],
         1 => [255, 64, 0],
@@ -1997,9 +3341,40 @@ impl Drop for WeaponFx {
     }
 }
 
+/// q_math.c PerpendicularVector: the axis `src` is least aligned with,
+/// projected onto the plane across `src`.
+fn perpendicular3(src: [f32; 3]) -> [f32; 3] {
+    let mut pos = 0;
+    let mut smallest = 1.0_f32;
+    for (i, component) in src.iter().enumerate() {
+        if component.abs() < smallest {
+            smallest = component.abs();
+            pos = i;
+        }
+    }
+    let mut unit = [0.0; 3];
+    unit[pos] = 1.0;
+    let d = dot3(src, unit) / dot3(src, src);
+    normalize3(sub3(unit, scale3(src, d)))
+}
+
+/// q_math.c RotatePointAroundVector: `point` turned `degrees` counterclockwise
+/// (right-handed) about the unit vector `dir`.
+fn rotate_about3(point: [f32; 3], dir: [f32; 3], degrees: f32) -> [f32; 3] {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    add3(
+        add3(scale3(point, cos), scale3(cross3(dir, point), sin)),
+        scale3(dir, dot3(dir, point) * (1.0 - cos)),
+    )
+}
+
 fn normalize_or_up(v: [f32; 3]) -> [f32; 3] {
     let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if length == 0.0 { [0.0, 0.0, 1.0] } else { v.map(|c| c / length) }
+}
+
+fn scale_axis(axis: [[f32; 3]; 3], scale: f32) -> [[f32; 3]; 3] {
+    axis.map(|row| row.map(|value| value * scale))
 }
 
 fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
@@ -2016,6 +3391,51 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn black_saber_uses_tayst_assets_and_has_no_dynamic_light() {
+        assert_eq!(
+            saber_shaders(SABER_BLACK),
+            ("gfx/effects/sabers/blackglow", "gfx/effects/sabers/blackcore")
+        );
+        // TaystJK's trail-colour switch has no black case, so black falls through
+        // to the same blue vertex colour as its default while using blacktrail.
+        assert_eq!(saber_trail_rgb(SABER_BLACK), [0, 64, 255]);
+
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(1_000);
+        fx.saber_dynamic_light(
+            SaberTrailKey { entity_num: 1, saber_num: 0, blade_num: 0 },
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            32.0,
+            32.0,
+            SABER_BLACK,
+            1,
+            false,
+        );
+        assert!(fx.end_frame().lights.is_empty());
+
+        // Its 3+ blade path is a separate combined-light routine and does include
+        // black blades as white, matching TaystJK CG_DoSaberLight.
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(1_001);
+        fx.saber_dynamic_light(
+            SaberTrailKey { entity_num: 2, saber_num: 0, blade_num: 0 },
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            32.0,
+            32.0,
+            SABER_BLACK,
+            4,
+            false,
+        );
+        let frame = fx.end_frame();
+        assert_eq!(frame.lights.len(), 1);
+        assert_eq!(frame.lights[0].rgb, [1.0, 1.0, 1.0]);
+    }
 
     fn missile_generation() -> MissileFxGeneration {
         MissileFxGeneration {
@@ -2051,6 +3471,135 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert!((samples[0][0] - 22.222_221).abs() < 0.001);
         assert!((samples[1][0] - 33.333_332).abs() < 0.001);
+    }
+
+    fn footprint_fx() -> WeaponFx {
+        WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap())
+    }
+
+    fn footprint_at(yaw: f32, foot: jka_assets::animevents::FootstepType) -> FootstepImpact {
+        FootstepImpact { entity: 3, foot, material: 8, position: [100.0, 50.0, 10.0], normal: [0.0, 0.0, 1.0], yaw }
+    }
+
+    fn mesh_of(frame: &FxFrame, shader: &str) -> Option<(Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u8; 4]>)> {
+        frame.draws.iter().find_map(|draw| match draw {
+            FxDraw::Mesh { positions, uvs, rgba, shader: name, .. } if name == shader => {
+                Some((positions.clone(), uvs.clone(), rgba.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_footprint_points_its_toes_along_the_legs_yaw() {
+        use jka_assets::animevents::FootstepType;
+        let mut fx = footprint_fx();
+        fx.begin_frame(1000);
+        // Yaw 90 on flat ground: the toes point along +Y, so the quad's +v edge is at y = 56.
+        fx.footstep(&footprint_at(90.0, FootstepType::Right), FootstepStages::from_level(3), false);
+        let frame = fx.end_frame();
+        let (positions, uvs, rgba) = mesh_of(&frame, "footstep_r").expect("a print");
+        assert_eq!(positions.len(), 4);
+        for (position, uv) in positions.iter().zip(&uvs) {
+            assert!((uv[1] - (0.5 + (position[1] - 50.0) / 12.0)).abs() < 1e-4, "v follows the toe direction: {position:?} {uv:?}");
+            assert!((position[2] - 10.24).abs() < 1e-4, "lifted off the floor");
+        }
+        assert!(rgba.iter().all(|c| *c == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn left_feet_mirror_the_right_print_and_heavy_steps_use_their_own_shader() {
+        use jka_assets::animevents::FootstepType;
+        let mut fx = footprint_fx();
+        fx.begin_frame(1000);
+        fx.footstep(&footprint_at(0.0, FootstepType::Left), FootstepStages::from_level(3), false);
+        fx.footstep(&footprint_at(0.0, FootstepType::HeavyRight), FootstepStages::from_level(3), false);
+        let frame = fx.end_frame();
+        let (positions, uvs, _) = mesh_of(&frame, "footstep_r").expect("the light left print");
+        // At yaw 0 axis1 = Z x axis2 = +Y, so u grows with y for a right foot and falls for a left one.
+        for (position, uv) in positions.iter().zip(&uvs) {
+            assert!((uv[0] - (0.5 - (position[1] - 50.0) / 12.0)).abs() < 1e-4);
+        }
+        assert!(mesh_of(&frame, "footstep_heavy_r").is_some());
+    }
+
+    #[test]
+    fn footprints_need_the_marks_stage_soft_ground_and_a_style() {
+        use jka_assets::animevents::FootstepType;
+        let draws = |fx: &mut WeaponFx, impact: &FootstepImpact, level: u8, owner: bool| {
+            fx.foot_marks.clear();
+            fx.footstep(impact, FootstepStages::from_level(level), owner);
+            fx.foot_marks.len()
+        };
+        let mut fx = footprint_fx();
+        fx.begin_frame(1000);
+        let sand = footprint_at(0.0, FootstepType::Right);
+        assert_eq!(draws(&mut fx, &sand, 3, false), 1);
+        assert_eq!(draws(&mut fx, &sand, 2, false), 0, "effects but no graphics");
+        let concrete = FootstepImpact { material: 11, ..sand.clone() };
+        assert_eq!(draws(&mut fx, &concrete, 3, false), 0, "hard ground keeps no print");
+        fx.set_footprint_mode(FootprintMode::Off);
+        assert_eq!(draws(&mut fx, &sand, 3, false), 0, "r_footprints off");
+        // In 3D mode the local player's snow is the Snowflow field's; everyone else's gets a print.
+        fx.set_footprint_mode(FootprintMode::ThreeD);
+        let snow = FootstepImpact { material: 14, ..sand };
+        assert_eq!(draws(&mut fx, &snow, 3, true), 0);
+        assert_eq!(draws(&mut fx, &snow, 3, false), 1);
+        fx.set_footprint_mode(FootprintMode::TwoD);
+        assert_eq!(draws(&mut fx, &snow, 3, true), 1);
+    }
+
+    #[test]
+    fn prints_fade_their_colour_over_the_last_second() {
+        use jka_assets::animevents::FootstepType;
+        let mut fx = footprint_fx();
+        fx.begin_frame(1000);
+        fx.footstep(&footprint_at(0.0, FootstepType::Right), FootstepStages::from_level(3), false);
+        fx.begin_frame(1000 + SABER_MARK_LIFETIME_MS - 500);
+        let (_, _, rgba) = mesh_of(&fx.end_frame(), "footstep_r").unwrap();
+        assert!(rgba.iter().all(|c| *c == [128, 128, 128, 255]), "half faded: {rgba:?}");
+        fx.begin_frame(1000 + SABER_MARK_LIFETIME_MS);
+        assert!(mesh_of(&fx.end_frame(), "footstep_r").is_none(), "gone after 10 s");
+    }
+
+    #[test]
+    fn rotating_about_the_up_axis_turns_counterclockwise() {
+        let forward = rotate_about3([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 90.0);
+        assert!((forward[1] - 1.0).abs() < 1e-5 && forward[0].abs() < 1e-5);
+        assert_eq!(perpendicular3([0.0, 0.0, 1.0]), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn item_cone_is_sampled_at_the_continuous_fx_rate() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.set_continuous_fx_fps(100);
+        let due = |fx: &WeaponFx| fx.entity_fx.get(&5).map(|state| state.next_time);
+        fx.begin_frame(1000);
+        fx.item_cone(5, [0.0; 3]);
+        assert_eq!(due(&fx), Some(1010));
+        fx.begin_frame(1004);
+        fx.item_cone(5, [0.0; 3]);
+        assert_eq!(due(&fx), Some(1010), "rendering again before the tick adds nothing");
+        fx.begin_frame(1010);
+        fx.item_cone(5, [0.0; 3]);
+        assert_eq!(due(&fx), Some(1020));
+    }
+
+    /// The real `mp/itemcone.efx` (a cylinder plus flares) must produce geometry.
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with the stock PK3s"]
+    fn stock_item_cone_effect_draws_a_cylinder() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut fx = WeaponFx::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap());
+        fx.set_continuous_fx_fps(crate::fx::FX_FPS_LEGACY_JKA);
+        fx.begin_frame(1000);
+        fx.item_cone(5, [0.0, 0.0, 32.0]);
+        let frame = fx.end_frame();
+        let cylinders = frame.draws.iter().filter(|draw| matches!(draw, FxDraw::Cylinder { .. })).count();
+        println!("item cone draws: {} ({} cylinder)", frame.draws.len(), cylinders);
+        assert_eq!(cylinders, 1, "the light cone");
+        assert!(frame.draws.len() > 1, "and its flares");
     }
 
     #[test]
@@ -2096,6 +3645,7 @@ mod tests {
             origin: [1.0, 2.0, 3.0],
             direction: [1.0, 0.0, 0.0],
             length: 10.0,
+            length_max: 10.0,
             radius: 2.0,
             color: 0,
             entity_alpha: 1.0,
@@ -2145,6 +3695,21 @@ mod tests {
     }
 
     #[test]
+    fn saber_flicker_matches_cg_dosaber_radius_math() {
+        // Fully extended: glow spans radius * [0.85, 1.0], core radius/3 +/- 7.5%.
+        let (glow_lo, core_lo) = saber_flicker_radii(2.0, 40.0, 40.0, -1.0, -1.0);
+        let (glow_hi, core_hi) = saber_flicker_radii(2.0, 40.0, 40.0, 1.0, 1.0);
+        assert!((glow_lo - 1.7).abs() < 1.0e-5 && (glow_hi - 2.0).abs() < 1.0e-5);
+        assert!((core_lo - (2.0 / 3.0 - 0.15)).abs() < 1.0e-5);
+        assert!((core_hi - (2.0 / 3.0 + 0.15)).abs() < 1.0e-5);
+
+        // Still extending: both radii pick up the 1 + 2 / length halo.
+        let (glow, core) = saber_flicker_radii(2.0, 4.0, 40.0, 1.0, 0.0);
+        assert!((glow - 2.0 * 1.5).abs() < 1.0e-5);
+        assert!((core - (2.0 / 3.0) * 1.5).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn saber_no_dlight_suppresses_stock_blade_light() {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
@@ -2152,6 +3717,7 @@ mod tests {
             origin: [0.0; 3],
             direction: [1.0, 0.0, 0.0],
             length: 40.0,
+            length_max: 40.0,
             radius: 3.0,
             color: 4,
             entity_alpha: 1.0,
@@ -2187,6 +3753,7 @@ mod tests {
                 origin: [0.0; 3],
                 direction,
                 length: 10.0,
+                length_max: 10.0,
                 radius: 2.0,
                 color,
                 entity_alpha: 1.0,
@@ -2253,7 +3820,7 @@ mod tests {
         // A thrown saber is always trail-active in OpenJK and avoids depending
         // on a specific saberMove enum value in this focused renderer test.
         let mut blade = PlayerFxRequest::SaberBlade {
-            origin: [0.0, 0.0, 0.0], direction: [1.0, 0.0, 0.0], length: 10.0, radius: 2.0,
+            origin: [0.0, 0.0, 0.0], direction: [1.0, 0.0, 0.0], length: 10.0, length_max: 10.0, radius: 2.0,
             color: 4, entity_alpha: 1.0, entity_num: 2, saber_num: 0, blade_num: 0,
             saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
             num_blades: 1, no_dlight: false, no_wall_marks: false,
@@ -2284,6 +3851,38 @@ mod tests {
     }
 
     #[test]
+    fn relit_blade_trail_starts_from_the_off_sample_not_the_last_lit_one() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        let blade = |origin: [f32; 3], length: f32| PlayerFxRequest::SaberBlade {
+            origin, direction: [1.0, 0.0, 0.0], length, length_max: 40.0, radius: 2.0,
+            color: 4, entity_alpha: 1.0, entity_num: 2, saber_num: 0, blade_num: 1,
+            saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
+            num_blades: 2, no_dlight: false, no_wall_marks: false,
+        };
+        let has_quad = |frame: &FxFrame| frame.draws.iter().any(|draw| matches!(draw, FxDraw::Quad { .. }));
+
+        fx.begin_frame(1000);
+        fx.player_fx(&blade([0.0, 0.0, 0.0], 10.0));
+        let _ = fx.end_frame();
+
+        // The blade is switched off mid-swing while the hilt keeps moving.
+        fx.begin_frame(1010);
+        fx.player_fx(&blade([100.0, 0.0, 0.0], 0.0));
+        assert!(!has_quad(&fx.end_frame()), "an off blade draws no trail");
+
+        // Relit: the quad must connect to the off sample, not to x = 0.
+        fx.begin_frame(1020);
+        fx.player_fx(&blade([100.0, 1.0, 0.0], 10.0));
+        let frame = fx.end_frame();
+        let positions = frame.draws.iter().find_map(|draw| match draw {
+            FxDraw::Quad { positions, .. } => Some(*positions),
+            _ => None,
+        }).expect("relit blade should trail from the off sample");
+        assert_eq!(positions[3], [100.0, 0.0, 0.0], "old base is where the blade was switched off");
+    }
+
+    #[test]
     fn vanilla_weapon_tables_match_cg_register_weapon() {
         assert_eq!(trail_effect(WP_BLASTER, false), Some("blaster/shot"));
         assert_eq!(trail_effect(WP_DEMP2, true), None, "DEMP2 alt has no trail func");
@@ -2294,5 +3893,155 @@ mod tests {
         assert_eq!(wall_impacts(WP_FLECHETTE, true, 0).len(), 0, "flechette alt impact is its own blow effect");
         assert_eq!(wall_impacts(WP_BRYAR_PISTOL, true, 4), [("bryar/wall_impact3", false)]);
         assert_eq!(play_effect_type(12), Some("env/water_impact"));
+    }
+}
+
+#[cfg(test)]
+mod event_beam_tests {
+    use super::*;
+    use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+
+    fn event(kind: EntityEvent, parm: i32, fields: &[(&str, u32)]) -> PresentationEvent {
+        let mut state = EntityState { number: 40, fields: [0; ENTITY_FIELDS.len()] };
+        for (name, value) in fields {
+            let index = ENTITY_FIELDS.iter().position(|(field, _)| field == name).unwrap();
+            state.fields[index] = *value;
+        }
+        PresentationEvent {
+            receive_sequence: 7,
+            source_entity_num: 40,
+            entity_num: 40,
+            event: kind,
+            raw_event: kind.as_i32(),
+            parm,
+            position: [100.0, 0.0, 0.0],
+            event_only_entity: true,
+            server_time: 5_000,
+            state,
+        }
+    }
+
+    fn prepare(event: &PresentationEvent) -> PreparedFxEvent {
+        prepare_entity_event(event, &ClientGameState::new(), &[], &SaberDefinitions::default())
+    }
+
+    #[test]
+    fn disruptor_alt_shot_adds_beef_beam_only_at_full_charge() {
+        let full = event(EntityEvent::EV_DISRUPTOR_SNIPER_SHOT, 0, &[("shouldtarget", 1)]);
+        let PreparedFxEvent::PlayEffects { beams, .. } = prepare(&full) else { panic!("expected beams") };
+        assert_eq!(beams.len(), 2);
+        assert_eq!(beams[0].end, [100.0, 0.0, 0.0]);
+        let partial = event(EntityEvent::EV_DISRUPTOR_SNIPER_SHOT, 0, &[]);
+        let PreparedFxEvent::PlayEffects { beams, .. } = prepare(&partial) else { panic!("expected beams") };
+        assert_eq!(beams.len(), 1);
+        assert_eq!((beams[0].size2, beams[0].kill_time), (10.0, 175));
+    }
+
+    #[test]
+    fn disruptor_impacts_pick_the_reference_effect() {
+        let name = |kind, weapon| {
+            let e = event(kind, 0, &[("weapon", weapon)]);
+            let PreparedFxEvent::PlayEffects { effects, .. } = prepare(&e) else { panic!("expected effect") };
+            effects[0].0.clone()
+        };
+        assert_eq!(name(EntityEvent::EV_DISRUPTOR_HIT, 1), "disruptor/flesh_impact");
+        assert_eq!(name(EntityEvent::EV_DISRUPTOR_HIT, 0), "disruptor/wall_impact");
+        assert_eq!(name(EntityEvent::EV_DISRUPTOR_SNIPER_MISS, 1), "disruptor/wall_impact");
+        assert_eq!(name(EntityEvent::EV_DISRUPTOR_SNIPER_MISS, 0), "disruptor/alt_miss");
+    }
+
+    #[test]
+    fn misc_model_explosion_scatters_inside_the_box() {
+        let e = event(EntityEvent::EV_MISC_MODEL_EXP, 12, &[("time", 1)]);
+        let PreparedFxEvent::PlayEffects { effects, .. } = prepare(&e) else { panic!("expected effects") };
+        assert_eq!(effects.len(), 8 + 7); // grate: 8 + 7 * size
+        assert!(effects.iter().all(|(name, ..)| name == "chunks/grateexplode"));
+        let none = event(EntityEvent::EV_MISC_MODEL_EXP, 8, &[]); // MAT_NONE
+        assert!(matches!(prepare(&none), PreparedFxEvent::None));
+    }
+
+    #[test]
+    fn beams_expire_after_their_kill_time() {
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        fx.begin_frame(1_000);
+        let shot = event(EntityEvent::EV_DISRUPTOR_MAIN_SHOT, 0, &[]);
+        let prepared = prepare(&shot);
+        fx.entity_event_prepared(&shot, &prepared);
+        let lines = |frame: &FxFrame| frame.draws.iter().filter(|draw| matches!(draw, FxDraw::Line { .. })).count();
+        assert_eq!(lines(&fx.end_frame()), 1);
+        fx.begin_frame(1_151);
+        assert_eq!(lines(&fx.end_frame()), 0);
+    }
+
+    #[test]
+    fn debris_spawns_tumbling_fragments_that_fall_and_expire() {
+        let bits = |v: f32| v.to_bits();
+        let debris = event(
+            EntityEvent::EV_DEBRIS,
+            0,
+            &[
+                ("trickedentindex", 9), // MAT_GREY_STONE
+                ("eventParm", 6),
+                ("speed", bits(100.0)),
+                ("origin2[0]", bits(16.0)),
+                ("origin2[1]", bits(16.0)),
+                ("origin2[2]", bits(16.0)),
+            ],
+        );
+        let PreparedFxEvent::Chunks(specs) = prepare(&debris) else { panic!("expected chunks") };
+        assert_eq!(specs.len(), 6);
+        assert!(specs.iter().all(|spec| spec.qpath.starts_with("models/chunks/rock/rock1_")));
+        assert!(specs.iter().all(|spec| (1300..=2200).contains(&spec.life_ms)));
+
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        fx.begin_frame(1_000);
+        fx.entity_event_prepared(&debris, &PreparedFxEvent::Chunks(specs));
+        let first = fx.chunk_models();
+        assert_eq!(first.len(), 6);
+        fx.begin_frame(1_500);
+        let later = fx.chunk_models();
+        // No collision world in this test: pure gravity, so z has dropped 0.5 g t^2 more than velocity gain.
+        assert!(later.iter().zip(&first).all(|(a, b)| a.origin != b.origin));
+        fx.begin_frame(3_300);
+        assert!(fx.chunk_models().is_empty(), "fragments live at most 2.2 s");
+    }
+
+    #[test]
+    fn glass_shatter_tessellates_the_thin_face_and_delays_far_shards() {
+        // A 200 x 4 x 120 window with the damage point at its centre.
+        let bounds = [([-1.0e4; 3], [1.0e4; 3]), ([0.0, 0.0, 0.0], [200.0, 4.0, 120.0])];
+        let bits = |v: f32| v.to_bits();
+        let shatter = event(
+            EntityEvent::EV_GLASS_SHATTER,
+            0,
+            &[("origin[0]", bits(100.0)), ("origin[1]", bits(2.0)), ("origin[2]", bits(60.0))],
+        );
+        let specs = glass_shards(&shatter, Some(1), &bounds);
+        assert!(specs.len() > 20, "a window this size breaks into many shards: {}", specs.len());
+        assert!(specs.iter().all(|shard| shard.positions.iter().all(|p| (p[1] - 2.0).abs() < 1e-3)), "shards lie in the thin axis' mid-plane");
+        let near = specs.iter().filter(|shard| shard.delay_ms == 0).count();
+        assert!(near > 0 && near < specs.len(), "the impact area falls at once, the rest is delayed");
+        // Entity model unknown: falls back to the box around the damage point.
+        assert_eq!(glass_shards(&shatter, None, &bounds).len(), specs.len());
+        // Capped by pos.trTime.
+        let capped = event(EntityEvent::EV_GLASS_SHATTER, 0, &[("origin[0]", bits(100.0)), ("origin[1]", bits(2.0)), ("origin[2]", bits(60.0)), ("pos.trTime", 7)]);
+        assert_eq!(glass_shards(&capped, Some(1), &bounds).len(), 7);
+    }
+
+    #[test]
+    fn gib_counts_follow_cg_blood_and_launch_upwards() {
+        assert!(gib_specs([0.0; 3], 1, 0).is_empty());
+        let skull_or_brain = gib_specs([0.0; 3], 1, 1);
+        assert_eq!(skull_or_brain.len(), 1);
+        assert!(skull_or_brain[0].qpath.ends_with("skull.md3") || skull_or_brain[0].qpath.ends_with("brain.md3"));
+        let full = gib_specs([0.0; 3], 1, 2);
+        assert_eq!(full.len(), 10);
+        assert!(full.iter().all(|gib| gib.velocity[2] >= 0.0 && gib.bounce_factor == 0.6));
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        fx.set_gib_level(2);
+        fx.begin_frame(1_000);
+        let gib = event(EntityEvent::EV_GIB_PLAYER, 0, &[]);
+        fx.entity_event_prepared(&gib, &prepare(&gib));
+        assert_eq!(fx.chunk_models().len(), 10);
     }
 }

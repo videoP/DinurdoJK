@@ -103,8 +103,14 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "cg_drawCrosshair",
         "1",
-        "0..6",
-        "Crosshair shape: 0 off; 1 classic; 2 dot; 3 plus; 4 classic+dot; 5 brackets; 6 box.",
+        "0..7",
+        "Crosshair shape: 0 off; 1 classic; 2 dot; 3 plus; 4 classic+dot; 5 brackets; 6 box; 7 line (jaPRO strafehelper line crosshair). A non-zero cg_crosshairImage draws that image instead of the shape.",
+    ),
+    cvar(
+        "cg_crosshairImage",
+        "0",
+        "0..10",
+        "Image crosshair: 0 draws the cg_drawCrosshair shape; 1..10 draws gfx/2d/crosshaira..crosshairj (j needs japro-assets.pk3). cg_drawCrosshair 0 still hides it.",
     ),
     cvar(
         "cg_crosshairSize",
@@ -113,11 +119,38 @@ pub const ENTRIES: &[Entry] = &[
         "Crosshair size using the stock JKA cg_crosshairSize convention.",
     ),
     cvar(
+        "cg_crosshairStrength",
+        "1",
+        "0..2",
+        "Crosshair visibility. 1 is as authored; below fades it, above strengthens the faint stock image crosshairs.",
+    ),
+    cvar(
         "cg_crosshairColor",
         "255 255 255 230",
         "R G B A (0..255)",
         "TaystJK-style crosshair RGBA color.",
     ),
+    cvar("cl_chatBubbleSelf", "1", "0..1", "jaPRO: show your own chat balloon to others while the console, chat or a menu has the keyboard."),
+    cvar("cl_chatBubbleUnfocused", "1", "0..1", "jaPRO: also show the chat balloon while the game window is unfocused."),
+    cvar(
+        "cg_crosshairIdentifyTarget",
+        "1",
+        "0..1",
+        "jaPRO: colour the crosshair by what it is on (red enemy, green friend, yellow neutral, grey duelist). With 0 it keeps cg_crosshairColor.",
+    ),
+    cvar(
+        "cg_drawCrosshairNames",
+        "1",
+        "float",
+        "jaPRO: name of the player under the crosshair. 0 off; a positive value is the seconds the name stays after you aim away; a negative value shows it only while aimed at.",
+    ),
+    cvar(
+        "cg_drawCrosshairNamesColours",
+        "1",
+        "0..1",
+        "jaPRO: 1 draws the name with its own colour codes; 0 strips them and colours it red/green by friend or foe.",
+    ),
+    cvar("cg_drawCrosshairNamesOpacity", "1", "0..1", "jaPRO: opacity of the crosshair name."),
     cvar("cg_movementKeys", "0", "0..4", "TaystJK movement-key HUD mode: 0 off, 1 original, 2 +attack, 3 compact centered, 4 compact movable."),
     cvar("cg_movementKeysX", "0", "float", "TaystJK movement-key HUD horizontal offset."),
     cvar("cg_movementKeysY", "0", "float", "TaystJK movement-key HUD vertical offset."),
@@ -155,6 +188,19 @@ pub const ENTRIES: &[Entry] = &[
         "anchor x y scale",
         "HUD Force panel layout used by HUD Edit Mode.",
     ),
+    cvar("cg_hudMovementKeys", "tl 0 0 1", "anchor x y scale", "Movement keys HUD offset/scale on top of its stock position (HUD Edit Mode)."),
+    cvar("cg_hudFps", "tl 0 0 1", "anchor x y scale", "FPS / profiler HUD offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudChat", "tl 0 0 1", "anchor x y scale", "Chat history and input box offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudCenterPrint", "tl 0 0 1", "anchor x y scale", "Center-print text offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudCrosshairName", "tl 0 0 1", "anchor x y scale", "Crosshair target name offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudFollow", "tl 0 0 1", "anchor x y scale", "Spectator follow name offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudVote", "tl 0 0 1", "anchor x y scale", "Vote text offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudRaceTimer", "tl 0 0 1", "anchor x y scale", "Race timer block offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudSurfaceInspector", "tl 0 0 1", "anchor x y scale", "Trace/surface inspector panel offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudSpeedometer", "tl 0 0 1", "anchor x y scale", "Speedometer main readout offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudSpeedometerJumps", "tl 0 0 1", "anchor x y scale", "Speedometer pre-speed jumps array offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudSpeedGraph", "tl 0 0 1", "anchor x y scale", "Speedometer speed graph offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudRaceStart", "tl 0 0 1", "anchor x y scale", "Race start-speed readout offset/scale (HUD Edit Mode)."),
     cvar(
         "cg_hudSnap",
         "1",
@@ -191,11 +237,23 @@ pub const ENTRIES: &[Entry] = &[
     ),
     cvar("con_timestamps", "1", "0..1", "Prefix console lines with local HH:MM:SS timestamps."),
     cvar("con_suggest", "1", "0..1", "Live command/cvar filter while typing in the console: Up/Down pick, Tab completes, Esc dismisses."),
+    cvar("cg_chatboxCompletion", "1", "0..1", "JAPP: Tab in the chat input completes a player name (substring match, colours ignored); several matches are listed instead."),
     cvar("ui_vgs", "1", "0=off, nonzero=on", "TaystJK: use the jaPRO VGS canned-voice menu."),
-    cvar("r_jumpHeightShade", "0", "0..1", "jaPRO SP physics: tint flat surfaces by jump height while airborne (green = ideal landing, red = deeper, blue = reachable above the jump line)."),
+    cvar("cg_screenShake", "1", "0..2", "Camera shake: 1 effect-driven (explosions, creature efx), 2 also the kick of firing rockets, repeater alt, flechette, bryar/demp2 alt and bowcaster. Server-triggered shake events are not affected, as in OpenJK."),
+    cvar("r_jumpHeightShade", "1", "0..1", "jaPRO SP physics: tint flat surfaces by jump height while airborne (green = ideal landing, red = deeper, blue = reachable above the jump line)."),
     cvar("s_volume", "0.5", "0..1", "OpenJK game/effects volume."),
     cvar("s_volumeVoice", "1.0", "0..1", "OpenJK voice-channel volume."),
-    cvar("s_musicvolume", "0.25", "0..1", "OpenJK background music volume (playback presenter pending)."),
+    cvar("s_musicvolume", "0.25", "0..1", "OpenJK background music volume (level music and the duel track)."),
+    cvar("cg_raceSounds", "1", "0..255", "jaPRO race mode sound bit mask; bit 1 keeps the race start-trigger sound."),
+    cvar("cg_chatSounds", "0", "0..2", "Beep on incoming chat: 0 silent, 1 the legacy talk beep, 2 distinct beeps for private messages and team chat (jaPRO)."),
+    cvar("cg_footsteps", "3", "0..4", "Player footsteps (jaPRO): 0 off, 1 sounds, 2 sounds and material effects (sand, mud, snow, gravel dust), 3+ same (footprints are controlled separately by r_footprints), 4 debugging."),
+    cvar("cg_ghoul2Marks", "16", "0..64", "Burn marks kept on each player model by blaster/rocket hits (0 disables). Needs GPU Ghoul2 skinning."),
+    cvar("cg_hitchrecord", "0", "0..1", "Keep a rolling buffer of per-frame prediction/view state for `hitchmark`, and print ^3HITCH^7 lines to console when one is detected. 0 disables both."),
+    cvar("cg_scorePlums", "1", "0..1", "Floating score numbers where you score (kills, captures)."),
+    cvar("cg_autoSwitch", "1", "0..2", "Weapon pickup/empty auto switch: 0 never, 1 to a better safe weapon (no rocket/thermal/mines), 2 to any better weapon."),
+    cvar("cg_blood", "0", "0..2", "jaPRO gibs: 0 none (death voice instead), 1 skull or brain, 2 full gibs (needs the jaPRO models/gibs assets)."),
+    cvar("cg_ambientSounds", "1", "0..1", "Level ambience from the map's sound sets (worldspawn soundSet and local ambient entities)."),
+    cvar("cg_duelMusic", "1", "0..1", "jaPRO: play the duel music track while you are in a duel."),
     cvar("s_separation", "0.5", "0..1", "OpenJK stereo separation used by positional sound."),
     cvar(
         "s_muteWhenUnfocused",
@@ -203,6 +261,14 @@ pub const ENTRIES: &[Entry] = &[
         "0..1",
         "Mute game and voice audio while the game window is unfocused.",
     ),
+    cvar("cg_jumpSounds", "1", "0..3", "jaPRO jump voice: 0 off, 1 everyone, 2 other players only, 3 only you (jaPRO itself defaults to 0)."),
+    cvar("cg_rollSounds", "1", "0..3", "jaPRO roll voice: 0 off, 1 everyone, 2 other players only, 3 only you."),
+    cvar("cg_noTaunt", "0", "0..1", "jaPRO: silence taunt voice lines."),
+    cvar("cg_duelSounds", "1", "0..3", "jaPRO duel start: 0 off, 1 sound and text, 2 sound only, 3 text only."),
+    cvar("cg_killSounds", "2", "0..2", "jaPRO frag sound when you kill: 1 always, 2 with a mid-air variant (needs the jaPRO sound/frag assets)."),
+    cvar("cg_killMessage", "1", "0..3", "TaystJK kill center-print: 0 off, 1 normal with FFA place/score, 2 kill only, 3 higher on screen."),
+    cvar("cg_drawRewards", "1", "0..2", "TaystJK/JKA award medals: 0 off, 1 JKA voice/medals, 2 Quake 3 variants where available."),
+    cvar("cg_hitsounds", "0", "0..6", "jaPRO hit feedback: 1-4 pick a hit sound (needs the jaPRO sound/effects/hitsound assets), 5 plain saber hit, 6 any saber hit variant."),
     command("soundinfo", "Show active output format, device buffer, voice count and pre-limiter overload diagnostics."),
     cvar("cg_thirdPerson", "0", "0..1", "OpenJK third-person view toggle."),
     cvar(
@@ -222,6 +288,36 @@ pub const ENTRIES: &[Entry] = &[
         "90",
         "0 or 15..250",
         "Continuous projectile/trail EFX sampling rate. 0 restores legacy JKA presentation-frame-driven density.",
+    ),
+    cvar(
+        "fx_physics",
+        "2",
+        "0..3",
+        "FX particle physics (TaystJK): 0 off, 1 same as 0 (stock has no non-expensive collision), 2 trace primitives flagged expensivePhysics, 3 force the world trace on every physics primitive.",
+    ),
+    cvar(
+        "fx_lod",
+        "2",
+        "0..2",
+        "EFX level of detail, decided when an effect spawns (live particles are never thinned): 0 stock, 1 honor authored cullRange (stock OpenJK ignores it), 2 also scale Particle/Tail populations down by projected screen size.",
+    ),
+    cvar(
+        "r_fxLodScale",
+        "5",
+        "0.1..100",
+        "EFX distance LOD scale, like r_lodscale: multiplies every authored cullRange (stock OpenJK ignores cullRange) and shifts the adaptive density curve. Larger keeps more detail farther away; 1 is the raw authored range. Needs fx_lod 1 or 2.",
+    ),
+    cvar(
+        "r_lodScale",
+        "5",
+        "0.1..100",
+        "Ghoul2 model LOD scale (OpenJK default 5). Larger keeps higher-detail GLM LODs at greater distances; smaller switches to cheaper LODs sooner. r_lodbias is added afterward.",
+    ),
+    cvar(
+        "fx_countScale",
+        "1",
+        "0..1",
+        "Stock OpenJK EFX count scale: multiplies authored count ranges wider than 1. Never scales upward; every primitive keeps at least one spawn.",
     ),
     cvar(
         "cg_smoothPlayerOrigin",
@@ -337,16 +433,41 @@ pub const ENTRIES: &[Entry] = &[
         "Graphics backend selected for the next vid_restart.",
         LatchScope::VidRestart,
     ),
+    command(
+        "version",
+        "Print the DinurdoJK version and UTC compile time embedded in this executable.",
+    ),
+    command(
+        "plugin",
+        "List or toggle a jaPRO cp_pluginDisable preference by the bit number shown by /plugin.",
+    ),
+    command(
+        "pluginDisable",
+        "Alias of /plugin: list or toggle jaPRO cp_pluginDisable preferences.",
+    ),
     command("cmdlist", "List registered console commands, optionally filtered by a wildcard pattern."),
     command("help", "Print help for one registered command."),
+    command("clear", "Clear the console output."),
     command("echo", "Print message text to the console."),
     command("vstr", "Execute the current value of a cvar as command text."),
     command("wait", "Pause execution of the remaining command buffer for one or more client frames."),
     command("record", "Start recording the current live session to a native demos/*.dm_26 file."),
     command("stoprecord", "Stop the current demo recording and write its end marker."),
+    command(
+        "predsettings",
+        "Print the pmove settings the predictor is running with: race/style, pmove_float/fixed/msec, velocity snapping, command chopping.",
+    ),
+    command(
+        "hitchmark",
+        "Write the last ~5 s of per-frame prediction/view state to <game>/hitch/*.csv. Bind it and tap it right after a hitch (needs cg_hitchrecord 1).",
+    ),
     command("demo", "Play demos/<demoname>.dm_26 using the same playback path as the GUI."),
     command("exec", "Execute a .cfg script through the active fs_game/base VFS."),
     command("execq", "Execute a .cfg script without displaying the exec notification."),
+    command(
+        "fs_refresh",
+        "Re-scan the active base/fs_game VFS and retry assets that previously failed without restarting CGame.",
+    ),
     command("write", "Alias for writeconfig <filename>; writes archived client settings and binds."),
     command("writeconfig", "Write archived client settings and binds to a .cfg under the active fs_game."),
     command(
@@ -363,6 +484,7 @@ pub const ENTRIES: &[Entry] = &[
     command("bindlist", "List all current key bindings."),
     command("trace", "Toggle inspection of the world surface under the center crosshair."),
     command("trace_clear", "Clear the pinned surface inspection and triangle highlight."),
+    command("entities", "Open the 2D entity blueprint: entities [targetname|classname] selects the first match."),
     command("viewpos", "Print the view origin and angles: (x y z) : yaw (pitch p)."),
     command(
         "perfsample",
@@ -464,6 +586,7 @@ pub const ENTRIES: &[Entry] = &[
     cvar("r_dynamicLightBrightnessLock", "1", "0..1", "1 links r_dynamicLightBrightness to r_gamma; 0 lets it be set independently."),
     cvar("r_drawTriggers", "0", "0..1", "Draw trigger_* volumes as colored translucent brushes (push green, teleport purple, hurt red, multiple blue, once cyan). Session-only."),
     cvar("r_drawClipBrushes", "0", "0..1", "Draw clip-only brushes (player clip orange, shot clip magenta, monster/bot clip yellow). Session-only."),
+    cvar("r_drawEntities", "0", "0..1", "NetRadiant-style 3D overlay: a colored box and classname label above every map entity (same data as the `entities` command), colored by category, with lines to its target/targetname links. Brush movers track their live position when networked. Session-only."),
     cvar("r_drawMapModels", "1", "0..1", "Draw server-placed MD3 map models (misc_model_* props). Brush models and geometry compiled into the BSP are unaffected."),
     cvar("r_hdr", "0", "0..1", "HDR intermediate rendering."),
     latched_cvar("r_floatLightmap", "0", "0..1", "Use FP16 lightmaps while HDR is enabled; prefer Rend2 .hdr companions when present.", LatchScope::MapLoadOrVidRestart),
@@ -479,7 +602,7 @@ pub const ENTRIES: &[Entry] = &[
         "r_contactShadows",
         "0",
         "0..1",
-        "Short-range screen-space contact shadows.",
+        "Short-range screen-space contact shadows toward the map sun.",
     ),
     cvar(
         "r_weatherWind",
@@ -506,10 +629,10 @@ pub const ENTRIES: &[Entry] = &[
         "A/B adaptive empty-space skipping in the primary volumetric cloud march.",
     ),
     cvar(
-        "r_fogMode",
-        "off",
-        "off|legacy|volumetric",
-        "Fog rendering mode.",
+        "r_drawfog",
+        "0",
+        "0|1|2|3",
+        "Fog rendering: 0 off, 1 legacy (authored fog redrawn in post), 2 legacy (per-surface EXP2 fog, JKA default), 3 volumetric.",
     ),
     cvar(
         "r_fogStrength",
@@ -522,6 +645,12 @@ pub const ENTRIES: &[Entry] = &[
         "0",
         "0..1",
         "Use a runtime custom q3 shader sun instead of the map-authored sky sun.",
+    ),
+    cvar(
+        "r_entitySunLighting",
+        "0",
+        "0..1",
+        "Remove the baked map sun from the entity lightgrid and re-light entities with the runtime sun (needs r_entityAmbientLighting bsp_lightgrid).",
     ),
     cvar(
         "r_sunYaw",
@@ -561,6 +690,24 @@ pub const ENTRIES: &[Entry] = &[
         "Rain preset used by the shared precipitation renderer.",
     ),
     cvar(
+        "r_puddleQuality",
+        "high",
+        "standard|high",
+        "high shades puddles and wet ground with the GodotOcean water response and streaked reflections.",
+    ),
+    cvar(
+        "r_puddleScatter",
+        "0.800",
+        "0..1",
+        "How readily rain collects in scattered puddles on large flat ground; 0 keeps only basin puddles.",
+    ),
+    cvar(
+        "r_rainGrade",
+        "0.500",
+        "0..1",
+        "Wet-weather colour grade (cool shadows, warm highlights, richer neon) while it rains.",
+    ),
+    cvar(
         "r_footprints",
         "3d",
         "off|2d|3d",
@@ -596,6 +743,12 @@ pub const ENTRIES: &[Entry] = &[
         "1",
         "0..1",
         "A/B 5-triangle middle grass blade LOD (runtime diagnostic; not persisted).",
+    ),
+    cvar(
+        "r_contactShadowDebug",
+        "0",
+        "0..1",
+        "Show why the contact-shadow pass returned per pixel: grey=factor, blue=faces away from sun, red=ray sub-pixel/off screen, yellow=origin behind camera, magenta=no depth (runtime diagnostic; not persisted).",
     ),
     cvar(
         "r_grassFrontToBack",
@@ -641,7 +794,7 @@ pub const ENTRIES: &[Entry] = &[
         "performance|adaptive|high",
         "DOF Gaussian sampling quality. Adaptive spends extra samples only on large blur radii.",
     ),
-    cvar("r_colorLut", "off", "preset", "Color grading LUT preset."),
+    cvar("r_colorLut", "off", "preset", "Color grading LUT: built-in film look or a .cube name from base/LUTs."),
     cvar(
         "r_colorLutStrength",
         "1.000",
@@ -661,6 +814,18 @@ pub const ENTRIES: &[Entry] = &[
         "0",
         "0..1",
         "Periodic renderer performance trace in the console.",
+    ),
+    cvar(
+        "r_pom",
+        "1",
+        "0..1",
+        "Parallax occlusion mapping when r_pbr is on; 0 keeps PBR shading without POM height sampling. Session-only.",
+    ),
+    cvar(
+        "r_worldPath",
+        "auto",
+        "auto|unified",
+        "World renderer: auto keeps the FastBaseline path when eligible; unified forces the general renderer (Minimal (Unified) preset).",
     ),
     cvar(
         "r_gpuTimings",
@@ -693,6 +858,12 @@ pub const ENTRIES: &[Entry] = &[
         "GPU Ghoul2 draw batching: 0 off, 1 adaptive, 2 force. Adaptive only groups repeated opaque/masked mesh/material/LOD surfaces when the crowd is likely to benefit.",
     ),
     cvar(
+        "r_ghoul2AnimSmooth",
+        "0.3",
+        "0..1 (exclusive)",
+        "jaPRO CBoneCache::SmoothLow renderer bone-history filter (jaPRO default 0.3): blends each player's final composed Ghoul2 pose toward last frame's filtered pose before skinning/attachments. Only active strictly between 0 and 1, matching jaPRO: 0 or >=1 disables it (1 is 'off', not 'maximum'). Does not apply while ragdolled.",
+    ),
+    cvar(
         "r_entityAmbientLighting",
         "off",
         "off|bsp_lightgrid|bevy_irradiance_volume",
@@ -722,8 +893,9 @@ pub const ENTRIES: &[Entry] = &[
         "off|legacy|vertex|clustered_lite|forward_plus|ray_traced",
         "Dynamic-lighting technique for runtime-authored lights.",
     ),
+    cvar("r_dynamicLightFalloff", "0", "0..1", "Falloff of runtime dynamic lights (sabers, blasters, explosions) in forward_plus/ray_traced. 0 stock JKA 1 - d^2/r^2, 1 physical inverse-square with a smooth window that reaches zero at the radius with no visible edge."),
     cvar("r_rtSamples", "1", "1|2|4", "Samples per soft RT sun or saber light. Higher values reduce noise and cost more GPU time; point lights use one ray."),
-    cvar("r_rtResolution", "full", "full|half", "RT visibility resolution. Half reuses depth-matched visibility; edges and missing lights trace at full resolution."),
+    cvar("r_rtResolution", "full", "full|half", "RT sun shadow rate. half = reduced rate: retraces each pixel every 4th frame and carries the rest by motion vectors; shadow edges and disocclusions still trace every frame. Always full screen resolution; local lights are always traced directly."),
     cvar(
         "r_mapLightSimulation",
         "0",
@@ -769,8 +941,8 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "r_dynamicShadows",
         "off",
-        "off|blob|stencil|csm|csm_bevy|ray_traced",
-        "Dynamic-shadow mode; CSM uses the current cascaded-shadow path.",
+        "off|blob|entity|csm|ray_traced",
+        "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.",
     ),
     cvar(
         "r_emissiveAreaLights",
@@ -783,6 +955,12 @@ pub const ENTRIES: &[Entry] = &[
         "0",
         "0..1",
         "Voxel/probe indirect lighting; enabling it on a map prepared without GI requires vid_restart.",
+    ),
+    cvar(
+        "r_entityShadowLight",
+        "lightgrid",
+        "lightgrid|authored",
+        "Entity-map shadow light: baked lightgrid direction, or the strongest authored map light's real position.",
     ),
     cvar(
         "r_localLightShadows",
@@ -828,8 +1006,8 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "r_pvsMode",
         "auto",
-        "off|minimal|full|auto|auto2|auto3|auto4",
-        "Potentially-visible-set culling mode; Auto 4 uses map-load portal/cluster draw plans with shared compatible merged batches.",
+        "off|minimal|full|auto",
+        "Potentially-visible-set culling mode; Auto uses map-load portal/cluster draw plans with shared compatible merged batches.",
     ),
     command("devmap", "Load a map for local development: devmap <map>."),
     command("map", "Load a map: map <map>."),
@@ -864,22 +1042,77 @@ pub const ENTRIES: &[Entry] = &[
     command("cmd", "Send the rest of the line to the server as a client command."),
     command("userinfo", "Print the userinfo sent to the server."),
     command("serverinfo", "Print the connected server's serverinfo configstring."),
+    command(
+        "serverdump",
+        "Dump the server's serverinfo + systeminfo with derived numbers (estimated sv_fps from snapshot gaps, ping, command lag) to the console and <game>/serverinfo/<addr>_<time>.txt, and append a one-line summary to <game>/serverinfo/servers.log for comparing servers.",
+    ),
     command("systeminfo", "Print the connected server's systeminfo configstring."),
     cvar("name", "Padawan", "string", "Player name sent in userinfo."),
     cvar("rate", "25000", "1000..90000", "Maximum bytes/second the server may send."),
     cvar("snaps", "40", "1..125", "Snapshots per second requested from the server."),
     cvar("cl_maxpackets", "60", "15..1000", "Maximum client packets per second."),
+    cvar("cg_stylePlayer", "0", "bit mask", "jaPRO player styling bits: 2 duel shell, 4 hide duelers, 8 hide racers in FFA, 16 hide non-racers while racing, 32 hide racers while racing, 64 solid racers, 128 solid FFA players while racing, 256 ghost duelers, 1024 hide non-duelers while dueling (stock servers), 65536 hide cosmetics, 1048576 seasonal cosmetics."),
+    cvar("cg_raceTimer", "2", "0..3", "jaPRO race timer: 0 off, 1 time, 2 time + max/avg/start speed, 3 same with milliseconds."),
+    cvar("cg_raceTimerSize", "0.75", "0.1..3", "Text scale of the race timer."),
+    cvar("cg_raceTimerX", "5", "640x480 px", "Left edge of the race timer."),
+    cvar("cg_raceTimerY", "280", "640x480 px", "Baseline of the race timer."),
+    cvar("cg_raceStart", "0", "0|1", "Show the speed you crossed the race start line with."),
+    cvar("cg_raceStartX", "300", "640x480 px", "Left edge of the start speed readout."),
+    cvar("cg_raceStartY", "280", "640x480 px", "Baseline of the start speed readout."),
+    cvar("cg_startGoal", "0", "speed", "The start speed readout turns green at or above this speed (0 = never)."),
+    cvar("cg_drainFX", "2", "0..2", "Force-drain hand effect: 0 off, 1 stock mp/drain(wide).efx, 2 jaPRO mp/drain(wide)_japro.efx. Force lightning itself is unaffected."),
+    command("speedometer", "List the cg_speedometer options, or toggle option <num> (see /speedometer)."),
+    cvar("cg_speedometer", "0", "bit mask", "jaPRO speedometer bits; configure with /speedometer <num>. 1 enable, 2 pre-speed, 4 jump height, 8 jump distance, 16 vertical speed, 32 yaw speed, 64 accel meter, 128 speed graph, 256 km/h, 512 mph, 1024 pre-speed jumps array, 2048 no colors, 4096/8192 array colors, 16384 old speed graph, 32768 XYZ speed."),
+    cvar("cg_speedometerX", "132", "640x480 px", "Left edge of the speedometer."),
+    cvar("cg_speedometerY", "459", "640x480 px", "Baseline of the speedometer."),
+    cvar("cg_speedometerSize", "0.75", "0.1..3", "Text scale of the speedometer."),
+    cvar("cg_speedometerJumps", "10", "0..511", "How many pre-speed jumps the jumps array keeps (bit 1024)."),
+    cvar("cg_speedometerJumpsX", "185", "640x480 px", "Left edge of the pre-speed jumps array."),
+    cvar("cg_speedometerJumpsY", "300", "640x480 px", "Baseline of the pre-speed jumps array."),
+    cvar("cg_jumpGoal", "0", "speed", "First-jump pre-speed at or above which the readout turns green (0 = never)."),
+    cvar("cg_lagometer", "0", "0..4", "jaPRO lagometer: 0 off (the connection-interrupted warning still shows), 1 graph, 2 graph with average ping and interpolation numbers, 3 numbers over a frameless graph, 4 (this client only) mode 3 plus packet loss and peak ping under the graph. Not shown against the local server."),
+    cvar("cg_lagometerX", "48", "640x480 px", "Distance of the lagometer's right edge from the right of the screen (also positions the old speed graph)."),
+    cvar("cl_commandsize", "64", "4..512", "How many usercmds back the connection-interrupted warning looks: it appears once the server has not acknowledged a command that old. (The usercmd history itself is always 512 deep.)"),
+    cvar("cg_lagometerY", "144", "640x480 px", "Distance of the lagometer's bottom from the bottom of the screen (also positions the old speed graph)."),
+    cvar("cg_specFollowFastest", "0", "0|1", "While spectating, keep following the fastest player (debounced)."),
+    command("cameraedit", "Adjust the third-person camera with the mouse: scroll to zoom, drag to move, hold right mouse to aim."),
+    command("followFastest", "Spectate whoever is moving fastest right now."),
+    command("followRedFlag", "Spectate the red flag carrier."),
+    command("followBlueFlag", "Spectate the blue flag carrier."),
+    cvar("cl_packetdup", "1", "0..5", "Repeat the usercmds of this many earlier packets to survive packet loss."),
     cvar("cl_timeNudge", "0", "-900..900", "Milliseconds of extra (+) or less (-) interpolation delay."),
+    cvar("net_port", "29070", "0..65535", "Preferred local UDP port for the live game connection. Like TaystJK/OpenJK, the client tries this port and the next 9 if it is busy; 0 lets the OS choose."),
     cvar("saber1", "single_1", "saber name", "Primary saber sent in userinfo."),
     cvar("saber2", "none", "saber name", "Secondary saber sent in userinfo."),
-    cvar("color1", "4", "0..5", "Primary saber colour."),
-    cvar("color2", "4", "0..5", "Secondary saber colour."),
+    cvar("color1", "4", "0..6", "Primary saber colour: 0 red, 1 orange, 2 yellow, 3 green, 4 blue, 5 purple, 6 RGB (jaPRO / JA+ servers; see cp_sbRGB1)."),
+    cvar("color2", "4", "0..6", "Secondary saber colour (same values as color1; RGB uses cp_sbRGB2)."),
+    cvar("cp_sbRGB1", "0", "0..16777215", "jaPRO custom blade colour for color1 6, packed red + green * 256 + blue * 65536."),
+    cvar("cp_sbRGB2", "0", "0..16777215", "jaPRO custom blade colour for color2 6, packed like cp_sbRGB1."),
     cvar("forcepowers", "7-1-032330000000001333", "rank-side-levels", "Force power configuration."),
     cvar("sex", "male", "male|female", "Sound gender hint sent in userinfo."),
     cvar("password", "", "string", "Server join password."),
+    cvar("rconPassword", "", "string", "Password for remote console access (see rcon). Not saved to the config."),
+    cvar("rconAddress", "", "host[:port]", "Alternate server address for rcon when not connected (default port 29070). Not saved to the config."),
+    command("rcon", "Run a command on a server remotely: rcon <command>. Needs rconPassword, and a connection or rconAddress."),
+    cvar("char_color_red", "255", "0..255", "Player tint (red) sent in userinfo; tints the entity-coloured parts of a player model, e.g. jedi_zf armour."),
+    cvar("char_color_green", "255", "0..255", "Player tint (green) sent in userinfo."),
+    cvar("char_color_blue", "255", "0..255", "Player tint (blue) sent in userinfo."),
+    cvar("handicap", "100", "1..100", "Handicap sent in userinfo; the server uses it as maximum health."),
+    cvar("cg_predictItems", "1", "0..1", "Tell the server this client predicts item pickups (userinfo)."),
+    cvar("fs_game", "japro", "directory", "Game directory mounted over base for local games (applied when a map loads); empty or base for none. A connected server's own fs_game overrides it."),
+    cvar("cp_cosmetics", "0", "bitfield", "jaPRO model cosmetics bitfield, sent to jaPRO servers."),
+    cvar("cp_clanPwd", "none", "string", "jaPRO clan password, sent to jaPRO servers. Not saved to the config."),
+    cvar("ui_username", "", "string", "jaPRO account name used by the login menu (Setup -> Mod) and the login command."),
+    cvar("ui_password", "", "string", "jaPRO account password used by the login menu. Not saved to the config."),
+    cvar("cg_displayCameraPosition", "1 80 16", "read-only", "jaPRO userinfo: cg_thirdPerson, range and vertical offset (kept current automatically)."),
+    cvar("cg_displayNetSettings", "125 0 125", "read-only", "jaPRO userinfo: cl_maxPackets, cl_timeNudge and com_maxFPS (kept current automatically)."),
     cvar("cg_errorDecay", "100", "0..500", "Milliseconds over which prediction corrections are smoothed."),
     cvar("cg_noPredict", "0", "0..1", "Disable client-side movement prediction (use interpolated server state)."),
     cvar("cg_showMiss", "0", "0..1", "Print prediction misses."),
+    cvar("cg_predictionDebug", "0", "0..1", "Show live prediction/ground-trace diagnostics and print rich miss details."),
+    cvar("cg_modelFrameDebug", "0", "0..1", "Log head, saber hilt and blade anchors for every presented render frame to <game>/hitch/model-frames-*.csv, with JKA world coordinates and screen pixels. Set 0 to finish and flush."),
+    cvar("cg_predictionMissHighlight", "0", "0..1", "Flash a red screen-edge warning when a prediction miss exceeds cg_predictionMissThreshold."),
+    cvar("cg_predictionMissThreshold", "8", "0..4096", "Prediction correction distance in JKA units required for the visual miss warning."),
     cvar(
         "cl_allowMissingMap",
         "0",
@@ -888,7 +1121,12 @@ pub const ENTRIES: &[Entry] = &[
     ),
     cvar("cl_allowHttpDownload", "1", "0..1", "Allow HTTP PK3 autodownloads advertised by the server. HTTP is preferred when available."),
     cvar("cl_allowDownload", "1", "0..1", "Allow legacy Jedi Academy UDP PK3 autodownloads (svc_download). Used when HTTP is unavailable or fails."),
-    cvar("cl_commandRate", "125", "15..1000", "Usercmds sent per second (OpenJK ties this to com_maxfps; 125 is the classic JKA rate)."),
+    cvar("cl_commandRate", "125", "15..1000", "Usercmds built per second, i.e. the movement physics rate. Set it yourself; it is not tied to com_maxfps (which only caps rendering here)."),
+    cvar("cg_groundTraceDebug", "0", "0..2", "Print this client's ground-trace predictions: 1 = ground changes (takeoff/landing/entity) and mismatches against the server snapshot for the same command, 2 = every new command."),
+    cvar("cg_physicsDiag", "0", "0..2", "Replay each snapshot interval from the previous snapshot and compare with the server's state: 1 = print intervals that do not match exactly (origin/velocity/ground/flags deltas), 2 = print every one. Isolates pure physics mismatch (e.g. at cl_commandRate 1000)."),
+    cvar("cg_snapMode", "-1", "-1..4", "How prediction rounds velocity after each pmove step (the engine's trap_SnapVector): -1 detect per server by replaying snapshot intervals (default), 0 OpenJK nearest, 1 truncate, 2 floor, 3 nearest-even, 4 none. Retail servers differ from OpenJK here and at cl_commandRate 1000 it decides friction and gravity."),
+    cvar("cg_predictBackend", "-1", "-1..1", "Which native pmove predicts: -1 detect (jaPRO servers use the jaPRO/TaystJK backend; others are tried against both by replaying snapshot intervals and the one that reproduces the server wins), 0 stock OpenJK, 1 jaPRO/TaystJK."),
+    cvar("cl_commandPacing", "1", "0..1", "1 = stamp usercmds on an exact cl.serverTime cadence (race physics steps by the command gap); 0 = wall-clock pacing (gaps jitter 5-10 ms at 125)."),
     // cgame weapon selection (cg_weapons.c).
     command("weapon", "Select a weapon slot: weapon <1..13>."),
     command("weapnext", "Select the next weapon."),
@@ -977,6 +1215,7 @@ pub const SERVER_COMMANDS: &[Entry] = &[
     server_command("team", "Join a team: team <free|red|blue|spectator|follow1|follow2|scoreboard>."),
     server_command("teamtask", "Choose a team task."),
     server_command("teamvote", "Vote in a team vote: teamvote <yes|no>."),
+    server_command("t_use", "Cheat: fire every entity with a targetname: t_use <targetname>."),
     server_command("tell", "Private message: tell <client number|name> <message>."),
     server_command("voice_cmd", "Send a voice command."),
     server_command("vgs_cmd", "Send a jaPRO VGS canned voice command."),
@@ -984,6 +1223,132 @@ pub const SERVER_COMMANDS: &[Entry] = &[
     server_command("where", "Print your current origin."),
     server_command("zoom", "Toggle binocular zoom."),
 ];
+
+/// jaPRO server game commands (`commands[]` in codemp/game/g_cmds.c) that stock JKA
+/// servers do not have. They complete only while connected to a jaPRO server.
+pub const JAPRO_COMMANDS: &[Entry] = &[
+    server_command("amBan", "jaPRO: Admin: ban a player: amBan <player> [duration]."),
+    server_command("amBeg", "jaPRO: Emote: beg."),
+    server_command("amBeg2", "jaPRO: Emote: beg (variant)."),
+    server_command("amBernie", "jaPRO: Emote: sit with mittens."),
+    server_command("amBreakdance", "jaPRO: Emote: breakdance."),
+    server_command("amBreakdance2", "jaPRO: Emote: breakdance 2."),
+    server_command("amBreakdance3", "jaPRO: Emote: breakdance 3."),
+    server_command("amBreakdance4", "jaPRO: Emote: breakdance 4."),
+    server_command("amCheer", "jaPRO: Emote: cheer."),
+    server_command("amCower", "jaPRO: Emote: cower."),
+    server_command("amDance", "jaPRO: Emote: dance."),
+    server_command("amFlip", "jaPRO: Emote: saber flip."),
+    server_command("amForceTeam", "jaPRO: Admin: move a player to a team: amForceTeam <player> <team>."),
+    server_command("amFreeze", "jaPRO: Admin: freeze or unfreeze a player: amFreeze <player>."),
+    server_command("amGrantAdmin", "jaPRO: Admin: grant admin rights: amGrantAdmin <player> <level>."),
+    server_command("amHug", "jaPRO: Emote: hug."),
+    server_command("amInfo", "jaPRO: Show the admin commands you may use."),
+    server_command("amKick", "jaPRO: Admin: kick a player: amKick <player> [reason]."),
+    server_command("amKillVote", "jaPRO: Admin: cancel the vote in progress."),
+    server_command("amListMaps", "jaPRO: List the maps on the server: amListMaps [filter]."),
+    server_command("amLockTeam", "jaPRO: Admin: lock or unlock a team: amLockTeam <team>."),
+    server_command("amLogin", "jaPRO: Log in as admin: amLogin <user> <password>."),
+    server_command("amLogout", "jaPRO: Log out of your admin session."),
+    server_command("amLookup", "jaPRO: Admin: look up a player's account: amLookup <player>."),
+    server_command("amMap", "jaPRO: Admin: change map immediately: amMap <map>."),
+    server_command("amMOTD", "jaPRO: Show the message of the day."),
+    server_command("amNoisy", "jaPRO: Emote: noisy."),
+    server_command("amPoint", "jaPRO: Emote: point."),
+    server_command("amPsay", "jaPRO: Admin: private message: amPsay <player> <message>."),
+    server_command("amRage", "jaPRO: Emote: rage."),
+    server_command("amRename", "jaPRO: Admin: rename a player: amRename <player> <name>."),
+    server_command("amRun", "jaPRO: Toggle the run/walk emote state."),
+    server_command("amSay", "jaPRO: Say something to the admins."),
+    server_command("amSignal", "jaPRO: Emote: signal."),
+    server_command("amSignal2", "jaPRO: Emote: signal 2."),
+    server_command("amSignal3", "jaPRO: Emote: signal 3."),
+    server_command("amSignal4", "jaPRO: Emote: signal 4."),
+    server_command("amSit", "jaPRO: Emote: sit."),
+    server_command("amSit2", "jaPRO: Emote: sit 2."),
+    server_command("amSit3", "jaPRO: Emote: sit 3."),
+    server_command("amSit4", "jaPRO: Emote: sit 4."),
+    server_command("amSit5", "jaPRO: Emote: sit 5."),
+    server_command("amSlap", "jaPRO: Emote: slap."),
+    server_command("amSleep", "jaPRO: Emote: sleep."),
+    server_command("amSmack", "jaPRO: Emote: smack."),
+    server_command("amSurrender", "jaPRO: Emote: surrender."),
+    server_command("amTaunt", "jaPRO: Emote: taunt."),
+    server_command("amTaunt2", "jaPRO: Emote: taunt 2."),
+    server_command("amTele", "jaPRO: Teleport: amTele [player] or to your saved mark."),
+    server_command("amTeleMark", "jaPRO: Save your position as the teleport mark."),
+    server_command("amVictory", "jaPRO: Emote: victory pose."),
+    server_command("amVstr", "jaPRO: Admin: run a server vstr: amVstr <name>."),
+    server_command("blink", "jaPRO: Blink forward a short distance."),
+    server_command("changePassword", "jaPRO: Change your account password: changePassword <old> <new>."),
+    server_command("clanAdmin", "jaPRO: Clan: administrate your clan."),
+    server_command("clanCreate", "jaPRO: Clan: create a clan: clanCreate <name>."),
+    server_command("clanInfo", "jaPRO: Clan: show your clan's information."),
+    server_command("clanInvite", "jaPRO: Clan: invite a player: clanInvite <player>."),
+    server_command("clanJoin", "jaPRO: Clan: join a clan you were invited to."),
+    server_command("clanLeave", "jaPRO: Clan: leave your clan."),
+    server_command("clanList", "jaPRO: Clan: list the clan members."),
+    server_command("clanPass", "jaPRO: Clan: set the clan password."),
+    server_command("clanSay", "jaPRO: Clan: message your clan: clanSay <message>."),
+    server_command("clanWhois", "jaPRO: Clan: who is in a clan: clanWhois <name>."),
+    server_command("coop", "jaPRO: Co-op race: coop <player>."),
+    server_command("crouchJump", "jaPRO: Toggle crouch jumping."),
+    server_command("flagRecord", "jaPRO: Invalidate your current race record."),
+    server_command("gc", "jaPRO: Send a game command to a player: gc <player> <command>."),
+    server_command("giveOther", "jaPRO: Cheat: give items to another player."),
+    server_command("haste", "jaPRO: Toggle haste."),
+    server_command("hide", "jaPRO: Toggle hiding yourself (spectators and racers)."),
+    server_command("ignore", "jaPRO: Ignore a player's chat: ignore <player>."),
+    server_command("jetpack", "jaPRO: Toggle the jetpack."),
+    server_command("jump", "jaPRO: Change your jump level: jump <1-3>."),
+    server_command("killOther", "jaPRO: Cheat: kill another player."),
+    server_command("launch", "jaPRO: Launch yourself (race practice)."),
+    server_command("login", "jaPRO: Log in to your account: login <name> <password>."),
+    server_command("logout", "jaPRO: Log out of your account."),
+    server_command("mapEnts", "jaPRO: Cheat: list or spawn map entities."),
+    server_command("master", "jaPRO: Add a clan master."),
+    server_command("masterList", "jaPRO: List the clan masters."),
+    server_command("modversion", "jaPRO: Show the server mod version."),
+    server_command("move", "jaPRO: Choose your movement style: move <jka|qw|cpm|q3|pjk|wsw|rjq3|rjcpm|swoop|jetpack|sp|...>."),
+    server_command("nearby", "jaPRO: List nearby players and their distance."),
+    server_command("nudge", "jaPRO: Cheat: nudge your position."),
+    server_command("pack", "jaPRO: Tribes: choose your pack."),
+    server_command("practice", "jaPRO: Toggle practice mode in race mode."),
+    server_command("printStats", "jaPRO: Print your account and race statistics."),
+    server_command("race", "jaPRO: Toggle race mode."),
+    server_command("rCompare", "jaPRO: Race: compare your records with another player: rCompare <player>."),
+    server_command("register", "jaPRO: Register an account: register <name> <password>."),
+    server_command("rFind", "jaPRO: Race: find a course by name: rFind <text>."),
+    server_command("rHardest", "jaPRO: Race: list the hardest courses."),
+    server_command("rLatest", "jaPRO: Race: list the latest records."),
+    server_command("rocketChange", "jaPRO: Toggle backwards rocket launching."),
+    server_command("rPopular", "jaPRO: Race: list the most popular courses."),
+    server_command("rRank", "jaPRO: Race: show your race rank."),
+    server_command("rTop", "jaPRO: Race: show the top times for this course."),
+    server_command("rWarp", "jaPRO: Race: warp to a course: rWarp <course>."),
+    server_command("rWorst", "jaPRO: Race: list the courses you have not beaten."),
+    server_command("saber", "jaPRO: Change your saber style: saber <name>."),
+    server_command("say_team_mod", "jaPRO: Team message visible to moderators."),
+    server_command("score", "jaPRO: Show the scoreboard text."),
+    server_command("serverConfig", "jaPRO: Show the server's configuration."),
+    server_command("showNet", "jaPRO: Show network information for a player."),
+    server_command("spot", "jaPRO: Save your current position as a spot."),
+    server_command("thedestroyer", "jaPRO: Cheat: summon the destroyer."),
+    server_command("throwNade", "jaPRO: Throw a grenade."),
+    server_command("top", "jaPRO: Show the duel ranking table."),
+    server_command("trace", "jaPRO: Trace what you are looking at."),
+    server_command("warp", "jaPRO: Warp to a saved course spot: warp <name>."),
+    server_command("warpList", "jaPRO: List the available warps."),
+    server_command("whois", "jaPRO: Look up a player's account and aliases: whois <player>."),
+    server_command("ysal", "jaPRO: Toggle the ysalamiri effect."),
+];
+
+static JAPRO_SERVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the console whether the current server is jaPRO (enables its commands).
+pub fn set_japro_server(active: bool) {
+    JAPRO_SERVER.store(active, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether `name` is a vanilla server game command (forwarded while connected).
 pub fn is_server_command(name: &str) -> bool {
@@ -995,9 +1360,16 @@ pub fn is_server_command(name: &str) -> bool {
 /// shares a name with a local command is listed once (the local entry).
 fn registry(connected: bool) -> impl Iterator<Item = &'static Entry> {
     let server: &'static [Entry] = if connected { SERVER_COMMANDS } else { &[] };
-    ENTRIES.iter().chain(server.iter().filter(|entry| {
-        !ENTRIES.iter().any(|local| local.name.eq_ignore_ascii_case(entry.name))
-    }))
+    let japro: &'static [Entry] =
+        if connected && JAPRO_SERVER.load(std::sync::atomic::Ordering::Relaxed) { JAPRO_COMMANDS } else { &[] };
+    ENTRIES
+        .iter()
+        .chain(server.iter().filter(|entry| {
+            !ENTRIES.iter().any(|local| local.name.eq_ignore_ascii_case(entry.name))
+        }))
+        .chain(japro.iter().filter(|entry| {
+            !ENTRIES.iter().chain(SERVER_COMMANDS).any(|known| known.name.eq_ignore_ascii_case(entry.name))
+        }))
 }
 
 /// Local commands and cvars only (used for cvar get/set).
@@ -1164,9 +1536,48 @@ pub fn common_prefix(prefix_text: &str, connected: bool) -> Option<String> {
     Some(first[..common_len].to_owned())
 }
 
+/// Result of completing a word against the connected players' names.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlayerNameCompletion {
+    None,
+    /// The full name with its colour codes, as in the player's `n` userinfo.
+    One(String),
+    Many(Vec<String>),
+}
+
+/// JAPP `CG_ChatboxTabComplete`: `word` is matched as a substring of every
+/// name, both with colour codes stripped and lowercased.
+pub fn complete_player_name(word: &str, names: &[String]) -> PlayerNameCompletion {
+    let needle = crate::logging::strip_jka_colors(word).to_lowercase();
+    if needle.is_empty() {
+        return PlayerNameCompletion::None;
+    }
+    let mut hits: Vec<String> = names
+        .iter()
+        .filter(|name| crate::logging::strip_jka_colors(name).to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+    match hits.len() {
+        0 => PlayerNameCompletion::None,
+        1 => PlayerNameCompletion::One(hits.remove(0)),
+        _ => PlayerNameCompletion::Many(hits),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_names_match_anywhere_ignoring_colour_and_case() {
+        let names = vec!["^1Red^7Jawa".to_owned(), "Padawan".to_owned(), "".to_owned()];
+        assert_eq!(complete_player_name("^2jaw", &names), PlayerNameCompletion::One("^1Red^7Jawa".to_owned()));
+        assert_eq!(complete_player_name("zzz", &names), PlayerNameCompletion::None);
+        assert_eq!(complete_player_name("", &names), PlayerNameCompletion::None);
+        assert_eq!(complete_player_name("^7", &names), PlayerNameCompletion::None);
+        // "a" is in both "RedJawa" and "Padawan".
+        assert!(matches!(complete_player_name("A", &names), PlayerNameCompletion::Many(hits) if hits.len() == 2));
+    }
 
     #[test]
     fn server_commands_complete_only_while_connected() {
@@ -1179,7 +1590,25 @@ mod tests {
         // Local commands keep priority and are not listed twice.
         assert_eq!(prefix("say", true).filter(|entry| entry.name == "say").count(), 1);
         let names: Vec<_> = prefix("follow", true).map(|entry| entry.name).collect();
-        assert_eq!(names, ["follow", "follownext", "followprev"]);
+        assert_eq!(
+            names,
+            ["followFastest", "followRedFlag", "followBlueFlag", "follow", "follownext", "followprev"]
+        );
+    }
+
+    #[test]
+    fn japro_commands_complete_only_on_japro_servers() {
+        set_japro_server(false);
+        assert!(find_command("whois", true).is_none());
+        set_japro_server(true);
+        assert_eq!(find_command("whois", true).map(|entry| entry.kind), Some(EntryKind::ServerCommand));
+        assert!(find_command("whois", false).is_none(), "not connected: nothing server-side completes");
+        assert_eq!(unique_prefix("whoi", true).map(|entry| entry.name), Some("whois"));
+        // Vanilla names are listed once even though jaPRO has them too.
+        assert_eq!(prefix("callvote", true).count(), 1);
+        assert_eq!(prefix("amtele", true).count(), 2, "amTele and amTeleMark");
+        set_japro_server(false);
+        assert!(find_command("whois", true).is_none());
     }
 
     #[test]
@@ -1212,13 +1641,13 @@ mod tests {
         for name in [
             "addbot", "callteamvote", "callvote", "duelteam", "follow", "follownext", "followprev",
             "forcechanged", "give", "god", "kill", "levelshot", "loaddefered", "noclip", "notarget",
-            "NPC", "say", "say_team", "setviewpos", "siegeclass", "stats", "team", "teamtask",
+            "NPC", "say", "say_team", "setviewpos", "siegeclass", "stats", "t_use", "team", "teamtask",
             "teamvote", "tell", "voice_cmd", "vote", "where", "zoom",
         ] {
             assert!(is_server_command(name), "{name}");
         }
         assert!(is_server_command("vgs_cmd"));
-        assert_eq!(SERVER_COMMANDS.len(), 35);
+        assert_eq!(SERVER_COMMANDS.len(), 36);
     }
 
     #[test]

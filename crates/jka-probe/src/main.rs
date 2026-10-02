@@ -164,7 +164,7 @@ fn live_connect(target: &str, seconds: u64, commands: &[String]) -> Result<(), B
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as i32;
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos();
-    let userinfo = br"\name\DinurdoProbe\rate\25000\snaps\40\model\kyle/default\forcepowers\7-1-032330000000001333\color1\4\color2\4\handicap\100\sex\male\cg_predictItems\1\saber1\single_1\saber2\none\char_color_red\255\char_color_green\255\char_color_blue\255\teamtask\0";
+    let userinfo = br"\name\DinurdoProbe\rate\25000\snaps\40\model\kyle/default\forcepowers\7-1-032330000000001333\color1\4\color2\4\handicap\100\sex\male\cg_predictItems\1\saber1\single_1\saber2\none\char_color_red\255\char_color_green\255\char_color_blue\255";
     let mut session = ClientSession::connect(server, userinfo.to_vec(), (seed & 0xffff) as u16, (seed >> 1) as i32 & 0x7fff_ffff, now());
     let mut buffer = [0u8; 65536];
     let (mut snapshots, mut sent_commands, mut active_at) = (0u64, false, None::<i32>);
