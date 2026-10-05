@@ -23,14 +23,23 @@ static uint32_t previous_legacy_fixes;
 static int legacy_fixes_initialized;
 static uint64_t next_entities_revision = 1;
 void japro_configure(const jka_predict_settings *settings) {
-    cgs.serverMod = SVMOD_JAPRO;
+    /* Server identity and native implementation are deliberately separate.
+     * TaystJK uses this same BG/Pmove for Base, JA+ and jaPRO; the cgs values
+     * select the exact compatibility branches inside the shared code. */
+    switch (settings->server_mod) {
+    case 1: cgs.serverMod = SVMOD_JAPRO; break;
+    case 2: cgs.serverMod = SVMOD_JAPLUS; break;
+    default: cgs.serverMod = SVMOD_BASEJKA; break;
+    }
     cgs.gametype = settings->gametype;
-    cgs.jcinfo = cgs.cinfo = settings->jcinfo;
+    cgs.cinfo = settings->cinfo;
+    cgs.jcinfo = settings->jcinfo;
     cgs.jcinfo2 = settings->jcinfo2;
     cgs.taystJKinfo = settings->taystjk_info;
     cgs.dmflags = settings->dmflags;
     cgs.hookpull = settings->hook_pull;
     cgs.restricts = settings->restricts;
+    cgs.baseGame = settings->base_game ? qtrue : qfalse;
     cgs.legacyProtocol = qfalse;
     cp_pluginDisable.integer = settings->plugin_disable;
     pmove_fixed.integer = settings->pmove_fixed;
@@ -1063,13 +1072,14 @@ int jka_bg_g2_player_angles(const jka_player_angle_entity *input, int time,
 int jka_item_count(void) { return bg_numItems; }
 
 int jka_item_info(int index, const char **classname, const char **world_model,
-                  const char **world_model2, int *type, int *tag, int *quantity) {
+                  const char **world_model2, const char **view_model, int *type, int *tag, int *quantity) {
     const gitem_t *item;
     if (index < 0 || index >= bg_numItems) return 0;
     item = &bg_itemlist[index];
     *classname = item->classname ? item->classname : "";
     *world_model = item->world_model[0] ? item->world_model[0] : "";
     *world_model2 = item->world_model[1] ? item->world_model[1] : "";
+    *view_model = item->view_model ? item->view_model : "";
     *type = (int)item->giType;
     *tag = item->giTag;
     *quantity = item->quantity;

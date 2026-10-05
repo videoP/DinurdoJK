@@ -111,6 +111,18 @@ struct Primitive {
 pub enum FxDraw {
     /// RT_SPRITE: view-facing quad of half-extent `radius`.
     Sprite { origin: [f32; 3], radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    /// RT_SABER_GLOW: JKA's renderer-side chain of view-facing glow sprites.
+    /// Keeping this as one primitive preserves the stock split between CGame's
+    /// blade flicker and RB_SurfaceSaberGlow's own hilt pulse/randomness.
+    SaberGlow {
+        origin: [f32; 3],
+        direction: [f32; 3],
+        length: f32,
+        radius: f32,
+        hilt_radius: f32,
+        rgba: [u8; 4],
+        shader: String,
+    },
     /// RT_ORIENTED_QUAD: quad in axis[1]/axis[2] of half-extent `radius`.
     OrientedQuad { origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.

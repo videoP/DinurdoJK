@@ -306,7 +306,8 @@ impl App {
 
     /// egui owns every menu overlay, not just the Video page.
     pub(super) fn egui_menu_active(&self) -> bool {
-        let blocking_download_ui = self.missing_map_prompt.is_some()
+        let blocking_download_ui = self.server_password_prompt.is_some()
+            || self.missing_map_prompt.is_some()
             || self.demo_missing_map_prompt.is_some()
             || self.live_download.is_some()
             || self.live_join_ui.is_some();
@@ -315,7 +316,7 @@ impl App {
             && self.overlay == OverlayMode::Console;
         (blocking_download_ui
             || asset_viewer_behind_console
-            || matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit | OverlayMode::EntityGraph | OverlayMode::Trace))
+            || matches!(self.overlay, OverlayMode::Game | OverlayMode::Video | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit | OverlayMode::EntityGraph | OverlayMode::Trace | OverlayMode::StrafeTrails | OverlayMode::RaceGhosts))
             && self.video_confirmation.is_none()
             && (blocking_download_ui || self.loading.is_none())
             && !self.video.skip_ui
@@ -398,6 +399,26 @@ impl App {
             return false;
         }
 
+        // Ctrl+C in the Trace popup is an application shortcut: it exports the
+        // complete selected diagnostic record, not just selectable egui text.
+        // Keep it out of egui so its generic copy handling cannot swallow (or
+        // later overwrite) the clipboard payload before `window_event` handles it.
+        if self.overlay == OverlayMode::Trace
+            && self.modifiers.control_key()
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyC),
+                        ..
+                    },
+                    ..
+                }
+            )
+        {
+            return false;
+        }
+
         let response = state.on_window_event(window, event);
         self.egui_repaint_requested |= response.repaint;
 
@@ -450,7 +471,8 @@ impl App {
                 return true;
             };
             if code == KeyCode::Escape
-                && (self.missing_map_prompt.is_some()
+                && (self.server_password_prompt.is_some()
+                    || self.missing_map_prompt.is_some()
                     || self.demo_missing_map_prompt.is_some()
                     || self.live_download.is_some()
                     || self.live_join_ui.is_some())
@@ -579,6 +601,60 @@ impl App {
             Some(ApplyVideoPath::LiveDisplay) => self.apply_display_live(true),
             Some(ApplyVideoPath::ReprepareMap) => self.reprepare_map_in_place(),
             _ => {}
+        }
+    }
+
+    fn egui_server_password_dialog(&mut self, root: &mut egui::Ui) {
+        let Some(prompt) = self.server_password_prompt.clone() else { return };
+        #[derive(Clone, Copy)]
+        enum Choice { Connect, Cancel }
+        let mut choice = None;
+        egui::Area::new(egui::Id::new("server_password_prompt"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.set_width(460.0);
+                        theme::page_title(ui, "SERVER PASSWORD", "Enter the password to connect.");
+                        ui.add_space(8.0);
+                        theme::label(ui, theme::plain(&prompt.target, 11.5, theme::TEXT_DIM));
+                        if let Some(message) = prompt.message.as_deref() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(message).color(theme::WARNING));
+                        }
+                        ui.add_space(14.0);
+                        let response = ui.add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::TextEdit::singleline(&mut self.network.password)
+                                .password(true)
+                                .hint_text("server password")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            choice = Some(Choice::Connect);
+                        }
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if theme::primary_button(ui, "CONNECT").clicked() {
+                                choice = Some(Choice::Connect);
+                            }
+                            ui.add_space(8.0);
+                            if theme::ghost_button(ui, "CANCEL").clicked() {
+                                choice = Some(Choice::Cancel);
+                            }
+                        });
+                    });
+            });
+        match choice {
+            Some(Choice::Connect) => self.submit_server_password_prompt(),
+            Some(Choice::Cancel) => self.cancel_server_password_prompt(),
+            None => {}
         }
     }
 
@@ -875,6 +951,10 @@ impl App {
             // Only the label painter wanted this frame; no menu to open.
             return;
         }
+        if self.server_password_prompt.is_some() {
+            self.egui_server_password_dialog(ui);
+            return;
+        }
         if self.missing_map_prompt.is_some() {
             self.egui_missing_map_dialog(ui);
             return;
@@ -913,6 +993,14 @@ impl App {
         }
         if self.overlay == OverlayMode::Trace {
             self.egui_trace_menu(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::StrafeTrails {
+            self.egui_strafe_trails(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::RaceGhosts {
+            self.egui_race_ghosts(ui);
             return;
         }
         if self.front_end {
@@ -1048,13 +1136,138 @@ impl App {
                 egui::Id::new(("hud_edit_item", id)),
                 egui::Sense::click_and_drag(),
             );
-            if response.clicked() || response.drag_started() {
+            let mut chat_resize_active = false;
+            if id == HudElementId::Chat && self.hud_edit_selected == Some(id) {
+                // Resize the chat bounds directly from its four corners. The bounds
+                // control wrapping/capacity; glyph size remains owned by HUD Scale.
+                let handle_size = 14.0_f32;
+                let handles = [
+                    ("nw", rect.left_top(), true, true, egui::CursorIcon::ResizeNwSe),
+                    ("ne", rect.right_top(), false, true, egui::CursorIcon::ResizeNeSw),
+                    ("sw", rect.left_bottom(), true, false, egui::CursorIcon::ResizeNeSw),
+                    ("se", rect.right_bottom(), false, false, egui::CursorIcon::ResizeNwSe),
+                ];
+                for (corner, position, move_left, move_top, cursor) in handles {
+                    let handle_rect = egui::Rect::from_center_size(
+                        position,
+                        egui::vec2(handle_size, handle_size),
+                    );
+                    let handle = root
+                        .interact(
+                            handle_rect,
+                            egui::Id::new(("hud_edit_chat_resize", corner)),
+                            egui::Sense::drag(),
+                        )
+                        .on_hover_cursor(cursor);
+
+                    // Visible diagonal resize grip on the element corner itself.
+                    // The OS cursor also switches to NW/SE or NE/SW resize arrows.
+                    let inward_x = if move_left { 1.0 } else { -1.0 };
+                    let inward_y = if move_top { 1.0 } else { -1.0 };
+                    for inset in [2.0_f32, 4.5, 7.0] {
+                        painter.line_segment(
+                            [
+                                position + egui::vec2(inward_x * inset, inward_y * 9.0),
+                                position + egui::vec2(inward_x * 9.0, inward_y * inset),
+                            ],
+                            egui::Stroke::new(1.5_f32, theme::ACCENT),
+                        );
+                    }
+
+                    if handle.drag_started() {
+                        self.hud_edit_drag_origin = None;
+                        self.hud_edit_drag_delta = [0.0, 0.0];
+                        self.egui_repaint_requested = true;
+                    }
+                    if handle.dragged() {
+                        chat_resize_active = true;
+                        let pointer_delta = root.input(|input| input.pointer.delta())
+                            * pixels_per_point;
+                        let mut left = hud_rect.x;
+                        let mut top = hud_rect.y;
+                        let mut right = hud_rect.x + hud_rect.width;
+                        let mut bottom = hud_rect.y + hud_rect.height;
+                        if move_left {
+                            left += pointer_delta.x;
+                        } else {
+                            right += pointer_delta.x;
+                        }
+                        if move_top {
+                            top += pointer_delta.y;
+                        } else {
+                            bottom += pointer_delta.y;
+                        }
+
+                        let alt_bypass = root.input(|input| input.modifiers.alt);
+                        if self.hud_layout.snap_to_grid && !alt_bypass {
+                            let grid = self.hud_layout.grid_size.clamp(1.0, 64.0);
+                            if move_left {
+                                left = (left / grid).round() * grid;
+                            } else {
+                                right = (right / grid).round() * grid;
+                            }
+                            if move_top {
+                                top = (top / grid).round() * grid;
+                            } else {
+                                bottom = (bottom / grid).round() * grid;
+                            }
+                        }
+
+                        let mut base_layout = layout;
+                        base_layout.offset = [0.0, 0.0];
+                        base_layout.extent = [1.0, 1.0];
+                        let base = ui::hud_element_rect(
+                            HudElementId::Chat,
+                            base_layout,
+                            &rect_ctx,
+                            size.width,
+                            size.height,
+                        );
+                        let screen_w = size.width as f32;
+                        let screen_h = size.height as f32;
+                        let min_w = (base.width * 0.25).min(screen_w);
+                        let min_h = (base.height * 0.25).min(screen_h);
+                        let max_w = (base.width * 4.0).min(screen_w).max(min_w);
+                        let max_h = (base.height * 8.0).min(screen_h).max(min_h);
+                        if move_left {
+                            left = left.clamp((right - max_w).max(0.0), right - min_w);
+                        } else {
+                            right = right.clamp(left + min_w, (left + max_w).min(screen_w));
+                        }
+                        if move_top {
+                            top = top.clamp((bottom - max_h).max(0.0), bottom - min_h);
+                        } else {
+                            bottom = bottom.clamp(top + min_h, (top + max_h).min(screen_h));
+                        }
+
+                        let next_extent = [
+                            ((right - left) / base.width.max(1.0)).clamp(0.25, 4.0),
+                            ((bottom - top) / base.height.max(1.0)).clamp(0.25, 8.0),
+                        ];
+                        let next_offset = [
+                            left - base.x,
+                            bottom - (base.y + base.height),
+                        ];
+                        let target = self.hud_layout.element_mut(HudElementId::Chat);
+                        if target.extent != next_extent || target.offset != next_offset {
+                            target.extent = next_extent;
+                            target.offset = next_offset;
+                            layout_changed = true;
+                        }
+                    }
+                    if handle.drag_stopped() {
+                        drag_ended = true;
+                    }
+                }
+            }
+
+            if !chat_resize_active && (response.clicked() || response.drag_started()) {
                 self.hud_edit_selected = Some(id);
                 self.hud_edit_drag_origin = Some(layout.offset);
                 self.hud_edit_drag_delta = [0.0, 0.0];
                 self.egui_repaint_requested = true;
             }
-            if response.dragged() {
+            if !chat_resize_active && response.dragged() {
                 let origin = self.hud_edit_drag_origin.unwrap_or(layout.offset);
                 let delta = response.drag_delta() * pixels_per_point;
                 self.hud_edit_drag_delta[0] += delta.x;
@@ -1148,6 +1361,19 @@ impl App {
                 target.offset[1] += delta[1];
                 layout_changed = true;
             }
+
+            // HUD edit owns the gameplay surface, so the wheel is free to be a
+            // direct scale gesture. Keep it fine-grained; the toolbar slider is
+            // still available for exact values.
+            let scroll = root.input(|input| input.smooth_scroll_delta.y);
+            if scroll.abs() > f32::EPSILON {
+                let target = self.hud_layout.element_mut(selected);
+                let next = (target.scale + scroll * 0.0025).clamp(0.5, 2.0);
+                if (target.scale - next).abs() > f32::EPSILON {
+                    target.scale = next;
+                    layout_changed = true;
+                }
+            }
         }
 
         let mut close_editor = false;
@@ -1208,7 +1434,7 @@ impl App {
                             theme::label(
                                 ui,
                                 theme::plain(
-                                    "Drag panels. ALT temporarily bypasses snapping. Arrow keys nudge 1 px; SHIFT+arrow uses the grid step.",
+                                    "Drag panels. Mouse wheel scales the selected item. Drag the chat corner grips to resize its wrapping area. ALT bypasses snapping; arrows nudge 1 px; SHIFT+arrow uses the grid step.",
                                     10.5,
                                     theme::TEXT_FAINT,
                                 ),
@@ -1229,6 +1455,51 @@ impl App {
             let target = self.hud_layout.element_mut(selected);
             if (target.scale - scale).abs() > f32::EPSILON {
                 target.scale = scale;
+                layout_changed = true;
+            }
+            if selected == HudElementId::Chat {
+                // Scaling glyphs also scales the chat bounds. Keep the current resized
+                // extent physically recoverable on-screen; corner dragging is the only
+                // UI for changing width/height.
+                let mut unit = *target;
+                unit.offset = [0.0, 0.0];
+                unit.extent = [1.0, 1.0];
+                let base = ui::hud_element_rect(
+                    HudElementId::Chat,
+                    unit,
+                    &rect_ctx,
+                    size.width,
+                    size.height,
+                );
+                let max_x = (size.width as f32 / base.width.max(1.0)).clamp(0.25, 4.0);
+                let max_y = (size.height as f32 / base.height.max(1.0)).clamp(0.25, 8.0);
+                let extent = [target.extent[0].min(max_x), target.extent[1].min(max_y)];
+                if target.extent != extent {
+                    target.extent = extent;
+                    layout_changed = true;
+                }
+            }
+        }
+
+        // HUD editor invariant: the resizable chat rectangle remains on-screen.
+        // This also clamps a dragged box immediately instead of allowing it to
+        // disappear and relying on a later reset to recover it.
+        if self.hud_edit_selected == Some(HudElementId::Chat) {
+            let layout = self.hud_layout.chat;
+            let chat = ui::hud_element_rect(HudElementId::Chat, layout, &rect_ctx, size.width, size.height);
+            let mut correction = [0.0_f32, 0.0_f32];
+            if chat.x < 0.0 { correction[0] -= chat.x; }
+            if chat.x + chat.width > size.width as f32 {
+                correction[0] -= chat.x + chat.width - size.width as f32;
+            }
+            if chat.y < 0.0 { correction[1] -= chat.y; }
+            if chat.y + chat.height > size.height as f32 {
+                correction[1] -= chat.y + chat.height - size.height as f32;
+            }
+            if correction != [0.0, 0.0] {
+                self.hud_layout.chat.offset[0] += correction[0];
+                self.hud_layout.chat.offset[1] += correction[1];
+                layout_changed = true;
             }
         }
         if reset_selected {
@@ -1540,7 +1811,10 @@ impl App {
     /// than the renderer's no-world clear color. Once the cinematic is ready,
     /// the scrim eases away and the BSP appears to brighten from 0 -> 1.
     fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
-        if self.frontend_page == FrontendPage::AssetViewer {
+        if matches!(
+            self.frontend_page,
+            FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::Screenshots
+        ) {
             return;
         }
         let brightness = self
@@ -1586,9 +1860,12 @@ impl App {
                             FrontendPage::ServerBrowser => "SERVERS",
                             FrontendPage::SoloGame => "SOLO GAME",
                             FrontendPage::PlayDemo => "PLAY DEMO",
+                            FrontendPage::Profile => "PROFILE",
                             FrontendPage::Controls => "CONTROLS",
+                            FrontendPage::ChatLogs => "CHAT LOGS",
                             FrontendPage::DeveloperTools => "DEVELOPER TOOLS",
                             FrontendPage::AssetViewer => "ASSET VIEWER",
+                            FrontendPage::Screenshots => "SCREENSHOTS",
                             FrontendPage::MapViewer => "MAP VIEWER",
                         }
                     };
@@ -1632,10 +1909,15 @@ impl App {
                     let hint = match self.frontend_page {
                         FrontendPage::Main => "Select an option.  ` opens the console.",
                         FrontendPage::Play => "ESC returns to the main menu.",
-                        FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => "ESC returns to Play.",
-                        FrontendPage::Controls => "ESC returns to the main menu.",
+                        FrontendPage::ServerBrowser
+                        | FrontendPage::SoloGame
+                        | FrontendPage::PlayDemo => "ESC returns to Play.",
+                        FrontendPage::Profile | FrontendPage::Controls | FrontendPage::ChatLogs => {
+                            "ESC returns to the main menu."
+                        },
                         FrontendPage::DeveloperTools => "ESC returns to the main menu.",
                         FrontendPage::AssetViewer | FrontendPage::MapViewer => "ESC returns to Developer Tools.",
+                        FrontendPage::Screenshots => "ESC returns to the main menu.",
                     };
                     theme::label(ui, theme::plain(hint, 11.5, theme::TEXT_FAINT));
                 });
@@ -1655,7 +1937,14 @@ impl App {
                     FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo
                 ) {
                     1120.0
-                } else if matches!(self.frontend_page, FrontendPage::AssetViewer | FrontendPage::MapViewer) {
+                } else if matches!(
+                    self.frontend_page,
+                    FrontendPage::Profile
+                        | FrontendPage::ChatLogs
+                        | FrontendPage::AssetViewer
+                        | FrontendPage::Screenshots
+                        | FrontendPage::MapViewer
+                ) {
                     ui.available_width()
                 } else {
                     CONTENT_MAX_W
@@ -1673,13 +1962,24 @@ impl App {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
-                        egui::Frame::new()
-                            .fill(if self.frontend_page == FrontendPage::AssetViewer {
-                                egui::Color32::TRANSPARENT
-                            } else {
-                                theme::PANEL_FILL
-                            })
-                            .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        let frame = if self.frontend_page == FrontendPage::Profile {
+                            // Match the in-game Profile layout: the right half is a
+                            // renderer-owned 3D viewport, while the controls pane
+                            // paints its own opaque surface.
+                            egui::Frame::new().fill(egui::Color32::TRANSPARENT)
+                        } else {
+                            egui::Frame::new()
+                                .fill(if matches!(
+                                    self.frontend_page,
+                                    FrontendPage::AssetViewer | FrontendPage::Screenshots
+                                ) {
+                                    egui::Color32::TRANSPARENT
+                                } else {
+                                    theme::PANEL_FILL
+                                })
+                                .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        };
+                        frame
                             .inner_margin(egui::Margin::symmetric(GUTTER as i8, 18))
                             .show(ui, |ui| {
                                 ui.set_width(content_w - GUTTER * 2.0);
@@ -1698,9 +1998,12 @@ impl App {
             FrontendPage::ServerBrowser => self.egui_server_browser_page(ui),
             FrontendPage::SoloGame => self.egui_solo_game_page(ui),
             FrontendPage::PlayDemo => self.egui_play_demo_page(ui),
+            FrontendPage::Profile => self.egui_profile_page(ui),
             FrontendPage::Controls => self.egui_controls_page(ui),
+            FrontendPage::ChatLogs => self.egui_chat_log_browser_page(ui),
             FrontendPage::DeveloperTools => self.egui_developer_tools_page(ui),
             FrontendPage::AssetViewer => self.egui_asset_viewer_page(ui),
+            FrontendPage::Screenshots => self.egui_screenshot_browser_page(ui),
             FrontendPage::MapViewer => self.egui_map_viewer_page(ui),
         }
     }
@@ -1713,6 +2016,17 @@ impl App {
             self.egui_repaint_requested = true;
             return;
         }
+        if menu_action(
+            ui,
+            "Profile",
+            "Player identity, model, Force loadout, saber, and cosmetics.",
+            true,
+        ) {
+            self.frontend_page = FrontendPage::Profile;
+            self.profile_preview_key = None;
+            self.set_overlay(OverlayMode::Game);
+            return;
+        }
         if menu_action(ui, "Controls", "Keyboard and mouse bindings.", true) {
             self.frontend_page = FrontendPage::Controls;
             self.controls_waiting_for_key = false;
@@ -1722,6 +2036,27 @@ impl App {
         if menu_action(ui, "Settings", "Use the same Setup pages available in game.", true) {
             self.setup_selected = SETUP_TAB_VIDEO;
             self.set_overlay(OverlayMode::Video);
+            return;
+        }
+        if menu_action(
+            ui,
+            "Chat Logs",
+            "Browse saved server chat by mod, server, date, message type, or text.",
+            true,
+        ) {
+            self.frontend_page = FrontendPage::ChatLogs;
+            self.egui_repaint_requested = true;
+            return;
+        }
+        if menu_action(
+            ui,
+            "Screenshots",
+            "Browse screenshots from base and every mod, inspect capture metadata, or return to a saved spot.",
+            true,
+        ) {
+            self.frontend_page = FrontendPage::Screenshots;
+            self.screenshot_catalog_loaded = false;
+            self.egui_repaint_requested = true;
             return;
         }
         if menu_action(ui, "Developer Tools", "Browse and inspect game assets and source maps.", true) {
@@ -1782,6 +2117,543 @@ impl App {
         }
     }
 
+    fn egui_chat_log_browser_page(&mut self, ui: &mut egui::Ui) {
+        self.ensure_chat_log_browser_catalog();
+
+        if self.ui_catalog.pending.chat_logs && self.chat_log_browser_entries.is_empty() {
+            theme::page_title(ui, "CHAT LOGS", "Browse saved live-server chat sessions.");
+            theme::label(ui, theme::plain("Scanning chat logs...", 12.0, theme::TEXT_FAINT));
+            return;
+        }
+        if let Some(error) = &self.chat_log_browser_catalog_error {
+            theme::page_title(ui, "CHAT LOGS", "Browse saved live-server chat sessions.");
+            theme::banner(ui, &format!("Chat log scan failed: {error}"), theme::WARNING);
+            if theme::ghost_button(ui, "RETRY").clicked() {
+                self.refresh_chat_log_browser_catalog();
+            }
+            return;
+        }
+
+        let mut mods = self
+            .chat_log_browser_entries
+            .iter()
+            .map(|entry| entry.mod_name.clone())
+            .collect::<Vec<_>>();
+        mods.sort_by_key(|value| value.to_ascii_lowercase());
+        mods.dedup_by(|a, b| a.as_str().eq_ignore_ascii_case(b.as_str()));
+
+        let mut server_map = BTreeMap::<String, String>::new();
+        for entry in self.chat_log_browser_entries.iter().filter(|entry| {
+            self.chat_log_browser_mod_filter.is_empty()
+                || entry.mod_name.eq_ignore_ascii_case(&self.chat_log_browser_mod_filter)
+        }) {
+            server_map
+                .entry(entry.server_key().to_owned())
+                .or_insert_with(|| entry.server_label());
+        }
+        if !self.chat_log_browser_server_filter.is_empty()
+            && !server_map.contains_key(&self.chat_log_browser_server_filter)
+        {
+            self.chat_log_browser_server_filter.clear();
+        }
+        let mut servers = server_map.into_iter().collect::<Vec<_>>();
+        servers.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()));
+
+        let search_terms = self
+            .chat_log_browser_search
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .collect::<Vec<_>>();
+        let now_ms = crate::chat_log::unix_ms_now();
+        let relative_cutoff = match self.chat_log_browser_range {
+            ChatLogRangeFilter::Hours24 => Some(now_ms.saturating_sub(24 * 60 * 60 * 1000)),
+            ChatLogRangeFilter::Days7 => Some(now_ms.saturating_sub(7 * 24 * 60 * 60 * 1000)),
+            ChatLogRangeFilter::Days30 => Some(now_ms.saturating_sub(30 * 24 * 60 * 60 * 1000)),
+            ChatLogRangeFilter::All | ChatLogRangeFilter::Custom => None,
+        };
+        let custom_from = self.chat_log_browser_date_from.trim();
+        let custom_to = self.chat_log_browser_date_to.trim();
+
+        let filtered = self
+            .chat_log_browser_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                self.chat_log_browser_mod_filter.is_empty()
+                    || entry.mod_name.eq_ignore_ascii_case(&self.chat_log_browser_mod_filter)
+            })
+            .filter(|(_, entry)| {
+                self.chat_log_browser_server_filter.is_empty()
+                    || entry.server_key() == self.chat_log_browser_server_filter.as_str()
+            })
+            .filter(|(_, entry)| {
+                if let Some(cutoff) = relative_cutoff {
+                    return entry.ended_unix_ms >= cutoff;
+                }
+                if self.chat_log_browser_range != ChatLogRangeFilter::Custom {
+                    return true;
+                }
+                // ISO local dates sort lexicographically. Treat a session as in
+                // range when any part of it overlaps the requested date span.
+                let after_start = custom_from.is_empty() || entry.ended_date.as_str() >= custom_from;
+                let before_end = custom_to.is_empty() || entry.started_date.as_str() <= custom_to;
+                after_start && before_end
+            })
+            .filter(|(_, entry)| {
+                search_terms
+                    .iter()
+                    .all(|term| entry.search_text.contains(term))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        if self.chat_log_browser_selected.as_ref().is_some_and(|selected| {
+            !filtered
+                .iter()
+                .any(|&index| self.chat_log_browser_entries[index].path == *selected)
+        }) {
+            self.chat_log_browser_selected = None;
+            self.chat_log_browser_detail_path = None;
+            self.chat_log_browser_detail = None;
+        }
+
+        let body_height = ui.available_height().max(360.0);
+        let total_width = ui.available_width().max(1.0);
+        let gap = 10.0_f32;
+        let browser_width = (total_width * 0.31).clamp(320.0, 430.0).min(total_width * 0.42);
+        let detail_width = (total_width - browser_width - gap).max(1.0);
+        let mut refresh_requested = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(browser_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::RAIL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(10, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (browser_width - 20.0).max(1.0),
+                                (body_height - 20.0).max(1.0),
+                            ));
+
+                            ui.horizontal(|ui| {
+                                theme::label(ui, theme::plain("SESSIONS", 11.0, theme::TEXT_DIM));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    refresh_requested |= refresh_icon(ui, "Rescan chat log folders");
+                                    if theme::ghost_button(ui, "CLEAR").clicked() {
+                                        self.chat_log_browser_mod_filter.clear();
+                                        self.chat_log_browser_server_filter.clear();
+                                        self.chat_log_browser_search.clear();
+                                        self.chat_log_browser_range = ChatLogRangeFilter::All;
+                                        self.chat_log_browser_date_from.clear();
+                                        self.chat_log_browser_date_to.clear();
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("chat_log_mod_filter")
+                                    .selected_text(if self.chat_log_browser_mod_filter.is_empty() {
+                                        "All mods"
+                                    } else {
+                                        self.chat_log_browser_mod_filter.as_str()
+                                    })
+                                    .width((ui.available_width() * 0.43).max(100.0))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.chat_log_browser_mod_filter,
+                                            String::new(),
+                                            "All mods",
+                                        );
+                                        for mod_name in &mods {
+                                            ui.selectable_value(
+                                                &mut self.chat_log_browser_mod_filter,
+                                                mod_name.clone(),
+                                                mod_name,
+                                            );
+                                        }
+                                    });
+                                egui::ComboBox::from_id_salt("chat_log_range_filter")
+                                    .selected_text(self.chat_log_browser_range.label())
+                                    .width(ui.available_width().max(110.0))
+                                    .show_ui(ui, |ui| {
+                                        for range in [
+                                            ChatLogRangeFilter::All,
+                                            ChatLogRangeFilter::Hours24,
+                                            ChatLogRangeFilter::Days7,
+                                            ChatLogRangeFilter::Days30,
+                                            ChatLogRangeFilter::Custom,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.chat_log_browser_range,
+                                                range,
+                                                range.label(),
+                                            );
+                                        }
+                                    });
+                            });
+
+                            egui::ComboBox::from_id_salt("chat_log_server_filter")
+                                .selected_text(
+                                    servers
+                                        .iter()
+                                        .find(|(key, _)| *key == self.chat_log_browser_server_filter)
+                                        .map(|(_, label)| label.as_str())
+                                        .unwrap_or("All servers"),
+                                )
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.chat_log_browser_server_filter,
+                                        String::new(),
+                                        "All servers",
+                                    );
+                                    for (key, label) in &servers {
+                                        ui.selectable_value(
+                                            &mut self.chat_log_browser_server_filter,
+                                            key.clone(),
+                                            label,
+                                        );
+                                    }
+                                });
+
+                            if self.chat_log_browser_range == ChatLogRangeFilter::Custom {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [(ui.available_width() - 8.0) * 0.5, 24.0],
+                                        egui::TextEdit::singleline(&mut self.chat_log_browser_date_from)
+                                            .hint_text("From YYYY-MM-DD"),
+                                    );
+                                    ui.add_sized(
+                                        [ui.available_width(), 24.0],
+                                        egui::TextEdit::singleline(&mut self.chat_log_browser_date_to)
+                                            .hint_text("To YYYY-MM-DD"),
+                                    );
+                                });
+                            }
+
+                            ui.add_sized(
+                                [ui.available_width(), 26.0],
+                                egui::TextEdit::singleline(&mut self.chat_log_browser_search)
+                                    .hint_text("Search all chat messages..."),
+                            );
+
+                            ui.horizontal(|ui| {
+                                theme::label(
+                                    ui,
+                                    theme::plain(
+                                        &format!("{} / {} sessions", filtered.len(), self.chat_log_browser_entries.len()),
+                                        9.5,
+                                        theme::TEXT_FAINT,
+                                    ),
+                                );
+                                if self.ui_catalog.pending.chat_logs {
+                                    ui.spinner();
+                                }
+                            });
+                            ui.separator();
+
+                            let list_height = ui.available_height().max(1.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("chat_log_session_list")
+                                .auto_shrink([false, false])
+                                .max_height(list_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    if filtered.is_empty() {
+                                        ui.add_space(8.0);
+                                        theme::label(
+                                            ui,
+                                            theme::plain("No chat sessions match these filters.", 11.0, theme::TEXT_FAINT),
+                                        );
+                                    }
+                                    for &index in &filtered {
+                                        let entry = self.chat_log_browser_entries[index].clone();
+                                        let selected = self.chat_log_browser_selected.as_ref() == Some(&entry.path);
+                                        let row_height = 58.0;
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), row_height),
+                                            egui::Sense::click(),
+                                        );
+                                        let painter = ui.painter().with_clip_rect(rect);
+                                        if selected {
+                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL_SELECTED);
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
+                                                egui::CornerRadius::ZERO,
+                                                theme::ACCENT,
+                                            );
+                                        } else if response.hovered() {
+                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL);
+                                        }
+
+                                        let inset = rect.shrink2(egui::vec2(8.0, 5.0));
+                                        let when = entry.started_label.get(..16).unwrap_or(entry.started_label.as_str());
+                                        painter.text(
+                                            inset.left_top(),
+                                            egui::Align2::LEFT_TOP,
+                                            when,
+                                            egui::FontId::monospace(9.5),
+                                            theme::TEXT_FAINT,
+                                        );
+                                        painter.text(
+                                            egui::pos2(inset.right(), inset.top()),
+                                            egui::Align2::RIGHT_TOP,
+                                            &entry.mod_name,
+                                            egui::FontId::monospace(9.0),
+                                            if selected { theme::ACCENT } else { theme::TEXT_FAINT },
+                                        );
+                                        let server = if entry.server.is_empty() { &entry.address } else { &entry.server };
+                                        painter.text(
+                                            egui::pos2(inset.left(), inset.top() + 17.0),
+                                            egui::Align2::LEFT_TOP,
+                                            server,
+                                            egui::FontId::proportional(12.0),
+                                            if selected { theme::TEXT } else { theme::TEXT_DIM },
+                                        );
+                                        let bottom = format!(
+                                            "{}{}{} msg{}{}",
+                                            if entry.initial_map.is_empty() { "" } else { entry.initial_map.as_str() },
+                                            if entry.initial_map.is_empty() { "" } else { "  ·  " },
+                                            entry.message_count,
+                                            if entry.message_count == 1 { "" } else { "s" },
+                                            if entry.cleanly_closed { "" } else { "  ·  incomplete" },
+                                        );
+                                        painter.text(
+                                            egui::pos2(inset.left(), inset.top() + 35.0),
+                                            egui::Align2::LEFT_TOP,
+                                            bottom,
+                                            egui::FontId::monospace(9.0),
+                                            theme::TEXT_FAINT,
+                                        );
+
+                                        let response = response.on_hover_text(entry.path.display().to_string());
+                                        if response.clicked() && !selected {
+                                            self.chat_log_browser_selected = Some(entry.path);
+                                            self.chat_log_browser_detail_path = None;
+                                            self.chat_log_browser_detail = None;
+                                            self.egui_repaint_requested = true;
+                                        }
+                                    }
+                                });
+                        });
+                },
+            );
+
+            self.ensure_chat_log_browser_detail();
+            let detail = self
+                .chat_log_browser_detail
+                .as_ref()
+                .and_then(|detail| detail.as_ref().ok())
+                .cloned();
+            let detail_error = self
+                .chat_log_browser_detail
+                .as_ref()
+                .and_then(|detail| detail.as_ref().err())
+                .cloned();
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(detail_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::PANEL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(14, 12))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (detail_width - 28.0).max(1.0),
+                                (body_height - 24.0).max(1.0),
+                            ));
+
+                            let Some(detail) = detail else {
+                                if self.ui_catalog.pending.chat_log_detail {
+                                    ui.spinner();
+                                    theme::label(ui, theme::plain("Loading transcript...", 11.0, theme::TEXT_FAINT));
+                                } else if let Some(error) = detail_error {
+                                    theme::banner(ui, &format!("Could not read chat log: {error}"), theme::WARNING);
+                                } else {
+                                    theme::page_title(ui, "CHAT LOGS", "Select a saved session to read its transcript.");
+                                    theme::label(
+                                        ui,
+                                        theme::plain(
+                                            "Search on the left scans message contents across every mod and server.",
+                                            11.0,
+                                            theme::TEXT_FAINT,
+                                        ),
+                                    );
+                                }
+                                return;
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    let title = if detail.server.is_empty() {
+                                        detail.address.as_str()
+                                    } else {
+                                        detail.server.as_str()
+                                    };
+                                    theme::label(ui, theme::plain(title, 17.0, theme::TEXT));
+                                    let mut subtitle = detail.started_label.clone();
+                                    if !detail.address.is_empty() {
+                                        subtitle.push_str("  ·  ");
+                                        subtitle.push_str(&detail.address);
+                                    }
+                                    theme::label(ui, theme::plain(&subtitle, 10.5, theme::TEXT_FAINT));
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let state = if detail.cleanly_closed { "CLOSED" } else { "INCOMPLETE" };
+                                    theme::label(
+                                        ui,
+                                        theme::plain(
+                                            state,
+                                            9.0,
+                                            if detail.cleanly_closed { theme::TEXT_FAINT } else { theme::WARNING },
+                                        ),
+                                    );
+                                });
+                            });
+                            ui.add_space(5.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for text in [
+                                    format!("Mod: {}", detail.mod_name),
+                                    format!("Player: {}", if detail.player.is_empty() { "—" } else { detail.player.as_str() }),
+                                    format!("Initial map: {}", if detail.initial_map.is_empty() { "—" } else { detail.initial_map.as_str() }),
+                                    format!("Duration: {}", chat_log_duration_label(detail.started_unix_ms, detail.ended_unix_ms)),
+                                ] {
+                                    egui::Frame::new()
+                                        .fill(theme::CONTROL)
+                                        .inner_margin(egui::Margin::symmetric(6, 3))
+                                        .show(ui, |ui| {
+                                            theme::label(ui, theme::plain(&text, 9.5, theme::TEXT_DIM));
+                                        });
+                                }
+                            });
+                            ui.add_space(7.0);
+                            ui.separator();
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.chat_log_browser_show_global, "Global");
+                                ui.checkbox(&mut self.chat_log_browser_show_team, "Team");
+                                ui.checkbox(&mut self.chat_log_browser_show_located, "Located");
+                                ui.checkbox(&mut self.chat_log_browser_show_voice, "Voice");
+                                ui.checkbox(&mut self.chat_log_browser_show_session, "Session");
+                                if !self.chat_log_browser_search.trim().is_empty() {
+                                    theme::label(
+                                        ui,
+                                        theme::plain("search active", 9.0, theme::ACCENT),
+                                    );
+                                }
+                            });
+                            ui.separator();
+
+                            let visible = detail
+                                .entries
+                                .iter()
+                                .filter(|entry| match entry.kind {
+                                    crate::chat_log::BrowserEntryKind::Say => self.chat_log_browser_show_global,
+                                    crate::chat_log::BrowserEntryKind::Team => self.chat_log_browser_show_team,
+                                    crate::chat_log::BrowserEntryKind::Located => self.chat_log_browser_show_located,
+                                    crate::chat_log::BrowserEntryKind::Voice => self.chat_log_browser_show_voice,
+                                    crate::chat_log::BrowserEntryKind::Session => self.chat_log_browser_show_session,
+                                })
+                                .filter(|entry| {
+                                    search_terms
+                                        .iter()
+                                        .all(|term| entry.plain_lower.contains(term))
+                                })
+                                .collect::<Vec<_>>();
+
+                            ui.horizontal(|ui| {
+                                theme::label(
+                                    ui,
+                                    theme::plain(
+                                        &format!("{} / {} entries", visible.len(), detail.entries.len()),
+                                        9.5,
+                                        theme::TEXT_FAINT,
+                                    ),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    theme::label(
+                                        ui,
+                                        theme::plain(&detail.path.display().to_string(), 8.5, theme::TEXT_FAINT),
+                                    );
+                                });
+                            });
+
+                            let transcript_height = ui.available_height().max(1.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("chat_log_transcript")
+                                .auto_shrink([false, false])
+                                .max_height(transcript_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    if visible.is_empty() {
+                                        ui.add_space(10.0);
+                                        theme::label(
+                                            ui,
+                                            theme::plain("No transcript entries match the current search/type filters.", 11.0, theme::TEXT_FAINT),
+                                        );
+                                    }
+                                    for entry in visible {
+                                        if entry.kind == crate::chat_log::BrowserEntryKind::Session {
+                                            ui.add_space(3.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_sized(
+                                                    [88.0, 18.0],
+                                                    egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT)),
+                                                );
+                                                theme::label(
+                                                    ui,
+                                                    theme::plain(&entry.text, 10.5, theme::TEXT_DIM),
+                                                );
+                                            });
+                                            ui.add_space(3.0);
+                                            continue;
+                                        }
+
+                                        let response = ui.horizontal(|ui| {
+                                            ui.add_sized(
+                                                [88.0, 20.0],
+                                                egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT)),
+                                            );
+                                            let badge_color = match entry.kind {
+                                                crate::chat_log::BrowserEntryKind::Team => egui::Color32::from_rgb(0x70, 0xD8, 0x78),
+                                                crate::chat_log::BrowserEntryKind::Located => theme::ACCENT,
+                                                crate::chat_log::BrowserEntryKind::Voice => theme::WARNING,
+                                                crate::chat_log::BrowserEntryKind::Say => theme::TEXT_FAINT,
+                                                crate::chat_log::BrowserEntryKind::Session => theme::TEXT_FAINT,
+                                            };
+                                            ui.add_sized(
+                                                [62.0, 20.0],
+                                                egui::Label::new(theme::plain(entry.kind.label(), 8.5, badge_color)),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(jka_colored_text(&entry.text, 11.5, theme::TEXT))
+                                                    .wrap(),
+                                            );
+                                        });
+                                        response.response.on_hover_text(format!("{} ms", entry.unix_ms));
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                        });
+                },
+            );
+        });
+
+        if refresh_requested {
+            self.refresh_chat_log_browser_catalog();
+            self.egui_repaint_requested = true;
+        }
+    }
+
     fn ensure_asset_viewer_catalog(&mut self) {
         if self.asset_viewer_catalog_loaded {
             return;
@@ -1792,6 +2664,35 @@ impl App {
         self.ui_catalog.pending.asset_viewer = true;
         self.ui_catalog
             .request(&self.base, self.game.as_deref(), ui_catalog::CatalogRequest::AssetViewer);
+    }
+
+    fn ensure_screenshot_catalog(&mut self) {
+        if self.screenshot_catalog_loaded || self.ui_catalog.pending.screenshots {
+            return;
+        }
+        self.screenshot_catalog_loaded = true;
+        self.screenshot_catalog_error = None;
+        self.ui_catalog.pending.screenshots = true;
+        self.ui_catalog.request(
+            &self.base,
+            self.game.as_deref(),
+            ui_catalog::CatalogRequest::ScreenshotCatalog,
+        );
+    }
+
+    fn request_screenshot_preview(&mut self, path: PathBuf) {
+        if self.screenshot_preview_path.as_ref() == Some(&path)
+            || self.screenshot_preview_pending.as_ref() == Some(&path)
+        {
+            return;
+        }
+        self.screenshot_preview_pending = Some(path.clone());
+        self.screenshot_preview_error = None;
+        self.ui_catalog.request(
+            &self.base,
+            self.game.as_deref(),
+            ui_catalog::CatalogRequest::ScreenshotImage { path },
+        );
     }
 
     /// Install finished background catalog scans and image decodes.
@@ -1810,6 +2711,87 @@ impl App {
                         Err(error) => {
                             eprintln!("Could not build Asset Viewer catalog: {error}");
                             self.asset_viewer_catalog_error = Some(error);
+                        }
+                    }
+                }
+                CatalogPayload::ChatLogs(result) => {
+                    self.ui_catalog.pending.chat_logs = false;
+                    match result {
+                        Ok(entries) => {
+                            self.chat_log_browser_entries = entries;
+                            if self.chat_log_browser_selected.as_ref().is_some_and(|selected| {
+                                !self.chat_log_browser_entries.iter().any(|entry| &entry.path == selected)
+                            }) {
+                                self.chat_log_browser_selected = None;
+                                self.chat_log_browser_detail_path = None;
+                                self.chat_log_browser_detail = None;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Could not build Chat Logs catalog: {error}");
+                            self.chat_log_browser_catalog_error = Some(error);
+                        }
+                    }
+                }
+                CatalogPayload::ChatLogDetail { path, detail } => {
+                    // Selection can change while an older parse is in flight.
+                    // Only the result for the currently requested path owns the
+                    // pending flag or detail slot.
+                    if self.chat_log_browser_detail_path.as_ref() == Some(&path) {
+                        self.ui_catalog.pending.chat_log_detail = false;
+                        self.chat_log_browser_detail = Some(detail);
+                    }
+                }
+                CatalogPayload::ScreenshotCatalog(result) => {
+                    self.ui_catalog.pending.screenshots = false;
+                    match result {
+                        Ok(entries) => {
+                            self.screenshot_entries = entries;
+                            self.screenshot_catalog_error = None;
+                            if let Some(path) = self.startup_screenshot_select.take() {
+                                if self.screenshot_entries.iter().any(|entry| entry.path == path) {
+                                    self.screenshot_selected = Some(path);
+                                }
+                            }
+                            if self.screenshot_selected.as_ref().is_none_or(|selected| {
+                                !self.screenshot_entries.iter().any(|entry| &entry.path == selected)
+                            }) {
+                                self.screenshot_selected = self
+                                    .screenshot_entries
+                                    .first()
+                                    .map(|entry| entry.path.clone());
+                            }
+                            self.screenshot_preview_texture = None;
+                            self.screenshot_preview_path = None;
+                            self.screenshot_preview_pending = None;
+                        }
+                        Err(error) => {
+                            eprintln!("Could not build Screenshot Browser catalog: {error}");
+                            self.screenshot_catalog_error = Some(error);
+                        }
+                    }
+                }
+                CatalogPayload::ScreenshotImage { path, image } => {
+                    if self.screenshot_preview_pending.as_ref() == Some(&path) {
+                        self.screenshot_preview_pending = None;
+                        match image {
+                            Ok(image) => {
+                                self.screenshot_preview_texture = Some(ctx.load_texture(
+                                    format!("screenshot-preview:{}", path.display()),
+                                    egui::ColorImage::from_rgba_unmultiplied(
+                                        image.size,
+                                        &image.rgba,
+                                    ),
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                                self.screenshot_preview_path = Some(path);
+                                self.screenshot_preview_error = None;
+                            }
+                            Err(error) => {
+                                self.screenshot_preview_texture = None;
+                                self.screenshot_preview_path = None;
+                                self.screenshot_preview_error = Some(error);
+                            }
                         }
                     }
                 }
@@ -1906,6 +2888,45 @@ impl App {
         self.egui_repaint_requested = true;
     }
 
+    fn ensure_chat_log_browser_catalog(&mut self) {
+        if self.chat_log_browser_catalog_loaded {
+            return;
+        }
+        self.chat_log_browser_catalog_loaded = true;
+        self.chat_log_browser_entries.clear();
+        self.chat_log_browser_catalog_error = None;
+        self.ui_catalog.pending.chat_logs = true;
+        self.ui_catalog
+            .request(&self.base, self.game.as_deref(), ui_catalog::CatalogRequest::ChatLogs);
+    }
+
+    fn refresh_chat_log_browser_catalog(&mut self) {
+        self.chat_log_browser_catalog_loaded = false;
+        self.chat_log_browser_catalog_error = None;
+        self.chat_log_browser_detail_path = None;
+        self.chat_log_browser_detail = None;
+        self.ensure_chat_log_browser_catalog();
+    }
+
+    fn ensure_chat_log_browser_detail(&mut self) {
+        let Some(path) = self.chat_log_browser_selected.clone() else {
+            self.chat_log_browser_detail_path = None;
+            self.chat_log_browser_detail = None;
+            return;
+        };
+        if self.chat_log_browser_detail_path.as_ref() == Some(&path) {
+            return;
+        }
+        self.chat_log_browser_detail_path = Some(path.clone());
+        self.chat_log_browser_detail = None;
+        self.ui_catalog.pending.chat_log_detail = true;
+        self.ui_catalog.request(
+            &self.base,
+            self.game.as_deref(),
+            ui_catalog::CatalogRequest::ChatLogDetail { path },
+        );
+    }
+
     fn ensure_asset_viewer_detail(&mut self) {
         let Some(selected_id) = self.asset_viewer_selected.clone() else {
             self.asset_viewer_detail_path = None;
@@ -1942,6 +2963,507 @@ impl App {
         self.asset_viewer_detail = Some(detail);
         self.clear_asset_preview_runtime();
         self.update_asset_preview_content();
+    }
+
+    fn browser_workspace_widths(total_width: f32) -> (f32, f32, f32) {
+        let gap = 8.0_f32;
+        let browser_width = (total_width * 0.21)
+            .clamp(250.0, 320.0)
+            .min(total_width * 0.30);
+        let inspector_width = (total_width * 0.25)
+            .clamp(280.0, 380.0)
+            .min(total_width * 0.32);
+        let preview_width =
+            (total_width - browser_width - inspector_width - gap * 2.0).max(1.0);
+        (browser_width, preview_width, inspector_width)
+    }
+
+    fn screenshot_metadata_row(ui: &mut egui::Ui, label: &str, value: impl AsRef<str>) {
+        ui.horizontal_wrapped(|ui| {
+            theme::label(ui, theme::plain(label, 8.5, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain(value.as_ref(), 9.5, theme::TEXT));
+        });
+    }
+
+    fn egui_screenshot_browser_page(&mut self, ui: &mut egui::Ui) {
+        self.ensure_screenshot_catalog();
+        if self.ui_catalog.pending.screenshots && self.screenshot_entries.is_empty() {
+            theme::label(
+                ui,
+                theme::plain("Scanning screenshot folders...", 12.0, theme::TEXT_FAINT),
+            );
+            return;
+        }
+        if let Some(error) = &self.screenshot_catalog_error {
+            theme::banner(
+                ui,
+                &format!("Screenshot scan failed: {error}"),
+                theme::WARNING,
+            );
+            return;
+        }
+
+        let mut games = self
+            .screenshot_entries
+            .iter()
+            .map(|entry| entry.game.clone())
+            .collect::<Vec<_>>();
+        games.sort_by_key(|game| (game != "base", game.to_ascii_lowercase()));
+        games.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+        let search = self.screenshot_search.trim().to_ascii_lowercase();
+        let game_filter = self.screenshot_game_filter.trim().to_ascii_lowercase();
+        let filtered = self
+            .screenshot_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                game_filter.is_empty() || entry.game.eq_ignore_ascii_case(&game_filter)
+            })
+            .filter(|(_, entry)| {
+                if search.is_empty() {
+                    return true;
+                }
+                entry.file_name.to_ascii_lowercase().contains(&search)
+                    || entry.relative_name.to_ascii_lowercase().contains(&search)
+                    || entry.game.to_ascii_lowercase().contains(&search)
+                    || entry.metadata.as_ref().is_some_and(|metadata| {
+                        metadata
+                            .map_name
+                            .as_deref()
+                            .is_some_and(|map| map.to_ascii_lowercase().contains(&search))
+                            || metadata
+                                .server_name
+                                .as_deref()
+                                .is_some_and(|name| name.to_ascii_lowercase().contains(&search))
+                            || metadata
+                                .server_address
+                                .as_deref()
+                                .is_some_and(|address| address.to_ascii_lowercase().contains(&search))
+                            || metadata.player_name.to_ascii_lowercase().contains(&search)
+                            || metadata
+                                .players
+                                .iter()
+                                .any(|player| player.name.to_ascii_lowercase().contains(&search))
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        if self.screenshot_selected.as_ref().is_some_and(|selected| {
+            !filtered
+                .iter()
+                .any(|&index| self.screenshot_entries[index].path == *selected)
+        }) {
+            self.screenshot_selected = filtered
+                .first()
+                .map(|&index| self.screenshot_entries[index].path.clone());
+            self.screenshot_preview_texture = None;
+            self.screenshot_preview_path = None;
+            self.screenshot_preview_pending = None;
+        } else if self.screenshot_selected.is_none() {
+            self.screenshot_selected = filtered
+                .first()
+                .map(|&index| self.screenshot_entries[index].path.clone());
+        }
+
+        if let Some(path) = self.screenshot_selected.clone() {
+            self.request_screenshot_preview(path);
+        }
+
+        let selected_entry = self.screenshot_selected.as_ref().and_then(|path| {
+            self.screenshot_entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .cloned()
+        });
+        let body_height = ui.available_height().max(320.0);
+        let total_width = ui.available_width().max(1.0);
+        let (browser_width, preview_width, inspector_width) =
+            Self::browser_workspace_widths(total_width);
+        let gap = 8.0_f32;
+        let mut select_path = None::<PathBuf>;
+        let mut refresh_requested = false;
+        let mut jump_metadata = None::<crate::screenshot::ScreenshotMetadata>;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(browser_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::RAIL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(9, 9))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (browser_width - 18.0).max(1.0),
+                                (body_height - 18.0).max(1.0),
+                            ));
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("screenshot_game_filter")
+                                    .selected_text(if self.screenshot_game_filter.is_empty() {
+                                        "All mods"
+                                    } else {
+                                        self.screenshot_game_filter.as_str()
+                                    })
+                                    .width((ui.available_width() - 74.0).max(90.0))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.screenshot_game_filter,
+                                            String::new(),
+                                            "All mods",
+                                        );
+                                        for game in &games {
+                                            ui.selectable_value(
+                                                &mut self.screenshot_game_filter,
+                                                game.clone(),
+                                                game.as_str(),
+                                            );
+                                        }
+                                    });
+                                if theme::ghost_button(ui, "REFRESH").clicked() {
+                                    refresh_requested = true;
+                                }
+                            });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.screenshot_search)
+                                    .hint_text("Search screenshots, maps, servers, players...")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.horizontal(|ui| {
+                                theme::label(
+                                    ui,
+                                    theme::plain(
+                                        &format!(
+                                            "{} / {}",
+                                            filtered.len(),
+                                            self.screenshot_entries.len()
+                                        ),
+                                        9.5,
+                                        theme::TEXT_FAINT,
+                                    ),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        theme::label(
+                                            ui,
+                                            theme::plain(
+                                                "base + mod screenshot folders",
+                                                8.5,
+                                                theme::TEXT_FAINT,
+                                            ),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.separator();
+
+                            egui::ScrollArea::vertical()
+                                .id_salt("screenshot_browser_list")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for &index in &filtered {
+                                        let entry = &self.screenshot_entries[index];
+                                        let selected = self
+                                            .screenshot_selected
+                                            .as_ref()
+                                            .is_some_and(|path| path == &entry.path);
+                                        let label = if let Some(metadata) = &entry.metadata {
+                                            let map = metadata.map_name.as_deref().unwrap_or("menu");
+                                            format!("{}\n{}  ·  {}", entry.file_name, entry.game, map)
+                                        } else {
+                                            format!("{}\n{}  ·  legacy", entry.file_name, entry.game)
+                                        };
+                                        let response = ui.selectable_label(selected, label);
+                                        let response = response.on_hover_text(entry.path.display().to_string());
+                                        if response.clicked() {
+                                            select_path = Some(entry.path.clone());
+                                        }
+                                    }
+                                    if filtered.is_empty() {
+                                        theme::label(
+                                            ui,
+                                            theme::plain(
+                                                "No screenshots match this filter.",
+                                                10.0,
+                                                theme::TEXT_FAINT,
+                                            ),
+                                        );
+                                    }
+                                });
+                        });
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(preview_width, body_height),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::PANEL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (preview_width - 20.0).max(1.0),
+                                (body_height - 20.0).max(1.0),
+                            ));
+                            if let Some(entry) = &selected_entry {
+                                theme::label(
+                                    ui,
+                                    theme::plain(&entry.file_name, 11.0, theme::TEXT_DIM),
+                                );
+                                ui.separator();
+                            }
+                            let available = ui.available_size();
+                            if self.screenshot_preview_pending.is_some() {
+                                ui.centered_and_justified(|ui| {
+                                    theme::label(
+                                        ui,
+                                        theme::plain("Decoding screenshot...", 11.0, theme::TEXT_FAINT),
+                                    );
+                                });
+                            } else if let Some(error) = &self.screenshot_preview_error {
+                                ui.centered_and_justified(|ui| {
+                                    theme::label(ui, theme::plain(error, 10.5, theme::WARNING));
+                                });
+                            } else if let Some(texture) = &self.screenshot_preview_texture {
+                                let source = texture.size_vec2();
+                                let scale = (available.x / source.x)
+                                    .min(available.y / source.y)
+                                    .min(1.0)
+                                    .max(0.01);
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Image::new(texture)
+                                            .fit_to_exact_size(source * scale),
+                                    );
+                                });
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    theme::label(
+                                        ui,
+                                        theme::plain("Select a screenshot.", 11.0, theme::TEXT_FAINT),
+                                    );
+                                });
+                            }
+                        });
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(inspector_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(theme::RAIL_FILL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(10, 9))
+                        .show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                (inspector_width - 20.0).max(1.0),
+                                (body_height - 18.0).max(1.0),
+                            ));
+                            theme::section(ui, "CAPTURE", "");
+                            let Some(entry) = &selected_entry else {
+                                theme::label(
+                                    ui,
+                                    theme::plain("No screenshot selected.", 10.0, theme::TEXT_FAINT),
+                                );
+                                return;
+                            };
+                            theme::label(
+                                ui,
+                                theme::plain(
+                                    &format!("MOD  {}", entry.game),
+                                    10.0,
+                                    theme::TEXT_DIM,
+                                ),
+                            );
+                            theme::label(
+                                ui,
+                                theme::plain(
+                                    &entry.relative_name,
+                                    9.0,
+                                    theme::TEXT_FAINT,
+                                ),
+                            );
+                            ui.add_space(5.0);
+
+                            if let Some(metadata) = &entry.metadata {
+                                let can_jump = metadata.can_go_to_spot();
+                                let clicked = ui
+                                    .add_enabled_ui(can_jump, |ui| {
+                                        theme::primary_button(ui, "GO TO SPOT").clicked()
+                                    })
+                                    .inner;
+                                if clicked {
+                                    jump_metadata = Some(metadata.clone());
+                                }
+                                if can_jump {
+                                    theme::label(
+                                        ui,
+                                        theme::plain(
+                                            "Loads the saved map/mod and restores the saved position + view in the local free camera.",
+                                            8.5,
+                                            theme::TEXT_FAINT,
+                                        ),
+                                    );
+                                }
+                                ui.separator();
+                                egui::ScrollArea::vertical()
+                                    .id_salt("screenshot_metadata_inspector")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        Self::screenshot_metadata_row(ui, "TIME", metadata.captured_at.clone());
+                                        Self::screenshot_metadata_row(ui, 
+                                            "MAP",
+                                            metadata
+                                                .map_name
+                                                .clone()
+                                                .unwrap_or_else(|| "—".into()),
+                                        );
+                                        Self::screenshot_metadata_row(ui, 
+                                            "MAP TIME",
+                                            metadata
+                                                .map_time_ms
+                                                .map(Self::format_demo_time)
+                                                .unwrap_or_else(|| "—".into()),
+                                        );
+                                        Self::screenshot_metadata_row(ui, 
+                                            "SERVER",
+                                            metadata
+                                                .server_name
+                                                .clone()
+                                                .unwrap_or_else(|| "local / unknown".into()),
+                                        );
+                                        Self::screenshot_metadata_row(ui, 
+                                            "ADDRESS",
+                                            metadata
+                                                .server_address
+                                                .clone()
+                                                .unwrap_or_else(|| "—".into()),
+                                        );
+                                        Self::screenshot_metadata_row(ui, "PLAYER", metadata.player_name.clone());
+                                        Self::screenshot_metadata_row(ui, "FOV", format!("{:.1}", metadata.fov));
+                                        Self::screenshot_metadata_row(ui, 
+                                            "VIEW",
+                                            if metadata.third_person {
+                                                "third person"
+                                            } else {
+                                                "first person"
+                                            },
+                                        );
+                                        if let Some(origin) = metadata.player_origin {
+                                            Self::screenshot_metadata_row(ui, 
+                                                "POSITION",
+                                                format!(
+                                                    "{:.1}  {:.1}  {:.1}",
+                                                    origin[0], origin[1], origin[2]
+                                                ),
+                                            );
+                                        } else if let Some(origin) = metadata.camera_origin {
+                                            Self::screenshot_metadata_row(ui, 
+                                                "CAMERA",
+                                                format!(
+                                                    "{:.1}  {:.1}  {:.1}",
+                                                    origin[0], origin[1], origin[2]
+                                                ),
+                                            );
+                                        }
+                                        if let Some(angles) = metadata.view_angles {
+                                            Self::screenshot_metadata_row(ui, 
+                                                "ANGLES",
+                                                format!(
+                                                    "{:.1}  {:.1}  {:.1}",
+                                                    angles[0], angles[1], angles[2]
+                                                ),
+                                            );
+                                        }
+                                        if let Some(crosshair) = &metadata.crosshair {
+                                            ui.add_space(7.0);
+                                            theme::section(ui, "CROSSHAIR HIT", "");
+                                            Self::screenshot_metadata_row(ui, "TYPE", crosshair.kind.clone());
+                                            if !crosshair.title.is_empty() {
+                                                Self::screenshot_metadata_row(ui, "HIT", crosshair.title.clone());
+                                            }
+                                            if let Some(material) = &crosshair.material {
+                                                Self::screenshot_metadata_row(ui, "SHADER", material.clone());
+                                            }
+                                            if let Some(distance) = &crosshair.distance {
+                                                Self::screenshot_metadata_row(ui, "DIST", distance.clone());
+                                            }
+                                            if let Some(entity_num) = crosshair.entity_num {
+                                                Self::screenshot_metadata_row(ui, "ENTITY", entity_num.to_string());
+                                            }
+                                        }
+                                        ui.add_space(7.0);
+                                        theme::section(
+                                            ui,
+                                            "PLAYERS",
+                                            &format!("{} captured", metadata.players.len()),
+                                        );
+                                        for player in &metadata.players {
+                                            let score = player
+                                                .score
+                                                .map(|score| format!("  score {score}"))
+                                                .unwrap_or_default();
+                                            let ping = player
+                                                .ping
+                                                .map(|ping| format!("  {ping} ms"))
+                                                .unwrap_or_default();
+                                            theme::label(
+                                                ui,
+                                                theme::plain(
+                                                    &format!("{}{}{}", player.name, score, ping),
+                                                    9.0,
+                                                    theme::TEXT_DIM,
+                                                ),
+                                            );
+                                        }
+                                    });
+                            } else {
+                                theme::banner(
+                                    ui,
+                                    "Legacy/plain screenshot: no DinurdoJK capture metadata is embedded. Preview is still available.",
+                                    theme::TEXT_FAINT,
+                                );
+                                if let Some(error) = &entry.metadata_error {
+                                    ui.add_space(5.0);
+                                    theme::label(
+                                        ui,
+                                        theme::plain(error, 9.0, theme::WARNING),
+                                    );
+                                }
+                            }
+                        });
+                },
+            );
+        });
+
+        if let Some(path) = select_path {
+            self.screenshot_selected = Some(path.clone());
+            self.screenshot_preview_texture = None;
+            self.screenshot_preview_path = None;
+            self.screenshot_preview_pending = None;
+            self.screenshot_preview_error = None;
+            self.request_screenshot_preview(path);
+            self.egui_repaint_requested = true;
+        }
+        if refresh_requested {
+            self.screenshot_catalog_loaded = false;
+            self.screenshot_catalog_error = None;
+            self.screenshot_preview_pending = None;
+            self.ensure_screenshot_catalog();
+            self.egui_repaint_requested = true;
+        }
+        if let Some(metadata) = jump_metadata {
+            self.launch_screenshot_spot(metadata);
+        }
     }
 
     fn egui_asset_viewer_page(&mut self, ui: &mut egui::Ui) {
@@ -2053,13 +3575,8 @@ impl App {
         let body_height = ui.available_height().max(320.0);
         let total_width = ui.available_width().max(1.0);
         let gap = 8.0_f32;
-        let browser_width = (total_width * 0.21)
-            .clamp(250.0, 320.0)
-            .min(total_width * 0.30);
-        let inspector_width = (total_width * 0.25)
-            .clamp(280.0, 380.0)
-            .min(total_width * 0.32);
-        let preview_width = (total_width - browser_width - inspector_width - gap * 2.0).max(1.0);
+        let (browser_width, preview_width, inspector_width) =
+            Self::browser_workspace_widths(total_width);
         let mut keyboard_selection = None::<String>;
         let mut refresh_requested = false;
 
@@ -3046,6 +4563,19 @@ impl App {
     }
 
     fn connect_browser_server(&mut self, address: std::net::SocketAddr) {
+        if self
+            .server_browser
+            .servers
+            .get(&address)
+            .is_some_and(|server| server.need_password)
+            && self.network.password.is_empty()
+        {
+            self.show_server_password_prompt(
+                address.to_string(),
+                Some("This server requires a password.".to_owned()),
+            );
+            return;
+        }
         self.connect_to_server(&address.to_string());
     }
 
@@ -4541,9 +6071,22 @@ impl App {
                 Some("servers") => FrontendPage::ServerBrowser,
                 Some("solo") => FrontendPage::SoloGame,
                 Some("demo") => FrontendPage::PlayDemo,
+                Some("profile") => {
+                    self.profile_selected_section = match tab.as_deref() {
+                        Some("model") => PROFILE_MODEL,
+                        Some("force") => PROFILE_FORCE,
+                        Some("saber") => PROFILE_SABER,
+                        Some("cosmetics") => PROFILE_COSMETICS,
+                        _ => PROFILE_IDENTITY,
+                    };
+                    self.profile_preview_key = None;
+                    FrontendPage::Profile
+                },
                 Some("controls") => FrontendPage::Controls,
+                Some("chatlogs") | Some("chatlog") => FrontendPage::ChatLogs,
                 Some("devtools") => FrontendPage::DeveloperTools,
                 Some("assets") => FrontendPage::AssetViewer,
+                Some("screenshots") | Some("shots") => FrontendPage::Screenshots,
                 Some("maps") => FrontendPage::MapViewer,
                 Some("setup") => {
                     self.setup_selected = Self::setup_tab_index(tab.as_deref());
@@ -4552,7 +6095,7 @@ impl App {
                 }
                 _ => {
                     self.console_status =
-                        "USAGE: uipage main|play|servers|solo|demo|controls|devtools|assets|maps|setup [game|camera|video|audio|network|interface]".into();
+                        "USAGE: uipage main|play|servers|solo|demo|profile|controls|chatlogs|devtools|assets|screenshots|maps|setup [tab]".into();
                     return;
                 }
             };
@@ -5816,7 +7359,31 @@ impl App {
                 .is_some_and(|server| server.can_join());
 
         theme::section(ui, "SESSION", "");
-        if menu_action(
+        let team_gametype = self.live_connected()
+            && self
+                .game_session
+                .as_ref()
+                .is_some_and(|session| session.client_game.gametype() >= crate::cgame::GT_TEAM);
+        if team_gametype {
+            if menu_action(
+                ui,
+                "Join red",
+                "Ask the server to join the red team.",
+                true,
+            ) {
+                self.join_live_team("red", "JOIN RED REQUEST SENT");
+                return;
+            }
+            if menu_action(
+                ui,
+                "Join blue",
+                "Ask the server to join the blue team.",
+                true,
+            ) {
+                self.join_live_team("blue", "JOIN BLUE REQUEST SENT");
+                return;
+            }
+        } else if menu_action(
             ui,
             "Join game",
             if self.live_connected() {
@@ -5847,10 +7414,35 @@ impl App {
         self.egui_spectator_actions(ui);
 
         ui.add_space(12.0);
+        theme::section(
+            ui,
+            "TOOLS",
+            "Client-side training and analysis tools.",
+        );
+        if menu_action(
+            ui,
+            "Strafe trails",
+            "Load recorded jaPRO trails, trace live players, and record race lines.",
+            true,
+        ) {
+            self.open_strafe_trails();
+            return;
+        }
+        if menu_action(
+            ui,
+            "Race ghosts",
+            "Browse race demos for the current map/style and race multiple synchronized ghosts.",
+            self.game_session.as_ref().is_some_and(|session| session.live),
+        ) {
+            self.open_race_ghosts();
+            return;
+        }
+
+        ui.add_space(12.0);
         theme::section(ui, "LEAVE", "Leave the current session or exit DinurdoJK.");
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if theme::primary_button(ui, "QUIT TO MAIN MENU").clicked() {
+            if theme::ghost_button(ui, "QUIT TO MAIN MENU").clicked() {
                 self.disconnect_to_main_menu();
                 return;
             }
@@ -5859,6 +7451,13 @@ impl App {
                 self.request_quit();
             }
         });
+    }
+
+    fn join_live_team(&mut self, team: &str, status: &str) {
+        debug_assert!(matches!(team, "red" | "blue"));
+        self.forward_command_to_server(&format!("team {team}"));
+        self.console_status = status.into();
+        self.set_overlay(OverlayMode::None);
     }
 
     pub(super) fn join_as(&mut self, mode: JoinMode) {
@@ -5912,20 +7511,40 @@ impl App {
         }
     }
 
+    /// Binding capture status is an overlay, not layout content. A normal
+    /// banner here moved every binding row as soon as it was clicked, making
+    /// the control the player was interacting with jump under the pointer.
+    pub(super) fn egui_binding_capture_overlay(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("jka_binding_capture_status"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(12, 17, 24, 242))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::WARNING))
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        theme::label(
+                            ui,
+                            theme::plain(
+                                "Press any key, mouse button or wheel direction…  ESC cancels.",
+                                12.5,
+                                theme::WARNING,
+                            ),
+                        );
+                    });
+            });
+    }
+
     fn egui_controls_page(&mut self, ui: &mut egui::Ui) {
         theme::page_title(
             ui,
             "CONTROLS",
-            "Base JKA bindings and mouse input. Click a binding to rebind it; right-click clears it.",
+            "Base JKA, spectator and mouse bindings. Spectator binds override normal keys only while spectating.",
         );
 
         if self.controls_waiting_for_key {
-            theme::banner(
-                ui,
-                "Press any key, mouse button or wheel direction…  ESC cancels.",
-                theme::WARNING,
-            );
-            ui.add_space(6.0);
+            self.egui_binding_capture_overlay(ui.ctx());
         }
 
         // One tab per action group, then Mouse, styled like the Setup tab strip.
@@ -5934,6 +7553,9 @@ impl App {
             if !groups.contains(&action.group) {
                 groups.push(action.group);
             }
+        }
+        if !keybinds::SPECTATOR_CONTROL_ACTIONS.is_empty() {
+            groups.push("Spectate");
         }
         let mouse_tab = groups.len();
         self.controls_section = self.controls_section.min(mouse_tab);
@@ -5974,37 +7596,75 @@ impl App {
                     return;
                 }
                 let group = groups[section];
-                theme::section(ui, &group.to_uppercase(), "");
-                for (index, action) in keybinds::CONTROL_ACTIONS.iter().enumerate() {
-                    if action.group != group {
-                        continue;
+                let spectator_group = group == "Spectate";
+                theme::section(
+                    ui,
+                    &group.to_uppercase(),
+                    if spectator_group {
+                        "Overrides used only while spectating. Unassigned keys inherit the normal binding."
+                    } else {
+                        ""
+                    },
+                );
+
+                if spectator_group {
+                    for (index, action) in keybinds::SPECTATOR_CONTROL_ACTIONS.iter().enumerate() {
+                        let selection = keybinds::spectator_selection(index);
+                        let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
+                        let binding = self.bindings.display_for_spectator_command(action.command);
+                        let tip = format!(
+                            "Spectator override for the \"{}\" command. Right-click to inherit the normal bind again.",
+                            action.command
+                        );
+                        theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
+                            let (text, color) = if waiting {
+                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                            } else if binding == "INHERIT NORMAL" {
+                                ("Inherit normal".to_owned(), theme::TEXT_DISABLED)
+                            } else {
+                                (binding.clone(), theme::ACCENT)
+                            };
+                            let response = binding_slot(ui, &text, color, waiting);
+                            if response.clicked() {
+                                rebind = Some(selection);
+                            }
+                            if response.secondary_clicked() {
+                                clear = Some(selection);
+                            }
+                        });
                     }
-                    let waiting = self.controls_waiting_for_key && self.controls_selected == index;
-                    let binding = self.bindings.display_for_command(action.command);
-                    let tip = format!("Bound to the \"{}\" command.", action.command);
-                    theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
-                        let (text, color) = if waiting {
-                            ("PRESS A KEY…".to_owned(), theme::WARNING)
-                        } else if binding == "UNBOUND" {
-                            ("Unbound".to_owned(), theme::TEXT_DISABLED)
-                        } else {
-                            (binding.clone(), theme::ACCENT)
-                        };
-                        let response = binding_slot(ui, &text, color, waiting);
-                        if response.clicked() {
-                            rebind = Some(index);
+                } else {
+                    for (index, action) in keybinds::CONTROL_ACTIONS.iter().enumerate() {
+                        if action.group != group {
+                            continue;
                         }
-                        if response.secondary_clicked() {
-                            clear = Some(index);
-                        }
-                    });
+                        let waiting = self.controls_waiting_for_key && self.controls_selected == index;
+                        let binding = self.bindings.display_for_command(action.command);
+                        let tip = format!("Bound to the \"{}\" command.", action.command);
+                        theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
+                            let (text, color) = if waiting {
+                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                            } else if binding == "UNBOUND" {
+                                ("Unbound".to_owned(), theme::TEXT_DISABLED)
+                            } else {
+                                (binding.clone(), theme::ACCENT)
+                            };
+                            let response = binding_slot(ui, &text, color, waiting);
+                            if response.clicked() {
+                                rebind = Some(index);
+                            }
+                            if response.secondary_clicked() {
+                                clear = Some(index);
+                            }
+                        });
+                    }
                 }
 
                 theme::section(ui, "DEFAULTS", "");
                 theme::row(
                     ui,
                     "Default bindings",
-                    "Replaces every binding, including ones you added from the console, with the stock jaPRO/JKA multiplayer layout.",
+                    "Replaces normal bindings with the stock jaPRO/JKA multiplayer layout and restores DinurdoJK spectator defaults.",
                     theme::Reset::None,
                     |ui| {
                         let armed_id = ui.id().with("restore_default_binds");
@@ -6096,20 +7756,8 @@ impl App {
         );
         theme::row(
             ui,
-            "Subframe input",
-            "cl_input_subframe. Applies mouse-look on each raw mouse event instead of waiting for the next client tick, reducing input latency.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.video.input_subframe) {
-                    self.set_input_subframe(enabled);
-                    self.egui_repaint_requested = true;
-                }
-            },
-        );
-        theme::row(
-            ui,
             "Late-latched view",
-            "cl_input_latelatch. Experimental A/B switch. Requires subframe input; the render thread resamples the newest real view orientation at the latest point that is still coherent with camera-dependent work. No mouse prediction or extra physics ticks.",
+            "cl_input_latelatch. Experimental A/B switch. Subframe input is always enabled; the render thread resamples the newest real view orientation at the latest point that is still coherent with camera-dependent work. No mouse prediction or extra physics ticks.",
             theme::Reset::None,
             |ui| {
                 if let Some(enabled) = theme::switch(ui, self.video.input_latelatch) {
@@ -6172,6 +7820,13 @@ impl App {
     fn egui_audio_page(&mut self, ui: &mut egui::Ui) {
         theme::page_title(ui, "AUDIO", "OpenJK mixer levels, Steam Audio spatial acoustics and native output diagnostics.");
 
+        egui::ScrollArea::vertical()
+            .id_salt("jka_audio_settings")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.egui_audio_page_contents(ui));
+    }
+
+    fn egui_audio_page_contents(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "MIX", "Changes are live and archived to DinurdoJK.cfg.");
         macro_rules! audio_slider {
             ($label:literal, $tip:literal, $field:ident, $cvar:literal) => {
@@ -6724,6 +8379,18 @@ fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
         if response.hovered() { theme::TEXT } else { theme::TEXT_DIM },
     );
     response.on_hover_text(tooltip).clicked()
+}
+
+fn chat_log_duration_label(start_ms: u64, end_ms: u64) -> String {
+    let seconds = end_ms.saturating_sub(start_ms) / 1000;
+    let hours = seconds / 3600;
+    let minutes = (seconds / 60) % 60;
+    let seconds = seconds % 60;
+    if hours != 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 /// Compact affordance for the existing `fs_refresh` path. Asset Viewer,

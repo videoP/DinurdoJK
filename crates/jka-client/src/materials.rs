@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::Arc, time::Instant
 const MAX_TEXTURE_FILE_BYTES: usize = 8192 * 8192 * 4 + 1024;
 const MAX_VIDEO_FILE_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BlendFactor {
     Zero,
     One,
@@ -33,13 +33,13 @@ pub enum BlendFactor {
     SrcAlphaSaturate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlendFunc {
     pub src: BlendFactor,
     pub dst: BlendFactor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CullMode {
     None,
     Front,

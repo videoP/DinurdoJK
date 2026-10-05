@@ -12,6 +12,11 @@
 //! old speed graph (`speedometer.rs`, `DF_DrawSpeedGraphOld`), which stacks above it.
 //! Mode 4 is an addition of this client: mode 3 plus a second row of numbers under the
 //! graph (packet loss over the visible window, and its peak ping).
+//! The two mode-2/3/4 headline numbers intentionally differ slightly from TaystJK:
+//! both are whole milliseconds and are refreshed at 10 Hz. The underlying values
+//! are already 48-sample moving averages, so an additional slow filter would only
+//! add lag. TaystJK prints the interpolation value with one decimal every frame; at
+//! high render rates that adds visual churn without adding useful precision.
 //!
 //! Notes on how this maps onto the C:
 //! * `cgs.widthRatioCoef` (`cl_ratioFix`, on by default) is applied exactly as written:
@@ -30,6 +35,9 @@ const MAX_LAGOMETER_PING: f32 = 900.0;
 const MAX_LAGOMETER_RANGE: f32 = 300.0;
 /// `SNAPFLAG_RATE_DELAYED`: the server held this snapshot back to respect `rate`.
 const SNAPFLAG_RATE_DELAYED: u8 = 1;
+/// Text is diagnostic, not animation. Keep it readable instead of changing on
+/// every high-FPS render frame.
+const TEXT_REFRESH_MS: i32 = 100;
 /// `BIGCHAR_WIDTH` / `BIGCHAR_HEIGHT`.
 pub const BIGCHAR: f32 = 16.0;
 /// `CMD_BACKUP` of the client's usercmd ring (`REAL_CMD_BACKUP` in `CG_DrawDisconnect`).
@@ -153,10 +161,17 @@ pub struct BigText {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Ui {
+    /// Settings used to author the graph positions. HUD Edit Mode keeps these as
+    /// the stock origin and applies its independent offset/scale on top.
+    pub settings: Settings,
     pub pics: Vec<Pic>,
     pub rects: Vec<Rect>,
     pub texts: Vec<Text>,
     pub big_texts: Vec<BigText>,
+    /// `draw_graph` runs before `draw_disconnect`; these counts split the
+    /// draggable lagometer itself from centered connection/map-change warnings.
+    pub graph_pic_count: usize,
+    pub graph_big_text_count: usize,
 }
 
 impl Ui {
@@ -208,6 +223,11 @@ pub struct Lagometer {
     last_message_num: Option<i32>,
     /// `cg.time` at the last frame sample (drives the warning icon's blink).
     time: i32,
+    /// Display-only averages for cg_lagometer 2/3/4. The graph itself always
+    /// consumes the raw sample rings just like TaystJK.
+    text_sample_time: Option<i32>,
+    text_avg_ping: f32,
+    text_avg_interp: f32,
 }
 
 impl Default for Lagometer {
@@ -220,6 +240,9 @@ impl Default for Lagometer {
             snapshot_count: 0,
             last_message_num: None,
             time: 0,
+            text_sample_time: None,
+            text_avg_ping: 0.0,
+            text_avg_interp: 0.0,
         }
     }
 }
@@ -250,6 +273,7 @@ impl Lagometer {
         self.frame_samples[frame_slot(self.frame_count)] = cg_time.wrapping_sub(latest_snapshot_time);
         self.frame_count = self.frame_count.wrapping_add(1);
         self.time = cg_time;
+        self.maybe_refresh_text_averages(cg_time);
     }
 
     /// `CG_AddLagometerSnapshotInfo` for a snapshot that arrived. `demo` is
@@ -294,6 +318,46 @@ impl Lagometer {
         self.snapshot_count = self.snapshot_count.wrapping_add(1);
     }
 
+    fn raw_text_averages(&self) -> (f32, f32) {
+        const WIDTH: usize = 48;
+        let mut interp = 0.0f32;
+        for a in 0..WIDTH {
+            let i = frame_slot(self.frame_count.wrapping_sub(1).wrapping_sub(a as u32));
+            interp += self.frame_samples[i] as f32;
+        }
+        let interp = (interp / WIDTH as f32) * -1.0;
+
+        let mut ping = 0.0f32;
+        let mut highest_ping = 1i32;
+        for a in 0..WIDTH {
+            let i = frame_slot(self.snapshot_count.wrapping_sub(1).wrapping_sub(a as u32));
+            let sample = self.snapshot_samples[i];
+            if sample > highest_ping {
+                highest_ping = sample;
+            }
+            if sample > 0 {
+                ping += sample as f32;
+            } else if sample < 0 {
+                // Same dropped-snapshot approximation CG_DrawLagometer uses.
+                ping += highest_ping as f32;
+            }
+        }
+        (ping / WIDTH as f32, interp)
+    }
+
+    fn maybe_refresh_text_averages(&mut self, cg_time: i32) {
+        let due = self
+            .text_sample_time
+            .map_or(true, |last| cg_time.wrapping_sub(last) >= TEXT_REFRESH_MS || cg_time < last);
+        if !due {
+            return;
+        }
+        let (ping, interp) = self.raw_text_averages();
+        self.text_avg_ping = ping;
+        self.text_avg_interp = interp;
+        self.text_sample_time = Some(cg_time);
+    }
+
     /// The decision at the top of `CG_DrawDisconnect`. `cmd_server_time` is
     /// `serverTime` of `GetUserCmd(currentCmdNumber - REAL_CMD_BACKUP + 1)` (0 when that
     /// command is gone) and `snapshot_command_time` is `cg.snap->ps.commandTime`.
@@ -311,10 +375,12 @@ impl Lagometer {
 
     /// `CG_DrawLagometer`. `None` when there is nothing to draw.
     pub fn draw(&self, settings: &Settings, input: &DrawInput) -> Option<Ui> {
-        let mut ui = Ui::default();
+        let mut ui = Ui { settings: *settings, ..Ui::default() };
         if settings.mode != 0 && !input.local_server {
             self.draw_graph(settings, input, &mut ui);
         }
+        ui.graph_pic_count = ui.pics.len();
+        ui.graph_big_text_count = ui.big_texts.len();
         self.draw_disconnect(input, &mut ui);
         (!ui.is_empty()).then_some(ui)
     }
@@ -338,11 +404,9 @@ impl Lagometer {
         let mut vscale = range / MAX_LAGOMETER_RANGE;
 
         // The frame interpolate / extrapolate graph.
-        let mut avg_interp = 0.0f32;
         for a in 0..aw {
             let i = frame_slot(self.frame_count.wrapping_sub(1).wrapping_sub(a as u32));
             let sample = self.frame_samples[i] as f32;
-            avg_interp += sample;
             let mut v = sample * vscale;
             let bar_x = ax + (aw - a) as f32 * coef;
             if v > 0.0 {
@@ -355,12 +419,9 @@ impl Lagometer {
                 ui.rects.push(Rect { x: bar_x, y: mid, w: 1.0 * coef, h: v, color: BLUE });
             }
         }
-        let avg_interp = (avg_interp / aw as f32) * -1.0;
-
         // The snapshot latency / drop graph.
         range = ah / 2.0;
         vscale = range / MAX_LAGOMETER_PING;
-        let mut avg_ping = 0.0f32;
         let mut highest_ping = 1i32;
         let (mut received, mut dropped) = (0u32, 0u32);
         for a in 0..aw {
@@ -372,7 +433,6 @@ impl Lagometer {
             let bar_x = ax + (aw - a) as f32 * coef;
             if sample > 0 {
                 received += 1;
-                avg_ping += sample as f32;
                 let color = if self.snapshot_flags[i] & i32::from(SNAPFLAG_RATE_DELAYED) != 0 {
                     YELLOW
                 } else {
@@ -382,11 +442,9 @@ impl Lagometer {
                 ui.rects.push(Rect { x: bar_x, y: ay + ah - v, w: 1.0 * coef, h: v, color });
             } else if sample < 0 {
                 dropped += 1;
-                avg_ping += highest_ping as f32;
                 ui.rects.push(Rect { x: bar_x, y: ay + ah - range, w: 1.0 * coef, h: range, color: RED });
             }
         }
-        let avg_ping = avg_ping / aw as f32;
 
         ay -= 1.0;
 
@@ -401,9 +459,11 @@ impl Lagometer {
         }
 
         if settings.mode == 2 || settings.mode == 3 || settings.mode == 4 {
-            ui.texts.push(Text { text: format!("{avg_ping:.0}"), x: ax + 3.0 * coef, y: ay, right: false });
+            ui.texts.push(Text { text: format!("{:.0}", self.text_avg_ping), x: ax + 3.0 * coef, y: ay, right: false });
             ui.texts.push(Text {
-                text: format!("{avg_interp:04.1}"),
+                // TaystJK uses `%04.1f` here. Whole milliseconds are easier to
+                // scan and leave more room beside a three-digit ping.
+                text: format!("{:.0}", self.text_avg_interp),
                 x: ax + aw as f32 * coef,
                 y: ay,
                 right: true,
@@ -593,6 +653,8 @@ mod tests {
             meter.add_snapshot_info(&snapshot(number, 60, 0), false, 20);
             meter.add_frame_info(number * 50 + 20, number * 50);
         }
+        // Cross one display cadence boundary with the complete 48-sample ring.
+        meter.add_frame_info(2_520, 2_500);
         let three = meter.draw(&Settings { mode: 3, ..Settings::default() }, &input()).expect("graph");
         assert!(three.pics.is_empty());
         let two = meter.draw(&Settings { mode: 2, ..Settings::default() }, &input()).expect("graph");
@@ -600,9 +662,31 @@ mod tests {
         for ui in [&three, &two] {
             assert_eq!(ui.texts.len(), 2);
             assert_eq!(ui.texts[0], Text { text: "60".to_owned(), x: 591.0 + 3.0, y: 319.0, right: false });
-            // Average of +20 ms offsets, negated.
-            assert_eq!(ui.texts[1], Text { text: "-20.0".to_owned(), x: 591.0 + 48.0, y: 319.0, right: true });
+            // Average of +20 ms offsets, negated; display precision is whole ms.
+            assert_eq!(ui.texts[1], Text { text: "-20".to_owned(), x: 591.0 + 48.0, y: 319.0, right: true });
         }
+    }
+
+    #[test]
+    fn numeric_readout_is_held_for_100ms() {
+        let mut meter = Lagometer::default();
+        for number in 1..=48 {
+            meter.add_snapshot_info(&snapshot(number, 60, 0), false, 20);
+            meter.add_frame_info(number * 50 + 20, number * 50);
+        }
+        let before = meter.text_avg_ping;
+
+        // A radically different new sample does not make the headline twitch
+        // on the very next high-FPS frame.
+        meter.add_snapshot_info(&snapshot(49, 600, 0), false, 20);
+        meter.add_frame_info(48 * 50 + 21, 48 * 50);
+        assert!(close(meter.text_avg_ping, before));
+
+        // Once the 100 ms display cadence elapses the already-window-averaged
+        // value advances.
+        meter.add_frame_info(48 * 50 + 121, 48 * 50);
+        assert!(meter.text_avg_ping > before);
+        assert!(meter.text_avg_ping < 600.0);
     }
 
     #[test]

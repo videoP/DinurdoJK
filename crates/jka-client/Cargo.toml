@@ -30,6 +30,7 @@ rodio = { version = "=0.22.2", default-features = false, features = ["playback",
 audionimbus = { version = "=0.16.0", features = ["auto-install"] }
 rayon = "=1.11.0"
 rapier3d = "=0.35.3"
+rapier-cloth-core = { path = "../jka-cloth-core" }
 wgpu = { version = "=29.0.4", default-features = false, features = ["std", "wgsl", "dx12", "vulkan"] }
 winit = "=0.30.13"
 

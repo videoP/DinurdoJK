@@ -168,33 +168,6 @@ impl App {
                     }
                 });
 
-                theme::section(
-                    ui,
-                    "SMOOTHING",
-                    "Render-only camera smoothing. These switches never change movement simulation or network command timing.",
-                );
-                theme::row(
-                    ui,
-                    "Smooth third-person target",
-                    "cg_smoothThirdPersonOrigin. Feed the third-person camera the same interpolated movement timeline instead of the latest stepped pmove origin.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_third_person_origin) {
-                            let _ = self.set_console_cvar("cg_smoothThirdPersonOrigin", if value { "1" } else { "0" });
-                        }
-                    },
-                );
-                theme::row(
-                    ui,
-                    "Smooth third-person camera time",
-                    "cg_smoothThirdPersonTime. Run camera damping from the continuous presentation clock instead of stepped commandTime.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_third_person_time) {
-                            let _ = self.set_console_cvar("cg_smoothThirdPersonTime", if value { "1" } else { "0" });
-                        }
-                    },
-                );
             });
     }
 
@@ -791,31 +764,10 @@ impl App {
         let _ = self.set_console_cvar("cg_stylePlayer", &style.to_string());
     }
 
-    // ------------------------------------------------------- game options --
+    // --------------------------------------------------------- HUD options --
 
-    /// jaPRO player visibility, race HUD and spectating rows on Setup -> Game.
-    pub(super) fn egui_japro_game_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section(
-            ui,
-            "PLAYER VISIBILITY",
-            "How other players in duels and race mode are drawn (jaPRO cg_stylePlayer).",
-        );
-        for &(bit, label, tip) in japro_cg::STYLE_TOGGLES {
-            theme::row(ui, label, tip, theme::Reset::None, |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(bit)) {
-                    self.set_style_bit(bit, on);
-                }
-            });
-        }
-        for &(bit, inverted, label, tip) in japro_cg::GHOST_TOGGLES {
-            theme::row(ui, label, tip, theme::Reset::None, |ui| {
-                let set = self.japro_cg.style_bit(bit);
-                if let Some(on) = theme::switch(ui, set != inverted) {
-                    self.set_style_bit(bit, on != inverted);
-                }
-            });
-        }
-
+    /// jaPRO HUD controls live with the rest of Setup -> Interface / HUD.
+    pub(super) fn egui_japro_hud_settings(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "RACE HUD", "The timer jaPRO shows while you are in race mode.");
         if let Some(value) = segmented_row(
             ui,
@@ -851,11 +803,6 @@ impl App {
                 });
             };
         }
-        race_number!("Timer size", "cg_raceTimerSize. Text scale of the timer.", race_timer_size, "cg_raceTimerSize", 0.1..=3.0, 0.01);
-        race_number!("Timer X", "cg_raceTimerX. Left edge of the timer on a 640x480 screen.", race_timer_x, "cg_raceTimerX", -640.0..=1280.0, 1.0);
-        race_number!("Timer Y", "cg_raceTimerY. Baseline of the timer on a 640x480 screen.", race_timer_y, "cg_raceTimerY", -480.0..=960.0, 1.0);
-        race_number!("Start readout X", "cg_raceStartX. Left edge of the start speed on a 640x480 screen.", race_start_x, "cg_raceStartX", -640.0..=1280.0, 1.0);
-        race_number!("Start readout Y", "cg_raceStartY. Baseline of the start speed on a 640x480 screen.", race_start_y, "cg_raceStartY", -480.0..=960.0, 1.0);
         race_number!("Start speed goal", "cg_startGoal. The start speed readout turns green at or above this speed. 0 disables the colour.", start_goal, "cg_startGoal", 0.0..=5000.0, 5.0);
 
         theme::section(
@@ -892,12 +839,7 @@ impl App {
                 });
             };
         }
-        speedometer_number!("Speedometer size", "cg_speedometerSize. Text scale of the speedometer.", size, "cg_speedometerSize", 0.1..=3.0, 0.01);
-        speedometer_number!("Speedometer X", "cg_speedometerX. Left edge of the speedometer on a 640x480 screen.", x, "cg_speedometerX", -640.0..=1280.0, 1.0);
-        speedometer_number!("Speedometer Y", "cg_speedometerY. Baseline of the speedometer on a 640x480 screen.", y, "cg_speedometerY", -480.0..=960.0, 1.0);
         speedometer_number!("Jumps stored", "cg_speedometerJumps. How many pre-speed jumps the jumps array keeps.", jumps, "cg_speedometerJumps", 0..=511, 1.0);
-        speedometer_number!("Jumps array X", "cg_speedometerJumpsX. Left edge of the pre-speed jumps array.", jumps_x, "cg_speedometerJumpsX", -640.0..=1280.0, 1.0);
-        speedometer_number!("Jumps array Y", "cg_speedometerJumpsY. Baseline of the pre-speed jumps array.", jumps_y, "cg_speedometerJumpsY", -480.0..=960.0, 1.0);
         speedometer_number!("Jump speed goal", "cg_jumpGoal. The first jump's pre-speed turns green at or above this speed. 0 disables the colour.", jump_goal, "cg_jumpGoal", 0.0..=5000.0, 5.0);
 
         theme::section(
@@ -915,20 +857,6 @@ impl App {
         ) {
             let _ = self.set_console_cvar("cg_lagometer", &value.to_string());
         }
-        macro_rules! lagometer_number {
-            ($label:literal, $tip:literal, $field:ident, $cvar:literal) => {
-                theme::row(ui, $label, $tip, theme::Reset::None, |ui| {
-                    let mut value = self.japro_cg.lagometer.$field;
-                    if ui
-                        .add(egui::DragValue::new(&mut value).range(-640..=1280).speed(1.0).update_while_editing(false))
-                        .changed()
-                    {
-                        let _ = self.set_console_cvar($cvar, &value.to_string());
-                    }
-                });
-            };
-        }
-        lagometer_number!("Lagometer X", "cg_lagometerX. Distance of the graph's right edge from the right of a 640x480 screen. The old speed graph shares it.", x, "cg_lagometerX");
         theme::row(
             ui,
             "Warning delay (commands)",
@@ -944,7 +872,33 @@ impl App {
                 }
             },
         );
-        lagometer_number!("Lagometer Y", "cg_lagometerY. Distance of the graph's bottom from the bottom of a 640x480 screen. The old speed graph shares it.", y, "cg_lagometerY");
+
+    }
+
+    // ------------------------------------------------------- game options --
+
+    /// jaPRO player visibility and spectating rows on Setup -> Game.
+    pub(super) fn egui_japro_game_settings(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "PLAYER VISIBILITY",
+            "How other players in duels and race mode are drawn (jaPRO cg_stylePlayer).",
+        );
+        for &(bit, label, tip) in japro_cg::STYLE_TOGGLES {
+            theme::row(ui, label, tip, theme::Reset::None, |ui| {
+                if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(bit)) {
+                    self.set_style_bit(bit, on);
+                }
+            });
+        }
+        for &(bit, inverted, label, tip) in japro_cg::GHOST_TOGGLES {
+            theme::row(ui, label, tip, theme::Reset::None, |ui| {
+                let set = self.japro_cg.style_bit(bit);
+                if let Some(on) = theme::switch(ui, set != inverted) {
+                    self.set_style_bit(bit, on != inverted);
+                }
+            });
+        }
 
         theme::section(ui, "SPECTATING", "Options while you watch other players.");
         theme::row(
@@ -967,7 +921,7 @@ impl App {
         }
         theme::section(ui, "SPECTATING", "Choose who to watch.");
         ui.horizontal_wrapped(|ui| {
-            if theme::primary_button(ui, "FOLLOW FASTEST").clicked() {
+            if theme::ghost_button(ui, "FOLLOW FASTEST").clicked() {
                 self.follow_fastest_now();
             }
             if theme::ghost_button(ui, "NEXT PLAYER").clicked() {
@@ -977,6 +931,40 @@ impl App {
                 self.forward_command_to_server("followprev");
             }
         });
+        let targets = self.companion_spectator_targets();
+        let current_target = self.companion_scene_target;
+        let selected_text = current_target
+            .map(|client| crate::logging::strip_jka_colors(&self.companion_scene_target_name(client)))
+            .unwrap_or_else(|| "Dashboard".to_owned());
+        let mut next_target = current_target;
+        theme::row(
+            ui,
+            "Companion spectator view",
+            "Show a second player's POV on the companion monitor. Only players present in your current spectator snapshot/PVS are available; the companion itself stays passive.",
+            theme::Reset::None,
+            |ui| {
+                egui::ComboBox::from_id_salt("companion_spectator_view")
+                    .selected_text(selected_text)
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(next_target.is_none(), "Dashboard").clicked() {
+                            next_target = None;
+                        }
+                        for (client, name) in &targets {
+                            let label = crate::logging::strip_jka_colors(name);
+                            if ui
+                                .selectable_label(next_target == Some(*client), label)
+                                .clicked()
+                            {
+                                next_target = Some(*client);
+                            }
+                        }
+                    });
+            },
+        );
+        if next_target != current_target {
+            self.set_companion_scene_target(next_target);
+        }
         let capture = self
             .game_session
             .as_ref()
@@ -992,6 +980,52 @@ impl App {
                 }
             });
         }
+        if let Some(mode) = segmented_row(
+            ui,
+            "Camera",
+            "Your local spectator camera while following a player. First person uses their POV; Third person uses the normal collision-aware chase camera; Orbit lets you rotate freely around them with the mouse and zoom with the wheel.",
+            theme::Reset::None,
+            self.spectator_camera.mode.as_i32(),
+            &[(0, "First person"), (1, "Third person"), (2, "Orbit")],
+        ) {
+            let _ = self.set_console_cvar("cg_specCamera", &mode.to_string());
+        }
+        theme::row(
+            ui,
+            "Face direction of motion",
+            "cg_specCameraMotion. In spectator Third person, use the followed player's current presented horizontal velocity as camera yaw, matching TaystJK cg_thirdPersonAngle -1 behavior.",
+            theme::Reset::None,
+            |ui| {
+                ui.add_enabled_ui(self.spectator_camera.mode == crate::camera::SpectatorCameraMode::ThirdPerson, |ui| {
+                    if let Some(on) = theme::switch(ui, self.spectator_camera.motion_direction) {
+                        let _ = self.set_console_cvar("cg_specCameraMotion", if on { "1" } else { "0" });
+                    }
+                });
+            },
+        );
+        theme::row(
+            ui,
+            "Orbit distance",
+            "cg_specOrbitRange. Starting/current orbit distance. While Orbit is active and the game has mouse capture, the scroll wheel changes this directly.",
+            theme::Reset::None,
+            |ui| {
+                ui.add_enabled_ui(self.spectator_camera.mode == crate::camera::SpectatorCameraMode::Orbit, |ui| {
+                    let mut range = self.spectator_camera.orbit_range;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut range)
+                                .range(crate::camera::MIN_SPECTATOR_ORBIT_RANGE..=crate::camera::MAX_SPECTATOR_ORBIT_RANGE)
+                                .speed(2.0)
+                                .max_decimals(1)
+                                .update_while_editing(false),
+                        )
+                        .changed()
+                    {
+                        let _ = self.set_console_cvar("cg_specOrbitRange", &range.to_string());
+                    }
+                });
+            },
+        );
         theme::row(
             ui,
             "Keep following the fastest",

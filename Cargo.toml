@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-movement"]
+members = ["crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-cloth-core", "crates/jka-movement"]
 resolver = "2"
 
 [workspace.package]

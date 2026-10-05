@@ -5,6 +5,7 @@ use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
+        atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender},
         Mutex, OnceLock,
     },
@@ -42,6 +43,40 @@ pub struct LogRecord {
 const MAX_UI_LOG_LINES: usize = 10_000;
 
 static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
+
+/// Runtime diagnostic levels mirror the familiar id-tech cvars while avoiding
+/// plumbing them through every worker/render/cgame object. They are process-wide
+/// atomics because the logging sinks themselves are process-wide and can be hit
+/// from any of those threads.
+static DEVELOPER_LEVEL: AtomicU8 = AtomicU8::new(0);
+static RENDERER_VERBOSE_LEVEL: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_developer_level(level: u8) {
+    DEVELOPER_LEVEL.store(level.min(3), Ordering::Relaxed);
+}
+
+pub fn developer_level() -> u8 {
+    DEVELOPER_LEVEL.load(Ordering::Relaxed)
+}
+
+pub fn developer_enabled(required: u8) -> bool {
+    developer_level() >= required.max(1)
+}
+
+pub fn set_renderer_verbose_level(level: u8) {
+    RENDERER_VERBOSE_LEVEL.store(level.min(3), Ordering::Relaxed);
+}
+
+pub fn renderer_verbose_level() -> u8 {
+    RENDERER_VERBOSE_LEVEL.load(Ordering::Relaxed)
+}
+
+/// `developer` is the global superset; `r_verbose` exists so renderer spew can
+/// be enabled independently, matching the old renderer-specific cvar's purpose.
+pub fn renderer_verbose_enabled(required: u8) -> bool {
+    let required = required.max(1);
+    developer_level() >= required || renderer_verbose_level() >= required
+}
 
 pub fn init() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;

@@ -19,6 +19,16 @@ const G2_BONEWEIGHT_TOPBITS_SHIFT: u32 =
     G2_BITS_PER_BONEREF * MAX_G2_BONEWEIGHTS_PER_VERT as u32 - 8;
 const G2_BONEWEIGHT_TOPBITS_AND: u32 = 0x300;
 
+// OpenJK/JaPRo `OldToNewRemapTable` from `tr_ghoul2.cpp`: Jedi Outcast's
+// 72-bone humanoid meshes use Jedi Academy's 53-bone animation skeleton.
+// Removed toe, metacarpal and finger bones map to their surviving counterparts.
+const JK2_TO_JKA_HUMANOID_BONES: [usize; 72] = [
+    0, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+    24, 25, 26, 27, 28, 29, 29, 34, 35, 35, 30, 31, 31, 32, 33, 33, 32, 33, 33, 34, 35, 35, 36, 37,
+    38, 39, 40, 41, 42, 42, 43, 44, 44, 43, 44, 44, 45, 46, 46, 45, 46, 46, 47, 48, 48, 52,
+];
+const JKA_HUMANOID_BONE_COUNT: usize = 53;
+
 pub type Matrix3x4 = [[f32; 4]; 3];
 
 
@@ -57,6 +67,8 @@ pub struct GlmModel {
     pub name: String,
     /// OpenJK stores this without the `.gla` suffix and registers `<anim_name>.gla`.
     pub anim_name: String,
+    /// Required animation-skeleton size after legacy humanoid remapping.
+    /// A Jedi Outcast 72-bone humanoid GLM is normalized to 53 bones.
     pub num_bones: usize,
     pub hierarchy: Vec<GlmSurfaceHierarchy>,
     pub lods: Vec<GlmLod>,
@@ -195,7 +207,8 @@ pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
     Ok(cstr(bytes_at(data, 72, 64, "GLM animation name")?))
 }
 
-/// Parse a Ghoul2 GLM/MDXM version 6 mesh.
+/// Parse a Ghoul2 GLM/MDXM version 6 mesh, remapping legacy Jedi Outcast
+/// humanoid bone references as OpenJK's `R_LoadMDXM` does.
 pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
         return Err("expected Ghoul2 GLM/MDXM file".into());
@@ -207,6 +220,8 @@ pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     let name = cstr(bytes_at(data, 8, 64, "GLM name")?);
     let anim_name = glm_animation_name(data)?;
     let num_bones = bounded_count(i32_at(data, 140, "GLM bone count")?, 4096, "GLM bone count")?;
+    let legacy_humanoid =
+        num_bones == JK2_TO_JKA_HUMANOID_BONES.len() && anim_name.contains("_humanoid");
     let num_lods = bounded_count(i32_at(data, 144, "GLM LOD count")?, 64, "GLM LOD count")?;
     let ofs_lods = usize_i32(i32_at(data, 148, "GLM LOD offset")?, "GLM LOD offset")?;
     let num_surfaces = bounded_count(
@@ -412,7 +427,14 @@ pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
                         "GLM LOD {lod_index} surface {surface_index} references bone {bone}, but mesh declares {num_bones}"
                     ));
                 }
-                bone_references.push(bone);
+                // Validate against the authored count before remapping. Vertex
+                // weights still index this local table, so neither their indices
+                // nor their weights change, including when two bones collapse.
+                bone_references.push(if legacy_humanoid {
+                    JK2_TO_JKA_HUMANOID_BONES[bone]
+                } else {
+                    bone
+                });
             }
 
             let mut vertices = Vec::with_capacity(num_verts);
@@ -518,7 +540,11 @@ pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     Ok(GlmModel {
         name,
         anim_name,
-        num_bones,
+        num_bones: if legacy_humanoid {
+            JKA_HUMANOID_BONE_COUNT
+        } else {
+            num_bones
+        },
         hierarchy,
         lods,
     })
@@ -2003,6 +2029,213 @@ mod tests {
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
         ]);
+    }
+
+    // Synthetic MDXM bytes keep these regression tests independent of PK3s.
+    // Two LODs and multiple surfaces exercise every registration/skinning path.
+    fn humanoid_glm_fixture(num_bones: i32, anim_name: &str, references: &[i32]) -> Vec<u8> {
+        fn put_i32(data: &mut [u8], offset: usize, value: i32) {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let surface_count = references.chunks(8).len();
+        let hierarchy_start = MDXM_HEADER_SIZE + surface_count * 4;
+        let lods_start = hierarchy_start + surface_count * MDXM_HIERARCHY_PREFIX;
+        let mut data = vec![0; lods_start];
+        data[..4].copy_from_slice(b"2LGM");
+        put_i32(&mut data, 4, MDXM_VERSION);
+        data[72..72 + anim_name.len()].copy_from_slice(anim_name.as_bytes());
+        put_i32(&mut data, 140, num_bones);
+        put_i32(&mut data, 144, 2);
+        put_i32(&mut data, 148, lods_start as i32);
+        put_i32(&mut data, 152, surface_count as i32);
+        put_i32(&mut data, 156, hierarchy_start as i32);
+        for index in 0..surface_count {
+            let start = hierarchy_start + index * MDXM_HIERARCHY_PREFIX;
+            put_i32(
+                &mut data,
+                MDXM_HEADER_SIZE + index * 4,
+                (start - MDXM_HEADER_SIZE) as i32,
+            );
+            put_i32(&mut data, start + 136, -1);
+        }
+        for _ in 0..2 {
+            let lod_start = data.len();
+            let offsets_start = lod_start + 4;
+            data.resize(offsets_start + surface_count * 4, 0);
+            for (surface_index, bones) in references.chunks(8).enumerate() {
+                let start = data.len();
+                let verts_offset = MDXM_SURFACE_SIZE;
+                let refs_offset = verts_offset + bones.len() * (MDXM_VERTEX_SIZE + 8);
+                let surface_size = refs_offset + bones.len() * 4;
+                data.resize(start + surface_size, 0);
+                put_i32(
+                    &mut data,
+                    offsets_start + surface_index * 4,
+                    (start - offsets_start) as i32,
+                );
+                put_i32(&mut data, start + 4, surface_index as i32);
+                put_i32(&mut data, start + 8, -(start as i32));
+                put_i32(&mut data, start + 12, bones.len() as i32);
+                put_i32(&mut data, start + 16, verts_offset as i32);
+                put_i32(&mut data, start + 24, refs_offset as i32);
+                put_i32(&mut data, start + 28, bones.len() as i32);
+                put_i32(&mut data, start + 32, refs_offset as i32);
+                put_i32(&mut data, start + 36, surface_size as i32);
+                for (local, &bone) in bones.iter().enumerate() {
+                    let vertex = start + verts_offset + local * MDXM_VERTEX_SIZE;
+                    for (offset, value) in [(8, 1.0f32), (12, 1.0), (16, 2.0), (20, 3.0)] {
+                        data[vertex + offset..vertex + offset + 4]
+                            .copy_from_slice(&value.to_le_bytes());
+                    }
+                    // One weight, using its original local table index.
+                    put_i32(&mut data, vertex + 24, local as i32);
+                    put_i32(&mut data, start + refs_offset + local * 4, bone);
+                }
+            }
+            let lod_size = data.len() - lod_start;
+            put_i32(&mut data, lod_start, lod_size as i32);
+        }
+        let file_size = data.len();
+        put_i32(&mut data, 160, file_size as i32);
+        data
+    }
+
+    #[test]
+    fn legacy_humanoid_skins_with_jka_pose_across_surfaces_and_lods() {
+        // JK2 toes, spine, hands, removed finger bones, hand tag and face.
+        let old = [7, 8, 13, 31, 32, 33, 48, 54, 55, 56, 62, 68, 71];
+        let expected = [6, 7, 11, 29, 29, 34, 36, 42, 42, 43, 45, 47, 52];
+        let model = parse_glm(&humanoid_glm_fixture(
+            72,
+            "models/players/_humanoid/_humanoid",
+            &old,
+        ))
+        .unwrap();
+        assert_eq!(model.num_bones, 53);
+        let pose = (0..53)
+            .map(|bone| {
+                [
+                    [1.0, 0.0, 0.0, bone as f32],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(model.lods.len(), 2);
+        for lod in &model.lods {
+            assert_eq!(lod.surfaces.len(), 2);
+            for (surface, expected_bones) in lod.surfaces.iter().zip(expected.chunks(8)) {
+                assert_eq!(surface.bone_references, expected_bones);
+                let skinned = skin_glm_surface(surface, &pose).unwrap();
+                for (local, (&bone, vertex)) in
+                    expected_bones.iter().zip(&skinned.vertices).enumerate()
+                {
+                    assert_eq!(
+                        surface.vertices[local].weights,
+                        vec![GlmWeight {
+                            local_bone_index: local,
+                            weight: 1.0
+                        }]
+                    );
+                    assert_eq!(vertex.position, [1.0 + bone as f32, 2.0, 3.0]);
+                    assert_eq!(vertex.normal, [0.0, 0.0, 1.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_and_non_humanoid_meshes_keep_authored_bone_references() {
+        for (count, anim_name, references) in [
+            (
+                53,
+                "models/players/_humanoid/_humanoid",
+                vec![7, 8, 13, 32, 48, 52],
+            ),
+            (
+                72,
+                "models/players/custom/custom",
+                vec![7, 8, 13, 54, 68, 71],
+            ),
+            (1, "*default", vec![0]),
+        ] {
+            let model = parse_glm(&humanoid_glm_fixture(count, anim_name, &references)).unwrap();
+            assert_eq!(model.num_bones, count as usize);
+            for lod in &model.lods {
+                assert_eq!(
+                    lod.surfaces[0].bone_references,
+                    references
+                        .iter()
+                        .map(|&bone| bone as usize)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_humanoid_rejects_invalid_authored_bone_references() {
+        for (bone, message) in [
+            (-1, "negative Ghoul2 GLM bone reference"),
+            (72, "references bone 72, but mesh declares 72"),
+        ] {
+            let bytes = humanoid_glm_fixture(72, "models/players/_humanoid/_humanoid", &[bone]);
+            assert!(parse_glm(&bytes).unwrap_err().contains(message));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock assets and the JAWA skin packs"]
+    fn legacy_jawa_models_skin_with_stock_animation() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut assets = crate::pk3::AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        let gla_bytes = assets
+            .read("models/players/_humanoid/_humanoid.gla", 128 * 1024 * 1024)
+            .unwrap()
+            .expect("stock humanoid GLA")
+            .bytes;
+        let gla = parse_gla(&gla_bytes).unwrap();
+        assert_eq!(gla.num_bones(), 53);
+        let poses = [0, 100, gla.num_frames - 1].map(|frame| gla.compose_frame(frame).unwrap());
+        for name in [
+            "jawa_loki_4lom",
+            "jawa_loki_tc14",
+            "jawa_loki_c3po",
+            "jawa_maw",
+        ] {
+            let qpath = format!("models/players/{name}/model.glm");
+            let bytes = assets
+                .read(&qpath, 16 * 1024 * 1024)
+                .unwrap()
+                .expect(&qpath)
+                .bytes;
+            assert_eq!(i32_at(&bytes, 140, "bone count").unwrap(), 72);
+            let model = parse_glm(&bytes).unwrap();
+            assert_eq!(model.num_bones, gla.num_bones());
+            let mut vertex_count = 0;
+            for lod in &model.lods {
+                for surface in &lod.surfaces {
+                    assert!(surface
+                        .bone_references
+                        .iter()
+                        .all(|&bone| bone < gla.num_bones()));
+                    for pose in &poses {
+                        let skinned = skin_glm_surface(surface, pose).unwrap();
+                        assert!(skinned.vertices.iter().all(|v| v
+                            .position
+                            .iter()
+                            .chain(&v.normal)
+                            .all(|x| x.is_finite())));
+                    }
+                    vertex_count += surface.vertices.len();
+                }
+            }
+            assert!(vertex_count > 0);
+            println!(
+                "{qpath}: 72 -> 53 bones, {} LODs, {vertex_count} vertices skinned at 3 frames",
+                model.lods.len()
+            );
+        }
     }
 
     #[test]

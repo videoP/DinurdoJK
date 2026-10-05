@@ -4,9 +4,9 @@
 
 Physics remains C-owned. The build links two isolated implementations:
 
-- Existing stock OpenJK for offline play, base servers, and unimplemented mods.
-- TaystJK's JAPRO client movement for servers whose `gamename` starts with
-  `japro`, case-insensitively.
+- Existing stock OpenJK for offline play and ordinary Base JKA prediction.
+- TaystJK's shared client movement for JA+, jaPRO, and Base/other servers that
+  explicitly advertise `taystJKinfo` movement capabilities.
 
 Rust reads current configstrings and passes settings, commands, and entity inputs
 through the bridge. `native/mod_dispatch.c` owns native backend selection and
@@ -25,10 +25,12 @@ The user identified upstream as a more authoritative client reference than the
 local `D:/Code/Japro` fork. Relevant recent fixes include
 [stand-up prediction](https://github.com/taysta/TaystJK/commit/4a6b1f95b5643f3e00d3cb657e01dc2e85d7e94e)
 and [JA+ DFA flag selection](https://github.com/taysta/TaystJK/commit/0b7350b908c0d7f53e48cca82ec0460bf0aedc15).
-Those changes are present in the imported source. JA+ is detected but still uses
-the stock backend; importing a source branch does not enable that mod's support.
-Likewise the new base-game stand-up selection is not applied to the isolated
-stock backend in this milestone.
+Those changes are present in the imported source. JA+ now selects the shared
+TaystJK backend and supplies `jp_cinfo`, while jaPRO supplies `jcinfo`/`jcinfo2`.
+Server identity is kept separate from backend selection so the shared source's
+`cgs.serverMod` branches execute exactly for Base, JA+, or jaPRO. Base servers
+that advertise `taystJKinfo` also use the shared backend with `cgs.baseGame`
+preserved, rather than parsing capability bits and then running stock Pmove.
 
 Both C builds use `/fp:precise` on MSVC, disable strict aliasing where supported,
 and disable floating-point contraction where supported. They use the same
@@ -38,9 +40,10 @@ architecture, or server binary.
 
 ## Implemented
 
-- Fresh server identity and native settings from current configstrings; JAPRO
-  feature bits do not carry into base or unknown profiles.
-- `jcinfo`, `jcinfo2`, `taystJKinfo`, `dmflags`, `restricts`, hook strength,
+- Fresh server identity and native settings from current configstrings. JA+
+  `jp_cinfo` and jaPRO `jcinfo` remain mod-scoped, while `taystJKinfo` is a
+  server capability mask independent of gamename, matching current TaystJK.
+- `jp_cinfo`, `jcinfo`, `jcinfo2`, `taystJKinfo`, `dmflags`, `restricts`, hook strength,
   pmove settings, and `CS_LEGACY_FIXES` reach the C host. Legacy animation tables
   are refreshed when their flags change.
 - The pinned C implementation includes all 18 non-vehicle player styles.
@@ -84,9 +87,10 @@ This is the first movement integration, not complete JAPRO client parity.
    vehicle changes are not imported. Native vehicle simulation still requires a
    vehicle entity host. Upstream player physics also needs a targeted comparison
    with any locally modified server physics before promising exact agreement.
-6. **Other mods:** detection recognizes JA+, OpenJK Alt, Base Enhanced, and
-   Lugormod. They retain the existing stock prediction fallback until their
-   settings, snapshot semantics, and native branches are deliberately enabled.
+6. **Other mods:** JA+ now uses the TaystJK backend. Detection also recognizes
+   OpenJK Alt, Base Enhanced, and Lugormod; those retain stock prediction unless
+   they explicitly advertise generic `taystJKinfo` capabilities, pending their
+   own targeted settings/snapshot compatibility passes.
 7. **Remaining client features:** inventory race timers, speed/jump displays,
    trails/ghosts, score extensions, chat, sounds, visual preferences, commands,
    and existing Rust strafe-helper behavior before porting missing pieces.

@@ -3,9 +3,9 @@
 //! `CGAZ_*`, and the per-movement-style physics getters).
 //!
 //! Everything here is pure: the caller hands over a [`MovementHudState`] and
-//! gets back line segments in the 640x480 virtual HUD space that `cg_draw`
-//! uses, so the math can be unit tested without a renderer. `ui.rs` maps the
-//! segments to pixels.
+//! gets either line segments in the 640x480 virtual HUD space or, for the
+//! DinurdoJK-only Cinematic presentation, world-space guide rays. The renderer
+//! only consumes that geometry, so the TaystJK movement math stays testable.
 //!
 //! Intentional differences from the C:
 //! * `DF_DrawLine` stamps a chain of `size` x `size` quads per line; we emit
@@ -19,7 +19,7 @@
 //! * Vehicles, the WSW/Weze/sound/accel-meter/zone add-ons are not ported.
 
 use crate::ui::{
-    MovementHudState, StrafeHelperSettings, SHELPER_A, SHELPER_CENTER, SHELPER_CGAZ, SHELPER_D, SHELPER_MAX,
+    MovementHudState, StrafeHelperSettings, SHELPER_A, SHELPER_CENTER, SHELPER_CGAZ, SHELPER_CINEMATIC, SHELPER_D, SHELPER_MAX,
     SHELPER_ORIGINAL, SHELPER_REAR, SHELPER_S, SHELPER_SA, SHELPER_SD, SHELPER_TINY, SHELPER_UPDATED, SHELPER_W, SHELPER_WA,
     SHELPER_WD,
 };
@@ -33,6 +33,82 @@ const LINE_HEIGHT: f32 = 0.5 * SCREEN_HEIGHT;
 /// `BUTTON_DASH` / `BUTTON_WALKING` from q_shared.h.
 const BUTTON_DASH: i32 = 8192;
 const BUTTON_WALKING: i32 = 16;
+
+/// Command data reconstructed from a non-predicted/followed player snapshot.
+///
+/// TaystJK cannot read another client's real usercmd while spectating, so its
+/// `DF_SetClientCmd` rebuilds the pieces the strafehelper needs from replicated
+/// player/entity state instead. Keep that policy here instead of accidentally
+/// feeding the local spectator's own command into the followed player's HUD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpectatedCmd {
+    pub forward_move: i8,
+    pub right_move: i8,
+    pub up_move: i8,
+    pub buttons: i32,
+}
+
+/// TaystJK `DF_SetClientCmd` / `DF_DirToCmd` reconstruction for a followed
+/// player. `walking_anim` is supplied by the presentation layer because the
+/// animation table lives in `jka-assets`, not in this pure HUD module.
+pub fn spectated_cmd(
+    movement_dir: i32,
+    velocity: [f32; 3],
+    pm_flags: i32,
+    e_flags: i32,
+    walking_anim: bool,
+) -> SpectatedCmd {
+    const PMF_DUCKED: i32 = 1;
+    const PMF_JUMP_HELD: i32 = 2;
+    const PMF_ROLLING: i32 = 4;
+    const EF_FIRING: i32 = 1 << 9;
+    const EF_ALT_FIRING: i32 = 1 << 10;
+
+    // TaystJK clears movementDir while effectively stationary so stale
+    // snapshot direction does not leave an active strafe line behind.
+    let horizontal_speed = velocity[0].hypot(velocity[1]);
+    let key = if horizontal_speed < 9.0 {
+        None
+    } else {
+        match movement_dir {
+            0 => Some(Key::W),
+            1 => Some(Key::Wa),
+            2 => Some(Key::A),
+            3 => Some(Key::As),
+            4 => Some(Key::S),
+            5 => Some(Key::Sd),
+            6 => Some(Key::D),
+            7 => Some(Key::Dw),
+            _ => None,
+        }
+    };
+    let (forward, right) = key.map(Key::axes).unwrap_or((0, 0));
+
+    let up_move = if pm_flags & PMF_JUMP_HELD != 0 {
+        127
+    } else if pm_flags & (PMF_DUCKED | PMF_ROLLING) != 0 {
+        -1
+    } else {
+        0
+    };
+
+    let mut buttons = 0;
+    if e_flags & EF_FIRING != 0 && e_flags & EF_ALT_FIRING == 0 {
+        buttons |= jka_movement::BUTTON_ATTACK;
+    } else if e_flags & EF_ALT_FIRING != 0 {
+        buttons |= jka_movement::BUTTON_ALT_ATTACK;
+    }
+    if walking_anim {
+        buttons |= BUTTON_WALKING;
+    }
+
+    SpectatedCmd {
+        forward_move: forward as i8,
+        right_move: right as i8,
+        up_move,
+        buttons,
+    }
+}
 
 /// `movementStyle_e` (bg_public.h, with `_SPPHYSICS` and `_COOP` on).
 pub mod mv {
@@ -95,6 +171,18 @@ pub struct StrafeSegment {
     pub from: [f32; 2],
     pub to: [f32; 2],
     pub size: f32,
+    pub color: [f32; 4],
+}
+
+/// One DinurdoJK Cinematic strafehelper guide in JKA world space. The caller
+/// renders this as additive, depth-tested FX geometry; no white saber core is
+/// part of the style, so `color` remains the actual strafehelper line colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrafeWorldRay {
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    /// Half-width of the bright coloured ribbon, in JKA world units.
+    pub width: f32,
     pub color: [f32; 4],
 }
 
@@ -552,6 +640,22 @@ struct Line {
     point: [f32; 2],
 }
 
+/// `DF_SetLineColor`, shared by the legacy HUD styles and the Cinematic
+/// world-space presentation so the new renderer cannot drift from TaystJK's
+/// active/inactive/max colour semantics.
+fn line_color(settings: &StrafeHelperSettings, active: bool, key: Option<Key>, gaz: Gaz) -> [f32; 4] {
+    if active {
+        if gaz == Gaz::Max {
+            return [1.0, 0.0, 0.0, 1.0];
+        }
+        let [r, g, b, a] = settings.active_color;
+        return [r, g, b, a].map(|c| f32::from(c) / 255.0);
+    }
+    let mut color = key.map_or([1.0, 0.75, 0.0, 0.75], Key::color);
+    color[3] = f32::from(settings.inactive_alpha) / 255.0;
+    color
+}
+
 struct Builder<'a> {
     settings: &'a StrafeHelperSettings,
     model: Model<'a>,
@@ -616,17 +720,7 @@ impl Builder<'_> {
 
     /// `DF_SetLineColor`.
     fn color(&self, line: &Line) -> [f32; 4] {
-        let s = self.settings;
-        if line.active {
-            if line.gaz == Gaz::Max {
-                return [1.0, 0.0, 0.0, 1.0];
-            }
-            let [r, g, b, a] = s.active_color;
-            return [r, g, b, a].map(|c| f32::from(c) / 255.0);
-        }
-        let mut color = line.key.map_or([1.0, 0.75, 0.0, 0.75], Key::color);
-        color[3] = f32::from(s.inactive_alpha) / 255.0;
-        color
+        line_color(self.settings, line.active, line.key, line.gaz)
     }
 
     fn push_segment(&mut self, from: [f32; 2], to: [f32; 2], y_limit: f32, color: [f32; 4]) {
@@ -712,6 +806,145 @@ impl Builder<'_> {
     }
 }
 
+/// Cinematic uses the exact same TaystJK/jaPRO optimum-angle decisions as the
+/// HUD styles, but keeps the guide as horizontal world-space geometry instead
+/// of flattening it into 640x480. TaystJK already uses
+/// `cg_strafeHelperPrecision` as the world-space distance before projection;
+/// preserve that distance here. Only the foot-level placement and glow are the
+/// DinurdoJK presentation layer.
+struct WorldBuilder<'a> {
+    settings: &'a StrafeHelperSettings,
+    model: Model<'a>,
+    velocity_yaw: f32,
+    origin: [f32; 3],
+    length: f32,
+    width: f32,
+    out: Vec<StrafeWorldRay>,
+}
+
+impl WorldBuilder<'_> {
+    fn flag(&self, flag: u32) -> bool {
+        self.settings.flags & flag != 0
+    }
+
+    fn rear_enabled(&self) -> bool {
+        self.flag(SHELPER_REAR) && !center_only(self.model.style)
+    }
+
+    fn emit(&mut self, yaw_offset: f32, active: bool, key: Option<Key>, gaz: Gaz) {
+        // OpenJK's player MINS_Z is -24 and its foot probes use mins.z + 1.
+        // Reuse that convention: the guide floats one JKA unit above a flat
+        // floor instead of z-fighting it. The line itself stays horizontal,
+        // matching DF_SetAngleToX forcing line[2] = start[2].
+        const FOOT_Z: f32 = -23.0;
+
+        let yaw = (self.velocity_yaw + yaw_offset).to_radians();
+        let (sin, cos) = yaw.sin_cos();
+        let start = [self.origin[0], self.origin[1], self.origin[2] + FOOT_Z];
+        let end = [
+            start[0] + cos * self.length,
+            start[1] + sin * self.length,
+            start[2],
+        ];
+        self.out.push(StrafeWorldRay {
+            start,
+            end,
+            width: self.width,
+            color: line_color(self.settings, active, key, gaz),
+        });
+    }
+
+    fn key_ray(&mut self, key: Key, rear: bool, gaz: Gaz) {
+        let real = self.model.cmd;
+        let (forward, right) = key.axes();
+        let active = real.forward == forward && real.right == right;
+        let draw = if key == Key::S {
+            self.flag(SHELPER_S) || self.rear_enabled()
+        } else {
+            self.flag(key.flag())
+        };
+        if !draw || center_only(self.model.style) {
+            return;
+        }
+        let delta = self.model.delta(gaz, Cmd { forward, right, up: real.up });
+        self.emit(key.angle(rear, delta), active, Some(key), gaz);
+    }
+
+    fn center_ray(&mut self, rear: bool) {
+        if !self.flag(SHELPER_CENTER) {
+            return;
+        }
+        let real = self.model.cmd;
+        self.emit(if rear { 180.0 } else { 0.0 }, real.forward == 0, None, Gaz::Opt);
+    }
+
+    /// Same `DF_StrafeHelper` line selection/order as [`Builder::build`].
+    fn build(&mut self) {
+        let style = self.model.style;
+        if style == mv::SIEGE {
+            return;
+        }
+        let rear_lines = self.rear_enabled();
+        if center_only(style) || self.model.physics.has_air_control {
+            for rear in [false, true].into_iter().filter(|&rear| !rear || rear_lines) {
+                self.center_ray(rear);
+            }
+        }
+        if center_only(style) {
+            return;
+        }
+        let real = self.model.cmd;
+        let Some(move_dir) = Key::from_axes(real.forward, real.right) else {
+            return;
+        };
+        let both_sides = rear_lines || matches!(move_dir, Key::W | Key::Wa | Key::Dw);
+
+        for key in Key::ALL.into_iter().filter(|&key| key != move_dir) {
+            for rear in [false, true].into_iter().filter(|&rear| !rear || rear_lines || key == Key::W) {
+                self.key_ray(key, rear, Gaz::Opt);
+            }
+        }
+        let sides = || [false, true].into_iter().filter(move |&rear| !rear || both_sides);
+        if self.flag(SHELPER_MAX) {
+            for rear in sides() {
+                self.key_ray(move_dir, rear, Gaz::Max);
+            }
+        }
+        for rear in sides() {
+            self.key_ray(move_dir, rear, Gaz::Opt);
+        }
+    }
+}
+
+/// DinurdoJK Cinematic strafehelper geometry. Physics/angle selection is still
+/// the TaystJK port above; only the final presentation changes from 2D HUD
+/// segments to coloured, depth-tested world-space rays.
+pub fn strafe_world_rays(
+    settings: &StrafeHelperSettings,
+    hud: &MovementHudState,
+    fps_cap: u32,
+) -> Vec<StrafeWorldRay> {
+    if settings.flags & SHELPER_CINEMATIC == 0 || hud.in_vehicle || hud.spectator_free_roam {
+        return Vec::new();
+    }
+    let mut builder = WorldBuilder {
+        settings,
+        model: Model::new(hud, settings, frametime(settings, fps_cap)),
+        velocity_yaw: hud.velocity[1].atan2(hud.velocity[0]).to_degrees(),
+        origin: hud.origin,
+        // TaystJK DF_SetStrafeHelper clamps sensitivity to this exact range,
+        // then DF_SetAngleToX uses it as the world-space line distance.
+        length: settings.precision.clamp(100, 10000) as f32,
+        // FxDraw::Line width is a half-width in world units. Keep line_width's
+        // familiar relative scale while making the 3D guide substantial enough
+        // to read as a luminous object rather than a one-pixel debug primitive.
+        width: settings.line_width.clamp(0.25, 5.0) * 2.0,
+        out: Vec::with_capacity(20),
+    };
+    builder.build();
+    builder.out
+}
+
 /// `DF_DrawLine`'s visibility test only stamps squares with `y < y_limit`,
 /// `y < SCREEN_HEIGHT` and `x < SCREEN_WIDTH`. Clip the segment to that region
 /// and apply the half-size offsets that center the stamped squares on the line.
@@ -764,7 +997,7 @@ pub fn strafe_lines(
     fps_cap: u32,
     aspect: f32,
 ) -> Vec<StrafeSegment> {
-    if hud.in_vehicle {
+    if hud.in_vehicle || hud.spectator_free_roam {
         return Vec::new();
     }
     let anchored_at_origin = hud.third_person || settings.flags & SHELPER_ORIGINAL != 0;
@@ -802,6 +1035,48 @@ mod tests {
     }
 
     #[test]
+    fn free_spectator_suppresses_all_strafehelper_lines() {
+        let mut state = air_state(127, -127);
+        state.spectator_free_roam = true;
+
+        assert!(strafe_lines(
+            &settings(SHELPER_CGAZ | SHELPER_WA),
+            &state,
+            125,
+            4.0 / 3.0,
+        )
+        .is_empty());
+        assert!(strafe_world_rays(
+            &settings(SHELPER_CINEMATIC | SHELPER_WA),
+            &state,
+            125,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn cinematic_is_world_only_and_keeps_tayst_angles() {
+        let mut state = air_state(127, -127);
+        state.origin = [100.0, 200.0, 300.0];
+        let cinematic = settings(SHELPER_CINEMATIC | SHELPER_WA);
+
+        // The Cinematic bit is presentation-only: it must not accidentally
+        // reactivate one of the legacy 2D drawing branches.
+        assert!(strafe_lines(&cinematic, &state, 125, 4.0 / 3.0).is_empty());
+
+        let rays = strafe_world_rays(&cinematic, &state, 125);
+        assert_eq!(rays.len(), 2, "held WA keeps TaystJK's two optimum sides");
+        assert!((rays[0].start[2] - 277.0).abs() < 1e-4);
+        assert!((rays[0].end[2] - 277.0).abs() < 1e-4);
+        let expected_length = cinematic.precision as f32;
+        let actual_length = ((rays[0].end[0] - rays[0].start[0]).powi(2)
+            + (rays[0].end[1] - rays[0].start[1]).powi(2))
+            .sqrt();
+        assert!((actual_length - expected_length).abs() < 1e-3);
+        assert_eq!(rays[0].color, [0.0, 1.0, 0.0, 200.0 / 255.0]);
+    }
+
+    #[test]
     fn opt_angle_matches_the_air_formula() {
         // acos((250 - 250 * 1 / 125) / 700) - 45 degrees.
         let expected = ((250.0_f32 - 2.0) / 700.0).acos().to_degrees() - 45.0;
@@ -818,6 +1093,42 @@ mod tests {
         state.velocity = [320.0, 0.0, 0.0];
         let model = Model::new(&state, &settings(0), 1.0 / 125.0);
         assert_eq!(model.delta(Gaz::Opt, model.cmd), 0.0);
+    }
+
+    #[test]
+    fn spectated_cmd_rebuilds_tayst_movement_dir() {
+        let cmd = spectated_cmd(1, [500.0, 0.0, 0.0], 0, 0, false);
+        assert_eq!(cmd.forward_move, 127);
+        assert_eq!(cmd.right_move, -127);
+        assert_eq!(cmd.up_move, 0);
+
+        let cmd = spectated_cmd(6, [500.0, 0.0, 0.0], 0, 0, false);
+        assert_eq!(cmd.forward_move, 0);
+        assert_eq!(cmd.right_move, 127);
+    }
+
+    #[test]
+    fn spectated_cmd_clears_stale_direction_when_stationary() {
+        let cmd = spectated_cmd(0, [8.99, 0.0, 0.0], 0, 0, false);
+        assert_eq!((cmd.forward_move, cmd.right_move), (0, 0));
+    }
+
+    #[test]
+    fn spectated_cmd_rebuilds_jump_duck_fire_and_walk() {
+        const PMF_JUMP_HELD: i32 = 2;
+        const PMF_DUCKED: i32 = 1;
+        const EF_FIRING: i32 = 1 << 9;
+        const EF_ALT_FIRING: i32 = 1 << 10;
+
+        let jump = spectated_cmd(0, [400.0, 0.0, 200.0], PMF_JUMP_HELD, EF_FIRING, true);
+        assert_eq!(jump.up_move, 127);
+        assert_ne!(jump.buttons & jka_movement::BUTTON_ATTACK, 0);
+        assert_ne!(jump.buttons & BUTTON_WALKING, 0);
+
+        let duck_alt = spectated_cmd(0, [400.0, 0.0, 0.0], PMF_DUCKED, EF_FIRING | EF_ALT_FIRING, false);
+        assert_eq!(duck_alt.up_move, -1);
+        assert_eq!(duck_alt.buttons & jka_movement::BUTTON_ATTACK, 0);
+        assert_ne!(duck_alt.buttons & jka_movement::BUTTON_ALT_ATTACK, 0);
     }
 
     #[test]

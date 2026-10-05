@@ -745,7 +745,8 @@ fn run_steam_audio_environment_thread(
 
     let mut sources: HashMap<u64, SteamAudioSimulationSource<Direct>> = HashMap::new();
     ready.store(true, Ordering::Release);
-    println!(
+    devprintln!(
+        1,
         "STEAM AUDIO DIRECT SIM: ready from {scene_source}: {} acoustic tris; {} Hz; raycast occlusion + material transmission (up to {} occluding surfaces); {} Hz updates",
         mesh.triangles.len(),
         sample_rate,
@@ -1451,7 +1452,8 @@ impl AudioBackend {
             let runtime = SteamAudioSignalRuntime::new(output_sample_rate.get());
             let hrtf_error = runtime.hrtf_error.clone();
             if runtime.hrtf.is_some() {
-                println!(
+                devprintln!(
+                    1,
                     "STEAM AUDIO SIGNAL DSP: ready at {} Hz / {}-sample blocks (HRTF available)",
                     output_sample_rate.get(),
                     runtime.settings.frame_size,
@@ -1715,7 +1717,8 @@ impl AudioBackend {
             self.steam_audio_acoustic_mesh = mesh;
             self.steam_audio_bake = bake;
             if let Some(bake) = &self.steam_audio_bake {
-                println!(
+                devprintln!(
+                    1,
                     "STEAM AUDIO RUNTIME ASSETS: attached {} probes / {:.2} MiB / {}; audible DSP pending",
                     bake.probe_count,
                     bake.serialized_bytes() as f64 / (1024.0 * 1024.0),

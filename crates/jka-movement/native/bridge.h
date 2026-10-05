@@ -106,7 +106,7 @@ typedef struct jka_saber_movement_info_s {
 typedef struct jka_predict_settings_s {
     int32_t pmove_fixed, pmove_msec, pmove_float, gametype;
     int32_t debug_melee, step_slide_fix, no_spec_move, tracemask, no_footsteps;
-    int32_t server_mod, jcinfo, jcinfo2, taystjk_info, dmflags, hook_pull, restricts, plugin_disable;
+    int32_t backend, server_mod, cinfo, jcinfo, jcinfo2, taystjk_info, dmflags, hook_pull, restricts, base_game, plugin_disable;
     uint32_t legacy_fixes;
 } jka_predict_settings;
 

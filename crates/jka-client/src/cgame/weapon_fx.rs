@@ -318,23 +318,14 @@ pub fn profile_saber_blade_draws(
             shader: glow_shader.to_owned(),
         });
     } else {
-        let mut distance = length;
-        let mut glow_radius = radius;
-        while distance > 0.0 {
-            draws.push(FxDraw::Sprite {
-                origin: madd3(origin, direction, distance),
-                radius: glow_radius,
-                rotation: 0.0,
-                rgba: glow_full,
-                shader: glow_shader.to_owned(),
-            });
-            distance -= (glow_radius * 0.65).max(0.05);
-            glow_radius += 0.017;
-        }
-        draws.push(FxDraw::Sprite {
+        // UI_DoSaber submits one RT_SABER_GLOW. Its renderer-side hilt pulse
+        // is Q_flrand(0, 1) * 0.25 on top of 5.5 units.
+        draws.push(FxDraw::SaberGlow {
             origin,
-            radius: 5.5,
-            rotation: 0.0,
+            direction,
+            length,
+            radius,
+            hilt_radius: 5.5 + rng.flrand(0.0, 1.0) * 0.25,
             rgba: glow_full,
             shader: glow_shader.to_owned(),
         });
@@ -342,7 +333,7 @@ pub fn profile_saber_blade_draws(
     draws.push(FxDraw::Line {
         start: tip,
         end: line_base,
-        width: core_radius.max(0.01),
+        width: core_radius,
         rgba: white,
         shader: line_shader.to_owned(),
     });
@@ -607,9 +598,17 @@ struct SaberTrailSegment {
 
 #[derive(Clone, Copy, Debug)]
 struct SaberContactHistory {
+    /// Previous emitted wall-mark sample. Under the default scope this is the
+    /// previous presentation-frame contact, matching OpenJK. Under the extended
+    /// cg_fxFPSScope it advances only on fixed-rate samples.
     have_old_pos: bool,
     old_pos: [f32; 3],
+    /// Previous presentation-frame contact used to interpolate fixed-rate
+    /// samples even when cg_fxFPS is higher than the render rate.
+    last_contact_pos: [f32; 3],
+    last_contact_normal: [f32; 3],
     last_time: i32,
+    next_fx_sample_time: f64,
     last_sound_time: i32,
     last_spark_time: i32,
 }
@@ -619,7 +618,10 @@ impl Default for SaberContactHistory {
         Self {
             have_old_pos: false,
             old_pos: [0.0; 3],
+            last_contact_pos: [0.0; 3],
+            last_contact_normal: [0.0, 1.0, 0.0],
             last_time: i32::MIN / 2,
+            next_fx_sample_time: f64::NEG_INFINITY,
             last_sound_time: i32::MIN / 2,
             last_spark_time: i32::MIN / 2,
         }
@@ -811,11 +813,16 @@ pub struct WeaponFx {
     /// `0` is stock JKA: invoke continuous projectile FX every presentation
     /// frame. Non-zero values sample them at a fixed rate independent of FPS.
     continuous_fx_fps: u32,
+    fx_fps_scope: u32,
     /// Mirrors the worker's `fx_physics` mode (worker starts at the default).
     fx_physics: u32,
     /// Mirrors the worker's `fx_lod` mode and `fx_countScale`.
     fx_lod: (u32, f32, f32),
     runner_rng: Rng,
+    /// RT_SABER_GLOW is expanded by the renderer, not CGame. Keep its hilt
+    /// pulse RNG separate so it cannot perturb CG_DoSaber's blade/core/light
+    /// random sequence for this blade or the next one.
+    saber_renderer_rng: Rng,
     puffs: Vec<Puff>,
     beams: Vec<Beam>,
     chunks: Vec<Chunk>,
@@ -892,9 +899,11 @@ impl WeaponFx {
             entity_fx: HashMap::new(),
             missile_fx: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
             fx_lod: (crate::fx::FX_LOD_DEFAULT, 1.0, crate::fx::LOD_SCALE_DEFAULT),
             runner_rng: Rng::new(0x4658_5255_4E4E_4552),
+            saber_renderer_rng: Rng::new(0x5341_4245_525F_474C),
             puffs: Vec::new(),
             beams: Vec::new(),
             chunks: Vec::new(),
@@ -1038,6 +1047,17 @@ impl WeaponFx {
             // Start the new cadence from the next presented sample instead of
             // inheriting phase from the previous rate/mode.
             self.missile_fx.clear();
+            self.saber_contact_history.clear();
+        }
+    }
+
+    pub fn set_fx_fps_scope(&mut self, value: u32) {
+        let value = value.min(crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN);
+        if self.fx_fps_scope != value {
+            self.fx_fps_scope = value;
+            // Do not connect a newly fixed-rate stroke to history accumulated
+            // under presentation-frame cadence (or vice versa).
+            self.saber_contact_history.clear();
         }
     }
 
@@ -1934,6 +1954,7 @@ impl WeaponFx {
             if let Some(history) = self.saber_contact_history.get_mut(&key) {
                 history.have_old_pos = false;
                 history.last_time = self.time;
+                history.next_fx_sample_time = f64::NEG_INFINITY;
             }
             self.finish_melt_stroke(key);
             return length;
@@ -1949,6 +1970,97 @@ impl WeaponFx {
         let previous = self.saber_contact_history.get(&key).copied().unwrap_or_default();
         let mut next = previous;
         next.last_time = self.time;
+
+        // Extended scope: preserve OpenJK's geometry/contact semantics, but
+        // sample the presentation-frame-driven legacy saber sparks/marks at the
+        // same fixed cadence as continuous EFX. Interpolate between consecutive
+        // render-frame contacts so 90/120/250 Hz remains spatially continuous
+        // even when the renderer itself is presenting more slowly. Authored EFX
+        // timing is not rewritten.
+        let fixed_legacy_contact = self.fx_fps_scope == crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN
+            && self.continuous_fx_fps != crate::fx::FX_FPS_LEGACY_JKA
+            && matches!(self.saber_marks, SaberMarkMode::Legacy);
+        if fixed_legacy_contact {
+            let now = f64::from(self.time);
+            let period = 1000.0 / f64::from(self.continuous_fx_fps.max(1));
+            let continuous = previous.last_time > i32::MIN / 4
+                && self.time >= previous.last_time
+                && self.time.saturating_sub(previous.last_time) <= CONTINUOUS_FX_BACKFILL_MAX_MS;
+
+            if !continuous || !previous.next_fx_sample_time.is_finite() {
+                // First contact arms the sample history immediately, just like
+                // OpenJK arms trail.haveOldPos on its first touching frame.
+                if !no_wall_marks && can_impact {
+                    self.play("sparks/spark_nosnd", hit.end, hit_normal);
+                    next.last_spark_time = self.time;
+                }
+                next.have_old_pos = can_mark;
+                next.old_pos = hit.end;
+                next.next_fx_sample_time = now + period;
+            } else {
+                let frame_dt = f64::from((self.time - previous.last_time).max(1));
+                let mut sample_time = previous.next_fx_sample_time;
+                let mut emitted = 0usize;
+                while sample_time <= now + f64::EPSILON && emitted < 64 {
+                    let t = ((sample_time - f64::from(previous.last_time)) / frame_dt)
+                        .clamp(0.0, 1.0) as f32;
+                    let sample_pos = [
+                        previous.last_contact_pos[0] + (hit.end[0] - previous.last_contact_pos[0]) * t,
+                        previous.last_contact_pos[1] + (hit.end[1] - previous.last_contact_pos[1]) * t,
+                        previous.last_contact_pos[2] + (hit.end[2] - previous.last_contact_pos[2]) * t,
+                    ];
+                    let sample_normal = normalize3([
+                        previous.last_contact_normal[0] + (hit_normal[0] - previous.last_contact_normal[0]) * t,
+                        previous.last_contact_normal[1] + (hit_normal[1] - previous.last_contact_normal[1]) * t,
+                        previous.last_contact_normal[2] + (hit_normal[2] - previous.last_contact_normal[2]) * t,
+                    ]);
+                    if !no_wall_marks && can_impact {
+                        self.play("sparks/spark_nosnd", sample_pos, sample_normal);
+                        next.last_spark_time = self.time;
+                    }
+                    if can_mark && next.have_old_pos
+                        && length3(sub3(sample_pos, next.old_pos)) > 1.0e-4
+                    {
+                        self.push_legacy_saber_wall_mark(next.old_pos, sample_pos, sample_normal);
+                    }
+                    if can_mark {
+                        next.old_pos = sample_pos;
+                        next.have_old_pos = true;
+                    } else {
+                        next.have_old_pos = false;
+                    }
+                    sample_time += period;
+                    emitted += 1;
+                }
+                // A hitch should not cause an unbounded burst. If the safety
+                // cap was reached, resume from the first future sample.
+                if sample_time <= now {
+                    let skipped = ((now - sample_time) / period).floor() + 1.0;
+                    sample_time += skipped * period;
+                }
+                next.next_fx_sample_time = sample_time;
+
+                // Audio is not an EFX density artifact. Keep OpenJK's 100 ms
+                // wall-hit debounce independent of the visual sampling rate.
+                if can_mark && previous.have_old_pos
+                    && self.time.saturating_sub(previous.last_sound_time) >= 100
+                {
+                    let variant = self.runner_rng.irand(1, 3);
+                    self.immediate_sounds.push(FxSound {
+                        origin: hit.end,
+                        qpath: format!("sound/weapons/saber/saberhitwall{variant}.wav"),
+                    });
+                    next.last_sound_time = self.time;
+                }
+            }
+            next.last_contact_pos = hit.end;
+            next.last_contact_normal = hit_normal;
+            if !can_mark {
+                next.have_old_pos = false;
+            }
+            self.saber_contact_history.insert(key, next);
+            return clipped_length;
+        }
 
         // OpenJK performs saber/world contact once per presentation frame. The
         // cg_fxFPS knob is for scheduled/continuous .efx emitters, not marks.
@@ -2023,6 +2135,8 @@ impl WeaponFx {
 
         next.have_old_pos = can_mark;
         next.old_pos = hit.end;
+        next.last_contact_pos = hit.end;
+        next.last_contact_normal = hit_normal;
         self.saber_contact_history.insert(key, next);
         clipped_length
     }
@@ -2311,25 +2425,17 @@ impl WeaponFx {
                 shader: glow_shader.to_owned(),
             });
         } else {
-            // OpenJK RB_SurfaceSaberGlow: march view-facing glow sprites from
-            // blade tip to hilt, growing the radius slightly each step.
-            let mut distance = length;
-            let mut glow_radius = radius;
-            while distance > 0.0 {
-                self.immediate_draws.push(FxDraw::Sprite {
-                    origin: madd3(origin, direction, distance),
-                    radius: glow_radius,
-                    rotation: 0.0,
-                    rgba: glow_full,
-                    shader: glow_shader.to_owned(),
-                });
-                distance -= (glow_radius * 0.65).max(0.05);
-                glow_radius += 0.017;
-            }
-            self.immediate_draws.push(FxDraw::Sprite {
+            // CG_DoSaber submits exactly one RT_SABER_GLOW. The renderer owns
+            // the bead-chain expansion and its independent 5.5..5.75 hilt
+            // pulse, matching TaystJK RB_SurfaceSaberGlow instead of flattening
+            // the entity into generic CGame sprites here.
+            let hilt_radius = 5.5 + self.saber_renderer_rng.flrand(0.0, 1.0) * 0.25;
+            self.immediate_draws.push(FxDraw::SaberGlow {
                 origin,
-                radius: 5.5,
-                rotation: 0.0,
+                direction,
+                length,
+                radius,
+                hilt_radius,
                 rgba: glow_full,
                 shader: glow_shader.to_owned(),
             });
@@ -2341,7 +2447,7 @@ impl WeaponFx {
         self.immediate_draws.push(FxDraw::Line {
             start: tip,
             end: line_base,
-            width: core_radius.max(0.01),
+            width: core_radius,
             rgba: white,
             shader: line_shader.to_owned(),
         });
@@ -3671,17 +3777,20 @@ mod tests {
         assert!(classic.lights[0].radius >= 14.0 && classic.lights[0].radius <= 17.0);
         assert!(classic.draws.iter().any(|draw| matches!(
             draw,
-            FxDraw::Sprite { shader, .. } if shader == "gfx/effects/sabers/red_glow"
+            FxDraw::SaberGlow { shader, hilt_radius, .. }
+                if shader == "gfx/effects/sabers/red_glow"
+                    && (5.5..=5.75).contains(hilt_radius)
         )));
         assert!(classic.draws.iter().any(|draw| matches!(
             draw,
             FxDraw::Line { shader, .. } if shader == "gfx/effects/sabers/red_line"
         )));
         assert!(classic.draws.iter().all(|draw| match draw {
-            FxDraw::Sprite { shader, .. } => shader == "gfx/effects/sabers/red_glow",
+            FxDraw::SaberGlow { shader, .. } => shader == "gfx/effects/sabers/red_glow",
             FxDraw::Line { shader, .. } => shader == "gfx/effects/sabers/red_line",
             _ => false,
         }));
+        assert_eq!(classic.draws.len(), 2, "one RT_SABER_GLOW plus one RT_LINE core");
 
         fx.set_modern_sabers(true);
         fx.begin_frame(1001);

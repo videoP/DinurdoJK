@@ -24,6 +24,9 @@ const MAX_CLIENTS: u16 = 32;
 const SOLID_BMODEL: i32 = 0x00ff_ffff;
 const WP_SABER: i32 = 3;
 const EF_ALT_FIRING: i32 = 1 << 10;
+const EF_JETPACK_ACTIVE: i32 = 1 << 11;
+const EF_JETPACK: i32 = 1 << 29;
+const EF_JETPACK_FLAMING: i32 = 1 << 30;
 const CLASS_VEHICLE: i32 = 53;
 const GT_CTY: i32 = 9;
 const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4;
@@ -76,6 +79,11 @@ pub(crate) struct SoundPrepData {
     pub saber_definitions: SaberDefinitions,
     pub ambient_sets: AmbientSets,
     pub game_sounds: crate::config::GameOptions,
+    /// The actual network-owned client slot for a live remote session. This is
+    /// deliberately separate from `presentation_client_num()`: while following
+    /// another player as a spectator, presentation ownership becomes the followed
+    /// player but locally-originated VGS still belongs to the connected client.
+    pub connection_client_num: Option<u16>,
 }
 
 /// Ordered-dispatch conditions that need per-entity presenter state.
@@ -204,6 +212,10 @@ pub struct SoundPresenter {
     /// `cent->loopingSound[]` from CG_S_AddRealLoopingSound: persistent
     /// per-entity loops (resolved qpath) until EV_STOPLOOPINGSOUND / EV_MUTE_SOUND.
     event_loops: HashMap<u16, Vec<String>>,
+    /// Reliable `kls` commands stop all loops for an entity immediately. The
+    /// suppression lasts through the next CG_AddCEntity-style loop rebuild so
+    /// a stale snapshot loopSound cannot be re-submitted in the same frame.
+    killed_loop_entities: HashSet<u16>,
     inline_model_midpoints: Arc<[[f32; 3]]>,
     announcer: Announcer,
     /// The `CS_MUSIC` value the level track was last started from.
@@ -244,7 +256,8 @@ impl SoundPresenter {
         let backend = match AudioBackend::open(steam_audio_enabled, steam_audio_binaural_enabled, steam_audio_environmental_enabled) {
             Ok(backend) => {
                 let info = backend.info();
-                println!(
+                devprintln!(
+                    1,
                     "AUDIO READY: Rodio/CPAL {}ch {}Hz {} buffer={} | WAV+MP3 | 32 voices | output limiter",
                     info.channels, info.sample_rate, info.sample_format, info.buffer_size
                 );
@@ -260,9 +273,15 @@ impl SoundPresenter {
             warnings: HashSet::new(),
             custom_sound_profiles: HashMap::new(),
             pain_times: HashMap::new(),
-            prep: SoundPrepData { saber_definitions, ambient_sets, game_sounds: Default::default() },
+            prep: SoundPrepData {
+                saber_definitions,
+                ambient_sets,
+                game_sounds: Default::default(),
+                connection_client_num: None,
+            },
             item_pickup_until: HashMap::new(),
             event_loops: HashMap::new(),
+            killed_loop_entities: HashSet::new(),
             inline_model_midpoints: Arc::from(Vec::new()),
             announcer: Announcer::default(),
             map_music: None,
@@ -331,6 +350,18 @@ impl SoundPresenter {
         self.start_background_track(intro, looped);
     }
 
+    /// Reliable `cs CS_MUSIC` side effect from CG_ConfigStringModified.
+    pub fn restart_map_music(&mut self, game: &ClientGameState) {
+        self.start_map_music(game, true);
+    }
+
+    /// TaystJK/OpenJK `kls`: stop looping sound state for this entity now and
+    /// prevent the current packet entity from immediately re-adding it.
+    pub fn kill_looping_sound(&mut self, entity: u16) {
+        self.event_loops.remove(&entity);
+        self.killed_loop_entities.insert(entity);
+    }
+
     pub fn set_music_volume(&mut self, level: f32) {
         self.music_base = level;
         self.apply_music_level();
@@ -362,6 +393,13 @@ impl SoundPresenter {
 
     pub fn set_game_sounds(&mut self, options: crate::config::GameOptions) {
         self.prep.game_sounds = options;
+    }
+
+    /// Set the real client slot owned by the current live network connection.
+    /// Spectator follow changes only presentation ownership and must not rewrite
+    /// this identity. Demos/local sessions leave it unset.
+    pub fn set_connection_client_num(&mut self, client: Option<u16>) {
+        self.prep.connection_client_num = client;
     }
 
     pub(crate) fn prep_data(&self) -> &SoundPrepData {
@@ -417,22 +455,34 @@ impl SoundPresenter {
             }
         }
         for entity in audio_entities(entities, followed_entity) {
-            if let Some(request) = entity_loop(entity, game, &self.prep.ambient_sets, &self.inline_model_midpoints) {
-                requests.push(request);
-            }
-            if entity.entity_type == ET_MISSILE {
-                if let Some(request) = missile_loop(entity) {
+            let killed = self.killed_loop_entities.contains(&entity.number);
+            if !killed {
+                if let Some(request) = entity_loop(entity, game, &self.prep.ambient_sets, &self.inline_model_midpoints) {
                     requests.push(request);
                 }
-            }
-            if let Some(loops) = self.event_loops.get(&entity.number) {
-                let origin = SoundOrigin::Fixed(loop_origin(entity, &self.inline_model_midpoints));
-                requests.extend(loops.iter().map(|qpath| LoopRequest { qpath: qpath.clone(), origin, volume: 1.0 }));
+                if entity.entity_type == ET_MISSILE {
+                    if let Some(request) = missile_loop(entity) {
+                        requests.push(request);
+                    }
+                }
+                if let Some(loops) = self.event_loops.get(&entity.number) {
+                    let origin = SoundOrigin::Fixed(loop_origin(entity, &self.inline_model_midpoints));
+                    requests.extend(loops.iter().map(|qpath| LoopRequest { qpath: qpath.clone(), origin, volume: 1.0 }));
+                }
             }
             if entity.entity_type == ET_PLAYER {
+                // `kls` targets entity loop sounds, not the player's separately
+                // submitted saber hum path.
                 saber_hum_loops(entity, game, siege_classes, &self.prep.saber_definitions, listener_entity, &mut requests);
             }
+            if entity.entity_type == ET_PLAYER || entity.entity_type == ET_NPC {
+                // CG_Player's jetpack path is also used for Ghoul2 NPCs (for
+                // example Boba-style NPCs), so do not restrict the loops to
+                // client slots only.
+                jetpack_loops(entity, game, listener_entity, &mut requests);
+            }
         }
+        self.killed_loop_entities.clear();
         let mut resolved = Vec::with_capacity(requests.len());
         for request in requests {
             match self.assets.register(&request.qpath) {
@@ -693,7 +743,12 @@ impl SoundPresenter {
     fn update_hit_feedback(&mut self, game: &ClientGameState, siege_classes: &[SiegeClassVisual]) {
         const PERS_HITS: usize = 1;
         const PERS_TEAM: usize = 3;
-        let Some(ps) = game.current_snapshot().map(|snapshot| &snapshot.player_state) else { return };
+        let Some(ps) = game.presentation_player_state() else {
+            // A reconstructed demo POV has no complete playerState, so hit
+            // counters belong to the recorder and must not leak into this view.
+            self.announcer.last_hits = None;
+            return;
+        };
         let (hits, team) = (ps.persistant[PERS_HITS], ps.persistant[PERS_TEAM]);
         let previous = self.announcer.last_hits.replace((hits, team, ps.field_i32("clientNum").unwrap_or(-1)));
         let Some((old_hits, old_team, old_client)) = previous else { return };
@@ -727,6 +782,7 @@ impl SoundPresenter {
     pub fn set_rate(&mut self, rate: f32) { if let Some(b) = &mut self.backend { b.set_rate(rate); } }
     pub fn clear(&mut self) {
         self.event_loops.clear();
+        self.killed_loop_entities.clear();
         self.pain_times.clear();
         self.item_pickup_until.clear();
         self.announcer = Announcer::default();
@@ -1323,7 +1379,7 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
             if channel < 0 { return Err("SOUND_INVALID_CHANNEL"); }
             let path = game.sound_qpath(event.parm).ok_or("SOUND_RESOURCE_MISSING")?;
             let origin = if event.event == EntityEvent::EV_GLOBAL_SOUND {
-                entity = game.current_snapshot().and_then(|s| s.player_state.field_i32("clientNum"))
+                entity = game.presentation_client_num()
                     .and_then(|n| u16::try_from(n).ok()).unwrap_or(entity);
                 SoundOrigin::Local
             } else { SoundOrigin::Entity(event.position) };
@@ -1420,15 +1476,15 @@ fn own_or_other_allowed(option: u8, own: bool) -> bool {
 }
 
 pub(super) fn local_client(game: &ClientGameState) -> Option<u16> {
-    game.current_snapshot()
-        .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"))
+    game.presentation_client_num()
         .and_then(|value| u16::try_from(value).ok())
 }
 
-/// A field of the viewed player's playerState (`cg.snap->ps.<field>`).
+/// A field of the viewed player's complete playerState. Reconstructed demo POVs
+/// deliberately return 0 rather than borrowing the recorder's playerState.
 pub(super) fn local_ps(game: &ClientGameState, field: &str) -> i32 {
-    game.current_snapshot()
-        .and_then(|snapshot| snapshot.player_state.field_i32(field))
+    game.presentation_player_state()
+        .and_then(|ps| ps.field_i32(field))
         .unwrap_or(0)
 }
 
@@ -1928,8 +1984,23 @@ fn complex_sound_event(
         }),
         E::EV_VOICECMD_SOUND => {
             let voice_client = u16::try_from(es.field_i32("groundEntityNum").unwrap_or(-1)).ok();
-            // Teammates also hear the line as a radio copy at the listener's head.
-            let mirror = local_client(game).zip(voice_client).and_then(|(local, speaker)| {
+            let viewed_client = local_client(game);
+            // A live spectator may be following another player while their own VGS
+            // still originates from the network-owned spectator client. The primary
+            // sound remains attached to that speaker entity, which can be far from
+            // the followed camera, so mirror our own accepted VGS at the listener.
+            // Never use the followed player's clientNum as proof that the VGS is ours.
+            let own_follow_copy = prep.connection_client_num.zip(voice_client).and_then(|(own, speaker)| {
+                (own == speaker && viewed_client != Some(speaker)).then(|| SoundRequest {
+                    qpath: String::new(),
+                    entity: viewed_client.unwrap_or(own),
+                    channel: CHAN_MENU1,
+                    origin: SoundOrigin::Local,
+                })
+            });
+            // Preserve the existing TaystJK-style teammate radio copy relative
+            // to the current presentation viewer for VGS from other players.
+            let teammate_copy = viewed_client.zip(voice_client).and_then(|(local, speaker)| {
                 let source = game.client_info(usize::from(speaker), siege_classes)?;
                 let listener = game.client_info(usize::from(local), siege_classes)?;
                 (local != speaker && source.team == listener.team).then(|| SoundRequest {
@@ -1939,6 +2010,7 @@ fn complex_sound_event(
                     origin: SoundOrigin::Local,
                 })
             });
+            let mirror = own_follow_copy.or(teammate_copy);
             simple(&|sound| {
                 sound.mirror = mirror.clone().map(|mut radio| {
                     radio.qpath = sound.plays[0].qpath.clone();
@@ -2071,6 +2143,50 @@ fn missile_loop(entity: &PresentedEntity) -> Option<LoopRequest> {
     let qpath = if alt { sounds.alt_missile } else { sounds.missile }?;
     Some(LoopRequest { qpath: qpath.to_owned(), origin: SoundOrigin::Fixed(entity.origin), volume: 1.0 })
 }
+
+/// TaystJK CG_Player jetpack loop sounds. The visual presenter owns the
+/// bolted GLM and EFX; audio remains here so all persistent loops are merged by
+/// entity/sfx in one place.
+fn jetpack_loops(
+    entity: &PresentedEntity,
+    game: &ClientGameState,
+    listener_entity: u16,
+    out: &mut Vec<LoopRequest>,
+) {
+    let e_flags = entity.state.field_i32("eFlags").unwrap_or(0);
+    if e_flags & EF_JETPACK == 0
+        || e_flags & EF_DEAD != 0
+        || e_flags & EF_JETPACK_ACTIVE == 0
+    {
+        return;
+    }
+    let origin = if entity.number == listener_entity {
+        SoundOrigin::Local
+    } else {
+        SoundOrigin::Fixed(entity.origin)
+    };
+    if game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES != 0 {
+        out.push(LoopRequest {
+            qpath: "sound/effects/thrust.wav".to_owned(),
+            origin,
+            volume: 1.0,
+        });
+    } else if e_flags & EF_JETPACK_FLAMING != 0 {
+        out.push(LoopRequest {
+            qpath: "sound/effects/fire_lp".to_owned(),
+            origin,
+            volume: 1.0,
+        });
+    }
+    // TaystJK adds JETHOVER for both the Boba and WTTRIBES branches while the
+    // pack is active.
+    out.push(LoopRequest {
+        qpath: "sound/boba/JETHOVER".to_owned(),
+        origin,
+        volume: 1.0,
+    });
+}
+
 fn saber_hum_loops(
     entity: &PresentedEntity,
     game: &ClientGameState,
@@ -2204,6 +2320,32 @@ mod tests {
     fn set_field(event: &mut PresentationEvent, name: &str, value: i32) {
         let index = ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap();
         event.state.fields[index] = value as u32;
+    }
+
+    #[test]
+    fn own_vgs_is_mirrored_locally_while_following_another_player() {
+        let mut game = ClientGameState::new();
+        game.presentation_viewer = super::super::PresentationViewer::Client(7);
+        game.configstrings.insert(super::super::CS_SOUNDS + 1, b"*attack.wav".to_vec());
+
+        let mut voice = event(EntityEvent::EV_VOICECMD_SOUND, 1);
+        set_field(&mut voice, "groundEntityNum", 3);
+
+        let mut prep = SoundPrepData::default();
+        prep.connection_client_num = Some(3);
+        let sound = prepare_sound_event(&voice, &game, &[], &prep)
+            .unwrap()
+            .expect("VGS should prepare a sound");
+        let mirror = sound.mirror.expect("own VGS needs a listener-local copy while following");
+        assert_eq!(mirror.entity, 7);
+        assert_eq!(mirror.channel, CHAN_MENU1);
+        assert!(matches!(mirror.origin, SoundOrigin::Local));
+
+        game.presentation_viewer = super::super::PresentationViewer::Client(3);
+        let sound = prepare_sound_event(&voice, &game, &[], &prep)
+            .unwrap()
+            .expect("VGS should prepare a sound");
+        assert!(sound.mirror.is_none(), "do not double-play own VGS outside follow spectate");
     }
 
     fn prepared(event: &PresentationEvent) -> PreparedSound {

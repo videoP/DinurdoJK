@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-use crate::cgame::{CS_PLAYERS, ET_EVENTS};
+use crate::cgame::{bytes_to_lossless_ascii, CS_PLAYERS, CS_SCORES1, CS_SCORES2, ET_EVENTS};
 
 const LEVELSHOT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -22,10 +22,41 @@ pub(super) enum FrontendPage {
     ServerBrowser,
     SoloGame,
     PlayDemo,
+    Profile,
     Controls,
+    ChatLogs,
     DeveloperTools,
     AssetViewer,
+    Screenshots,
     MapViewer,
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChatLogRangeFilter {
+    All,
+    Hours24,
+    Days7,
+    Days30,
+    Custom,
+}
+
+impl Default for ChatLogRangeFilter {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl ChatLogRangeFilter {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All time",
+            Self::Hours24 => "Last 24 hours",
+            Self::Days7 => "Last 7 days",
+            Self::Days30 => "Last 30 days",
+            Self::Custom => "Custom dates",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -858,6 +889,33 @@ pub(super) struct DemoKillMarker {
     pub attacker_team: i32,
 }
 
+/// One scoreboard row captured from a reliable `scores` server command in a
+/// demo.  Keep the client slot as the stable identity: CS_PLAYERS can change
+/// names/teams later and the live presentation layer can refresh those fields
+/// without guessing which historical row belonged to whom.
+#[derive(Debug, Clone)]
+pub(super) struct DemoScoreEntry {
+    pub client: i32,
+    pub name: String,
+    pub score: i32,
+    pub deaths: Option<i32>,
+    pub ping: i32,
+    pub time: i32,
+    pub team: i32,
+}
+
+/// Timeline-addressable scoreboard payload extracted while the demo index is
+/// built.  This is the native equivalent of the old web viewer's
+/// `extractScoreEvents`: demo playback can show the most recently recorded
+/// scoreboard without trying to send a `score` command to a server that no
+/// longer exists.
+#[derive(Debug, Clone)]
+pub(super) struct DemoScoreboardSample {
+    pub elapsed_ms: i32,
+    pub team_scores: [i32; 2],
+    pub entries: Vec<DemoScoreEntry>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct DemoIndex {
     pub first_active_server_time: Option<i32>,
@@ -865,6 +923,8 @@ pub(super) struct DemoIndex {
     pub kill_markers: Vec<DemoKillMarker>,
     /// Timeline-addressable transient notices used to rebuild HUD state after seeks.
     pub transient_notices: Vec<DemoConsoleEntry>,
+    /// Reliable `scores` payloads recorded in the demo, indexed by demo time.
+    pub scoreboards: Vec<DemoScoreboardSample>,
 }
 
 impl DemoIndex {
@@ -873,6 +933,16 @@ impl DemoIndex {
             (Some(first), Some(last)) => last.saturating_sub(first).max(0),
             _ => 0,
         }
+    }
+
+    /// Most recent authoritative scoreboard at or before this playback time.
+    /// Never borrow a future score frame: a demo seek must not leak scores that
+    /// had not happened yet.
+    pub fn scoreboard_at(&self, elapsed_ms: i32) -> Option<&DemoScoreboardSample> {
+        let upper = self
+            .scoreboards
+            .partition_point(|sample| sample.elapsed_ms <= elapsed_ms);
+        upper.checked_sub(1).and_then(|index| self.scoreboards.get(index))
     }
 }
 
@@ -1055,24 +1125,79 @@ fn client_name(configstrings: &BTreeMap<u16, Vec<u8>>, client: i32) -> String {
         .unwrap_or_else(|| format!("CLIENT {client}"))
 }
 
-fn parse_scores(args: &[Vec<u8>], configstrings: &BTreeMap<u16, Vec<u8>>) -> (Option<[i32; 2]>, Vec<(String, i32)>) {
+fn scoreboard_client_name(configstrings: &BTreeMap<u16, Vec<u8>>, client: i32) -> String {
+    u16::try_from(client)
+        .ok()
+        .and_then(|client| CS_PLAYERS.checked_add(client))
+        .and_then(|index| configstrings.get(&index))
+        .and_then(|info| info_value(info, b"n"))
+        .map(bytes_to_lossless_ascii)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("CLIENT {client}"))
+}
+
+fn demo_score_stride(
+    count: usize,
+    body_fields: usize,
+    configstrings: &BTreeMap<u16, Vec<u8>>,
+) -> usize {
+    const STOCK: usize = 14;
+    const JAPRO: usize = 15;
+
+    // Most score commands are unambiguous from their wire length. This also
+    // handles the server's MAX_CLIENT_SCORE_SEND cap: argv(1) can name more
+    // connected clients than the command actually has room to serialize.
+    let stock_rows = (body_fields % STOCK == 0).then_some(body_fields / STOCK);
+    let japro_rows = (body_fields % JAPRO == 0).then_some(body_fields / JAPRO);
+    let stock_fits = stock_rows.is_some_and(|rows| rows <= count);
+    let japro_fits = japro_rows.is_some_and(|rows| rows <= count);
+    match (stock_fits, japro_fits) {
+        (true, false) => return STOCK,
+        (false, true) => return JAPRO,
+        _ => {}
+    }
+
+    // If both layouts happen to divide evenly, mirror TaystJK's server-mod
+    // preference. jaPRO appends a deaths integer to every score row.
+    let japro_server = configstrings
+        .get(&0)
+        .and_then(|info| info_value(info, b"gamename"))
+        .map(clean_quake_text)
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("japro"));
+    if japro_server { JAPRO } else { STOCK }
+}
+
+fn parse_scoreboard(
+    args: &[Vec<u8>],
+    configstrings: &BTreeMap<u16, Vec<u8>>,
+) -> Option<([i32; 2], Vec<DemoScoreEntry>)> {
     if args.len() < 4 {
-        return (None, Vec::new());
+        return None;
     }
     let count = atoi(&args[1]).clamp(0, 32) as usize;
-    let team_scores = Some([atoi(&args[2]), atoi(&args[3])]);
-    const SCORE_OFFSET: usize = 14;
-    let mut scores = Vec::with_capacity(count);
+    let team_scores = [atoi(&args[2]), atoi(&args[3])];
+    let body_fields = args.len().saturating_sub(4);
+    let stride = demo_score_stride(count, body_fields, configstrings);
+    let mut entries = Vec::with_capacity(count.min(body_fields / stride.max(1)));
     for row in 0..count {
-        let base = 4 + row * SCORE_OFFSET;
-        if args.len() < base + SCORE_OFFSET {
+        let base = 4 + row * stride;
+        // The stock fields are always present; JA+/jaPRO append deaths as the
+        // 15th field for clients advertising the compatible score extension.
+        if args.len() < base + 14 {
             break;
         }
         let client = atoi(&args[base]).clamp(0, 31);
-        let score = atoi(&args[base + 1]);
-        scores.push((client_name(configstrings, client), score));
+        entries.push(DemoScoreEntry {
+            client,
+            name: scoreboard_client_name(configstrings, client),
+            score: atoi(&args[base + 1]),
+            deaths: (stride == 15).then(|| atoi(&args[base + 14])),
+            ping: atoi(&args[base + 2]),
+            time: atoi(&args[base + 3]),
+            team: client_team(configstrings, client),
+        });
     }
-    (team_scores, scores)
+    Some((team_scores, entries))
 }
 
 fn console_text(args: &[Vec<u8>], start: usize) -> String {
@@ -1133,6 +1258,7 @@ fn scan_demo_bytes(
     let mut private_duels = Vec::<RawPrivateDuel>::new();
     let mut console = Vec::<(i32, DemoConsoleKind, String)>::new();
     let mut transient_notices = Vec::<(i32, DemoConsoleKind, String)>::new();
+    let mut scoreboards = Vec::<(i32, [i32; 2], Vec<DemoScoreEntry>)>::new();
     let mut kill_count = 0usize;
     let mut kill_markers = Vec::<DemoKillMarker>::new();
     let mut previous_event = [0i32; MAX_GENTITIES];
@@ -1246,6 +1372,16 @@ fn scan_demo_bytes(
                         }
                         if name.eq_ignore_ascii_case(b"map_restart") {
                             console.push((server_time, DemoConsoleKind::Event, "map_restart".to_owned()));
+                            // Do not let a pre-restart full scoreboard leak into
+                            // the new round while we wait for the next recorded
+                            // `scores` payload. CS_SCORES1/2 are reset by gamecode
+                            // and remain the authoritative header in the meantime.
+                            let score_cs = |index| configstrings.get(&index).map_or(0, |value| atoi(value));
+                            scoreboards.push((
+                                server_time,
+                                [score_cs(CS_SCORES1), score_cs(CS_SCORES2)],
+                                Vec::new(),
+                            ));
                             close_round(server_time, &mut round, &mut rounds);
                             round = Some(RoundAccum {
                                 map_name: current_map.as_ref().map(|v| v.0.clone()).unwrap_or_else(|| map_name.clone()),
@@ -1260,11 +1396,17 @@ fn scan_demo_bytes(
                             continue;
                         }
                         if name.eq_ignore_ascii_case(b"scores") {
-                            let (team_scores, scores) = parse_scores(&args, &configstrings);
-                            if let Some(active_round) = &mut round {
-                                active_round.team_scores = team_scores;
-                                active_round.leader = scores.iter().max_by_key(|(_, score)| *score).cloned();
-                                active_round.scores = scores;
+                            if let Some((team_scores, entries)) = parse_scoreboard(&args, &configstrings) {
+                                let scores = entries
+                                    .iter()
+                                    .map(|entry| (entry.name.clone(), entry.score))
+                                    .collect::<Vec<_>>();
+                                scoreboards.push((server_time, team_scores, entries));
+                                if let Some(active_round) = &mut round {
+                                    active_round.team_scores = Some(team_scores);
+                                    active_round.leader = scores.iter().max_by_key(|(_, score)| *score).cloned();
+                                    active_round.scores = scores;
+                                }
                             }
                             continue;
                         }
@@ -1514,11 +1656,20 @@ fn scan_demo_bytes(
         kind,
         text,
     }).collect();
+    let scoreboards = scoreboards
+        .into_iter()
+        .map(|(at, team_scores, entries)| DemoScoreboardSample {
+            elapsed_ms: at.saturating_sub(first).max(0),
+            team_scores,
+            entries,
+        })
+        .collect();
     let index = DemoIndex {
         first_active_server_time: Some(first),
         last_server_time: Some(last),
         kill_markers,
         transient_notices,
+        scoreboards,
     };
 
     Ok((index, DemoMetadata {

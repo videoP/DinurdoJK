@@ -1,10 +1,14 @@
-use crate::camera::{ThirdPersonSettings, DEFAULT_CG_FOV, MAX_CG_FOV, MIN_CG_FOV};
-use crate::player::{LocalPresentationSettings, MouseInputSettings};
+use crate::camera::{
+    SpectatorCameraMode, SpectatorCameraSettings, ThirdPersonSettings, DEFAULT_CG_FOV,
+    MAX_CG_FOV, MAX_SPECTATOR_ORBIT_RANGE, MIN_CG_FOV, MIN_SPECTATOR_ORBIT_RANGE,
+};
+use crate::player::MouseInputSettings;
 use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::ui::{
     CloudRenderResolution, CloudType, ColorLutPreset, DetailTextureMode, DofQuality, DynamicLightsMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FullscreenMode,
     CrosshairSettings, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout, HudLayout,
+    PlayerNameSettings,
     MovementKeysSettings, StrafeHelperSettings,
     PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter,
     VideoSettings, VsyncMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_THICKNESS_MAX,
@@ -22,11 +26,21 @@ const PHYSICS_MSEC_MAX: u32 = 33;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientPresentationSettings {
     pub third_person: ThirdPersonSettings,
+    pub spectator_camera: SpectatorCameraSettings,
     pub first_person_lightsaber: bool,
     /// OpenJK cg_saberTrail: 0 disables saber swing trails, 1 is normal,
     /// 2 requests the legacy special/high-frequency mode.
     pub saber_trail: i32,
-    pub smoothing: LocalPresentationSettings,
+    /// TaystJK cg_saberTeamColors: force red/blue saber colors in ordinary team games.
+    pub saber_team_colors: bool,
+    /// TaystJK cg_saberStaffMultiColor: primary staff blades after blade 0 use c2.
+    pub saber_staff_multi_color: bool,
+    /// TaystJK cg_drawTeamOverlay family (styles/position/columns).
+    pub team_overlay: crate::ui::TeamOverlaySettings,
+    /// TaystJK cg_scoreDeaths: 0 off, 1 server deaths, 2 local fallback, 3 local count.
+    pub score_deaths: i32,
+    /// TaystJK cg_drawScores: 0 off, 1 classic, 2 coloured classic, 3 centred boxes.
+    pub draw_scores: i32,
     pub mouse: MouseInputSettings,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
     pub fov: f32,
@@ -40,14 +54,31 @@ pub struct ClientPresentationSettings {
     /// DinurdoJK compact forced-player-model cvar: 0=off, model=all other players, ally,enemy=team split.
     pub force_model: String,
     pub crosshair: CrosshairSettings,
+    pub player_names: PlayerNameSettings,
     pub hud_layout: HudLayout,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
+    /// jaPRO-compatible strafe-trail appearance, live tracing and recording settings.
+    pub strafe_trail: crate::strafe_trail::Settings,
+    /// Visual opacity of loaded race ghosts.
+    pub race_ghost_alpha: f32,
+    /// Draw the archive username/demo label above each synchronized race ghost.
+    pub race_ghost_name: bool,
+    /// Draw the recorded ghost route through the existing strafe-trail renderer.
+    pub race_ghost_trail: bool,
+    /// Append ghost speed minus local speed to the ghost's world-space label.
+    pub race_ghost_velocity_delta: bool,
+    /// Append the current 3D separation from the local racer to the ghost label.
+    pub race_ghost_distance_delta: bool,
+    /// Public race archive root; `/index/...` is derived from this value.
+    pub race_ghost_demo_base_url: String,
     pub console_timestamps: bool,
     /// con_suggest: live command/cvar filter popup while typing in the console.
     pub console_suggest: bool,
     /// cg_chatboxCompletion: Tab in the chat input completes player names.
     pub chatbox_completion: bool,
+    /// cl_chatLog: persist live server chat sessions as self-contained HTML.
+    pub chat_log: bool,
     /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
     pub ui_vgs: i32,
     /// r_jumpHeightShade: tint landing surfaces by jump height in jaPRO SP physics.
@@ -241,9 +272,14 @@ impl Default for ClientPresentationSettings {
     fn default() -> Self {
         Self {
             third_person: ThirdPersonSettings::default(),
+            spectator_camera: SpectatorCameraSettings::default(),
             first_person_lightsaber: true,
             saber_trail: 1,
-            smoothing: LocalPresentationSettings::default(),
+            saber_team_colors: true,
+            saber_staff_multi_color: false,
+            team_overlay: crate::ui::TeamOverlaySettings::default(),
+            score_deaths: 1,
+            draw_scores: 1,
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
             zoom_fov: 30.0,
@@ -253,12 +289,21 @@ impl Default for ClientPresentationSettings {
             model: "kyle".to_owned(),
             force_model: "0".to_owned(),
             crosshair: CrosshairSettings::default(),
+            player_names: PlayerNameSettings::default(),
             hud_layout: HudLayout::default(),
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
+            strafe_trail: crate::strafe_trail::Settings::default(),
+            race_ghost_alpha: 0.35,
+            race_ghost_name: false,
+            race_ghost_trail: false,
+            race_ghost_velocity_delta: false,
+            race_ghost_distance_delta: false,
+            race_ghost_demo_base_url: "http://s.playja.pro/races".to_owned(),
             console_timestamps: true,
             console_suggest: true,
             chatbox_completion: true,
+            chat_log: true,
             ui_vgs: 1,
             jump_height_shade: true,
             screen_shake: 1,
@@ -270,7 +315,7 @@ impl Default for ClientPresentationSettings {
 }
 
 /// Load local/POV presentation cvars. Stock OpenJK/TaystJK camera and mouse
-/// controls live alongside DinurdoJK's presentation-only smoothing switches.
+/// controls live alongside DinurdoJK's presentation settings.
 /// Unknown or malformed values retain the client defaults above.
 pub fn load_client_presentation_settings(
     primary: &Path,
@@ -333,6 +378,11 @@ pub fn load_client_presentation_settings(
                     settings.crosshair.color = color;
                 }
             }
+            "cg_dynamiccrosshair" => {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.crosshair.dynamic = mode.min(2);
+                }
+            }
             "cg_crosshairidentifytarget" => {
                 settings.crosshair.identify_target =
                     parse_bool(value).unwrap_or(settings.crosshair.identify_target)
@@ -350,6 +400,18 @@ pub fn load_client_presentation_settings(
                 settings.crosshair.names_opacity = finite()
                     .unwrap_or(settings.crosshair.names_opacity)
                     .clamp(0.0, 1.0);
+            }
+            "cg_drawplayernames" => {
+                settings.player_names.mode = value
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or(settings.player_names.mode)
+                    .clamp(0, 2);
+            }
+            "cg_drawplayernamesscale" => {
+                settings.player_names.scale = finite()
+                    .unwrap_or(settings.player_names.scale)
+                    .clamp(0.05, 4.0);
             }
             hud_cvar if HudElementId::from_cvar(hud_cvar).is_some() => {
                 if let (Some(id), Some(layout)) =
@@ -388,6 +450,20 @@ pub fn load_client_presentation_settings(
             "cg_strafehelperinactivealpha" => {
                 if let Ok(alpha) = value.trim().parse::<i32>() { settings.strafe_helper.inactive_alpha = alpha.clamp(0, 255) as u8; }
             }
+            "cg_strafetrailradius" => settings.strafe_trail.radius = finite().unwrap_or(settings.strafe_trail.radius).clamp(0.1, 100.0),
+            "cg_strafetraillife" => settings.strafe_trail.life_seconds = finite().unwrap_or(settings.strafe_trail.life_seconds).clamp(0.1, 3600.0),
+            "cg_strafetrailfps" => settings.strafe_trail.fps = finite().unwrap_or(settings.strafe_trail.fps).clamp(1.0, 1000.0),
+            "cg_strafetrailplums" => settings.strafe_trail.plums = parse_bool(value).unwrap_or(settings.strafe_trail.plums),
+            "cg_strafetrailghost" => settings.strafe_trail.ghost = parse_bool(value).unwrap_or(settings.strafe_trail.ghost),
+            "cg_strafetrailplayers" => settings.strafe_trail.players = value.trim().parse::<u32>().unwrap_or(settings.strafe_trail.players),
+            "cg_logstrafetrail" => settings.strafe_trail.log_name = value.trim().to_owned(),
+            "cg_strafetraildistance" => settings.strafe_trail.draw_distance = finite().unwrap_or(settings.strafe_trail.draw_distance).clamp(256.0, 131072.0),
+            "cg_rghostalpha" => settings.race_ghost_alpha = finite().unwrap_or(settings.race_ghost_alpha).clamp(0.02, 1.0),
+            "cg_rghostname" => settings.race_ghost_name = parse_bool(value).unwrap_or(settings.race_ghost_name),
+            "cg_rghosttrail" => settings.race_ghost_trail = parse_bool(value).unwrap_or(settings.race_ghost_trail),
+            "cg_rghostvelocitydelta" => settings.race_ghost_velocity_delta = parse_bool(value).unwrap_or(settings.race_ghost_velocity_delta),
+            "cg_rghostdistancedelta" => settings.race_ghost_distance_delta = parse_bool(value).unwrap_or(settings.race_ghost_distance_delta),
+            "cg_rghostdemobaseurl" if !value.trim().is_empty() => settings.race_ghost_demo_base_url = value.trim().to_owned(),
             "con_timestamps" => {
                 settings.console_timestamps =
                     parse_bool(value).unwrap_or(settings.console_timestamps)
@@ -399,6 +475,9 @@ pub fn load_client_presentation_settings(
             "cg_chatboxcompletion" => {
                 settings.chatbox_completion =
                     parse_bool(value).unwrap_or(settings.chatbox_completion)
+            }
+            "cl_chatlog" => {
+                settings.chat_log = parse_bool(value).unwrap_or(settings.chat_log)
             }
             "ui_vgs" => {
                 settings.ui_vgs = value.trim().parse::<i32>().unwrap_or(settings.ui_vgs)
@@ -456,6 +535,19 @@ pub fn load_client_presentation_settings(
                 settings.third_person.enabled =
                     parse_bool(value).unwrap_or(settings.third_person.enabled)
             }
+            "cg_speccamera" => {
+                let mode = value.trim().parse::<i32>().unwrap_or(settings.spectator_camera.mode.as_i32());
+                settings.spectator_camera.mode = SpectatorCameraMode::from_i32(mode);
+            }
+            "cg_speccameramotion" => {
+                settings.spectator_camera.motion_direction =
+                    parse_bool(value).unwrap_or(settings.spectator_camera.motion_direction)
+            }
+            "cg_specorbitrange" => {
+                settings.spectator_camera.orbit_range = finite()
+                    .unwrap_or(settings.spectator_camera.orbit_range)
+                    .clamp(MIN_SPECTATOR_ORBIT_RANGE, MAX_SPECTATOR_ORBIT_RANGE)
+            }
             "cg_fpls" => {
                 settings.first_person_lightsaber =
                     parse_bool(value).unwrap_or(settings.first_person_lightsaber)
@@ -468,26 +560,23 @@ pub fn load_client_presentation_settings(
                     .map(|value| value.clamp(0, 2))
                     .unwrap_or(settings.saber_trail)
             }
-            "cg_smoothplayerorigin" => {
-                settings.smoothing.smooth_player_origin =
-                    parse_bool(value).unwrap_or(settings.smoothing.smooth_player_origin)
+            "cg_saberteamcolors" => {
+                settings.saber_team_colors =
+                    parse_bool(value).unwrap_or(settings.saber_team_colors)
             }
-            "cg_smooththirdpersonorigin" => {
-                settings.smoothing.smooth_third_person_origin =
-                    parse_bool(value).unwrap_or(settings.smoothing.smooth_third_person_origin)
+            "cg_saberstaffmulticolor" => {
+                settings.saber_staff_multi_color =
+                    parse_bool(value).unwrap_or(settings.saber_staff_multi_color)
             }
-            "cg_smoothplayeranimation" => {
-                settings.smoothing.smooth_player_animation =
-                    parse_bool(value).unwrap_or(settings.smoothing.smooth_player_animation)
-            }
-            "cg_subframeplayerangles" => {
-                settings.smoothing.subframe_player_angles =
-                    parse_bool(value).unwrap_or(settings.smoothing.subframe_player_angles)
-            }
-            "cg_smooththirdpersontime" => {
-                settings.smoothing.smooth_third_person_time =
-                    parse_bool(value).unwrap_or(settings.smoothing.smooth_third_person_time)
-            }
+            "cg_drawteamoverlay" => settings.team_overlay.mode = value.trim().parse::<i32>().ok().map(|v| v.clamp(0, 6)).unwrap_or(settings.team_overlay.mode),
+            "cg_drawteamoverlayx" => settings.team_overlay.x = value.trim().parse().unwrap_or(settings.team_overlay.x),
+            "cg_drawteamoverlayy" => settings.team_overlay.y = value.trim().parse().unwrap_or(settings.team_overlay.y),
+            "cg_drawteamoverlayweapons" => settings.team_overlay.weapons = parse_bool(value).unwrap_or(settings.team_overlay.weapons),
+            "cg_drawteamoverlayscale" => settings.team_overlay.scale = finite().unwrap_or(settings.team_overlay.scale).clamp(0.5, 2.5),
+            "cg_drawteamoverlaymaxhp" => settings.team_overlay.max_hp = finite().unwrap_or(settings.team_overlay.max_hp).max(1.0),
+            "cg_drawteamoverlayforce" => settings.team_overlay.force = parse_bool(value).unwrap_or(settings.team_overlay.force),
+            "cg_scoredeaths" => settings.score_deaths = value.trim().parse::<i32>().ok().map(|v| v.clamp(0, 3)).unwrap_or(settings.score_deaths),
+            "cg_drawscores" => settings.draw_scores = value.trim().parse::<i32>().ok().map(|v| v.clamp(0, 3)).unwrap_or(settings.draw_scores),
             "cg_thirdpersonalpha" => {
                 settings.third_person.alpha = finite().unwrap_or(settings.third_person.alpha)
             }
@@ -609,6 +698,11 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     _ => settings.texture_filter,
                 };
             }
+            "r_picmip" => {
+                if let Ok(picmip) = value.parse::<u32>() {
+                    settings.picmip = picmip.min(16);
+                }
+            }
             // Keep the familiar OpenJK/JKA cvar name. wgpu exposes anisotropy
             // directly on the sampler; values above 1 require linear min/mag/mip
             // filtering, so the UI represents AF as a refinement of trilinear.
@@ -640,7 +734,24 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                 settings.skip_ui = parse_bool(value).unwrap_or(settings.skip_ui);
             }
             "developer" => {
-                settings.developer_tools = parse_bool(value).unwrap_or(settings.developer_tools);
+                let level = value
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .map(|level| level.min(3))
+                    .or_else(|| parse_bool(value).map(u8::from))
+                    .unwrap_or(settings.developer_level);
+                settings.developer_level = level;
+                settings.developer_tools = level != 0;
+            }
+            "r_verbose" => {
+                settings.renderer_verbose = value
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .map(|level| level.min(3))
+                    .or_else(|| parse_bool(value).map(u8::from))
+                    .unwrap_or(settings.renderer_verbose);
             }
             "r_perftrace" => {
                 settings.perf_trace = parse_bool(value).unwrap_or(settings.perf_trace);
@@ -688,6 +799,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "cg_fxfps" => {
                 settings.fx_fps = normalize_fx_fps(value, settings.fx_fps);
             }
+            "cg_fxfpsscope" => {
+                settings.fx_fps_scope = normalize_fx_fps_scope(value, settings.fx_fps_scope);
+            }
             "fx_physics" => {
                 settings.fx_physics = normalize_fx_physics(value, settings.fx_physics);
             }
@@ -716,11 +830,11 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     settings.draw_fps = mode.min(2);
                 }
             }
+            "cg_drawtimer" => {
+                settings.draw_timer = parse_bool(value).unwrap_or(settings.draw_timer);
+            }
             "pmove_msec" => {
                 settings.physics_msec = normalize_physics_msec(value, settings.physics_msec);
-            }
-            "cl_input_subframe" => {
-                settings.input_subframe = parse_bool(value).unwrap_or(settings.input_subframe);
             }
             "cl_timerresolution1ms" => {
                 settings.timer_resolution_1ms =
@@ -772,6 +886,69 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
             "r_ragdollselfcollision" => {
                 settings.ragdoll_self_collision = parse_bool(value).unwrap_or(settings.ragdoll_self_collision);
             }
+            "cg_dismember" => {
+                if let Ok(value) = value.parse::<u8>() {
+                    settings.dismemberment = value.min(2);
+                }
+            }
+            "r_dismembermax" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    settings.dismember_max = value.clamp(1, 128);
+                }
+            }
+            "r_dismemberlifetime" => {
+                if let Some(value) = value.parse::<f32>().ok().filter(|value| value.is_finite()) {
+                    settings.dismember_lifetime = value.clamp(1.0, 300.0);
+                }
+            }
+            "r_jigglephysics" => {
+                settings.jiggle_physics = parse_bool(value).unwrap_or(settings.jiggle_physics);
+            }
+            "r_jigglestrength" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_strength = v.clamp(0.0, 2.0); }
+            }
+            "r_jigglebreaststrength" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_breast_strength = v.clamp(0.0, 2.0); }
+            }
+            "r_jiggleglutestrength" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_glute_strength = v.clamp(0.0, 2.0); }
+            }
+            "r_jigglestiffness" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_stiffness = v.clamp(0.0, 3.0); }
+            }
+            "r_jiggledamping" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_damping = v.clamp(0.0, 3.0); }
+            }
+            "r_jiggleglutelift" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) { settings.jiggle_glute_lift = v.clamp(-0.4, 0.6); }
+            }
+            "r_clothphysics" => {
+                settings.cloth_physics = parse_bool(value).unwrap_or(settings.cloth_physics);
+            }
+            "r_clothbodycollision" => {
+                settings.cloth_body_collision = parse_bool(value).unwrap_or(settings.cloth_body_collision);
+            }
+            "r_clothbodyclearance" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_body_clearance = v.clamp(0.0, 4.0);
+                }
+            }
+            "r_clothairresistance" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_air_resistance = v.clamp(0.0, 4.0);
+                }
+            }
+            "r_clothturnresponse" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_turn_response = v.clamp(0.0, 4.0);
+                }
+            }
+            "r_clothanimationinfluence" => {
+                if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_animation_influence = v.clamp(0.0, 1.0);
+                }
+            }
+            "r_clothwind" => settings.cloth_wind = parse_bool(value).unwrap_or(settings.cloth_wind),
             "r_physicsprops" => settings.physics_props = parse_bool(value).unwrap_or(settings.physics_props),
             "r_physicspropmax" => {
                 if let Ok(requested) = value.parse::<u32>() {
@@ -1237,6 +1414,9 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
                     .map(|strength| strength.clamp(0.0, 1.0))
                     .unwrap_or(settings.depth_of_field_strength)
             }
+            "r_dofautofocus" => {
+                settings.dof_autofocus = parse_bool(value).unwrap_or(settings.dof_autofocus)
+            }
             "r_dofquality" => {
                 settings.dof_quality =
                     DofQuality::from_config(value).unwrap_or(settings.dof_quality)
@@ -1421,9 +1601,6 @@ pub fn load_video_settings(primary: &Path, fallback: Option<&Path>) -> VideoSett
         };
     }
     settings.ocean_settings = settings.ocean_settings.sanitize();
-    if !settings.input_subframe {
-        settings.input_latelatch = false;
-    }
     settings
 }
 
@@ -1479,6 +1656,7 @@ seta r_swapInterval \"{}\"\n\
 seta r_maxFrameLatency \"{}\"\n\
 seta r_ext_multisample \"{}\"\n\
 seta r_textureMode \"{}\"\n\
+seta r_picmip \"{}\"\n\
 seta r_ext_texture_filter_anisotropic \"{}\"\n\
 seta r_detailTextures \"{}\"\n\
 seta r_detailTextureFade \"{}\"\n\
@@ -1486,6 +1664,7 @@ seta r_detailTextureFadeDistance \"{:.0}\"\n\
 seta r_showtris \"{}\"\n\
 seta r_skipUi \"{}\"\n\
 seta developer \"{}\"\n\
+seta r_verbose \"{}\"\n\
 seta r_perfTrace \"{}\"\n\
 seta r_worldPath \"{}\"\n\
 seta r_gpuTimings \"{}\"\n\
@@ -1498,8 +1677,8 @@ seta r_novis \"{}\"\n\
 seta r_pvsMode \"{}\"\n\
 seta com_maxfps \"{}\"\n\
 seta cg_drawFPS \"{}\"\n\
+seta cg_drawTimer \"{}\"\n\
 seta pmove_msec \"{}\"\n\
-seta cl_input_subframe \"{}\"\n\
 seta cl_timerResolution1ms \"{}\"\n\
 seta cl_input_latelatch \"{}\"\n\
 seta r_gamma \"{:.3}\"\n\
@@ -1579,6 +1758,7 @@ seta r_vignette \"{}\"\n\
 seta r_filmGrain \"{:.3}\"\n\
 seta r_motionBlur \"{:.3}\"\n\
 seta r_depthOfField \"{:.3}\"\n\
+seta r_dofAutoFocus \"{}\"\n\
 seta r_dofQuality \"{}\"\n\
 seta r_colorLut \"{}\"\n\
 seta r_colorLutStrength \"{:.3}\"\n\
@@ -1614,13 +1794,15 @@ seta r_entityShadowLight \"{}\"\n\
         settings.max_frame_latency,
         msaa,
         texture_mode,
+        settings.picmip,
         anisotropy,
         settings.detail_textures.config_value(),
         u8::from(settings.detail_texture_fade),
         settings.detail_texture_fade_distance,
         settings.wireframe_mask,
         u8::from(settings.skip_ui),
-        u8::from(settings.developer_tools),
+        settings.developer_level,
+        settings.renderer_verbose,
         u8::from(settings.perf_trace),
         if settings.force_unified_world { "unified" } else { "auto" },
         u8::from(settings.gpu_timings),
@@ -1633,8 +1815,8 @@ seta r_entityShadowLight \"{}\"\n\
         pvs_mode,
         settings.fps_cap,
         settings.draw_fps,
+        u8::from(settings.draw_timer),
         settings.physics_msec,
-        u8::from(settings.input_subframe),
         u8::from(settings.timer_resolution_1ms),
         u8::from(settings.input_latelatch),
         settings.gamma,
@@ -1717,6 +1899,7 @@ seta r_entityShadowLight \"{}\"\n\
         settings.film_grain_strength,
         settings.motion_blur_strength,
         settings.depth_of_field_strength,
+        u8::from(settings.dof_autofocus),
         settings.dof_quality.config_value(),
         settings.color_lut.config_value(),
         settings.color_lut_strength,
@@ -1753,6 +1936,7 @@ seta r_entityShadowLight \"{}\"\n\
         u8::from(settings.lightmap_only),
     ));
     let _ = writeln!(text, "seta cg_fxFPS \"{}\"", settings.fx_fps);
+    let _ = writeln!(text, "seta cg_fxFPSScope \"{}\"", settings.fx_fps_scope);
     let _ = writeln!(text, "seta fx_physics \"{}\"", settings.fx_physics);
     let _ = writeln!(text, "seta fx_lod \"{}\"", settings.fx_lod);
     let _ = writeln!(text, "seta fx_countScale \"{}\"", settings.fx_count_scale);
@@ -1765,6 +1949,20 @@ seta r_entityShadowLight \"{}\"\n\
     let _ = writeln!(text, "seta r_modelBrightnessLock \"{}\"", u8::from(settings.model_brightness_locked));
     let _ = writeln!(text, "seta r_dynamicLightBrightness \"{:.3}\"", settings.dynamic_light_brightness);
     let _ = writeln!(text, "seta r_dynamicLightBrightnessLock \"{}\"", u8::from(settings.dynamic_light_brightness_locked));
+    let _ = writeln!(text, "seta r_jiggleStrength \"{:.3}\"", settings.jiggle_strength);
+    let _ = writeln!(text, "seta r_jiggleBreastStrength \"{:.3}\"", settings.jiggle_breast_strength);
+    let _ = writeln!(text, "seta r_jiggleGluteStrength \"{:.3}\"", settings.jiggle_glute_strength);
+    let _ = writeln!(text, "seta r_jiggleStiffness \"{:.3}\"", settings.jiggle_stiffness);
+    let _ = writeln!(text, "seta r_jiggleDamping \"{:.3}\"", settings.jiggle_damping);
+    let _ = writeln!(text, "seta r_jiggleGluteLift \"{:.3}\"", settings.jiggle_glute_lift);
+    let _ = writeln!(text, "seta r_clothBodyClearance \"{:.3}\"", settings.cloth_body_clearance);
+    let _ = writeln!(text, "seta r_clothAirResistance \"{:.3}\"", settings.cloth_air_resistance);
+    let _ = writeln!(text, "seta r_clothTurnResponse \"{:.3}\"", settings.cloth_turn_response);
+    let _ = writeln!(text, "seta r_clothAnimationInfluence \"{:.3}\"", settings.cloth_animation_influence);
+    let _ = writeln!(text, "seta r_clothWind \"{}\"", u8::from(settings.cloth_wind));
+    let _ = writeln!(text, "seta cg_dismember \"{}\"", settings.dismemberment);
+    let _ = writeln!(text, "seta r_dismemberMax \"{}\"", settings.dismember_max);
+    let _ = writeln!(text, "seta r_dismemberLifetime \"{:.1}\"", settings.dismember_lifetime);
     text.push_str(&format!(
         "seta r_physics \"{}\"\n\
 seta r_physicsHz \"{}\"\n\
@@ -1775,6 +1973,9 @@ seta r_ragdolls \"{}\"\n\
 seta r_ragdollMax \"{}\"\n\
 seta r_ragdollLifetime \"{:.1}\"\n\
 seta r_ragdollSelfCollision \"{}\"\n\
+seta r_jigglePhysics \"{}\"\n\
+seta r_clothPhysics \"{}\"\n\
+seta r_clothBodyCollision \"{}\"\n\
 seta r_physicsProps \"{}\"\n\
 seta r_physicsPropMax \"{}\"\n\
 seta r_physicsDebris \"{}\"\n\
@@ -1795,6 +1996,9 @@ seta r_physicsStats \"{}\"\n",
         settings.ragdoll_max,
         settings.ragdoll_lifetime,
         u8::from(settings.ragdoll_self_collision),
+        u8::from(settings.jiggle_physics),
+        u8::from(settings.cloth_physics),
+        u8::from(settings.cloth_body_collision),
         u8::from(settings.physics_props),
         settings.physics_prop_max,
         u8::from(settings.physics_debris),
@@ -1815,10 +2019,13 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta cg_crosshairStrength \"{:.3}\"", presentation.crosshair.strength);
     let [r, g, b, a] = presentation.crosshair.color;
     let _ = writeln!(text, "seta cg_crosshairColor \"{r} {g} {b} {a}\"");
+    let _ = writeln!(text, "seta cg_dynamicCrosshair \"{}\"", presentation.crosshair.dynamic);
     let _ = writeln!(text, "seta cg_crosshairIdentifyTarget \"{}\"", u8::from(presentation.crosshair.identify_target));
     let _ = writeln!(text, "seta cg_drawCrosshairNames \"{}\"", presentation.crosshair.names);
     let _ = writeln!(text, "seta cg_drawCrosshairNamesColours \"{}\"", u8::from(presentation.crosshair.names_colours));
     let _ = writeln!(text, "seta cg_drawCrosshairNamesOpacity \"{}\"", presentation.crosshair.names_opacity);
+    let _ = writeln!(text, "seta cg_drawPlayerNames \"{}\"", presentation.player_names.mode);
+    let _ = writeln!(text, "seta cg_drawPlayerNamesScale \"{:.3}\"", presentation.player_names.scale);
     for id in HudElementId::ALL {
         let _ = writeln!(
             text,
@@ -1843,9 +2050,24 @@ seta r_physicsStats \"{}\"\n",
     let [sr, sg, sb, sa] = presentation.strafe_helper.active_color;
     let _ = writeln!(text, "seta cg_strafeHelperActiveColor \"{sr} {sg} {sb} {sa}\"");
     let _ = writeln!(text, "seta cg_strafeHelperInactiveAlpha \"{}\"", presentation.strafe_helper.inactive_alpha);
+    let _ = writeln!(text, "seta cg_strafeTrailRadius \"{:.3}\"", presentation.strafe_trail.radius);
+    let _ = writeln!(text, "seta cg_strafeTrailLife \"{:.3}\"", presentation.strafe_trail.life_seconds);
+    let _ = writeln!(text, "seta cg_strafeTrailFPS \"{:.3}\"", presentation.strafe_trail.fps);
+    let _ = writeln!(text, "seta cg_strafeTrailPlums \"{}\"", u8::from(presentation.strafe_trail.plums));
+    let _ = writeln!(text, "seta cg_strafeTrailGhost \"{}\"", u8::from(presentation.strafe_trail.ghost));
+    let _ = writeln!(text, "seta cg_strafeTrailPlayers \"{}\"", presentation.strafe_trail.players);
+    let _ = writeln!(text, "seta cg_logStrafeTrail \"{}\"", presentation.strafe_trail.log_name);
+    let _ = writeln!(text, "seta cg_strafeTrailDistance \"{:.1}\"", presentation.strafe_trail.draw_distance);
+    let _ = writeln!(text, "seta cg_rGhostAlpha \"{:.3}\"", presentation.race_ghost_alpha);
+    let _ = writeln!(text, "seta cg_rGhostName \"{}\"", u8::from(presentation.race_ghost_name));
+    let _ = writeln!(text, "seta cg_rGhostTrail \"{}\"", u8::from(presentation.race_ghost_trail));
+    let _ = writeln!(text, "seta cg_rGhostVelocityDelta \"{}\"", u8::from(presentation.race_ghost_velocity_delta));
+    let _ = writeln!(text, "seta cg_rGhostDistanceDelta \"{}\"", u8::from(presentation.race_ghost_distance_delta));
+    let _ = writeln!(text, "seta cg_rGhostDemoBaseUrl \"{}\"", presentation.race_ghost_demo_base_url);
     let _ = writeln!(text, "seta con_timestamps \"{}\"", u8::from(presentation.console_timestamps));
     let _ = writeln!(text, "seta con_suggest \"{}\"", u8::from(presentation.console_suggest));
     let _ = writeln!(text, "seta cg_chatboxCompletion \"{}\"", u8::from(presentation.chatbox_completion));
+    let _ = writeln!(text, "seta cl_chatLog \"{}\"", u8::from(presentation.chat_log));
     let _ = writeln!(text, "seta ui_vgs \"{}\"", presentation.ui_vgs);
     let _ = writeln!(text, "seta r_jumpHeightShade \"{}\"", u8::from(presentation.jump_height_shade));
     let _ = writeln!(text, "seta cg_screenShake \"{}\"", presentation.screen_shake);
@@ -1864,13 +2086,22 @@ seta r_physicsStats \"{}\"\n",
     let _ = writeln!(text, "seta m_pitch \"{:.6}\"", presentation.mouse.pitch);
     let _ = writeln!(text, "seta cl_mouseAccel \"{:.6}\"", presentation.mouse.accel);
     let _ = writeln!(text, "seta cg_thirdPerson \"{}\"", u8::from(presentation.third_person.enabled));
+    let _ = writeln!(text, "seta cg_specCamera \"{}\"", presentation.spectator_camera.mode.as_i32());
+    let _ = writeln!(text, "seta cg_specCameraMotion \"{}\"", u8::from(presentation.spectator_camera.motion_direction));
+    let _ = writeln!(text, "seta cg_specOrbitRange \"{:.3}\"", presentation.spectator_camera.orbit_range);
     let _ = writeln!(text, "seta cg_fpls \"{}\"", u8::from(presentation.first_person_lightsaber));
     let _ = writeln!(text, "seta cg_saberTrail \"{}\"", presentation.saber_trail);
-    let _ = writeln!(text, "seta cg_smoothPlayerOrigin \"{}\"", u8::from(presentation.smoothing.smooth_player_origin));
-    let _ = writeln!(text, "seta cg_smoothThirdPersonOrigin \"{}\"", u8::from(presentation.smoothing.smooth_third_person_origin));
-    let _ = writeln!(text, "seta cg_smoothPlayerAnimation \"{}\"", u8::from(presentation.smoothing.smooth_player_animation));
-    let _ = writeln!(text, "seta cg_subframePlayerAngles \"{}\"", u8::from(presentation.smoothing.subframe_player_angles));
-    let _ = writeln!(text, "seta cg_smoothThirdPersonTime \"{}\"", u8::from(presentation.smoothing.smooth_third_person_time));
+    let _ = writeln!(text, "seta cg_saberTeamColors \"{}\"", u8::from(presentation.saber_team_colors));
+    let _ = writeln!(text, "seta cg_saberStaffMultiColor \"{}\"", u8::from(presentation.saber_staff_multi_color));
+    let _ = writeln!(text, "seta cg_drawTeamOverlay \"{}\"", presentation.team_overlay.mode);
+    let _ = writeln!(text, "seta cg_drawTeamOverlayX \"{}\"", presentation.team_overlay.x);
+    let _ = writeln!(text, "seta cg_drawTeamOverlayY \"{}\"", presentation.team_overlay.y);
+    let _ = writeln!(text, "seta cg_drawTeamOverlayWeapons \"{}\"", u8::from(presentation.team_overlay.weapons));
+    let _ = writeln!(text, "seta cg_drawTeamOverlayScale \"{:.3}\"", presentation.team_overlay.scale);
+    let _ = writeln!(text, "seta cg_drawTeamOverlayMaxHP \"{:.3}\"", presentation.team_overlay.max_hp);
+    let _ = writeln!(text, "seta cg_drawTeamOverlayForce \"{}\"", u8::from(presentation.team_overlay.force));
+    let _ = writeln!(text, "seta cg_scoreDeaths \"{}\"", presentation.score_deaths);
+    let _ = writeln!(text, "seta cg_drawScores \"{}\"", presentation.draw_scores);
     let _ = writeln!(text, "seta cg_thirdPersonAlpha \"{:.3}\"", presentation.third_person.alpha);
     let _ = writeln!(text, "seta cg_thirdPersonAngle \"{:.3}\"", presentation.third_person.angle);
     let _ = writeln!(text, "seta cg_thirdPersonCameraDamp \"{:.3}\"", presentation.third_person.camera_damp);
@@ -1932,6 +2163,15 @@ pub fn normalize_physics_msec(value: &str, fallback: u32) -> u32 {
         .ok()
         .map(|msec| msec.clamp(PHYSICS_MSEC_MIN, PHYSICS_MSEC_MAX))
         .unwrap_or_else(|| fallback.clamp(PHYSICS_MSEC_MIN, PHYSICS_MSEC_MAX))
+}
+
+pub fn normalize_fx_fps_scope(value: &str, fallback: u32) -> u32 {
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .map(|scope| scope.min(crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN))
+        .unwrap_or(fallback)
 }
 
 pub fn normalize_fx_fps(value: &str, fallback: u32) -> u32 {
@@ -2064,6 +2304,25 @@ fn split_cfg_words(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn cloth_controls_survive_config_round_trip() {
+        let path = std::env::temp_dir().join(format!("jka-cloth-controls-{}.cfg", std::process::id()));
+        let mut settings = VideoSettings::default();
+        settings.cloth_air_resistance = 2.25;
+        settings.cloth_turn_response = 2.75;
+        settings.cloth_animation_influence = 0.2;
+        settings.cloth_wind = true;
+        save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
+        let loaded = load_video_settings(&path, None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.cloth_air_resistance, settings.cloth_air_resistance);
+        assert_eq!(loaded.cloth_turn_response, settings.cloth_turn_response);
+        assert_eq!(loaded.cloth_animation_influence, settings.cloth_animation_influence);
+        assert_eq!(loaded.cloth_wind, settings.cloth_wind);
+    }
+
     #[test]
     fn ocean_authoring_cfg_roundtrip_preserves_units_and_seed() {
         let path = std::env::temp_dir().join(format!("ocean-authoring-{}.cfg",std::process::id()));
@@ -2085,6 +2344,32 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_levels_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "jka-diagnostic-levels-{}-{:?}.cfg",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut settings = VideoSettings::default();
+        settings.developer_level = 2;
+        settings.developer_tools = true;
+        settings.renderer_verbose = 3;
+        save_video_settings(
+            &path,
+            settings,
+            &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(),
+            &AudioSettings::default(),
+        )
+        .expect("save");
+        let loaded = load_video_settings(&path, None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.developer_level, 2);
+        assert!(loaded.developer_tools);
+        assert_eq!(loaded.renderer_verbose, 3);
+    }
+
+    #[test]
     fn cfg_words_preserve_empty_quoted_values() {
         assert_eq!(
             split_cfg_words(r#"seta sv_master1 """#),
@@ -2102,6 +2387,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("test.cfg");
         let mut presentation = ClientPresentationSettings::default();
+        presentation.chat_log = true;
         presentation.master_servers[0].clear();
         presentation.master_servers[3] = "custom.example.org:29061".to_owned();
         save_video_settings(
@@ -2114,6 +2400,7 @@ mod tests {
         .expect("save");
         let loaded = load_client_presentation_settings(&path, None);
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(loaded.chat_log);
         assert_eq!(loaded.master_servers[0], "");
         assert_eq!(loaded.master_servers[1], "master.jkhub.org");
         assert_eq!(loaded.master_servers[2], "master.ouned.de");
@@ -2372,14 +2659,12 @@ mod tests {
                 "seta cl_mouseAccel \"0.45\"\n",
                 "seta cg_fov \"110\"\n",
                 "seta cg_thirdPerson \"1\"\n",
+                "seta cg_specCamera \"2\"\n",
+                "seta cg_specCameraMotion \"1\"\n",
+                "seta cg_specOrbitRange \"220\"\n",
                 "seta cg_fpls \"0\"\n",
                 "seta r_jumpHeightShade \"1\"\n",
                 "seta cg_saberTrail \"2\"\n",
-                "seta cg_smoothPlayerOrigin \"0\"\n",
-                "seta cg_smoothThirdPersonOrigin \"0\"\n",
-                "seta cg_smoothPlayerAnimation \"0\"\n",
-                "seta cg_subframePlayerAngles \"0\"\n",
-                "seta cg_smoothThirdPersonTime \"0\"\n",
                 "seta cg_thirdPersonAlpha \"0.375\"\n",
                 "seta cg_thirdPersonAngle \"25\"\n",
                 "seta cg_thirdPersonCameraDamp \"0.42\"\n",
@@ -2415,14 +2700,12 @@ mod tests {
         assert!((loaded.mouse.accel - 0.45).abs() < 1e-6);
         assert!((loaded.fov - 110.0).abs() < 1e-6);
         assert!(loaded.third_person.enabled);
+        assert_eq!(loaded.spectator_camera.mode, SpectatorCameraMode::Orbit);
+        assert!(loaded.spectator_camera.motion_direction);
+        assert!((loaded.spectator_camera.orbit_range - 220.0).abs() < 1e-6);
         assert!(!loaded.first_person_lightsaber);
         assert!(loaded.jump_height_shade);
         assert_eq!(loaded.saber_trail, 2);
-        assert!(!loaded.smoothing.smooth_player_origin);
-        assert!(!loaded.smoothing.smooth_third_person_origin);
-        assert!(!loaded.smoothing.smooth_player_animation);
-        assert!(!loaded.smoothing.subframe_player_angles);
-        assert!(!loaded.smoothing.smooth_third_person_time);
         assert!((loaded.third_person.alpha - 0.375).abs() < 1e-6);
         assert!((loaded.third_person.angle - 25.0).abs() < 1e-6);
         assert!((loaded.third_person.camera_damp - 0.42).abs() < 1e-6);
@@ -2449,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn client_presentation_writer_archives_camera_and_smoothing_choices() {
+    fn client_presentation_writer_archives_camera_choices() {
         let dir = std::env::temp_dir().join(format!(
             "jka-thirdperson-save-cfg-{}-{:?}",
             std::process::id(),
@@ -2466,14 +2749,12 @@ mod tests {
         presentation.mouse.accel = 0.3;
         presentation.fov = 105.0;
         presentation.third_person.enabled = true;
+        presentation.spectator_camera.mode = SpectatorCameraMode::ThirdPerson;
+        presentation.spectator_camera.motion_direction = true;
+        presentation.spectator_camera.orbit_range = 256.0;
         presentation.first_person_lightsaber = false;
         presentation.jump_height_shade = true;
         presentation.saber_trail = 0;
-        presentation.smoothing.smooth_player_origin = false;
-        presentation.smoothing.smooth_third_person_origin = false;
-        presentation.smoothing.smooth_player_animation = false;
-        presentation.smoothing.subframe_player_angles = false;
-        presentation.smoothing.smooth_third_person_time = false;
         presentation.third_person.alpha = 0.25;
         presentation.third_person.angle = 15.0;
         presentation.third_person.camera_damp = 0.8;
@@ -2491,11 +2772,13 @@ mod tests {
             anchor: crate::ui::HudAnchor::TopLeft,
             offset: [48.0, 64.0],
             scale: 1.25,
+            extent: [1.0, 1.0],
         };
         presentation.hud_layout.fps = HudElementLayout {
             anchor: crate::ui::HudAnchor::TopLeft,
             offset: [-20.0, 10.0],
             scale: 0.75,
+            extent: [1.0, 1.0],
         };
         presentation.hud_layout.snap_to_grid = false;
         presentation.hud_layout.grid_size = 16.0;
@@ -2519,15 +2802,13 @@ mod tests {
         assert!(text.contains("seta cl_mouseAccel \"0.300000\""));
         assert!(text.contains("seta cg_fov \"105.000\""));
         assert!(text.contains("seta cg_thirdPerson \"1\""));
+        assert!(text.contains("seta cg_specCamera \"1\""));
+        assert!(text.contains("seta cg_specCameraMotion \"1\""));
+        assert!(text.contains("seta cg_specOrbitRange \"256.000\""));
         assert!(text.contains("seta cg_fpls \"0\""));
         assert!(text.contains("seta r_jumpHeightShade \"1\""));
         assert!(text.contains("seta cg_saberTrail \"0\""));
         assert!(text.contains("seta cg_fxFPS \"90\""));
-        assert!(text.contains("seta cg_smoothPlayerOrigin \"0\""));
-        assert!(text.contains("seta cg_smoothThirdPersonOrigin \"0\""));
-        assert!(text.contains("seta cg_smoothPlayerAnimation \"0\""));
-        assert!(text.contains("seta cg_subframePlayerAngles \"0\""));
-        assert!(text.contains("seta cg_smoothThirdPersonTime \"0\""));
         assert!(text.contains("seta cg_thirdPersonAlpha \"0.250\""));
         assert!(text.contains("seta cg_thirdPersonAngle \"15.000\""));
         assert!(text.contains("seta cg_thirdPersonCameraDamp \"0.800\""));
@@ -2547,7 +2828,7 @@ mod tests {
         assert!(text.contains("seta cg_hudGridSize \"16.000\""));
 
         // cg_thirdPersonSpecialCam remains the TaystJK runtime-only exception.
-        // DinurdoJK archives cg_fpls and its render-only smoothing A/B switches.
+        // cg_fpls is archived; cg_thirdPersonSpecialCam remains runtime-only.
         assert!(!text.contains("seta cg_thirdPersonSpecialCam"));
     }
 
@@ -2557,13 +2838,9 @@ mod tests {
         assert_eq!(settings.model, "kyle");
         assert!((settings.fov - DEFAULT_CG_FOV).abs() < 1e-6);
         assert!(!settings.third_person.enabled);
+        assert_eq!(settings.spectator_camera, SpectatorCameraSettings::default());
         assert!(settings.first_person_lightsaber);
         assert_eq!(settings.saber_trail, 1);
-        assert!(settings.smoothing.smooth_player_origin);
-        assert!(settings.smoothing.smooth_third_person_origin);
-        assert!(settings.smoothing.smooth_player_animation);
-        assert!(settings.smoothing.subframe_player_angles);
-        assert!(settings.smoothing.smooth_third_person_time);
         assert_eq!(settings.crosshair, CrosshairSettings::default());
         assert!((settings.third_person.alpha - 1.0).abs() < 1e-6);
         assert!((settings.third_person.angle - 0.0).abs() < 1e-6);

@@ -39,30 +39,6 @@ impl Default for MouseInputSettings {
     }
 }
 
-/// Render-only smoothing controls for the local player. None of these change
-/// OpenJK pmove state or command generation; they only choose how fixed-step
-/// samples are presented between simulation ticks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalPresentationSettings {
-    pub smooth_player_origin: bool,
-    pub smooth_third_person_origin: bool,
-    pub smooth_player_animation: bool,
-    pub subframe_player_angles: bool,
-    pub smooth_third_person_time: bool,
-}
-
-impl Default for LocalPresentationSettings {
-    fn default() -> Self {
-        Self {
-            smooth_player_origin: true,
-            smooth_third_person_origin: true,
-            smooth_player_animation: true,
-            subframe_player_angles: true,
-            smooth_third_person_time: true,
-        }
-    }
-}
-
 impl MouseInputSettings {
     /// Sensitivity/acceleration-scaled mouse counts (before m_yaw/m_pitch),
     /// shared by the offline player and CL_MouseMove for live play.

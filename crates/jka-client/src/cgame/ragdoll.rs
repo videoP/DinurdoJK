@@ -23,6 +23,9 @@ const JKA_GRAVITY: f32 = 800.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RagdollConfig {
+    /// Master client visual-physics switch (`r_physics`).
+    pub physics_enabled: bool,
+    /// Articulated ragdolls specifically (`r_ragdolls`).
     pub enabled: bool,
     pub hz: u32,
     pub max_substeps: u32,
@@ -30,6 +33,10 @@ pub struct RagdollConfig {
     pub sleeping: bool,
     pub max_ragdolls: u32,
     pub lifetime_seconds: f32,
+    /// OpenJK cg_dismember semantics: 0 off, 1 limbs only, 2 full (head/waist too).
+    pub dismemberment: u8,
+    pub max_detached_limbs: u32,
+    pub detached_limb_lifetime_seconds: f32,
     pub self_collision: bool,
     pub weapon_impulses: bool,
     pub explosion_impulses: bool,
@@ -41,6 +48,7 @@ pub struct RagdollConfig {
 impl Default for RagdollConfig {
     fn default() -> Self {
         Self {
+            physics_enabled: false,
             enabled: false,
             hz: 60,
             max_substeps: 4,
@@ -48,6 +56,9 @@ impl Default for RagdollConfig {
             sleeping: true,
             max_ragdolls: 8,
             lifetime_seconds: 20.0,
+            dismemberment: 0,
+            max_detached_limbs: 24,
+            detached_limb_lifetime_seconds: 16.0,
             self_collision: false,
             weapon_impulses: true,
             explosion_impulses: true,
@@ -178,6 +189,12 @@ struct CorpseGeneration {
     body_queue_time: i32,
 }
 
+// A reliable `ircg` BodyQueueCopy arrives at the exact OpenJK handoff point,
+// before the destination ET_BODY's trajectory stamp necessarily reaches the
+// presenter. Keep the already-solved Rapier corpse alive under the body-queue
+// entity number and adopt the real stamp on its first ET_BODY presentation.
+const BODY_QUEUE_PENDING_TIME: i32 = i32::MIN;
+
 #[derive(Debug, Clone)]
 struct LivingRagdollRecovery {
     model_key: String,
@@ -212,6 +229,38 @@ struct RagdollInstance {
     driven: Vec<DrivenBone>,
 }
 
+/// Stable identity of one server-authored `G2_MODEL_PART` presentation entity.
+/// Entity numbers are reusable, so the source/kind/trTime tuple is part of the
+/// generation just like ET_BODY queue slots use a copy timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedLimbGeneration {
+    pub source_entity: u16,
+    pub kind: u8,
+    pub trajectory_time: i32,
+}
+
+/// Spawn data prepared by the Ghoul2 presenter at the exact sever pose.
+/// All coordinates are JKA world/model units except angular velocity (rad/s).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DetachedLimbSpawn {
+    pub entity: u16,
+    pub generation: DetachedLimbGeneration,
+    pub body_world: Matrix3x4,
+    /// Capsule endpoints in the rigid body's local frame. `None` creates a ball.
+    pub capsule_local: Option<([f32; 3], [f32; 3])>,
+    pub radius: f32,
+    pub mass_kg: f32,
+    pub linear_velocity: [f32; 3],
+    pub angular_velocity: [f32; 3],
+}
+
+#[derive(Debug)]
+struct DetachedLimbBody {
+    generation: DetachedLimbGeneration,
+    body: RigidBodyHandle,
+    spawned_at: i32,
+}
+
 pub struct RagdollWorld {
     config: RagdollConfig,
     pipeline: PhysicsPipeline,
@@ -227,6 +276,7 @@ pub struct RagdollWorld {
     static_world_ready: bool,
     previous_body_poses: HashMap<RigidBodyHandle, Pose>,
     instances: HashMap<u16, RagdollInstance>,
+    detached_limbs: HashMap<u16, DetachedLimbBody>,
     living_recoveries: HashMap<u16, LivingRagdollRecovery>,
     retired: HashMap<u16, (String, CorpseGeneration)>,
     last_time: Option<i32>,
@@ -258,6 +308,7 @@ impl RagdollWorld {
             static_world_ready: false,
             previous_body_poses: HashMap::new(),
             instances: HashMap::new(),
+            detached_limbs: HashMap::new(),
             living_recoveries: HashMap::new(),
             retired: HashMap::new(),
             last_time: None,
@@ -269,6 +320,21 @@ impl RagdollWorld {
 
     pub fn active(&self) -> bool {
         self.config.enabled && self.static_world_ready
+    }
+
+    pub fn dismemberment_level(&self) -> u8 {
+        self.config.dismemberment
+    }
+
+    fn detached_physics_active(&self) -> bool {
+        self.config.physics_enabled && self.config.dismemberment != 0 && self.static_world_ready
+    }
+
+    fn world_active(&self) -> bool {
+        // Do not step an otherwise-unused Rapier world merely because
+        // cg_dismember is enabled. The first detached body is seeded after the
+        // presentation prepass and starts integrating on the following frame.
+        self.active() || (self.detached_physics_active() && !self.detached_limbs.is_empty())
     }
 
     pub fn debug_enabled(&self) -> bool {
@@ -290,6 +356,7 @@ impl RagdollWorld {
     /// Drop only dynamic ragdoll state; keep the map collider and configuration.
     pub fn reset_dynamic_for_seek(&mut self) {
         self.clear_instances();
+        self.clear_detached_limbs();
         self.previous_body_poses.clear();
         self.living_recoveries.clear();
         self.last_time = None;
@@ -298,17 +365,26 @@ impl RagdollWorld {
 
     pub fn set_config(&mut self, config: RagdollConfig) {
         let was_enabled = self.config.enabled;
+        let physics_was_enabled = self.config.physics_enabled;
         let debug_was = self.config.debug;
-        let rebuild_dynamic = self.config.enabled
+        let rebuild_ragdolls = self.config.enabled
             && config.enabled
             && (self.config.ccd != config.ccd
                 || self.config.sleeping != config.sleeping
                 || self.config.self_collision != config.self_collision);
+        let rebuild_detached = self.config.physics_enabled
+            && config.physics_enabled
+            && self.config.dismemberment != 0
+            && config.dismemberment != 0
+            && (self.config.ccd != config.ccd || self.config.sleeping != config.sleeping);
         self.config = RagdollConfig {
             hz: config.hz.clamp(30, 240),
             max_substeps: config.max_substeps.clamp(1, 16),
             max_ragdolls: config.max_ragdolls.min(64),
             lifetime_seconds: config.lifetime_seconds.clamp(0.0, 300.0),
+            dismemberment: config.dismemberment.min(2),
+            max_detached_limbs: config.max_detached_limbs.min(128),
+            detached_limb_lifetime_seconds: config.detached_limb_lifetime_seconds.clamp(0.0, 300.0),
             ..config
         };
 
@@ -333,6 +409,9 @@ impl RagdollWorld {
         if was_enabled && !self.config.enabled {
             self.clear_instances();
         }
+        if physics_was_enabled && !self.config.physics_enabled {
+            self.clear_detached_limbs();
+        }
         if !was_enabled && self.config.enabled {
             self.last_time = None;
             self.accumulator = 0.0;
@@ -340,10 +419,17 @@ impl RagdollWorld {
         // These flags are baked into already-created rigid bodies/colliders.
         // Re-seed visible corpses from their current authoritative animation
         // pose instead of leaving a mixed old/new physics world.
-        if rebuild_dynamic {
+        if rebuild_ragdolls {
             self.clear_instances();
         }
+        if rebuild_detached {
+            self.clear_detached_limbs();
+        }
+        if self.config.dismemberment == 0 {
+            self.clear_detached_limbs();
+        }
         self.trim_to_budget();
+        self.trim_detached_to_budget();
     }
 
     /// Replace the fixed Rapier world collider for a newly loaded map.
@@ -368,7 +454,8 @@ impl RagdollWorld {
                 .collision_groups(static_groups),
         );
         self.static_world_ready = true;
-        println!(
+        devprintln!(
+            1,
             "RAPIER MAP COLLISION: {} vertices / {} triangles",
             mesh.vertex_count,
             mesh.triangle_count
@@ -383,7 +470,7 @@ impl RagdollWorld {
         let Some(previous) = self.last_time.replace(current_time) else {
             return;
         };
-        if !self.active() {
+        if !self.world_active() {
             self.accumulator = 0.0;
             return;
         }
@@ -392,6 +479,7 @@ impl RagdollWorld {
             // The next ET_BODY presentation will seed each corpse from the
             // authoritative snapshot/death animation pose at the new time.
             self.clear_instances();
+            self.clear_detached_limbs();
             self.accumulator = 0.0;
             return;
         }
@@ -439,9 +527,10 @@ impl RagdollWorld {
         {
             self.last_stats_print = Some(current_time);
             println!(
-                "RAPIER STATS: active={} ragdolls={} bodies={} colliders={} joints={} steps={} accumulatorMs={:.2}",
-                self.active(),
+                "RAPIER STATS: active={} ragdolls={} detachedLimbs={} bodies={} colliders={} joints={} steps={} accumulatorMs={:.2}",
+                self.world_active(),
                 self.instances.len(),
+                self.detached_limbs.len(),
                 self.bodies.len(),
                 self.colliders.len(),
                 self.impulse_joints.len(),
@@ -504,6 +593,21 @@ impl RagdollWorld {
             // means this slot now represents a new corpse and may enter the
             // active budget again.
             self.retired.remove(&entity.number);
+        }
+
+        if entity.entity_type == crate::cgame::ET_BODY {
+            if let Some(instance) = self.instances.get_mut(&entity.number) {
+                if instance.kind == RagdollKind::Corpse
+                    && instance.generation.client_num == generation.client_num
+                    && instance.generation.body_queue_time == BODY_QUEUE_PENDING_TIME
+                {
+                    // CG_BodyQueueCopy duplicates the already-dead Ghoul2
+                    // instance; it does not restart the corpse's death pose.
+                    // Rekeying the existing Rapier articulation is the same
+                    // ownership transfer for this renderer.
+                    instance.generation = generation;
+                }
+            }
         }
 
         let must_respawn = self
@@ -593,7 +697,8 @@ impl RagdollWorld {
                 }
                 return Ok(false);
             }
-            println!(
+            devprintln!(
+                2,
                 "RAPIER RAGDOLL SPAWN: entity={} kind={:?} model={} bodies={} modelScale={:.3}",
                 entity.number,
                 kind,
@@ -1142,6 +1247,12 @@ impl RagdollWorld {
                 }
             }
         }
+        for detached in self.detached_limbs.values() {
+            if let Some(body) = self.bodies.get(detached.body) {
+                self.previous_body_poses
+                    .insert(detached.body, body.position().clone());
+            }
+        }
     }
 
     fn interpolation_alpha(&self) -> f32 {
@@ -1150,19 +1261,208 @@ impl RagdollWorld {
     }
 
     fn sleep_expired(&mut self, current_time: i32) {
-        if self.config.lifetime_seconds <= 0.0 {
-            return;
-        }
-        let lifetime_ms = (self.config.lifetime_seconds * 1000.0) as i32;
-        for instance in self.instances.values() {
-            if current_time.saturating_sub(instance.spawned_at) < lifetime_ms {
-                continue;
-            }
-            for driven in &instance.driven {
-                if let Some(body) = self.bodies.get_mut(driven.body) {
-                    body.sleep();
+        if self.config.lifetime_seconds > 0.0 {
+            let lifetime_ms = (self.config.lifetime_seconds * 1000.0) as i32;
+            for instance in self.instances.values() {
+                if current_time.saturating_sub(instance.spawned_at) < lifetime_ms {
+                    continue;
+                }
+                for driven in &instance.driven {
+                    if let Some(body) = self.bodies.get_mut(driven.body) {
+                        body.sleep();
+                    }
                 }
             }
+        }
+
+        let detached_lifetime_ms = (self.config.detached_limb_lifetime_seconds * 1000.0) as i32;
+        let expired = self
+            .detached_limbs
+            .iter()
+            .filter_map(|(&entity, limb)| {
+                (detached_lifetime_ms > 0
+                    && current_time.saturating_sub(limb.spawned_at) >= detached_lifetime_ms)
+                    .then_some(entity)
+            })
+            .collect::<Vec<_>>();
+        for entity in expired {
+            self.remove_detached_limb(entity);
+        }
+
+        // CCD matters during the initial high-speed flight, not after a limb has
+        // settled. Turning it off below ~120 JKA u/s saves narrow/TOI work.
+        let ccd_threshold_sq = (120.0 * JKA_TO_RAPIER).powi(2);
+        for limb in self.detached_limbs.values() {
+            if let Some(body) = self.bodies.get_mut(limb.body) {
+                let fast = body.linvel().length_squared() > ccd_threshold_sq;
+                body.enable_ccd(self.config.ccd && fast);
+            }
+        }
+    }
+
+    /// Create exactly one rigid body for a server-authored detached Ghoul2 part.
+    /// Repeated snapshot presentation is idempotent; a reused entity number with
+    /// a new generation tears down the previous body first.
+    pub(crate) fn ensure_detached_limb(
+        &mut self,
+        spawn: DetachedLimbSpawn,
+        current_time: i32,
+    ) -> bool {
+        if !self.detached_physics_active() {
+            return false;
+        }
+        if self
+            .detached_limbs
+            .get(&spawn.entity)
+            .is_some_and(|limb| limb.generation == spawn.generation)
+        {
+            return true;
+        }
+        self.remove_detached_limb(spawn.entity);
+
+        let linear_velocity = Vector::new(
+            spawn.linear_velocity[0],
+            spawn.linear_velocity[1],
+            spawn.linear_velocity[2],
+        ) * JKA_TO_RAPIER;
+        let angular_velocity = Vector::new(
+            spawn.angular_velocity[0],
+            spawn.angular_velocity[1],
+            spawn.angular_velocity[2],
+        );
+        let body = self.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .pose(matrix_to_pose(&spawn.body_world))
+                .linvel(linear_velocity)
+                .angvel(angular_velocity)
+                .linear_damping(0.45)
+                .angular_damping(1.6)
+                .ccd_enabled(self.config.ccd && linear_velocity.length_squared() > (120.0 * JKA_TO_RAPIER).powi(2))
+                .can_sleep(self.config.sleeping)
+                .additional_solver_iterations(4),
+        );
+        if let Some(rigid) = self.bodies.get(body) {
+            self.previous_body_poses.insert(body, rigid.position().clone());
+        }
+        let groups = InteractionGroups::new(
+            Group::GROUP_2,
+            Group::GROUP_1,
+            InteractionTestMode::default(),
+        );
+        let collider = if let Some((a, b)) = spawn.capsule_local {
+            ColliderBuilder::capsule_from_endpoints(
+                Vector::new(a[0], a[1], a[2]) * JKA_TO_RAPIER,
+                Vector::new(b[0], b[1], b[2]) * JKA_TO_RAPIER,
+                spawn.radius.max(0.25) * JKA_TO_RAPIER,
+            )
+        } else {
+            ColliderBuilder::ball(spawn.radius.max(0.25) * JKA_TO_RAPIER)
+        };
+        self.colliders.insert_with_parent(
+            collider
+                .mass(spawn.mass_kg.max(0.05))
+                .friction(0.9)
+                .restitution(0.05)
+                .collision_groups(groups),
+            body,
+            &mut self.bodies,
+        );
+        self.detached_limbs.insert(
+            spawn.entity,
+            DetachedLimbBody {
+                generation: spawn.generation,
+                body,
+                spawned_at: current_time,
+            },
+        );
+        self.trim_detached_to_budget();
+        true
+    }
+
+    /// Interpolated rigid transform for rendering at display FPS while physics
+    /// remains fixed-step at r_physicsHz.
+    pub(crate) fn detached_limb_matrix(
+        &self,
+        entity: u16,
+        generation: DetachedLimbGeneration,
+    ) -> Option<Matrix3x4> {
+        let limb = self.detached_limbs.get(&entity)?;
+        if limb.generation != generation {
+            return None;
+        }
+        let current = self.bodies.get(limb.body)?.position();
+        let previous = self.previous_body_poses.get(&limb.body).unwrap_or(current);
+        Some(pose_to_matrix(&interpolate_pose(
+            previous,
+            current,
+            self.interpolation_alpha(),
+        )))
+    }
+
+    /// Prefer the live Rapier segment velocity when a sever occurs after the
+    /// source has already entered a ragdoll. This makes a flying corpse's limb
+    /// continue naturally instead of restarting from the network trajectory.
+    pub(crate) fn ragdoll_bone_velocity(
+        &self,
+        entity: u16,
+        gla: &GlaAnimation,
+        bone_name: &str,
+    ) -> Option<[f32; 3]> {
+        let instance = self.instances.get(&entity)?;
+        let bone = bone_index(gla, bone_name)?;
+        let driven = instance
+            .driven
+            .iter()
+            .find(|driven| driven.bone_index == bone)
+            .or_else(|| {
+                let mut parent = gla.skeleton.get(bone)?.parent;
+                while let Ok(index) = usize::try_from(parent) {
+                    if let Some(driven) = instance.driven.iter().find(|driven| driven.bone_index == index) {
+                        return Some(driven);
+                    }
+                    parent = gla.skeleton.get(index)?.parent;
+                }
+                None
+            })?;
+        let v = self.bodies.get(driven.body)?.linvel() * RAPIER_TO_JKA;
+        Some([v.x, v.y, v.z])
+    }
+
+    pub(crate) fn retain_detached_limbs(&mut self, live: &HashSet<u16>) {
+        let stale = self
+            .detached_limbs
+            .keys()
+            .copied()
+            .filter(|entity| !live.contains(entity))
+            .collect::<Vec<_>>();
+        for entity in stale {
+            self.remove_detached_limb(entity);
+        }
+    }
+
+    fn oldest_detached_limb(&self) -> Option<u16> {
+        self.detached_limbs
+            .iter()
+            .min_by_key(|(_, limb)| limb.spawned_at)
+            .map(|(&entity, _)| entity)
+    }
+
+    fn trim_detached_to_budget(&mut self) {
+        while self.detached_limbs.len() > self.config.max_detached_limbs as usize {
+            let Some(oldest) = self.oldest_detached_limb() else { break };
+            self.remove_detached_limb(oldest);
+        }
+    }
+
+    fn remove_detached_limb(&mut self, entity: u16) {
+        let Some(limb) = self.detached_limbs.remove(&entity) else { return };
+        self.remove_body(limb.body);
+    }
+
+    fn clear_detached_limbs(&mut self) {
+        let entities = self.detached_limbs.keys().copied().collect::<Vec<_>>();
+        for entity in entities {
+            self.remove_detached_limb(entity);
         }
     }
 
@@ -1189,6 +1489,45 @@ impl RagdollWorld {
         }
         self.retired.clear();
         self.living_recoveries.clear();
+    }
+
+    /// OpenJK `CG_BodyQueueCopy` duplicates the source Ghoul2 corpse at its
+    /// already-solved pose. Move the corresponding Rapier articulation to the
+    /// destination entity instead of spawning a second ragdoll from the death
+    /// animation when ET_BODY first appears.
+    pub(crate) fn body_queue_copy(&mut self, source: u16, body: u16) {
+        if source == body {
+            return;
+        }
+
+        // Body-queue slots are reused; discard any physics left by the previous
+        // occupant before transferring the new corpse into that slot.
+        self.remove_instance(body);
+        self.retired.remove(&body);
+        self.living_recoveries.remove(&body);
+        self.debug_candidates.remove(&body);
+
+        let Some(mut instance) = self.instances.remove(&source) else {
+            return;
+        };
+        if instance.kind != RagdollKind::Corpse {
+            // A body copy is only meaningful for an already-dead articulation.
+            // Put any other presentation takeover back untouched.
+            self.instances.insert(source, instance);
+            return;
+        }
+        instance.generation.body_queue_time = BODY_QUEUE_PENDING_TIME;
+        self.instances.insert(body, instance);
+        self.debug_candidates.remove(&source);
+    }
+
+    /// Reliable `kg2` removes the Ghoul2 instance immediately; mirror that for
+    /// any physics state bolted to the same presentation entity.
+    pub(crate) fn remove_entity(&mut self, entity: u16) {
+        self.remove_instance(entity);
+        self.remove_detached_limb(entity);
+        self.retired.remove(&entity);
+        self.living_recoveries.remove(&entity);
     }
 
     fn retire_instance(&mut self, entity: u16) {
@@ -1238,6 +1577,7 @@ impl RagdollWorld {
         self.static_world_ready = false;
         self.previous_body_poses.clear();
         self.instances.clear();
+        self.detached_limbs.clear();
         self.living_recoveries.clear();
         self.retired.clear();
         self.last_time = None;

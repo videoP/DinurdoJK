@@ -321,7 +321,8 @@ impl FogSystem {
         self.map_fog = self.global_fog.or_else(|| summarize_map_fog(batches));
 
         if let Some(fog) = self.map_fog {
-            println!(
+            rverbose!(
+                1,
                 "Map fog: rgb=({:.3}, {:.3}, {:.3}) depth={:.1}; MAP baseline=1.00x{}",
                 fog.color[0],
                 fog.color[1],
@@ -334,7 +335,7 @@ impl FogSystem {
                 },
             );
         } else {
-            println!("Map fog: none; MAP/DEFAULT fog remains inactive");
+            rverbose!(1, "Map fog: none; MAP/DEFAULT fog remains inactive");
         }
     }
 
@@ -386,8 +387,9 @@ impl FogSystem {
         ))
     }
 
-    /// Legacy fog for geometry that is not a BSP material stage (entities,
-    /// procedural grass) and therefore must fog itself in its own shader, as
+    /// Global/manual Legacy fog for geometry that is not a BSP material stage.
+    /// Procedural grass supplements this with its source surface's local fog slot.
+    /// Returned as
     /// (linear RGB + depthForOpaque, [mode, scale, 0, 0]) with mode 1 = authored
     /// global EXP2, 2 = manual. Mirrors bsp.wgsl legacy_fog_color_amount so this
     /// geometry and BSP at the same depth match.
@@ -404,7 +406,8 @@ impl FogSystem {
                 return None;
             }
             // OpenJK r_drawfog 2 only uses GL fog for the world's global fog.
-            // Maps with only local fog brushes leave this geometry unfogged.
+            // Entities on maps with only local fog brushes remain unfogged here;
+            // procedural grass handles local brush fog from its source BSP surface.
             let fog = self.global_fog?;
             let color = legacy_authored_fog_color(fog.color);
             return Some((
@@ -415,6 +418,12 @@ impl FogSystem {
         // No authored fog: the strength slider is the manual Legacy fog, the
         // same neutral colour and 1024-unit curve BSP uses in both Legacy modes.
         Some(([0.55, 0.62, 0.70, 1024.0], [2.0, self.strength, 0.0, 0.0]))
+    }
+
+    /// Strength multiplier used by local BSP fog redraws. A zero UI value is
+    /// the authored MAP baseline, i.e. 1.0x, not "disabled".
+    pub(crate) fn legacy_local_fog_scale(&self) -> f32 {
+        authored_fog_strength_scale(self.strength)
     }
 
     pub(crate) fn legacy1_global_post_active(&self) -> bool {
@@ -473,7 +482,26 @@ impl FogSystem {
     }
 
     pub(crate) fn clear_color(&self) -> wgpu::Color {
-        if let Some(fog) = self.global_fog {
+        // A compiled global fog is also the legacy renderer's background clear,
+        // so preserve that behavior even when the user's fog mode is disabled.
+        //
+        // Local-only authored fog needs one extra case in this renderer: WGPU
+        // deterministically clears the scene target every frame, while the old GL
+        // backend normally left the color buffer alone unless a global fog/other
+        // feature requested a clear. If distanceCull exposes pixels with no world
+        // geometry behind a dense local fog, using our arbitrary blue fallback
+        // therefore creates a visible rectangle at the cull boundary. When authored
+        // fog is active, converge those uncovered pixels to the same dominant map
+        // fog color. This changes only the existing clear value; it adds no pass or
+        // draw work.
+        let fog = self.global_fog.or_else(|| {
+            if (self.mode.is_legacy() && self.legacy_effective()) || self.volumetric_effective() {
+                self.map_fog
+            } else {
+                None
+            }
+        });
+        if let Some(fog) = fog {
             let color = if self.mode.is_legacy() || self.mode == FogMode::Volumetric {
                 // BSP fog colors are authored in the legacy display-space
                 // convention. Volumetric MAP fog lives in the linear/HDR

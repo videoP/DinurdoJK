@@ -53,7 +53,7 @@ pub struct GpuVertex {
     pub alpha_cutoff: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DrawClass {
     Sky,
     Opaque,
@@ -61,13 +61,13 @@ pub enum DrawClass {
     Transparent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BlendMode {
     Opaque,
     Custom(BlendFactor, BlendFactor),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PipelineKey {
     pub class: DrawClass,
     pub blend: BlendMode,
@@ -574,6 +574,10 @@ fn phase_lap(timings: &mut MapLoadTimings, phase: usize, clock: &mut Instant) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapPrepareOptions {
+    /// Renderer upload policy captured with the prepared world so changing
+    /// classic `r_picmip` can use the normal Apply Video Settings/map-reload
+    /// path without pretending the old GPU textures already changed.
+    pub picmip: u32,
     pub grass: bool,
     pub voxel_probe_gi: bool,
     pub ocean: bool,
@@ -617,6 +621,7 @@ pub struct MapPrepareOptions {
 impl Default for MapPrepareOptions {
     fn default() -> Self {
         Self {
+            picmip: 0,
             grass: true,
             voxel_probe_gi: true,
             ocean: true,
@@ -1081,6 +1086,9 @@ pub struct GrassInstance {
     // derived from position and sorted once during map preparation, so there is no
     // per-blade seed field and renderer upload can copy these records directly.
     // Ground tint reuses those four bytes and keeps the compact layout at 24 bytes.
+    // The low 8 mantissa bits of this positive finite height carry a compact local
+    // BSP fog slot. Clearing them changes height by < 0.004%, while avoiding any
+    // stride/bandwidth increase for maps with local brush fog.
     pub position: [f32; 3],
     pub height: f32,
     pub baked_light_rgba: [u8; 4],
@@ -1194,6 +1202,9 @@ pub struct PreparedMap {
     /// Per-blade grass generated once from BSP surfaces authored with
     /// `surfaceSprites vertical`. Runtime rendering only culls and instances it.
     pub grass_patches: Vec<GrassPatch>,
+    /// Compact local BSP fog parameters indexed by the per-blade fog slot.
+    /// Slot 0 is always none; slots 1..=255 are map-local brush fogs only.
+    pub grass_local_fogs: Vec<[f32; 4]>,
     /// Retail JKA `surfaceSprites effect` emitters. The authored stage texture
     /// is expanded into transient QuickSprite quads every frame instead of being
     /// mapped across the BSP surface.
@@ -1892,6 +1903,38 @@ struct GrassEmitterTriangle {
     height: f32,
     density: f32,
     ground_tint_rgba: [u8; 4],
+    fog_slot: u8,
+}
+
+/// Build a compact table only for local brush fogs that grass can actually inherit
+/// from a BSP source surface. Global fog remains on the existing whole-scene path.
+/// A u8 slot keeps the 24-byte GrassInstance stride unchanged.
+fn grass_local_fog_slots(
+    bsp: &Bsp,
+    library: &BTreeMap<String, Shader>,
+    global_fog_num: Option<i32>,
+) -> (BTreeMap<i32, u8>, Vec<[f32; 4]>) {
+    let mut slots = BTreeMap::new();
+    let mut fogs = vec![[0.0; 4]]; // slot 0 = no local fog
+    for fog_index in 0..bsp.fogs.len() {
+        let Ok(fog_num) = i32::try_from(fog_index) else {
+            break;
+        };
+        if global_fog_num == Some(fog_num) {
+            continue;
+        }
+        let params = bsp_fog_params(bsp, library, fog_num);
+        if params[3] <= 0.0 {
+            continue;
+        }
+        let Ok(slot) = u8::try_from(fogs.len()) else {
+            // 255 local fog slots plus slot 0 is far beyond normal JKA maps.
+            break;
+        };
+        slots.insert(fog_num, slot);
+        fogs.push(params);
+    }
+    (slots, fogs)
 }
 
 fn collect_grass_emitters(
@@ -1899,6 +1942,7 @@ fn collect_grass_emitters(
     mesh: &jka_assets::bsp::Mesh,
     surface_materials: &[SurfaceMaterial],
     grass_ground_tints: &[[u8; 4]],
+    fog_slots: &BTreeMap<i32, u8>,
 ) -> (Vec<GrassEmitterTriangle>, Vec<Vec<u64>>) {
     let mut emitters = Vec::new();
     let mut signature_ids = BTreeMap::<Vec<u64>, u32>::new();
@@ -1988,6 +2032,7 @@ fn collect_grass_emitters(
                 height: grass.height.max(1.0),
                 density: grass.density,
                 ground_tint_rgba,
+                fog_slot: fog_slots.get(&surface.fog_num).copied().unwrap_or(0),
             });
         }
     }
@@ -2013,6 +2058,7 @@ fn grass_fingerprint(
                 emitter.height.to_bits(),
                 emitter.density.to_bits(),
                 u32::from_le_bytes(emitter.ground_tint_rgba),
+                u32::from(emitter.fog_slot),
             ])
             .debug(&emitter.lightmap_uv)
             .debug(&emitter.lightmap_page);
@@ -2072,6 +2118,15 @@ fn grass_worker_baked_lighting(
         ));
     }
     sample_embedded_lightmap_bilinear(&sources.embedded, page, uv)
+}
+
+fn pack_grass_height_fog_slot(height: f32, fog_slot: u8) -> f32 {
+    debug_assert!(height.is_finite() && height > 0.0);
+    f32::from_bits((height.to_bits() & !0xff) | u32::from(fog_slot))
+}
+
+fn grass_instance_height(instance: &GrassInstance) -> f32 {
+    f32::from_bits(instance.height.to_bits() & !0xff)
 }
 
 fn generate_grass_chunk(
@@ -2153,7 +2208,7 @@ fn generate_grass_chunk(
                     ground_tint_rgba[3] = (packed_clump >> 8) as u8;
                     GrassInstance {
                         position: position.to_array(),
-                        height: emitter.height,
+                        height: pack_grass_height_fog_slot(emitter.height, emitter.fog_slot),
                         baked_light_rgba,
                         ground_tint_rgba,
                     }
@@ -2189,7 +2244,7 @@ fn finish_grass_patch(key: GrassPatchKey, mut instances: Vec<GrassInstance>) -> 
         let position = Vec3::from_array(instance.position);
         minimum = minimum.min(position);
         maximum = maximum.max(position);
-        max_height = max_height.max(instance.height);
+        max_height = max_height.max(grass_instance_height(instance));
     }
     maximum.y += max_height * 4.0;
     minimum.y -= max_height * 0.5;
@@ -2447,8 +2502,21 @@ fn map_asset_name(name: &str, extension: &str) -> Result<String, String> {
     Ok(format!("maps/{name}.{extension}"))
 }
 
+fn stage_is_opaque_replacement(stage: &MaterialStage) -> bool {
+    stage.blend
+        == Some(materials::BlendFunc {
+            src: BlendFactor::One,
+            dst: BlendFactor::Zero,
+        })
+}
+
 fn stage_class(stage: &MaterialStage) -> DrawClass {
-    if stage.blend.is_some() {
+    // GL_ONE GL_ZERO is authored through blendFunc, but it does not actually
+    // blend with the framebuffer: src * 1 + dst * 0 is a full replacement.
+    // Keep world-material semantics aligned with the FX/player paths so a
+    // replacement base is an opaque/depth-seeding pass instead of letting
+    // later translucent surfaces show through it.
+    if stage.blend.is_some() && !stage_is_opaque_replacement(stage) {
         DrawClass::Transparent
     } else if stage.alpha_cutoff > 0.0 {
         DrawClass::Mask
@@ -2481,10 +2549,34 @@ fn stage_is_guaranteed_alpha_discard(stage: &MaterialStage) -> bool {
         && stage.opacity < stage.alpha_cutoff
 }
 
+/// True for the common q3map light-brush idiom that emits light at compile
+/// time but contributes no visible RGB at runtime: a single `$whiteimage`
+/// stage, black `rgbGen const`, and additive `GL_ONE GL_ONE` blending.
+///
+/// Restrict this to authored surface lights rather than treating every black
+/// additive stage as disposable. OpenGL blend state also touches destination
+/// alpha, and arbitrary non-light shaders can intentionally depend on that.
+fn stage_is_light_only_black_additive(
+    stage: &MaterialStage,
+    has_authored_surface_light: bool,
+) -> bool {
+    has_authored_surface_light
+        && matches!(stage.texture, StageTexture::White)
+        && matches!(stage.rgb_gen, RgbGen::Const)
+        && stage.color.iter().all(|channel| channel.abs() <= f32::EPSILON)
+        && stage.blend
+            == Some(materials::BlendFunc {
+                src: BlendFactor::One,
+                dst: BlendFactor::One,
+            })
+        && !stage.depth_write
+        && stage.alpha_cutoff <= 0.0
+}
+
 /// Map-load-only render cull for explicit shader geometry whose ordinary
-/// stages are all guaranteed to alpha-discard. The BSP surface itself remains
-/// intact so compile/runtime semantics that consume its triangles first (for
-/// example q3map_surfacelight extraction) are preserved.
+/// stages are guaranteed not to contribute visible RGB. The BSP surface itself
+/// remains intact so compile/runtime semantics that consume its triangles first
+/// (for example q3map_surfacelight extraction) are preserved.
 fn material_render_is_guaranteed_discarded(
     material: &SurfaceMaterial,
     vertex_lit: bool,
@@ -2500,16 +2592,26 @@ fn material_render_is_guaranteed_discarded(
         return false;
     }
 
-    prepared_stages(material, vertex_lit)
-        .iter()
-        .all(stage_is_guaranteed_alpha_discard)
+    let stages = prepared_stages(material, vertex_lit);
+    let authored_light_only_candidate = material
+        .surface_light
+        .is_some_and(|light| !light.inferred_from_emissive)
+        && stages.len() == 1;
+    stages.iter().all(|stage| {
+        stage_is_guaranteed_alpha_discard(stage)
+            || stage_is_light_only_black_additive(stage, authored_light_only_candidate)
+    })
 }
 
 fn blend_for(stage: &MaterialStage) -> BlendMode {
-    stage
-        .blend
-        .map(|blend| BlendMode::Custom(blend.src, blend.dst))
-        .unwrap_or(BlendMode::Opaque)
+    if stage_is_opaque_replacement(stage) {
+        BlendMode::Opaque
+    } else {
+        stage
+            .blend
+            .map(|blend| BlendMode::Custom(blend.src, blend.dst))
+            .unwrap_or(BlendMode::Opaque)
+    }
 }
 
 fn effective_world_cull(material: &SurfaceMaterial) -> CullMode {
@@ -2542,9 +2644,11 @@ fn stage_pipeline(material: &SurfaceMaterial, stage: &MaterialStage, first: bool
             effective_world_cull(material)
         },
         offset: material.offset,
-        // OpenJK's default opaque first stage writes depth. Blended later stages
-        // do not unless the shader explicitly requests depthWrite.
-        depth_write: stage.depth_write || (first && stage.blend.is_none()),
+        // OpenJK's default opaque first stage writes depth. Treat GL_ONE GL_ZERO
+        // as that same opaque replacement semantic; later genuinely blended
+        // stages still need an explicit depthWrite.
+        depth_write: stage.depth_write
+            || (first && (stage.blend.is_none() || stage_is_opaque_replacement(stage))),
         depth_equal: stage.depth_equal,
     }
 }
@@ -4288,7 +4392,8 @@ fn log_reflection_cache(name: &str, batches: &[DrawBatch]) {
         .iter()
         .filter(|batch| (batch.reflection_cache_flags & REFLECTION_CACHE_PLANAR) != 0)
         .count();
-    println!(
+    devprintln!(
+        2,
         "{name}: reflection cache: {probe} probe batch(es), {ssr} SSR-eligible batch(es), {planar} planar candidate batch(es)"
     );
 }
@@ -4649,11 +4754,15 @@ fn build_material_debug_entry(
             stage_unsupported
         ));
         for (index, stage) in definition.stages.iter().enumerate() {
+            let color = stage.color.unwrap_or([1.0; 3]);
             lines.push(format!(
-                "authored stage {index}: map={} blend={} rgbGen={:?} alphaGen={:?} normalMap={} normalHeightMap={} normalScale={} rmoMap={} rmos={} specMap={} roughness={} specularReflectance={} parallaxDepth={}",
+                "authored stage {index}: map={} blend={} rgbGen={:?} rgbConst={:.3},{:.3},{:.3} alphaGen={:?} normalMap={} normalHeightMap={} normalScale={} rmoMap={} rmos={} specMap={} roughness={} specularReflectance={} parallaxDepth={}",
                 if stage.image.is_empty() { "-" } else { &stage.image },
                 if stage.blend.is_empty() { "opaque" } else { &stage.blend },
                 stage.rgb_gen,
+                color[0],
+                color[1],
+                color[2],
                 stage.alpha_gen,
                 stage.normal_map.as_deref().unwrap_or("-"),
                 stage.normal_height_map.as_deref().unwrap_or("-"),
@@ -4780,9 +4889,13 @@ fn build_material_debug_entry(
             && stage.alpha_cutoff == 0.0
             && matches!(stage.tc_gen, TcGen::Base);
         lines.push(format!(
-            "resolved stage {index}: base={base} blend={:?} alpha_cutoff={:.3} tcGen={:?} rgbGen={:?} alphaGen={:?} pbr_eligible={} normal={} roughness={} metallic={} specular={} emissive={} height={} height_from_alpha={} rmo_packed={} rmos_alpha={} normalScale={:.3},{:.3} roughnessOverride={} specularReflectance={} parallaxDepth={:.4}",
+            "resolved stage {index}: base={base} blend={:?} alpha_cutoff={:.3} color={:.3},{:.3},{:.3},{:.3} tcGen={:?} rgbGen={:?} alphaGen={:?} pbr_eligible={} normal={} roughness={} metallic={} specular={} emissive={} height={} height_from_alpha={} rmo_packed={} rmos_alpha={} normalScale={:.3},{:.3} roughnessOverride={} specularReflectance={} parallaxDepth={:.4}",
             stage.blend,
             stage.alpha_cutoff,
+            stage.color[0],
+            stage.color[1],
+            stage.color[2],
+            stage.opacity,
             stage.tc_gen,
             stage.rgb_gen,
             stage.alpha_gen,
@@ -6175,7 +6288,8 @@ fn prepare_internal(
     let global_fog_num = bsp_global_fog_num(&bsp);
     let global_fog = bsp_global_fog_params(&bsp, &library);
     if let Some(fog) = global_fog {
-        println!(
+        devprintln!(
+            1,
             "{name}: BSP global fog rgb=({:.3}, {:.3}, {:.3}) depth={:.1}",
             fog[0], fog[1], fog[2], fog[3]
         );
@@ -6387,7 +6501,8 @@ fn prepare_internal(
         &textures,
     );
     load_timings.material_ms = material_stage.elapsed().as_secs_f64() * 1000.0;
-    println!(
+    devprintln!(
+        2,
         "[MAP MATERIALS] total {:.1} ms | describe {:.1} (of which texture read/probe {:.1}, decode {:.1}, mip {:.1}; {} decoded, {} new image slot(s); light-image averaging {:.1}) | grass tints {:.1} | surface lights {:.1} | material debug {:.1}",
         load_timings.material_ms,
         describe_ms,
@@ -6413,7 +6528,8 @@ fn prepare_internal(
             .iter()
             .map(|emitter| emitter.triangles.len())
             .sum();
-        println!(
+        devprintln!(
+            1,
             "{name}: surfaceSprites effect: {} emitter stage(s), {triangle_count} source triangle(s)",
             surface_sprite_effects.len()
         );
@@ -6423,8 +6539,19 @@ fn prepare_internal(
     // emitter triangles/material metadata have been captured. Start it on the map
     // worker pool before entering the main geometry walk so both jobs overlap.
     let grass_stage = Instant::now();
+    let (grass_fog_slots, grass_local_fogs) = if options.grass {
+        grass_local_fog_slots(&bsp, &library, global_fog_num)
+    } else {
+        (BTreeMap::new(), vec![[0.0; 4]])
+    };
     let (grass_emitters, grass_signatures) = if options.grass {
-        collect_grass_emitters(&bsp, &mesh, &surface_materials, &grass_ground_tints)
+        collect_grass_emitters(
+            &bsp,
+            &mesh,
+            &surface_materials,
+            &grass_ground_tints,
+            &grass_fog_slots,
+        )
     } else {
         (Vec::new(), Vec::new())
     };
@@ -6484,9 +6611,9 @@ fn prepare_internal(
     }
     // Atomic so `batch_geometry` is `Fn` and the world walk can run it on rayon.
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    let alpha_discard_culled_batches = AtomicUsize::new(0);
-    let alpha_discard_culled_triangles = AtomicUsize::new(0);
-    let alpha_discard_culled_vertices = AtomicUsize::new(0);
+    let invisible_render_culled_batches = AtomicUsize::new(0);
+    let invisible_render_culled_triangles = AtomicUsize::new(0);
+    let invisible_render_culled_vertices = AtomicUsize::new(0);
     // One BSP mesh batch -> its material/lightmap group and render vertices.
     // Shared by the world and inline models so a mover's surfaces resolve
     // lightmaps, vertex lighting and fog exactly like the world's.
@@ -6505,12 +6632,12 @@ fn prepare_internal(
             .find(|&i| batch.lightmaps[i] == LIGHTMAP_BY_VERTEX && surface.vertex_styles[i] < 254);
         let vertex_lit = vertex_lit_slot.is_some();
         if material_render_is_guaranteed_discarded(material, vertex_lit) {
-            alpha_discard_culled_batches.fetch_add(1, AtomicOrdering::Relaxed);
-            alpha_discard_culled_triangles
+            invisible_render_culled_batches.fetch_add(1, AtomicOrdering::Relaxed);
+            invisible_render_culled_triangles
                 .fetch_add(batch.indices.len() / 3, AtomicOrdering::Relaxed);
             // World geometry is expanded to one GPU vertex per source index,
             // so this is the exact number of render vertices we avoid packing.
-            alpha_discard_culled_vertices.fetch_add(batch.indices.len(), AtomicOrdering::Relaxed);
+            invisible_render_culled_vertices.fetch_add(batch.indices.len(), AtomicOrdering::Relaxed);
             return None;
         }
         let class = class_for(material);
@@ -6765,19 +6892,29 @@ fn prepare_internal(
                 coarse_area_signature[word] |= area_signature[word];
             }
 
-            append_material_batches(
-                &mut pvs_batches,
-                material,
-                key.shader,
-                material_debug_index,
-                key.vertex_lit,
-                piece_start..piece_end,
-                key.lightmap,
-                &signature,
-                area_signature,
-                fog,
-                fog_is_global,
-            );
+            // FULL/AUTO normally split a MINIMAL batch by exact PVS signature.
+            // Do not do that for sky: the authored BSP sky polygons are the
+            // screen-space admission mask for the skybox, so removing only one
+            // PVS piece can cut a rectangular hole through an otherwise visible
+            // sky. MINIMAL already has the correct conservative behavior: if any
+            // constituent sky surface is visible, submit the whole coarse sky
+            // geometry. Build FULL/AUTO the same way for this domain, with the
+            // ORed signature emitted below after every piece has contributed.
+            if !material.sky {
+                append_material_batches(
+                    &mut pvs_batches,
+                    material,
+                    key.shader,
+                    material_debug_index,
+                    key.vertex_lit,
+                    piece_start..piece_end,
+                    key.lightmap,
+                    &signature,
+                    area_signature,
+                    fog,
+                    fog_is_global,
+                );
+            }
         }
 
         let coarse_end =
@@ -6803,6 +6940,21 @@ fn prepare_internal(
             fog,
             fog_is_global,
         );
+        if material.sky {
+            append_material_batches(
+                &mut pvs_batches,
+                material,
+                key.shader,
+                material_debug_index,
+                key.vertex_lit,
+                coarse_start..coarse_end,
+                key.lightmap,
+                &coarse_signature,
+                coarse_area_signature,
+                fog,
+                fog_is_global,
+            );
+        }
     }
     load_timings.geometry_detail_ms = [
         dlight_surfaces_ms,
@@ -6889,19 +7041,21 @@ fn prepare_internal(
         }
     }
     if !inline_models.is_empty() {
-        println!(
+        devprintln!(
+            1,
             "{name}: {} drawable inline BSP model(s), {} vertices, {} material batch(es)",
             inline_models.len(),
             inline_vertices.len(),
             inline_batches.len()
         );
     }
-    let alpha_discard_culled_batches = alpha_discard_culled_batches.into_inner();
-    if alpha_discard_culled_batches > 0 {
-        println!(
-            "{name}: guaranteed alpha-discard render cull: {alpha_discard_culled_batches} BSP batch(es), {} triangle(s), {} GPU render vertices omitted; source BSP geometry retained for semantic extraction",
-            alpha_discard_culled_triangles.into_inner(),
-            alpha_discard_culled_vertices.into_inner(),
+    let invisible_render_culled_batches = invisible_render_culled_batches.into_inner();
+    if invisible_render_culled_batches > 0 {
+        devprintln!(
+            2,
+            "{name}: guaranteed invisible/no-op render cull: {invisible_render_culled_batches} BSP batch(es), {} triangle(s), {} GPU render vertices omitted; source BSP geometry retained for semantic extraction",
+            invisible_render_culled_triangles.into_inner(),
+            invisible_render_culled_vertices.into_inner(),
         );
     }
 
@@ -6911,7 +7065,8 @@ fn prepare_internal(
     let surface_light_count = surface_lights.len();
     lights.extend(surface_lights);
     if surface_light_candidates > 0 {
-        println!(
+        devprintln!(
+            1,
             "{name}: emissive/area lights: {surface_light_count} real-time sample(s) selected from {surface_light_candidates} candidate(s); {entity_light_count} entity light(s) retained first"
         );
     }
@@ -7193,7 +7348,8 @@ fn prepare_internal(
     load_timings.grass_ms = grass_stage.elapsed().as_secs_f64() * 1000.0;
     if grass_blades != 0 {
         let grass_cpu_bytes = grass_blades * std::mem::size_of::<GrassInstance>();
-        println!(
+        devprintln!(
+            1,
             "{name}: procedural grass: {grass_blades} blade(s) in {} spatial/PVS patch(es), {:.1} MiB compact CPU instances ({} bytes/blade); worker CPU {:.1} ms, wall-to-ready {:.1} ms",
             grass_patches.len(),
             grass_cpu_bytes as f64 / (1024.0 * 1024.0),
@@ -7219,7 +7375,8 @@ fn prepare_internal(
         None
     };
     if let Some(grid) = &voxel_probe_gi {
-        println!(
+        devprintln!(
+            1,
             "{name}: voxel/probe GI: {}x{}x{} probes, {:.1}-unit cells, {} occupied surface voxel(s)",
             grid.bounds[0], grid.bounds[1], grid.bounds[2], grid.cell_size, grid.occupied_voxels
         );
@@ -7233,7 +7390,8 @@ fn prepare_internal(
     let steam_audio_acoustic_mesh = match steam_audio_result {
         Some((Ok(mesh), cpu_ms)) => {
             load_timings.steam_audio_ms = cpu_ms;
-            println!(
+            devprintln!(
+                1,
                 "{name}: Steam Audio acoustic scene: {} vertices, {} triangles, {:.1} ms CPU",
                 mesh.vertices.len(),
                 mesh.triangles.len(),
@@ -7267,7 +7425,8 @@ fn prepare_internal(
                         std::thread::available_parallelism()
                             .map_or(1, |count| count.get().saturating_sub(2).clamp(1, 8))
                     });
-                println!(
+                devprintln!(
+                    1,
                     "{name}: Steam Audio bake cache MISS; background bake queued after map preparation ({num_threads} Steam Audio thread(s))"
                 );
                 steam_audio_bake_request = Some(crate::steam_audio::SteamAudioBakeRequest {
@@ -7346,10 +7505,11 @@ fn prepare_internal(
     let portal_wait_ms = portal_wait_started.elapsed().as_secs_f64() * 1000.0;
     phase_lap(&mut load_timings, 14, &mut phase_clock);
     if !reused.is_empty() {
-        println!("{name}: re-prepare reused unchanged stage(s): {}", reused.join(", "));
+        devprintln!(2, "{name}: re-prepare reused unchanged stage(s): {}", reused.join(", "));
     }
     if !portal_draw_plan.plan_by_cluster.is_empty() {
-        println!(
+        devprintln!(
+            2,
             "{name}: AUTO 4 map-worker plans: {} FULL piece(s), {} collapsed recipe(s) over {} physical geometr(ies) ({} already contiguous, {:.2} MiB to build lazily), {} unique plan(s) for {} cluster(s); {} recipe reuse hit(s), {} whole-plan reuse hit(s), {:.1} ms (loader waited {:.1} ms)",
             pvs_batches.len(),
             portal_draw_plan.variants.len(),
@@ -7413,6 +7573,7 @@ fn prepare_internal(
         voxel_probe_gi,
         reflection_probes,
         grass_patches,
+        grass_local_fogs,
         surface_sprite_effects,
         global_fog,
         warnings,
@@ -9380,7 +9541,8 @@ fn prepare_map_document_with_assets_options(
     let lights = map_dynamic_lights(&document);
     let source_map_lighting = map_world_lighting(world);
     if source_map_lighting.ambient != [0.0; 3] || source_map_lighting.minlight != [0.0; 3] {
-        println!(
+        devprintln!(
+            2,
             "Source .map q3map2 baseline: ambient={:.3},{:.3},{:.3} minlight={:.3},{:.3},{:.3}",
             source_map_lighting.ambient[0], source_map_lighting.ambient[1], source_map_lighting.ambient[2],
             source_map_lighting.minlight[0], source_map_lighting.minlight[1], source_map_lighting.minlight[2],
@@ -9428,6 +9590,7 @@ fn prepare_map_document_with_assets_options(
         voxel_probe_gi,
         reflection_probes: Vec::new(),
         grass_patches: Vec::new(),
+        grass_local_fogs: vec![[0.0; 4]],
         surface_sprite_effects: Vec::new(),
         global_fog: None,
         warnings,
@@ -9654,6 +9817,43 @@ second timings {:?}", first.load_timings, second.load_timings);
     }
 
     use super::*;
+
+    #[test]
+    fn one_zero_world_base_is_opaque_and_seeds_depth() {
+        let stage = MaterialStage {
+            texture: StageTexture::Image(7),
+            enhancements: Default::default(),
+            blend: Some(materials::BlendFunc {
+                src: BlendFactor::One,
+                dst: BlendFactor::Zero,
+            }),
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+        };
+        let material = SurfaceMaterial {
+            stages: vec![stage.clone()],
+            explicit: true,
+            ..Default::default()
+        };
+
+        assert_eq!(stage_class(&stage), DrawClass::Opaque);
+        assert_eq!(blend_for(&stage), BlendMode::Opaque);
+
+        let first = stage_pipeline(&material, &stage, true);
+        assert_eq!(first.class, DrawClass::Opaque);
+        assert_eq!(first.blend, BlendMode::Opaque);
+        assert!(first.depth_write);
+
+        let later = stage_pipeline(&material, &stage, false);
+        assert!(!later.depth_write, "only a replacement base gets implicit depthWrite");
+    }
 
     fn sun_test_grid(cells: Vec<ClassicLightGridCell>) -> ClassicEntityLightGrid {
         ClassicEntityLightGrid {
@@ -9961,6 +10161,67 @@ second timings {:?}", first.load_timings, second.load_timings);
 
         assert!(material.surface_light.is_some());
         assert!(material_render_is_guaranteed_discarded(&material, true));
+    }
+
+    #[test]
+    fn black_additive_surface_light_render_cull_keeps_surface_light_semantics() {
+        let material = SurfaceMaterial {
+            stages: vec![MaterialStage {
+                texture: StageTexture::White,
+                enhancements: Default::default(),
+                blend: Some(materials::BlendFunc {
+                    src: BlendFactor::One,
+                    dst: BlendFactor::One,
+                }),
+                alpha_cutoff: 0.0,
+                opacity: 1.0,
+                color: [0.0; 3],
+                rgb_gen: RgbGen::Const,
+                alpha_gen: AlphaGen::Identity,
+                tc_gen: TcGen::Base,
+                tc_mods: Vec::new(),
+                depth_write: false,
+                depth_equal: false,
+            }],
+            surface_light: Some(materials::SurfaceLight {
+                value: 500.0,
+                color: [1.0; 3],
+                subdivide: 120.0,
+                inferred_from_emissive: false,
+            }),
+            explicit: true,
+            ..Default::default()
+        };
+
+        assert!(material.surface_light.is_some());
+        assert!(material_render_is_guaranteed_discarded(&material, true));
+    }
+
+    #[test]
+    fn black_additive_non_light_shader_is_not_mapload_culled() {
+        let material = SurfaceMaterial {
+            stages: vec![MaterialStage {
+                texture: StageTexture::White,
+                enhancements: Default::default(),
+                blend: Some(materials::BlendFunc {
+                    src: BlendFactor::One,
+                    dst: BlendFactor::One,
+                }),
+                alpha_cutoff: 0.0,
+                opacity: 1.0,
+                color: [0.0; 3],
+                rgb_gen: RgbGen::Const,
+                alpha_gen: AlphaGen::Identity,
+                tc_gen: TcGen::Base,
+                tc_mods: Vec::new(),
+                depth_write: false,
+                depth_equal: false,
+            }],
+            explicit: true,
+            ..Default::default()
+        };
+
+        assert!(!material_render_is_guaranteed_discarded(&material, false));
     }
 
     #[test]

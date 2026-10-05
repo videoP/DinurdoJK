@@ -29,6 +29,10 @@ pub enum OverlayMode {
     /// The `/trace` results menu: a clickable list of everything traced this
     /// session, with a full-info inspector and solo-server actions.
     Trace,
+    /// Loaded/live jaPRO strafe trails and asynchronous trail-file browser.
+    StrafeTrails,
+    /// Remote/local race demo browser and synchronized visual ghosts.
+    RaceGhosts,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,22 +56,26 @@ pub struct UiCenterPrint {
     pub y_fraction: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiScoreEntry {
+    pub client: i32,
     pub name: String,
     pub score: i32,
+    pub deaths: Option<i32>,
     pub ping: i32,
     pub time: i32,
     pub team: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiScoreboard {
     pub team_scores: [i32; 2],
     pub team_game: bool,
     /// Duel and power duel keep a win/loss score for the spectators waiting in line;
     /// every other mode shows only ping and time for them, like jaPRO's scoreboard.
     pub spectator_scores: bool,
+    /// Whether this scoreboard mode has a usable deaths value to display.
+    pub show_deaths: bool,
     pub entries: Vec<UiScoreEntry>,
 }
 
@@ -118,12 +126,60 @@ pub fn demo_timeline_layout(width: u32, height: u32) -> Option<DemoTimelineLayou
     Some(DemoTimelineLayout { play, track, speed })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TeamOverlaySettings {
+    /// TaystJK cg_drawTeamOverlay: 0 off; 1/2 classic, 3/4 cards, 5/6 bars.
+    /// Even modes omit the local player.
+    pub mode: i32,
+    pub x: i32,
+    pub y: i32,
+    pub weapons: bool,
+    pub scale: f32,
+    pub max_hp: f32,
+    pub force: bool,
+}
+
+impl Default for TeamOverlaySettings {
+    fn default() -> Self {
+        Self { mode: 0, x: 640, y: 0, weapons: false, scale: 1.0, max_hp: 150.0, force: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamOverlayEntry {
+    pub client: u16,
+    pub name: String,
+    pub location: String,
+    pub health: i32,
+    pub armor: i32,
+    pub force: i32,
+    pub model_icon: Option<u16>,
+    pub weapon_icon: Option<u16>,
+    pub powerup_icons: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamOverlayUi {
+    pub settings: TeamOverlaySettings,
+    pub team: i32,
+    /// TaystJK scans every CS_LOCATIONS string, not only teammates' current locations.
+    pub location_width: usize,
+    pub has_locations: bool,
+    /// Dynamic atlas cells. Each string contains one or more qpath candidates
+    /// separated by `\n`; the renderer registers the first asset that exists.
+    /// This mirrors CG_LoadClientInfo's model-icon fallback without doing VFS I/O
+    /// on the main/app thread every snapshot.
+    pub icon_paths: Vec<String>,
+    pub entries: Vec<TeamOverlayEntry>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HudState {
     pub health: i32,
     pub max_health: i32,
     pub armor: i32,
-    pub force_power: i32,
+    /// None when a reconstructed demo POV has no recorded force value.
+    pub force_power: Option<i32>,
     pub force_power_max: i32,
     pub ammo: Option<i32>,
     /// Selected weapon (`weapon_t`); WP_SABER swaps the ammo panel for the saber style.
@@ -149,6 +205,9 @@ pub struct CrosshairSettings {
     /// Visibility, 0..=2, 1 = as authored. Below 1 fades the crosshair; above 1
     /// strengthens the faint stock images by layering them (shapes are already opaque).
     pub strength: f32,
+    /// TaystJK `cg_dynamicCrosshair`: 0 static, 1 always dynamic, 2 dynamic with
+    /// the reference melee/racemode/strafehelper static overrides.
+    pub dynamic: u8,
     /// jaPRO `cg_crosshairIdentifyTarget`: colour the crosshair by what it is on.
     pub identify_target: bool,
     /// jaPRO `cg_drawCrosshairNames`: 0 off, > 0 seconds a name lingers after
@@ -188,6 +247,9 @@ pub const CROSSHAIR_IMAGE_NAMES: [&str; CROSSHAIR_IMAGE_COUNT as usize] = [
 pub struct UiCrosshairTarget {
     /// RGB (0..=1) the crosshair takes; `None` keeps its configured colour.
     pub color: Option<[f32; 3]>,
+    /// Whether the current TaystJK policy uses muzzle/world-point placement.
+    /// The high-rate endpoint itself rides the render/subframe mailbox, not UI commands.
+    pub dynamic: bool,
     pub name: Option<UiCrosshairName>,
 }
 
@@ -208,6 +270,8 @@ impl Default for CrosshairSettings {
             // TaystJK's four-component cg_crosshairColor storage convention.
             color: [255, 255, 255, 230],
             strength: 1.0,
+            // OpenJK/TaystJK default.
+            dynamic: 1,
             // jaPRO defaults.
             identify_target: true,
             names: 1.0,
@@ -215,6 +279,37 @@ impl Default for CrosshairSettings {
             names_opacity: 1.0,
         }
     }
+}
+
+/// TaystJK `cg_drawPlayerNames` settings. 0 disables labels, 1 draws names,
+/// and values above 1 also draw the target's health bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerNameSettings {
+    pub mode: i32,
+    pub scale: f32,
+}
+
+impl Default for PlayerNameSettings {
+    fn default() -> Self {
+        Self { mode: 0, scale: 0.5 }
+    }
+}
+
+/// World-space input for the render-thread player-label pass. Visibility is
+/// decided by CGame/app traces; projection is deliberately deferred until the
+/// final render camera so late-latched mouse motion keeps labels glued to heads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiWorldPlayerLabel {
+    pub anchor: [f32; 3],
+    pub text: String,
+    pub health_fraction: Option<f32>,
+    pub health_color: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiWorldPlayerNames {
+    pub scale: f32,
+    pub labels: std::sync::Arc<Vec<UiWorldPlayerLabel>>,
 }
 
 
@@ -233,6 +328,7 @@ pub enum HudElementId {
     Vote,
     RaceTimer,
     RaceStart,
+    Lagometer,
     SurfaceInspector,
     Speedometer,
     SpeedometerJumps,
@@ -244,7 +340,7 @@ impl HudElementId {
     // position is now the clickable `OverlayMode::Trace` egui menu, which
     // isn't a draggable HUD element. The variant, its cvar prefix and its
     // offset field stay (see `element`/`element_mut`) so old configs still load.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Health,
         Self::Shield,
         Self::Ammo,
@@ -258,6 +354,7 @@ impl HudElementId {
         Self::Vote,
         Self::RaceTimer,
         Self::RaceStart,
+        Self::Lagometer,
         Self::Speedometer,
         Self::SpeedometerJumps,
         Self::SpeedGraph,
@@ -278,6 +375,7 @@ impl HudElementId {
             Self::Vote => "VOTE",
             Self::RaceTimer => "RACE TIMER",
             Self::RaceStart => "RACE START SPEED",
+            Self::Lagometer => "LAGOMETER",
             Self::SurfaceInspector => "TRACE INSPECTOR",
             Self::Speedometer => "SPEEDOMETER",
             Self::SpeedometerJumps => "SPEEDOMETER JUMPS",
@@ -300,6 +398,7 @@ impl HudElementId {
             Self::Vote => "cg_hudVote",
             Self::RaceTimer => "cg_hudRaceTimer",
             Self::RaceStart => "cg_hudRaceStart",
+            Self::Lagometer => "cg_hudLagometer",
             Self::SurfaceInspector => "cg_hudSurfaceInspector",
             Self::Speedometer => "cg_hudSpeedometer",
             Self::SpeedometerJumps => "cg_hudSpeedometerJumps",
@@ -390,16 +489,21 @@ pub struct HudElementLayout {
     /// positive Y is down; the element is aligned to the same anchor point.
     pub offset: [f32; 2],
     pub scale: f32,
+    /// Independent bounds size. Currently used by the chat box so resizing its
+    /// area changes wrapping/capacity without stretching the glyphs.
+    pub extent: [f32; 2],
 }
 
 impl HudElementLayout {
     pub fn to_config(self) -> String {
         format!(
-            "{} {:.3} {:.3} {:.3}",
+            "{} {:.3} {:.3} {:.3} {:.3} {:.3}",
             self.anchor.short_name(),
             self.offset[0],
             self.offset[1],
-            self.scale
+            self.scale,
+            self.extent[0],
+            self.extent[1]
         )
     }
 
@@ -409,13 +513,22 @@ impl HudElementLayout {
         let x = words.next()?.parse::<f32>().ok()?;
         let y = words.next()?.parse::<f32>().ok()?;
         let scale = words.next()?.parse::<f32>().ok()?;
-        if words.next().is_some() || !x.is_finite() || !y.is_finite() || !scale.is_finite() {
+        let extent_x = words.next().map(str::parse::<f32>).transpose().ok()?.unwrap_or(1.0);
+        let extent_y = words.next().map(str::parse::<f32>).transpose().ok()?.unwrap_or(1.0);
+        if words.next().is_some()
+            || !x.is_finite()
+            || !y.is_finite()
+            || !scale.is_finite()
+            || !extent_x.is_finite()
+            || !extent_y.is_finite()
+        {
             return None;
         }
         Some(Self {
             anchor,
             offset: [x.clamp(-16384.0, 16384.0), y.clamp(-16384.0, 16384.0)],
             scale: scale.clamp(0.5, 2.0),
+            extent: [extent_x.clamp(0.25, 4.0), extent_y.clamp(0.25, 8.0)],
         })
     }
 }
@@ -435,6 +548,7 @@ pub struct HudLayout {
     pub vote: HudElementLayout,
     pub race_timer: HudElementLayout,
     pub race_start: HudElementLayout,
+    pub lagometer: HudElementLayout,
     pub surface_inspector: HudElementLayout,
     pub speedometer: HudElementLayout,
     pub speedometer_jumps: HudElementLayout,
@@ -448,6 +562,7 @@ const HUD_UNMOVED: HudElementLayout = HudElementLayout {
     anchor: HudAnchor::TopLeft,
     offset: [0.0, 0.0],
     scale: 1.0,
+    extent: [1.0, 1.0],
 };
 
 impl Default for HudLayout {
@@ -462,6 +577,7 @@ impl Default for HudLayout {
             vote: HUD_UNMOVED,
             race_timer: HUD_UNMOVED,
             race_start: HUD_UNMOVED,
+            lagometer: HUD_UNMOVED,
             surface_inspector: HUD_UNMOVED,
             speedometer: HUD_UNMOVED,
             speedometer_jumps: HUD_UNMOVED,
@@ -471,21 +587,25 @@ impl Default for HudLayout {
                 anchor: HudAnchor::BottomLeft,
                 offset: [24.0, -58.0],
                 scale: 1.0,
+                extent: [1.0, 1.0],
             },
             shield: HudElementLayout {
                 anchor: HudAnchor::BottomLeft,
                 offset: [24.0, -28.0],
                 scale: 1.0,
+                extent: [1.0, 1.0],
             },
             ammo: HudElementLayout {
                 anchor: HudAnchor::BottomRight,
                 offset: [-24.0, -58.0],
                 scale: 1.0,
+                extent: [1.0, 1.0],
             },
             force: HudElementLayout {
                 anchor: HudAnchor::BottomRight,
                 offset: [-24.0, -28.0],
                 scale: 1.0,
+                extent: [1.0, 1.0],
             },
             snap_to_grid: true,
             grid_size: 8.0,
@@ -509,6 +629,7 @@ impl HudLayout {
             HudElementId::Vote => self.vote,
             HudElementId::RaceTimer => self.race_timer,
             HudElementId::RaceStart => self.race_start,
+            HudElementId::Lagometer => self.lagometer,
             HudElementId::SurfaceInspector => self.surface_inspector,
             HudElementId::Speedometer => self.speedometer,
             HudElementId::SpeedometerJumps => self.speedometer_jumps,
@@ -531,6 +652,7 @@ impl HudLayout {
             HudElementId::Vote => &mut self.vote,
             HudElementId::RaceTimer => &mut self.race_timer,
             HudElementId::RaceStart => &mut self.race_start,
+            HudElementId::Lagometer => &mut self.lagometer,
             HudElementId::SurfaceInspector => &mut self.surface_inspector,
             HudElementId::Speedometer => &mut self.speedometer,
             HudElementId::SpeedometerJumps => &mut self.speedometer_jumps,
@@ -564,6 +686,7 @@ pub struct HudRectContext {
     pub race_timer: [f32; 3],
     /// `cg_raceStart` x, y (640x480).
     pub race_start: [f32; 2],
+    pub lagometer: crate::lagometer::Settings,
     pub speedometer: crate::speedometer::Settings,
 }
 
@@ -583,6 +706,7 @@ impl HudRectContext {
             thread_count,
             race_timer: [race.race_timer_x, race.race_timer_y, race.race_timer_size],
             race_start: [race.race_start_x, race.race_start_y],
+            lagometer: race.lagometer,
             speedometer: race.speedometer,
         }
     }
@@ -598,6 +722,9 @@ impl HudRectContext {
         }
         if let Some(speedometer) = ui.speedometer.as_ref() {
             race.speedometer = speedometer.settings;
+        }
+        if let Some(lagometer) = ui.lagometer.as_ref() {
+            race.lagometer = lagometer.settings;
         }
         Self::new(ui.movement_keys, &ui.video, &ui.perf, ui.threads.len(), &race)
     }
@@ -636,7 +763,7 @@ fn hud_stock_rect(id: HudElementId, ctx: &HudRectContext, w: u32, h: u32) -> Hud
             HudRect { x, y, width, height }
         }
         HudElementId::Fps => {
-            let width = 7.0 * 8.0 * 1.55;
+            let width = 7.0 * 6.0 * 1.55;
             HudRect {
                 x: (w as f32 - 12.0 - width).max(12.0),
                 y: 12.0,
@@ -644,7 +771,7 @@ fn hud_stock_rect(id: HudElementId, ctx: &HudRectContext, w: u32, h: u32) -> Hud
                 height: 13.0,
             }
         }
-        HudElementId::Chat => virtual_rect(30.0, 373.0, 400.0, 52.0),
+        HudElementId::Chat => virtual_rect(30.0, 373.0, CHATBOX_CUTOFF, 52.0),
         HudElementId::CenterPrint => virtual_rect(170.0, 126.0, 300.0, 36.0),
         HudElementId::CrosshairName => virtual_rect(220.0, 168.0, 200.0, 22.0),
         HudElementId::Follow => virtual_rect(4.0, 14.0, 160.0, 16.0),
@@ -656,6 +783,14 @@ fn hud_stock_rect(id: HudElementId, ctx: &HudRectContext, w: u32, h: u32) -> Hud
         HudElementId::RaceStart => {
             let k = ctx.race_timer[2] / 0.75;
             virtual_rect(ctx.race_start[0], ctx.race_start[1], 80.0 * k, 20.0 * k)
+        }
+        HudElementId::Lagometer => {
+            let lag = ctx.lagometer;
+            let coef = crate::lagometer::width_ratio_coef(w, h);
+            let x = 640.0 - lag.x as f32 * coef;
+            let y = 480.0 - lag.y as f32 - 16.0;
+            let height = if lag.mode == 4 { 60.0 } else { 48.0 };
+            virtual_rect(x - coef, y, 49.0 * coef, height)
         }
         HudElementId::Speedometer => {
             let s = &ctx.speedometer;
@@ -698,13 +833,21 @@ fn apply_hud_layout(
         return;
     }
     let stock = hud_stock_rect(id, ctx, w, h);
-    let (cx, cy) = (stock.x + stock.width * 0.5, stock.y + stock.height * 0.5);
+    // Chat's authored rectangle is bottom-left anchored: history grows upward from
+    // CHATBOX_Y. Its editor rectangle uses the same anchor so scaling the chat
+    // cannot visually drift outside the selected bounds. Other HUD elements keep
+    // their historical centre-based scale behavior.
+    let (anchor_x, anchor_y) = if id == HudElementId::Chat {
+        (stock.x, stock.y + stock.height)
+    } else {
+        (stock.x + stock.width * 0.5, stock.y + stock.height * 0.5)
+    };
     let (wf, hf) = (w as f32, h as f32);
     for vertex in vertices {
         let px = (vertex.position[0] + 1.0) * 0.5 * wf;
         let py = (1.0 - vertex.position[1]) * 0.5 * hf;
-        let px = cx + (px - cx) * scale + layout.offset[0];
-        let py = cy + (py - cy) * scale + layout.offset[1];
+        let px = anchor_x + (px - anchor_x) * scale + layout.offset[0];
+        let py = anchor_y + (py - anchor_y) * scale + layout.offset[1];
         vertex.position = [px / wf * 2.0 - 1.0, 1.0 - py / hf * 2.0];
     }
 }
@@ -736,7 +879,19 @@ pub fn hud_element_rect(
     let scale = layout.scale.clamp(0.5, 2.0);
     if !id.is_anchored() {
         let stock = hud_stock_rect(id, ctx, w, h);
-        let (width, height) = (stock.width * scale, stock.height * scale);
+        let extent = if id == HudElementId::Chat { layout.extent } else { [1.0, 1.0] };
+        let (width, height) = (
+            stock.width * scale * extent[0],
+            stock.height * scale * extent[1],
+        );
+        if id == HudElementId::Chat {
+            return HudRect {
+                x: stock.x + layout.offset[0],
+                y: stock.y + stock.height + layout.offset[1] - height,
+                width,
+                height,
+            };
+        }
         return HudRect {
             x: stock.x + stock.width * 0.5 + layout.offset[0] - width * 0.5,
             y: stock.y + stock.height * 0.5 + layout.offset[1] - height * 0.5,
@@ -780,6 +935,9 @@ impl Default for MovementKeysSettings {
 pub const SHELPER_ORIGINAL: u32 = 1 << 0;
 pub const SHELPER_UPDATED: u32 = 1 << 1;
 pub const SHELPER_CGAZ: u32 = 1 << 2;
+/// DinurdoJK-only world-space presentation. TaystJK currently occupies
+/// bits 0..=20 (`SHELPER_ACCELZONES` is bit 20), so keep this extension next.
+pub const SHELPER_CINEMATIC: u32 = 1 << 21;
 pub const SHELPER_W: u32 = 1 << 5;
 pub const SHELPER_WA: u32 = 1 << 6;
 pub const SHELPER_WD: u32 = 1 << 7;
@@ -795,7 +953,7 @@ pub const SHELPER_SD: u32 = 1 << 17;
 pub const SHELPER_TINY: u32 = 1 << 18;
 pub const SHELPER_ACCELMETER: u32 = 1 << 12;
 pub const SHELPER_MAX: u32 = 1 << 19;
-pub const SHELPER_STYLE_MASK: u32 = SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ;
+pub const SHELPER_STYLE_MASK: u32 = SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ | SHELPER_CINEMATIC;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrafeHelperSettings {
@@ -834,6 +992,9 @@ pub struct MovementHudState {
     pub up_move: i8,
     pub buttons: i32,
     pub velocity: [f32; 3],
+    /// Player origin in JKA world coordinates. Cinematic strafehelper rays are
+    /// anchored from this point; 2D styles ignore it.
+    pub origin: [f32; 3],
     /// Rendered view orientation; the strafehelper projects through it.
     pub view_yaw: f32,
     pub view_pitch: f32,
@@ -850,6 +1011,11 @@ pub struct MovementHudState {
     pub jetpack_pm_type: bool,
     pub jetpack_active: bool,
     pub in_vehicle: bool,
+    /// True only while the local view is a free-roaming spectator. TaystJK's
+    /// strafehelper describes player movement, not PM_SPECTATOR fly movement;
+    /// followed spectators remain eligible because PMF_FOLLOW supplies a real
+    /// movement subject.
+    pub spectator_free_roam: bool,
     pub third_person: bool,
     /// Player origin minus the rendered eye position.
     pub eye_to_origin: [f32; 3],
@@ -859,11 +1025,12 @@ impl Default for MovementHudState {
     fn default() -> Self {
         Self {
             forward_move: 0, right_move: 0, up_move: 0, buttons: 0,
-            velocity: [0.0; 3], view_yaw: 0.0, view_pitch: 0.0, view_roll: 0.0,
+            velocity: [0.0; 3], origin: [0.0; 3], view_yaw: 0.0, view_pitch: 0.0, view_roll: 0.0,
             player_speed: 250.0, grounded: false, was_grounded: false, fov_x: 90.0,
             move_style: crate::strafehelper::mv::JKA,
             knockback: false, jetpack_pm_type: false, jetpack_active: false,
-            in_vehicle: false, third_person: false, eye_to_origin: [0.0; 3],
+            in_vehicle: false, spectator_free_roam: false, third_person: false,
+            eye_to_origin: [0.0; 3],
         }
     }
 }
@@ -1879,6 +2046,10 @@ pub const VIDEO_ROW_FX_PHYSICS: usize = 78;
 pub const VIDEO_ROW_FX_LOD: usize = 79;
 pub const VIDEO_ROW_ENTITY_SHADOW_LIGHT: usize = 80;
 pub const VIDEO_ROW_DRAW_ENTITIES: usize = 81;
+pub const VIDEO_ROW_RENDERER_VERBOSE: usize = 82;
+pub const VIDEO_ROW_PICMIP: usize = 83;
+pub const VIDEO_ROW_FX_FPS_SCOPE: usize = 84;
+pub const VIDEO_ROW_DOF_AUTOFOCUS: usize = 85;
 
 pub const ENV_ROW_FOG_MODE: usize = 0;
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
@@ -2196,6 +2367,9 @@ pub struct VideoSettings {
     pub window_position: Option<[i32; 2]>,
     pub window_maximized: bool,
     pub texture_filter: TextureFilter,
+    /// Classic `r_picmip`: number of highest map-texture mip levels omitted
+    /// when the texture is uploaded. TaystJK defaults to 0.
+    pub picmip: u32,
     pub detail_textures: DetailTextureMode,
     /// Port of the standard distance-based detail fade: blend the detail contribution
     /// back to its neutral identity as camera distance approaches the configured range.
@@ -2208,6 +2382,8 @@ pub struct VideoSettings {
     /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
     /// render-frame-driven behavior; non-zero values are fixed Hz.
     pub fx_fps: u32,
+    /// `cg_fxFPSScope`: 0 continuous EFX only, 1 also stock frame-driven FX.
+    pub fx_fps_scope: u32,
     /// `fx_physics`: 0 off, 2 authored expensivePhysics (default), 3 force all.
     pub fx_physics: u32,
     /// `fx_lod`: 0 stock, 1 authored cullRange, 2 adaptive screen-size density.
@@ -2238,7 +2414,15 @@ pub struct VideoSettings {
     /// target/targetname link lines for every map entity. Session-only.
     pub draw_entities: bool,
     pub draw_fps: u8,
+    /// `cg_drawTimer`: classic elapsed level timer (M:SS only).
+    pub draw_timer: bool,
+    /// `developer`: 0 quiet, 1 basic diagnostics, 2 verbose, 3 trace.
+    /// `developer_tools` remains the derived compatibility gate used by
+    /// inspector/overlay code: it is always `developer_level != 0`.
+    pub developer_level: u8,
     pub developer_tools: bool,
+    /// Classic renderer-only verbose spew level (`r_verbose`).
+    pub renderer_verbose: u8,
     pub perf_trace: bool,
     /// World renderer choice (`r_worldPath unified`): keeps the world on
     /// the unified renderer even when the FastBaseline feature envelope matches,
@@ -2256,13 +2440,12 @@ pub struct VideoSettings {
     /// between 0 and 1 (0 or >=1 disables it).
     pub ghoul2_anim_smooth: f32,
     pub physics_msec: u32,
-    pub input_subframe: bool,
     /// Request a 1 ms Windows multimedia timer period for timeout/sleep waits.
     /// Raw mouse events already wake the event loop independently.
     pub timer_resolution_1ms: bool,
-    /// Experimental render-thread late latch. Only effective with
-    /// `cl_input_subframe`; the renderer resamples the newest real view
-    /// orientation at its last coherent camera point for the active path.
+    /// Experimental render-thread late latch. Subframe input is always enabled;
+    /// the renderer resamples the newest real view orientation at its last
+    /// coherent camera point for the active path.
     pub input_latelatch: bool,
     // Client-side visual physics (Rapier integration target). These never replace
     // authoritative JKA/OpenJK player movement or server entity state.
@@ -2275,6 +2458,26 @@ pub struct VideoSettings {
     pub ragdoll_max: u32,
     pub ragdoll_lifetime: f32,
     pub ragdoll_self_collision: bool,
+    /// Profile-driven post-Ghoul2 soft-tissue secondary motion.
+    pub jiggle_physics: bool,
+    pub jiggle_strength: f32,
+    pub jiggle_breast_strength: f32,
+    pub jiggle_glute_strength: f32,
+    pub jiggle_stiffness: f32,
+    pub jiggle_damping: f32,
+    pub jiggle_glute_lift: f32,
+    /// OpenJK cg_dismember: 0 off, 1 limbs only, 2 full.
+    pub dismemberment: u8,
+    pub dismember_max: u32,
+    pub dismember_lifetime: f32,
+    /// Experimental Ghoul2 cape/cloak/robe presentation cloth.
+    pub cloth_physics: bool,
+    pub cloth_body_collision: bool,
+    pub cloth_body_clearance: f32,
+    pub cloth_air_resistance: f32,
+    pub cloth_turn_response: f32,
+    pub cloth_animation_influence: f32,
+    pub cloth_wind: bool,
     pub physics_props: bool,
     pub physics_prop_max: u32,
     pub physics_debris: bool,
@@ -2388,6 +2591,8 @@ pub struct VideoSettings {
     pub film_grain_strength: f32,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
+    /// Crosshair-surface autofocus for DOF. When off, the last focus distance is held.
+    pub dof_autofocus: bool,
     pub dof_quality: DofQuality,
     pub color_lut: ColorLutPreset,
     pub color_lut_strength: f32,
@@ -2488,6 +2693,7 @@ impl Default for VideoSettings {
             window_position: None,
             window_maximized: false,
             texture_filter: TextureFilter::Trilinear,
+            picmip: 0,
             detail_textures: DetailTextureMode::Off,
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
@@ -2496,6 +2702,7 @@ impl Default for VideoSettings {
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
             fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
             fx_lod: crate::fx::FX_LOD_DEFAULT,
             fx_count_scale: 1.0,
@@ -2508,7 +2715,10 @@ impl Default for VideoSettings {
             draw_clip_brushes: false,
             draw_entities: false,
             draw_fps: 1,
+            draw_timer: false,
+            developer_level: 0,
             developer_tools: false,
+            renderer_verbose: 0,
             perf_trace: false,
             force_unified_world: false,
             pom: true,
@@ -2519,7 +2729,6 @@ impl Default for VideoSettings {
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             ghoul2_anim_smooth: 0.3,
             physics_msec: 8,
-            input_subframe: false,
             timer_resolution_1ms: false,
             input_latelatch: false,
             client_physics: false,
@@ -2531,6 +2740,23 @@ impl Default for VideoSettings {
             ragdoll_max: 8,
             ragdoll_lifetime: 20.0,
             ragdoll_self_collision: false,
+            jiggle_physics: false,
+            jiggle_strength: 1.0,
+            jiggle_breast_strength: 1.0,
+            jiggle_glute_strength: 1.0,
+            jiggle_stiffness: 1.0,
+            jiggle_damping: 1.0,
+            jiggle_glute_lift: 0.15,
+            dismemberment: 0,
+            dismember_max: 24,
+            dismember_lifetime: 16.0,
+            cloth_physics: false,
+            cloth_body_collision: true,
+            cloth_body_clearance: 1.0,
+            cloth_air_resistance: 1.0,
+            cloth_turn_response: 1.8,
+            cloth_animation_influence: 0.35,
+            cloth_wind: false,
             physics_props: true,
             physics_prop_max: 96,
             physics_debris: true,
@@ -2624,6 +2850,7 @@ impl Default for VideoSettings {
             film_grain_strength: 0.0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
+            dof_autofocus: true,
             dof_quality: DofQuality::Adaptive,
             color_lut: ColorLutPreset::Off,
             color_lut_strength: 1.0,
@@ -2787,6 +3014,26 @@ pub struct PredictionDebugUi {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiForceSelect {
+    pub selected: u8,
+    pub known_bits: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiDuelMiniScore {
+    pub name: String,
+    pub score: Option<i32>,
+    /// Cell in the shared lazy player-icon atlas, matching clientInfo.modelIcon.
+    pub model_icon: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiMiniScores {
+    Team { mode: i32, red: Option<i32>, blue: Option<i32> },
+    Duel { icon_paths: Vec<String>, blue: UiDuelMiniScore, red: UiDuelMiniScore },
+}
+
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
     pub setup_selected: usize,
@@ -2823,17 +3070,28 @@ pub struct UiSnapshot {
     pub chat_lines: Vec<UiChatLine>,
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
+    /// TaystJK/OpenJK `cg_drawTimer` elapsed level time, preformatted as M:SS.
+    pub game_timer: Option<String>,
+    /// TaystJK `cg_drawScores` compact score HUD.
+    pub mini_scores: Option<UiMiniScores>,
     /// jaPRO `cg_raceTimer` / `cg_raceStart` readout (updates every frame of a run).
     pub race_timer: Option<crate::japro_cg::RaceTimerUi>,
     /// `CG_DrawVote`: the open vote's summary line (colour codes included).
     pub vote_line: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
+    /// TaystJK scoreboard ownership: `cg.snap->ps.clientNum`. While following
+    /// another player this is the followed client, so their row is highlighted
+    /// instead of the spectator's own row.
+    pub scoreboard_focus_client: Option<i32>,
     pub demo_timeline: Option<DemoTimelineUi>,
     pub prediction_debug: Option<PredictionDebugUi>,
     pub hud: Option<HudState>,
+    pub team_overlay: Option<TeamOverlayUi>,
     pub hud_layout: HudLayout,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
+    /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
+    pub force_select: Option<UiForceSelect>,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub movement_hud: MovementHudState,
@@ -2884,15 +3142,20 @@ impl Default for UiSnapshot {
             chat_lines: Vec::new(),
             center_print: None,
             follow_name: None,
+            game_timer: None,
+            mini_scores: None,
             race_timer: None,
             vote_line: None,
             scoreboard: None,
+            scoreboard_focus_client: None,
             demo_timeline: None,
             prediction_debug: None,
             hud: None,
+            team_overlay: None,
             hud_layout: HudLayout::default(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
+            force_select: None,
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             movement_hud: MovementHudState::default(),
@@ -3065,7 +3328,7 @@ pub fn build_vertices(
         OverlayMode::None | OverlayMode::Chat => {}
         OverlayMode::Console => build_console(&mut out, ui, width, height),
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
-        OverlayMode::Video | OverlayMode::Game | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit | OverlayMode::EntityGraph | OverlayMode::Trace => {}
+        OverlayMode::Video | OverlayMode::Game | OverlayMode::Vgs | OverlayMode::HudEdit | OverlayMode::CameraEdit | OverlayMode::MapEdit | OverlayMode::EntityGraph | OverlayMode::Trace | OverlayMode::StrafeTrails | OverlayMode::RaceGhosts => {}
     }
     // The trace result panel used to be drawn here from `ui.surface_inspector`
     // (`build_surface_inspector`, a static non-interactive readout). It's now
@@ -3136,23 +3399,16 @@ pub fn build_transient_vertices(
     if gameplay_hud_visible(ui, width, height) {
         // Colour and name follow the aim target, so they share the small batch
         // that is rebuilt when it changes rather than the stable HUD prefix.
-        let mut crosshair = ui.crosshair;
-        if ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0 {
-            // jaPRO draws its line crosshair from cg_strafeHelper and suppresses the normal one.
-            crosshair.style = CROSSHAIR_STYLE_LINE;
-            crosshair.image = 0;
+        // Dynamic crosshair placement depends on the render thread's final
+        // late-latched camera, so its geometry is appended in the view-dependent
+        // UI tail. Static/smart-overridden crosshairs stay in this stable batch.
+        if !ui.crosshair_target.dynamic {
+            build_crosshair_vertices(out, ui, None, width, height);
         }
-        build_crosshair(
-            out,
-            crosshair,
-            ui.crosshair_target.color,
-            ui.strafe_helper.line_width,
-            width,
-            height,
-        );
         draw_placed(out, ui, HudElementId::CrosshairName, width, height, |out| {
             build_crosshair_name(out, ui, small_font, width, height);
         });
+        build_force_select(out, ui, small_font, width, height);
     }
     if gameplay_overlay {
         // Follows the snapshot's client every frame (CG_DrawFollow), so it lives
@@ -3160,6 +3416,7 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::Follow, width, height, |out| {
             build_follow_indicator(out, ui, small_font, width, height);
         });
+        build_team_overlay(out, ui, small_font, width, height);
         build_race_timer(out, ui, small_font, width, height);
         build_speedometer(out, ui, small_font, width, height);
         build_lagometer(out, ui, small_font, width, height);
@@ -3182,6 +3439,15 @@ pub fn build_transient_vertices(
         1 => build_fps_simple(out, ui, width, height),
         _ => build_perf(out, ui, width, height),
     });
+    if gameplay_overlay {
+        // TaystJK CG_DrawFPS/CG_DrawTimer share the same right edge. Reuse the
+        // FPS HUD transform as well, so moving/scaling FPS cannot leave the
+        // timer behind with a different effective right edge.
+        draw_placed(out, ui, HudElementId::Fps, width, height, |out| {
+            build_game_timer(out, ui, width, height);
+        });
+        build_mini_scores(out, ui, small_font, width, height);
+    }
     if ui.mode == OverlayMode::Chat {
         // The input box is anchored to the oldest visible chat line, so keep
         // it in the same transient batch as chat history. This lets fades/new
@@ -3189,6 +3455,346 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
             build_chat_input(out, ui, small_font, width, height);
         });
+    }
+}
+
+fn player_icon_atlas_cell(
+    out: &mut Vec<UiVertex>,
+    icon_count: usize,
+    index: Option<u16>,
+    x: f32,
+    y: f32,
+    width_px: f32,
+    height_px: f32,
+    w: u32,
+    h: u32,
+) {
+    let Some(index) = index.map(usize::from).filter(|&i| i < icon_count) else { return };
+    let columns = TEAM_ICON_COLUMNS.max(1);
+    let rows = ((icon_count as u32 + columns - 1) / columns).max(1);
+    let cell = TEAM_ICON_CELL as f32;
+    let atlas_w = columns as f32 * cell;
+    let atlas_h = rows as f32 * cell;
+    let col = index as u32 % columns;
+    let row = index as u32 / columns;
+    let uv0 = [(col as f32 * cell + 0.5) / atlas_w, (row as f32 * cell + 0.5) / atlas_h];
+    let uv1 = [((col + 1) as f32 * cell - 0.5) / atlas_w, ((row + 1) as f32 * cell - 0.5) / atlas_h];
+    textured_rect_with_source(
+        out, x, y, width_px, height_px, uv0, uv1, [1.0; 4], TEAM_ICON_TEXTURE_SOURCE, w, h,
+    );
+}
+
+fn team_overlay_icon(
+    out: &mut Vec<UiVertex>,
+    overlay: &TeamOverlayUi,
+    index: Option<u16>,
+    x: f32,
+    y: f32,
+    width_px: f32,
+    height_px: f32,
+    w: u32,
+    h: u32,
+) {
+    player_icon_atlas_cell(
+        out, overlay.icon_paths.len(), index, x, y, width_px, height_px, w, h,
+    );
+}
+
+fn team_overlay_health_color(health: i32, armor: i32) -> [f32; 4] {
+    // OpenJK CG_GetColorForHealth. ARMOR_PROTECTION is 0.5 in JKA, so useful
+    // armor is capped to health before selecting the classic red/yellow/white tint.
+    if health <= 0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let effective = health.saturating_add(armor.max(0).min(health));
+    let blue = if effective >= 100 { 1.0 } else if effective < 66 { 0.0 } else { (effective - 66) as f32 / 33.0 };
+    let green = if effective > 60 { 1.0 } else if effective < 30 { 0.0 } else { (effective - 30) as f32 / 30.0 };
+    [1.0, green, blue, 1.0]
+}
+
+fn team_overlay_force_color(force: i32) -> [f32; 4] {
+    // TaystJK/OpenJK CG_GetColorForForce.
+    if force <= 0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let red = if force >= 100 {
+        1.0
+    } else if force < 66 {
+        0.0
+    } else {
+        (force - 66) as f32 / 33.0
+    };
+    let green = if force > 60 {
+        1.0
+    } else if force < 30 {
+        0.0
+    } else {
+        (force - 30) as f32 / 30.0
+    };
+    [red, green, 1.0, 1.0]
+}
+
+fn build_team_overlay(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(overlay) = &ui.team_overlay else { return };
+    if overlay.settings.mode == 0 || overlay.entries.is_empty() { return; }
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    // TaystJK cgs.widthRatioCoef keeps horizontal HUD dimensions at a 4:3
+    // physical scale on widescreen displays. Keep it in virtual-space math,
+    // then apply the renderer's ordinary 640x480 -> framebuffer transform.
+    let ratio = crate::lagometer::width_ratio_coef(w, h);
+    let draw_force = overlay.settings.force && overlay.entries.iter().any(|entry| entry.force >= 0);
+
+    match overlay.settings.mode {
+        1 | 2 => {
+            // TaystJK CG_DrawTeamOverlay: fixed 8x8 text, max 12-char names and
+            // 16-char locations, right anchored by cg_drawTeamOverlayX/Y.
+            const CW: f32 = 8.0;
+            const CH: f32 = 8.0;
+            let pwidth = overlay.entries.iter().map(|e| visible_jka_chars(&e.name)).max().unwrap_or(0).min(12);
+            let lwidth = overlay.location_width.min(16);
+            let mut width_v = (pwidth + lwidth + 11) as f32 * CW * ratio;
+            if overlay.settings.weapons { width_v += CW * ratio; }
+            // TaystJK's jaPRO force extension reserves a literal 32 virtual
+            // units beyond the ratio-corrected stock overlay width.
+            if draw_force { width_v += 32.0; }
+            let x_v = overlay.settings.x as f32 - width_v;
+            let y_v = if overlay.settings.y != 0 { overlay.settings.y as f32 } else { 0.0 };
+            let background = if overlay.team == 1 { [1.0, 0.0, 0.0, 0.33] } else { [0.0, 0.0, 1.0, 0.33] };
+            rect(out, x_v * sx, y_v * sy, width_v * sx, overlay.entries.len() as f32 * CH * sy, background, w, h);
+
+            for (row, entry) in overlay.entries.iter().enumerate() {
+                let y = (y_v + row as f32 * CH) * sy;
+                let name = truncate_jka_text(&entry.name, 12);
+                let location = truncate_jka_text(&entry.location, 16);
+                let cw_x = CW * ratio;
+                fixed_charset_text(out, &name, (x_v + cw_x) * sx, y, cw_x*sx, CH*sy, cw_x*sx, [1.0;4], false, w, h);
+                if lwidth > 0 {
+                    fixed_charset_text(out, &location, (x_v + cw_x*2.0 + pwidth as f32*cw_x)*sx, y, cw_x*sx, CH*sy, cw_x*sx, [1.0;4], false, w, h);
+                }
+                let stats_x_v = x_v + cw_x*3.0 + (pwidth + lwidth) as f32*cw_x;
+                let stats = format!("{:>3} {:>3}", entry.health.max(0), entry.armor.max(0));
+                fixed_charset_text(out, &stats, stats_x_v*sx, y, cw_x*sx, CH*sy, cw_x*sx, team_overlay_health_color(entry.health, entry.armor), false, w, h);
+                let mut icon_x_v = stats_x_v + cw_x*7.0;
+                if draw_force {
+                    let fp = format!("{:>3}", entry.force.max(0));
+                    fixed_charset_text(out, &fp, (stats_x_v + 66.0*ratio)*sx, y, cw_x*sx, CH*sy, cw_x*sx, team_overlay_force_color(entry.force), false, w, h);
+                    icon_x_v = stats_x_v + 66.0*ratio + cw_x*4.0;
+                }
+                if overlay.settings.weapons {
+                    team_overlay_icon(out, overlay, entry.weapon_icon, icon_x_v*sx, y, cw_x*sx, CH*sy, w, h);
+                }
+                let mut pw_x_v = x_v;
+                for &icon in &entry.powerup_icons {
+                    team_overlay_icon(out, overlay, Some(icon), pw_x_v*sx, y, cw_x*sx, CH*sy, w, h);
+                    pw_x_v -= cw_x;
+                }
+            }
+        }
+        3 | 4 => {
+            // TaystJK CG_DrawTeamOverlay2: four cards across the right half, then
+            // a second row, with name/location, H/A(/F) and optional icons.
+            let text_h_v = small_font.map_or(11.0, |font| font.height.max(1) as f32 * 0.55);
+            let has_locations = overlay.has_locations;
+            let card_h_v = if has_locations { text_h_v * 3.0 + 10.0 } else { text_h_v * 2.0 + 7.5 };
+            let gap_v = 3.0 * ratio;
+            // CG_DrawTeamOverlay2 sets overlayXPos to SCREEN_WIDTH/2 in the normal
+            // upper-right HUD path and ratio-corrects both the half-screen width
+            // and its four 3px gutters before /4.
+            let card_w_v = (320.0 * ratio - 4.0 * gap_v) / 4.0;
+            let origin_y_v = 0.0;
+            let right_v = 640.0;
+            for (i, entry) in overlay.entries.iter().enumerate() {
+                let col = i % 4;
+                let row = i / 4;
+                let x_v = right_v - (col + 1) as f32*card_w_v - col as f32*gap_v;
+                let y_v = origin_y_v + row as f32*(card_h_v + 8.0);
+                let bg = if entry.health < 1 { [0.4,0.4,0.4,0.4] }
+                    else if overlay.team == 1 { [0.65,0.01,0.02,0.70] }
+                    else { [0.02,0.40,0.65,0.70] };
+                rect(out, x_v*sx, y_v*sy, card_w_v*sx, card_h_v*sy, bg, w, h);
+                let name = truncate_jka_text(&entry.name, 16);
+                let loc = truncate_jka_text(&entry.location, 16);
+                let name_y_v = if has_locations {
+                    y_v + card_h_v / 4.0 - text_h_v / 2.0 - 2.5
+                } else {
+                    y_v + card_h_v / 3.0 - text_h_v / 2.0 - 2.5
+                };
+                if let Some(font) = small_font {
+                    let name_w_v = proportional_text_width(&name, font, 0.55);
+                    proportional_text(out, &name, font, (x_v + card_w_v/2.0 - name_w_v/2.0)*sx, name_y_v*sy, 0.55, [1.0;4], false, w, h);
+                    if has_locations {
+                        let loc_w_v = proportional_text_width(&loc, font, 0.55);
+                        proportional_text(out, &loc, font, (x_v + card_w_v/2.0 - loc_w_v/2.0)*sx, (y_v + card_h_v/2.0 - text_h_v/1.4)*sy, 0.55, [1.0;4], false, w, h);
+                    }
+                } else {
+                    let name_w_v = visible_jka_chars(&name) as f32 * 5.0;
+                    fixed_charset_text(out, &name, (x_v + card_w_v/2.0 - name_w_v/2.0)*sx, name_y_v*sy, 5.0*sx, 8.0*sy, 5.0*sx, [1.0;4], false, w, h);
+                    if has_locations {
+                        let loc_w_v = visible_jka_chars(&loc) as f32 * 5.0;
+                        fixed_charset_text(out, &loc, (x_v + card_w_v/2.0 - loc_w_v/2.0)*sx, (y_v + card_h_v/2.0 - text_h_v/1.4)*sy, 5.0*sx, 8.0*sy, 5.0*sx, [1.0;4], false, w, h);
+                    }
+                }
+                let stats_y_v = if has_locations { y_v + 3.0*card_h_v/4.0 - text_h_v/2.0 } else { y_v + 2.0*card_h_v/3.0 - text_h_v/2.0 };
+                let elements = if draw_force { 3.0 } else { 2.0 };
+                let health_color = team_overlay_health_color(entry.health, entry.armor);
+                let values = [
+                    (format!("{:>3}", entry.health.max(0)), health_color),
+                    (format!("{:>3}", entry.armor.max(0)), health_color),
+                    (format!("{:>3}", entry.force.max(0)), team_overlay_force_color(entry.force)),
+                ];
+                for (slot, (value, color)) in values.into_iter().enumerate() {
+                    if slot == 2 && !draw_force { break; }
+                    let value_w_v = if let Some(font) = small_font {
+                        proportional_text_width(&value, font, 0.55)
+                    } else {
+                        visible_jka_chars(&value) as f32 * 5.0
+                    };
+                    let tx_v = x_v + (slot as f32 + 1.0)*card_w_v/(elements+1.0) - value_w_v/2.0;
+                    if let Some(font) = small_font {
+                        proportional_text(out, &value, font, tx_v*sx, stats_y_v*sy, 0.55, color, false, w, h);
+                    } else {
+                        fixed_charset_text(out, &value, tx_v*sx, stats_y_v*sy, 5.0*sx, 8.0*sy, 5.0*sx, color, false, w, h);
+                    }
+                }
+                let mut ix_v = x_v;
+                let iy_v = (y_v + card_h_v)*sy;
+                if overlay.settings.weapons {
+                    team_overlay_icon(out, overlay, entry.weapon_icon, ix_v*sx, iy_v, 8.0*ratio*sx, 8.0*sy, w, h);
+                    ix_v += 8.0*ratio;
+                }
+                for &icon in &entry.powerup_icons {
+                    team_overlay_icon(out, overlay, Some(icon), ix_v*sx, iy_v, 8.0*ratio*sx, 8.0*sy, w, h);
+                    ix_v += 8.0*ratio;
+                }
+            }
+        }
+        5 | 6 => {
+            // TaystJK CG_DrawTeamOverlay3. All geometry derives from scale and
+            // CG_Text_Height; use the resident small font's metrics where available.
+            let scale = overlay.settings.scale.clamp(0.5, 2.5);
+            let text_scale = 0.8 * scale;
+            let text_h_v = small_font.map_or(12.0 * scale, |font| font.height.max(1) as f32 * text_scale);
+            let bar_h_v = text_h_v * 0.55;
+            let pad_v = 3.0 * scale;
+            let pad_x_v = pad_v * ratio;
+            let has_locations = overlay.has_locations;
+            let row_h_v = pad_v + text_h_v + pad_v + bar_h_v + pad_v + if has_locations { text_h_v + pad_v } else { 0.0 };
+            let panel_w_v = 190.0 * scale * ratio;
+            let panel_x_v = overlay.settings.x as f32 - panel_w_v;
+            let panel_y_v = if overlay.settings.y != 0 { overlay.settings.y as f32 } else { 0.0 };
+            let icon_size_v = row_h_v - pad_v*2.0;
+            let icon_w_v = icon_size_v * ratio;
+            let pw_icon_w_v = text_h_v * ratio;
+            let icon_x_v = panel_x_v + pad_x_v;
+            let text_x_v = icon_x_v + icon_w_v + pad_x_v;
+            let mut bar_w_v = panel_x_v + panel_w_v - pad_x_v - text_x_v;
+            let fp_bar_w_v = if draw_force { bar_w_v*0.22 } else { 0.0 };
+            if draw_force { bar_w_v -= fp_bar_w_v + pad_x_v; }
+            let fp_bar_x_v = text_x_v + bar_w_v + pad_x_v;
+            let max_hp = overlay.settings.max_hp.max(1.0);
+
+            for (row, entry) in overlay.entries.iter().enumerate() {
+                let y_v = panel_y_v + row as f32*row_h_v;
+                let bg = if entry.health < 1 { [0.35,0.35,0.35,0.50] }
+                    else if overlay.team == 1 { [0.45,0.05,0.05,0.35] }
+                    else { [0.05,0.15,0.45,0.35] };
+                rect(out, panel_x_v*sx, y_v*sy, panel_w_v*sx, row_h_v*sy, bg, w, h);
+                team_overlay_icon(out, overlay, entry.model_icon, icon_x_v*sx, (y_v+pad_v)*sy, icon_w_v*sx, icon_size_v*sy, w, h);
+
+                let baseline = (y_v + pad_v + text_h_v*0.82)*sy;
+                let total = entry.health.max(0).saturating_add(entry.armor.max(0));
+                let total_text = total.to_string();
+                let total_w_v = if let Some(font) = small_font {
+                    proportional_text_width(&total_text, font, text_scale)
+                } else {
+                    visible_jka_chars(&total_text) as f32 * 5.0 * scale
+                };
+                let total_x_v = panel_x_v + panel_w_v - pad_x_v - total_w_v;
+                let mut text_color = [1.0; 4];
+                if entry.health < 1 { text_color[3] = 0.4; }
+                if let Some(font) = small_font {
+                    proportional_text(out, &total_text, font, total_x_v*sx, baseline, text_scale, text_color, false, w, h);
+                } else {
+                    fixed_charset_text(out, &total_text, total_x_v*sx, (y_v+pad_v)*sy, 5.0*scale*sx, 8.0*scale*sy, 5.0*scale*sx, text_color, false, w, h);
+                }
+
+                // Powerups and the optional weapon consume space from right to left,
+                // immediately before the total, exactly like CG_DrawTeamOverlay3.
+                let mut pw_x_v = total_x_v - pad_x_v;
+                for &icon in &entry.powerup_icons {
+                    if pw_x_v - pw_icon_w_v < text_x_v { break; }
+                    pw_x_v -= pw_icon_w_v;
+                    team_overlay_icon(out, overlay, Some(icon), pw_x_v*sx, (y_v+pad_v)*sy, pw_icon_w_v*sx, text_h_v*sy, w, h);
+                }
+                if overlay.settings.weapons && pw_x_v - pw_icon_w_v >= text_x_v {
+                    pw_x_v -= pw_icon_w_v;
+                    team_overlay_icon(out, overlay, entry.weapon_icon, pw_x_v*sx, (y_v+pad_v)*sy, pw_icon_w_v*sx, text_h_v*sy, w, h);
+                }
+
+                let name_w_v = (pw_x_v - text_x_v - pad_x_v).max(0.0);
+                let mut name_len = visible_jka_chars(&entry.name).min(36);
+                let mut name = truncate_jka_text(&entry.name, name_len);
+                loop {
+                    let width_v = if let Some(font) = small_font {
+                        proportional_text_width(&name, font, text_scale)
+                    } else {
+                        visible_jka_chars(&name) as f32 * 5.0 * scale
+                    };
+                    if name_len <= 1 || width_v <= name_w_v { break; }
+                    name_len -= 1;
+                    name = truncate_jka_text(&entry.name, name_len);
+                }
+                if let Some(font) = small_font {
+                    proportional_text(out, &name, font, text_x_v*sx, baseline, text_scale, text_color, true, w, h);
+                } else {
+                    fixed_charset_text(out, &name, text_x_v*sx, (y_v+pad_v)*sy, 5.0*scale*sx, 8.0*scale*sy, 5.0*scale*sx, text_color, true, w, h);
+                }
+
+                let mut bars_y_v = y_v + pad_v + text_h_v + pad_v;
+                if has_locations {
+                    let loc = truncate_jka_text(&entry.location, 16);
+                    if let Some(font) = small_font {
+                        proportional_text(out, &loc, font, text_x_v*sx, (bars_y_v+text_h_v*0.82)*sy, text_scale*0.8, text_color, false, w, h);
+                    } else {
+                        fixed_charset_text(out, &loc, text_x_v*sx, bars_y_v*sy, 5.0*scale*sx, 8.0*scale*sy, 5.0*scale*sx, text_color, false, w, h);
+                    }
+                    bars_y_v += text_h_v + pad_v;
+                }
+                rect(out, text_x_v*sx, bars_y_v*sy, bar_w_v*sx, bar_h_v*sy, [0.0,0.0,0.0,0.55], w, h);
+                let health = entry.health.max(0) as f32;
+                let armor = entry.armor.max(0) as f32;
+                if health > 0.0 {
+                    let health_w = (health/max_hp).clamp(0.0,1.0)*bar_w_v;
+                    let armor_w = ((armor/max_hp).max(0.0)*bar_w_v).min((bar_w_v-health_w).max(0.0));
+                    let mut health_color = team_overlay_health_color((health + armor).min(100.0) as i32, 0);
+                    health_color[3] = 0.90;
+                    rect(out, text_x_v*sx, bars_y_v*sy, health_w*sx, bar_h_v*sy, health_color, w, h);
+                    if armor > 0.0 && health_w < bar_w_v {
+                        rect(out, (text_x_v+health_w)*sx, bars_y_v*sy, armor_w*sx, bar_h_v*sy, [0.20,0.85,0.30,0.90], w, h);
+                    }
+                    if health + armor > max_hp {
+                        let over = bar_w_v * 0.04;
+                        rect(out, (text_x_v+bar_w_v-over)*sx, bars_y_v*sy, over*sx, bar_h_v*sy, [1.0,1.0,1.0,0.90], w, h);
+                    }
+                }
+                if draw_force {
+                    rect(out, fp_bar_x_v*sx, bars_y_v*sy, fp_bar_w_v*sx, bar_h_v*sy, [0.0,0.0,0.0,0.55], w, h);
+                    if health > 0.0 && entry.force > 0 {
+                        let fw = (entry.force.clamp(0,100) as f32/100.0)*fp_bar_w_v;
+                        let mut force_color = team_overlay_force_color(entry.force);
+                        force_color[3] = 0.92;
+                        rect(out, fp_bar_x_v*sx, bars_y_v*sy, fw*sx, bar_h_v*sy, force_color, w, h);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3498,9 +4104,8 @@ fn build_speedometer(
         let (px, py) = (item.x * sx, item.y * sy);
         let color = speedometer_color(item.color);
         if let Some(font) = small_font {
-            // Glyph bytes: the acceleration label is the font's 0xB5 character.
-            let bytes: Vec<u8> = item.text.chars().map(|c| c as u32 as u8).collect();
-            proportional_text(out, bytes, font, px, py, speedo.size * 0.78, color, true, w, h);
+            // The acceleration label uses the legacy font's 0xB5 glyph.
+            proportional_text(out, &item.text, font, px, py, speedo.size * 0.78, color, true, w, h);
         } else {
             let ascii: String = item.text.chars().map(|c| if c == '\u{b5}' { 'u' } else { c }).collect();
             text(out, &ascii, px, py, speedo.size * 1.4, color, w, h);
@@ -3544,7 +4149,28 @@ fn build_speedometer(
 /// Image names of the icon atlas (see `renderer::load_ui_icon_atlas`): the two
 /// lagometer images in `crate::lagometer::Icon` order, then the image crosshairs
 /// from `ICON_CROSSHAIR_BASE` in `CROSSHAIR_IMAGE_NAMES` order.
-pub const ICON_NAMES: [&str; 2 + CROSSHAIR_IMAGE_COUNT as usize] = [
+pub const FORCE_ICON_NAMES: [&str; 18] = [
+    "gfx/mp/f_icon_lt_heal",
+    "gfx/mp/f_icon_levitation",
+    "gfx/mp/f_icon_speed",
+    "gfx/mp/f_icon_push",
+    "gfx/mp/f_icon_pull",
+    "gfx/mp/f_icon_lt_telepathy",
+    "gfx/mp/f_icon_dk_grip",
+    "gfx/mp/f_icon_dk_l1",
+    "gfx/mp/f_icon_dk_rage",
+    "gfx/mp/f_icon_lt_protect",
+    "gfx/mp/f_icon_lt_absorb",
+    "gfx/mp/f_icon_lt_healother",
+    "gfx/mp/f_icon_dk_forceother",
+    "gfx/mp/f_icon_dk_drain",
+    "gfx/mp/f_icon_sight",
+    "gfx/mp/f_icon_saber_attack",
+    "gfx/mp/f_icon_saber_defend",
+    "gfx/mp/f_icon_saber_throw",
+];
+
+pub const ICON_NAMES: [&str; 2 + CROSSHAIR_IMAGE_COUNT as usize + FORCE_ICON_NAMES.len()] = [
     "gfx/2d/lag",
     "gfx/2d/net",
     CROSSHAIR_IMAGE_NAMES[0],
@@ -3557,13 +4183,23 @@ pub const ICON_NAMES: [&str; 2 + CROSSHAIR_IMAGE_COUNT as usize] = [
     CROSSHAIR_IMAGE_NAMES[7],
     CROSSHAIR_IMAGE_NAMES[8],
     CROSSHAIR_IMAGE_NAMES[9],
+    FORCE_ICON_NAMES[0], FORCE_ICON_NAMES[1], FORCE_ICON_NAMES[2], FORCE_ICON_NAMES[3],
+    FORCE_ICON_NAMES[4], FORCE_ICON_NAMES[5], FORCE_ICON_NAMES[6], FORCE_ICON_NAMES[7],
+    FORCE_ICON_NAMES[8], FORCE_ICON_NAMES[9], FORCE_ICON_NAMES[10], FORCE_ICON_NAMES[11],
+    FORCE_ICON_NAMES[12], FORCE_ICON_NAMES[13], FORCE_ICON_NAMES[14], FORCE_ICON_NAMES[15],
+    FORCE_ICON_NAMES[16], FORCE_ICON_NAMES[17],
 ];
 /// Atlas cell of the first image crosshair.
 const ICON_CROSSHAIR_BASE: usize = 2;
+const ICON_FORCE_BASE: usize = 2 + CROSSHAIR_IMAGE_COUNT as usize;
 /// Edge of one atlas cell in texels; the retail 32x32 images are resampled to it.
 pub const ICON_CELL: u32 = 64;
 /// Texture source id of the icon atlas in `ui.wgsl`.
 const ICON_TEXTURE_SOURCE: f32 = 5.0;
+/// Lazily rebuilt team-overlay icon atlas (`ui.wgsl` texture source 6).
+pub const TEAM_ICON_CELL: u32 = 64;
+pub const TEAM_ICON_COLUMNS: u32 = 8;
+const TEAM_ICON_TEXTURE_SOURCE: f32 = 6.0;
 
 /// The whole of atlas cell `index` as (uv0, uv1).
 fn icon_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
@@ -3653,17 +4289,40 @@ fn build_lagometer(
 ) {
     let Some(lag) = ui.lagometer.as_ref() else { return };
     let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
-    for pic in &lag.pics {
+
+    // The graph/numbers are a normal editable HUD item. Connection-interrupted
+    // and map-change warnings stay screen-centered exactly like JKA.
+    draw_placed(out, ui, HudElementId::Lagometer, w, h, |out| {
+        for pic in &lag.pics[..lag.graph_pic_count.min(lag.pics.len())] {
+            lagometer_pic(out, pic, w, h);
+        }
+        for bar in &lag.rects {
+            rect(out, bar.x * sx, bar.y * sy, bar.w * sx, bar.h * sy, bar.color, w, h);
+        }
+        for item in &lag.texts {
+            lagometer_text(out, item, small_font, w, h);
+        }
+        for item in &lag.big_texts[..lag.graph_big_text_count.min(lag.big_texts.len())] {
+            fixed_charset_text(
+                out,
+                &item.text,
+                item.x * sx,
+                item.y * sy,
+                item.char_w * sx,
+                crate::lagometer::BIGCHAR * sy,
+                item.char_w * sx,
+                [1.0; 4],
+                true,
+                w,
+                h,
+            );
+        }
+    });
+
+    for pic in &lag.pics[lag.graph_pic_count.min(lag.pics.len())..] {
         lagometer_pic(out, pic, w, h);
     }
-    for bar in &lag.rects {
-        rect(out, bar.x * sx, bar.y * sy, bar.w * sx, bar.h * sy, bar.color, w, h);
-    }
-    for item in &lag.texts {
-        lagometer_text(out, item, small_font, w, h);
-    }
-    // CG_DrawBigString: 16x16 glyphs of the fixed charset, white with a shadow.
-    for item in &lag.big_texts {
+    for item in &lag.big_texts[lag.graph_big_text_count.min(lag.big_texts.len())..] {
         fixed_charset_text(
             out,
             &item.text,
@@ -3710,7 +4369,7 @@ fn build_race_timer(
     });
 }
 
-fn visible_jka_chars(value: &str) -> usize {
+pub(crate) fn visible_jka_chars(value: &str) -> usize {
     let mut chars = value.chars().peekable();
     let mut visible = 0usize;
     while let Some(ch) = chars.next() {
@@ -4005,7 +4664,8 @@ fn build_scoreboard(
     let team_right = x + width - pad;
     let time_right = if board.team_game { team_right - 82.0 * s } else { team_right };
     let ping_right = time_right - 92.0 * s;
-    let score_right = ping_right - 92.0 * s;
+    let deaths_right = ping_right - 92.0 * s;
+    let score_right = if board.show_deaths { deaths_right - 92.0 * s } else { ping_right - 92.0 * s };
     let player_x = x + pad + 7.0 * s;
     let header_baseline = columns_y + columns_h * 0.69;
 
@@ -4013,6 +4673,10 @@ fn build_scoreboard(
     for (label, right) in [("SCORE", score_right), ("PING", ping_right), ("TIME", time_right)] {
         let tw = text_width(label, header_font_scale, fallback_header_scale);
         draw(out, label, right - tw, header_baseline, header_font_scale, fallback_header_scale, TEXT_DIM);
+    }
+    if board.show_deaths {
+        let tw = text_width("DEATHS", header_font_scale, fallback_header_scale);
+        draw(out, "DEATHS", deaths_right - tw, header_baseline, header_font_scale, fallback_header_scale, TEXT_DIM);
     }
     if board.team_game {
         let tw = text_width("TEAM", header_font_scale, fallback_header_scale);
@@ -4053,7 +4717,13 @@ fn build_scoreboard(
         let row_y = row_top + row_h * 0.68;
         let spectating = entry.team == 3;
 
-        let row_fill = if index % 2 == 0 {
+        let focused = ui.scoreboard_focus_client == Some(entry.client);
+        let row_fill = if focused {
+            // TaystJK fills the current `cg.snap->ps.clientNum` score line.
+            // Keep this renderer's palette, but make the same ownership state
+            // unmistakable without introducing a separate "VIEWING" label.
+            [0.22, 0.58, 0.82, 0.24]
+        } else if index % 2 == 0 {
             [0.80, 0.86, 0.96, 0.050]
         } else {
             [0.55, 0.62, 0.72, 0.022]
@@ -4068,6 +4738,19 @@ fn build_scoreboard(
             w,
             h,
         );
+        if focused {
+            rect_outline(
+                out,
+                x + 6.0 * s,
+                row_top + 2.0 * s,
+                width - 12.0 * s,
+                row_h - 3.0 * s,
+                (1.0 * s).max(1.0),
+                [0.38, 0.82, 1.0, 0.72],
+                w,
+                h,
+            );
+        }
 
         let accent = match entry.team {
             1 => [0.92, 0.22, 0.24, 0.95],
@@ -4106,6 +4789,21 @@ fn build_scoreboard(
                 fallback_row_scale,
                 TEXT_BRIGHT,
             );
+            if board.show_deaths {
+                if let Some(deaths) = entry.deaths {
+                    let deaths = deaths.to_string();
+                    let deaths_w = text_width(&deaths, row_font_scale, fallback_row_scale);
+                    draw(
+                        out,
+                        &deaths,
+                        deaths_right - deaths_w,
+                        row_y,
+                        row_font_scale,
+                        fallback_row_scale,
+                        TEXT,
+                    );
+                }
+            }
         }
 
         let ping = if entry.ping < 0 { "CNCT".to_owned() } else { entry.ping.to_string() };
@@ -4162,7 +4860,7 @@ fn build_scoreboard(
 }
 
 fn truncate_jka_text(value: &str, max_visible: usize) -> String {
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut out = Vec::with_capacity(bytes.len().min(max_visible + 8));
     let mut visible = 0usize;
     let mut index = 0usize;
@@ -4176,7 +4874,7 @@ fn truncate_jka_text(value: &str, max_visible: usize) -> String {
         visible += 1;
         index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out.into_iter().map(char::from).collect()
 }
 
 fn build_reflection_debug_legend(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
@@ -4749,17 +5447,21 @@ fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 
     let force_layout = ui.hud_layout.force;
     let force = hud_element_rect(HudElementId::Force, force_layout, &ctx, w, h);
-    hud_meter(
-        out,
-        force,
-        force_layout.scale,
-        "FORCE",
-        hud.force_power,
-        hud.force_power_max.max(1),
-        if hud.force_flash { [1.0, 0.15, 0.15, 1.0] } else { HUD_FORCE },
-        w,
-        h,
-    );
+    if let Some(force_power) = hud.force_power {
+        hud_meter(
+            out,
+            force,
+            force_layout.scale,
+            "FORCE",
+            force_power,
+            hud.force_power_max.max(1),
+            if hud.force_flash { [1.0, 0.15, 0.15, 1.0] } else { HUD_FORCE },
+            w,
+            h,
+        );
+    } else {
+        hud_value_panel(out, force, force_layout.scale, "FORCE", "--", HUD_FORCE, w, h);
+    }
 }
 
 /// `WP_SABER` in OpenJK's `weapon_t`.
@@ -4923,6 +5625,72 @@ const CHATBOX_FONT_HEIGHT: f32 = 20.0;
 const CHATBOX_FONT_SCALE: f32 = 0.65 * 0.5;
 const CHATBOX_CUTOFF: f32 = 550.0;
 
+
+fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> String {
+    let max_columns = max_columns.max(1);
+    let bytes = crate::cgame::text_to_jka_bytes(value);
+    let mut out = String::with_capacity(value.len() + value.len() / max_columns.max(8));
+    let mut line_start = 0usize;
+    let mut line_columns = 0usize;
+    let mut last_space_out = None::<usize>;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'^'
+            && index + 1 < bytes.len()
+            && color_code(bytes[index + 1] as char, 1.0).is_some()
+        {
+            out.push(bytes[index] as char);
+            out.push(bytes[index + 1] as char);
+            index += 2;
+            continue;
+        }
+        let byte = bytes[index];
+        if byte == b'\n' {
+            out.push('\n');
+            line_start = out.len();
+            line_columns = 0;
+            last_space_out = None;
+            index += 1;
+            continue;
+        }
+        if byte == b' ' {
+            last_space_out = Some(out.len());
+        }
+        out.push(byte as char);
+        line_columns += 1;
+
+        if line_columns >= max_columns {
+            if let Some(space) = last_space_out.filter(|space| *space >= line_start) {
+                out.replace_range(space..=space, "\n");
+                line_start = space + 1;
+                line_columns = visible_jka_chars(&out[line_start..]);
+            } else {
+                out.push('\n');
+                line_start = out.len();
+                line_columns = 0;
+            }
+            last_space_out = None;
+        }
+        index += 1;
+    }
+    out
+}
+
+fn clamp_wrapped_chat_lines(value: &str, max_lines: usize) -> String {
+    let max_lines = max_lines.max(1);
+    let mut kept = value.split('\n').take(max_lines);
+    let Some(first) = kept.next() else {
+        return String::new();
+    };
+    let mut out = first.to_owned();
+    for line in kept {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
 fn build_chat_history(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
@@ -4943,17 +5711,48 @@ fn build_chat_history(
         const CHAT_BASE_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
         let bottom = h as f32 * (CHATBOX_Y / 480.0);
         let line_step = h as f32 * (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE / 480.0);
-        let count = ui.chat_lines.len().min(8);
-        let first_y = bottom - count.saturating_sub(1) as f32 * line_step;
-        let start = ui.chat_lines.len() - count;
-        for (index, line) in ui.chat_lines[start..].iter().enumerate() {
+        let chat_width = (CHATBOX_CUTOFF * ui.hud_layout.chat.extent[0]).clamp(120.0, 2200.0);
+        let max_columns = (chat_width / 4.5).floor().max(1.0) as usize;
+        let max_lines = ((52.0 * ui.hud_layout.chat.extent[1])
+            / (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE))
+            .floor()
+            .max(1.0) as usize;
+        let mut wrapped = Vec::new();
+        for line in &ui.chat_lines {
+            let alpha = line.alpha.clamp(0.0, 1.0);
+            if alpha <= 0.01 {
+                continue;
+            }
+            let text = wrap_fixed_chat_text(&line.text, max_columns);
+            let lines = text.bytes().filter(|&byte| byte == b'\n').count() + 1;
+            wrapped.push((text, lines, alpha));
+        }
+        while wrapped.len() > 1
+            && wrapped.iter().map(|(_, lines, _)| *lines).sum::<usize>() > max_lines
+        {
+            wrapped.remove(0);
+        }
+        if let Some((text, lines, _)) = wrapped.first_mut() {
+            if *lines > max_lines {
+                *text = clamp_wrapped_chat_lines(text, max_lines);
+                *lines = max_lines;
+            }
+        }
+        let total_lines = wrapped
+            .iter()
+            .map(|(_, lines, _)| *lines)
+            .sum::<usize>()
+            .min(max_lines);
+        let first_y = bottom - total_lines.saturating_sub(1) as f32 * line_step;
+        let mut y = first_y;
+        for (text, lines, alpha) in wrapped {
             let mut color = CHAT_BASE_WHITE;
-            color[3] = line.alpha.clamp(0.0, 1.0);
+            color[3] = alpha;
             fixed_charset_text(
                 out,
-                &line.text,
+                &text,
                 w as f32 * (30.0 / 640.0),
-                first_y + index as f32 * line_step,
+                y,
                 w as f32 * (4.0 / 640.0),
                 h as f32 * (8.0 / 480.0),
                 w as f32 * (4.5 / 640.0),
@@ -4962,6 +5761,7 @@ fn build_chat_history(
                 w,
                 h,
             );
+            y += lines as f32 * line_step;
         }
         return;
     };
@@ -4974,13 +5774,18 @@ fn build_chat_history(
     // uncolored run is the player name, so its base color must be white.
     const CHAT_BASE_WHITE: [f32; 3] = [1.0, 1.0, 1.0];
 
+    let chat_width = (CHATBOX_CUTOFF * ui.hud_layout.chat.extent[0]).clamp(120.0, 2200.0);
+    let max_lines = ((52.0 * ui.hud_layout.chat.extent[1])
+        / (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE))
+        .floor()
+        .max(1.0) as usize;
     let mut wrapped = Vec::new();
     for line in &ui.chat_lines {
         let alpha = line.alpha.clamp(0.0, 1.0);
         if alpha <= 0.01 {
             continue;
         }
-        let text = wrap_proportional_text(&line.text, font, CHATBOX_FONT_SCALE, CHATBOX_CUTOFF);
+        let text = wrap_proportional_text(&line.text, font, CHATBOX_FONT_SCALE, chat_width);
         let lines = text.bytes().filter(|&byte| byte == b'\n').count() + 1;
         wrapped.push((text, lines, alpha));
     }
@@ -4988,6 +5793,17 @@ fn build_chat_history(
         return;
     }
 
+    while wrapped.len() > 1
+        && wrapped.iter().map(|(_, lines, _)| *lines).sum::<usize>() > max_lines
+    {
+        wrapped.remove(0);
+    }
+    if let Some((text, lines, _)) = wrapped.first_mut() {
+        if *lines > max_lines {
+            *text = clamp_wrapped_chat_lines(text, max_lines);
+            *lines = max_lines;
+        }
+    }
     let total_lines: usize = wrapped.iter().map(|(_, lines, _)| *lines).sum();
     let line_step_virtual = CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE;
     let x = CHATBOX_X * w as f32 / 640.0;
@@ -5028,7 +5844,12 @@ fn build_chat_input(
     const CHAT_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     const INPUT_HEIGHT: f32 = 40.0;
     const INPUT_GAP: f32 = 6.0;
-    let width = (w as f32 * 0.62).min(840.0).max(360.0);
+    let chat_width_virtual = (CHATBOX_CUTOFF * ui.hud_layout.chat.extent[0]).clamp(120.0, 2200.0);
+    let max_history_lines = ((52.0 * ui.hud_layout.chat.extent[1])
+        / (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE))
+        .floor()
+        .max(1.0) as usize;
+    let width = (chat_width_virtual * w as f32 / 640.0).clamp(220.0, (w as f32 - 36.0).max(220.0));
     let x = 18.0;
 
     // Anchor the entry box above the oldest visible chat line instead of to a
@@ -5042,14 +5863,15 @@ fn build_chat_input(
             .filter(|line| line.alpha > 0.01)
             .map(|line| {
                 let wrapped =
-                    wrap_proportional_text(&line.text, font, CHATBOX_FONT_SCALE, CHATBOX_CUTOFF);
+                    wrap_proportional_text(&line.text, font, CHATBOX_FONT_SCALE, chat_width_virtual);
                 wrapped.bytes().filter(|&byte| byte == b'\n').count() + 1
             })
-            .sum();
+            .sum::<usize>()
+            .min(max_history_lines);
         let line_step = CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE;
         (CHATBOX_Y - line_step * (total_lines.max(1) as f32 + 1.0)) * y_scale
     } else {
-        let count = ui.chat_lines.len().min(8).max(1);
+        let count = ui.chat_lines.len().min(max_history_lines).max(1);
         let line_step = 6.5 * y_scale;
         CHATBOX_Y * y_scale - count as f32 * line_step
     };
@@ -5077,7 +5899,7 @@ fn build_chat_input(
     let input_x = x + 8.0 + (prompt.chars().count() as f32 + 1.0) * BIG_CHAR;
     fixed_charset_text(
         out,
-        &format!("{} _", ui.chat_input),
+        &format!("{}_", ui.chat_input),
         input_x,
         y + 11.0,
         BIG_CHAR,
@@ -5219,7 +6041,9 @@ fn build_movement_keys(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32)
 }
 fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let sh = ui.strafe_helper;
-    if sh.flags & SHELPER_STYLE_MASK == 0 { return; }
+    // Cinematic is submitted through the 3D FX path in app.rs; do not also
+    // spend time projecting/building an empty 2D strafehelper batch.
+    if sh.flags & (SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ) == 0 { return; }
     let aspect = w.max(1) as f32 / h.max(1) as f32;
     let segments = crate::strafehelper::strafe_lines(&sh, &ui.movement_hud, ui.video.fps_cap, aspect);
     // cg_draw's 640x480 space maps straight onto the window on both axes.
@@ -5283,10 +6107,160 @@ fn build_crosshair_name(
     fixed_charset_text(out, &name.text, x, y, glyph_w, glyph_h, glyph_w, color, true, w, h);
 }
 
+fn build_force_select(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    // OpenJK/TaystJK forcePowerSorted[] and CG_DrawForceSelect().
+    const FORCE_POWER_SORTED: [u8; 18] = [5, 0, 10, 9, 11, 1, 2, 3, 4, 14, 7, 13, 8, 6, 12, 15, 16, 17];
+    const NAMES: [&str; 18] = [
+        "Heal", "Levitation", "Speed", "Push", "Pull", "Mind Trick", "Grip", "Lightning",
+        "Rage", "Protect", "Absorb", "Team Heal", "Team Energize", "Drain", "Seeing",
+        "Saber Offense", "Saber Defense", "Saber Throw",
+    ];
+    let Some(selector) = ui.force_select else { return };
+    let valid = |power: u8| {
+        power < 18
+            && selector.known_bits & (1_u32 << power) != 0
+            && !matches!(power, 1 | 15 | 16 | 17)
+    };
+    if !valid(selector.selected) {
+        return;
+    }
+    let Some(selected_sorted) = FORCE_POWER_SORTED.iter().position(|&p| p == selector.selected) else {
+        return;
+    };
+
+    let count = FORCE_POWER_SORTED.iter().copied().filter(|&power| valid(power)).count();
+    if count == 0 {
+        return;
+    }
+
+    // CG_DrawForceSelect: at most three neighbour icons on either side. For six
+    // powers JKA intentionally uses 2 left / 3 right; for seven or more, 3 / 3.
+    let hold_count = count - 1;
+    let (left_count, right_count) = if hold_count == 0 {
+        (0, 0)
+    } else if count > 6 {
+        (3, 3)
+    } else {
+        let left = hold_count / 2;
+        (left, hold_count - left)
+    };
+
+    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
+    let small = 30.0;
+    let big = 60.0;
+    let pad = 12.0;
+    let center_x = 320.0;
+    let y = 425.0;
+
+    let draw_icon = |out: &mut Vec<UiVertex>, power: u8, x: f32, y: f32, size: f32| {
+        let (uv0, uv1) = icon_cell_uv(ICON_FORCE_BASE + usize::from(power));
+        textured_rect_with_source(
+            out,
+            x * sx,
+            y * sy,
+            size * sx,
+            size * sy,
+            uv0,
+            uv1,
+            [1.0; 4],
+            ICON_TEXTURE_SOURCE,
+            w,
+            h,
+        );
+    };
+
+    // Work backwards/forwards through forcePowerSorted[] with wrap, skipping
+    // powers ForcePower_Valid() rejects. This is the important JKA behaviour;
+    // neighbours are not simply clipped at either end of the sorted array.
+    let mut sorted_index = selected_sorted;
+    let mut hold_x = center_x - ((big * 0.5) + pad + small);
+    for _ in 0..left_count {
+        loop {
+            sorted_index = if sorted_index == 0 { FORCE_POWER_SORTED.len() - 1 } else { sorted_index - 1 };
+            let power = FORCE_POWER_SORTED[sorted_index];
+            if valid(power) {
+                draw_icon(out, power, hold_x, y, small);
+                hold_x -= small + pad;
+                break;
+            }
+        }
+    }
+
+    draw_icon(
+        out,
+        selector.selected,
+        center_x - big * 0.5,
+        y - (big - small) * 0.5,
+        big,
+    );
+
+    sorted_index = selected_sorted;
+    hold_x = center_x + big * 0.5 + pad;
+    for _ in 0..right_count {
+        loop {
+            sorted_index = (sorted_index + 1) % FORCE_POWER_SORTED.len();
+            let power = FORCE_POWER_SORTED[sorted_index];
+            if valid(power) {
+                draw_icon(out, power, hold_x, y, small);
+                hold_x += small + pad;
+                break;
+            }
+        }
+    }
+
+    let name = NAMES[usize::from(selector.selected)];
+    let text_y = 455.0 * sy;
+    if let Some(font) = small_font {
+        let scale = 0.55;
+        let x = ((640.0 - proportional_text_width(name, font, scale)) * 0.5) * sx;
+        proportional_text(out, name, font, x, text_y, scale, [1.0; 4], true, w, h);
+    } else {
+        let glyph_w = 8.0 * sx;
+        let glyph_h = 12.0 * sy;
+        let x = (w as f32 - name.len() as f32 * glyph_w) * 0.5;
+        fixed_charset_text(out, name, x, text_y, glyph_w, glyph_h, glyph_w, [1.0; 4], true, w, h);
+    }
+}
+
+/// Build the ordinary JKA crosshair at an optional framebuffer coordinate.
+/// The render thread uses this for dynamic crosshairs after late-latching.
+pub fn build_crosshair_vertices(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    screen_position: Option<[f32; 2]>,
+    w: u32,
+    h: u32,
+) {
+    if !gameplay_hud_visible(ui, w, h) {
+        return;
+    }
+    let mut crosshair = ui.crosshair;
+    if ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0 {
+        crosshair.style = CROSSHAIR_STYLE_LINE;
+        crosshair.image = 0;
+    }
+    build_crosshair(
+        out,
+        crosshair,
+        ui.crosshair_target.color,
+        screen_position,
+        ui.strafe_helper.line_width,
+        w,
+        h,
+    );
+}
+
 fn build_crosshair(
     out: &mut Vec<UiVertex>,
     crosshair: CrosshairSettings,
     target_color: Option<[f32; 3]>,
+    screen_position: Option<[f32; 2]>,
     line_width: f32,
     w: u32,
     h: u32,
@@ -5295,8 +6269,7 @@ fn build_crosshair(
         return;
     }
 
-    let cx = w as f32 * 0.5;
-    let cy = h as f32 * 0.5;
+    let [cx, cy] = screen_position.unwrap_or([w as f32 * 0.5, h as f32 * 0.5]);
     // Stock JKA's default is cg_crosshairSize 24, but the source artwork has
     // transparent padding. Scale procedural geometry by 2/3 so 24 retains the
     // apparent size of DinurdoJK's previous 16px crosshair.
@@ -5422,10 +6395,178 @@ fn build_crosshair(
     }
 }
 
+fn build_game_timer(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(label) = ui.game_timer.as_deref() else {
+        return;
+    };
+
+    // TaystJK CG_DrawUpperRight stacks cg_drawTimer after cg_drawFPS and uses
+    // the FPS text style when both are enabled. Our detailed FPS mode is a
+    // native diagnostics panel, so keep the timer in its header instead of
+    // letting the panel cover it. No millisecond variant is intentionally
+    // exposed: cg_drawTimer is just the classic M:SS readout here.
+    let scale = 1.55;
+    let glyph_w = 6.0 * scale;
+    let x = (w as f32 - 12.0 - label.chars().count() as f32 * glyph_w).max(12.0);
+    let y = if ui.video.draw_fps == 1 { 34.0 } else { 12.0 };
+    text(out, label, x + 1.0, y + 1.0, scale, [0.0, 0.0, 0.0, 0.72], w, h);
+    text(out, label, x, y, scale, [1.0; 4], w, h);
+}
+
+fn build_mini_scores(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    _small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    let Some(scores) = ui.mini_scores.as_ref() else { return };
+    let sx = w.max(1) as f32 / 640.0;
+    let sy = h.max(1) as f32 / 480.0;
+    // TaystJK uses cgs.widthRatioCoef for horizontally sized HUD pieces.
+    // `ratio * sx == sy`, so glyphs/boxes stay square on widescreen instead
+    // of stretching with the full 640x480 projection.
+    let ratio = crate::lagometer::width_ratio_coef(w, h);
+    let score_text = |score: Option<i32>| score.map_or_else(|| "-".to_owned(), |score| score.to_string());
+
+    match scores {
+        UiMiniScores::Team { mode, red, blue } if *mode == 1 || *mode == 2 => {
+            // CG_DrawMiniScoreboard: a single right-aligned line, 0.7 medium
+            // font. Mode 2 colours only the numeric team scores.
+            let red = score_text(*red);
+            let blue = score_text(*blue);
+            let label = if *mode == 2 {
+                format!("RED: ^1{red}^7 BLUE: ^4{blue}^7")
+            } else {
+                format!("RED: {red} BLUE: {blue}")
+            };
+            let scale = 1.25;
+            let text_w = visible_jka_chars(&label) as f32 * 6.0 * scale;
+            let x = (w as f32 - 10.0 - text_w).max(8.0);
+            // In Tayst this receives CG_DrawUpperRight's running y. Our upper
+            // right stack currently consists of FPS and the classic timer.
+            let rows = (ui.video.draw_fps != 0) as usize + ui.game_timer.is_some() as usize;
+            let y = 12.0 + rows as f32 * 22.0;
+            fixed_charset_text(
+                out, &label, x, y, 6.0 * scale, 8.0 * scale, 6.0 * scale,
+                [1.0; 4], true, w, h,
+            );
+        }
+        UiMiniScores::Team { mode: 3, red, blue } => {
+            // CG_DrawTeamHUD: equal-width blue-left/red-right boxes, centred
+            // standalone when cg_drawTimer != 7. This client currently exposes
+            // the classic timer only, so this is exactly that standalone path.
+            const BLUE: [f32; 4] = [0.02, 0.40, 0.65, 0.70];
+            const RED: [f32; 4] = [0.65, 0.01, 0.02, 0.70];
+            let blue = score_text(*blue);
+            let red = score_text(*red);
+            let glyph_w_v = 10.0 * ratio;
+            let glyph_h_v = 16.0;
+            let widest = visible_jka_chars(&blue).max(visible_jka_chars(&red)) as f32;
+            let box_w_v = widest * glyph_w_v + 10.0 * ratio;
+            let box_h_v = 20.0;
+            let y_v = 12.0;
+            let blue_x_v = 320.0 - box_w_v;
+            let red_x_v = 320.0;
+            rect(out, blue_x_v * sx, y_v * sy, box_w_v * sx, box_h_v * sy, BLUE, w, h);
+            rect(out, red_x_v * sx, y_v * sy, box_w_v * sx, box_h_v * sy, RED, w, h);
+
+            let draw_score = |out: &mut Vec<UiVertex>, value: &str, box_x_v: f32| {
+                let text_w_v = visible_jka_chars(value) as f32 * glyph_w_v;
+                let x = (box_x_v + (box_w_v - text_w_v) * 0.5) * sx;
+                let y = (y_v + (box_h_v - glyph_h_v) * 0.5) * sy;
+                fixed_charset_text(
+                    out, value, x, y, glyph_w_v * sx, glyph_h_v * sy, glyph_w_v * sx,
+                    [1.0; 4], true, w, h,
+                );
+            };
+            draw_score(out, &blue, blue_x_v);
+            draw_score(out, &red, red_x_v);
+        }
+        UiMiniScores::Duel { icon_paths, blue, red } => {
+            // CG_DrawDuelHUD: duelist1 is blue/left and duelist2 red/right,
+            // including each clientInfo modelIcon beside the equal score boxes.
+            const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 0.70];
+            const BLUE: [f32; 4] = [0.02, 0.40, 0.65, 0.70];
+            const RED: [f32; 4] = [0.65, 0.01, 0.02, 0.70];
+            const NAME: [f32; 4] = [0.60, 0.60, 0.60, 1.0];
+            let blue_score = score_text(blue.score);
+            let red_score = score_text(red.score);
+            let score_glyph_w_v = 14.0 * ratio;
+            let score_glyph_h_v = 22.0;
+            let widest = visible_jka_chars(&blue_score).max(visible_jka_chars(&red_score)) as f32;
+            let box_w_v = widest * score_glyph_w_v + 15.0 * ratio;
+            let box_h_v = 20.0;
+            let y_v = 8.0;
+            let blue_x_v = 320.0 - box_w_v;
+            let red_x_v = 320.0;
+            rect(out, blue_x_v * sx, y_v * sy, box_w_v * sx, box_h_v * sy, BLUE, w, h);
+            rect(out, red_x_v * sx, y_v * sy, box_w_v * sx, box_h_v * sy, RED, w, h);
+
+            // Tayst: iconHeight = background.h - 3, blue icon sits one
+            // virtual unit in from the left extension and red two units out.
+            let icon_w_v = box_h_v * ratio;
+            let icon_h_v = box_h_v - 3.0;
+            player_icon_atlas_cell(
+                out, icon_paths.len(), blue.model_icon,
+                (blue_x_v - icon_w_v + ratio) * sx, (y_v + 1.0) * sy,
+                (icon_w_v - 3.0 * ratio) * sx, icon_h_v * sy, w, h,
+            );
+            player_icon_atlas_cell(
+                out, icon_paths.len(), red.model_icon,
+                (red_x_v + box_w_v + 2.0 * ratio) * sx, (y_v + 1.0) * sy,
+                (icon_w_v - 3.0 * ratio) * sx, icon_h_v * sy, w, h,
+            );
+
+            let draw_score = |out: &mut Vec<UiVertex>, value: &str, box_x_v: f32| {
+                let text_w_v = visible_jka_chars(value) as f32 * score_glyph_w_v;
+                fixed_charset_text(
+                    out, value,
+                    (box_x_v + (box_w_v - text_w_v) * 0.5) * sx,
+                    (y_v - 2.0) * sy,
+                    score_glyph_w_v * sx, score_glyph_h_v * sy, score_glyph_w_v * sx,
+                    [1.0; 4], false, w, h,
+                );
+            };
+            draw_score(out, &blue_score, blue_x_v);
+            draw_score(out, &red_score, red_x_v);
+
+            let name_glyph_w_v = 5.0 * ratio;
+            let name_glyph_h_v = 8.0;
+            let name_h_v = name_glyph_h_v + 2.0;
+            // Tayst's strips include one model-icon-width outside each score box.
+            rect(
+                out, (blue_x_v - icon_w_v) * sx, (y_v + box_h_v) * sy,
+                (box_w_v + icon_w_v) * sx, name_h_v * sy, BLACK, w, h,
+            );
+            rect(
+                out, red_x_v * sx, (y_v + box_h_v) * sy,
+                (box_w_v + icon_w_v) * sx, name_h_v * sy, BLACK, w, h,
+            );
+            let blue_name_w_v = visible_jka_chars(&blue.name) as f32 * name_glyph_w_v;
+            fixed_charset_text(
+                out, &blue.name,
+                (blue_x_v + box_w_v - blue_name_w_v - ratio) * sx,
+                (y_v + box_h_v + 1.0) * sy,
+                name_glyph_w_v * sx, name_glyph_h_v * sy, name_glyph_w_v * sx,
+                NAME, false, w, h,
+            );
+            fixed_charset_text(
+                out, &red.name,
+                (red_x_v + ratio) * sx,
+                (y_v + box_h_v + 1.0) * sy,
+                name_glyph_w_v * sx, name_glyph_h_v * sy, name_glyph_w_v * sx,
+                NAME, false, w, h,
+            );
+        }
+        _ => {}
+    }
+}
+
 fn build_fps_simple(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let label = format!("{:.0} FPS", ui.perf.fps);
     let scale = 1.55;
-    let glyph_w = 8.0 * scale;
+    let glyph_w = 6.0 * scale;
     let x = (w as f32 - 12.0 - label.chars().count() as f32 * glyph_w).max(12.0);
     // Keep the simple FPS counter readable like the chat text, but with a
     // tight screen-space shadow instead of a resolution-scaled offset.
@@ -5897,12 +7038,10 @@ fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
 
     text(
         out,
-        if ui.video.input_subframe && ui.video.input_latelatch {
+        if ui.video.input_latelatch {
             "INPUT LATENCY (MOUSE)   SUBFRAME + LATE-LATCH"
-        } else if ui.video.input_subframe {
-            "INPUT LATENCY (MOUSE)   SUBFRAME EVENT-RATE"
         } else {
-            "INPUT LATENCY (MOUSE)   CLIENT-TICK"
+            "INPUT LATENCY (MOUSE)   SUBFRAME EVENT-RATE"
         },
         x + 12.0,
         next_y + 1.0,
@@ -6194,7 +7333,7 @@ pub fn console_text_hit(
 }
 
 fn visible_text_len(value: &str) -> usize {
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut index = 0usize;
     let mut count = 0usize;
     while index < bytes.len() {
@@ -6231,7 +7370,6 @@ const CON_FAINT: [f32; 4] = [0.32, 0.40, 0.52, 1.0];
 const SUGGEST_ROW_H: f32 = 20.0;
 const SUGGEST_MAX_ROWS: usize = 8;
 const SUGGEST_PAD: f32 = 6.0;
-const SUGGEST_DETAIL_H: f32 = 68.0;
 const SUGGEST_FOOTER_H: f32 = 22.0;
 
 fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
@@ -6420,15 +7558,32 @@ pub struct ConsoleSuggestGeometry {
     pub visible: usize,
 }
 
+pub fn console_suggest_detail_line_count(w: u32, h: u32, description: &str) -> usize {
+    let popup_w = (w as f32 - 24.0).clamp(240.0, 820.0);
+    let inner_chars = ((popup_w - 28.0) / CONSOLE_CHAR_WIDTH) as usize;
+    let natural = wrap_plain(description, inner_chars, usize::MAX).len().max(1);
+    // Keep at least one suggestion row and the footer on-screen. Only descriptions
+    // taller than the entire framebuffer are forced to truncate.
+    let fixed = SUGGEST_PAD + SUGGEST_ROW_H + SUGGEST_FOOTER_H + 28.0;
+    let fit = (((h as f32 - fixed).max(18.0)) / 18.0).floor() as usize;
+    natural.min(fit.max(1))
+}
+
 pub fn console_suggest_geometry(
     w: u32,
     h: u32,
     size: ConsoleSize,
     count: usize,
     selected: usize,
+    detail_lines: usize,
 ) -> ConsoleSuggestGeometry {
-    let visible = count.clamp(1, SUGGEST_MAX_ROWS);
-    let total_h = SUGGEST_PAD + visible as f32 * SUGGEST_ROW_H + SUGGEST_DETAIL_H + SUGGEST_FOOTER_H;
+    let detail_h = 28.0 + detail_lines.max(1) as f32 * 18.0;
+    let max_rows_fit = (((h as f32 - SUGGEST_PAD - detail_h - SUGGEST_FOOTER_H - 8.0)
+        / SUGGEST_ROW_H)
+        .floor()
+        .max(1.0)) as usize;
+    let visible = count.clamp(1, SUGGEST_MAX_ROWS.min(max_rows_fit));
+    let total_h = SUGGEST_PAD + visible as f32 * SUGGEST_ROW_H + detail_h + SUGGEST_FOOTER_H;
     let ph = console_panel_height(h, size);
     let input_y = ph - 34.0;
     // Hang below the panel like a drop-down when there is room, otherwise
@@ -6457,13 +7612,14 @@ pub fn console_suggest_hit(
     size: ConsoleSize,
     count: usize,
     selected: usize,
+    detail_lines: usize,
     x: f64,
     y: f64,
 ) -> Option<usize> {
     if count == 0 {
         return None;
     }
-    let g = console_suggest_geometry(w, h, size, count, selected);
+    let g = console_suggest_geometry(w, h, size, count, selected, detail_lines);
     let rows_y = (g.y + SUGGEST_PAD) as f64;
     if x < g.x as f64 || x >= (g.x + g.w) as f64 || y < rows_y {
         return None;
@@ -6885,7 +8041,9 @@ fn build_console_suggestions(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h
     let count = ui.console_suggestions.len();
     let selected = ui.console_suggest_selected.min(count - 1);
     let hint = ui.console_suggest_hint;
-    let g = console_suggest_geometry(w, h, ui.console_size, count, selected);
+    let description = ui.console_suggestions.get(selected).map_or("", |item| item.description);
+    let detail_lines = console_suggest_detail_line_count(w, h, description);
+    let g = console_suggest_geometry(w, h, ui.console_size, count, selected, detail_lines);
     let (x, y, pw) = (g.x, g.y, g.w);
     let inner_chars = ((pw - 28.0) / CONSOLE_CHAR_WIDTH) as usize;
 
@@ -6979,11 +8137,11 @@ fn build_console_suggestions(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h
     let detail_y = rows_y + g.visible as f32 * SUGGEST_ROW_H + 2.0;
     rect(out, x + 10.0, detail_y, pw - 20.0, 1.0, with_alpha(CON_CYAN, 0.16), w, h);
     if let Some(item) = ui.console_suggestions.get(selected) {
-        let lines = wrap_plain(item.description, inner_chars, 2);
+        let lines = wrap_plain(item.description, inner_chars, detail_lines);
         for (i, line) in lines.iter().enumerate() {
             console_plain(out, line, x + 14.0, detail_y + 6.0 + i as f32 * 18.0, CON_TEXT, w, h);
         }
-        let meta_y = detail_y + 6.0 + 2.0 * 18.0 + 3.0;
+        let meta_y = detail_y + 6.0 + lines.len().max(1) as f32 * 18.0 + 3.0;
         let mut mx = x + 14.0;
         let mut meta = |label: &str, value: &str, color: [f32; 4], out: &mut Vec<UiVertex>| {
             if value.is_empty() || mx > x + pw - 40.0 {
@@ -7047,7 +8205,7 @@ fn text(
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -7084,8 +8242,8 @@ fn text(
     }
 }
 
-fn proportional_text_width(value: impl AsRef<[u8]>, font: &ProportionalFont, scale: f32) -> f32 {
-    let bytes = value.as_ref();
+fn proportional_text_width(value: &str, font: &ProportionalFont, scale: f32) -> f32 {
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut width = 0.0f32;
     let mut index = 0usize;
     while index < bytes.len() {
@@ -7111,11 +8269,11 @@ fn wrap_proportional_text(
     scale: f32,
     max_width: f32,
 ) -> String {
-    if proportional_text_width(value, font, 1.0) <= max_width {
+    if proportional_text_width(value, font, scale) <= max_width {
         return value.to_owned();
     }
 
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut out = String::with_capacity(value.len() + value.len() / 32);
     let mut line_width = 0.0f32;
     let mut line_start = 0usize;
@@ -7170,7 +8328,7 @@ fn wrap_proportional_text(
 #[allow(clippy::too_many_arguments)]
 fn proportional_text(
     out: &mut Vec<UiVertex>,
-    value: impl AsRef<[u8]>,
+    value: &str,
     font: &ProportionalFont,
     x: f32,
     baseline_y: f32,
@@ -7188,7 +8346,7 @@ fn proportional_text(
         let mut cursor_x = x;
         let mut cursor_y = baseline_y;
         let mut active_color = color;
-        let bytes = value.as_ref();
+        let bytes = crate::cgame::text_to_jka_bytes(value);
         let mut index = 0usize;
         while index < bytes.len() {
             let byte = bytes[index];
@@ -7246,6 +8404,79 @@ fn proportional_text(
     draw_pass(out, false);
 }
 
+/// Append one projected `cg_drawPlayerNames` label. `x`/`y` are physical
+/// framebuffer coordinates produced from the final render camera.
+pub fn build_world_player_label_vertices(
+    out: &mut Vec<UiVertex>,
+    label: &UiWorldPlayerLabel,
+    x: f32,
+    y: f32,
+    scale: f32,
+    font: Option<&ProportionalFont>,
+    width: u32,
+    height: u32,
+) {
+    let sx = width.max(1) as f32 / 640.0;
+    let sy = height.max(1) as f32 / 480.0;
+    let scale = scale.clamp(0.05, 4.0);
+
+    if let Some(font) = font {
+        // Most player labels are one line, but race-ghost comparison labels can
+        // add a second stats line. Center each line independently instead of
+        // letting the generic text drawer inherit the first line's x origin.
+        let line_step = 20.0 * scale * sy;
+        for (line, text) in label.text.split('\n').enumerate() {
+            let text_width = proportional_text_width(text, font, scale) * sx;
+            proportional_text(
+                out,
+                text,
+                font,
+                x - text_width * 0.5,
+                y + line as f32 * line_step,
+                scale,
+                [1.0, 1.0, 1.0, 1.0],
+                true,
+                width,
+                height,
+            );
+        }
+    } else {
+        // Startup/font-load fallback. The ordinary renderer normally has the
+        // proportional JKA font by the time a game snapshot can exist.
+        let fallback_scale = (1.25 * scale).max(0.25);
+        for (line, value) in label.text.split('\n').enumerate() {
+            let visible = crate::cgame::text_to_jka_bytes(value)
+                .iter()
+                .filter(|&&c| c != b'^')
+                .count() as f32;
+            text(
+                out,
+                value,
+                x - visible * 3.0 * fallback_scale,
+                y - 4.0 * fallback_scale + line as f32 * 12.0 * fallback_scale,
+                fallback_scale,
+                [1.0, 1.0, 1.0, 1.0],
+                width,
+                height,
+            );
+        }
+    }
+
+    let Some(fraction) = label.health_fraction else { return };
+    // TaystJK HEALTH_WIDTH/HEIGHT are 50x5 virtual pixels. Keep the same
+    // authored size and alpha, but render it at native framebuffer resolution.
+    let bar_w = 50.0 * sx;
+    let bar_h = 5.0 * sy;
+    let border = 1.0_f32.max(sx.min(sy));
+    let bar_x = x - bar_w * 0.5;
+    let bar_y = y - 7.0 * sy;
+    rect(out, bar_x - border, bar_y - border, bar_w + border * 2.0, bar_h + border * 2.0,
+        [0.0, 0.0, 0.0, 0.75], width, height);
+    rect(out, bar_x, bar_y, bar_w, bar_h, [0.5, 0.5, 0.5, 0.4], width, height);
+    rect(out, bar_x, bar_y, bar_w * fraction.clamp(0.0, 1.0), bar_h,
+        label.health_color, width, height);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fixed_charset_text(
     out: &mut Vec<UiVertex>,
@@ -7263,7 +8494,7 @@ fn fixed_charset_text(
     if shadow {
         let mut cursor_x = x + 2.0;
         let mut cursor_y = y + 2.0;
-        let bytes = value.as_bytes();
+        let bytes = crate::cgame::text_to_jka_bytes(value);
         let mut index = 0usize;
         while index < bytes.len() {
             let byte = bytes[index];
@@ -7301,7 +8532,7 @@ fn fixed_charset_text(
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -7349,7 +8580,7 @@ fn console_text(
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
-    let bytes = value.as_bytes();
+    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -7860,7 +9091,7 @@ mod crosshair_tests {
         let (width, height) = (1280_u32, 720_u32);
         let mut vertices = Vec::new();
         let crosshair = CrosshairSettings { style: 1, image: 3, size: 32.0, ..CrosshairSettings::default() };
-        build_crosshair(&mut vertices, crosshair, None, 1.0, width, height);
+        build_crosshair(&mut vertices, crosshair, None, None, 1.0, width, height);
         assert_eq!(vertices.len(), 6);
         assert!(vertices.iter().all(|vertex| vertex.textured == ICON_TEXTURE_SOURCE));
 
@@ -7881,7 +9112,7 @@ mod crosshair_tests {
         for image in [0, CROSSHAIR_IMAGE_COUNT + 1] {
             let mut vertices = Vec::new();
             let crosshair = CrosshairSettings { style: 2, image, ..CrosshairSettings::default() };
-            build_crosshair(&mut vertices, crosshair, None, 1.0, 1280, 720);
+            build_crosshair(&mut vertices, crosshair, None, None, 1.0, 1280, 720);
             assert!(vertices.iter().all(|vertex| vertex.textured == 0.0));
             assert_eq!(vertices.len(), 16 * 3);
         }
@@ -7892,7 +9123,7 @@ mod crosshair_tests {
         let (width, height) = (1280_u32, 960_u32);
         let mut vertices = Vec::new();
         let crosshair = CrosshairSettings { style: CROSSHAIR_STYLE_LINE, size: 24.0, ..CrosshairSettings::default() };
-        build_crosshair(&mut vertices, crosshair, None, 2.0, width, height);
+        build_crosshair(&mut vertices, crosshair, None, None, 2.0, width, height);
         assert_eq!(vertices.len(), 6);
         let [min_x, min_y, max_x, max_y] = pixel_bounds(&vertices, width, height);
         // 2 units wide at 2 px per unit; 1.25x the plus (24 * 2/3 = 16 px) tall.
@@ -7903,7 +9134,7 @@ mod crosshair_tests {
 
         // The width follows jaPRO's 0.25..=5 clamp.
         let mut thick = Vec::new();
-        build_crosshair(&mut thick, crosshair, None, 50.0, width, height);
+        build_crosshair(&mut thick, crosshair, None, None, 50.0, width, height);
         let [min_x, _, max_x, _] = pixel_bounds(&thick, width, height);
         assert!((max_x - min_x - 10.0).abs() < 0.01);
     }

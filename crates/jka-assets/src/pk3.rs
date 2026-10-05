@@ -267,6 +267,13 @@ impl AssetSearchPath {
         self.shared.entries.iter().map(|entry| entry.key.as_str())
     }
 
+    /// Fast indexed existence check for an exact virtual qpath. This mirrors
+    /// BG_FileExists-style lookups without opening the asset.
+    pub fn contains_qpath(&self, name: &str) -> bool {
+        validate_asset_name(name).is_ok()
+            && self.shared.find(&normalize_asset_name(name)).is_some()
+    }
+
     /// Control whether ordinary VFS reads may shadow qpaths present in the
     /// retail JKA `assets0.pk3` through `assets3.pk3` archives. This does not
     /// affect [`Self::read_from_source`], because an active material explicitly

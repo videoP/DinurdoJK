@@ -1,6 +1,15 @@
 //! Local RT light receivers for the existing transient model geometry stream.
 use super::*;
 
+struct CompiledRtModelReceivers {
+    key: (wgpu::TextureFormat, u32, bool, bool),
+    lights_layout: wgpu::BindGroupLayout,
+    opaque: wgpu::RenderPipeline,
+    mask: wgpu::RenderPipeline,
+    blend: wgpu::RenderPipeline,
+    mask_blend: wgpu::RenderPipeline,
+}
+
 pub(super) struct RtModelReceivers {
     pub key: (wgpu::TextureFormat, u32, bool, bool),
     pub lights: wgpu::BindGroup,
@@ -15,38 +24,97 @@ impl Renderer {
         if self.dynamic_lights_mode != DynamicLightsMode::RayTracedHardware || !self.hardware_rt_active() {
             return;
         }
-        let key = (self.scene_format(), self.msaa_samples,
-            self.dynamic_model_renderer.legacy_fog_compiled, self.map_light_simulation_active());
-        let Some(rt) = self.ray_traced_shadows.as_mut() else { return };
-        if rt.model_receivers.as_ref().is_some_and(|models| models.key == key) { return; }
-        let Some(world) = self.world.as_ref() else { return };
-        let lights_layout = light_layout(&self.device);
-        let lights = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("RT model local lights"), layout: &lights_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: world.light_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: world._cluster_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.lighting_settings_buffer.as_entire_binding() },
-            ],
-        });
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("RT model receiver layout"),
-            bind_group_layouts: &[Some(&self.camera_layout), Some(&self.dynamic_model_renderer.texture_layout),
-                Some(&lights_layout), Some(&rt.receiver_layout)],
-            immediate_size: 0,
-        });
-        let source = model_shader_source(key.3).expect("RT model shader anchors");
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RT model receivers"), source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let pipeline = |alpha| create_dynamic_model_pipeline_inner(
-            &self.device, &layout, &shader, key.0, key.1, alpha, key.2, true);
-        rt.model_receivers = Some(RtModelReceivers {
-            key, lights,
-            opaque: pipeline(DynamicModelAlphaMode::Opaque),
-            mask: pipeline(DynamicModelAlphaMode::Mask),
-            blend: pipeline(DynamicModelAlphaMode::Blend),
-            mask_blend: pipeline(DynamicModelAlphaMode::MaskBlend),
+        let key = (
+            self.scene_format(),
+            self.msaa_samples,
+            self.dynamic_model_renderer.legacy_fog_compiled,
+            self.map_light_simulation_active(),
+        );
+        if self
+            .ray_traced_shadows
+            .as_ref()
+            .and_then(|rt| rt.model_receivers.as_ref())
+            .is_some_and(|models| models.key == key)
+        {
+            return;
+        }
+        let Some(rt) = self.ray_traced_shadows.as_ref() else { return };
+        if self.world.is_none() {
+            return;
+        }
+
+        let job_key = PipelineJobKey::new("rt-model-receivers", 0, pipeline_hash(&key));
+        if let Some(compiled) = self
+            .pipeline_jobs
+            .take_ready::<CompiledRtModelReceivers>(job_key)
+        {
+            // Bind groups carry map-owned light buffers, so build this cheap piece
+            // on the render thread at install time. A worker result can therefore
+            // survive a map transition without retaining or rebinding stale buffers.
+            let Some(world) = self.world.as_ref() else { return };
+            let lights = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RT model local lights"),
+                layout: &compiled.lights_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: world.light_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: world._cluster_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.lighting_settings_buffer.as_entire_binding() },
+                ],
+            });
+            if let Some(rt) = self.ray_traced_shadows.as_mut() {
+                rt.model_receivers = Some(RtModelReceivers {
+                    key: compiled.key,
+                    lights,
+                    opaque: compiled.opaque,
+                    mask: compiled.mask,
+                    blend: compiled.blend,
+                    mask_blend: compiled.mask_blend,
+                });
+            }
+            return;
+        }
+
+        let device = self.device.clone();
+        let camera_layout = self.camera_layout.clone();
+        let texture_layout = self.dynamic_model_renderer.texture_layout.clone();
+        let receiver_layout = rt.receiver_layout.clone();
+        self.pipeline_jobs.request(job_key, "RT dynamic-model receiver pipelines", move || {
+            let lights_layout = light_layout(&device);
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("RT model receiver layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&texture_layout),
+                    Some(&lights_layout),
+                    Some(&receiver_layout),
+                ],
+                immediate_size: 0,
+            });
+            let source = model_shader_source(key.3).expect("RT model shader anchors");
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("RT model receivers"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let pipeline = |alpha| {
+                create_dynamic_model_pipeline_inner(
+                    &device,
+                    &layout,
+                    &shader,
+                    key.0,
+                    key.1,
+                    alpha,
+                    key.2,
+                    true,
+                )
+            };
+            CompiledRtModelReceivers {
+                key,
+                lights_layout,
+                opaque: pipeline(DynamicModelAlphaMode::Opaque),
+                mask: pipeline(DynamicModelAlphaMode::Mask),
+                blend: pipeline(DynamicModelAlphaMode::Blend),
+                mask_blend: pipeline(DynamicModelAlphaMode::MaskBlend),
+            }
         });
     }
 }

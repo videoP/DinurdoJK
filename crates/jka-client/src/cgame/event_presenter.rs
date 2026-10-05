@@ -269,6 +269,22 @@ impl ViewKick {
         self.step_time = time;
     }
 
+    /// `CG_CalculateWeaponPosition` landing-only weapon drop. OpenJK applies
+    /// exactly one quarter of cg.landChange and does not include stair smoothing.
+    pub fn weapon_land_offset(&self, time: i32) -> f32 {
+        let delta = time - self.land_time;
+        if (0..LAND_DEFLECT_TIME).contains(&delta) {
+            self.land_change * 0.25 * delta as f32 / LAND_DEFLECT_TIME as f32
+        } else if (LAND_DEFLECT_TIME..LAND_DEFLECT_TIME + LAND_RETURN_TIME).contains(&delta) {
+            self.land_change
+                * 0.25
+                * (LAND_DEFLECT_TIME + LAND_RETURN_TIME - delta) as f32
+                / LAND_RETURN_TIME as f32
+        } else {
+            0.0
+        }
+    }
+
     /// Vertical eye offset at `time` (CG_OffsetFirstPersonView / CG_StepOffset).
     /// The landing dip is a first-person-only effect; step smoothing also
     /// applies to the third-person camera.
@@ -424,6 +440,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
                     _ => [0.0, 1.0],
                 },
                 color: [flash.color[0], flash.color[1], flash.color[2], alpha * 0.55],
+                depth_hack: 0.0,
             });
         }
         indices.extend_from_slice(&[

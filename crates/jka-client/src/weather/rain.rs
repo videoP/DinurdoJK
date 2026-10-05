@@ -1,5 +1,6 @@
 use crate::{
     camera::Camera,
+    pipeline_jobs::{hash_config as pipeline_hash, PipelineJobKey, PipelineJobManager},
     scene::WeatherOcclusionSource,
     ui::{PuddleQuality, RainIntensity},
 };
@@ -323,24 +324,42 @@ impl RainSystem {
         self.gpu.splash_pipeline = None;
     }
 
-    pub(crate) fn ensure_render_pipelines(&mut self, device: &wgpu::Device) {
-        if self.gpu.drop_pipeline.is_some() && self.gpu.splash_pipeline.is_some() {
-            return;
+    pub(crate) fn ensure_render_pipelines(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+    ) {
+        let config = pipeline_hash(&(self.gpu.render_format, self.gpu.render_samples));
+        if self.gpu.drop_pipeline.is_none() {
+            let key = PipelineJobKey::new("rain", 0, config);
+            if let Some(pipeline) = jobs.take_ready(key) {
+                self.gpu.drop_pipeline = Some(pipeline);
+            } else {
+                let device = device.clone();
+                let layout = self.gpu.render_pipeline_layout.clone();
+                let shader = self.gpu.render_shader.clone();
+                let format = self.gpu.render_format;
+                let samples = self.gpu.render_samples;
+                jobs.request(key, "rain drops", move || {
+                    create_rain_drop_pipeline(&device, &layout, &shader, format, samples)
+                });
+            }
         }
-        self.gpu.drop_pipeline = Some(create_rain_drop_pipeline(
-            device,
-            &self.gpu.render_pipeline_layout,
-            &self.gpu.render_shader,
-            self.gpu.render_format,
-            self.gpu.render_samples,
-        ));
-        self.gpu.splash_pipeline = Some(create_rain_splash_pipeline(
-            device,
-            &self.gpu.render_pipeline_layout,
-            &self.gpu.render_shader,
-            self.gpu.render_format,
-            self.gpu.render_samples,
-        ));
+        if self.gpu.splash_pipeline.is_none() {
+            let key = PipelineJobKey::new("rain", 1, config);
+            if let Some(pipeline) = jobs.take_ready(key) {
+                self.gpu.splash_pipeline = Some(pipeline);
+            } else {
+                let device = device.clone();
+                let layout = self.gpu.render_pipeline_layout.clone();
+                let shader = self.gpu.render_shader.clone();
+                let format = self.gpu.render_format;
+                let samples = self.gpu.render_samples;
+                jobs.request(key, "rain splashes", move || {
+                    create_rain_splash_pipeline(&device, &layout, &shader, format, samples)
+                });
+            }
+        }
     }
 
     pub(crate) fn collision_view(&self) -> &wgpu::TextureView {
@@ -568,7 +587,7 @@ impl RainSystem {
             },
         };
         let Some(built) = built else {
-            println!("Weather occlusion: no usable static BSP solid footprint");
+            rverbose!(1, "Weather occlusion: no usable static BSP solid footprint");
             return None;
         };
         let basin_cells = built.surface_field.iter().filter(|cell| cell[3] > 0.01).count();
@@ -600,7 +619,8 @@ impl RainSystem {
         self.gpu.collision_view = view;
         self.cpu_field = Some(CpuField::new(built.info, built.surface_field));
         self.occlusion = WeatherOcclusionCache::Ready(built.info);
-        println!(
+        rverbose!(
+            1,
             "Weather surface field: background CPU solve {}x{} from {} BSP brush(es), {} blocker triangle(s), {} rendered topography triangle(s); {}/{} top-visible topography texels are puddle basins, {} are large flat ground for scattered puddles; CPU {:.1} ms",
             built.info.width, built.info.height, built.brush_count, built.triangle_count,
             built.topography_triangle_count, basin_cells, topography_cells, scatter_cells, built.build_ms,

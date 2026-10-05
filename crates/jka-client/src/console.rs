@@ -68,6 +68,29 @@ const fn command(name: &'static str, description: &'static str) -> Entry {
     }
 }
 
+/// Return the cvar's declared discrete integer choices. Pipe-delimited ranges
+/// are explicit choice lists (`0|1|2`, `30|60|120|240`). A plain `0..1` is
+/// also a two-choice boolean declaration so legacy `toggle <bool-cvar>` binds
+/// remain useful. Wider numeric ranges are scalar domains, not option lists.
+pub fn declared_integer_options(entry: &Entry) -> Option<Vec<String>> {
+    let range = entry.range.trim();
+    if range == "0..1" {
+        return Some(vec!["0".to_owned(), "1".to_owned()]);
+    }
+    if !range.contains('|') {
+        return None;
+    }
+    let mut values = Vec::new();
+    for part in range.split('|') {
+        let token = part.trim().split_whitespace().next().unwrap_or("");
+        if token.parse::<i64>().is_err() {
+            return None;
+        }
+        values.push(token.to_owned());
+    }
+    (values.len() >= 2).then_some(values)
+}
+
 pub const ENTRIES: &[Entry] = &[
     cvar("cp_pluginDisable", "1536", "0..2147483647", "JAPRO preference bitfield; also available in the Mod menu."),
     cvar(
@@ -81,6 +104,12 @@ pub const ENTRIES: &[Entry] = &[
         "1",
         "0|1|2",
         "FPS overlay: 0 off, 1 simple FPS, 2 detailed diagnostics.",
+    ),
+    cvar(
+        "cg_drawTimer",
+        "0",
+        "0|1",
+        "TaystJK/OpenJK match timer: elapsed time since level start as M:SS.",
     ),
     cvar(
         "cg_debugEvents",
@@ -133,6 +162,12 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cl_chatBubbleSelf", "1", "0..1", "jaPRO: show your own chat balloon to others while the console, chat or a menu has the keyboard."),
     cvar("cl_chatBubbleUnfocused", "1", "0..1", "jaPRO: also show the chat balloon while the game window is unfocused."),
     cvar(
+        "cg_dynamicCrosshair",
+        "1",
+        "0|1|2",
+        "TaystJK dynamic crosshair: 0 static screen-center trace, 1 always trace from the weapon/player muzzle, 2 use the dynamic trace except for the original melee/saber/racemode/strafehelper static overrides.",
+    ),
+    cvar(
         "cg_crosshairIdentifyTarget",
         "1",
         "0..1",
@@ -151,12 +186,24 @@ pub const ENTRIES: &[Entry] = &[
         "jaPRO: 1 draws the name with its own colour codes; 0 strips them and colours it red/green by friend or foe.",
     ),
     cvar("cg_drawCrosshairNamesOpacity", "1", "0..1", "jaPRO: opacity of the crosshair name."),
+    cvar(
+        "cg_drawPlayerNames",
+        "0",
+        "0..2",
+        "TaystJK: draw unobstructed player names above players. 0 off, 1 names, 2 names plus health bars.",
+    ),
+    cvar(
+        "cg_drawPlayerNamesScale",
+        "0.5",
+        "0.05..4",
+        "TaystJK: scale of world-space player-name labels.",
+    ),
     cvar("cg_movementKeys", "0", "0..4", "TaystJK movement-key HUD mode: 0 off, 1 original, 2 +attack, 3 compact centered, 4 compact movable."),
     cvar("cg_movementKeysX", "0", "float", "TaystJK movement-key HUD horizontal offset."),
     cvar("cg_movementKeysY", "0", "float", "TaystJK movement-key HUD vertical offset."),
     cvar("cg_movementKeysSize", "1", "0.25..4", "TaystJK movement-key HUD scale."),
     cvar("cg_movementKeysWalk", "0", "0|1", "Show the walk/run key in the movement-key HUD."),
-    cvar("cg_strafeHelper", "3008", "bitmask", "TaystJK Strafehelper style/direction bitmask."),
+    cvar("cg_strafeHelper", "3008", "bitmask", "TaystJK Strafehelper style/direction bitmask, plus DinurdoJK Cinematic world-space style bit 2097152."),
     cvar("cg_strafeHelper_FPS", "0", "0..1000", "Strafehelper physics FPS override; 0 follows com_maxfps, then falls back to 125 when uncapped."),
     cvar("cg_strafeHelperOffset", "75", "float", "TaystJK Strafehelper angular offset in hundredths of a degree."),
     cvar("cg_strafeHelperLineWidth", "1", "0.25..5", "Strafehelper line width."),
@@ -164,6 +211,18 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cg_strafeHelperCutoff", "0", "0..480", "Strafehelper line cutoff."),
     cvar("cg_strafeHelperActiveColor", "0 255 0 200", "R G B A", "TaystJK active Strafehelper line color."),
     cvar("cg_strafeHelperInactiveAlpha", "200", "0..255", "TaystJK inactive Strafehelper line alpha."),
+    cvar("cg_strafeTrailRadius", "2", "0.1..100", "jaPRO strafe-trail line diameter."),
+    cvar("cg_strafeTrailLife", "5", "0.1..3600 seconds", "jaPRO lifetime for live /strafeTrail player traces."),
+    cvar("cg_strafeTrailFPS", "40", "1..1000", "jaPRO SV_FPS metadata for recorded trails (used by legacy plum spacing)."),
+    cvar("cg_strafeTrailPlums", "0", "0|1", "jaPRO whole-second number markers on loaded strafe trails."),
+    cvar("cg_strafeTrailGhost", "1", "0|1", "Draw strafe trails translucently."),
+    cvar("cg_strafeTrailPlayers", "0", "32-bit mask", "jaPRO live-player strafe-trail bitmask; configure with /strafeTrail."),
+    cvar("cg_logStrafeTrail", "0", "0 or trail name", "Record your active jaPRO race run to strafetrails/<name>.cfg on a background writer."),
+    cvar("cg_strafeTrailDistance", "16384", "256..131072", "DinurdoJK draw-distance cull for loaded/live strafe trails."),
+    command("loadTrail", "Load a jaPRO strafetrails/<name>.cfg asynchronously: /loadTrail <name> [slot]."),
+    command("clearTrail", "Clear existing trail geometry by client/color slot; -1 clears all."),
+    command("strafeTrail", "List/toggle live player trail tracing: /strafeTrail [client|-1]."),
+    command("trailMenu", "Open the Strafe Trails GUI."),
     cvar(
         "cg_hudHealth",
         "bl 24 -58 1",
@@ -201,6 +260,7 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cg_hudSpeedometerJumps", "tl 0 0 1", "anchor x y scale", "Speedometer pre-speed jumps array offset/scale (HUD Edit Mode)."),
     cvar("cg_hudSpeedGraph", "tl 0 0 1", "anchor x y scale", "Speedometer speed graph offset/scale (HUD Edit Mode)."),
     cvar("cg_hudRaceStart", "tl 0 0 1", "anchor x y scale", "Race start-speed readout offset/scale (HUD Edit Mode)."),
+    cvar("cg_hudLagometer", "tl 0 0 1", "anchor x y scale", "Lagometer graph/numbers offset/scale (HUD Edit Mode)."),
     cvar(
         "cg_hudSnap",
         "1",
@@ -237,7 +297,8 @@ pub const ENTRIES: &[Entry] = &[
     ),
     cvar("con_timestamps", "1", "0..1", "Prefix console lines with local HH:MM:SS timestamps."),
     cvar("con_suggest", "1", "0..1", "Live command/cvar filter while typing in the console: Up/Down pick, Tab completes, Esc dismisses."),
-    cvar("cg_chatboxCompletion", "1", "0..1", "JAPP: Tab in the chat input completes a player name (substring match, colours ignored); several matches are listed instead."),
+    cvar("cg_chatboxCompletion", "1", "0..1", "JAPP: Tab in the chat input completes a player name (colours ignored); repeated Tab cycles ranked matches, preferring exact and prefix matches."),
+    cvar("cl_chatLog", "1", "0..1", "Save live server chat sessions as self-contained HTML under the active fs_game/chatlogs directory. File I/O runs on a dedicated worker thread."),
     cvar("ui_vgs", "1", "0=off, nonzero=on", "TaystJK: use the jaPRO VGS canned-voice menu."),
     cvar("cg_screenShake", "1", "0..2", "Camera shake: 1 effect-driven (explosions, creature efx), 2 also the kick of firing rockets, repeater alt, flechette, bryar/demp2 alt and bowcaster. Server-triggered shake events are not affected, as in OpenJK."),
     cvar("r_jumpHeightShade", "1", "0..1", "jaPRO SP physics: tint flat surfaces by jump height while airborne (green = ideal landing, red = deeper, blue = reachable above the jump line)."),
@@ -268,6 +329,16 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cg_killSounds", "2", "0..2", "jaPRO frag sound when you kill: 1 always, 2 with a mid-air variant (needs the jaPRO sound/frag assets)."),
     cvar("cg_killMessage", "1", "0..3", "TaystJK kill center-print: 0 off, 1 normal with FFA place/score, 2 kill only, 3 higher on screen."),
     cvar("cg_drawRewards", "1", "0..2", "TaystJK/JKA award medals: 0 off, 1 JKA voice/medals, 2 Quake 3 variants where available."),
+    cvar("cg_drawTeamOverlay", "0", "0..6", "TaystJK team overlay: 0 off; 1/2 classic, 3/4 alternate, 5/6 compact scalable; even modes omit your own row."),
+    cvar("teamoverlay", "0", "read-only", "Server tinfo request bit mirrored automatically from cg_drawTeamOverlay (CVAR_USERINFO)."),
+    cvar("cg_drawTeamOverlayX", "640", "integer", "Horizontal anchor for the TaystJK team overlay."),
+    cvar("cg_drawTeamOverlayY", "0", "integer", "Vertical anchor for the TaystJK team overlay."),
+    cvar("cg_drawTeamOverlayWeapons", "0", "0..1", "Show teammate weapon icons in cg_drawTeamOverlay."),
+    cvar("cg_drawTeamOverlayScale", "1.0", "0.5..2.5", "Scale for cg_drawTeamOverlay modes 5/6."),
+    cvar("cg_drawTeamOverlayMaxHP", "150", ">=1", "Health-bar reference maximum for cg_drawTeamOverlay modes 5/6."),
+    cvar("cg_drawTeamOverlayForce", "1", "0..1", "Show the jaPRO force-power column/bar in cg_drawTeamOverlay when the server provides it."),
+    cvar("cg_scoreDeaths", "1", "0..3", "TaystJK scoreboard deaths: 0 off, 1 server data, 2 local fallback, 3 local count."),
+    cvar("cg_drawScores", "1", "0..3", "TaystJK score HUD: 0 off; 1 classic team scores; 2 classic with red/blue score colours; 3 centred team boxes (and duel HUD in GT_DUEL)."),
     cvar("cg_hitsounds", "0", "0..6", "jaPRO hit feedback: 1-4 pick a hit sound (needs the jaPRO sound/effects/hitsound assets), 5 plain saber hit, 6 any saber hit variant."),
     command("soundinfo", "Show active output format, device buffer, voice count and pre-limiter overload diagnostics."),
     cvar("cg_thirdPerson", "0", "0..1", "OpenJK third-person view toggle."),
@@ -284,10 +355,28 @@ pub const ENTRIES: &[Entry] = &[
         "OpenJK saber swing trail: 0 off, 1 normal authored saberBlur trail, 2 legacy special/high-frequency mode.",
     ),
     cvar(
+        "cg_saberTeamColors",
+        "1",
+        "0..1",
+        "TaystJK team saber colors: force red-team sabers red and blue-team sabers blue outside Siege/Jedi-vs-Merc.",
+    ),
+    cvar(
+        "cg_saberStaffMultiColor",
+        "0",
+        "0..1",
+        "TaystJK staff-saber option: use the secondary saber color for primary-saber blades after blade 0.",
+    ),
+    cvar(
         "cg_fxFPS",
         "90",
         "0 or 15..250",
         "Continuous projectile/trail EFX sampling rate. 0 restores legacy JKA presentation-frame-driven density.",
+    ),
+    cvar(
+        "cg_fxFPSScope",
+        "0",
+        "0..1",
+        "Which render-frame-driven effects cg_fxFPS resamples: 0 continuous projectile/trail EFX only, 1 also eligible stock frame-driven effects such as saber/world sparks and wall marks.",
     ),
     cvar(
         "fx_physics",
@@ -319,36 +408,6 @@ pub const ENTRIES: &[Entry] = &[
         "0..1",
         "Stock OpenJK EFX count scale: multiplies authored count ranges wider than 1. Never scales upward; every primitive keeps at least one spawn.",
     ),
-    cvar(
-        "cg_smoothPlayerOrigin",
-        "1",
-        "0..1",
-        "Interpolate the local player model origin between fixed pmove ticks.",
-    ),
-    cvar(
-        "cg_smoothThirdPersonOrigin",
-        "1",
-        "0..1",
-        "Interpolate the third-person camera target origin between fixed pmove ticks.",
-    ),
-    cvar(
-        "cg_smoothPlayerAnimation",
-        "1",
-        "0..1",
-        "Drive local Ghoul2 animation/angle presentation from continuous presentation time.",
-    ),
-    cvar(
-        "cg_subframePlayerAngles",
-        "1",
-        "0..1",
-        "Use cl_input_subframe view angles for the local player's visual pose.",
-    ),
-    cvar(
-        "cg_smoothThirdPersonTime",
-        "1",
-        "0..1",
-        "Drive third-person camera damping from continuous presentation time.",
-    ),
     cvar("cg_thirdPersonAlpha", "1.0", "float", "OpenJK third-person player alpha."),
     cvar("cg_thirdPersonAngle", "0", "degrees", "OpenJK third-person orbit angle."),
     cvar("cg_thirdPersonCameraDamp", "1", "float", "Third-person camera damping (DinurdoJK default 1)."),
@@ -372,20 +431,20 @@ pub const ENTRIES: &[Entry] = &[
     cvar(
         "developer",
         "0",
-        "0..1",
-        "Enable additional developer and renderer debug overlays.",
+        "0..3",
+        "Global diagnostic level: 0 quiet, 1 basic lifecycle, 2 verbose per-entity/job output, 3 trace. Levels above 0 also enable developer-only inspector/overlay tools.",
+    ),
+    cvar(
+        "r_verbose",
+        "0",
+        "0..3",
+        "Renderer-only diagnostic level: 0 quiet, 1 basic renderer lifecycle, 2 verbose renderer internals, 3 trace. A matching developer level also enables renderer output.",
     ),
     cvar(
         "pmove_msec",
         "8",
         "1..33",
         "Fixed player movement timestep in milliseconds.",
-    ),
-    cvar(
-        "cl_input_subframe",
-        "0",
-        "0..1",
-        "Apply mouse-look on each raw mouse event instead of waiting for the client tick.",
     ),
     cvar(
         "cl_timerResolution1ms",
@@ -399,7 +458,7 @@ pub const ENTRIES: &[Entry] = &[
         "0..1",
         "Experimental: resample the newest subframe view orientation on the render thread at the latest coherent camera point.",
     ),
-    cvar("r_physics", "0", "0..1", "Master switch for Rapier client-side visual physics."),
+    cvar("r_physics", "0", "0..1", "Master switch for client-side visual physics (ragdolls, cloth, jiggle, props)."),
     cvar("r_physicsHz", "60", "30|60|120|240", "Fixed timestep for client-side visual physics."),
     cvar("r_physicsMaxSubsteps", "4", "1|2|4|8", "Maximum visual-physics catch-up steps after a slow frame."),
     cvar("r_physicsCCD", "1", "0..1", "Enable continuous collision detection for eligible visual physics bodies."),
@@ -408,6 +467,23 @@ pub const ENTRIES: &[Entry] = &[
     cvar("r_ragdollMax", "8", "2|4|8|16|32", "Maximum active client ragdolls."),
     cvar("r_ragdollLifetime", "20", "5|10|20|30|60 seconds", "Lifetime of simulated client ragdolls."),
     cvar("r_ragdollSelfCollision", "0", "0..1", "Allow limbs on one ragdoll to collide with each other."),
+    cvar("r_jigglePhysics", "0", "0..1", "Experimental: enable auto-detected _humanoid soft-tissue motion; model.jiggle overrides auto detection."),
+    cvar("r_jiggleStrength", "1", "0..2", "Overall soft-tissue displacement multiplier."),
+    cvar("r_jiggleBreastStrength", "1", "0..2", "Chest-region soft-tissue displacement multiplier."),
+    cvar("r_jiggleGluteStrength", "1", "0..2", "Glute-region soft-tissue displacement multiplier."),
+    cvar("r_jiggleStiffness", "1", "0..3", "Multiplier for KawaiiPhysics-style pose stiffness."),
+    cvar("r_jiggleDamping", "1", "0..3", "Multiplier for KawaiiPhysics-style velocity damping."),
+    cvar("r_jiggleGluteLift", "0.15", "-0.4..0.6", "Raise/lower the live glute mask; positive values suppress upper-thigh influence."),
+    cvar("cg_dismember", "0", "0|1|2", "OpenJK dismemberment: 0 off, 1 limbs only, 2 full including head/waist."),
+    cvar("r_dismemberMax", "24", "1..128", "Maximum detached limb rigid bodies kept by client physics."),
+    cvar("r_dismemberLifetime", "16", "1..300 seconds", "Maximum client Rapier lifetime of a detached limb."),
+    cvar("r_clothPhysics", "0", "0..1", "Experimental: add cloth sway and momentum to authored cape/cloak/robe surfaces."),
+    cvar("r_clothBodyClearance", "1", "0..4", "Additional cloth/body separation in JKA units. Large values inflate the garment."),
+    cvar("r_clothAirResistance", "1", "0..4", "Cloth airflow strength. Zero disables aerodynamic drag; one uses normal fabric pressure."),
+    cvar("r_clothTurnResponse", "1.8", "0..4", "Cloth turning inertia multiplier. One uses the same response as translation."),
+    cvar("r_clothAnimationInfluence", "0.35", "0..1", "Animation influence on free fabric: zero follows sewn attachments; one follows full skeletal animation."),
+    cvar("r_clothWind", "0", "0..1", "Use shared r_weatherWind direction and gusts for cloth."),
+    cvar("r_clothBodyCollision", "1", "0..1", "Collide experimental player cloth with animated head and body capsules."),
     cvar("r_physicsProps", "1", "0..1", "Enable client-only dynamic visual props."),
     cvar("r_physicsPropMax", "96", "32|64|96|192|384", "Maximum active client physics props."),
     cvar("r_physicsDebris", "1", "0..1", "Enable rigid-body simulation for client-spawned debris."),
@@ -462,6 +538,7 @@ pub const ENTRIES: &[Entry] = &[
         "Write the last ~5 s of per-frame prediction/view state to <game>/hitch/*.csv. Bind it and tap it right after a hitch (needs cg_hitchrecord 1).",
     ),
     command("demo", "Play demos/<demoname>.dm_26 using the same playback path as the GUI."),
+    command("rGhost", "Load a demos/<demoname>.dm_26 race run as a visual-only ghost synchronized to your duelTime. Use rGhost clear to remove it."),
     command("exec", "Execute a .cfg script through the active fs_game/base VFS."),
     command("execq", "Execute a .cfg script without displaying the exec notification."),
     command(
@@ -482,6 +559,10 @@ pub const ENTRIES: &[Entry] = &[
     command("unbind", "Remove a key binding."),
     command("unbindall", "Remove all key bindings."),
     command("bindlist", "List all current key bindings."),
+    command("bindspec", "Bind a key only while spectating; unassigned spectator keys inherit normal binds."),
+    command("unbindspec", "Remove one spectator-only key override."),
+    command("unbindspecall", "Remove all spectator-only key overrides."),
+    command("bindspeclist", "List spectator-only key overrides."),
     command("trace", "Toggle inspection of the world surface under the center crosshair."),
     command("trace_clear", "Clear the pinned surface inspection and triangle highlight."),
     command("entities", "Open the 2D entity blueprint: entities [targetname|classname] selects the first match."),
@@ -490,7 +571,7 @@ pub const ENTRIES: &[Entry] = &[
         "perfsample",
         "perfsample <seconds> [label]: hold the command buffer, then print the average render FPS.",
     ),
-    command("toggle", "OpenJK-style cvar toggle: toggle <cvar> [value1 value2 ...]."),
+    command("toggle", "Cycle a cvar through its declared discrete options; explicit value lists are also supported."),
     command("messagemode", "Open global chat input."),
     command("voicechat", "Open TaystJK VGS when connected to a jaPRO server and ui_vgs is enabled."),
     command("+scores", "Show the live scoreboard while held and request fresh scores."),
@@ -519,6 +600,13 @@ pub const ENTRIES: &[Entry] = &[
         "GL_LINEAR_MIPMAP_LINEAR",
         "GL_* filter mode",
         "Base texture filtering mode.",
+    ),
+    latched_cvar(
+        "r_picmip",
+        "0",
+        "0..16",
+        "Classic texture-quality mip bias: omit this many highest map-texture mip levels on upload.",
+        LatchScope::MapLoadOrVidRestart,
     ),
     cvar(
         "r_ext_texture_filter_anisotropic",
@@ -789,6 +877,12 @@ pub const ENTRIES: &[Entry] = &[
         "Gaussian depth-of-field strength with crosshair autofocus.",
     ),
     cvar(
+        "r_dofAutoFocus",
+        "1",
+        "0..1",
+        "Autofocus depth of field on the surface under the crosshair. Uses the same BSP/entity trace as the crosshair and works in remote play and demos, not only Solo.",
+    ),
+    cvar(
         "r_dofQuality",
         "adaptive",
         "performance|adaptive|high",
@@ -1041,6 +1135,7 @@ pub const ENTRIES: &[Entry] = &[
     cvar("sv_master5", "", "host[:port]", "TaystJK custom master slot 5; empty disables it."),
     command("cmd", "Send the rest of the line to the server as a client command."),
     command("userinfo", "Print the userinfo sent to the server."),
+    command("configstrings", "Print the active client configstrings list."),
     command("serverinfo", "Print the connected server's serverinfo configstring."),
     command(
         "serverdump",
@@ -1048,11 +1143,13 @@ pub const ENTRIES: &[Entry] = &[
     ),
     command("systeminfo", "Print the connected server's systeminfo configstring."),
     cvar("name", "Padawan", "string", "Player name sent in userinfo."),
-    cvar("rate", "25000", "1000..90000", "Maximum bytes/second the server may send."),
-    cvar("snaps", "40", "1..125", "Snapshots per second requested from the server."),
-    cvar("cl_maxpackets", "60", "15..1000", "Maximum client packets per second."),
+    cvar("rate", "50000", "1000..90000", "Maximum bytes/second the server may send."),
+    cvar("snaps", "100", "1..125", "Snapshots per second requested from the server."),
+    cvar("cl_maxpackets", "100", "15..1000", "Maximum client packets per second."),
     cvar("cg_stylePlayer", "0", "bit mask", "jaPRO player styling bits: 2 duel shell, 4 hide duelers, 8 hide racers in FFA, 16 hide non-racers while racing, 32 hide racers while racing, 64 solid racers, 128 solid FFA players while racing, 256 ghost duelers, 1024 hide non-duelers while dueling (stock servers), 65536 hide cosmetics, 1048576 seasonal cosmetics."),
     cvar("cg_raceTimer", "2", "0..3", "jaPRO race timer: 0 off, 1 time, 2 time + max/avg/start speed, 3 same with milliseconds."),
+    cvar("cg_rGhostAlpha", "0.35", "0.02..1", "Opacity of /rGhost recorded race players."),
+    cvar("cg_rGhostDemoBaseUrl", "https://s.playja.pro/races", "URL", "Base URL of the public race-demo archive; the client reads its /index JSON catalog."),
     cvar("cg_raceTimerSize", "0.75", "0.1..3", "Text scale of the race timer."),
     cvar("cg_raceTimerX", "5", "640x480 px", "Left edge of the race timer."),
     cvar("cg_raceTimerY", "280", "640x480 px", "Baseline of the race timer."),
@@ -1075,6 +1172,9 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cl_commandsize", "64", "4..512", "How many usercmds back the connection-interrupted warning looks: it appears once the server has not acknowledged a command that old. (The usercmd history itself is always 512 deep.)"),
     cvar("cg_lagometerY", "144", "640x480 px", "Distance of the lagometer's bottom from the bottom of the screen (also positions the old speed graph)."),
     cvar("cg_specFollowFastest", "0", "0|1", "While spectating, keep following the fastest player (debounced)."),
+    cvar("cg_specCamera", "0", "0|1|2", "Spectator follow camera: 0 first person, 1 third person, 2 orbit."),
+    cvar("cg_specCameraMotion", "0", "0|1", "Third-person spectator camera faces the current presented direction of motion (TaystJK cg_thirdPersonAngle -1 behavior)."),
+    cvar("cg_specOrbitRange", "140", "24..1200", "Spectator orbit-camera distance; the mouse wheel changes it while orbiting."),
     command("cameraedit", "Adjust the third-person camera with the mouse: scroll to zoom, drag to move, hold right mouse to aim."),
     command("followFastest", "Spectate whoever is moving fastest right now."),
     command("followRedFlag", "Spectate the red flag carrier."),
@@ -1125,7 +1225,7 @@ pub const ENTRIES: &[Entry] = &[
     cvar("cg_groundTraceDebug", "0", "0..2", "Print this client's ground-trace predictions: 1 = ground changes (takeoff/landing/entity) and mismatches against the server snapshot for the same command, 2 = every new command."),
     cvar("cg_physicsDiag", "0", "0..2", "Replay each snapshot interval from the previous snapshot and compare with the server's state: 1 = print intervals that do not match exactly (origin/velocity/ground/flags deltas), 2 = print every one. Isolates pure physics mismatch (e.g. at cl_commandRate 1000)."),
     cvar("cg_snapMode", "-1", "-1..4", "How prediction rounds velocity after each pmove step (the engine's trap_SnapVector): -1 detect per server by replaying snapshot intervals (default), 0 OpenJK nearest, 1 truncate, 2 floor, 3 nearest-even, 4 none. Retail servers differ from OpenJK here and at cl_commandRate 1000 it decides friction and gravity."),
-    cvar("cg_predictBackend", "-1", "-1..1", "Which native pmove predicts: -1 detect (jaPRO servers use the jaPRO/TaystJK backend; others are tried against both by replaying snapshot intervals and the one that reproduces the server wins), 0 stock OpenJK, 1 jaPRO/TaystJK."),
+    cvar("cg_predictBackend", "-1", "-1..1", "Which native pmove predicts: -1 detect (JA+/jaPRO servers use the TaystJK backend; Base/other servers are tried against stock and TaystJK by snapshot replay), 0 stock OpenJK, 1 TaystJK shared BG/Pmove."),
     cvar("cl_commandPacing", "1", "0..1", "1 = stamp usercmds on an exact cl.serverTime cadence (race physics steps by the command gap); 0 = wall-clock pacing (gaps jitter 5-10 ms at 125)."),
     // cgame weapon selection (cg_weapons.c).
     command("weapon", "Select a weapon slot: weapon <1..13>."),
@@ -1258,7 +1358,7 @@ pub const JAPRO_COMMANDS: &[Entry] = &[
     server_command("amPsay", "jaPRO: Admin: private message: amPsay <player> <message>."),
     server_command("amRage", "jaPRO: Emote: rage."),
     server_command("amRename", "jaPRO: Admin: rename a player: amRename <player> <name>."),
-    server_command("amRun", "jaPRO: Toggle the run/walk emote state."),
+    command("amRun", "jaPRO: Toggle the new run animation preference."),
     server_command("amSay", "jaPRO: Say something to the admins."),
     server_command("amSignal", "jaPRO: Emote: signal."),
     server_command("amSignal2", "jaPRO: Emote: signal 2."),
@@ -1542,21 +1642,47 @@ pub enum PlayerNameCompletion {
     None,
     /// The full name with its colour codes, as in the player's `n` userinfo.
     One(String),
+    /// Multiple matches, already ordered from closest to loosest match.
     Many(Vec<String>),
 }
 
-/// JAPP `CG_ChatboxTabComplete`: `word` is matched as a substring of every
-/// name, both with colour codes stripped and lowercased.
+/// JAPP `CG_ChatboxTabComplete`: `word` is matched against connected player
+/// names with colour codes stripped and case ignored. Ambiguous hits are ranked
+/// so repeated Tab can cycle in a useful order:
+/// exact -> prefix -> word/separator boundary -> interior substring.
 pub fn complete_player_name(word: &str, names: &[String]) -> PlayerNameCompletion {
     let needle = crate::logging::strip_jka_colors(word).to_lowercase();
     if needle.is_empty() {
         return PlayerNameCompletion::None;
     }
-    let mut hits: Vec<String> = names
+
+    let mut hits: Vec<(usize, usize, usize, usize, String)> = names
         .iter()
-        .filter(|name| crate::logging::strip_jka_colors(name).to_lowercase().contains(&needle))
-        .cloned()
+        .enumerate()
+        .filter_map(|(slot_order, name)| {
+            let clean = crate::logging::strip_jka_colors(name).to_lowercase();
+            let position = clean.find(&needle)?;
+            let tier = if clean == needle {
+                0
+            } else if position == 0 {
+                1
+            } else {
+                let at_boundary = clean[..position]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| !ch.is_alphanumeric());
+                if at_boundary { 2 } else { 3 }
+            };
+            // Within a tier, earlier occurrences and shorter names are closer.
+            // Preserve server/client slot order as the final deterministic tie-break.
+            Some((tier, position, clean.chars().count(), slot_order, name.clone()))
+        })
         .collect();
+    hits.sort_by_key(|(tier, position, clean_len, slot_order, _)| {
+        (*tier, *position, *clean_len, *slot_order)
+    });
+    let mut hits: Vec<String> = hits.into_iter().map(|(_, _, _, _, name)| name).collect();
+
     match hits.len() {
         0 => PlayerNameCompletion::None,
         1 => PlayerNameCompletion::One(hits.remove(0)),
@@ -1577,6 +1703,27 @@ mod tests {
         assert_eq!(complete_player_name("^7", &names), PlayerNameCompletion::None);
         // "a" is in both "RedJawa" and "Padawan".
         assert!(matches!(complete_player_name("A", &names), PlayerNameCompletion::Many(hits) if hits.len() == 2));
+    }
+
+    #[test]
+    fn player_name_completion_ranks_exact_prefix_boundary_then_substring() {
+        let names = vec![
+            "SuperJawaGuy".to_owned(),
+            "RedJawa".to_owned(),
+            "JawaBob".to_owned(),
+            "Foo_Jawa".to_owned(),
+            "^2Jawa".to_owned(),
+        ];
+        assert_eq!(
+            complete_player_name("^7jaw", &names),
+            PlayerNameCompletion::Many(vec![
+                "^2Jawa".to_owned(),
+                "JawaBob".to_owned(),
+                "Foo_Jawa".to_owned(),
+                "RedJawa".to_owned(),
+                "SuperJawaGuy".to_owned(),
+            ])
+        );
     }
 
     #[test]
@@ -1696,5 +1843,22 @@ mod tests {
             LatchScope::MapLoadOrVidRestart
         );
         assert_eq!(find("r_swapInterval").unwrap().latch, LatchScope::None);
+    }
+}
+
+#[cfg(test)]
+mod discrete_option_tests {
+    use super::*;
+
+    #[test]
+    fn declared_integer_options_are_explicit_only() {
+        let discrete = cvar("x", "0", "0|1|2", "");
+        assert_eq!(declared_integer_options(&discrete), Some(vec!["0".into(), "1".into(), "2".into()]));
+        let annotated = cvar("x", "20", "5|10|20|30|60 seconds", "");
+        assert_eq!(declared_integer_options(&annotated), Some(vec!["5".into(), "10".into(), "20".into(), "30".into(), "60".into()]));
+        let boolean = cvar("x", "0", "0..1", "");
+        assert_eq!(declared_integer_options(&boolean), Some(vec!["0".into(), "1".into()]));
+        let slider = cvar("x", "0", "0..10000", "");
+        assert_eq!(declared_integer_options(&slider), None);
     }
 }

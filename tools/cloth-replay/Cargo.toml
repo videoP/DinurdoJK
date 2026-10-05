@@ -1,0 +1,16 @@
+[package]
+name = "cloth-replay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+glam = "=0.32.1"
+rapier-cloth-core = { path = "../../crates/jka-cloth-core" }
+fastnoise-lite = "=1.1.1"
+jka-assets = { path = "../../crates/jka-assets" }
+serde_json = "=1.0.151"
+[[bin]]
+name = "cloth-replay"
+path = "main.rs"
+

@@ -17,7 +17,10 @@
 //! WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
 //! WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-use crate::scene::{DirectionalSun, GrassInstance, GrassPatch};
+use crate::{
+    pipeline_jobs::{hash_config as pipeline_hash, PipelineJobKey, PipelineJobManager},
+    scene::{DirectionalSun, GrassInstance, GrassPatch},
+};
 use bytemuck::{Pod, Zeroable};
 use fastnoise_lite::{
     CellularDistanceFunction, CellularReturnType, DomainWarpType, FastNoiseLite, FractalType,
@@ -59,6 +62,7 @@ const PREPARED_WORDS_PER_BLADE: u64 = 11;
 const PREPARED_BLADE_BYTES: u64 = PREPARED_WORDS_PER_BLADE * 4;
 const PREPARED_VISIBLE_CAPACITY: u32 = 524_288;
 const PREPARE_WORKGROUP_SIZE: u32 = 64;
+const GRASS_LOCAL_FOG_SLOTS: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -91,11 +95,15 @@ struct GrassGlobals {
     /// Self-applied Legacy fog (FogSystem::legacy_self_fog): linear RGB, depthForOpaque.
     /// Owned by `set_legacy_fog`; environment updates never write these fields.
     legacy_fog_color_depth: [f32; 4],
-    /// x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    /// x: 0 off, 1 authored global EXP2, 2 manual; y: self-fog strength scale;
+    /// z: local brush-fog authored strength scale.
     legacy_fog_params: [f32; 4],
+    /// Slot 0 is none. Local BSP fog slots are uploaded once with the map.
+    local_fog_color_depth: [[f32; 4]; GRASS_LOCAL_FOG_SLOTS],
 }
 
 const GRASS_LEGACY_FOG_OFFSET: usize = std::mem::offset_of!(GrassGlobals, legacy_fog_color_depth);
+const GRASS_LOCAL_FOG_OFFSET: usize = std::mem::offset_of!(GrassGlobals, local_fog_color_depth);
 
 struct GrassPatchGpu {
     chunk: u32,
@@ -142,6 +150,13 @@ pub struct GrassMapGpu {
     prepared_capacity: u32,
     patches: Vec<GrassPatchGpu>,
     blade_count: u32,
+    has_local_fog: bool,
+}
+
+impl GrassMapGpu {
+    pub(crate) fn has_local_fog(&self) -> bool {
+        self.has_local_fog
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -530,7 +545,8 @@ impl GrassRenderer {
             &shadow_shader,
             true,
         );
-        println!(
+        rverbose!(
+            1,
             "Grass GPU path: A/B compute preparation + high/mid/low true instanced LOD (faithful fallback retained)"
         );
 
@@ -593,55 +609,88 @@ impl GrassRenderer {
         self.prepared_pipeline = None;
     }
 
-    fn ensure_render_pipeline(&mut self, device: &wgpu::Device, gpu_precompute: bool) {
+    fn ensure_render_pipeline(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        gpu_precompute: bool,
+    ) {
+        let slot = u32::from(gpu_precompute);
+        let key = PipelineJobKey::new(
+            "grass-color",
+            slot,
+            pipeline_hash(&(self.pipeline_format, self.pipeline_samples, self.legacy_fog_compiled)),
+        );
+        let target = if gpu_precompute {
+            &mut self.prepared_pipeline
+        } else {
+            &mut self.pipeline
+        };
+        if target.is_some() {
+            return;
+        }
+        if let Some(pipeline) = jobs.take_ready(key) {
+            *target = Some(pipeline);
+            return;
+        }
+        let device = device.clone();
+        let format = self.pipeline_format;
+        let samples = self.pipeline_samples;
+        let legacy_fog = self.legacy_fog_compiled;
         if gpu_precompute {
-            if self.prepared_pipeline.is_none() {
-                self.prepared_pipeline = Some(create_prepared_pipeline(
-                    device,
-                    &self.prepared_pipeline_layout,
-                    &self.prepared_shader,
-                    self.pipeline_format,
-                    self.pipeline_samples,
-                    self.legacy_fog_compiled,
-                ));
-            }
-        } else if self.pipeline.is_none() {
-            self.pipeline = Some(create_pipeline(
-                device,
-                &self.pipeline_layout,
-                &self.shader,
-                self.pipeline_format,
-                self.pipeline_samples,
-                self.legacy_fog_compiled,
-            ));
+            let layout = self.prepared_pipeline_layout.clone();
+            let shader = self.prepared_shader.clone();
+            jobs.request(key, "grass prepared color", move || {
+                create_prepared_pipeline(&device, &layout, &shader, format, samples, legacy_fog)
+            });
+        } else {
+            let layout = self.pipeline_layout.clone();
+            let shader = self.shader.clone();
+            jobs.request(key, "grass color", move || {
+                create_pipeline(&device, &layout, &shader, format, samples, legacy_fog)
+            });
         }
     }
 
     pub fn ensure_wireframe_pipeline_for_draw(
         &mut self,
+        jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         msaa_samples: u32,
         prepared: &GrassPreparedDraw,
     ) {
+        let slot = u32::from(prepared.gpu_precompute);
+        let key = PipelineJobKey::new(
+            "grass-wireframe",
+            slot,
+            pipeline_hash(&(surface_format, msaa_samples)),
+        );
+        let target = if prepared.gpu_precompute {
+            &mut self.prepared_wireframe_pipeline
+        } else {
+            &mut self.wireframe_pipeline
+        };
+        if target.is_some() {
+            return;
+        }
+        if let Some(pipeline) = jobs.take_ready(key) {
+            *target = Some(pipeline);
+            return;
+        }
+        let device = device.clone();
         if prepared.gpu_precompute {
-            if self.prepared_wireframe_pipeline.is_none() {
-                self.prepared_wireframe_pipeline = Some(create_prepared_grass_wireframe_pipeline(
-                    device,
-                    &self.prepared_pipeline_layout,
-                    &self.prepared_shader,
-                    surface_format,
-                    msaa_samples,
-                ));
-            }
-        } else if self.wireframe_pipeline.is_none() {
-            self.wireframe_pipeline = Some(create_grass_wireframe_pipeline(
-                device,
-                &self.pipeline_layout,
-                &self.shader,
-                surface_format,
-                msaa_samples,
-            ));
+            let layout = self.prepared_pipeline_layout.clone();
+            let shader = self.prepared_shader.clone();
+            jobs.request(key, "grass prepared wireframe", move || {
+                create_prepared_grass_wireframe_pipeline(&device, &layout, &shader, surface_format, msaa_samples)
+            });
+        } else {
+            let layout = self.pipeline_layout.clone();
+            let shader = self.shader.clone();
+            jobs.request(key, "grass wireframe", move || {
+                create_grass_wireframe_pipeline(&device, &layout, &shader, surface_format, msaa_samples)
+            });
         }
     }
 
@@ -660,8 +709,8 @@ impl GrassRenderer {
         );
     }
 
-    /// Applies FogSystem::legacy_self_fog. Called only when fog settings or the
-    /// map change; pipelines are respecialized only when fog turns on or off.
+    /// Applies global/manual self-fog plus source-local BSP fog inherited by grass.
+    /// Called only when fog settings or the map change; no per-frame CPU check.
     pub fn set_legacy_fog(
         &mut self,
         device: &wgpu::Device,
@@ -670,24 +719,42 @@ impl GrassRenderer {
         msaa_samples: u32,
         color_depth: [f32; 4],
         params: [f32; 4],
+        local_fog_enabled: bool,
     ) {
         queue.write_buffer(
             &self.globals_buffer,
             GRASS_LEGACY_FOG_OFFSET as wgpu::BufferAddress,
             bytemuck::cast_slice(&[color_depth, params]),
         );
-        let enabled = params[0] > 0.5;
+        let enabled = params[0] > 0.5 || local_fog_enabled;
         if enabled != self.legacy_fog_compiled {
             self.legacy_fog_compiled = enabled;
             self.rebuild_pipeline(device, surface_format, msaa_samples);
         }
     }
 
-    pub fn upload_map(&self, device: &wgpu::Device, patches: &[GrassPatch]) -> Option<GrassMapGpu> {
+    pub fn upload_map(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        patches: &[GrassPatch],
+        local_fogs: &[[f32; 4]],
+    ) -> Option<GrassMapGpu> {
         let blade_count: usize = patches.iter().map(|patch| patch.instances.len()).sum();
         if blade_count == 0 {
             return None;
         }
+
+        let mut local_fog_table = [[0.0_f32; 4]; GRASS_LOCAL_FOG_SLOTS];
+        for (destination, source) in local_fog_table.iter_mut().zip(local_fogs.iter()) {
+            *destination = *source;
+        }
+        queue.write_buffer(
+            &self.globals_buffer,
+            GRASS_LOCAL_FOG_OFFSET as wgpu::BufferAddress,
+            bytemuck::cast_slice(&local_fog_table),
+        );
+        let has_local_fog = local_fogs.iter().skip(1).any(|fog| fog[3] > 0.0);
 
         let instance_stride = std::mem::size_of::<GrassInstanceGpu>();
         let max_binding_bytes = device.limits().max_storage_buffer_binding_size as usize;
@@ -734,7 +801,8 @@ impl GrassRenderer {
         cpu_chunks.retain(|chunk| !chunk.is_empty());
 
         let gpu_bytes = blade_count * instance_stride;
-        println!(
+        rverbose!(
+            1,
             "Grass GPU instances: {} blade(s), {:.1} MiB at {} bytes/blade across {} storage chunk(s) (max binding {:.1} MiB)",
             blade_count,
             gpu_bytes as f64 / (1024.0 * 1024.0),
@@ -825,7 +893,8 @@ impl GrassRenderer {
             });
         }
 
-        println!(
+        rverbose!(
+            1,
             "Grass visible buffers: index={:.1} MiB capacity={} blade(s), prepared={:.1} MiB capacity={} blade(s)",
             u64::from(visible_index_capacity) as f64 * 4.0 / (1024.0 * 1024.0),
             visible_index_capacity,
@@ -843,6 +912,7 @@ impl GrassRenderer {
             prepared_capacity,
             patches: gpu_patches,
             blade_count: blade_count as u32,
+            has_local_fog,
         })
     }
 
@@ -852,6 +922,7 @@ impl GrassRenderer {
     /// binding can hold the whole map this is literally two indexed instanced draws.
     pub fn prepare_draw(
         &mut self,
+        jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         map: &GrassMapGpu,
@@ -1109,7 +1180,7 @@ impl GrassRenderer {
 
         stats.cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
         if total_visible != 0 {
-            self.ensure_render_pipeline(device, gpu_precompute);
+            self.ensure_render_pipeline(jobs, device, gpu_precompute);
         }
         GrassPreparedDraw {
             stats,
@@ -2028,6 +2099,7 @@ fn globals_for_environment(
         ],
         legacy_fog_color_depth: [0.0; 4],
         legacy_fog_params: [0.0; 4],
+        local_fog_color_depth: [[0.0; 4]; GRASS_LOCAL_FOG_SLOTS],
     }
 }
 

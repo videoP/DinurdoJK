@@ -25,6 +25,10 @@ struct SkinDraw {
     uv_xform: vec4<f32>,
     spec_light: vec4<f32>,
     spec_viewer: vec4<f32>,
+    jiggle0: vec4<f32>,
+    jiggle1: vec4<f32>,
+    jiggle2: vec4<f32>,
+    jiggle3: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -105,6 +109,25 @@ fn skin_position(
         + residual * p3;
 }
 
+fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
+    switch region {
+        case 0u: { return draw.jiggle0.xyz; }
+        case 1u: { return draw.jiggle1.xyz; }
+        case 2u: { return draw.jiggle2.xyz; }
+        case 3u: { return draw.jiggle3.xyz; }
+        default: { return vec3<f32>(0.0); }
+    }
+}
+
+fn jiggle_effective_weight(draw: SkinDraw, weight: f32, coord: f32) -> f32 {
+    let overall = draw.jiggle0.w;
+    if (abs(coord) < 2.0) {
+        let vertical = smoothstep(-0.70 + draw.jiggle3.w, -0.15 + draw.jiggle3.w, coord);
+        return weight * overall * draw.jiggle2.w * vertical;
+    }
+    return weight * overall * draw.jiggle1.w;
+}
+
 fn model_to_world(draw: SkinDraw, model_position: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
         draw.origin.x + draw.axis0.x * model_position.x + draw.axis1.x * model_position.y + draw.axis2.x * model_position.z,
@@ -155,13 +178,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let draw = skin_draws[draw_index];
     let input = input_vertices[vertex_index];
     let bone_base = draw.params.x;
-    let model_position = skin_position(
+    var model_position = skin_position(
         input.position_uv_x.xyz,
         input.bone_indices,
         input.weights,
         input.params.x,
         bone_base,
     );
+    let jiggle_weight = bitcast<f32>(input.params.z);
+    let jiggle_coord = bitcast<f32>(input.params.w);
+    if (jiggle_weight > 0.0 && input.params.y < 4u) {
+        let effective_weight = jiggle_effective_weight(draw, jiggle_weight, jiggle_coord);
+        model_position += jiggle_offset(draw, input.params.y) * effective_weight;
+    }
 
     // Match OpenJK's fast Ghoul2 normal path exactly: weight-0's bone only.
     let model_normal = transform_vector(

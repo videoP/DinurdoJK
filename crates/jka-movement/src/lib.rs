@@ -22,6 +22,8 @@ pub struct ItemInfo {
     /// `world_model[1]`: e.g. the `_pu.md3` pickup model CG_RegisterItemVisuals
     /// uses for thermal/trip mine/det pack (empty for none).
     pub world_model2: String,
+    /// `view_model`: first-person weapon MD3 qpath (empty for none).
+    pub view_model: String,
     /// itemType_t (IT_WEAPON = 1, IT_AMMO, IT_ARMOR, IT_HEALTH, IT_POWERUP,
     /// IT_HOLDABLE, IT_PERSISTANT_POWERUP, IT_TEAM).
     pub item_type: i32,
@@ -34,17 +36,19 @@ pub fn bg_item(index: i32) -> Option<ItemInfo> {
     let mut classname = std::ptr::null();
     let mut world_model = std::ptr::null();
     let mut world_model2 = std::ptr::null();
+    let mut view_model = std::ptr::null();
     let (mut item_type, mut tag, mut quantity) = (0, 0, 0);
     // SAFETY: bg_itemlist is immutable static C data; the returned strings
     // are static literals (never freed) and are copied before returning.
     unsafe {
-        if ffi::jka_item_info(index, &mut classname, &mut world_model, &mut world_model2, &mut item_type, &mut tag, &mut quantity) == 0 {
+        if ffi::jka_item_info(index, &mut classname, &mut world_model, &mut world_model2, &mut view_model, &mut item_type, &mut tag, &mut quantity) == 0 {
             return None;
         }
         Some(ItemInfo {
             classname: CStr::from_ptr(classname).to_string_lossy().into_owned(),
             world_model: CStr::from_ptr(world_model).to_string_lossy().into_owned(),
             world_model2: CStr::from_ptr(world_model2).to_string_lossy().into_owned(),
+            view_model: CStr::from_ptr(view_model).to_string_lossy().into_owned(),
             item_type,
             tag,
             quantity,
@@ -567,14 +571,24 @@ pub struct PredictSettings {
     pub no_spec_move: i32,
     pub tracemask: i32,
     pub no_footsteps: i32,
-    /// Native backend: 0 = stock OpenJK, 1 = JAPRO. Physics stays in C.
+    /// Native implementation: 0 = stock OpenJK, 1 = TaystJK shared BG/Pmove.
+    /// The TaystJK backend is used for JA+ and jaPRO, and can also be selected
+    /// for Base when advertised TaystJK feature flags require it.
+    pub backend: i32,
+    /// Server identity consumed by the TaystJK cgs.serverMod branches:
+    /// 0 = Base/other, 1 = jaPRO, 2 = JA+. Keep this separate from backend.
     pub server_mod: i32,
+    /// JA+ `jp_cinfo` (`cgs.cinfo`). jaPRO continues to use `jcinfo`.
+    pub cinfo: i32,
     pub jcinfo: i32,
     pub jcinfo2: i32,
     pub taystjk_info: i32,
     pub dmflags: i32,
     pub hook_pull: i32,
     pub restricts: i32,
+    /// TaystJK cgs.baseGame: Raven SDK/base semantics even when the gamename is
+    /// unusual (sv_legacyGameAPI/g_saberWallDamageScale detection).
+    pub base_game: i32,
     pub plugin_disable: i32,
     pub legacy_fixes: u32,
 }
@@ -584,9 +598,9 @@ impl Default for PredictSettings {
         Self {
             pmove_fixed: 0, pmove_msec: 8, pmove_float: 0, gametype: 0,
             debug_melee: 0, step_slide_fix: 1, no_spec_move: 0,
-            tracemask: 0x1111, no_footsteps: 0, server_mod: 0,
-            jcinfo: 0, jcinfo2: 0, taystjk_info: 0, dmflags: 0,
-            hook_pull: 0, restricts: 0, plugin_disable: 1536, legacy_fixes: 0,
+            tracemask: 0x1111, no_footsteps: 0, backend: 0, server_mod: 0,
+            cinfo: 0, jcinfo: 0, jcinfo2: 0, taystjk_info: 0, dmflags: 0,
+            hook_pull: 0, restricts: 0, base_game: 0, plugin_disable: 1536, legacy_fixes: 0,
         }
     }
 }

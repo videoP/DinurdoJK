@@ -96,7 +96,8 @@ impl LocalServer {
         );
         let game = game::MoverGame::new(movers.entities, movers.sources, movers.trains, brush_entities, areas.clone());
         if game.published().next().is_some() {
-            println!(
+            devprintln!(
+                1,
                 "LOCAL SERVER MOVERS: {} of {} brush entities spawned as ET_MOVER ({}; {} model2)",
                 game.published().count(),
                 brush_entities.len(),
@@ -379,6 +380,10 @@ impl LocalServer {
         self.player.note_movement_key_press(key);
     }
 
+    pub fn set_noclip(&mut self, enabled: bool) -> Result<bool, String> {
+        self.player.set_noclip(enabled)
+    }
+
     pub fn toggle_noclip(&mut self) -> Result<bool, String> {
         self.player.toggle_noclip()
     }
@@ -537,7 +542,8 @@ fn build_map_fx_entities(runners: &[MapFxRunner]) -> (Vec<String>, Vec<EntitySta
     }
 
     if !entities.is_empty() {
-        println!(
+        devprintln!(
+            1,
             "LOCAL SERVER FX: {} fx_runner entity(s), {} unique effect(s)",
             entities.len(),
             effects.len()

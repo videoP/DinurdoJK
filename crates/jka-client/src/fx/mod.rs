@@ -10,6 +10,16 @@ pub const FX_FPS_DEFAULT: u32 = 90;
 pub const FX_FPS_MIN: u32 = 15;
 pub const FX_FPS_MAX: u32 = 250;
 
+/// Which presentation-frame-driven effects are resampled by `cg_fxFPS`.
+///
+/// * `0` keeps the original DinurdoJK scope: continuous projectile/trail EFX only.
+/// * `1` also applies the fixed cadence to eligible stock frame-driven contact
+///   presentation such as saber/world sparks and wall-mark sampling. Authored
+///   `.efx` delay/life/count values are never rewritten by either mode.
+pub const FX_FPS_SCOPE_CONTINUOUS: u32 = 0;
+pub const FX_FPS_SCOPE_FRAME_DRIVEN: u32 = 1;
+pub const FX_FPS_SCOPE_DEFAULT: u32 = FX_FPS_SCOPE_CONTINUOUS;
+
 /// `fx_physics` values (TaystJK/jaPRO `fx_physics` cvar semantics).
 ///
 /// * `0` disables all FX particle physics.

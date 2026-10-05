@@ -9,6 +9,8 @@ pub const DEFAULT_DISTANCE_CULL: f32 = 6000.0;
 pub const DEFAULT_CG_FOV: f32 = 90.0;
 pub const MIN_CG_FOV: f32 = 1.0;
 pub const MAX_CG_FOV: f32 = 140.0;
+pub const MIN_SPECTATOR_ORBIT_RANGE: f32 = 24.0;
+pub const MAX_SPECTATOR_ORBIT_RANGE: f32 = 1200.0;
 /// OpenJK keeps the camera far plane at least this far out.
 pub const MIN_FAR_DISTANCE: f32 = 2048.0;
 /// Raven expands distanceCull by the diagonal of a unit cube so the far plane
@@ -41,6 +43,92 @@ pub struct ThirdPersonSettings {
     pub special_cam: bool,
     pub target_damp: f32,
     pub vert_offset: f32,
+}
+
+/// Client-only camera choice while following another player as a spectator.
+/// This is deliberately independent of `cg_thirdPerson`: changing how you
+/// watch somebody must not silently change the camera you use when you join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectatorCameraMode {
+    FirstPerson,
+    ThirdPerson,
+    Orbit,
+}
+
+impl SpectatorCameraMode {
+    pub const fn from_i32(value: i32) -> Self {
+        match value {
+            1 => Self::ThirdPerson,
+            2 => Self::Orbit,
+            _ => Self::FirstPerson,
+        }
+    }
+
+    pub const fn as_i32(self) -> i32 {
+        match self {
+            Self::FirstPerson => 0,
+            Self::ThirdPerson => 1,
+            Self::Orbit => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpectatorCameraSettings {
+    pub mode: SpectatorCameraMode,
+    /// TaystJK `cg_thirdPersonAngle -1` semantics: use the current presented
+    /// horizontal velocity directly as the chase yaw.
+    pub motion_direction: bool,
+    pub orbit_range: f32,
+}
+
+impl Default for SpectatorCameraSettings {
+    fn default() -> Self {
+        Self {
+            mode: SpectatorCameraMode::FirstPerson,
+            motion_direction: false,
+            orbit_range: 140.0,
+        }
+    }
+}
+
+/// Free-orbit input state. Position/collision damping stays in the existing
+/// `ThirdPersonCameraState`; this only owns the spectator's chosen angles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpectatorCameraState {
+    orbit_angles: [f32; 3],
+    orbit_initialized: bool,
+}
+
+impl Default for SpectatorCameraState {
+    fn default() -> Self {
+        Self {
+            orbit_angles: [0.0; 3],
+            orbit_initialized: false,
+        }
+    }
+}
+
+impl SpectatorCameraState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn orbit_angles(&mut self, fallback: [f32; 3]) -> [f32; 3] {
+        if !self.orbit_initialized {
+            self.orbit_angles = fallback;
+            self.orbit_angles[2] = 0.0;
+            self.orbit_initialized = true;
+        }
+        self.orbit_angles
+    }
+
+    pub fn apply_orbit_mouse(&mut self, yaw_delta: f32, pitch_delta: f32, fallback: [f32; 3]) {
+        let _ = self.orbit_angles(fallback);
+        self.orbit_angles[1] -= yaw_delta;
+        self.orbit_angles[0] = (self.orbit_angles[0] + pitch_delta).clamp(-80.0, 80.0);
+        self.orbit_angles[2] = 0.0;
+    }
 }
 
 impl Default for ThirdPersonSettings {
@@ -100,6 +188,8 @@ pub struct ThirdPersonViewInput {
     pub origin: [f32; 3],
     /// Client view angles in native JKA degrees: pitch, yaw, roll.
     pub view_angles: [f32; 3],
+    /// Horizontal motion source for TaystJK `cg_thirdPersonAngle -1`.
+    pub velocity: [f32; 3],
     pub view_height: i32,
     pub health: i32,
     pub dead_yaw: f32,
@@ -161,7 +251,7 @@ fn normalize(a: [f32; 3]) -> ([f32; 3], f32) {
 }
 
 /// OpenJK/Q3 AngleVectors, retaining the native PITCH/YAW/ROLL convention.
-fn angle_vectors(angles: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+pub(crate) fn angle_vectors(angles: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let pitch = angles[0].to_radians();
     let yaw = angles[1].to_radians();
     let roll = angles[2].to_radians();
@@ -207,6 +297,17 @@ fn vector_to_angles(value: [f32; 3]) -> [f32; 3] {
         (yaw, pitch)
     };
     [-pitch, yaw, 0.0]
+}
+
+#[inline]
+fn motion_direction_yaw(input: ThirdPersonViewInput) -> Option<f32> {
+    // TaystJK CG_OffsetThirdPersonView: cg_thirdPersonAngle -1 does not add a
+    // second presentation filter. cg.predictedPlayerState is already predicted
+    // for the local player and interpolated while following/demoing, so consume
+    // that presented velocity directly on every camera frame.
+    let speed_sq = input.velocity[0] * input.velocity[0] + input.velocity[1] * input.velocity[1];
+    (speed_sq > f32::EPSILON)
+        .then(|| input.velocity[1].atan2(input.velocity[0]).to_degrees())
 }
 
 fn camera_trace_with_fraction<W: TraceWorld>(
@@ -352,7 +453,16 @@ pub fn offset_third_person_view<W: TraceWorld>(
     if input.health <= 0 {
         focus_angles[1] = input.dead_yaw;
     } else {
-        focus_angles[1] += settings.angle;
+        if settings.angle == -1.0 {
+            // TaystJK/jaPRO extension: a magic -1 makes the chase camera face
+            // the player's current presented horizontal velocity. When there
+            // is no horizontal motion TaystJK leaves the normal view yaw alone.
+            if let Some(motion_yaw) = motion_direction_yaw(input) {
+                focus_angles[1] = motion_yaw;
+            }
+        } else {
+            focus_angles[1] += settings.angle;
+        }
         focus_angles[0] += settings.pitch_offset;
     }
 
@@ -403,6 +513,7 @@ pub fn offset_third_person_view<W: TraceWorld>(
     let late_latch = (!reset_damp
         && input.health > 0
         && !input.teleported
+        && settings.angle != -1.0
         && settings.camera_damp >= 1.0
         && state.last_camera_trace_fraction >= 0.999_999)
         .then_some(ThirdPersonLateLatchView {
@@ -695,6 +806,42 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn third_person_input(view_angles: [f32; 3], velocity: [f32; 3], time: f64) -> ThirdPersonViewInput {
+        ThirdPersonViewInput {
+            origin: [0.0; 3],
+            view_angles,
+            velocity,
+            view_height: 24,
+            health: 100,
+            dead_yaw: 0.0,
+            client_num: 0,
+            time,
+            teleported: false,
+        }
+    }
+
+    #[test]
+    fn spectator_orbit_starts_from_followed_view_and_owns_mouse_angles() {
+        let mut state = SpectatorCameraState::default();
+        assert_eq!(state.orbit_angles([10.0, 20.0, 30.0]), [10.0, 20.0, 0.0]);
+        state.apply_orbit_mouse(5.0, 7.0, [0.0; 3]);
+        assert_eq!(state.orbit_angles([0.0; 3]), [17.0, 15.0, 0.0]);
+        state.apply_orbit_mouse(0.0, 500.0, [0.0; 3]);
+        assert_eq!(state.orbit_angles([0.0; 3])[0], 80.0);
+    }
+
+    #[test]
+    fn motion_camera_uses_presented_velocity_directly_and_keeps_view_yaw_when_stopped() {
+        let moving = third_person_input([0.0, 45.0, 0.0], [100.0, 0.0, 0.0], 1000.0);
+        assert_eq!(motion_direction_yaw(moving), Some(0.0));
+
+        let turned = third_person_input([0.0, 45.0, 0.0], [0.0, 100.0, 0.0], 1000.0);
+        assert_eq!(motion_direction_yaw(turned), Some(90.0));
+
+        let stopped = third_person_input([0.0, 90.0, 0.0], [0.0; 3], 1000.0);
+        assert_eq!(motion_direction_yaw(stopped), None);
+    }
 
     #[test]
     fn camera_shake_falls_off_and_expires() {

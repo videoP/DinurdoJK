@@ -133,7 +133,7 @@ fn second_saber_alone_selects_the_dual_base_without_a_primary_blade_count() {
 
 #[test]
 fn japro_backend_predicts_half_lit_staff_the_same_way() {
-    let japro = PredictSettings { server_mod: 1, ..PredictSettings::default() };
+    let japro = PredictSettings { backend: 1, server_mod: 1, ..PredictSettings::default() };
     let mut player = half_lit_saber_player();
     player.configure(&japro).unwrap();
     for (slot, info) in staff().into_iter().enumerate() {

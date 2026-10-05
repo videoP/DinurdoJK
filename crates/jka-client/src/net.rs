@@ -56,6 +56,9 @@ pub struct NetworkSettings {
     pub handicap: u32,
     /// `cg_predictItems`: tells the server whether this client predicts pickups.
     pub predict_items: bool,
+    /// Read-only `teamoverlay` CVAR_USERINFO mirror. OpenJK/TaystJK set this
+    /// from cg_drawTeamOverlay so the game server knows whether to send tinfo.
+    pub team_overlay: bool,
     /// jaPRO `cp_cosmetics`: bitfield of enabled model cosmetics.
     pub cosmetics: u32,
     /// `fs_game` for local (solo) games: the game directory mounted over base
@@ -99,9 +102,9 @@ pub struct NetworkSettings {
     /// `trap_SnapVector`). -1 = detect per server (default), 0 OpenJK nearest, 1 truncate,
     /// 2 floor, 3 nearest-even, 4 none.
     pub snap_mode: i32,
-    /// `cg_predictBackend`: which native pmove predicts. -1 = detect (jaPRO servers use the jaPRO
-    /// backend; others are tried against both by replaying snapshot intervals), 0 stock OpenJK,
-    /// 1 jaPRO/TaystJK. Session-only.
+    /// `cg_predictBackend`: which native pmove predicts. -1 = detect (JA+/jaPRO and
+    /// servers advertising TaystJK movement capabilities use the shared backend; plain Base/other
+    /// servers are replay-tested), 0 stock OpenJK, 1 TaystJK shared BG/Pmove. Session-only.
     pub predict_backend: i32,
     /// Minimum correction distance, in JKA units, for the visual miss warning.
     pub prediction_miss_threshold: f32,
@@ -129,9 +132,9 @@ impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
             name: "Padawan".into(),
-            rate: 25000,
-            snaps: 40,
-            max_packets: 60,
+            rate: 50000,
+            snaps: 100,
+            max_packets: 100,
             packet_dup: 1,
             time_nudge: 0,
             net_port: jka_protocol::DEFAULT_PORT,
@@ -147,6 +150,7 @@ impl Default for NetworkSettings {
             char_color: [255; 3],
             handicap: 100,
             predict_items: true,
+            team_overlay: false,
             cosmetics: 0,
             fs_game: "japro".into(),
             clan_pwd: "none".into(),
@@ -204,6 +208,7 @@ impl NetworkSettings {
             "char_color_blue" => self.char_color[2].to_string(),
             "handicap" => self.handicap.to_string(),
             "cg_predictitems" => u8::from(self.predict_items).to_string(),
+            "teamoverlay" => u8::from(self.team_overlay).to_string(),
             "cp_cosmetics" => (self.cosmetics as i32).to_string(),
             "fs_game" => self.fs_game.clone(),
             "cp_clanpwd" => self.clan_pwd.clone(),
@@ -278,6 +283,8 @@ impl NetworkSettings {
             "char_color_blue" => number(0, 255).map(|v| { self.char_color[2] = v as u8; true }),
             "handicap" => number(1, 100).map(|v| { self.handicap = v as u32; true }),
             "cg_predictitems" => Ok({ self.predict_items = atoi(value.as_bytes()) != 0; true }),
+            // CVAR_ROM in OpenJK/TaystJK. cg_drawTeamOverlay owns this value.
+            "teamoverlay" => Err("teamoverlay is read-only; use cg_drawTeamOverlay".to_owned()),
             "cp_cosmetics" => number(i64::from(i32::MIN), i64::from(i32::MAX)).map(|v| { self.cosmetics = v as i32 as u32; true }),
             "fs_game" => {
                 // A sibling directory name, as `resolve_fs_game_directory` accepts.
@@ -345,13 +352,14 @@ impl NetworkSettings {
     pub fn userinfo(&self, model: &str) -> Vec<u8> {
         let mut info = Vec::new();
         // Info_SetValueForKey prepends, so insert in reverse of the desired order.
-        let pairs: [(&str, String); 15] = [
+        let pairs: [(&str, String); 16] = [
             ("char_color_blue", self.char_color[2].to_string()),
             ("char_color_green", self.char_color[1].to_string()),
             ("char_color_red", self.char_color[0].to_string()),
             ("saber2", self.saber2.clone()),
             ("saber1", self.saber1.clone()),
             ("cg_predictItems", u8::from(self.predict_items).to_string()),
+            ("teamoverlay", u8::from(self.team_overlay).to_string()),
             ("sex", self.sex.clone()),
             ("handicap", self.handicap.to_string()),
             ("color2", self.color2.to_string()),
@@ -363,17 +371,36 @@ impl NetworkSettings {
             ("name", self.name.clone()),
         ];
         for (key, value) in pairs {
-            set_info_value(&mut info, key.as_bytes(), value.as_bytes());
+            let value = crate::cgame::text_to_jka_bytes(&value);
+            set_info_value(&mut info, key.as_bytes(), &value);
         }
         if !self.password.is_empty() {
-            set_info_value(&mut info, b"password", self.password.as_bytes());
+            let password = crate::cgame::text_to_jka_bytes(&self.password);
+            set_info_value(&mut info, b"password", &password);
         }
         info
     }
 
+    pub fn userinfo_for_server(&self, model: &str, server_info: &[u8]) -> Vec<u8> {
+        self.userinfo_for_capabilities(
+            model,
+            mod_support::ServerMod::detect(server_info),
+            mod_support::supports_rgb_sabers(server_info),
+        )
+    }
+
     pub fn userinfo_for_mod(&self, model: &str, server_mod: mod_support::ServerMod) -> Vec<u8> {
+        self.userinfo_for_capabilities(model, server_mod, server_mod.supports_rgb_sabers())
+    }
+
+    fn userinfo_for_capabilities(
+        &self,
+        model: &str,
+        server_mod: mod_support::ServerMod,
+        rgb_sabers: bool,
+    ) -> Vec<u8> {
         let mut info = self.userinfo(model);
-        if server_mod.supports_rgb_sabers() {
+        if rgb_sabers {
             // jaPRO / JA+ relay these as c3/c4 in the client configstring.
             set_info_value(&mut info, b"cp_sbRGB1", self.sb_rgb1.to_string().as_bytes());
             set_info_value(&mut info, b"cp_sbRGB2", self.sb_rgb2.to_string().as_bytes());
@@ -390,8 +417,11 @@ impl NetworkSettings {
             set_info_value(&mut info, b"color1", base(self.color1, self.sb_rgb1).to_string().as_bytes());
             set_info_value(&mut info, b"color2", base(self.color2, self.sb_rgb2).to_string().as_bytes());
         }
+        // TaystJK declares cjp_client CVAR_USERINFO|CVAR_ROM, so it is present
+        // on every connect. JA+ uses the value to enable plugin behavior including
+        // the extended 15-field scores record with trailing deaths.
+        set_info_value(&mut info, b"cjp_client", b"1.4JAPRO");
         if server_mod == mod_support::ServerMod::Japro {
-            set_info_value(&mut info, b"cjp_client", b"1.4JAPRO");
             set_info_value(&mut info, b"cp_pluginDisable", self.plugin_disable.to_string().as_bytes());
             set_info_value(&mut info, b"cp_cosmetics", (self.cosmetics as i32).to_string().as_bytes());
             set_info_value(&mut info, b"cp_clanPwd", self.clan_pwd.as_bytes());
@@ -1106,8 +1136,31 @@ impl LiveInput {
 pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>, ps: &PlayerState) -> PredictSettings {
     let server = configstrings.get(&0).map(Vec::as_slice).unwrap_or_default();
     let system = configstrings.get(&1).map(Vec::as_slice).unwrap_or_default();
-    let japro = mod_support::ServerMod::detect(server) == mod_support::ServerMod::Japro;
+    let detected_mod = mod_support::ServerMod::detect(server);
+    let japro = detected_mod == mod_support::ServerMod::Japro;
+    let japlus = detected_mod == mod_support::ServerMod::Japlus;
     let int = |info: &[u8], key: &[u8], default: i32| info_value(info, key).map_or(default, atoi);
+    let taystjk_info = int(server, b"taystJKinfo", 0);
+    let legacy_fixes = configstrings.get(&36).and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| {
+            let value = value.trim();
+            if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16).ok()
+            } else if value.starts_with('0') && value.len() > 1 {
+                u32::from_str_radix(value, 8).ok()
+            } else { value.parse().ok() }
+        }).unwrap_or(0);
+    let tayst_movement = taystjk_info & mod_support::TAYSTJK_INFO_MOVEMENT_MASK != 0 || legacy_fixes != 0;
+    // TaystJK also recognizes Raven SDK gamecode independently of gamename.
+    let mut base_game = detected_mod == mod_support::ServerMod::Base;
+    if info_value(server, b"g_saberWallDamageScale").is_some() {
+        base_game = true;
+    }
+    // TaystJK servers make this authoritative when present: a `0` must be able
+    // to override even a basejka-looking gamename that is backed by OpenJK.
+    if let Some(value) = info_value(server, b"sv_legacyGameAPI") {
+        base_game = atoi(value) != 0;
+    }
     const CONTENTS_SOLID: i32 = 0x1;
     const CONTENTS_PLAYERCLIP: i32 = 0x10;
     const CONTENTS_BODY: i32 = 0x100;
@@ -1135,25 +1188,32 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         no_spec_move: int(server, b"g_noSpecMove", 0),
         tracemask,
         no_footsteps: i32::from(int(server, b"dmflags", 0) & 32 != 0),
-        server_mod: i32::from(japro),
+        // TaystJK's shared BG/Pmove backend contains the JA+/jaPRO branches.
+        // Base/unknown stays on stock by default unless auto-detection or an
+        // explicit cg_predictBackend selection chooses the shared backend.
+        backend: i32::from(japro || japlus || tayst_movement),
+        // Compact Rust-side identity consumed by native japro_configure:
+        // 0 Base/other, 1 jaPRO, 2 JA+.
+        server_mod: if japro { 1 } else if japlus { 2 } else { 0 },
+        // TaystJK stores JA+ `jp_cinfo` here, while jaPRO mirrors `jcinfo`
+        // into both cgs.cinfo and cgs.jcinfo.
+        cinfo: if japlus { int(server, b"jp_cinfo", 0) } else if japro { int(server, b"jcinfo", 0) } else { 0 },
         jcinfo: if japro { int(server, b"jcinfo", 0) } else { 0 },
         jcinfo2: if japro { int(server, b"jcinfo2", 0) } else { 0 },
-        taystjk_info: if japro { int(server, b"taystJKinfo", 0) } else { 0 },
+        // TaystJK deliberately reads feature flags independently of gamename.
+        // This lets Base/other game modules advertise compatible behavior.
+        taystjk_info,
         dmflags: int(server, b"dmflags", 0),
-        hook_pull: if japro { int(server, b"g_hookStrength", 0) } else { 0 },
-        restricts: if japro { int(server, b"restricts", 0) } else { 0 },
+        hook_pull: if japro { int(server, b"g_hookStrength", 0) } else if japlus { 800 } else { 0 },
+        // Current TaystJK parses `restricts` after mod detection rather than
+        // gating it on jaPRO, so preserve any server that advertises it.
+        restricts: int(server, b"restricts", 0),
+        base_game: i32::from(base_game),
         plugin_disable: 1536,
-        legacy_fixes: if japro {
-            configstrings.get(&36).and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| {
-                    let value = value.trim();
-                    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
-                        u32::from_str_radix(hex, 16).ok()
-                    } else if value.starts_with('0') && value.len() > 1 {
-                        u32::from_str_radix(value, 8).ok()
-                    } else { value.parse().ok() }
-                }).unwrap_or(0)
-        } else { 0 },
+        // CS_LEGACY_FIXES is a protocol-visible capability configstring, not a
+        // jaPRO-only field. The TaystJK backend is responsible for deciding
+        // which fixes actually affect the current server/mod.
+        legacy_fixes,
     }
 }
 
@@ -1632,7 +1692,7 @@ fn combo_index(backend: i32, snap: i32) -> usize {
 }
 
 fn combo_name(backend: i32, snap: i32) -> String {
-    let backend = if backend == 1 { "jaPRO backend" } else { "stock backend" };
+    let backend = if backend == 1 { "TaystJK backend" } else { "stock backend" };
     let snap = ["nearest", "truncate", "floor", "nearest-even", "no rounding"][snap.clamp(0, 4) as usize];
     format!("{backend}, {snap} rounding")
 }
@@ -1727,13 +1787,14 @@ impl Predictor {
         };
         vec![
             format!(
-                "predsettings: server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
-                settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
+                "predsettings: backend={} server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
+                settings.backend, settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
             ),
             format!("  velocity snap: {snap}"),
             format!("  step chopping: {chop}"),
             format!(
-                "  jcinfo={:#x} jcinfo2={:#x} taystJKinfo={:#x} step_slide_fix={} provisional_step={}",
+                "  jp_cinfo={:#x} jcinfo={:#x} jcinfo2={:#x} taystJKinfo={:#x} step_slide_fix={} provisional_step={}",
+                settings.cinfo,
                 settings.jcinfo,
                 settings.jcinfo2,
                 settings.taystjk_info,
@@ -1809,11 +1870,12 @@ impl Predictor {
             }
         }
         self.last_snapshot = Some(snap_key);
-        let next_frame_teleport = next.is_some_and(|next| {
-            (next.player_state.field_i32("eFlags").unwrap_or(0) ^ snap.player_state.field_i32("eFlags").unwrap_or(0))
-                & EF_TELEPORT_BIT
-                != 0
-        });
+        // TaystJK CG_SetNextSnap marks the whole snapshot transition as a
+        // no-interpolate boundary not only for EF_TELEPORT_BIT, but also when
+        // follow clientNum changes or SNAPFLAG_SERVERCOUNT toggles. Prediction
+        // must use the same gate before choosing nextSnap as its base/solid list.
+        let next_frame_teleport = next
+            .is_some_and(|next| crate::cgame::snapshot_discontinuity(snap, next));
         let old_time = self.old_time;
         self.old_time = time;
 
@@ -1850,18 +1912,22 @@ impl Predictor {
         let base_ps = &base.player_state;
         let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
         prediction_settings.plugin_disable = settings.plugin_disable;
-        // Backend and rounding: jaPRO servers always use the jaPRO backend (their prediction was exact);
-        // for every other server both are chosen by `cg_predictBackend` / `cg_snapMode`, or detected
-        // by replaying snapshot intervals (below) when left at -1.
-        let detected_japro = prediction_settings.server_mod == 1;
+        // Backend and server identity are separate. JA+ and jaPRO use the
+        // TaystJK backend by default. Base/other servers only require it for
+        // movement-related taystJKinfo bits or CS_LEGACY_FIXES; presentation-only
+        // flags (RGB/black sabers) must not silently change prediction.
+        // Plain Base/unknown can still auto-detect stock vs Tayst from replay.
+        let fixed_tayst_backend = prediction_settings.server_mod != 0
+            || prediction_settings.taystjk_info & mod_support::TAYSTJK_INFO_MOVEMENT_MASK != 0
+            || prediction_settings.legacy_fixes != 0;
         let effective_backend = if settings.predict_backend >= 0 {
             settings.predict_backend
-        } else if detected_japro {
+        } else if fixed_tayst_backend {
             1
         } else {
             self.auto_backend
         };
-        prediction_settings.server_mod = effective_backend;
+        prediction_settings.backend = effective_backend;
         let effective_snap_mode = if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap };
         if self.snap_mode_applied != Some(effective_snap_mode) {
             jka_movement::set_snap_mode(effective_snap_mode);
@@ -1869,11 +1935,11 @@ impl Predictor {
         }
         let regime = (prediction_settings, base_ps.stats[STAT_RACEMODE], base_ps.stats[STAT_MOVEMENTSTYLE]);
         if self.last_regime != Some(regime) {
-            // One line in the console/latest.log whenever the settings the replay runs with change
-            // (first prediction of a session included), so a dump can be read against them.
-            self.misses.push(format!(
+            // This is diagnostic context, not normal gameplay output. Keep it visible when the
+            // dedicated prediction diagnostics are enabled, or under the global verbose gate.
+            let line = format!(
                 "PRED-SETTINGS backend={} pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} base_snapshot={} cmdtime={}",
-                if prediction_settings.server_mod == 1 { "jaPRO" } else { "stock" },
+                if prediction_settings.backend == 1 { "TaystJK" } else { "stock" },
                 prediction_settings.pmove_fixed,
                 prediction_settings.pmove_float,
                 prediction_settings.pmove_msec,
@@ -1885,7 +1951,12 @@ impl Predictor {
                 prediction_settings.jcinfo,
                 base.message_num,
                 base_ps.field_i32("commandTime").unwrap_or(0),
-            ));
+            );
+            if settings.prediction_debug {
+                self.misses.push(line);
+            } else {
+                devprintln!(2, "{line}");
+            }
         }
         self.last_regime = Some(regime);
         // cg.physicsTime: the snapshot time the replay starts from, which is
@@ -1919,7 +1990,7 @@ impl Predictor {
 
         native.set_foot_bolts(self.foot_bolts)?;
         native.configure(&prediction_settings)?;
-        if prediction_settings.server_mod == 1 {
+        if prediction_settings.backend == 1 {
             let prediction_entities: Vec<_> = entities.iter().map(|entity| {
                 let int = |key| entity.state.field_i32(key).unwrap_or(0);
                 let float = |key| entity.state.field_f32(key).unwrap_or(0.0);
@@ -2186,14 +2257,14 @@ impl Predictor {
         let replay_ground_probe = *world.ground_probe;
         let backend_candidates: Vec<i32> = if settings.predict_backend >= 0 {
             vec![settings.predict_backend]
-        } else if detected_japro {
+        } else if fixed_tayst_backend {
             vec![1]
         } else {
             vec![0, 1]
         };
         let snap_candidates: Vec<i32> = if settings.snap_mode >= 0 {
             vec![settings.snap_mode]
-        } else if detected_japro {
+        } else if fixed_tayst_backend {
             vec![0]
         } else {
             vec![0, 1, 2]
@@ -2210,7 +2281,7 @@ impl Predictor {
             // ran between the previous snapshot and this one, starting from the previous snapshot's
             // state, and compare with this snapshot. Any difference is a pure physics mismatch over
             // one snapshot interval, with no long replay chain, time sync or smoothing involved.
-            // The same interval is replayed under every candidate (stock or jaPRO backend, each
+            // The same interval is replayed under every candidate (stock or TaystJK backend, each
             // velocity rounding) and the candidate that reproduces the server wins the vote: at 1 ms
             // steps the rounding, and any modded server's movement, decide friction and gravity.
             if let Some((_, previous)) = self.diag_previous.take() {
@@ -2227,7 +2298,7 @@ impl Predictor {
                     for &(backend, snap) in &combos {
                         jka_movement::set_snap_mode(snap);
                         let mut candidate = prediction_settings;
-                        candidate.server_mod = backend;
+                        candidate.backend = backend;
                         let mut probe = NativePlayerState::from_network(&to_native(&previous))?;
                         probe.configure(&candidate)?;
                         probe.set_foot_bolts(self.foot_bolts)?;
@@ -2288,10 +2359,10 @@ impl Predictor {
                                     && best_votes >= 4
                                     && best_votes >= current_votes + 3
                                 {
-                                    if settings.predict_backend < 0 && !detected_japro {
+                                    if settings.predict_backend < 0 && !fixed_tayst_backend {
                                         self.auto_backend = best.0;
                                     }
-                                    if settings.snap_mode < 0 && !detected_japro {
+                                    if settings.snap_mode < 0 && !fixed_tayst_backend {
                                         self.auto_snap = best.1;
                                     }
                                     jka_movement::set_snap_mode(if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap });
@@ -2726,6 +2797,15 @@ mod tests {
         let mut cfg = String::new();
         settings.write_cfg(&mut cfg);
         assert!(cfg.contains("seta cp_sbRGB1 \"16711680\""));
+
+        // The mod name and the feature mask are independent in TaystJK. A Base
+        // server can advertise RGB support without becoming JA+/jaPRO.
+        let info = settings.userinfo_for_server(
+            "kyle/default",
+            br"\gamename\basejka\taystJKinfo\1",
+        );
+        assert_eq!(info_value(&info, b"color1"), Some(b"6".as_slice()));
+        assert_eq!(info_value(&info, b"cp_sbRGB1"), Some(b"16711680".as_slice()));
     }
 
     #[test]
@@ -2784,10 +2864,21 @@ mod tests {
     fn userinfo_contains_stock_keys_in_openjk_order() {
         let info = NetworkSettings::default().userinfo("kyle/default");
         let text = String::from_utf8(info.clone()).unwrap();
-        assert!(text.starts_with("\\name\\Padawan\\rate\\25000\\snaps\\40\\model\\kyle/default"), "{text}");
+        assert!(text.starts_with("\\name\\Padawan\\rate\\50000\\snaps\\100\\model\\kyle/default"), "{text}");
         assert!(text.ends_with("\\char_color_blue\\255"), "{text}");
         assert_eq!(info_value(&info, b"teamtask"), None);
         assert!(jka_protocol::netchan::connect_packet(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn team_overlay_userinfo_mirrors_cgame_request_bit() {
+        let mut settings = NetworkSettings::default();
+        let info = settings.userinfo("kyle/default");
+        assert_eq!(info_value(&info, b"teamoverlay"), Some(b"0".as_slice()));
+        settings.team_overlay = true;
+        let info = settings.userinfo("kyle/default");
+        assert_eq!(info_value(&info, b"teamoverlay"), Some(b"1".as_slice()));
+        assert!(settings.set_cvar("teamoverlay", "0").unwrap().is_err());
     }
 
     #[test]
@@ -2806,15 +2897,45 @@ mod tests {
             (36, b"0x7".to_vec()),
         ]);
         let settings = predict_settings(&config, &ps);
-        assert_eq!((settings.server_mod, settings.jcinfo, settings.jcinfo2), (1, 123, 8));
+        assert_eq!((settings.backend, settings.server_mod, settings.cinfo, settings.jcinfo, settings.jcinfo2), (1, 1, 123, 123, 8));
         assert_eq!((settings.pmove_msec, settings.hook_pull, settings.legacy_fixes), (1, 900, 7));
         config.insert(0, br"\gamename\basejka\jcinfo\123".to_vec());
         let settings = predict_settings(&config, &ps);
-        assert_eq!((settings.server_mod, settings.jcinfo, settings.jcinfo2, settings.legacy_fixes), (0, 0, 0, 0));
+        assert_eq!((settings.backend, settings.server_mod, settings.cinfo, settings.jcinfo, settings.jcinfo2, settings.legacy_fixes), (0, 0, 0, 0, 0, 7));
         assert_eq!(settings.pmove_msec, 8);
         assert_eq!(settings.hook_pull, 0);
         config.clear();
         assert_eq!(predict_settings(&config, &ps).server_mod, 0);
+    }
+
+
+    #[test]
+    fn japlus_and_tayst_feature_flags_are_independent_of_japro() {
+        let ps = PlayerState::default();
+        let mut config = std::collections::BTreeMap::from([(
+            0,
+            br"\gamename\JA+ Mod\jp_cinfo\4660\taystJKinfo\33\restricts\7".to_vec(),
+        )]);
+        let settings = predict_settings(&config, &ps);
+        assert_eq!((settings.backend, settings.server_mod, settings.cinfo), (1, 2, 4660));
+        assert_eq!(settings.hook_pull, 800);
+        assert_eq!((settings.taystjk_info, settings.restricts), (33, 7));
+
+        config.insert(0, br"\gamename\basejka\taystJKinfo\9".to_vec());
+        let settings = predict_settings(&config, &ps);
+        assert_eq!((settings.backend, settings.server_mod, settings.taystjk_info, settings.base_game), (1, 0, 9, 1));
+
+        config.remove(&36);
+        config.insert(0, br"\gamename\basejka\taystJKinfo\1".to_vec());
+        let settings = predict_settings(&config, &ps);
+        assert_eq!(settings.backend, 0, "RGB-only capability must not change movement implementation");
+
+        // A TaystJK server explicitly advertises whether its game module uses
+        // the Raven SDK API. This overrides gamename, including a false value.
+        config.insert(0, br"\gamename\basejka\taystJKinfo\9\sv_legacyGameAPI\0".to_vec());
+        assert_eq!(predict_settings(&config, &ps).base_game, 0);
+        config.insert(0, br"\gamename\futuremod\sv_legacyGameAPI\1".to_vec());
+        assert_eq!(predict_settings(&config, &ps).base_game, 1);
     }
 
     #[test]
@@ -2837,8 +2958,11 @@ mod tests {
         assert_eq!(info_value(&info, b"cjp_client"), Some(b"1.4JAPRO".as_slice()));
         assert_eq!(info_value(&info, b"cp_pluginDisable"), Some(b"1048576".as_slice()));
         assert!(jka_protocol::netchan::connect_packet(&info).is_ok());
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Japlus);
+        assert_eq!(info_value(&info, b"cjp_client"), Some(b"1.4JAPRO".as_slice()));
+        assert_eq!(info_value(&info, b"cp_pluginDisable"), None);
         let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
-        assert_eq!(info_value(&info, b"cjp_client"), None);
+        assert_eq!(info_value(&info, b"cjp_client"), Some(b"1.4JAPRO".as_slice()));
         assert_eq!(info_value(&info, b"cp_pluginDisable"), None);
         let mut cfg = String::new();
         settings.write_cfg(&mut cfg);

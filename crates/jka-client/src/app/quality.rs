@@ -329,12 +329,13 @@ impl App {
         self.end_settings_batch();
         let applied_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
         timings.sort_by(|a, b| b.1.total_cmp(&a.1));
-        println!(
+        devprintln!(
+            2,
             "[BATCH] {title}: main thread applied {} setting(s) in {applied_ms:.2} ms (render-thread work is reported separately)",
             timings.len(),
         );
         for (name, ms) in timings.iter().filter(|(_, ms)| *ms >= 0.05).take(20) {
-            println!("[BATCH]   main {name}: {ms:.2} ms");
+            devprintln!(2, "[BATCH]   main {name}: {ms:.2} ms");
         }
 
         // Capture the canonical values *after* all setters have run. Some cvars

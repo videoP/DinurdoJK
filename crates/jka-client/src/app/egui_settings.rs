@@ -77,12 +77,7 @@ impl App {
                 if self.controls_waiting_for_key
                     && crate::keybinds::is_japro_selection(self.controls_selected)
                 {
-                    theme::banner(
-                        ui,
-                        "Press any key, mouse button or wheel direction…  ESC cancels.",
-                        theme::WARNING,
-                    );
-                    ui.add_space(6.0);
+                    self.egui_binding_capture_overlay(ui.ctx());
                 }
 
                 let mut rebind = None;
@@ -234,44 +229,6 @@ impl App {
                     let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
                 }
 
-                theme::section(
-                    ui,
-                    "SMOOTH PRESENTATION (A/B)",
-                    "Render-only decoupling from fixed pmove_msec. These switches never change movement simulation or network command timing.",
-                );
-                theme::row(
-                    ui,
-                    "Smooth player position",
-                    "cg_smoothPlayerOrigin. Interpolate the local player model root between the previous and current fixed pmove samples.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_player_origin) {
-                            let _ = self.set_console_cvar("cg_smoothPlayerOrigin", if value { "1" } else { "0" });
-                        }
-                    },
-                );
-                theme::row(
-                    ui,
-                    "Smooth player animation time",
-                    "cg_smoothPlayerAnimation. Advance Ghoul2 animation and BG_G2PlayerAngles on continuous presentation time instead of stepped playerState commandTime.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.smooth_player_animation) {
-                            let _ = self.set_console_cvar("cg_smoothPlayerAnimation", if value { "1" } else { "0" });
-                        }
-                    },
-                );
-                theme::row(
-                    ui,
-                    "Subframe local-player pose",
-                    "cg_subframePlayerAngles. Render-only: when cl_input_subframe is enabled, use its newest pitch/yaw for the visible local player/Ghoul2 pose instead of waiting for the next pmove tick. Does not change mouse aim, usercmd angles, movement, weapon/saber gameplay traces, or networking.",
-                    theme::Reset::None,
-                    |ui| {
-                        if let Some(value) = theme::switch(ui, self.presentation_smoothing.subframe_player_angles) {
-                            let _ = self.set_console_cvar("cg_subframePlayerAngles", if value { "1" } else { "0" });
-                        }
-                    },
-                );
                 self.egui_japro_game_settings(ui);
             });
     }
@@ -308,6 +265,8 @@ impl App {
                         }
                     },
                 );
+                self.egui_japro_hud_settings(ui);
+
                 theme::section(
                     ui,
                     "CROSSHAIR",
@@ -402,6 +361,18 @@ impl App {
                         );
                     },
                 );
+                const DYNAMIC_CROSSHAIR: [(u8, &str); 3] = [(0, "Off"), (1, "Always"), (2, "Smart")];
+                if let Some(mode) = segmented_row(
+                    ui,
+                    "Dynamic crosshair",
+                    "TaystJK cg_dynamicCrosshair. Off keeps the crosshair at screen center. Always traces from the weapon/player muzzle. Smart uses TaystJK's static overrides for saber/melee, race mode and the applicable strafehelper modes.",
+                    theme::Reset::None,
+                    self.crosshair.dynamic,
+                    &DYNAMIC_CROSSHAIR,
+                ) {
+                    let _ = self.set_console_cvar("cg_dynamicCrosshair", &mode.to_string());
+                }
+
                 theme::row(
                     ui,
                     "Color by target",
@@ -453,7 +424,7 @@ impl App {
                 theme::section(
                     ui,
                     "MOVEMENT KEYS",
-                    "TaystJK-compatible cg_movementKeys overlay and layout controls.",
+                    "TaystJK-compatible cg_movementKeys overlay controls. Position is handled by HUD Edit Mode.",
                 );
                 const MOVEMENT_KEY_MODES: [(u8, &str); 5] = [
                     (0, "Off"), (1, "Original"), (2, "+ Attack"), (3, "Compact"), (4, "Movable"),
@@ -464,27 +435,6 @@ impl App {
                 ) {
                     let _ = self.set_console_cvar("cg_movementKeys", &mode.to_string());
                 }
-                theme::row(ui, "Horizontal", "cg_movementKeysX.", theme::Reset::None, |ui| {
-                    let mut value = self.movement_keys_hud.x;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, -320.0..=320.0, &readout) {
-                        let _ = self.set_console_cvar("cg_movementKeysX", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Vertical", "cg_movementKeysY.", theme::Reset::None, |ui| {
-                    let mut value = self.movement_keys_hud.y;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, -240.0..=240.0, &readout) {
-                        let _ = self.set_console_cvar("cg_movementKeysY", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Scale", "cg_movementKeysSize.", theme::Reset::None, |ui| {
-                    let mut value = self.movement_keys_hud.size;
-                    let readout = format!("{value:.2}x");
-                    if theme::slider(ui, &mut value, 0.25..=4.0, &readout) {
-                        let _ = self.set_console_cvar("cg_movementKeysSize", &value.to_string());
-                    }
-                });
                 theme::row(ui, "Walk key", "cg_movementKeysWalk. Include the walk/run state in the overlay.", theme::Reset::None, |ui| {
                     if let Some(value) = theme::switch(ui, self.movement_keys_hud.walk) {
                         let _ = self.set_console_cvar("cg_movementKeysWalk", if value { "1" } else { "0" });
@@ -496,21 +446,23 @@ impl App {
                     "STRAFEHELPER",
                     "TaystJK CGAZ/Strafehelper controls. Direction bits remain available through cg_strafeHelper.",
                 );
-                const STRAFE_STYLES: [(u8, &str); 4] = [
-                    (0, "Off"), (1, "Original"), (2, "Updated"), (3, "CGAZ"),
+                const STRAFE_STYLES: [(u8, &str); 5] = [
+                    (0, "Off"), (1, "Original"), (2, "Updated"), (3, "CGAZ"), (4, "Cinematic"),
                 ];
-                let style = if self.strafe_helper.flags & crate::ui::SHELPER_CGAZ != 0 { 3 }
+                let style = if self.strafe_helper.flags & crate::ui::SHELPER_CINEMATIC != 0 { 4 }
+                    else if self.strafe_helper.flags & crate::ui::SHELPER_CGAZ != 0 { 3 }
                     else if self.strafe_helper.flags & crate::ui::SHELPER_UPDATED != 0 { 2 }
                     else if self.strafe_helper.flags & crate::ui::SHELPER_ORIGINAL != 0 { 1 }
                     else { 0 };
                 if let Some(selected) = segmented_row(
-                    ui, "Style", "Visual style bits inside cg_strafeHelper.",
+                    ui, "Style", "Visual style inside cg_strafeHelper. Cinematic keeps TaystJK strafe math but presents it as depth-tested glowing lines in 3D world space.",
                     theme::Reset::None, style, &STRAFE_STYLES,
                 ) {
                     let style_bit = match selected {
                         1 => crate::ui::SHELPER_ORIGINAL,
                         2 => crate::ui::SHELPER_UPDATED,
                         3 => crate::ui::SHELPER_CGAZ,
+                        4 => crate::ui::SHELPER_CINEMATIC,
                         _ => 0,
                     };
                     let flags = (self.strafe_helper.flags & !crate::ui::SHELPER_STYLE_MASK) | style_bit;
@@ -548,6 +500,13 @@ impl App {
                         let _ = self.set_console_cvar("cg_strafeHelperLineWidth", &value.to_string());
                     }
                 });
+                theme::row(ui, "Precision", "cg_strafeHelperPrecision. TaystJK uses this as the world-space distance before projecting a guide. Cinematic keeps that distance directly as its 3D line length.", theme::Reset::None, |ui| {
+                    let mut value = self.strafe_helper.precision as f32;
+                    let readout = format!("{value:.0}");
+                    if theme::slider(ui, &mut value, 100.0..=10000.0, &readout) {
+                        let _ = self.set_console_cvar("cg_strafeHelperPrecision", &(value.round() as u32).to_string());
+                    }
+                });
                 theme::row(ui, "Physics FPS", "cg_strafeHelper_FPS. Zero follows com_maxfps like TaystJK; uncapped falls back to 125.", theme::Reset::None, |ui| {
                     let mut value = self.strafe_helper.fps;
                     let readout = if value < 1.0 { "Auto (125)".to_owned() } else { format!("{value:.0}") };
@@ -555,7 +514,7 @@ impl App {
                         let _ = self.set_console_cvar("cg_strafeHelper_FPS", &value.to_string());
                     }
                 });
-                theme::row(ui, "Cutoff", "cg_strafeHelperCutoff. Controls the visible line length.", theme::Reset::None, |ui| {
+                theme::row(ui, "Cutoff", "cg_strafeHelperCutoff. Controls 2D style clipping; Cinematic uses Precision for its 3D length.", theme::Reset::None, |ui| {
                     let mut value = self.strafe_helper.cutoff;
                     let readout = format!("{value:.0}");
                     if theme::slider(ui, &mut value, 0.0..=480.0, &readout) {
@@ -587,11 +546,22 @@ impl App {
                 theme::row(
                     ui,
                     "Name completion",
-                    "cg_chatboxCompletion. Tab completes the word before the caret to a player name (colours ignored, matches anywhere in the name). Several matches are listed instead.",
+                    "cg_chatboxCompletion. Tab completes the current word to a player name (colours ignored). Repeated Tab cycles matches, preferring exact names and names that start with what you typed.",
                     theme::Reset::None,
                     |ui| {
                         if let Some(value) = theme::switch(ui, self.chatbox_completion) {
                             let _ = self.set_console_cvar("cg_chatboxCompletion", if value { "1" } else { "0" });
+                        }
+                    },
+                );
+                theme::row(
+                    ui,
+                    "Chat logging",
+                    "cl_chatLog. Saves live server chat as a self-contained HTML session under the active fs_game/chatlogs directory. A dedicated writer thread batches user-space flushes for up to 10 seconds; demo playback is not logged.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.chat_log_enabled) {
+                            let _ = self.set_console_cvar("cl_chatLog", if value { "1" } else { "0" });
                         }
                     },
                 );
@@ -790,6 +760,25 @@ impl App {
         }
         if self.video.fullscreen != self.applied_fullscreen {
             theme::hint(ui, "Display mode changed: needs Apply", theme::WARNING);
+        }
+
+        theme::row(
+            ui,
+            "Companion window",
+            "Opens a native second-monitor workspace for persistent Console, Scoreboard and Server info. The auxiliary surface has its own sleeping render worker and only submits when its contents change. This is also the presentation-surface foundation for a later spectator Scene View.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.companion_enabled()) {
+                    self.set_companion_enabled(enabled);
+                }
+            },
+        );
+        if self.companion_enabled() && self.applied_fullscreen == FullscreenMode::Exclusive {
+            theme::hint(
+                ui,
+                "Exclusive fullscreen can lose focus when you click the companion; passive display remains safe.",
+                theme::TEXT_DIM,
+            );
         }
 
         let resolutions = Self::available_resolutions(self.window.as_deref(), self.video.resolution);
@@ -1022,6 +1011,32 @@ impl App {
         ) {
             let current = index_of(&FILTERS, self.video.texture_filter, 2);
             self.video_selected = ui::VIDEO_ROW_TEXTURE_FILTER;
+            self.change_video_setting(target as i32 - current as i32);
+        }
+
+        // quality_table_row is ordered low -> high quality. r_picmip runs in
+        // the opposite numeric direction, so present the values reversed.
+        const PICMIP: [(u32, &str); 5] = [
+            (4, "1/16"),
+            (3, "1/8"),
+            (2, "1/4"),
+            (1, "1/2"),
+            (0, "Full"),
+        ];
+        if let Some(target) = quality_table_row(
+            ui,
+            "Texture quality",
+            "Classic r_picmip. Omits the highest map-texture mip levels at upload: 0 keeps full resolution, 1 halves each dimension, 2 quarters it, and so on. Matches TaystJK's latched texture-quality behavior; Apply Video Settings reloads the current map.",
+            theme::Reset::Video(ui::VIDEO_ROW_PICMIP),
+            self.video.picmip.min(4),
+            &PICMIP,
+            0,
+        ) {
+            let current = PICMIP
+                .iter()
+                .position(|(value, _)| *value == self.video.picmip.min(4))
+                .unwrap_or(PICMIP.len() - 1);
+            self.video_selected = ui::VIDEO_ROW_PICMIP;
             self.change_video_setting(target as i32 - current as i32);
         }
 
@@ -1422,6 +1437,21 @@ impl App {
             },
         );
 
+        const FX_FPS_SCOPE: [(u32, &str); 2] = [
+            (crate::fx::FX_FPS_SCOPE_CONTINUOUS, "Continuous"),
+            (crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN, "All frame-driven"),
+        ];
+        if let Some(scope) = segmented_row(
+            ui,
+            "FX FPS scope",
+            "Continuous (default) only resamples projectile/trail EFX whose stock density accidentally follows render FPS. All frame-driven also applies cg_fxFPS to eligible stock presentation-frame effects such as legacy saber wall sparks and mark sampling. Authored .efx count/life/delay values are still respected.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_FPS_SCOPE),
+            self.video.fx_fps_scope,
+            &FX_FPS_SCOPE,
+        ) {
+            let _ = self.set_console_cvar("cg_fxFPSScope", &scope.to_string());
+        }
+
         ui.add_enabled_ui(self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu, |ui| {
         if let Some(value) = segmented_row(
             ui,
@@ -1814,6 +1844,18 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
             },
         );
 
+        theme::row(
+            ui,
+            "Autofocus",
+            "r_dofAutoFocus. When depth of field is enabled, continuously focuses on the surface under the crosshair. Off holds the current focus distance.",
+            theme::Reset::Video(ui::VIDEO_ROW_DOF_AUTOFOCUS),
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.dof_autofocus) {
+                    let _ = self.set_console_cvar("r_dofAutoFocus", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
         const DOF: [(DofQuality, &str); 3] = [
             (DofQuality::Performance, "Performance"),
             (DofQuality::Adaptive, "Adaptive"),
@@ -2022,6 +2064,35 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
     }
 
     fn egui_debug_tools(&mut self, ui: &mut egui::Ui) {
+        const DIAGNOSTIC_LEVELS: [(u8, &str); 4] = [
+            (0, "Off"),
+            (1, "Basic"),
+            (2, "Verbose"),
+            (3, "Trace"),
+        ];
+
+        if let Some(level) = segmented_row(
+            ui,
+            "Developer output",
+            "developer. Global diagnostic gate. Off keeps routine engine/cgame diagnostics out of the console; Basic shows lifecycle/setup information; Verbose adds per-entity and worker/job diagnostics; Trace is reserved for very noisy tracing. Any non-zero level also enables developer-only inspector tools.",
+            theme::Reset::Video(ui::VIDEO_ROW_DEVELOPER_TOOLS),
+            self.video.developer_level,
+            &DIAGNOSTIC_LEVELS,
+        ) {
+            let _ = self.set_console_cvar("developer", &level.to_string());
+        }
+
+        if let Some(level) = segmented_row(
+            ui,
+            "Renderer verbose output",
+            "r_verbose. Renderer-only diagnostic gate, matching the classic JKA renderer cvar's purpose. Use this when you want renderer allocation/pipeline/material diagnostics without enabling cgame/client developer spew. developer at the same level also enables these lines.",
+            theme::Reset::Video(ui::VIDEO_ROW_RENDERER_VERBOSE),
+            self.video.renderer_verbose,
+            &DIAGNOSTIC_LEVELS,
+        ) {
+            let _ = self.set_console_cvar("r_verbose", &level.to_string());
+        }
+
         self.egui_toggle_row(
             ui,
             "Lightmap-only debug view",
@@ -3401,8 +3472,8 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         self.egui_physics_toggle(
             ui,
             "Client physics",
-            "Master switch for Rapier-driven client-side visual physics. It must never replace \
-             OpenJK/JKA movement prediction or server-authoritative entity state.",
+            "Master switch for client-side visual physics. Rapier handles rigid/ragdoll simulation, \
+             while cloth and jiggle use dedicated solvers. It never replaces authoritative JKA movement.",
             PHYS_CLIENT_ENABLED,
             self.video.client_physics,
         );
@@ -3411,8 +3482,8 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         if let Some(rate) = segmented_row(
             ui,
             "Simulation rate",
-            "Fixed Rapier timestep for visual physics. 60 Hz is the baseline; higher rates improve \
-             fast contacts and joints at additional CPU cost.",
+            "Fixed target timestep shared by client visual-physics solvers. 60 Hz is the baseline; \
+             higher rates improve fast secondary motion and contacts at additional CPU cost.",
             theme::Reset::Physics(PHYS_RATE),
             self.video.client_physics_hz,
             &RATES,
@@ -3525,6 +3596,127 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
             self.video.physics_force_impulses,
         );
 
+        theme::section(
+            ui,
+            "SOFT TISSUE (EXPERIMENTAL)",
+            "Profile-driven post-skin secondary motion for stock _humanoid player meshes.",
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Jiggle physics",
+            "Enable _humanoid soft-tissue secondary motion. Chest/glute regions are auto-detected; \
+             model.jiggle overrides Auto. GPU skinning locally promotes only the weighted soft region, up to 16x triangles in its core.",
+            PHYS_JIGGLE,
+            self.video.jiggle_physics,
+        );
+        for (label, tip, field, current, min, max, cvar) in [
+            ("Overall motion", "Global multiplier for all soft-tissue displacement.", PHYS_JIGGLE_STRENGTH, self.video.jiggle_strength, 0.0, 2.0, "r_jiggleStrength"),
+            ("Breast motion", "Multiplier for chest-region displacement only.", PHYS_JIGGLE_BREAST, self.video.jiggle_breast_strength, 0.0, 2.0, "r_jiggleBreastStrength"),
+            ("Glute motion", "Multiplier for glute-region displacement only.", PHYS_JIGGLE_GLUTE, self.video.jiggle_glute_strength, 0.0, 2.0, "r_jiggleGluteStrength"),
+            ("Stiffness", "KawaiiPhysics-style stiffness multiplier. Higher values pull the simulated point back toward the animated pose faster.", PHYS_JIGGLE_STIFFNESS, self.video.jiggle_stiffness, 0.0, 3.0, "r_jiggleStiffness"),
+            ("Damping", "KawaiiPhysics-style damping multiplier. Higher values remove secondary velocity faster.", PHYS_JIGGLE_DAMPING, self.video.jiggle_damping, 0.0, 3.0, "r_jiggleDamping"),
+            ("Glute height", "Raise or lower the live glute mask without rebuilding the model. Positive values suppress more upper-thigh influence.", PHYS_JIGGLE_GLUTE_LIFT, self.video.jiggle_glute_lift, -0.4, 0.6, "r_jiggleGluteLift"),
+        ] {
+            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                let mut value = current;
+                let readout = format!("{value:.2}");
+                if theme::slider(ui, &mut value, min..=max, &readout) {
+                    let _ = self.set_console_cvar(cvar, &value.to_string());
+                }
+            });
+        }
+
+        theme::section(
+            ui,
+            "DISMEMBERMENT",
+            "OpenJK server-authored severing with Ghoul2 stump caps and one Rapier body per detached part.",
+        );
+        const DISMEMBERMENT: [(u8, &str); 3] = [(0, "Off"), (1, "Limbs"), (2, "Full")];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Dismemberment",
+            "OpenJK cg_dismember semantics. Limbs hides head/waist severing; Full permits every server-authored part. \
+             This never invents a client-side saber hit or changes gameplay.",
+            theme::Reset::Physics(PHYS_DISMEMBERMENT),
+            self.video.dismemberment,
+            &DISMEMBERMENT,
+        ) {
+            self.video.dismemberment = mode;
+            self.physics_menu_changed();
+        }
+        const DISMEMBER_MAX: [(u32, &str); 5] = [(8, "8"), (16, "16"), (24, "24"), (48, "48"), (96, "96")];
+        if let Some(index) = quality_table_row(
+            ui,
+            "Detached limb budget",
+            "Maximum detached rigid bodies retained locally. The oldest is retired first when the budget is exceeded.",
+            theme::Reset::Physics(PHYS_DISMEMBER_MAX),
+            self.video.dismember_max,
+            &DISMEMBER_MAX,
+            2,
+        ) {
+            self.video.dismember_max = DISMEMBER_MAX[index].0;
+            self.physics_menu_changed();
+        }
+        const DISMEMBER_LIFE: [(u32, &str); 5] = [(5, "5 s"), (10, "10 s"), (16, "16 s"), (30, "30 s"), (60, "60 s")];
+        let dismember_life = self.video.dismember_lifetime.round().clamp(1.0, 300.0) as u32;
+        if let Some(index) = quality_table_row(
+            ui,
+            "Detached limb lifetime",
+            "Maximum local Rapier lifetime for a detached part. Server entity lifetime is still authoritative for visibility.",
+            theme::Reset::Physics(PHYS_DISMEMBER_LIFETIME),
+            dismember_life,
+            &DISMEMBER_LIFE,
+            2,
+        ) {
+            self.video.dismember_lifetime = DISMEMBER_LIFE[index].0 as f32;
+            self.physics_menu_changed();
+        }
+
+        theme::section(
+            ui,
+            "CLOTH (EXPERIMENTAL)",
+            "Secondary garment motion driven by movement, turning and animation.",
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Cape / robe cloth",
+            "Add cloth sway and momentum to cape, cloak and robe surfaces while preserving \
+             their animated shape.",
+            PHYS_CLOTH,
+            self.video.cloth_physics,
+        );
+        self.egui_physics_toggle(
+            ui,
+            "Cloth body collision",
+            "Keep cloth from moving through the animated head, torso, arms and legs. \
+             Collision adapts to each garment's authored fit.",
+            PHYS_CLOTH_BODY_COLLISION,
+            self.video.cloth_body_collision,
+        );
+
+        for (label, tip, field, current, maximum, cvar) in [
+            ("Body clearance", "Additional gap between the fabric and the body, in JKA units.",
+                PHYS_CLOTH_CLEARANCE, self.video.cloth_body_clearance, 4.0, "r_clothBodyClearance"),
+            ("Air resistance", "Air pressure on moving fabric. Higher values make running and stopping pull the garment more strongly.",
+                PHYS_CLOTH_AIR, self.video.cloth_air_resistance, 4.0, "r_clothAirResistance"),
+            ("Turning response", "How strongly fabric lags and swings as the character turns.",
+                PHYS_CLOTH_TURN, self.video.cloth_turn_response, 4.0, "r_clothTurnResponse"),
+            ("Animation influence", "How closely free fabric follows skeletal animation. At 0 it follows its sewn attachments; at 1 it follows the full authored pose.",
+                PHYS_CLOTH_ANIMATION, self.video.cloth_animation_influence, 1.0, "r_clothAnimationInfluence"),
+        ] {
+            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                let mut value = current;
+                let readout = format!("{value:.2}");
+                if theme::slider(ui, &mut value, 0.0..=maximum, &readout) {
+                    let _ = self.set_console_cvar(cvar, &value.to_string());
+                }
+            });
+        }
+        self.egui_physics_toggle(
+            ui, "Weather wind", "Apply the shared weather wind direction and gusts to cloth.",
+            PHYS_CLOTH_WIND, self.video.cloth_wind,
+        );
+
         theme::section(ui, "PROPS", "Client-only dynamic objects layered over the server world.");
         self.egui_physics_toggle(
             ui,
@@ -3633,6 +3825,10 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
             PHYS_SLEEPING => self.video.client_physics_sleeping = value,
             PHYS_RAGDOLLS => self.video.ragdolls = value,
             PHYS_RAGDOLL_SELF_COLLISION => self.video.ragdoll_self_collision = value,
+            PHYS_JIGGLE => self.video.jiggle_physics = value,
+            PHYS_CLOTH => self.video.cloth_physics = value,
+            PHYS_CLOTH_BODY_COLLISION => self.video.cloth_body_collision = value,
+            PHYS_CLOTH_WIND => self.video.cloth_wind = value,
             PHYS_PROPS => self.video.physics_props = value,
             PHYS_DEBRIS => self.video.physics_debris = value,
             PHYS_PLAYER_PUSH => self.video.physics_player_push = value,
@@ -3646,7 +3842,7 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         self.physics_menu_changed();
     }
 
-    fn physics_menu_changed(&mut self) {
+    pub(super) fn physics_menu_changed(&mut self) {
         self.mark_config_dirty();
         self.ensure_map_physics_mesh();
         self.egui_repaint_requested = true;
@@ -3735,6 +3931,23 @@ const PHYS_EXPLOSION_IMPULSES: u8 = 16;
 const PHYS_FORCE_IMPULSES: u8 = 17;
 const PHYS_DEBUG_DRAW: u8 = 18;
 const PHYS_STATS: u8 = 19;
+const PHYS_CLOTH: u8 = 20;
+const PHYS_CLOTH_BODY_COLLISION: u8 = 21;
+const PHYS_CLOTH_WIND: u8 = 22;
+const PHYS_CLOTH_AIR: u8 = 23;
+const PHYS_CLOTH_TURN: u8 = 24;
+const PHYS_CLOTH_ANIMATION: u8 = 25;
+const PHYS_CLOTH_CLEARANCE: u8 = 26;
+const PHYS_DISMEMBERMENT: u8 = 27;
+const PHYS_DISMEMBER_MAX: u8 = 28;
+const PHYS_DISMEMBER_LIFETIME: u8 = 29;
+const PHYS_JIGGLE: u8 = 30;
+const PHYS_JIGGLE_STRENGTH: u8 = 31;
+const PHYS_JIGGLE_BREAST: u8 = 32;
+const PHYS_JIGGLE_GLUTE: u8 = 33;
+const PHYS_JIGGLE_STIFFNESS: u8 = 34;
+const PHYS_JIGGLE_DAMPING: u8 = 35;
+const PHYS_JIGGLE_GLUTE_LIFT: u8 = 36;
 
 const OCEAN_MAP_SIZE: u8 = 0;
 const OCEAN_MESH_QUALITY: u8 = 1;
@@ -3755,6 +3968,7 @@ fn pending_video_reset(key: &str) -> Option<theme::Reset> {
         "voxel_probe_gi" => theme::Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI),
         "gen_normal_maps" => theme::Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS),
         "float_lightmap" => theme::Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP),
+        "picmip" => theme::Reset::Video(ui::VIDEO_ROW_PICMIP),
         "reflections" => theme::Reset::Video(ui::VIDEO_ROW_SSR),
         "pbr" => theme::Reset::Video(ui::VIDEO_ROW_PBR),
         "asset_overrides" => theme::Reset::Video(ui::VIDEO_ROW_ASSET_OVERRIDES),
@@ -3917,8 +4131,11 @@ fn ocean_slider(
 }
 
 impl App {
-    /// jaPRO account login, the same fields as jaPRO's own login menu: username and
-    /// password, then `login`, `register` or `logout` sent to the server.
+    /// jaPRO account login plus secure, exact-endpoint automatic logins.
+    ///
+    /// A saved credential is keyed by the resolved UDP `IP:port`, never by a
+    /// hostname or a friendly server name. Presence in the OS credential store
+    /// means auto-login is enabled for that endpoint.
     fn egui_japro_account(&mut self, ui: &mut egui::Ui) {
         theme::section(
             ui,
@@ -3959,7 +4176,8 @@ impl App {
                         .char_limit(LIMIT)
                         .desired_width(220.0),
                 );
-                submit = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                submit = response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
             },
         );
         clean(&mut self.network.ui_username);
@@ -3974,7 +4192,9 @@ impl App {
         theme::row(ui, "Account", "", theme::Reset::None, |ui| {
             ui.add_enabled_ui(connected, |ui| {
                 ui.add_enabled_ui(ready, |ui| {
-                    if theme::primary_button(ui, "LOG IN").clicked() || (submit && ready && connected) {
+                    if theme::primary_button(ui, "LOG IN").clicked()
+                        || (submit && ready && connected)
+                    {
                         command = Some(format!(
                             "login {} {}",
                             self.network.ui_username, self.network.ui_password
@@ -3995,10 +4215,146 @@ impl App {
             });
         });
         if !connected {
-            theme::label(ui, theme::plain("Join a jaPRO server to log in.", 11.5, theme::TEXT_FAINT));
+            theme::label(
+                ui,
+                theme::plain("Join a jaPRO server to log in.", 11.5, theme::TEXT_FAINT),
+            );
         }
         if let Some(command) = command {
             self.forward_command_to_server(&command);
+        }
+
+        ui.add_space(16.0);
+        theme::section(
+            ui,
+            "SAVED LOGINS",
+            "Passwords are stored by the operating system, not in DinurdoJK.cfg. Auto-login requires an exact resolved IP:port match and a gamestate that identifies jaPRO.",
+        );
+
+        if !crate::credential_store::supported() {
+            theme::label(
+                ui,
+                theme::plain(
+                    "Secure saved logins are unavailable on this platform.",
+                    11.5,
+                    theme::TEXT_FAINT,
+                ),
+            );
+            return;
+        }
+
+        let current = self.current_japro_server_endpoint();
+        if let Some(server) = current {
+            let saved = self
+                .japro_saved_logins
+                .iter()
+                .find(|entry| entry.server == server)
+                .cloned();
+            theme::row(
+                ui,
+                "Current server",
+                "The exact resolved UDP endpoint used as the credential identity. Hostnames and display names are never used for automatic login matching.",
+                theme::Reset::None,
+                |ui| {
+                    theme::glow_label(ui, &server.to_string(), 12.5, theme::TEXT);
+                },
+            );
+
+            let mut save_current = false;
+            let mut forget_current = false;
+            theme::row(
+                ui,
+                "Auto-login",
+                "A saved login is sent at most once per connection, only after this exact endpoint's gamestate identifies the server as jaPRO.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(saved) = &saved {
+                        theme::glow_label(
+                            ui,
+                            &format!("ON  ·  {}", saved.username),
+                            12.5,
+                            theme::TEXT,
+                        );
+                        ui.add_space(10.0);
+                        if theme::ghost_button(ui, "FORGET").clicked() {
+                            forget_current = true;
+                        }
+                    } else {
+                        ui.add_enabled_ui(ready, |ui| {
+                            if theme::primary_button(ui, "SAVE & ENABLE").clicked() {
+                                save_current = true;
+                            }
+                        });
+                    }
+                },
+            );
+
+            if save_current {
+                match self.save_japro_login_for_current_server() {
+                    Ok(()) => {
+                        self.japro_credential_error = None;
+                        self.console_status = format!(
+                            "JAPRO AUTO-LOGIN SAVED FOR {server} (EXACT IP:PORT)"
+                        );
+                    }
+                    Err(error) => self.japro_credential_error = Some(error),
+                }
+            }
+            if forget_current {
+                match self.forget_japro_login(server) {
+                    Ok(()) => {
+                        self.japro_credential_error = None;
+                        self.console_status = format!("JAPRO AUTO-LOGIN FORGOTTEN FOR {server}");
+                    }
+                    Err(error) => self.japro_credential_error = Some(error),
+                }
+            }
+        } else {
+            theme::label(
+                ui,
+                theme::plain(
+                    "Connect to a jaPRO server to save an automatic login for its exact IP:port.",
+                    11.5,
+                    theme::TEXT_FAINT,
+                ),
+            );
+        }
+
+        if let Some(error) = &self.japro_credential_error {
+            theme::label(
+                ui,
+                theme::plain(&format!("Credential store: {error}"), 11.5, theme::TEXT_FAINT),
+            );
+        }
+
+        if !self.japro_saved_logins.is_empty() {
+            ui.add_space(10.0);
+            let saved_logins = self.japro_saved_logins.clone();
+            let mut forget = None;
+            for entry in saved_logins {
+                theme::row(
+                    ui,
+                    &entry.server.to_string(),
+                    "Saved in Windows Credential Manager. The password is never displayed here.",
+                    theme::Reset::None,
+                    |ui| {
+                        theme::glow_label(ui, &entry.username, 12.5, theme::TEXT);
+                        ui.add_space(10.0);
+                        if theme::ghost_button(ui, "FORGET").clicked() {
+                            forget = Some(entry.server);
+                        }
+                    },
+                );
+            }
+            if let Some(server) = forget {
+                match self.forget_japro_login(server) {
+                    Ok(()) => {
+                        self.japro_credential_error = None;
+                        self.console_status = format!("JAPRO AUTO-LOGIN FORGOTTEN FOR {server}");
+                    }
+                    Err(error) => self.japro_credential_error = Some(error),
+                }
+            }
         }
     }
 }
@@ -4087,6 +4443,11 @@ impl App {
             ui::VIDEO_ROW_TEXTURE_FILTER => {
                 self.video.texture_filter = defaults.texture_filter;
                 self.render_command(RenderCommand::SetTextureFilter(self.video.texture_filter));
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PICMIP => {
+                self.video.picmip = defaults.picmip;
+                self.render_command(RenderCommand::SetPicmip(self.video.picmip));
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_DETAIL_TEXTURES => {
@@ -4185,8 +4546,15 @@ impl App {
             }
             ui::VIDEO_ROW_FX_FPS => {
                 self.video.fx_fps = defaults.fx_fps;
+                self.apply_fx_fps_settings();
                 self.mark_config_dirty();
                 self.console_status = format!("FX FPS: {} HZ", self.video.fx_fps);
+            }
+            ui::VIDEO_ROW_FX_FPS_SCOPE => {
+                self.video.fx_fps_scope = defaults.fx_fps_scope;
+                self.apply_fx_fps_settings();
+                self.mark_config_dirty();
+                self.console_status = "FX FPS SCOPE: CONTINUOUS EFX".into();
             }
             ui::VIDEO_ROW_FX_LOD => {
                 self.video.fx_lod = defaults.fx_lod;
@@ -4303,6 +4671,10 @@ impl App {
             ui::VIDEO_ROW_DEPTH_OF_FIELD => {
                 self.set_depth_of_field_strength(defaults.depth_of_field_strength)
             }
+            ui::VIDEO_ROW_DOF_AUTOFOCUS => {
+                self.video.dof_autofocus = defaults.dof_autofocus;
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_DOF_QUALITY => {
                 self.video.dof_quality = defaults.dof_quality;
                 self.sync_post_effects();
@@ -4338,11 +4710,18 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_DEVELOPER_TOOLS => {
-                self.video.developer_tools = defaults.developer_tools;
+                self.video.developer_level = defaults.developer_level;
+                self.video.developer_tools = self.video.developer_level != 0;
+                crate::logging::set_developer_level(self.video.developer_level);
                 if !self.video.developer_tools {
                     self.surface_inspector = None;
                     self.render_command(RenderCommand::ClearSurfaceInspection);
                 }
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_RENDERER_VERBOSE => {
+                self.video.renderer_verbose = defaults.renderer_verbose;
+                crate::logging::set_renderer_verbose_level(self.video.renderer_verbose);
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PERF_TRACE => {
@@ -4423,6 +4802,23 @@ impl App {
             PHYS_RAGDOLL_MAX => self.video.ragdoll_max = defaults.ragdoll_max,
             PHYS_RAGDOLL_LIFETIME => self.video.ragdoll_lifetime = defaults.ragdoll_lifetime,
             PHYS_RAGDOLL_SELF_COLLISION => self.video.ragdoll_self_collision = defaults.ragdoll_self_collision,
+            PHYS_JIGGLE => self.video.jiggle_physics = defaults.jiggle_physics,
+            PHYS_JIGGLE_STRENGTH => self.video.jiggle_strength = defaults.jiggle_strength,
+            PHYS_JIGGLE_BREAST => self.video.jiggle_breast_strength = defaults.jiggle_breast_strength,
+            PHYS_JIGGLE_GLUTE => self.video.jiggle_glute_strength = defaults.jiggle_glute_strength,
+            PHYS_JIGGLE_STIFFNESS => self.video.jiggle_stiffness = defaults.jiggle_stiffness,
+            PHYS_JIGGLE_DAMPING => self.video.jiggle_damping = defaults.jiggle_damping,
+            PHYS_JIGGLE_GLUTE_LIFT => self.video.jiggle_glute_lift = defaults.jiggle_glute_lift,
+            PHYS_DISMEMBERMENT => self.video.dismemberment = defaults.dismemberment,
+            PHYS_DISMEMBER_MAX => self.video.dismember_max = defaults.dismember_max,
+            PHYS_DISMEMBER_LIFETIME => self.video.dismember_lifetime = defaults.dismember_lifetime,
+            PHYS_CLOTH => self.video.cloth_physics = defaults.cloth_physics,
+            PHYS_CLOTH_BODY_COLLISION => self.video.cloth_body_collision = defaults.cloth_body_collision,
+            PHYS_CLOTH_WIND => self.video.cloth_wind = defaults.cloth_wind,
+            PHYS_CLOTH_AIR => self.video.cloth_air_resistance = defaults.cloth_air_resistance,
+            PHYS_CLOTH_TURN => self.video.cloth_turn_response = defaults.cloth_turn_response,
+            PHYS_CLOTH_ANIMATION => self.video.cloth_animation_influence = defaults.cloth_animation_influence,
+            PHYS_CLOTH_CLEARANCE => self.video.cloth_body_clearance = defaults.cloth_body_clearance,
             PHYS_PROPS => self.video.physics_props = defaults.physics_props,
             PHYS_PROP_MAX => self.video.physics_prop_max = defaults.physics_prop_max,
             PHYS_DEBRIS => self.video.physics_debris = defaults.physics_debris,

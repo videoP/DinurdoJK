@@ -24,6 +24,7 @@ dependencies = [
  "naga",
  "oximedia-lut",
  "png",
+ "rapier-cloth-core",
  "rapier3d",
  "rayon",
  "rodio",
@@ -2851,6 +2852,13 @@ name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
+
+[[package]]
+name = "rapier-cloth-core"
+version = "0.1.0"
+dependencies = [
+ "glam 0.33.9",
+]
 
 [[package]]
 name = "rapier3d"

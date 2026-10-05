@@ -1,6 +1,9 @@
 mod egui_entity_graph;
+mod companion;
 mod egui_menu;
 mod egui_trace_menu;
+mod egui_strafe_trails;
+mod egui_race_ghosts;
 mod egui_pages;
 mod egui_settings;
 mod session_tools;
@@ -8,6 +11,8 @@ mod frontend;
 mod hitch;
 mod serverdump;
 mod map_editor;
+mod race_ghost;
+mod race_ghost_web;
 mod egui_theme;
 mod quality;
 mod ui_catalog;
@@ -16,13 +21,20 @@ use egui_menu::VideoSection;
 use egui_entity_graph::EntityGraphUi;
 use map_editor::{ExternalMapChange, MapEditor};
 use frontend::{
-    build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, DemoConsoleKind, DemoEntry,
-    DemoIndex, DemoMetadata, FrontendPage, ProfileModelEntry, ProfileSaberEntry, SoloMapEntry,
+    build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, ChatLogRangeFilter,
+    DemoConsoleKind, DemoEntry, DemoIndex, DemoMetadata, FrontendPage, ProfileModelEntry,
+    ProfileSaberEntry, SoloMapEntry,
 };
 
 use crate::{
-    camera::{offset_third_person_view, Camera, ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewInput},
+    chat_log::{BrowserDetail as ChatLogBrowserDetail, BrowserIndexEntry as ChatLogBrowserEntry},
+    camera::{
+        offset_third_person_view, Camera, SpectatorCameraMode, SpectatorCameraSettings,
+        SpectatorCameraState, ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewInput,
+        MAX_SPECTATOR_ORBIT_RANGE, MIN_SPECTATOR_ORBIT_RANGE,
+    },
     cgame::{
+        cloth::ClothConfig,
         entity_presenter::EntityPresenter,
         event_debug,
         event_workers,
@@ -31,15 +43,16 @@ use crate::{
         ragdoll::{PhysicsMapMesh, RagdollConfig},
         presented_openjk_player, snapshot_discontinuity,
         view::{local_player_alpha, rendering_third_person, PlayerViewPolicyState},
-        ClientGameState, ClientInfo, EntityPresentationKind, EventCheckDisposition, ForcedPlayerModels, PresentedEntity, ET_PLAYER,
+        ClientGameState, ClientInfo, EntityPresentationKind, EventCheckDisposition, ForcedPlayerModels, PresentationViewer, PresentedEntity, ET_PLAYER,
     },
     config,
     keybinds::{self, BindKey, Bindings},
     local_server::LocalServer,
-    player::{LocalPresentationSettings, MouseInputSettings},
+    player::MouseInputSettings,
     renderer::{
-        ClientFramePerf, DynamicModelSurface, EguiRenderData, InputLatencySample, InspectorEntityHint, PostEffects,
-        RenderCommand, RenderSnapshot, RenderThread, TransientLight, ViewLatchMode,
+        ClientFramePerf, DynamicModelSurface, EguiRenderData, InputLatencySample,
+        InspectorEntityHint, PostEffects, RenderCommand, RenderSnapshot, RenderThread, TransientLight,
+        ViewLatchMode,
     },
     runtime::{RenderStats, ScreenshotOutput, SurfaceInspectorInfo, SurfaceInspectorSection, UserEvent},
     scene::{self, SpawnPoint},
@@ -58,6 +71,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::File,
     io::{Cursor, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -672,6 +686,15 @@ struct ChatRecord {
     demo_elapsed_ms: Option<f64>,
 }
 
+/// Retained state for repeated chatbox Tab completion. The first Tab captures
+/// the original word's ranked candidates; later Tabs cycle that same set even
+/// though the visible input has already been replaced by a completed name.
+struct ChatPlayerCompletionCycle {
+    word_start: usize,
+    candidates: Vec<String>,
+    index: usize,
+}
+
 struct CenterPrintRecord {
     text: String,
     created: Instant,
@@ -821,10 +844,14 @@ struct DemoCameraSample {
     eye_position: [f32; 3],
     player_position: [f32; 3],
     view_angles: [f32; 3],
+    velocity: [f32; 3],
+    /// OpenJK playerState bobCycle; CG_CalculateWeaponPosition derives bob parity/phase from it.
+    bob_cycle: i32,
     view_height: i32,
     dead_yaw: f32,
     client_num: i32,
     policy: PlayerViewPolicyState,
+    following: bool,
     teleported: bool,
 }
 
@@ -848,11 +875,18 @@ enum DemoViewMode {
     Free,
 }
 
+const DEMO_FREE_SPEEDS: [f32; 7] = [78.75, 157.5, 315.0, 630.0, 1260.0, 2520.0, 5040.0];
+const DEMO_FREE_SPEED_DEFAULT_INDEX: usize = 3;
+
 #[derive(Debug, Clone, Copy)]
 struct DemoFakeView {
     client_num: i32,
+    /// Native JKA actor origin; third-person collision starts here.
+    native_origin: [f32; 3],
     eye_position: [f32; 3],
     view_angles: [f32; 3],
+    velocity: [f32; 3],
+    health: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +916,13 @@ struct DemoMetadataResult {
     generation: u64,
     demo_name: String,
     result: Result<DemoMetadata, String>,
+}
+
+struct RaceGhostLoadResult {
+    generation: u64,
+    replace_existing: bool,
+    source_key: String,
+    result: Result<race_ghost::RaceGhostTrack, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1004,6 +1045,10 @@ struct GameSession {
     suppress_audio: bool,
     /// Remote ET_PLAYER to animate but not submit while faking its first-person POV.
     demo_hidden_view_client: Option<i32>,
+    /// Camera mode mirrored from App for non-live demo follow/recorded POV presentation.
+    demo_spectator_camera_mode: Option<SpectatorCameraMode>,
+    /// Client-side obituary counts used by TaystJK cg_scoreDeaths modes 2/3.
+    client_deaths: [i32; 32],
     player_position: Option<glam::Vec3>,
     client_game: ClientGameState,
     siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
@@ -1045,6 +1090,13 @@ struct GameSession {
     race_stats: crate::japro_cg::RaceStats,
     /// The race readout for this frame (`None` outside a timed run).
     race_timer_ui: Option<crate::japro_cg::RaceTimerUi>,
+    /// Visual-only recorded race references. Kept as a Vec from day one so
+    /// multi-ghost presentation does not require changing session ownership.
+    race_ghosts: Vec<race_ghost::RaceGhost>,
+    race_ghost_alpha: f32,
+    /// Exact predicted/followed sample used to compare the live racer against
+    /// the synchronized ghost labels on this frame.
+    race_ghost_live_sample: Option<race_ghost::RaceGhostVisualSample>,
     /// jaPRO `lagometer`: frame / snapshot sample rings, fed as cgame reads snapshots
     /// and presents frames.
     lagometer: crate::lagometer::Lagometer,
@@ -1286,6 +1338,8 @@ impl GameSession {
             seeking_demo: false,
             suppress_audio: false,
             demo_hidden_view_client: None,
+            demo_spectator_camera_mode: None,
+            client_deaths: [0; 32],
             player_position: None,
             client_game: ClientGameState::new(),
             siege_classes,
@@ -1309,6 +1363,9 @@ impl GameSession {
             japro_cg: crate::japro_cg::JaproCgame::default(),
             race_stats: crate::japro_cg::RaceStats::default(),
             race_timer_ui: None,
+            race_ghosts: Vec::new(),
+            race_ghost_alpha: 0.35,
+            race_ghost_live_sample: None,
             lagometer: crate::lagometer::Lagometer::default(),
             map_change: false,
             vote_ui: None,
@@ -1382,8 +1439,7 @@ impl GameSession {
         if event.event != EntityEvent::EV_NOAMMO {
             return;
         }
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
+        let Some(ps) = self.client_game.presentation_player_state() else { return };
         let local = ps.field_i32("clientNum").unwrap_or(-1);
         let duel = ps.field_i32("duelInProgress").unwrap_or(0) != 0;
         let duel_index = ps.field_i32("duelIndex").unwrap_or(-1);
@@ -1418,8 +1474,7 @@ impl GameSession {
     fn note_stringed_messages(&mut self, event: &crate::cgame::PresentationEvent) {
         use crate::cgame::CgameNotice;
         use EntityEvent as E;
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let local = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
+        let local = self.client_game.presentation_client_num().unwrap_or(-1);
         let state = &event.state;
         let notice = match event.event {
             E::EV_GLOBAL_DUEL => {
@@ -1488,6 +1543,88 @@ impl GameSession {
         }
     }
 
+    /// OpenJK CG_Obituary. The obituary line is a client-side consequence of
+    /// EV_OBITUARY, which is why demo playback otherwise had kill effects/markers
+    /// but no console death text.
+    fn note_obituary(&mut self, event: &crate::cgame::PresentationEvent) {
+        use EntityEvent as E;
+        if event.event != E::EV_OBITUARY {
+            return;
+        }
+        let target = event.state.field_i32("otherEntityNum").unwrap_or(-1);
+        let attacker = event.state.field_i32("otherEntityNum2").unwrap_or(-1);
+        let mod_ = event.parm;
+        let Some(target_client) = usize::try_from(target).ok().filter(|&client| client < 32) else { return };
+        self.client_deaths[target_client] = self.client_deaths[target_client].saturating_add(1);
+        let Some(target_name) = self.client_game.client_name(target_client) else { return };
+
+        let attacker_client = usize::try_from(attacker).ok().filter(|&client| client < 32);
+        let attacker_name = attacker_client.and_then(|client| self.client_game.client_name(client));
+        let gender = self.client_game.client_gender(target_client);
+        let gender_key = |male: &'static str, female: &'static str, neuter: &'static str| match gender {
+            1 => female,
+            2 => neuter,
+            _ => male,
+        };
+
+        let notice = if attacker == target {
+            let key = match mod_ {
+                4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 17 => gender_key(
+                    "SUICIDE_SHOT_MALE", "SUICIDE_SHOT_FEMALE", "SUICIDE_SHOT_GENDERLESS",
+                ),
+                14 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 => gender_key(
+                    "SUICIDE_EXPLOSIVES_MALE", "SUICIDE_EXPLOSIVES_FEMALE", "SUICIDE_EXPLOSIVES_GENDERLESS",
+                ),
+                15 => gender_key(
+                    "SUICIDE_ELECTROCUTED_MALE", "SUICIDE_ELECTROCUTED_FEMALE", "SUICIDE_ELECTROCUTED_GENDERLESS",
+                ),
+                38 => gender_key(
+                    "SUICIDE_FALLDEATH_MALE", "SUICIDE_FALLDEATH_FEMALE", "SUICIDE_FALLDEATH_GENDERLESS",
+                ),
+                _ => gender_key(
+                    "SUICIDE_GENERICDEATH_MALE", "SUICIDE_GENERICDEATH_FEMALE", "SUICIDE_GENERICDEATH_GENDERLESS",
+                ),
+            };
+            crate::cgame::CgameNotice::Obituary { target: target_name, attacker: None, key }
+        } else if let Some(attacker_name) = attacker_name {
+            let key = match mod_ {
+                1 => "KILLED_STUN",
+                2 => "KILLED_MELEE",
+                3 => "KILLED_SABER",
+                4 | 5 => "KILLED_BRYAR",
+                6 | 7 => "KILLED_BLASTER",
+                8 | 9 => "KILLED_DISRUPTOR",
+                10 => "KILLED_DISRUPTORSNIPE",
+                11 => "KILLED_BOWCASTER",
+                12 => "KILLED_REPEATER",
+                13 | 14 => "KILLED_REPEATERALT",
+                15 | 16 => "KILLED_DEMP2",
+                17 => "KILLED_FLECHETTE",
+                18 => "KILLED_FLECHETTE_MINE",
+                19 | 20 => "KILLED_ROCKET",
+                21 | 22 => "KILLED_ROCKET_HOMING",
+                23 | 24 => "KILLED_THERMAL",
+                25 => "KILLED_TRIPMINE",
+                26 => "KILLED_TRIPMINE_TIMED",
+                27 => "KILLED_DETPACK",
+                28 | 29 | 30 | 36 | 41 => "KILLED_GENERIC",
+                31 => "KILLED_DARKFORCE",
+                32 => "KILLED_SENTRY",
+                37 => "KILLED_TELEFRAG",
+                38 => "KILLED_FORCETOSS",
+                _ => "KILLED_GENERIC",
+            };
+            crate::cgame::CgameNotice::Obituary { target: target_name, attacker: Some(attacker_name), key }
+        } else {
+            let key = match mod_ {
+                40 => "DIED_LASER",
+                _ => "DIED_GENERIC",
+            };
+            crate::cgame::CgameNotice::Obituary { target: target_name, attacker: None, key }
+        };
+        self.client_game.push_notice(notice);
+    }
+
     /// TaystJK/jaPRO `cg_killMessage`: EV_OBITUARY is the authoritative kill
     /// event, so this shares exactly the same attacker/target semantics as
     /// `cg_killSounds` and works for live play, demos, and follow views.
@@ -1503,9 +1640,7 @@ impl GameSession {
         if option == 0 {
             return;
         }
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
-        let local = ps.field_i32("clientNum").unwrap_or(-1);
+        let Some(local) = self.client_game.presentation_client_num() else { return };
         let target = event.state.field_i32("otherEntityNum").unwrap_or(-1);
         let attacker = event.state.field_i32("otherEntityNum2").unwrap_or(-1);
         if attacker != local || attacker == target {
@@ -1518,10 +1653,14 @@ impl GameSession {
         else {
             return;
         };
+        let (rank, score) = self
+            .client_game
+            .presentation_player_state()
+            .map_or((None, None), |ps| (Some(ps.persistant[2]), Some(ps.persistant[0])));
         self.client_game.push_notice(crate::cgame::CgameNotice::KillMessage {
             target: info.name,
-            rank: ps.persistant[2],
-            score: ps.persistant[0],
+            rank,
+            score,
             gametype: self.client_game.gametype(),
         });
     }
@@ -1529,9 +1668,11 @@ impl GameSession {
     /// EV_LOCALTIMER, EV_SCOREPLUM and the saber "no force" flash of EV_NOAMMO.
     fn note_hud_events(&mut self, event: &crate::cgame::PresentationEvent) {
         use EntityEvent as E;
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
-        let local = ps.field_i32("clientNum").unwrap_or(-1);
+        let Some(local) = self.client_game.presentation_client_num() else { return };
+        let viewer_weapon = self
+            .client_game
+            .presentation_player_state()
+            .and_then(|ps| ps.field_i32("weapon"));
         match event.event {
             E::EV_LOCALTIMER if event.state.field_i32("owner") == Some(local) => {
                 let duration = event.state.field_i32("time2").unwrap_or(0);
@@ -1547,7 +1688,8 @@ impl GameSession {
                 }
             }
             E::EV_NOAMMO if i32::from(event.entity_num) == local => {
-                if ps.field_i32("weapon") == Some(3) {
+                // Remote demo POVs have no complete playerState weapon/force data.
+                if viewer_weapon == Some(3) {
                     self.force_flash_until = Some(Instant::now() + Duration::from_millis(1000));
                 }
             }
@@ -1562,10 +1704,14 @@ impl GameSession {
         if !matches!(event.event, E::EV_ITEM_PICKUP | E::EV_GLOBAL_ITEM_PICKUP) {
             return;
         }
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
-        if ps.field_i32("duelInProgress").unwrap_or(0) != 0
-            || i32::from(event.entity_num) != ps.field_i32("clientNum").unwrap_or(-1)
+        let Some(local) = self.client_game.presentation_client_num() else { return };
+        if i32::from(event.entity_num) != local {
+            return;
+        }
+        if self
+            .client_game
+            .presentation_player_state()
+            .is_some_and(|ps| ps.field_i32("duelInProgress").unwrap_or(0) != 0)
         {
             return;
         }
@@ -1603,8 +1749,7 @@ impl GameSession {
         if self.screen_shake_level < 2 || !matches!(event.event, E::EV_FIRE_WEAPON | E::EV_ALT_FIRE) {
             return;
         }
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        if i32::from(event.entity_num) != snapshot.player_state.field_i32("clientNum").unwrap_or(-1) {
+        if self.client_game.presentation_client_num() != Some(i32::from(event.entity_num)) {
             return;
         }
         let alt = event.event == E::EV_ALT_FIRE;
@@ -1631,17 +1776,23 @@ impl GameSession {
     /// EV_FALL / EV_ROLL landings and EV_STEP_* smoothing for the viewer.
     fn note_view_kick(&mut self, event: &crate::cgame::PresentationEvent) {
         use EntityEvent as E;
-        let Some(snapshot) = self.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
-        let local = ps.field_i32("clientNum").unwrap_or(-1);
+        let Some(local) = self.client_game.presentation_client_num() else { return };
         if event.state.field_i32("clientNum").unwrap_or(-2) != local {
             return;
         }
+        let (falling_to_death, pm_flags) = self
+            .client_game
+            .presentation_player_state()
+            .map_or((false, 0), |ps| {
+                (
+                    ps.field_i32("fallingToDeath").unwrap_or(0) != 0,
+                    ps.field_i32("pm_flags").unwrap_or(0),
+                )
+            });
         let time = event.server_time;
         match event.event {
             E::EV_FALL | E::EV_ROLL => {
                 // EV_ROLL only runs DoFall for a fall-roll-in-one (eventParm set).
-                let falling_to_death = ps.field_i32("fallingToDeath").unwrap_or(0) != 0;
                 if !falling_to_death && (event.event == E::EV_FALL || event.parm != 0) {
                     self.event_presenter.view_kick_mut().land(event.parm, time);
                 }
@@ -1649,7 +1800,9 @@ impl GameSession {
             E::EV_STEP_4 | E::EV_STEP_8 | E::EV_STEP_12 | E::EV_STEP_16 => {
                 // Demos and followed players interpolate, so they need no smoothing.
                 const PMF_FOLLOW: i32 = 4096;
-                if (self.live || self.local) && ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0 {
+                if (self.live || self.local)
+                    && pm_flags & PMF_FOLLOW == 0
+                {
                     let steps = event.event.as_i32() - E::EV_STEP_4.as_i32() + 1;
                     self.event_presenter.view_kick_mut().step(steps, time);
                 }
@@ -1674,6 +1827,7 @@ impl GameSession {
         self.note_weapon_shake(&event);
         self.note_item_pickup(&event);
         self.note_hud_events(&event);
+        self.note_obituary(&event);
         self.note_kill_message(&event);
         self.note_stringed_messages(&event);
         let fx_dispatch = self.weapon_fx.entity_event_prepared(&event, &fx);
@@ -1755,7 +1909,8 @@ impl GameSession {
             Ok(None) => {
                 self.eof = true;
                 if !self.seeking_demo {
-                    println!(
+                    devprintln!(
+                        1,
                         "DEMO EOF: {} messages, {} valid snapshots",
                         self.messages, self.snapshots
                     );
@@ -1794,7 +1949,8 @@ impl GameSession {
                     checksum_feed,
                 } => {
                     if !self.seeking_demo {
-                        println!(
+                        devprintln!(
+                            2,
                             "DEMO svc_gamestate: sequence={} serverCommandSequence={} configstrings={} baselines={} clientNum={} checksumFeed=0x{:08x}",
                             sequence,
                             server_command_sequence,
@@ -1806,7 +1962,7 @@ impl GameSession {
                     }
                     if let Some(map) = self.decoder.map_name() {
                         if self.map_name.as_deref() != Some(map.as_str()) {
-                            if !self.seeking_demo { println!("DEMO map: {map}"); }
+                            if !self.seeking_demo { devprintln!(1, "DEMO map: {map}"); }
                         }
                         self.map_name = Some(map);
                     }
@@ -1820,7 +1976,8 @@ impl GameSession {
                 ServerMessageEvent::ServerCommand(command) => {
                     self.client_game.queue_server_command(command.clone());
                     if !self.seeking_demo {
-                        println!(
+                        devprintln!(
+                            2,
                             "DEMO svc_serverCommand #{}: {}",
                             command.sequence,
                             String::from_utf8_lossy(&command.text)
@@ -1835,7 +1992,8 @@ impl GameSession {
                 } => {
                     self.snapshots += 1;
                     if !self.seeking_demo && (self.snapshots == 1 || self.snapshots % 60 == 0) {
-                        println!(
+                        devprintln!(
+                            3,
                             "DEMO svc_snapshot: serverTime={} message={} delta={} entities={} decodedSnapshots={}",
                             server_time,
                             message_num,
@@ -1848,11 +2006,11 @@ impl GameSession {
                 }
                 ServerMessageEvent::SetGame(game) => {
                     if !self.seeking_demo {
-                        println!("DEMO svc_setgame: {}", String::from_utf8_lossy(game));
+                        devprintln!(2, "DEMO svc_setgame: {}", String::from_utf8_lossy(game));
                     }
                 }
-                ServerMessageEvent::MapChange => { if !self.seeking_demo { println!("DEMO svc_mapchange"); } }
-                ServerMessageEvent::Download(_) => { if !self.seeking_demo { println!("DEMO svc_download"); } }
+                ServerMessageEvent::MapChange => { if !self.seeking_demo { devprintln!(2, "DEMO svc_mapchange"); } }
+                ServerMessageEvent::Download(_) => { if !self.seeking_demo { devprintln!(2, "DEMO svc_download"); } }
             }
         }
 
@@ -1905,6 +2063,34 @@ impl GameSession {
         self.timeline.map(|timeline| timeline.rate)
     }
 
+    /// Freeze completed demo playback on the final authoritative snapshot instead
+    /// of tearing down the CGame session. Keeping the session alive preserves the
+    /// rendered world, camera/follow mode, scoreboard and seek controls so the
+    /// user can scrub back and resume from the timeline.
+    fn hold_demo_end(&mut self, now: Instant) -> Result<(), String> {
+        if self.live || self.local {
+            return Ok(());
+        }
+        let final_server_time = self
+            .current_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.server_time)
+            .ok_or_else(|| "DEMO HAS NO FINAL SNAPSHOT".to_owned())?;
+        let timeline = self
+            .timeline
+            .as_mut()
+            .ok_or_else(|| "DEMO PLAYBACK CLOCK WAS NOT INITIALIZED".to_owned())?;
+
+        // Clamp away any wall-clock overshoot from the frame that discovered EOF,
+        // then pause. set_rate(0) intentionally leaves resume_rate unchanged.
+        timeline.seek(now, f64::from(final_server_time));
+        timeline.set_rate(now, 0.0);
+        if let Some(sound) = &mut self.sound_presenter {
+            sound.set_rate(0.0);
+        }
+        Ok(())
+    }
+
     fn set_audio_suppressed(&mut self, suppressed: bool) {
         if self.suppress_audio == suppressed {
             return;
@@ -1925,6 +2111,89 @@ impl GameSession {
         let first = f64::from(self.demo_index.as_ref()?.first_active_server_time?);
         let current = self.timeline?.target_time_ms(now);
         Some((current - first).clamp(0.0, f64::from(self.demo_duration_ms()?.max(0))))
+    }
+
+    /// Rebuild the scoreboard from demo-indexed `scores` commands instead of
+    /// trying to ask a non-existent historical server for fresh data. Team/top
+    /// scores come from the *current* CS_SCORES1/2 state so they remain exact
+    /// between sparse recorded scoreboard payloads and after seeks.
+    fn demo_scoreboard_ui(&self, now: Instant, score_deaths_mode: i32) -> Option<UiScoreboard> {
+        if self.live {
+            return None;
+        }
+        let elapsed_ms = self.demo_elapsed_ms(now)?.round() as i32;
+        let gametype = self.client_game.gametype();
+        let limits = self.client_game.match_limits();
+        let sample = self.demo_index.as_ref()?.scoreboard_at(elapsed_ms);
+        let current_team_scores = [limits.scores1, limits.scores2];
+        let team_scores = if self.client_game.configstring(crate::cgame::CS_SCORES1).is_some()
+            || self.client_game.configstring(crate::cgame::CS_SCORES2).is_some()
+        {
+            current_team_scores
+        } else {
+            sample.map_or(current_team_scores, |sample| sample.team_scores)
+        };
+        let mut entries = sample
+            .map(|sample| {
+                sample
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        // Client slot is the stable wire identity. If a user
+                        // renamed or changed teams after this score payload,
+                        // present the current CS_PLAYERS identity while keeping
+                        // the score/ping/time values from the recorded command.
+                        let current = usize::try_from(entry.client)
+                            .ok()
+                            .and_then(|client| self.client_game.client_info(client, &self.siege_classes));
+                        let counted = usize::try_from(entry.client)
+                            .ok()
+                            .filter(|&client| client < self.client_deaths.len())
+                            .map(|client| self.client_deaths[client]);
+                        let deaths = match score_deaths_mode {
+                            0 => None,
+                            1 => entry.deaths,
+                            2 => entry.deaths.or(counted),
+                            3 => counted,
+                            _ => entry.deaths,
+                        };
+                        UiScoreEntry {
+                            client: entry.client,
+                            name: current.as_ref().map_or_else(|| entry.name.clone(), |info| info.name.clone()),
+                            score: entry.score,
+                            deaths,
+                            ping: entry.ping,
+                            time: entry.time,
+                            team: current.as_ref().map_or(entry.team, |info| info.team),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // A recorded score payload may be a couple of seconds old. The POV's
+        // own PERS_SCORE is carried in every playerState, so refresh that row
+        // when it already exists without fabricating ping/time for missing rows.
+        if let Some(snapshot) = self.current_snapshot.as_ref() {
+            if let Some(client) = snapshot.player_state.field_i32("clientNum") {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.client == client) {
+                    if let Some(score) = snapshot.player_state.persistant.first() {
+                        entry.score = *score;
+                    }
+                }
+            }
+        }
+
+        let show_deaths = score_deaths_mode != 0
+            && !matches!(gametype, 3 | 4 | 8)
+            && entries.iter().any(|entry| entry.deaths.is_some());
+        Some(UiScoreboard {
+            team_scores,
+            team_game: gametype >= 6,
+            spectator_scores: matches!(gametype, 3 | 4),
+            show_deaths,
+            entries,
+        })
     }
 
     fn demo_followed_client(&self) -> Option<i32> {
@@ -1966,8 +2235,15 @@ impl GameSession {
         eye[2] += 26.0;
         Some(DemoFakeView {
             client_num,
+            native_origin: entity.origin,
             eye_position: scene::render_position(eye),
             view_angles: entity.angles,
+            velocity: [
+                entity.state.field_f32("pos.trDelta[0]").unwrap_or(0.0),
+                entity.state.field_f32("pos.trDelta[1]").unwrap_or(0.0),
+                entity.state.field_f32("pos.trDelta[2]").unwrap_or(0.0),
+            ],
+            health: entity.state.field_i32("health").unwrap_or(100),
         })
     }
 
@@ -1989,6 +2265,8 @@ impl GameSession {
         self.timeline = None;
         self.eof = false;
         self.player_position = None;
+        self.demo_spectator_camera_mode = None;
+        self.client_deaths = [0; 32];
         self.client_game = ClientGameState::new();
         self.presented_entities.clear();
         self.event_presenter.clear();
@@ -2053,7 +2331,20 @@ impl GameSession {
 
         // Seeking reconstructs authoritative CGame state, but transient effects
         // from the replay-to-target pass must not burst onto the destination frame.
-        let _ = self.client_game.drain_presentation_events();
+        // Keep the one persistent client-side statistic TaystJK needs for
+        // cg_scoreDeaths 2/3 so seeking does not reset the displayed count.
+        for event in self.client_game.drain_presentation_events() {
+            if event.event == EntityEvent::EV_OBITUARY {
+                if let Some(target) = event
+                    .state
+                    .field_i32("otherEntityNum")
+                    .and_then(|target| usize::try_from(target).ok())
+                    .filter(|&target| target < self.client_deaths.len())
+                {
+                    self.client_deaths[target] = self.client_deaths[target].saturating_add(1);
+                }
+            }
+        }
         let _ = self.client_game.drain_event_check_traces();
         // Replayed server commands are historical at the seek destination. The App
         // reconstructs chat/centerprint explicitly from the indexed demo timeline.
@@ -2199,6 +2490,7 @@ impl GameSession {
         &mut self,
         now: Instant,
         third_person: ThirdPersonSettings,
+        spectator_camera: SpectatorCameraSettings,
         first_person_lightsaber: bool,
         debug_events: u8,
         event_workers_enabled: bool,
@@ -2218,6 +2510,7 @@ impl GameSession {
             target_server_time,
             presentation_time_ms,
             third_person,
+            spectator_camera,
             first_person_lightsaber,
             debug_events,
             event_workers_enabled,
@@ -2233,6 +2526,7 @@ impl GameSession {
         &mut self,
         target_server_time: i32,
         third_person: ThirdPersonSettings,
+        spectator_camera: SpectatorCameraSettings,
         first_person_lightsaber: bool,
         debug_events: u8,
         event_workers_enabled: bool,
@@ -2244,6 +2538,7 @@ impl GameSession {
             target_server_time,
             f64::from(target_server_time),
             third_person,
+            spectator_camera,
             first_person_lightsaber,
             debug_events,
             event_workers_enabled,
@@ -2262,6 +2557,7 @@ impl GameSession {
         target_server_time: i32,
         presentation_time_ms: f64,
         third_person: ThirdPersonSettings,
+        spectator_camera: SpectatorCameraSettings,
         first_person_lightsaber: bool,
         debug_events: u8,
         event_workers_enabled: bool,
@@ -2356,6 +2652,21 @@ impl GameSession {
         for command in self.client_game.drain_ghoul2_commands() {
             self.player_presenter.apply_ghoul2_server_command(command);
         }
+        for action in self.client_game.drain_audio_server_actions() {
+            if let Some(sound) = self.sound_presenter.as_mut() {
+                match action {
+                    crate::cgame::CgameServerAction::KillLoopSounds { entities } => {
+                        for entity in entities {
+                            sound.kill_looping_sound(entity);
+                        }
+                    }
+                    crate::cgame::CgameServerAction::RestartMapMusic => {
+                        sound.restart_map_music(&self.client_game);
+                    }
+                    _ => unreachable!("drain_audio_server_actions returned a non-audio action"),
+                }
+            }
+        }
 
         // FX_AdjustTime: effects spawned by this frame's events and entities
         // start at cg.time.
@@ -2401,9 +2712,16 @@ impl GameSession {
         // person needs collision/orbit state owned by App, so it uses the previous
         // rendered third-person camera as a one-frame hint. Never reuse that hint
         // across a teleport/snapshot discontinuity.
+        let sample_third_person = if self.live && sample.following {
+            spectator_camera.mode != SpectatorCameraMode::FirstPerson
+        } else if let Some(mode) = self.demo_spectator_camera_mode {
+            mode != SpectatorCameraMode::FirstPerson
+        } else {
+            rendering_third_person(third_person, first_person_lightsaber, sample.policy)
+        };
         let ghoul2_view = if sample.teleported {
             None
-        } else if !rendering_third_person(third_person, first_person_lightsaber, sample.policy) {
+        } else if !sample_third_person {
             ghoul2_view.map(|view| {
                 let yaw = sample.view_angles[1].to_radians();
                 let pitch = -sample.view_angles[0].to_radians();
@@ -2554,7 +2872,8 @@ impl GameSession {
         }
         if !self.logged_entity_summary {
             let summary = self.client_game.summarize_entities();
-            println!(
+            devprintln!(
+                2,
                 "DEMO ENTITY TYPES: total={} players={} npcs={} movers={} missiles={} items={} eventEntities={} other={}",
                 summary.total,
                 summary.players,
@@ -2565,7 +2884,8 @@ impl GameSession {
                 summary.event_entities,
                 summary.other,
             );
-            println!(
+            devprintln!(
+                2,
                 "DEMO GAME RULES: gametype={} weaponDisable=0x{:08x}",
                 self.client_game.gametype(),
                 self.client_game.weapon_disable_mask() as u32,
@@ -2586,7 +2906,8 @@ impl GameSession {
                     .client_game
                     .client_info(client_num as usize, &self.siege_classes)
                 {
-                    Some(info) => println!(
+                    Some(info) => devprintln!(
+                        2,
                         "  ET_PLAYER entity={} clientNum={} name={:?} model={}/{} glm={} skin={} siegeclass={:?}",
                         entity.number,
                         client_num,
@@ -2597,7 +2918,8 @@ impl GameSession {
                         info.skin_qpath(),
                         info.siege_class,
                     ),
-                    None => println!(
+                    None => devprintln!(
+                        2,
                         "  ET_PLAYER entity={} clientNum={} has no CS_PLAYERS configstring",
                         entity.number, client_num
                     ),
@@ -2688,7 +3010,8 @@ impl GameSession {
         self.client_perf.entity_present_ms = entity_present_started.elapsed().as_secs_f64() * 1000.0;
         self.inline_models = Arc::new(inline_models);
         if !self.logged_dispatch_summary {
-            println!(
+            devprintln!(
+                2,
                 "DEMO ENTITY DISPATCH: general={} movers={} items={} missiles={} npcs={} fx={} other={} renderedSurfaces={}",
                 dispatch_summary.general,
                 dispatch_summary.movers,
@@ -2701,6 +3024,9 @@ impl GameSession {
             );
             self.logged_dispatch_summary = true;
         }
+        self.player_presenter.set_external_live_entities(
+            self.race_ghosts.iter().map(|ghost| ghost.entity_num),
+        );
         let player_present_started = Instant::now();
         dynamic_models.extend(self.player_presenter.present_snapshot_players(
             &self.presented_entities,
@@ -2712,16 +3038,39 @@ impl GameSession {
             ghoul2_view,
             self.forced_player_models.as_ref(),
         ));
+        // TaystJK CG_Player: spawn protection is an authoritative eFlags bit
+        // and the shell is a separate MD3 refEntity, not a tint on Ghoul2.
+        // Use the same presentation view that selected player LODs; in first
+        // person it was replaced above with this frame's exact sampled eye.
+        let sphere_view_origin = ghoul2_view
+            .map(crate::cgame::player_presenter::Ghoul2PresentationView::jka_position)
+            .unwrap_or_else(|| scene::jka_position(sample.eye_position));
+        dynamic_models.extend(self.entity_presenter.present_invulnerability_bubbles(
+            &self.presented_entities,
+            followed_entity.as_ref(),
+            &self.client_game,
+            sphere_view_origin,
+        ));
         self.client_perf.player_present_ms = player_present_started.elapsed().as_secs_f64() * 1000.0;
-        // OpenJK always runs CG_Player for the local/predicted player. In first
-        // person it marks the refEntity RF_THIRD_PERSON so the body is not
-        // submitted to the main view, but its animation/Ghoul2 state continues
-        // to advance. Mirror that ownership here instead of recreating the local
-        // player only when cg_thirdPerson is enabled.
-        let render_followed_body =
-            rendering_third_person(third_person, first_person_lightsaber, sample.policy);
+        // EternalJK keeps the local Ghoul2 instance active for first-person
+        // saber/melee so the attached hilt and blade bolts keep presenting,
+        // but cg_fpls mode 3 turns the player-body surfaces off. Other weapons
+        // use the separate CG_AddViewWeapon-style first-person viewmodel path.
+        const WP_MELEE: i32 = 2;
+        const WP_SABER: i32 = 3;
+        // EternalJK only applies cg_fpls to the local non-followed player;
+        // spectator/follow presentation disables it rather than putting the
+        // followed player's Ghoul2 instance around the camera.
+        let first_person_saber = !sample_third_person
+            && first_person_lightsaber
+            && !sample.following
+            && matches!(sample.policy.weapon, WP_MELEE | WP_SABER);
+        let render_followed_body = sample_third_person || first_person_saber;
         let followed_started = Instant::now();
-        if let Some(entity) = followed_entity {
+        let intermission = sample.policy.pm_type == crate::cgame::PM_INTERMISSION;
+        if let Some(entity) = followed_entity.filter(|entity| {
+            !crate::cgame::suppressed_during_intermission(intermission, entity)
+        }) {
             let client_num = entity.state.field_i32("clientNum").unwrap_or(sample.client_num);
             if client_num >= 0 {
                 if let Some(info) = self.client_game.client_info(client_num as usize, &self.siege_classes) {
@@ -2748,6 +3097,7 @@ impl GameSession {
                         look_target_origin,
                         sample.teleported,
                         render_followed_body,
+                        first_person_saber,
                         // Without a view the presenter cannot pick a Ghoul2 LOD,
                         // so the local player's own model would stay at LOD 0.
                         ghoul2_view,
@@ -2771,10 +3121,112 @@ impl GameSession {
                             local_player_alpha(third_person.alpha),
                         )?);
                     }
+                    // TaystJK/OpenJK CG_AddViewWeapon. Saber/melee are intentionally
+                    // absent here: their first-person presentation is the local
+                    // Ghoul2 body above. Firearms/explosives use the bg_itemlist
+                    // view_model + _hand.md3 tag parent with RF_DEPTHHACK semantics.
+                    const TEAM_SPECTATOR: i32 = 3;
+                    if !sample_third_person
+                        && sample.policy.team != TEAM_SPECTATOR
+                        && !intermission
+                        && sample.policy.zoom_mode == 0
+                        && !matches!(jka_movement::animation_name(sample.policy.torso_anim), Some("BOTH_BUTTON_HOLD"))
+                    {
+                        let (hand_frame, hand_oldframe, hand_backlerp) =
+                            self.player_presenter.view_weapon_frames(
+                                entity.number,
+                                target_server_time,
+                                sample.policy.torso_anim,
+                                sample.policy.force_hand_extend,
+                            );
+                        // CG_CalculateWeaponPosition starts from cg.refdef.vieworg,
+                        // which already includes the first-person fall/step offset.
+                        let mut weapon_view_origin = sample.eye_position;
+                        weapon_view_origin[2] += self
+                            .event_presenter
+                            .view_kick()
+                            .offset(target_server_time, true);
+                        dynamic_models.extend(self.entity_presenter.present_view_weapon(
+                            entity.number,
+                            sample.policy.weapon,
+                            weapon_view_origin,
+                            sample.view_angles,
+                            sample.velocity,
+                            sample.bob_cycle,
+                            target_server_time,
+                            self.event_presenter.view_kick().weapon_land_offset(target_server_time),
+                            hand_frame,
+                            hand_oldframe,
+                            hand_backlerp,
+                        )?);
+                    }
                 }
             }
         }
         self.client_perf.followed_player_ms = followed_started.elapsed().as_secs_f64() * 1000.0;
+
+        // `/rGhost`: the reference player is presentation-only and is driven by
+        // the live player's own duelTime race clock. It never enters collision,
+        // prediction, entity dispatch, audio, events, or server-visible state.
+        self.race_ghost_live_sample = None;
+        if self.live && !self.race_ghosts.is_empty() {
+            let ghost_present_started = Instant::now();
+            let live_race_clock = predicted
+                .as_ref()
+                .map(|prediction| &prediction.display)
+                .or_else(|| self.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state))
+                .map(|player_state| {
+                    (
+                        player_state.field_i32("duelTime").unwrap_or(0),
+                        player_state.stats[crate::japro_cg::STAT_RACEMODE] != 0,
+                        playerstate_vec3(player_state, "origin"),
+                        playerstate_vec3(player_state, "velocity"),
+                    )
+                });
+            if let Some((live_duel_time, live_race_mode, live_origin, live_velocity)) = live_race_clock {
+                if live_duel_time > 0 && live_race_mode {
+                    if let (Some(origin), Some(velocity)) = (live_origin, live_velocity) {
+                        self.race_ghost_live_sample = Some(race_ghost::RaceGhostVisualSample {
+                            origin,
+                            velocity,
+                        });
+                    }
+                }
+                let mut ghost_errors = Vec::new();
+                for ghost in &mut self.race_ghosts {
+                    if let Some((entity, force_reset, _elapsed_ms)) = ghost.sample(
+                        live_duel_time,
+                        live_race_mode,
+                        target_server_time,
+                    ) {
+                        match self.player_presenter.present_race_ghost_entity(
+                            &entity,
+                            &ghost.info,
+                            target_server_time,
+                            self.race_ghost_alpha,
+                            force_reset,
+                            ghoul2_view,
+                        ) {
+                            Ok(mut draws) => dynamic_models.append(&mut draws),
+                            Err(error) => ghost_errors.push(format!(
+                                "RACE GHOST presentation {}: {error}",
+                                ghost.track.demo_name
+                            )),
+                        }
+                    }
+                }
+                for error in ghost_errors {
+                    self.push_event_debug_line(error);
+                }
+            } else {
+                for ghost in &mut self.race_ghosts {
+                    ghost.reset_sync();
+                }
+            }
+            self.client_perf.player_present_ms +=
+                ghost_present_started.elapsed().as_secs_f64() * 1000.0;
+        }
+
         let cosmetics = self.player_presenter.drain_cosmetic_draws();
         if !cosmetics.is_empty() {
             dynamic_models.extend(self.entity_presenter.present_cosmetics(cosmetics));
@@ -2893,6 +3345,11 @@ impl GameSession {
 
         let completed = self.eof
             && self.next_snapshot.is_none()
+            // Once App freezes the demo at EOF, subsequent render frames should
+            // simply keep presenting that final snapshot rather than repeatedly
+            // reporting completion. Seeking backwards and resuming makes rate > 0
+            // again, so reaching EOF later still produces one completion edge.
+            && self.timeline.is_some_and(|timeline| timeline.rate > 0.0)
             && self
                 .current_snapshot
                 .as_ref()
@@ -2934,16 +3391,19 @@ impl GameSession {
 
         let current_origin = playerstate_vec3(&current.player_state, "origin")?;
         let current_angles = playerstate_vec3(&current.player_state, "viewangles")?;
+        let current_velocity = playerstate_vec3(&current.player_state, "velocity").unwrap_or([0.0; 3]);
         let current_viewheight = current
             .player_state
             .field_i32("viewheight")
             .unwrap_or(0) as f32;
 
-        let (origin, angles, viewheight) = if let Some(next) = next {
+        let (origin, angles, velocity, viewheight) = if let Some(next) = next {
             let next_origin = playerstate_vec3(&next.player_state, "origin")
                 .unwrap_or(current_origin);
             let next_angles = playerstate_vec3(&next.player_state, "viewangles")
                 .unwrap_or(current_angles);
+            let next_velocity = playerstate_vec3(&next.player_state, "velocity")
+                .unwrap_or(current_velocity);
             let next_viewheight = next
                 .player_state
                 .field_i32("viewheight")
@@ -2955,14 +3415,18 @@ impl GameSession {
                     lerp_angle_degrees(current_angles[1], next_angles[1], alpha),
                     lerp_angle_degrees(current_angles[2], next_angles[2], alpha),
                 ],
+                lerp_vec3(current_velocity, next_velocity, alpha),
                 current_viewheight + (next_viewheight - current_viewheight) * alpha,
             )
         } else {
-            (current_origin, current_angles, current_viewheight)
+            (current_origin, current_angles, current_velocity, current_viewheight)
         };
 
+        let policy = PlayerViewPolicyState::from_player_state(&current.player_state);
         let mut eye = origin;
-        eye[2] += viewheight;
+        if policy.pm_type != crate::cgame::PM_INTERMISSION {
+            eye[2] += viewheight;
+        }
         Some(DemoCameraSample {
             server_time,
             presentation_time_ms,
@@ -2970,10 +3434,13 @@ impl GameSession {
             eye_position: scene::render_position(eye),
             player_position: scene::render_position(origin),
             view_angles: angles,
+            velocity,
+            bob_cycle: current.player_state.field_i32("bobCycle").unwrap_or(0),
             view_height: viewheight.round() as i32,
             dead_yaw: current.player_state.stats.get(6).copied().unwrap_or(0) as f32,
             client_num: current.player_state.field_i32("clientNum").unwrap_or(0),
-            policy: PlayerViewPolicyState::from_player_state(&current.player_state),
+            policy,
+            following: current.player_state.field_i32("pm_flags").unwrap_or(0) & 4096 != 0,
             teleported,
         })
     }
@@ -2989,10 +3456,14 @@ fn sample_player_state(
 ) -> Option<DemoCameraSample> {
     let origin = playerstate_vec3(ps, "origin")?;
     let view_angles = playerstate_vec3(ps, "viewangles")?;
+    let velocity = playerstate_vec3(ps, "velocity").unwrap_or([0.0; 3]);
     let view_height = ps.field_i32("viewheight").unwrap_or(0);
+    let policy = PlayerViewPolicyState::from_player_state(ps);
     let view_origin = [origin[0] + error[0], origin[1] + error[1], origin[2] + error[2]];
     let mut eye = view_origin;
-    eye[2] += view_height as f32;
+    if policy.pm_type != crate::cgame::PM_INTERMISSION {
+        eye[2] += view_height as f32;
+    }
     Some(DemoCameraSample {
         server_time,
         presentation_time_ms: f64::from(server_time),
@@ -3000,10 +3471,13 @@ fn sample_player_state(
         eye_position: scene::render_position(eye),
         player_position: scene::render_position(origin),
         view_angles,
+        velocity,
+        bob_cycle: ps.field_i32("bobCycle").unwrap_or(0),
         view_height,
         dead_yaw: ps.stats.get(6).copied().unwrap_or(0) as f32,
         client_num: ps.field_i32("clientNum").unwrap_or(0),
-        policy: PlayerViewPolicyState::from_player_state(ps),
+        policy,
+        following: ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0,
         teleported,
     })
 }
@@ -3014,6 +3488,32 @@ fn playerstate_vec3(state: &jka_protocol::server::PlayerState, base: &str) -> Op
         state.field_f32(&format!("{base}[1]"))?,
         state.field_f32(&format!("{base}[2]"))?,
     ])
+}
+
+/// TaystJK `CG_IsWalkingAnim` for spectator/demo strafehelper command
+/// reconstruction. Resolve the animation ids once from the shared JKA table so
+/// this stays correct without duplicating enum numbers in the client.
+fn strafehelper_walking_anim(raw_anim: i32) -> bool {
+    const ANIM_TOGGLEBIT: i32 = 2048;
+    static WALK_ANIMS: std::sync::OnceLock<[i32; 8]> = std::sync::OnceLock::new();
+    let walk_anims = WALK_ANIMS.get_or_init(|| {
+        [
+            "BOTH_WALK1",
+            "BOTH_WALK2",
+            "BOTH_WALK_STAFF",
+            "BOTH_WALKBACK_STAFF",
+            "BOTH_WALK_DUAL",
+            "BOTH_WALKBACK_DUAL",
+            "BOTH_WALKBACK1",
+            "BOTH_WALKBACK2",
+        ]
+        .map(|name| {
+            jka_assets::animation::animation_index(name)
+                .and_then(|index| i32::try_from(index).ok())
+                .unwrap_or(-1)
+        })
+    });
+    walk_anims.contains(&(raw_anim & !ANIM_TOGGLEBIT))
 }
 
 fn lerp_vec3(a: [f32; 3], b: [f32; 3], alpha: f32) -> [f32; 3] {
@@ -3088,6 +3588,12 @@ fn ray_aabb_distance(origin: [f32; 3], dir: [f32; 3], mins: [f32; 3], maxs: [f32
 struct MissingMapPrompt {
     map_name: String,
     reason: String,
+}
+
+#[derive(Clone)]
+struct ServerPasswordPrompt {
+    target: String,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3187,6 +3693,39 @@ pub struct App {
     asset_viewer_model_yaw: f32,
     asset_viewer_model_pitch: f32,
     asset_viewer_model_zoom: f32,
+    screenshot_entries: Vec<crate::screenshot::ScreenshotEntry>,
+    screenshot_catalog_loaded: bool,
+    screenshot_catalog_error: Option<String>,
+    screenshot_selected: Option<PathBuf>,
+    screenshot_search: String,
+    /// Empty means every game/mod folder.
+    screenshot_game_filter: String,
+    screenshot_preview_texture: Option<egui::TextureHandle>,
+    screenshot_preview_path: Option<PathBuf>,
+    screenshot_preview_pending: Option<PathBuf>,
+    screenshot_preview_error: Option<String>,
+    /// Set by the browser or EXE screenshot launch and consumed after the
+    /// matching local map has created its solo authority.
+    pending_screenshot_jump: Option<crate::screenshot::ScreenshotMetadata>,
+    /// Startup drag/drop can ask the browser to select a plain/non-jumpable image.
+    startup_screenshot_select: Option<PathBuf>,
+    chat_log_browser_entries: Vec<ChatLogBrowserEntry>,
+    chat_log_browser_catalog_loaded: bool,
+    chat_log_browser_catalog_error: Option<String>,
+    chat_log_browser_selected: Option<PathBuf>,
+    chat_log_browser_detail_path: Option<PathBuf>,
+    chat_log_browser_detail: Option<Result<ChatLogBrowserDetail, String>>,
+    chat_log_browser_mod_filter: String,
+    chat_log_browser_server_filter: String,
+    chat_log_browser_search: String,
+    chat_log_browser_range: ChatLogRangeFilter,
+    chat_log_browser_date_from: String,
+    chat_log_browser_date_to: String,
+    chat_log_browser_show_global: bool,
+    chat_log_browser_show_team: bool,
+    chat_log_browser_show_located: bool,
+    chat_log_browser_show_voice: bool,
+    chat_log_browser_show_session: bool,
     asset_preview_player_presenter: Option<PlayerPresenter>,
     asset_preview_entity_presenter: Option<EntityPresenter>,
     asset_preview_model_key: Option<(String, i32, i32, i32)>,
@@ -3242,11 +3781,44 @@ pub struct App {
     demo_metadata_inflight: HashSet<String>,
     demo_metadata_tx: Sender<DemoMetadataResult>,
     demo_metadata_rx: Receiver<DemoMetadataResult>,
+    race_ghost_load_generation: u64,
+    race_ghost_tx: Sender<RaceGhostLoadResult>,
+    race_ghost_rx: Receiver<RaceGhostLoadResult>,
+    race_ghost_alpha: f32,
+    race_ghost_name: bool,
+    race_ghost_trail: bool,
+    race_ghost_velocity_delta: bool,
+    race_ghost_distance_delta: bool,
+    race_ghost_demo_base_url: String,
+    race_ghost_demo_base_url_input: String,
+    race_ghost_web_generation: u64,
+    race_ghost_web_tx: Sender<race_ghost_web::WebResult>,
+    race_ghost_web_rx: Receiver<race_ghost_web::WebResult>,
+    race_ghost_web_courses: Vec<race_ghost_web::RemoteCourse>,
+    race_ghost_web_demos: Vec<race_ghost_web::RemoteDemo>,
+    race_ghost_web_selected_course: Option<String>,
+    race_ghost_web_suggested_course: Option<String>,
+    race_ghost_web_active_map: Option<String>,
+    race_ghost_web_active_style: Option<String>,
+    race_ghost_web_catalog_pending: bool,
+    race_ghost_web_demos_pending: bool,
+    race_ghost_web_pending_demos: HashSet<String>,
+    race_ghost_web_error: Option<String>,
     ui_catalog: ui_catalog::UiCatalog,
+    strafe_trails: crate::strafe_trail::Manager,
+    strafe_trail_filter: String,
+    strafe_trail_name_input: String,
+    strafe_trail_log_input: String,
+    strafe_trail_slot: u8,
     demo_console_filter: DemoConsoleFilter,
     demo_launch_seek_ms: Option<i32>,
     demo_view_mode: DemoViewMode,
+    /// POV we detached from when entering demo Free Spec. Attack/alt-attack
+    /// cycle relative to this client, matching normal spectator expectations.
+    demo_free_follow_anchor: Option<i32>,
     demo_view_outside_authoritative: bool,
+    /// Demo-only noclip speed. weapnext/weapprev step this like a 3D editor wheel.
+    demo_free_speed_index: usize,
     server_browser_tx: Sender<BrowserCommand>,
     server_browser_rx: Receiver<BrowserEvent>,
     server_browser: BrowserUiState,
@@ -3260,6 +3832,10 @@ pub struct App {
     /// `com_errorMessage` -> `error_popmenu` behavior instead of leaving the reason
     /// buried in a console the player may never open.
     disconnect_notice: Option<String>,
+    /// Password entry/retry dialog for a protected server. TaystJK checks
+    /// `needpass` before joining from the browser; we also reuse the same prompt
+    /// when a direct `/connect` is rejected because its password is missing/wrong.
+    server_password_prompt: Option<ServerPasswordPrompt>,
     /// Blocking pre-connect choice shown when infoResponse names a BSP that is not installed.
     missing_map_prompt: Option<MissingMapPrompt>,
     /// Blocking demo-playback choice shown when the recorded BSP is not installed.
@@ -3290,6 +3866,12 @@ pub struct App {
     pending_live_server_commands: VecDeque<jka_protocol::server::ServerCommand>,
     live_join_timing: Option<LiveJoinTiming>,
     network: crate::net::NetworkSettings,
+    /// Secure jaPRO credentials discovered in the OS credential store. Secrets
+    /// themselves are never cached here; this list contains only endpoint/user.
+    japro_saved_logins: Vec<crate::credential_store::SavedLogin>,
+    japro_credential_error: Option<String>,
+    /// Exact resolved endpoint already auto-login-attempted for this connection.
+    japro_autologin_attempted: Option<SocketAddr>,
     /// jaPRO cgame options (`cg_stylePlayer`, race timer, spectator aids).
     japro_cg: crate::japro_cg::JaproCgame,
     /// The camera editor's undo state while `OverlayMode::CameraEdit` is open.
@@ -3358,19 +3940,43 @@ pub struct App {
     /// Static BSP surface mesh cached for client-side Rapier visuals.
     map_physics_collision: PhysicsMapMesh,
     third_person: ThirdPersonSettings,
+    spectator_camera: SpectatorCameraSettings,
+    spectator_camera_state: SpectatorCameraState,
     first_person_lightsaber: bool,
     saber_trail: i32,
+    saber_team_colors: bool,
+    saber_staff_multi_color: bool,
+    team_overlay: ui::TeamOverlaySettings,
+    /// TaystJK cg_scoreDeaths (0..3).
+    score_deaths: i32,
+    /// TaystJK cg_drawScores (0..3).
+    draw_scores: i32,
+    mini_scores_shown: Option<ui::UiMiniScores>,
+    team_overlay_shown: Option<ui::TeamOverlayUi>,
     cg_debug_events: u8,
     /// A/B switch: side-effect-free event semantic preparation on the dedicated Rayon pool.
     cg_event_workers: bool,
     crosshair: ui::CrosshairSettings,
     /// jaPRO cg.crosshairClientNum / cg.crosshairClientTime, plus the scan that set them.
     crosshair_target: ui::UiCrosshairTarget,
+    /// World-space endpoint of the current crosshair trace (render coordinates).
+    /// Shared by dynamic-crosshair projection and DOF autofocus.
+    crosshair_hit_world: Option<[f32; 3]>,
     crosshair_seen: Option<CrosshairSeen>,
     crosshair_scan_at: Instant,
+    /// `cg.forceSelectTime`: selector remains visible for OpenJK WEAPON_SELECT_TIME.
+    force_select_until: Option<Instant>,
+    /// TaystJK cg_drawPlayerNames. Occlusion is sampled at 30 Hz; the render
+    /// thread still projects accepted labels every frame for smooth late-latched motion.
+    player_names: ui::PlayerNameSettings,
+    player_name_visible: [bool; 32],
+    race_ghost_label_visible: [bool; 128],
+    player_name_scan_at: Instant,
     /// The follow name last sent to the renderer; CG_DrawFollow re-reads it every
     /// frame, so a change of followed player must reach the screen on its own.
     follow_name_shown: Option<String>,
+    /// The last whole-second classic game timer text sent to the renderer.
+    game_timer_shown: Option<String>,
     /// The race readout last sent to the renderer.
     race_timer_shown: Option<crate::japro_cg::RaceTimerUi>,
     /// The vote summary last sent to the renderer.
@@ -3381,7 +3987,6 @@ pub struct App {
     hud_edit_selected: Option<HudElementId>,
     hud_edit_drag_origin: Option<[f32; 2]>,
     hud_edit_drag_delta: [f32; 2],
-    presentation_smoothing: LocalPresentationSettings,
     third_person_camera: ThirdPersonCameraState,
     local_player_presenter: Option<PlayerPresenter>,
     solo_dynamic_models: Arc<Vec<DynamicModelSurface>>,
@@ -3399,12 +4004,10 @@ pub struct App {
     modifiers: ModifiersState,
     captured: bool,
     mouse_input: MouseInputSettings,
-    mouse_delta: (f64, f64),
     last_mouse_motion_at: Option<Instant>,
     noclip_primary_down: bool,
     noclip_alt_down: bool,
     mouse_input_sequence: u64,
-    pending_mouse_input: Option<(u64, Instant)>,
     last_simulated_mouse_input: Option<InputLatencySample>,
     cursor_position: (f64, f64),
     demo_scrub_dragging: bool,
@@ -3430,6 +4033,9 @@ pub struct App {
     console_suggest: bool,
     /// `cg_chatboxCompletion`: Tab in the chat input completes player names.
     chatbox_completion: bool,
+    /// `cl_chatLog`: session-based HTML logging for live server chat.
+    chat_log_enabled: bool,
+    chat_log: crate::chat_log::ChatLog,
     /// Highlighted popup row; only meaningful while `console_suggest_picked`
     /// (otherwise row 0 is the implicit Tab target).
     console_suggest_index: usize,
@@ -3492,6 +4098,7 @@ pub struct App {
     console_search_index: Option<usize>,
     chat_mode: ChatMode,
     chat_input: String,
+    chat_player_completion: Option<ChatPlayerCompletionCycle>,
     chat_lines: VecDeque<ChatRecord>,
     last_chat_refresh: Instant,
     video_selected: usize,
@@ -3631,6 +4238,14 @@ pub struct App {
     egui_repaint_requested: bool,
     egui_renderer_active: bool,
     egui_apply_video_requested: bool,
+    /// Optional native auxiliary workspace. Its WGPU surface lives on a separate
+    /// sleeping render worker so desktop/compositor waits never enter the primary loop.
+    companion: Option<companion::CompanionWindowState>,
+    companion_target_enabled: bool,
+    /// Client number shown by the companion's secondary spectator POV. `None`
+    /// keeps the passive dashboard. Selection is made in the primary window so
+    /// the companion never needs mouse/keyboard focus.
+    companion_scene_target: Option<i32>,
 }
 
 impl App {
@@ -3649,9 +4264,14 @@ impl App {
         let config_path = settings_dir.join("DinurdoJK.cfg");
         let legacy_config = settings_dir.join("jampconfig.cfg");
         let mut video = config::load_video_settings(&config_path, Some(&legacy_config));
+        crate::logging::set_developer_level(video.developer_level);
+        crate::logging::set_renderer_verbose_level(video.renderer_verbose);
         let audio = config::load_audio_settings(&config_path, Some(&legacy_config));
         let mut presentation =
             config::load_client_presentation_settings(&config_path, Some(&legacy_config));
+        // OpenJK/TaystJK mirror cg_drawTeamOverlay into the read-only CVAR_USERINFO
+        // key `teamoverlay`; the server uses it to decide whether to send tinfo.
+        presentation.network.team_overlay = presentation.team_overlay.mode > 0;
         let forced_player_models = match ForcedPlayerModels::parse(&presentation.force_model) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -3695,7 +4315,15 @@ impl App {
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
         let server_browser = BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
         let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
+        let (race_ghost_tx, race_ghost_rx) = mpsc::channel();
+        let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();
         let ui_catalog = ui_catalog::UiCatalog::spawn()?;
+        let mut strafe_trails = crate::strafe_trail::Manager::spawn(presentation.strafe_trail.clone())?;
+        if presentation.strafe_trail.log_name.trim() != "0" && !presentation.strafe_trail.log_name.trim().is_empty() {
+            if let Err(error) = strafe_trails.set_log_name(jka_assets::pk3::active_game_directory(&base, game.as_deref()), &presentation.strafe_trail.log_name) {
+                eprintln!("Ignoring invalid cg_logStrafeTrail from config: {error}");
+            }
+        }
         let mut windows_timer_resolution = crate::windows_timer::TimerResolutionGuard::default();
         if video.timer_resolution_1ms {
             if let Err(error) = windows_timer_resolution.set_enabled(true) {
@@ -3704,6 +4332,10 @@ impl App {
                 config_dirty = true;
             }
         }
+        let (japro_saved_logins, japro_credential_error) = match crate::credential_store::list() {
+            Ok(entries) => (entries, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let mut app = Self {
             base,
             startup_game: game.clone(),
@@ -3747,6 +4379,35 @@ impl App {
             asset_viewer_model_yaw: 180.0,
             asset_viewer_model_pitch: 0.0,
             asset_viewer_model_zoom: 1.0,
+            screenshot_entries: Vec::new(),
+            screenshot_catalog_loaded: false,
+            screenshot_catalog_error: None,
+            screenshot_selected: None,
+            screenshot_search: String::new(),
+            screenshot_game_filter: String::new(),
+            screenshot_preview_texture: None,
+            screenshot_preview_path: None,
+            screenshot_preview_pending: None,
+            screenshot_preview_error: None,
+            pending_screenshot_jump: None,
+            startup_screenshot_select: None,
+            chat_log_browser_entries: Vec::new(),
+            chat_log_browser_catalog_loaded: false,
+            chat_log_browser_catalog_error: None,
+            chat_log_browser_selected: None,
+            chat_log_browser_detail_path: None,
+            chat_log_browser_detail: None,
+            chat_log_browser_mod_filter: String::new(),
+            chat_log_browser_server_filter: String::new(),
+            chat_log_browser_search: String::new(),
+            chat_log_browser_range: ChatLogRangeFilter::All,
+            chat_log_browser_date_from: String::new(),
+            chat_log_browser_date_to: String::new(),
+            chat_log_browser_show_global: true,
+            chat_log_browser_show_team: true,
+            chat_log_browser_show_located: true,
+            chat_log_browser_show_voice: true,
+            chat_log_browser_show_session: true,
             asset_preview_player_presenter: None,
             asset_preview_entity_presenter: None,
             asset_preview_model_key: None,
@@ -3787,11 +4448,41 @@ impl App {
             demo_metadata_inflight: HashSet::new(),
             demo_metadata_tx,
             demo_metadata_rx,
+            race_ghost_load_generation: 0,
+            race_ghost_tx,
+            race_ghost_rx,
+            race_ghost_alpha: presentation.race_ghost_alpha,
+            race_ghost_name: presentation.race_ghost_name,
+            race_ghost_trail: presentation.race_ghost_trail,
+            race_ghost_velocity_delta: presentation.race_ghost_velocity_delta,
+            race_ghost_distance_delta: presentation.race_ghost_distance_delta,
+            race_ghost_demo_base_url: presentation.race_ghost_demo_base_url.clone(),
+            race_ghost_demo_base_url_input: presentation.race_ghost_demo_base_url.clone(),
+            race_ghost_web_generation: 0,
+            race_ghost_web_tx,
+            race_ghost_web_rx,
+            race_ghost_web_courses: Vec::new(),
+            race_ghost_web_demos: Vec::new(),
+            race_ghost_web_selected_course: None,
+            race_ghost_web_suggested_course: None,
+            race_ghost_web_active_map: None,
+            race_ghost_web_active_style: None,
+            race_ghost_web_catalog_pending: false,
+            race_ghost_web_demos_pending: false,
+            race_ghost_web_pending_demos: HashSet::new(),
+            race_ghost_web_error: None,
             ui_catalog,
+            strafe_trails,
+            strafe_trail_filter: String::new(),
+            strafe_trail_name_input: String::new(),
+            strafe_trail_log_input: presentation.strafe_trail.log_name.clone(),
+            strafe_trail_slot: crate::strafe_trail::DEFAULT_SLOT,
             demo_console_filter: DemoConsoleFilter::All,
             demo_launch_seek_ms: None,
             demo_view_mode: DemoViewMode::Authoritative,
+            demo_free_follow_anchor: None,
             demo_view_outside_authoritative: false,
+            demo_free_speed_index: DEMO_FREE_SPEED_DEFAULT_INDEX,
             server_browser_tx,
             server_browser_rx,
             server_browser,
@@ -3799,6 +4490,7 @@ impl App {
             live_without_world: false,
             demo_without_world: false,
             disconnect_notice: None,
+            server_password_prompt: None,
             missing_map_prompt: None,
             demo_missing_map_prompt: None,
             live_missing_map_authorized: false,
@@ -3814,6 +4506,9 @@ impl App {
             pending_live_server_commands: VecDeque::new(),
             live_join_timing: None,
             network: presentation.network.clone(),
+            japro_saved_logins,
+            japro_credential_error,
+            japro_autologin_attempted: None,
             japro_cg: presentation.japro,
             camera_edit: None,
             vote_menu: egui_pages::VoteMenuState::default(),
@@ -3858,15 +4553,31 @@ impl App {
             steam_audio_bake_error: None,
             map_physics_collision: PhysicsMapMesh::default(),
             third_person: presentation.third_person,
+            spectator_camera: presentation.spectator_camera,
+            spectator_camera_state: SpectatorCameraState::default(),
             first_person_lightsaber: presentation.first_person_lightsaber,
             saber_trail: presentation.saber_trail,
+            saber_team_colors: presentation.saber_team_colors,
+            saber_staff_multi_color: presentation.saber_staff_multi_color,
+            team_overlay: presentation.team_overlay,
+            score_deaths: presentation.score_deaths,
+            draw_scores: presentation.draw_scores,
+            mini_scores_shown: None,
+            team_overlay_shown: None,
             cg_debug_events: 0,
             cg_event_workers: false,
             crosshair: presentation.crosshair,
             crosshair_target: ui::UiCrosshairTarget::default(),
+            crosshair_hit_world: None,
             crosshair_seen: None,
             crosshair_scan_at: Instant::now(),
+            force_select_until: None,
+            player_names: presentation.player_names,
+            player_name_visible: [false; 32],
+            race_ghost_label_visible: [false; 128],
+            player_name_scan_at: Instant::now(),
             follow_name_shown: None,
+            game_timer_shown: None,
             race_timer_shown: None,
             vote_line_shown: None,
             movement_keys_hud: presentation.movement_keys,
@@ -3875,7 +4586,6 @@ impl App {
             hud_edit_selected: None,
             hud_edit_drag_origin: None,
             hud_edit_drag_delta: [0.0, 0.0],
-            presentation_smoothing: presentation.smoothing,
             third_person_camera: ThirdPersonCameraState::default(),
             local_player_presenter: None,
             solo_dynamic_models: Arc::new(Vec::new()),
@@ -3892,12 +4602,10 @@ impl App {
             modifiers: ModifiersState::empty(),
             captured: false,
             mouse_input: presentation.mouse,
-            mouse_delta: (0.0, 0.0),
             last_mouse_motion_at: None,
             noclip_primary_down: false,
             noclip_alt_down: false,
             mouse_input_sequence: 0,
-            pending_mouse_input: None,
             last_simulated_mouse_input: None,
             cursor_position: (0.0, 0.0),
             demo_scrub_dragging: false,
@@ -3917,6 +4625,8 @@ impl App {
             console_timestamps: presentation.console_timestamps,
             console_suggest: presentation.console_suggest,
             chatbox_completion: presentation.chatbox_completion,
+            chat_log_enabled: presentation.chat_log,
+            chat_log: crate::chat_log::ChatLog::spawn(),
             console_suggest_index: 0,
             console_suggest_picked: false,
             console_suggest_hidden: false,
@@ -3956,6 +4666,7 @@ impl App {
             console_search_index: None,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
+            chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
             last_chat_refresh: Instant::now(),
             video_selected: 0,
@@ -4006,6 +4717,7 @@ impl App {
             sun_custom_initialized,
             latest_request_id: 0,
             latest_prepare_options: scene::MapPrepareOptions {
+                picmip: video.picmip,
                 grass: video.grass,
                 voxel_probe_gi: video.voxel_probe_gi,
                 ocean: video.ocean,
@@ -4183,6 +4895,9 @@ impl App {
             egui_repaint_requested: true,
             egui_renderer_active: false,
             egui_apply_video_requested: false,
+            companion: None,
+            companion_target_enabled: false,
+            companion_scene_target: None,
         };
         // A first run has no opinion yet, so start somewhere that runs well on
         // modest hardware instead of at the engine's uncurated field defaults.
@@ -4333,7 +5048,10 @@ impl App {
                 .find(|(candidate, _)| *candidate == client)
                 .map(|(_, name)| format!("FAKE POV: {name}"))
                 .unwrap_or_else(|| format!("FAKE POV: CLIENT {client}")),
-            DemoViewMode::Free => "FREE VIEW".to_owned(),
+            DemoViewMode::Free => format!(
+                "FREE VIEW · {:.0} U/S",
+                DEMO_FREE_SPEEDS[self.demo_free_speed_index.min(DEMO_FREE_SPEEDS.len() - 1)]
+            ),
         };
         Some(DemoTimelineUi {
             elapsed_ms: session.demo_elapsed_ms(now).unwrap_or(0.0),
@@ -4440,6 +5158,8 @@ impl App {
         let mut crosshair_target = self.crosshair_target.clone();
         let mut surface_inspector = self.surface_inspector.clone();
         let mut speedometer = self.speedometer_ui.clone();
+        let scoreboard = self.visible_scoreboard();
+        let scoreboard_focus_client = self.scoreboard_focus_client();
         if self.overlay == OverlayMode::HudEdit {
             self.hud_edit_transient_samples(
                 &mut chat_lines,
@@ -4472,6 +5192,7 @@ impl App {
             0
         };
         let prediction_debug = self.prediction_debug_ui();
+        let force_select = self.force_select_ui(Instant::now());
 
         UiSnapshot {
             mode: self.overlay,
@@ -4503,15 +5224,20 @@ impl App {
             chat_lines,
             center_print,
             follow_name,
+            game_timer: self.game_timer_text(),
+            mini_scores: self.mini_scores_ui(),
             race_timer,
             vote_line,
-            scoreboard: self.scores_showing.then(|| self.scoreboard.clone()).flatten(),
+            scoreboard,
+            scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
             prediction_debug,
             hud,
+            team_overlay: self.team_overlay_ui(),
             hud_layout: self.hud_layout,
             crosshair: self.crosshair,
             crosshair_target,
+            force_select,
             movement_keys: self.movement_keys_hud,
             strafe_helper: self.strafe_helper,
             movement_hud: self.current_movement_hud_state(),
@@ -4706,9 +5432,6 @@ impl App {
     }
 
     fn subframe_input_view_rotation(&self) -> Option<[f32; 2]> {
-        if !self.video.input_subframe {
-            return None;
-        }
         if !self.live_remote_view_forced() {
             if let Some(angles) = self.live_view_angles() {
                 return Some([angles[1].to_radians(), -angles[0].to_radians()]);
@@ -4794,6 +5517,7 @@ impl App {
                 self.render_view_latch
             },
             input_view_rotation,
+            dynamic_crosshair_world: self.crosshair_target.dynamic.then_some(self.crosshair_hit_world).flatten(),
             player_position: demo_player_position
                 .or_else(|| self.local_server.as_ref().map(LocalServer::world_position)),
             area_mask: self
@@ -4821,6 +5545,7 @@ impl App {
                     .map_or_else(|| Arc::new(Vec::new()), |playback| Arc::clone(&playback.fx_blades))
             },
             inline_models,
+            companion_scene: self.companion_scene_view(),
             dof_focus_target: self.dof_focus_target,
             input_latency: self.last_simulated_mouse_input,
             client_perf: self
@@ -4829,6 +5554,7 @@ impl App {
                 .map_or_else(ClientFramePerf::default, |playback| playback.client_perf),
             hud: self.current_hud_state(),
             movement_hud: self.current_movement_hud_state(),
+            player_names: self.world_player_names(),
             jump_shade: self.current_jump_shade(),
             camera_shake: self
                 .game_session
@@ -4872,7 +5598,7 @@ impl App {
     /// decides whether they map directly to first person or through the cheap
     /// no-trace portion of the existing OpenJK third-person camera.
     fn publish_live_subframe_view(&self, input: InputLatencySample) {
-        if !self.video.input_subframe || self.live_remote_view_forced() {
+        if self.live_remote_view_forced() {
             return;
         }
         let Some(view_angles) = self.live_view_angles() else {
@@ -4882,15 +5608,13 @@ impl App {
             render.publish_subframe_view_rotation(
                 view_angles[1].to_radians(),
                 -view_angles[0].to_radians(),
+                self.crosshair_target.dynamic.then_some(self.crosshair_hit_world).flatten(),
                 input,
             );
         }
     }
 
     fn publish_local_subframe_view(&self, input: InputLatencySample) -> bool {
-        if !self.video.input_subframe {
-            return false;
-        }
         let Some(server) = self.local_server.as_ref() else {
             return false;
         };
@@ -4913,6 +5637,7 @@ impl App {
             render.publish_subframe_view_rotation(
                 view_angles[1].to_radians(),
                 -view_angles[0].to_radians(),
+                self.crosshair_target.dynamic.then_some(self.crosshair_hit_world).flatten(),
                 input,
             );
             return true;
@@ -4943,6 +5668,19 @@ impl App {
         self.render_command(RenderCommand::BatchEnd);
     }
 
+    fn force_select_ui(&self, now: Instant) -> Option<ui::UiForceSelect> {
+        let until = self.force_select_until?;
+        if now >= until {
+            return None;
+        }
+        let ps = self.live_player_state()?;
+        if ps.stats[0] <= 0 {
+            return None;
+        }
+        let known_bits = ps.field_i32("fd.forcePowersKnown").unwrap_or(0) as u32;
+        Some(ui::UiForceSelect { selected: self.live_input.force_select, known_bits })
+    }
+
     fn publish_transient_ui(&self) {
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
         let demo_timeline = self.demo_timeline_ui(Instant::now());
@@ -4955,6 +5693,10 @@ impl App {
             .and_then(|session| session.race_timer_ui.clone());
         let mut vote_line = self.vote_hud_line();
         let mut speedometer = self.speedometer_ui.clone();
+        let team_overlay = self.team_overlay_ui();
+        let scoreboard = self.visible_scoreboard();
+        let scoreboard_focus_client = self.scoreboard_focus_client();
+        let force_select = self.force_select_ui(Instant::now());
         if self.overlay == OverlayMode::HudEdit {
             self.hud_edit_transient_samples(
                 &mut chat_lines,
@@ -4972,11 +5714,17 @@ impl App {
             demo_timeline,
             prediction_debug,
             crosshair_target,
+            force_select,
             follow_name,
+            game_timer: self.game_timer_text(),
+            mini_scores: self.mini_scores_ui(),
             race_timer,
             vote_line,
+            scoreboard,
+            scoreboard_focus_client,
             speedometer,
             lagometer: self.lagometer_ui.clone(),
+            team_overlay,
         });
     }
 
@@ -5012,6 +5760,11 @@ impl App {
                 && point[1] >= rect[1]
                 && point[1] <= rect[1] + rect[3]
         };
+        // During demo playback the mouse belongs to the camera by default.
+        // Holding the user's +speed bind is the explicit, temporary UI modifier.
+        if !self.live_buttons.contains("+speed") {
+            return None;
+        }
         if inside(layout.play) {
             return Some(DemoTimelineHit::PlayPause);
         }
@@ -5178,6 +5931,9 @@ impl App {
             self.push_console_line(format!("^1{}", self.console_status));
         }
         self.publish_transient_ui();
+        // If +speed was released before the mouse button, the scrub itself kept
+        // cursor ownership. Mouse-up ends that ownership and may recapture now.
+        self.sync_demo_camera_capture();
     }
 
     fn seek_demo_relative(&mut self, delta_ms: i32) {
@@ -5252,7 +6008,12 @@ impl App {
             self.overlay == OverlayMode::Console && overlay != OverlayMode::Console;
         self.overlay = overlay;
         self.sync_profile_preview_mode(
-            !self.front_end && self.overlay == OverlayMode::Game && self.menu_selected == 2,
+            self.overlay == OverlayMode::Game
+                && if self.front_end {
+                    self.frontend_page == FrontendPage::Profile
+                } else {
+                    self.menu_selected == 2
+                },
         );
         self.egui_repaint_requested = true;
         if leaving_console {
@@ -5263,9 +6024,7 @@ impl App {
         if overlay != OverlayMode::Console {
             self.console_search_open = false;
         }
-        self.mouse_delta = (0.0, 0.0);
         self.last_mouse_motion_at = None;
-        self.pending_mouse_input = None;
         if let Some(player) = &mut self.local_server {
             player.pause();
         }
@@ -5277,7 +6036,7 @@ impl App {
             self.noclip_alt_down = false;
             self.set_capture(false);
         } else if self.demo_playback_active() {
-            self.set_capture(false);
+            self.sync_demo_camera_capture();
         } else {
             self.set_capture(true);
         }
@@ -5312,7 +6071,9 @@ impl App {
             self.set_overlay(OverlayMode::Game);
             return;
         }
-        if self.frontend_page == FrontendPage::AssetViewer {
+        if self.frontend_page == FrontendPage::Profile {
+            self.sync_profile_preview_mode(false);
+        } else if self.frontend_page == FrontendPage::AssetViewer {
             self.render_command(RenderCommand::SetAssetPreviewMode(false));
             self.render_command(RenderCommand::SetAssetPreviewViewport(None));
             self.asset_preview_viewport_key = None;
@@ -5320,9 +6081,18 @@ impl App {
         }
         self.frontend_page = match self.frontend_page {
             FrontendPage::Main => FrontendPage::Main,
-            FrontendPage::Play | FrontendPage::Controls | FrontendPage::DeveloperTools => FrontendPage::Main,
-            FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => FrontendPage::Play,
-            FrontendPage::AssetViewer | FrontendPage::MapViewer => FrontendPage::DeveloperTools,
+            FrontendPage::Play
+            | FrontendPage::Profile
+            | FrontendPage::Controls
+            | FrontendPage::ChatLogs
+            | FrontendPage::DeveloperTools
+            | FrontendPage::Screenshots => FrontendPage::Main,
+            FrontendPage::ServerBrowser
+            | FrontendPage::SoloGame
+            | FrontendPage::PlayDemo => FrontendPage::Play,
+            FrontendPage::AssetViewer | FrontendPage::MapViewer => {
+                FrontendPage::DeveloperTools
+            },
         };
         self.egui_repaint_requested = true;
         self.publish_ui();
@@ -5334,6 +6104,7 @@ impl App {
     }
 
     fn refresh_bound_state(&mut self) {
+        let spectator_context = self.spectator_binding_context();
         let mut movement_keys = HashSet::with_capacity(8);
         let mut primary = false;
         let mut alt = false;
@@ -5361,15 +6132,16 @@ impl App {
         };
 
         for code in &self.keys {
-            if let Some(binding) = self.bindings.get(keybinds::bind_key_for_code(*code)) {
+            if let Some(binding) = self.bindings.get_resolved(keybinds::bind_key_for_code(*code), spectator_context) {
                 apply(binding);
             }
         }
         for button in &self.mouse_buttons_down {
-            if let Some(binding) = self.bindings.get(BindKey::Mouse(*button)) { apply(binding); }
+            if let Some(binding) = self.bindings.get_resolved(BindKey::Mouse(*button), spectator_context) { apply(binding); }
         }
 
         let was_scores_showing = self.scores_showing;
+        let was_demo_ui_modifier = self.live_buttons.contains("+speed");
         let was_zoomed = self.live_buttons.contains("+zoom");
         let is_zoomed = live_buttons.contains("+zoom");
         if is_zoomed != was_zoomed {
@@ -5382,9 +6154,18 @@ impl App {
         self.noclip_primary_down = primary;
         self.noclip_alt_down = alt;
         self.scores_showing = self.live_buttons.contains("+scores");
+        if self.demo_playback_active()
+            && was_demo_ui_modifier != self.live_buttons.contains("+speed")
+        {
+            self.sync_demo_camera_capture();
+        }
         if self.scores_showing && !was_scores_showing {
-            // CG_ScoresDown_f clears stale contents when issuing a new request.
-            self.request_scores_if_due(true);
+            // TaystJK's CG_ScoresDown_f does not send `score` or clear the
+            // cached board during demo playback. Rebuild from the demo index;
+            // live play keeps the normal ~2 second score request cadence.
+            if !self.refresh_demo_scoreboard(Instant::now()) {
+                self.request_scores_if_due(true);
+            }
         }
         if self.scores_showing != was_scores_showing {
             self.publish_ui();
@@ -5397,15 +6178,40 @@ impl App {
     /// the Trace popup is up — the same key needs to close it again.
     fn key_bound_to_trace(&self, code: KeyCode) -> bool {
         self.bindings
-            .get(keybinds::bind_key_for_code(code))
+            .get_resolved(keybinds::bind_key_for_code(code), self.spectator_binding_context())
             .is_some_and(|binding| keybinds::binding_contains_command(binding, "trace"))
     }
 
     fn execute_binding_press(&mut self, key: BindKey) {
-        let Some(binding) = self.bindings.get(key).map(str::to_owned) else { return; };
+        let spectator_context = self.spectator_binding_context();
+        let Some(binding) = self.bindings.get_resolved(key, spectator_context).map(str::to_owned) else { return; };
         let mut buffered = Vec::new();
         for command in keybinds::split_binding_commands(&binding) {
             if command.starts_with('+') {
+                let button_verb = command.split_whitespace().next().unwrap_or("");
+                if self.demo_playback_active() {
+                    let follow_direction = if button_verb.eq_ignore_ascii_case("+attack") {
+                        Some(1)
+                    } else if button_verb.eq_ignore_ascii_case("+altattack") {
+                        Some(-1)
+                    } else {
+                        None
+                    };
+                    if let Some(direction) = follow_direction {
+                        // +speed is the demo cursor/timeline modifier. While it is
+                        // held, mouse buttons belong to UI interaction, not POV cycling.
+                        if !self.live_buttons.contains("+speed") {
+                            self.cycle_demo_follow(direction);
+                        }
+                        continue;
+                    }
+                }
+                if button_verb.eq_ignore_ascii_case("+moveup")
+                    && self.demo_playback_active()
+                    && self.demo_view_mode != DemoViewMode::Free
+                {
+                    self.enter_demo_free_view();
+                }
                 // +scores is a local CG kbutton, not a usercmd button bit. The
                 // held state is derived by refresh_bound_state above.
                 if command
@@ -5431,8 +6237,13 @@ impl App {
     fn bind_control_key(&mut self, key: BindKey) {
         let Some(action) = keybinds::control_action(self.controls_selected) else { return; };
         let command = action.command;
-        self.bindings.unbind_command(command);
-        self.bindings.set(key, command);
+        if keybinds::is_spectator_selection(self.controls_selected) {
+            self.bindings.unbind_spectator_command(command);
+            self.bindings.set_spectator(key, command);
+        } else {
+            self.bindings.unbind_command(command);
+            self.bindings.set(key, command);
+        }
         self.controls_waiting_for_key = false;
         self.refresh_bound_state();
         self.mark_config_dirty();
@@ -5443,7 +6254,12 @@ impl App {
     fn unbind_selected_control(&mut self) {
         if let Some(action) = keybinds::control_action(self.controls_selected) {
             let command = action.command;
-            if self.bindings.unbind_command(command) > 0 {
+            let changed = if keybinds::is_spectator_selection(self.controls_selected) {
+                self.bindings.unbind_spectator_command(command)
+            } else {
+                self.bindings.unbind_command(command)
+            };
+            if changed > 0 {
                 self.refresh_bound_state();
                 self.mark_config_dirty();
             }
@@ -5455,19 +6271,48 @@ impl App {
     fn handle_bind_console_command(&mut self, command: &str) -> bool {
         let words = keybinds::split_command_words(command.trim_start_matches('/'));
         let Some(verb) = words.first() else { return false; };
-        if verb.eq_ignore_ascii_case("bind") {
+        if verb.eq_ignore_ascii_case("bind") || verb.eq_ignore_ascii_case("bindspec") {
+            let spectator = verb.eq_ignore_ascii_case("bindspec");
+            let label = if spectator { "bindspec" } else { "bind" };
             match words.as_slice() {
-                [_] => self.push_console_line("^3bind <key> [command]^7 - attach a command to a key"),
+                [_] => self.push_console_line(format!(
+                    "^3{label} <key> [command]^7 - attach a {}command to a key",
+                    if spectator { "spectator-only " } else { "" }
+                )),
                 [_, key_name] => match keybinds::parse_key(key_name) {
-                    Some(key) => match self.bindings.get(key).map(str::to_owned) {
-                        Some(binding) => self.push_console_line(format!("^7\"{}\" = \"{}\"", keybinds::key_name(key), binding)),
-                        None => self.push_console_line(format!("^7\"{}\" is not bound", keybinds::key_name(key))),
-                    },
+                    Some(key) => {
+                        let binding = if spectator {
+                            self.bindings.get_spectator(key)
+                        } else {
+                            self.bindings.get(key)
+                        }
+                        .map(str::to_owned);
+                        match binding {
+                            Some(binding) => self.push_console_line(format!(
+                                "^7\"{}\" = \"{}\"{}",
+                                keybinds::key_name(key),
+                                binding,
+                                if spectator { " ^5[spectator]" } else { "" }
+                            )),
+                            None if spectator => self.push_console_line(format!(
+                                "^7\"{}\" has no spectator override (inherits normal bind)",
+                                keybinds::key_name(key)
+                            )),
+                            None => self.push_console_line(format!(
+                                "^7\"{}\" is not bound",
+                                keybinds::key_name(key)
+                            )),
+                        }
+                    }
                     None => self.push_console_line(format!("^1\"{key_name}\" isn't a valid key")),
                 },
                 [_, key_name, rest @ ..] => match keybinds::parse_key(key_name) {
                     Some(key) => {
-                        self.bindings.set(key, rest.join(" "));
+                        if spectator {
+                            self.bindings.set_spectator(key, rest.join(" "));
+                        } else {
+                            self.bindings.set(key, rest.join(" "));
+                        }
                         self.refresh_bound_state();
                         self.mark_config_dirty();
                     }
@@ -5478,11 +6323,20 @@ impl App {
             self.publish_ui();
             return true;
         }
-        if verb.eq_ignore_ascii_case("unbind") {
+        if verb.eq_ignore_ascii_case("unbind") || verb.eq_ignore_ascii_case("unbindspec") {
+            let spectator = verb.eq_ignore_ascii_case("unbindspec");
+            let label = if spectator { "unbindspec" } else { "unbind" };
             if words.len() != 2 {
-                self.push_console_line("^3unbind <key>^7 - remove a key binding");
+                self.push_console_line(format!(
+                    "^3{label} <key>^7 - remove a {}key binding",
+                    if spectator { "spectator-only " } else { "" }
+                ));
             } else if let Some(key) = keybinds::parse_key(&words[1]) {
-                self.bindings.unbind(key);
+                if spectator {
+                    self.bindings.unbind_spectator(key);
+                } else {
+                    self.bindings.unbind(key);
+                }
                 self.refresh_bound_state();
                 self.mark_config_dirty();
             } else {
@@ -5491,16 +6345,31 @@ impl App {
             self.publish_ui();
             return true;
         }
-        if verb.eq_ignore_ascii_case("unbindall") {
-            self.bindings.clear();
+        if verb.eq_ignore_ascii_case("unbindall") || verb.eq_ignore_ascii_case("unbindspecall") {
+            if verb.eq_ignore_ascii_case("unbindspecall") {
+                self.bindings.clear_spectator();
+            } else {
+                self.bindings.clear();
+            }
             self.refresh_bound_state();
             self.mark_config_dirty();
             self.publish_ui();
             return true;
         }
-        if verb.eq_ignore_ascii_case("bindlist") {
-            for (key, binding) in self.bindings.sorted() {
-                self.push_console_line(format!("^7{} \"{}\"", keybinds::key_name(key), binding));
+        if verb.eq_ignore_ascii_case("bindlist") || verb.eq_ignore_ascii_case("bindspeclist") {
+            let spectator = verb.eq_ignore_ascii_case("bindspeclist");
+            let entries = if spectator {
+                self.bindings.spectator_sorted()
+            } else {
+                self.bindings.sorted()
+            };
+            for (key, binding) in entries {
+                self.push_console_line(format!(
+                    "^7{} \"{}\"{}",
+                    keybinds::key_name(key),
+                    binding,
+                    if spectator { " ^5[spectator]" } else { "" }
+                ));
             }
             return true;
         }
@@ -5555,20 +6424,34 @@ impl App {
 
         let presentation = config::ClientPresentationSettings {
             third_person: self.third_person,
+            spectator_camera: self.spectator_camera,
             first_person_lightsaber: self.first_person_lightsaber,
             saber_trail: self.saber_trail,
-            smoothing: self.presentation_smoothing,
+            saber_team_colors: self.saber_team_colors,
+            saber_staff_multi_color: self.saber_staff_multi_color,
+            team_overlay: self.team_overlay,
+            score_deaths: self.score_deaths,
+            draw_scores: self.draw_scores,
             mouse: self.mouse_input,
             fov: self.camera.cg_fov(),
             model: self.solo_client_info.model_cvar(),
             force_model: self.force_model.clone(),
             crosshair: self.crosshair,
+            player_names: self.player_names,
             hud_layout: self.hud_layout,
             movement_keys: self.movement_keys_hud,
             strafe_helper: self.strafe_helper,
+            strafe_trail: self.strafe_trails.settings.clone(),
+            race_ghost_alpha: self.race_ghost_alpha,
+            race_ghost_name: self.race_ghost_name,
+            race_ghost_trail: self.race_ghost_trail,
+            race_ghost_velocity_delta: self.race_ghost_velocity_delta,
+            race_ghost_distance_delta: self.race_ghost_distance_delta,
+            race_ghost_demo_base_url: self.race_ghost_demo_base_url.clone(),
             console_timestamps: self.console_timestamps,
             console_suggest: self.console_suggest,
             chatbox_completion: self.chatbox_completion,
+            chat_log: self.chat_log_enabled,
             ui_vgs: self.ui_vgs,
             jump_height_shade: self.jump_height_shade,
             screen_shake: self.screen_shake,
@@ -5722,6 +6605,14 @@ impl App {
             self.fps_cap_replace_on_type = true;
         }
         self.publish_ui();
+    }
+
+    /// Push the FX sampling rate/scope into the active presentation session.
+    fn apply_fx_fps_settings(&mut self) {
+        if let Some(session) = self.game_session.as_mut() {
+            session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
+            session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
+        }
     }
 
     /// Push `fx_physics` into the live session's FX worker.
@@ -6560,6 +7451,7 @@ impl App {
         }
         self.console_lines.push_back(line);
         self.console_path_links.push_back(path_links);
+        self.mark_companion_console_dirty();
 
         // If the user has scrolled up to inspect/select older output, keep the
         // viewport anchored on that same content as new lines arrive. At the
@@ -7109,6 +8001,7 @@ impl App {
     fn begin_chat(&mut self, mode: ChatMode) {
         self.chat_mode = mode;
         self.chat_input.clear();
+        self.chat_player_completion = None;
         self.set_overlay(OverlayMode::Chat);
     }
 
@@ -7164,50 +8057,57 @@ impl App {
             .collect()
     }
 
-    /// A chatbox-only line (no console echo, no chat sound).
-    fn push_chat_notice(&mut self, text: String) {
-        if self.chat_lines.len() >= 16 {
-            self.chat_lines.pop_front();
-        }
-        let now = Instant::now();
-        self.chat_lines.push_back(ChatRecord {
-            text,
-            created: now,
-            demo_elapsed_ms: self.current_demo_elapsed_ms(now),
-        });
-        self.last_chat_refresh = Instant::now();
-    }
-
-    /// JAPP `CG_ChatboxTabComplete`: complete the word being typed to a player
-    /// name, or list the candidates when it is ambiguous.
+    /// JAPP `CG_ChatboxTabComplete`, with deterministic cycling for ambiguous
+    /// player names. The first Tab ranks candidates from the original word;
+    /// repeated Tabs keep cycling that captured set instead of matching the
+    /// already-completed replacement text.
     fn complete_chat_player_name(&mut self) {
         use crate::console::PlayerNameCompletion;
+
+        if let Some(cycle) = self.chat_player_completion.as_mut() {
+            if !cycle.candidates.is_empty() {
+                cycle.index = (cycle.index + 1) % cycle.candidates.len();
+                let word_start = cycle.word_start;
+                let name = cycle.candidates[cycle.index].clone();
+                self.chat_input.truncate(word_start);
+                self.chat_input.push_str(&name);
+                self.chat_input.push(' ');
+                self.publish_ui();
+                return;
+            }
+        }
 
         let word_start = self
             .chat_input
             .rfind(char::is_whitespace)
             .map_or(0, |index| index + self.chat_input[index..].chars().next().map_or(1, char::len_utf8));
-        let word = self.chat_input[word_start..].to_owned();
-        match crate::console::complete_player_name(&word, &self.connected_player_names()) {
-            PlayerNameCompletion::None => {}
-            PlayerNameCompletion::One(name) => {
-                // The input is capped at 160 bytes; never truncate a name mid colour code.
-                if word_start + name.len() + 1 <= 160 {
-                    self.chat_input.truncate(word_start);
-                    self.chat_input.push_str(&name);
-                    self.chat_input.push(' ');
-                    self.publish_ui();
-                }
-            }
-            PlayerNameCompletion::Many(names) => {
-                self.push_chat_notice(format!("^3Several matches found for '^7{word}^3':"));
-                self.push_chat_notice(names.join("^7, "));
-                self.publish_ui();
-            }
-        }
+        let query = self.chat_input[word_start..].to_owned();
+        let mut candidates = match crate::console::complete_player_name(&query, &self.connected_player_names()) {
+            PlayerNameCompletion::None => return,
+            PlayerNameCompletion::One(name) => vec![name],
+            PlayerNameCompletion::Many(names) => names,
+        };
+
+        // Chat input is capped at 160 bytes. Drop candidates that cannot replace
+        // this word without overflowing rather than truncating a name/color code.
+        candidates.retain(|name| word_start + name.len() + 1 <= 160);
+        let Some(name) = candidates.first().cloned() else {
+            return;
+        };
+
+        self.chat_input.truncate(word_start);
+        self.chat_input.push_str(&name);
+        self.chat_input.push(' ');
+        self.chat_player_completion = Some(ChatPlayerCompletionCycle {
+            word_start,
+            candidates,
+            index: 0,
+        });
+        self.publish_ui();
     }
 
     fn submit_chat(&mut self) {
+        self.chat_player_completion = None;
         let message = std::mem::take(&mut self.chat_input);
         let message = message.trim();
         if !message.is_empty() {
@@ -7255,15 +8155,19 @@ impl App {
         Some(match name.to_ascii_lowercase().as_str() {
             "com_maxfps" => self.effective_fps_cap().to_string(),
             "cg_drawfps" => self.video.draw_fps.to_string(),
+            "cg_drawtimer" => bool_value(self.video.draw_timer),
             "cg_debugevents" => self.cg_debug_events.to_string(),
             "cg_eventworkers" => bool_value(self.cg_event_workers),
             "cg_asyncassets" => bool_value(crate::asset_jobs::async_enabled()),
             "cg_drawcrosshair" => self.crosshair.style.to_string(),
             "cg_crosshairimage" => self.crosshair.image.to_string(),
+            "cg_dynamiccrosshair" => self.crosshair.dynamic.to_string(),
             "cg_crosshairidentifytarget" => bool_value(self.crosshair.identify_target),
             "cg_drawcrosshairnames" => format!("{}", self.crosshair.names),
             "cg_drawcrosshairnamescolours" => bool_value(self.crosshair.names_colours),
             "cg_drawcrosshairnamesopacity" => format!("{}", self.crosshair.names_opacity),
+            "cg_drawplayernames" => self.player_names.mode.to_string(),
+            "cg_drawplayernamesscale" => format!("{:.3}", self.player_names.scale),
             "cg_crosshairsize" => format!("{:.3}", self.crosshair.size),
             "cg_crosshairstrength" => format!("{:.3}", self.crosshair.strength),
             "cg_crosshaircolor" => {
@@ -7286,6 +8190,20 @@ impl App {
                 format!("{r} {g} {b} {a}")
             }
             "cg_strafehelperinactivealpha" => self.strafe_helper.inactive_alpha.to_string(),
+            "cg_strafetrailradius" => format!("{:.3}", self.strafe_trails.settings.radius),
+            "cg_strafetraillife" => format!("{:.3}", self.strafe_trails.settings.life_seconds),
+            "cg_strafetrailfps" => format!("{:.3}", self.strafe_trails.settings.fps),
+            "cg_strafetrailplums" => bool_value(self.strafe_trails.settings.plums),
+            "cg_strafetrailghost" => bool_value(self.strafe_trails.settings.ghost),
+            "cg_strafetrailplayers" => self.strafe_trails.settings.players.to_string(),
+            "cg_logstrafetrail" => self.strafe_trails.settings.log_name.clone(),
+            "cg_strafetraildistance" => format!("{:.1}", self.strafe_trails.settings.draw_distance),
+            "cg_rghostalpha" => format!("{:.3}", self.race_ghost_alpha),
+            "cg_rghostname" => bool_value(self.race_ghost_name),
+            "cg_rghosttrail" => bool_value(self.race_ghost_trail),
+            "cg_rghostvelocitydelta" => bool_value(self.race_ghost_velocity_delta),
+            "cg_rghostdistancedelta" => bool_value(self.race_ghost_distance_delta),
+            "cg_rghostdemobaseurl" => self.race_ghost_demo_base_url.clone(),
             hud_cvar if HudElementId::from_cvar(hud_cvar).is_some() => {
                 HudElementId::from_cvar(hud_cvar)
                     .map(|id| self.hud_layout.element(id).to_config())
@@ -7298,6 +8216,7 @@ impl App {
             "con_timestamps" => bool_value(self.console_timestamps),
             "con_suggest" => bool_value(self.console_suggest),
             "cg_chatboxcompletion" => bool_value(self.chatbox_completion),
+            "cl_chatlog" => bool_value(self.chat_log_enabled),
             "ui_vgs" => self.ui_vgs.to_string(),
             "r_jumpheightshade" => bool_value(self.jump_height_shade),
             "cg_screenshake" => self.screen_shake.to_string(),
@@ -7341,9 +8260,24 @@ impl App {
             "cg_chatsounds" => self.audio.game.chat_sounds.to_string(),
             "cg_footsteps" => self.audio.game.footsteps.to_string(),
             "cg_thirdperson" => bool_value(self.third_person.enabled),
+            "cg_speccamera" => self.spectator_camera.mode.as_i32().to_string(),
+            "cg_speccameramotion" => bool_value(self.spectator_camera.motion_direction),
+            "cg_specorbitrange" => format!("{:.3}", self.spectator_camera.orbit_range),
             "cg_fpls" => bool_value(self.first_person_lightsaber),
             "cg_sabertrail" => self.saber_trail.to_string(),
+            "cg_saberteamcolors" => bool_value(self.saber_team_colors),
+            "cg_saberstaffmulticolor" => bool_value(self.saber_staff_multi_color),
+            "cg_drawteamoverlay" => self.team_overlay.mode.to_string(),
+            "cg_drawteamoverlayx" => self.team_overlay.x.to_string(),
+            "cg_drawteamoverlayy" => self.team_overlay.y.to_string(),
+            "cg_drawteamoverlayweapons" => bool_value(self.team_overlay.weapons),
+            "cg_drawteamoverlayscale" => format!("{:.3}", self.team_overlay.scale),
+            "cg_drawteamoverlaymaxhp" => format!("{:.3}", self.team_overlay.max_hp),
+            "cg_drawteamoverlayforce" => bool_value(self.team_overlay.force),
+            "cg_scoredeaths" => self.score_deaths.to_string(),
+            "cg_drawscores" => self.draw_scores.to_string(),
             "cg_fxfps" => self.video.fx_fps.to_string(),
+            "cg_fxfpsscope" => self.video.fx_fps_scope.to_string(),
             "fx_physics" => self.video.fx_physics.to_string(),
             "fx_lod" => self.video.fx_lod.to_string(),
             "r_fxlodscale" => self.video.fx_lod_scale.to_string(),
@@ -7351,11 +8285,6 @@ impl App {
             "fx_countscale" => self.video.fx_count_scale.to_string(),
             "r_fxgeometry" => self.video.fx_geometry.config_value().to_owned(),
             "r_fxzeroalphadiscard" => bool_value(self.video.fx_zero_alpha_discard),
-            "cg_smoothplayerorigin" => bool_value(self.presentation_smoothing.smooth_player_origin),
-            "cg_smooththirdpersonorigin" => bool_value(self.presentation_smoothing.smooth_third_person_origin),
-            "cg_smoothplayeranimation" => bool_value(self.presentation_smoothing.smooth_player_animation),
-            "cg_subframeplayerangles" => bool_value(self.presentation_smoothing.subframe_player_angles),
-            "cg_smooththirdpersontime" => bool_value(self.presentation_smoothing.smooth_third_person_time),
             "cg_thirdpersonalpha" => format!("{:.3}", self.third_person.alpha),
             "cg_thirdpersonangle" => format!("{:.3}", self.third_person.angle),
             "cg_thirdpersoncameradamp" => format!("{:.3}", self.third_person.camera_damp),
@@ -7366,7 +8295,6 @@ impl App {
             "cg_thirdpersontargetdamp" => format!("{:.3}", self.third_person.target_damp),
             "cg_thirdpersonvertoffset" => format!("{:.3}", self.third_person.vert_offset),
             "pmove_msec" => self.video.physics_msec.to_string(),
-            "cl_input_subframe" => bool_value(self.video.input_subframe),
             "cl_timerresolution1ms" => bool_value(self.video.timer_resolution_1ms),
             "cl_input_latelatch" => bool_value(self.video.input_latelatch),
             "r_physics" => bool_value(self.video.client_physics),
@@ -7378,6 +8306,23 @@ impl App {
             "r_ragdollmax" => self.video.ragdoll_max.to_string(),
             "r_ragdolllifetime" => format!("{:.1}", self.video.ragdoll_lifetime),
             "r_ragdollselfcollision" => bool_value(self.video.ragdoll_self_collision),
+            "r_jigglephysics" => bool_value(self.video.jiggle_physics),
+            "r_jigglestrength" => format!("{:.3}", self.video.jiggle_strength),
+            "r_jigglebreaststrength" => format!("{:.3}", self.video.jiggle_breast_strength),
+            "r_jiggleglutestrength" => format!("{:.3}", self.video.jiggle_glute_strength),
+            "r_jigglestiffness" => format!("{:.3}", self.video.jiggle_stiffness),
+            "r_jiggledamping" => format!("{:.3}", self.video.jiggle_damping),
+            "r_jiggleglutelift" => format!("{:.3}", self.video.jiggle_glute_lift),
+            "cg_dismember" => self.video.dismemberment.to_string(),
+            "r_dismembermax" => self.video.dismember_max.to_string(),
+            "r_dismemberlifetime" => format!("{:.1}", self.video.dismember_lifetime),
+            "r_clothphysics" => bool_value(self.video.cloth_physics),
+            "r_clothbodycollision" => bool_value(self.video.cloth_body_collision),
+            "r_clothbodyclearance" => self.video.cloth_body_clearance.to_string(),
+            "r_clothairresistance" => self.video.cloth_air_resistance.to_string(),
+            "r_clothturnresponse" => self.video.cloth_turn_response.to_string(),
+            "r_clothanimationinfluence" => self.video.cloth_animation_influence.to_string(),
+            "r_clothwind" => bool_value(self.video.cloth_wind),
             "r_physicsprops" => bool_value(self.video.physics_props),
             "r_physicspropmax" => self.video.physics_prop_max.to_string(),
             "r_physicsdebris" => bool_value(self.video.physics_debris),
@@ -7405,6 +8350,7 @@ impl App {
                 TextureFilter::Bilinear => "GL_LINEAR_MIPMAP_NEAREST".into(),
                 _ => "GL_LINEAR_MIPMAP_LINEAR".into(),
             },
+            "r_picmip" => self.video.picmip.to_string(),
             "r_ext_texture_filter_anisotropic" => match self.video.texture_filter {
                 TextureFilter::Anisotropic2x => "2".into(),
                 TextureFilter::Anisotropic4x => "4".into(),
@@ -7562,6 +8508,7 @@ impl App {
             "r_filmgrain" => format!("{:.3}", self.video.film_grain_strength),
             "r_motionblur" => format!("{:.3}", self.video.motion_blur_strength),
             "r_depthoffield" => format!("{:.3}", self.video.depth_of_field_strength),
+            "r_dofautofocus" => bool_value(self.video.dof_autofocus),
             "r_dofquality" => self.video.dof_quality.config_value().to_owned(),
             "r_colorlut" => self.video.color_lut.config_value().to_owned(),
             "r_colorlutstrength" => format!("{:.3}", self.video.color_lut_strength),
@@ -7598,7 +8545,8 @@ impl App {
                 .to_ascii_lowercase(),
             "r_showtris" => self.video.wireframe_mask.to_string(),
             "r_skipui" => bool_value(self.video.skip_ui),
-            "developer" => bool_value(self.video.developer_tools),
+            "developer" => self.video.developer_level.to_string(),
+            "r_verbose" => self.video.renderer_verbose.to_string(),
             "r_perftrace" => bool_value(self.video.perf_trace),
             "r_pom" => bool_value(self.video.pom),
             "r_worldpath" => if self.video.force_unified_world { "unified" } else { "auto" }.to_owned(),
@@ -7659,32 +8607,6 @@ impl App {
         }
     }
 
-    fn set_input_subframe(&mut self, enabled: bool) {
-        if enabled == self.video.input_subframe {
-            return;
-        }
-        self.video.input_subframe = enabled;
-        self.render_command(RenderCommand::SetInputSubframe(enabled));
-        if !enabled && self.video.input_latelatch {
-            self.video.input_latelatch = false;
-            self.render_command(RenderCommand::SetInputLateLatch(false));
-        }
-        self.mouse_delta = (0.0, 0.0);
-        self.last_mouse_motion_at = None;
-        self.pending_mouse_input = None;
-        self.last_simulated_mouse_input = None;
-        if let Some(player) = &self.local_server {
-            if enabled {
-                player.camera_subframe(&mut self.camera);
-            } else {
-                player.camera(&mut self.camera);
-            }
-        }
-        self.mark_config_dirty();
-        self.publish_snapshot();
-        self.publish_ui();
-    }
-
     fn set_timer_resolution_1ms(&mut self, enabled: bool) -> Result<(), String> {
         if self.video.timer_resolution_1ms == enabled
             && self.windows_timer_resolution.is_active() == enabled
@@ -7705,9 +8627,6 @@ impl App {
     }
 
     fn set_input_latelatch(&mut self, enabled: bool) {
-        if enabled && !self.video.input_subframe {
-            self.set_input_subframe(true);
-        }
         if enabled == self.video.input_latelatch {
             return;
         }
@@ -7739,6 +8658,11 @@ impl App {
         };
         match lower.as_str() {
             "r_pbr" | "r_gennormalmaps" | "r_floatlightmap" | "fs_allowassetoverrides" => boolean(),
+            "r_picmip" => value
+                .trim()
+                .parse::<u32>()
+                .map(|picmip| picmip.min(16).to_string())
+                .map_err(|_| format!("{name}: expected an integer from 0 to 16")),
             "r_fullscreen" => FullscreenMode::from_config(value)
                 .map(|mode| mode.config_value().to_string())
                 .ok_or_else(|| format!("{name}: expected 0 (windowed), 1 (borderless), or 2 (exclusive)")),
@@ -7865,6 +8789,11 @@ impl App {
                     settings.float_lightmap =
                         Self::parse_console_bool(value).unwrap_or(settings.float_lightmap)
                 }
+                "r_picmip" => {
+                    if let Ok(picmip) = value.parse::<u32>() {
+                        settings.picmip = picmip.min(16);
+                    }
+                }
                 _ => {}
             }
         }
@@ -7938,6 +8867,86 @@ impl App {
             self.request_userinfo_send();
         }
         result
+    }
+
+    fn refresh_japro_saved_logins(&mut self) {
+        match crate::credential_store::list() {
+            Ok(entries) => {
+                self.japro_saved_logins = entries;
+                self.japro_credential_error = None;
+            }
+            Err(error) => self.japro_credential_error = Some(error),
+        }
+    }
+
+    fn current_japro_server_endpoint(&self) -> Option<SocketAddr> {
+        (self.live_connected()
+            && self.connected_server_mod() == crate::net::mod_support::ServerMod::Japro)
+            .then(|| self.net.as_ref().map(|net| net.session().server()))
+            .flatten()
+    }
+
+    fn save_japro_login_for_current_server(&mut self) -> Result<(), String> {
+        let server = self.current_japro_server_endpoint().ok_or_else(|| {
+            "Join a jaPRO server before saving an automatic login".to_owned()
+        })?;
+        if self.network.ui_username.is_empty() || self.network.ui_password.is_empty() {
+            return Err("Enter both jaPRO username and password first".to_owned());
+        }
+        crate::credential_store::save(
+            server,
+            &self.network.ui_username,
+            &self.network.ui_password,
+        )?;
+        self.refresh_japro_saved_logins();
+        Ok(())
+    }
+
+    fn forget_japro_login(&mut self, server: SocketAddr) -> Result<(), String> {
+        crate::credential_store::delete(server)?;
+        self.refresh_japro_saved_logins();
+        Ok(())
+    }
+
+    /// Auto-login only after the gamestate identifies jaPRO, and only with a
+    /// credential whose key exactly equals the resolved UDP endpoint. Server
+    /// names / hostnames are deliberately not accepted as credential identity.
+    fn try_japro_autologin(&mut self) {
+        let Some(server) = self.current_japro_server_endpoint() else { return };
+        if self.japro_autologin_attempted == Some(server) {
+            return;
+        }
+        self.japro_autologin_attempted = Some(server);
+        match crate::credential_store::read(server) {
+            Ok(Some(credential)) => {
+                let valid = !credential.username.is_empty()
+                    && !credential.password.is_empty()
+                    && !credential.username.chars().any(char::is_whitespace)
+                    && !credential.password.chars().any(char::is_whitespace)
+                    && !credential.username.chars().any(|c| matches!(c, ';' | '"' | '\\'))
+                    && !credential.password.chars().any(|c| matches!(c, ';' | '"' | '\\'));
+                if !valid {
+                    self.push_console_line(format!(
+                        "^3Auto-login skipped:^7 saved credential for {server} is invalid"
+                    ));
+                    return;
+                }
+                self.network.ui_username = credential.username.clone();
+                // Never copy the saved password into ui_password or config. Build
+                // the one reliable command directly, then let the local secret drop.
+                self.forward_command_to_server(&format!(
+                    "login {} {}", credential.username, credential.password
+                ));
+                self.push_console_line(format!(
+                    "^2jaPRO auto-login:^7 {} @ {server}", credential.username
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.japro_credential_error = Some(error.clone());
+                self.push_console_line(format!("^3jaPRO auto-login unavailable:^7 {error}"));
+            }
+        }
     }
 
     /// The connected server's mod, from its serverinfo configstring.
@@ -8038,6 +9047,27 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "cl_chatlog" => {
+                let enabled = boolean()?;
+                if self.chat_log_enabled != enabled {
+                    self.chat_log_enabled = enabled;
+                    if enabled {
+                        self.begin_chat_log_for_current_connection();
+                        if let Some(map_name) = self
+                            .game_session
+                            .as_ref()
+                            .filter(|session| session.live && !session.local)
+                            .and_then(|session| session.map_name.clone())
+                        {
+                            self.update_chat_log_live_metadata(&map_name);
+                        }
+                    } else {
+                        self.chat_log.end("Chat logging disabled");
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                }
+            }
             "ui_vgs" => {
                 self.ui_vgs = value
                     .trim()
@@ -8050,6 +9080,67 @@ impl App {
                 } else {
                     self.publish_ui();
                 }
+            }
+            "cg_strafetrailradius" => {
+                self.strafe_trails.settings.radius = finite_number()?.clamp(0.1, 100.0);
+                self.mark_config_dirty();
+            }
+            "cg_strafetraillife" => {
+                self.strafe_trails.settings.life_seconds = finite_number()?.clamp(0.1, 3600.0);
+                self.mark_config_dirty();
+            }
+            "cg_strafetrailfps" => {
+                self.strafe_trails.settings.fps = finite_number()?.clamp(1.0, 1000.0);
+                self.mark_config_dirty();
+            }
+            "cg_strafetrailplums" => {
+                self.strafe_trails.settings.plums = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_strafetrailghost" => {
+                self.strafe_trails.settings.ghost = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_strafetrailplayers" => {
+                let mask = value.trim().parse::<u32>().map_err(|_| format!("{name}: expected an unsigned integer bitmask"))?;
+                self.strafe_trails.set_players_mask(mask);
+                self.mark_config_dirty();
+            }
+            "cg_logstrafetrail" => {
+                let active_dir = jka_assets::pk3::active_game_directory(&self.base, self.game.as_deref());
+                self.strafe_trails.set_log_name(&active_dir, value)?;
+                self.strafe_trail_log_input = self.strafe_trails.settings.log_name.clone();
+                self.mark_config_dirty();
+            }
+            "cg_strafetraildistance" => {
+                self.strafe_trails.settings.draw_distance = finite_number()?.clamp(256.0, 131_072.0);
+                self.mark_config_dirty();
+            }
+            "cg_rghostalpha" => {
+                self.race_ghost_alpha = finite_number()?.clamp(0.02, 1.0);
+                if let Some(session) = self.game_session.as_mut() {
+                    session.race_ghost_alpha = self.race_ghost_alpha;
+                }
+                self.mark_config_dirty();
+            }
+            "cg_rghostname" => {
+                self.race_ghost_name = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_rghosttrail" => {
+                self.race_ghost_trail = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_rghostvelocitydelta" => {
+                self.race_ghost_velocity_delta = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_rghostdistancedelta" => {
+                self.race_ghost_distance_delta = boolean()?;
+                self.mark_config_dirty();
+            }
+            "cg_rghostdemobaseurl" => {
+                self.set_race_ghost_demo_base_url(value)?;
             }
             "cg_screenshake" => {
                 self.screen_shake = finite_number()?.clamp(0.0, 2.0) as u8;
@@ -8147,6 +9238,19 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "cg_dynamiccrosshair" => {
+                let mode = value
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| "cg_dynamicCrosshair: expected 0, 1, or 2".to_owned())?;
+                if mode > 2 {
+                    return Err("cg_dynamicCrosshair: expected 0, 1, or 2".to_owned());
+                }
+                self.crosshair.dynamic = mode;
+                self.crosshair_scan_at = Instant::now() - Duration::from_secs(1);
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
             "cg_crosshairidentifytarget" => {
                 self.crosshair.identify_target = boolean()?;
                 self.mark_config_dirty();
@@ -8167,6 +9271,28 @@ impl App {
                 self.crosshair.names_opacity = finite_number()?.clamp(0.0, 1.0);
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "cg_drawplayernames" => {
+                let mode = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| "cg_drawPlayerNames: expected 0, 1, or 2".to_owned())?;
+                if !(0..=2).contains(&mode) {
+                    return Err("cg_drawPlayerNames: expected 0, 1, or 2".to_owned());
+                }
+                self.player_names.mode = mode;
+                if mode == 0 {
+                    self.player_name_visible = [false; 32];
+                } else {
+                    self.player_name_scan_at = Instant::now() - Duration::from_secs(1);
+                }
+                self.mark_config_dirty();
+                self.publish_snapshot();
+            }
+            "cg_drawplayernamesscale" => {
+                self.player_names.scale = finite_number()?.clamp(0.05, 4.0);
+                self.mark_config_dirty();
+                self.publish_snapshot();
             }
             "cg_crosshairsize" => {
                 self.crosshair.size = finite_number()?.clamp(4.0, 96.0);
@@ -8198,7 +9324,7 @@ impl App {
             }
             hud_cvar if HudElementId::from_cvar(hud_cvar).is_some() => {
                 let layout = ui::HudElementLayout::from_config(value).ok_or_else(|| {
-                    format!("{name}: expected <anchor> <x> <y> <scale>, e.g. bl 24 -58 1")
+                    format!("{name}: expected <anchor> <x> <y> <scale> [width height], e.g. bl 24 -58 1")
                 })?;
                 let id = HudElementId::from_cvar(hud_cvar).expect("guarded above");
                 *self.hud_layout.element_mut(id) = layout;
@@ -8486,6 +9612,38 @@ impl App {
                 self.publish_snapshot();
                 self.publish_ui();
             }
+            "cg_speccamera" => {
+                let mode = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| "cg_specCamera expects 0 (first), 1 (third), or 2 (orbit)".to_owned())?;
+                if !(0..=2).contains(&mode) {
+                    return Err("cg_specCamera expects 0 (first), 1 (third), or 2 (orbit)".to_owned());
+                }
+                self.spectator_camera.mode = SpectatorCameraMode::from_i32(mode);
+                self.spectator_camera_state.reset();
+                self.third_person_camera.reset();
+                self.sync_demo_camera_capture();
+                self.mark_config_dirty();
+                self.publish_snapshot();
+                self.publish_ui();
+            }
+            "cg_speccameramotion" => {
+                self.spectator_camera.motion_direction = boolean()?;
+                self.third_person_camera.reset();
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "cg_specorbitrange" => {
+                self.spectator_camera.orbit_range = value
+                    .trim()
+                    .parse::<f32>()
+                    .map_err(|_| format!("{name}: expected a number"))?
+                    .clamp(MIN_SPECTATOR_ORBIT_RANGE, MAX_SPECTATOR_ORBIT_RANGE);
+                self.third_person_camera.reset();
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
             "cg_fpls" => {
                 self.first_person_lightsaber = boolean()?;
                 self.third_person_camera.reset();
@@ -8503,6 +9661,51 @@ impl App {
                 self.mark_config_dirty();
                 self.push_console_line(format!("cg_saberTrail = {}", self.saber_trail));
             }
+            "cg_saberteamcolors" => {
+                self.saber_team_colors = boolean()?;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.player_presenter.set_saber_team_colors(self.saber_team_colors);
+                }
+                self.mark_config_dirty();
+                self.publish_snapshot();
+            }
+            "cg_saberstaffmulticolor" => {
+                self.saber_staff_multi_color = boolean()?;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.player_presenter.set_saber_staff_multi_color(self.saber_staff_multi_color);
+                }
+                self.mark_config_dirty();
+                self.publish_snapshot();
+            }
+            "cg_drawteamoverlay" => {
+                self.team_overlay.mode = value.trim().parse::<i32>().map_err(|_| "cg_drawTeamOverlay expects 0..6".to_owned())?.clamp(0, 6);
+                // CG_UpdateCvars parity: mirror the visual cvar into the hidden
+                // CVAR_USERINFO teamoverlay bit so the server sends/stops tinfo.
+                let requested = self.team_overlay.mode > 0;
+                if self.network.team_overlay != requested {
+                    self.network.team_overlay = requested;
+                    self.request_userinfo_send();
+                }
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+            }
+            "cg_drawteamoverlayx" => { self.team_overlay.x = value.trim().parse::<i32>().map_err(|_| "cg_drawTeamOverlayX expects an integer".to_owned())?; self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_drawteamoverlayy" => { self.team_overlay.y = value.trim().parse::<i32>().map_err(|_| "cg_drawTeamOverlayY expects an integer".to_owned())?; self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_drawteamoverlayweapons" => { self.team_overlay.weapons = boolean()?; self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_drawteamoverlayscale" => { self.team_overlay.scale = value.trim().parse::<f32>().map_err(|_| "cg_drawTeamOverlayScale expects a number".to_owned())?.clamp(0.5, 2.5); self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_drawteamoverlaymaxhp" => { self.team_overlay.max_hp = value.trim().parse::<f32>().map_err(|_| "cg_drawTeamOverlayMaxHP expects a number".to_owned())?.max(1.0); self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_drawteamoverlayforce" => { self.team_overlay.force = boolean()?; self.mark_config_dirty(); self.publish_transient_ui(); }
+            "cg_scoredeaths" => {
+                self.score_deaths = value.trim().parse::<i32>().map_err(|_| "cg_scoreDeaths expects 0..3".to_owned())?.clamp(0, 3);
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "cg_drawscores" => {
+                self.draw_scores = value.trim().parse::<i32>().map_err(|_| "cg_drawScores expects 0..3".to_owned())?.clamp(0, 3);
+                self.mini_scores_shown = self.mini_scores_ui();
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+            }
             "cg_fxfps" => {
                 let requested = value
                     .trim()
@@ -8517,12 +9720,28 @@ impl App {
                 } else {
                     requested.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
                 };
+                self.apply_fx_fps_settings();
                 self.mark_config_dirty();
                 self.publish_ui();
                 self.console_status = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
                     "FX FPS: LEGACY JKA (ONE CONTINUOUS EFFECT INVOCATION PER PRESENTATION FRAME)".into()
                 } else {
                     format!("FX FPS: {} HZ", self.video.fx_fps)
+                };
+            }
+            "cg_fxfpsscope" => {
+                let requested = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "cg_fxFPSScope expects 0..1".to_owned())?;
+                self.video.fx_fps_scope = requested.min(crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN);
+                self.apply_fx_fps_settings();
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = if self.video.fx_fps_scope == crate::fx::FX_FPS_SCOPE_FRAME_DRIVEN {
+                    "FX FPS SCOPE: ALL FRAME-DRIVEN FX".into()
+                } else {
+                    "FX FPS SCOPE: CONTINUOUS EFX".into()
                 };
             }
             "fx_physics" => {
@@ -8578,43 +9797,6 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
                 self.console_status = format!("FX COUNT SCALE: {}", self.video.fx_count_scale);
-            }
-            "cg_smoothplayerorigin" => {
-                self.presentation_smoothing.smooth_player_origin = boolean()?;
-                self.mark_config_dirty();
-                self.update_solo_player_view_and_presentation();
-                self.publish_snapshot();
-                self.publish_ui();
-            }
-            "cg_smooththirdpersonorigin" => {
-                self.presentation_smoothing.smooth_third_person_origin = boolean()?;
-                self.third_person_camera.reset();
-                self.mark_config_dirty();
-                self.update_solo_player_view_and_presentation();
-                self.publish_snapshot();
-                self.publish_ui();
-            }
-            "cg_smoothplayeranimation" => {
-                self.presentation_smoothing.smooth_player_animation = boolean()?;
-                self.mark_config_dirty();
-                self.update_solo_player_view_and_presentation();
-                self.publish_snapshot();
-                self.publish_ui();
-            }
-            "cg_subframeplayerangles" => {
-                self.presentation_smoothing.subframe_player_angles = boolean()?;
-                self.mark_config_dirty();
-                self.update_solo_player_view_and_presentation();
-                self.publish_snapshot();
-                self.publish_ui();
-            }
-            "cg_smooththirdpersontime" => {
-                self.presentation_smoothing.smooth_third_person_time = boolean()?;
-                self.third_person_camera.reset();
-                self.mark_config_dirty();
-                self.update_solo_player_view_and_presentation();
-                self.publish_snapshot();
-                self.publish_ui();
             }
             "cg_thirdpersonalpha" => {
                 self.third_person.alpha = value.trim().parse::<f32>().map_err(|_| format!("{name}: expected a number"))?;
@@ -8672,6 +9854,12 @@ impl App {
                 self.mark_config_dirty();
                 self.publish_ui();
             }
+            "cg_drawtimer" => {
+                self.video.draw_timer = boolean()?;
+                self.game_timer_shown = None;
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+            }
             "cg_debugevents" => {
                 let mode = value
                     .trim()
@@ -8716,10 +9904,6 @@ impl App {
                     .map_err(|_| format!("{name}: expected an integer timestep in milliseconds"))?;
                 self.set_physics_msec(parsed.clamp(1, 33));
             }
-            "cl_input_subframe" => {
-                let enabled = boolean()?;
-                self.set_input_subframe(enabled);
-            }
             "cl_timerresolution1ms" => {
                 let enabled = boolean()?;
                 self.set_timer_resolution_1ms(enabled)?;
@@ -8729,7 +9913,8 @@ impl App {
                 self.set_input_latelatch(enabled);
             }
             "r_physics" | "r_physicsccd" | "r_physicssleeping" | "r_ragdolls"
-            | "r_ragdollselfcollision" | "r_physicsprops" | "r_physicsdebris"
+            | "r_ragdollselfcollision" | "r_jigglephysics" | "r_clothphysics" | "r_clothbodycollision" | "r_clothwind"
+            | "r_physicsprops" | "r_physicsdebris"
             | "r_physicsplayerpush" | "r_physicsweaponimpulses"
             | "r_physicsexplosionimpulses" | "r_physicsforceimpulses"
             | "r_physicsdebug" | "r_physicsstats" => {
@@ -8740,6 +9925,10 @@ impl App {
                     "r_physicssleeping" => self.video.client_physics_sleeping = enabled,
                     "r_ragdolls" => self.video.ragdolls = enabled,
                     "r_ragdollselfcollision" => self.video.ragdoll_self_collision = enabled,
+                    "r_jigglephysics" => self.video.jiggle_physics = enabled,
+                    "r_clothphysics" => self.video.cloth_physics = enabled,
+                    "r_clothbodycollision" => self.video.cloth_body_collision = enabled,
+                    "r_clothwind" => self.video.cloth_wind = enabled,
                     "r_physicsprops" => self.video.physics_props = enabled,
                     "r_physicsdebris" => self.video.physics_debris = enabled,
                     "r_physicsplayerpush" => self.video.physics_player_push = enabled,
@@ -8754,6 +9943,37 @@ impl App {
                 if lower == "r_physics" {
                     self.ensure_map_physics_mesh();
                 }
+                self.publish_ui();
+            }
+            "r_jigglestrength" | "r_jigglebreaststrength" | "r_jiggleglutestrength"
+            | "r_jigglestiffness" | "r_jiggledamping" | "r_jiggleglutelift" => {
+                let amount = value.trim().parse::<f32>()
+                    .map_err(|_| format!("{name}: expected a finite number"))?;
+                if !amount.is_finite() { return Err(format!("{name}: expected a finite number")); }
+                match lower.as_str() {
+                    "r_jigglestrength" => self.video.jiggle_strength = amount.clamp(0.0, 2.0),
+                    "r_jigglebreaststrength" => self.video.jiggle_breast_strength = amount.clamp(0.0, 2.0),
+                    "r_jiggleglutestrength" => self.video.jiggle_glute_strength = amount.clamp(0.0, 2.0),
+                    "r_jigglestiffness" => self.video.jiggle_stiffness = amount.clamp(0.0, 3.0),
+                    "r_jiggledamping" => self.video.jiggle_damping = amount.clamp(0.0, 3.0),
+                    "r_jiggleglutelift" => self.video.jiggle_glute_lift = amount.clamp(-0.4, 0.6),
+                    _ => unreachable!(),
+                }
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_clothbodyclearance" | "r_clothairresistance" | "r_clothturnresponse" | "r_clothanimationinfluence" => {
+                let amount = value.trim().parse::<f32>()
+                    .map_err(|_| format!("{name}: expected a finite number"))?;
+                if !amount.is_finite() { return Err(format!("{name}: expected a finite number")); }
+                match lower.as_str() {
+                    "r_clothbodyclearance" => self.video.cloth_body_clearance = amount.clamp(0.0, 4.0),
+                    "r_clothairresistance" => self.video.cloth_air_resistance = amount.clamp(0.0, 4.0),
+                    "r_clothturnresponse" => self.video.cloth_turn_response = amount.clamp(0.0, 4.0),
+                    "r_clothanimationinfluence" => self.video.cloth_animation_influence = amount.clamp(0.0, 1.0),
+                    _ => unreachable!(),
+                }
+                self.mark_config_dirty();
                 self.publish_ui();
             }
             "r_physicshz" => {
@@ -8799,6 +10019,27 @@ impl App {
                 self.video.ragdoll_lifetime = requested as f32;
                 self.mark_config_dirty();
                 self.publish_ui();
+            }
+            "cg_dismember" => {
+                let requested = value.trim().parse::<u8>().map_err(|_| "cg_dismember expects 0, 1, or 2".to_owned())?;
+                self.video.dismemberment = requested.min(2);
+                self.physics_menu_changed();
+                return Ok(());
+            }
+            "r_dismembermax" => {
+                let requested = value.trim().parse::<u32>().map_err(|_| "r_dismemberMax expects an integer".to_owned())?;
+                self.video.dismember_max = requested.clamp(1, 128);
+                self.physics_menu_changed();
+                return Ok(());
+            }
+            "r_dismemberlifetime" => {
+                let requested = value.trim().parse::<f32>().map_err(|_| "r_dismemberLifetime expects seconds".to_owned())?;
+                if !requested.is_finite() {
+                    return Err("r_dismemberLifetime expects a finite number".to_owned());
+                }
+                self.video.dismember_lifetime = requested.clamp(1.0, 300.0);
+                self.physics_menu_changed();
+                return Ok(());
             }
             "r_physicspropmax" => {
                 let requested = value.trim().parse::<u32>()
@@ -8907,6 +10148,17 @@ impl App {
                     _ => return Err(format!("{name}: unknown texture mode")),
                 };
                 self.render_command(RenderCommand::SetTextureFilter(self.video.texture_filter));
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_picmip" => {
+                let picmip = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{name}: expected an integer from 0 to 16"))?
+                    .min(16);
+                self.video.picmip = picmip;
+                self.render_command(RenderCommand::SetPicmip(picmip));
                 self.mark_config_dirty();
                 self.publish_ui();
             }
@@ -9100,11 +10352,39 @@ impl App {
                 self.publish_ui();
             }
             "developer" => {
-                self.video.developer_tools = boolean()?;
+                let level = match Self::parse_console_bool(value) {
+                    Some(enabled) => u8::from(enabled),
+                    None => value
+                        .trim()
+                        .parse::<u8>()
+                        .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                };
+                if level > 3 {
+                    return Err(format!("{name}: expected 0..3"));
+                }
+                self.video.developer_level = level;
+                self.video.developer_tools = level != 0;
+                crate::logging::set_developer_level(level);
                 if !self.video.developer_tools {
                     self.forget_trace();
                     self.render_command(RenderCommand::ClearSurfaceInspection);
                 }
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
+            "r_verbose" => {
+                let level = match Self::parse_console_bool(value) {
+                    Some(enabled) => u8::from(enabled),
+                    None => value
+                        .trim()
+                        .parse::<u8>()
+                        .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                };
+                if level > 3 {
+                    return Err(format!("{name}: expected 0..3"));
+                }
+                self.video.renderer_verbose = level;
+                crate::logging::set_renderer_verbose_level(level);
                 self.mark_config_dirty();
                 self.publish_ui();
             }
@@ -9777,6 +11057,12 @@ impl App {
                     .map_err(|_| format!("{name}: expected 0..1"))?;
                 self.set_depth_of_field_strength(strength);
             }
+            "r_dofautofocus" => {
+                self.video.dof_autofocus = boolean()?;
+                self.crosshair_scan_at = Instant::now() - Duration::from_secs(1);
+                self.mark_config_dirty();
+                self.publish_ui();
+            }
             "r_dofquality" => {
                 self.video.dof_quality = DofQuality::from_config(value)
                     .ok_or_else(|| format!("{name}: expected performance|adaptive|high"))?;
@@ -10297,8 +11583,21 @@ impl App {
         } else {
             0
         };
-        let Some(index) =
-            ui::console_suggest_hit(width, height, self.console_size, hits.len(), selected, x, y)
+        let detail_lines = ui::console_suggest_detail_line_count(
+            width,
+            height,
+            hits[selected].entry.description,
+        );
+        let Some(index) = ui::console_suggest_hit(
+            width,
+            height,
+            self.console_size,
+            hits.len(),
+            selected,
+            detail_lines,
+            x,
+            y,
+        )
         else {
             return false;
         };
@@ -10363,6 +11662,15 @@ impl App {
     }
 
     fn disconnect_to_main_menu(&mut self) {
+        if self.chat_log_enabled {
+            self.chat_log.end("Disconnected");
+        }
+        // A just-finished session may have created or appended a log after the
+        // browser was last opened. Force a background rescan next time the
+        // main-menu Chat Logs page is entered.
+        self.chat_log_browser_catalog_loaded = false;
+        self.chat_log_browser_detail_path = None;
+        self.chat_log_browser_detail = None;
         if self.demo_recording.is_some() {
             self.stop_demo_recording();
         }
@@ -10380,6 +11688,7 @@ impl App {
         self.game_session = None;
         self.live_without_world = false;
         self.demo_without_world = false;
+        self.server_password_prompt = None;
         self.missing_map_prompt = None;
         self.demo_missing_map_prompt = None;
         self.live_missing_map_authorized = false;
@@ -10392,6 +11701,7 @@ impl App {
         self.pending_live_gamestate = false;
         self.pending_live_server_commands.clear();
         self.live_join_timing = None;
+        self.japro_autologin_attempted = None;
         self.restore_startup_game();
         if let Some(mut net) = self.net.take() {
             net.disconnect();
@@ -10401,6 +11711,7 @@ impl App {
         self.scoreboard = None;
         self.scores_showing = false;
         self.last_scores_request = None;
+        self.mark_companion_dirty();
         self.center_print = None;
         self.last_center_print.clear();
 
@@ -10429,8 +11740,6 @@ impl App {
         self.mouse_buttons_down.clear();
         self.noclip_primary_down = false;
         self.noclip_alt_down = false;
-        self.mouse_delta = (0.0, 0.0);
-        self.pending_mouse_input = None;
 
         self.front_end = true;
         self.frontend_page = FrontendPage::Main;
@@ -10452,6 +11761,9 @@ impl App {
     /// The previous GPU world is harmless behind the opaque loading-information
     /// screen and is replaced atomically by RenderCommand::LoadMap.
     fn disconnect_for_demo_transition(&mut self) {
+        if self.chat_log_enabled {
+            self.chat_log.end("Switched to demo playback");
+        }
         if self.demo_recording.is_some() {
             self.stop_demo_recording();
         }
@@ -10465,6 +11777,7 @@ impl App {
         self.game_session = None;
         self.live_without_world = false;
         self.demo_without_world = false;
+        self.server_password_prompt = None;
         self.missing_map_prompt = None;
         self.demo_missing_map_prompt = None;
         self.live_missing_map_authorized = false;
@@ -10485,6 +11798,7 @@ impl App {
         self.scoreboard = None;
         self.scores_showing = false;
         self.last_scores_request = None;
+        self.mark_companion_dirty();
         self.center_print = None;
         self.last_center_print.clear();
 
@@ -10511,8 +11825,6 @@ impl App {
         self.mouse_buttons_down.clear();
         self.noclip_primary_down = false;
         self.noclip_alt_down = false;
-        self.mouse_delta = (0.0, 0.0);
-        self.pending_mouse_input = None;
     }
 
     /// DinurdoJK's targeted equivalent of the useful part of OpenJK's
@@ -10626,6 +11938,20 @@ impl App {
         self.asset_viewer_detail_path = None;
         self.asset_viewer_detail = None;
         self.asset_viewer_shader_name = None;
+        self.screenshot_catalog_loaded = false;
+        self.screenshot_catalog_error = None;
+        self.screenshot_entries.clear();
+        self.screenshot_selected = None;
+        self.screenshot_preview_texture = None;
+        self.screenshot_preview_path = None;
+        self.screenshot_preview_pending = None;
+        self.screenshot_preview_error = None;
+        self.chat_log_browser_catalog_loaded = false;
+        self.chat_log_browser_catalog_error = None;
+        self.chat_log_browser_entries.clear();
+        self.chat_log_browser_selected = None;
+        self.chat_log_browser_detail_path = None;
+        self.chat_log_browser_detail = None;
         self.asset_preview_player_presenter = None;
         self.asset_preview_entity_presenter = None;
         self.asset_preview_model_key = None;
@@ -10810,10 +12136,227 @@ impl App {
         }
     }
 
+    fn build_screenshot_metadata(&self) -> crate::screenshot::ScreenshotMetadata {
+        let game = self
+            .game
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "base".to_owned());
+        let camera_origin = (!self.front_end).then(|| scene::jka_position(self.camera.position.to_array()));
+        let view_angles = (!self.front_end).then(|| [
+            -self.camera.pitch.to_degrees(),
+            self.camera.yaw.to_degrees().rem_euclid(360.0),
+            0.0,
+        ]);
+        let player_origin = self.live_player_state().and_then(|ps| playerstate_vec3(ps, "origin"));
+
+        let mut players = Vec::new();
+        if let Some(session) = self.game_session.as_ref() {
+            for client_num in 0..32usize {
+                let Some(info) = session.client_game.client_info(client_num, &session.siege_classes) else {
+                    continue;
+                };
+                if info.name.is_empty() {
+                    continue;
+                }
+                let score = self.scoreboard.as_ref().and_then(|scoreboard| {
+                    scoreboard.entries.iter().find(|entry| entry.client == client_num as i32)
+                });
+                players.push(crate::screenshot::ScreenshotPlayer {
+                    client_num: client_num as i32,
+                    name: info.name,
+                    team: info.team,
+                    score: score.map(|entry| entry.score),
+                    ping: score.map(|entry| entry.ping),
+                    time_minutes: score.map(|entry| entry.time),
+                });
+            }
+        }
+
+        let server_time_ms = self
+            .game_session
+            .as_ref()
+            .and_then(|session| session.current_snapshot.as_ref().map(|snapshot| snapshot.server_time))
+            .or_else(|| self.net.as_ref().map(|net| net.session().server_time()));
+        let map_time_ms = self.game_session.as_ref().and_then(|session| {
+            let server_time = server_time_ms?;
+            Some(server_time.saturating_sub(session.client_game.match_limits().level_start_time))
+        });
+
+        crate::screenshot::ScreenshotMetadata {
+            version: crate::screenshot::METADATA_VERSION,
+            captured_at: crate::screenshot::capture_timestamp_local(),
+            captured_unix_ms: crate::screenshot::unix_time_ms(),
+            game,
+            map_name: (!self.front_end && !self.map_name.is_empty()).then(|| {
+                self.map_name
+                    .strip_suffix(".bsp")
+                    .or_else(|| self.map_name.strip_suffix(".map"))
+                    .unwrap_or(&self.map_name)
+                    .replace('\\', "/")
+            }),
+            server_name: self.current_server_hostname(),
+            server_address: self.net.as_ref().map(|net| net.session().server().to_string()),
+            player_name: self.network.name.clone(),
+            players,
+            camera_origin,
+            player_origin,
+            view_angles,
+            map_time_ms,
+            server_time_ms,
+            fov: self.camera.cg_fov(),
+            third_person: self.third_person.enabled,
+            crosshair: None,
+        }
+    }
+
     fn request_screenshot(&mut self) {
         self.render_command(RenderCommand::Screenshot {
             directory: self.game_write_path("screenshots"),
+            metadata: self.build_screenshot_metadata(),
         });
+    }
+
+    /// Configure an image path supplied on the process command line (for
+    /// example by dragging a screenshot onto DinurdoJK.exe). Metadata-bearing
+    /// screenshots launch directly into their saved viewpoint; ordinary images
+    /// simply open selected in the browser.
+    pub fn configure_startup_screenshot(
+        &mut self,
+        path: PathBuf,
+        metadata: Option<crate::screenshot::ScreenshotMetadata>,
+    ) {
+        if let Some(metadata) = metadata.filter(|metadata| metadata.can_go_to_spot()) {
+            self.pending_screenshot_jump = Some(metadata);
+        } else {
+            self.frontend_page = FrontendPage::Screenshots;
+            self.startup_screenshot_select = Some(path);
+            self.screenshot_catalog_loaded = false;
+        }
+    }
+
+    fn launch_screenshot_spot(&mut self, metadata: crate::screenshot::ScreenshotMetadata) {
+        let Some(map_name) = metadata
+            .map_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|map| !map.is_empty())
+            .map(str::to_owned)
+        else {
+            self.console_status = "SCREENSHOT HAS NO MAP NAME".into();
+            return;
+        };
+        let Some(_origin) = metadata.player_origin.or(metadata.camera_origin) else {
+            self.console_status = "SCREENSHOT HAS NO SAVED POSITION".into();
+            return;
+        };
+        if metadata.view_angles.is_none() {
+            self.console_status = "SCREENSHOT HAS NO SAVED VIEW ANGLES".into();
+            return;
+        }
+
+        let fs_game = if metadata.game.trim().is_empty()
+            || metadata.game.eq_ignore_ascii_case("base")
+        {
+            Vec::new()
+        } else {
+            metadata.game.as_bytes().to_vec()
+        };
+        if let Err(error) = self.set_session_fs_game(&fs_game, "screenshot spot") {
+            self.console_status = format!("SCREENSHOT MOD UNAVAILABLE: {error}");
+            self.push_console_line(format!("^1{}", self.console_status));
+            return;
+        }
+
+        let source = scene::MapSource::Bsp(map_name.clone());
+        if let Err(error) = scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
+            self.console_status = format!("SCREENSHOT MAP NOT FOUND: {map_name}");
+            self.push_console_line(format!("^3{}:^7 {error}", self.console_status));
+            self.publish_ui();
+            return;
+        }
+
+        // Screenshot Browser is frontend-only, but explicitly clear any stale
+        // authority so this always becomes a local solo world.
+        self.net = None;
+        self.game_session = None;
+        self.local_server = None;
+        self.predictor.reset();
+        self.live_without_world = false;
+        self.demo_without_world = false;
+        self.solo_dynamic_models = Arc::new(Vec::new());
+        self.pending_screenshot_jump = Some(metadata);
+        self.request_map(source);
+        self.console_status = format!("LOADING SCREENSHOT SPOT: {map_name}");
+        self.publish_ui();
+    }
+
+    /// Apply a pending screenshot viewpoint after the local server exists.
+    /// Local solo starts as a free spectator, so saved positions are restored
+    /// without requiring a valid grounded spawn. Joined players use noclip.
+    fn apply_pending_screenshot_jump(&mut self, loaded_name: &str) {
+        let Some(metadata) = self.pending_screenshot_jump.take() else {
+            return;
+        };
+        let Some(saved_map) = metadata.map_name.as_deref() else {
+            return;
+        };
+        if Self::normalized_bsp_name(saved_map) != Self::normalized_bsp_name(loaded_name) {
+            self.push_console_line(format!(
+                "^3SCREENSHOT SPOT:^7 saved map {} does not match loaded {}",
+                saved_map, loaded_name
+            ));
+            return;
+        }
+        let Some(origin) = metadata.player_origin.or(metadata.camera_origin) else {
+            return;
+        };
+        let Some(angles) = metadata.view_angles else {
+            return;
+        };
+
+        let mut refreshed_snapshot = None;
+        let result = if let Some(server) = self.local_server.as_mut() {
+            // Local solo starts as a free spectator. `teleport` intentionally
+            // supports both spectator and joined-player states; noclip is only
+            // relevant once the user has joined the local game.
+            let _ = server.set_noclip(true);
+            match server.teleport(origin, angles) {
+                Ok(()) => {
+                    server.camera(&mut self.camera);
+                    if metadata.fov.is_finite() {
+                        self.camera.set_cg_fov(metadata.fov.clamp(1.0, 179.0));
+                    }
+                    refreshed_snapshot = server.take_snapshot(true);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            Err("local server was not created for the screenshot map".into())
+        };
+        if let Some(snapshot) = refreshed_snapshot {
+            if let Some(session) = self.game_session.as_mut() {
+                session.snapshots = session.snapshots.saturating_add(1);
+                session.live_snapshots.push_back(snapshot);
+            }
+        }
+
+        match result {
+            Ok(()) => {
+                self.third_person_camera.reset();
+                self.console_status = format!(
+                    "SCREENSHOT SPOT: {} @ {:.1} {:.1} {:.1} (FREE CAMERA)",
+                    saved_map, origin[0], origin[1], origin[2]
+                );
+                self.push_console_line(format!("^2{}", self.console_status));
+            }
+            Err(error) => {
+                self.console_status = format!("SCREENSHOT SPOT FAILED: {error}");
+                self.push_console_line(format!("^1{}", self.console_status));
+            }
+        }
     }
 
     fn request_clipboard_capture(&mut self) {
@@ -10879,7 +12422,7 @@ impl App {
         if !preserve_rendered_world {
             self.render_command(RenderCommand::UnloadMap);
         }
-        println!("FS_GAME: {source}: {previous} -> {next}");
+        devprintln!(1, "FS_GAME: {source}: {previous} -> {next}");
         self.push_console_line(format!("^5FS_GAME:^7 {next} ^8({source})"));
         if let Some(path) = missing_game {
             self.push_console_line(format!(
@@ -10916,7 +12459,7 @@ impl App {
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "base".to_owned());
-        println!("FS_GAME: restored startup game {name}");
+        devprintln!(1, "FS_GAME: restored startup game {name}");
     }
 
     fn build_cgame_cpu_assets(
@@ -10939,7 +12482,7 @@ impl App {
         let mut assets = open().map_err(|error| format!("ASSET PATH ERROR: {error}"))?;
         let siege_classes = jka_assets::siege::load_siege_class_visuals(&mut assets)
             .map_err(|error| format!("SIEGE CLASS LOAD ERROR: {error}"))?;
-        println!("CGAME: loaded {} Siege class definition(s)", siege_classes.len());
+        devprintln!(1, "CGAME: loaded {} Siege class definition(s)", siege_classes.len());
         let player_presenter = PlayerPresenter::new(assets, pbr)
             .map_err(|error| format!("PLAYER ASSET ERROR: {error}"))?;
         let entity_assets = open().map_err(|error| format!("ENTITY ASSET PATH ERROR: {error}"))?;
@@ -10975,8 +12518,11 @@ impl App {
         session.weapon_fx.set_mark_surfaces(self.map_mark_surfaces.clone());
         session.entity_presenter.set_static_models(Arc::clone(&self.map_static_models));
         session.player_presenter.set_collision_world(self.map_collision.clone());
+        session.player_presenter.set_saber_team_colors(self.saber_team_colors);
+        session.player_presenter.set_saber_staff_multi_color(self.saber_staff_multi_color);
         session.weapon_fx.set_saber_trail(self.saber_trail);
         session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
+        session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
         session.weapon_fx.set_fx_physics(self.video.fx_physics);
         session.weapon_fx.set_fx_lod(self.video.fx_lod, self.video.fx_count_scale, self.video.fx_lod_scale);
         session.apply_client_options(
@@ -11144,6 +12690,428 @@ impl App {
 
     fn play_demo_named(&mut self, argument: &str) {
         self.play_demo_named_from(argument, None);
+    }
+
+    fn race_ghost_context(&self) -> Result<(String, i32, String), String> {
+        let map = self
+            .game_session
+            .as_ref()
+            .filter(|session| session.live)
+            .ok_or_else(|| "Race ghosts are available while playing a live or local race map.".to_owned())?
+            .map_name
+            .clone()
+            .ok_or_else(|| "Current map is not known yet.".to_owned())?;
+        // Use the same playerState source as movement prediction/HUD. Remote
+        // play prefers the predicted state; local play is already authoritative.
+        let player_state = self
+            .live_player_state()
+            .ok_or_else(|| "Waiting for the first gameplay snapshot.".to_owned())?;
+        let style_id = player_state.stats[crate::japro_cg::STAT_MOVEMENTSTYLE];
+        let style = crate::japro_cg::movement_style_slug(style_id)
+            .ok_or_else(|| format!("Unknown movement style {style_id}."))?;
+        Ok((map, style_id, style.to_owned()))
+    }
+
+    fn race_ghost_suggested_course(&self) -> Option<String> {
+        let origin = self
+            .live_player_state()
+            .and_then(|state| playerstate_vec3(state, "origin"))?;
+        race_ghost_web::nearest_course(&self.race_ghost_web_courses, origin)
+            .map(|course| course.course.clone())
+    }
+
+    /// Re-evaluate the closest course start from the player's predicted origin.
+    /// This is called when entering the menu (or after a fresh catalog arrives),
+    /// not every frame, so a manual course selection remains stable while the
+    /// player browses the menu.
+    fn select_suggested_race_ghost_course(&mut self) {
+        let suggested = self.race_ghost_suggested_course();
+        self.race_ghost_web_suggested_course = suggested.clone();
+        let selected = suggested.or_else(|| {
+            self.race_ghost_web_courses
+                .first()
+                .map(|course| course.course.clone())
+        });
+        let Some(selected) = selected else { return };
+        if self.race_ghost_web_selected_course.as_deref() != Some(selected.as_str()) {
+            self.request_race_ghost_demos(selected);
+        }
+    }
+
+    fn set_race_ghost_demo_base_url(&mut self, value: &str) -> Result<(), String> {
+        let normalized = race_ghost_web::normalize_base_url(value)?;
+        self.race_ghost_demo_base_url = normalized.clone();
+        self.race_ghost_demo_base_url_input = normalized;
+        self.race_ghost_web_generation = self.race_ghost_web_generation.wrapping_add(1);
+        self.race_ghost_web_courses.clear();
+        self.race_ghost_web_demos.clear();
+        self.race_ghost_web_selected_course = None;
+        self.race_ghost_web_suggested_course = None;
+        self.race_ghost_web_active_map = None;
+        self.race_ghost_web_active_style = None;
+        self.race_ghost_web_catalog_pending = false;
+        self.race_ghost_web_demos_pending = false;
+        self.race_ghost_web_error = None;
+        self.mark_config_dirty();
+        Ok(())
+    }
+
+    fn request_race_ghost_catalog(&mut self) {
+        let (map, style_id, style) = match self.race_ghost_context() {
+            Ok(context) => context,
+            Err(error) => {
+                self.race_ghost_web_error = Some(error);
+                self.race_ghost_web_catalog_pending = false;
+                return;
+            }
+        };
+        let base_url = match race_ghost_web::normalize_base_url(&self.race_ghost_demo_base_url) {
+            Ok(url) => url,
+            Err(error) => {
+                self.race_ghost_web_error = Some(error);
+                return;
+            }
+        };
+        self.race_ghost_web_generation = self.race_ghost_web_generation.wrapping_add(1);
+        let generation = self.race_ghost_web_generation;
+        self.race_ghost_web_active_map = Some(map.clone());
+        self.race_ghost_web_active_style = Some(style.clone());
+        self.race_ghost_web_catalog_pending = true;
+        self.race_ghost_web_demos_pending = false;
+        self.race_ghost_web_courses.clear();
+        self.race_ghost_web_demos.clear();
+        self.race_ghost_web_selected_course = None;
+        self.race_ghost_web_suggested_course = None;
+        self.race_ghost_web_error = None;
+        let tx = self.race_ghost_web_tx.clone();
+        let worker_map = map.clone();
+        let worker_style = style.clone();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("race-ghost-index:{}", map.chars().take(20).collect::<String>()))
+            .spawn(move || {
+                let result = race_ghost_web::fetch_courses(
+                    &base_url,
+                    &worker_map,
+                    style_id,
+                    &worker_style,
+                );
+                let _ = tx.send(race_ghost_web::WebResult::Courses {
+                    generation,
+                    map: worker_map,
+                    style: worker_style,
+                    result,
+                });
+            })
+        {
+            self.race_ghost_web_catalog_pending = false;
+            self.race_ghost_web_error = Some(format!("Could not start catalog worker: {error}"));
+        }
+    }
+
+    fn request_race_ghost_demos(&mut self, course: String) {
+        let (Some(map), Some(style)) = (
+            self.race_ghost_web_active_map.clone(),
+            self.race_ghost_web_active_style.clone(),
+        ) else {
+            return;
+        };
+        let base_url = self.race_ghost_demo_base_url.clone();
+        let generation = self.race_ghost_web_generation;
+        self.race_ghost_web_selected_course = Some(course.clone());
+        self.race_ghost_web_demos.clear();
+        self.race_ghost_web_demos_pending = true;
+        self.race_ghost_web_error = None;
+        let tx = self.race_ghost_web_tx.clone();
+        let worker_course = course.clone();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("race-ghost-list:{}", course.chars().take(20).collect::<String>()))
+            .spawn(move || {
+                let result = race_ghost_web::fetch_demos(&base_url, &map, &worker_course, &style);
+                let _ = tx.send(race_ghost_web::WebResult::Demos {
+                    generation,
+                    map,
+                    style,
+                    course: worker_course,
+                    result,
+                });
+            })
+        {
+            self.race_ghost_web_demos_pending = false;
+            self.race_ghost_web_error = Some(format!("Could not start demo-list worker: {error}"));
+        }
+    }
+
+    fn request_remote_race_ghost(&mut self, demo: race_ghost_web::RemoteDemo) {
+        let already_loaded = self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| session.race_ghosts.iter().any(|ghost| ghost.track.source_key == demo.url));
+        if already_loaded || !self.race_ghost_web_pending_demos.insert(demo.url.clone()) {
+            return;
+        }
+        let generation = self.race_ghost_load_generation;
+        let source_key = demo.url.clone();
+        let worker_key = source_key.clone();
+        let display_name = demo.label.clone();
+        let base_url = self.race_ghost_demo_base_url.clone();
+        let tx = self.race_ghost_tx.clone();
+        let cache_root = self.base.join("cache").join("race_ghosts");
+        if let Err(error) = thread::Builder::new()
+            .name("race-ghost-web".to_owned())
+            .spawn(move || {
+                let result = (|| {
+                    let bytes = race_ghost_web::fetch_demo_cached(&base_url, &worker_key, &cache_root)?;
+                    let demo_name = race_ghost_web::demo_basename(&worker_key);
+                    let mut track = race_ghost::parse_track(demo_name, bytes)?;
+                    track.source_key = worker_key.clone();
+                    track.display_name = display_name;
+                    Ok(track)
+                })();
+                let _ = tx.send(RaceGhostLoadResult {
+                    generation,
+                    replace_existing: false,
+                    source_key: worker_key,
+                    result,
+                });
+            })
+        {
+            self.race_ghost_web_pending_demos.remove(&source_key);
+            self.race_ghost_web_error = Some(format!("Could not start demo download: {error}"));
+        }
+    }
+
+    fn unload_race_ghost_source(&mut self, source_key: &str) {
+        // Removing a pending URL doubles as cancellation: the worker may finish,
+        // but poll_race_ghost_loads discards it if the URL is no longer pending.
+        self.race_ghost_web_pending_demos.remove(source_key);
+        if let Some(session) = self.game_session.as_mut() {
+            session.race_ghosts.retain(|ghost| ghost.track.source_key != source_key);
+        }
+        self.egui_repaint_requested = true;
+    }
+
+    fn clear_race_ghosts(&mut self) {
+        self.race_ghost_load_generation = self.race_ghost_load_generation.wrapping_add(1);
+        self.race_ghost_web_pending_demos.clear();
+        let cleared = self
+            .game_session
+            .as_mut()
+            .map(|session| {
+                let count = session.race_ghosts.len();
+                session.race_ghosts.clear();
+                count
+            })
+            .unwrap_or(0);
+        self.push_console_line(if cleared == 0 {
+            "^3RACE GHOST:^7 no ghost was loaded".to_owned()
+        } else {
+            "^3RACE GHOST:^7 cleared".to_owned()
+        });
+    }
+
+    fn load_race_ghost_named(&mut self, argument: &str) {
+        let Some(session) = self.game_session.as_ref().filter(|session| session.live) else {
+            self.push_console_line("^1RACE GHOST:^7 /rGhost is available while playing a live or local race map".to_owned());
+            return;
+        };
+        if session.map_name.is_none() {
+            self.push_console_line("^1RACE GHOST:^7 current map is not known yet".to_owned());
+            return;
+        }
+
+        let argument = argument.trim().trim_matches('"');
+        let mut name = argument.replace('\\', "/");
+        if name.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("demos/")) {
+            name = name[6..].to_owned();
+        }
+        let demo_name = if name.get(name.len().saturating_sub(6)..).is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dm_26")) {
+            name[..name.len() - 6].to_owned()
+        } else {
+            name
+        };
+        if demo_name.is_empty()
+            || Path::new(&demo_name).components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            self.push_console_line("^1RACE GHOST:^7 demo name must stay inside demos/".to_owned());
+            return;
+        }
+
+        let qpath = format!("demos/{demo_name}.dm_26");
+        // Console /rGhost preserves its v1 replacement behavior. Starting one
+        // also invalidates any in-flight web additions from the previous set.
+        self.race_ghost_load_generation = self.race_ghost_load_generation.wrapping_add(1);
+        self.race_ghost_web_pending_demos.clear();
+        let generation = self.race_ghost_load_generation;
+        let tx = self.race_ghost_tx.clone();
+        let source_key = format!("local:{demo_name}");
+        let worker_key = source_key.clone();
+        let worker_name = demo_name.clone();
+        let worker_qpath = qpath.clone();
+        let base = self.base.clone();
+        let game = self.game.clone();
+        self.push_console_line(format!("^3RACE GHOST:^7 loading {qpath}..."));
+        if let Err(error) = thread::Builder::new()
+            .name(format!("race-ghost:{}", demo_name.chars().take(24).collect::<String>()))
+            .spawn(move || {
+                const MAX_DEMO_FILE_BYTES: usize = 512 * 1024 * 1024;
+                let result = (|| {
+                    let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref())
+                        .map_err(|error| format!("RACE GHOST ASSET PATH ERROR: {error}"))?;
+                    let asset = assets
+                        .read(&worker_qpath, MAX_DEMO_FILE_BYTES)
+                        .map_err(|error| format!("RACE GHOST READ ERROR: {error}"))?
+                        .ok_or_else(|| format!("RACE GHOST NOT FOUND: {worker_qpath}"))?;
+                    let mut track = race_ghost::parse_track(worker_name.clone(), asset.bytes)?;
+                    track.source_key = worker_key.clone();
+                    track.display_name = worker_name;
+                    Ok(track)
+                })();
+                let _ = tx.send(RaceGhostLoadResult {
+                    generation,
+                    replace_existing: true,
+                    source_key: worker_key,
+                    result,
+                });
+            })
+        {
+            self.push_console_line(format!("^1RACE GHOST WORKER ERROR:^7 {error}"));
+        }
+    }
+
+    fn poll_race_ghost_loads(&mut self) {
+        while let Ok(done) = self.race_ghost_rx.try_recv() {
+            if done.generation != self.race_ghost_load_generation {
+                continue;
+            }
+            if !done.replace_existing && !self.race_ghost_web_pending_demos.remove(&done.source_key) {
+                // The GUI unchecked this entry while its worker was in flight.
+                continue;
+            }
+            let source_key = done.source_key.clone();
+            let remote = !done.replace_existing;
+            let message = match done.result {
+                Err(error) => Err(error),
+                Ok(track) => {
+                    let Some(session) = self.game_session.as_mut().filter(|session| session.live) else {
+                        continue;
+                    };
+                    let Some(current_map) = session.map_name.clone() else {
+                        continue;
+                    };
+                    if !current_map.eq_ignore_ascii_case(&track.map_name) {
+                        Err(format!(
+                            "RACE GHOST MAP MISMATCH: demo is {} but current map is {}",
+                            track.map_name, current_map
+                        ))
+                    } else {
+                        let duration = track.duration_ms();
+                        let display_name = track.display_name.clone();
+                        if done.replace_existing {
+                            session.race_ghosts.clear();
+                        } else {
+                            session.race_ghosts.retain(|ghost| ghost.track.source_key != source_key);
+                        }
+                        let entity_num = (60_000u16..60_128u16)
+                            .find(|candidate| session.race_ghosts.iter().all(|ghost| ghost.entity_num != *candidate))
+                            .ok_or_else(|| "RACE GHOST: too many simultaneous ghosts (128 max)".to_owned());
+                        match entity_num.and_then(|entity_num| {
+                            race_ghost::RaceGhost::from_track(track, &session.siege_classes, entity_num)
+                        }) {
+                            Ok(ghost) => {
+                                session.race_ghosts.push(ghost);
+                                Ok(format!(
+                                    "RACE GHOST: loaded {display_name} ({:.3}s) for {current_map}; it will appear when your race starts",
+                                    f64::from(duration) / 1000.0
+                                ))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+            };
+            match message {
+                Ok(line) => self.push_console_line(format!("^2{line}")),
+                Err(line) => {
+                    if remote {
+                        self.race_ghost_web_error = Some(line.clone());
+                    }
+                    self.push_console_line(format!("^1{line}"));
+                }
+            }
+            self.egui_repaint_requested = true;
+        }
+    }
+
+    fn poll_race_ghost_web(&mut self) {
+        let events = self.race_ghost_web_rx.try_iter().collect::<Vec<_>>();
+        let mut request_course = None::<String>;
+        for event in events {
+            match event {
+                race_ghost_web::WebResult::Courses { generation, map, style, result } => {
+                    if generation != self.race_ghost_web_generation
+                        || self.race_ghost_web_active_map.as_deref() != Some(map.as_str())
+                        || self.race_ghost_web_active_style.as_deref() != Some(style.as_str())
+                    {
+                        continue;
+                    }
+                    self.race_ghost_web_catalog_pending = false;
+                    match result {
+                        Ok(courses) => {
+                            self.race_ghost_web_courses = courses;
+                            self.race_ghost_web_error = None;
+                            let suggested = self.race_ghost_suggested_course();
+                            self.race_ghost_web_suggested_course = suggested.clone();
+                            let selected = suggested.or_else(|| {
+                                self.race_ghost_web_courses
+                                    .first()
+                                    .map(|course| course.course.clone())
+                            });
+                            self.race_ghost_web_selected_course = selected.clone();
+                            request_course = selected;
+                        }
+                        Err(error) => {
+                            self.race_ghost_web_courses.clear();
+                            self.race_ghost_web_demos.clear();
+                            self.race_ghost_web_suggested_course = None;
+                            self.race_ghost_web_error = Some(error);
+                        }
+                    }
+                }
+                race_ghost_web::WebResult::Demos { generation, map, style, course, result } => {
+                    if generation != self.race_ghost_web_generation
+                        || self.race_ghost_web_active_map.as_deref() != Some(map.as_str())
+                        || self.race_ghost_web_active_style.as_deref() != Some(style.as_str())
+                        || self.race_ghost_web_selected_course.as_deref() != Some(course.as_str())
+                    {
+                        continue;
+                    }
+                    self.race_ghost_web_demos_pending = false;
+                    match result {
+                        Ok(demos) => {
+                            self.race_ghost_web_demos = demos;
+                            self.race_ghost_web_error = None;
+                        }
+                        Err(error) => {
+                            self.race_ghost_web_demos.clear();
+                            self.race_ghost_web_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(course) = request_course {
+            self.request_race_ghost_demos(course);
+        }
+        if self.overlay == OverlayMode::RaceGhosts {
+            self.egui_repaint_requested = true;
+        }
     }
 
     fn play_demo_named_from(&mut self, argument: &str, start_elapsed_ms: Option<i32>) {
@@ -11397,7 +13365,9 @@ impl App {
                 self.demo_scrub_last_seek = None;
                 self.demo_scrub_last_applied_fraction = None;
                 self.demo_view_mode = DemoViewMode::Authoritative;
+                self.demo_free_follow_anchor = None;
                 self.demo_view_outside_authoritative = false;
+                self.demo_free_speed_index = DEMO_FREE_SPEED_DEFAULT_INDEX;
                 if let Some(elapsed_ms) = launch_seek_ms {
                     self.restore_demo_transients(elapsed_ms, now);
                 }
@@ -11411,7 +13381,7 @@ impl App {
                 // uncovered by the just-cleared loading screen, that stale view
                 // is usually outside the map and exposes the fog clear color.
                 self.publish_snapshot();
-                self.set_capture(false);
+                self.sync_demo_camera_capture();
                 self.previous_tick = now;
                 self.console_status = format!(
                     "DEMO PLAYING: {qpath} serverTime={} source={source}",
@@ -11431,16 +13401,56 @@ impl App {
 
     fn apply_demo_camera(&mut self, sample: DemoCameraSample) {
         self.render_view_latch = ViewLatchMode::Disabled;
-        let latch_input_available = self.video.input_subframe
-            && sample.policy.health > 0
+        let live_follow = sample.following
+            && self.game_session.as_ref().is_some_and(|session| session.live);
+        let demo_follow = self
+            .game_session
+            .as_ref()
+            .is_some_and(|session| !session.live)
+            && self.demo_view_mode != DemoViewMode::Free;
+        let spectator_view = live_follow || demo_follow;
+        if sample.teleported && spectator_view {
+            self.spectator_camera_state.reset();
+            self.third_person_camera.reset();
+        }
+        let spectator_mode = spectator_view.then_some(self.spectator_camera.mode);
+        let render_third_person = match spectator_mode {
+            Some(SpectatorCameraMode::FirstPerson) => false,
+            Some(SpectatorCameraMode::ThirdPerson) | Some(SpectatorCameraMode::Orbit) => true,
+            None => rendering_third_person(
+                self.third_person,
+                self.first_person_lightsaber,
+                sample.policy,
+            ),
+        };
+        let latch_input_available = sample.policy.health > 0
             && sample.policy.vehicle_num == 0
+            && spectator_mode.is_none()
             && self.subframe_input_view_rotation().is_some();
-        if rendering_third_person(
-            self.third_person,
-            self.first_person_lightsaber,
-            sample.policy,
-        ) {
+        if render_third_person {
             let mut third_person = self.third_person;
+            let mut camera_angles = sample.view_angles;
+            if let Some(mode) = spectator_mode {
+                third_person.enabled = true;
+                match mode {
+                    SpectatorCameraMode::FirstPerson => unreachable!("handled above"),
+                    SpectatorCameraMode::ThirdPerson => {
+                        third_person.angle = if self.spectator_camera.motion_direction {
+                            // TaystJK cg_thirdPersonAngle -1 semantics: use
+                            // the followed player's presented velocity directly.
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                    }
+                    SpectatorCameraMode::Orbit => {
+                        third_person.angle = 0.0;
+                        third_person.range = self.spectator_camera.orbit_range;
+                        third_person.camera_damp = 1.0;
+                        camera_angles = self.spectator_camera_state.orbit_angles(sample.view_angles);
+                    }
+                }
+            }
             if self.live_buttons.contains("+zoom") {
                 // TaystJK CG_OffsetThirdPersonView: +zoom changes chase-camera
                 // range directly using the integer cg_zoomFov value.
@@ -11502,9 +13512,17 @@ impl App {
                     &mut self.third_person_camera,
                     ThirdPersonViewInput {
                         origin: sample.native_origin,
-                        view_angles: sample.view_angles,
+                        view_angles: camera_angles,
+                        velocity: sample.velocity,
                         view_height: sample.view_height,
-                        health: sample.policy.health,
+                        // Orbit is spectator-owned. Do not let OpenJK's dead-camera
+                        // yaw override replace the local orbit yaw when the followed
+                        // player is dead (or a reconstructed demo POV reports 0 HP).
+                        health: if spectator_mode == Some(SpectatorCameraMode::Orbit) {
+                            sample.policy.health.max(1)
+                        } else {
+                            sample.policy.health
+                        },
                         dead_yaw: sample.dead_yaw,
                         client_num: sample.client_num,
                         time: sample.presentation_time_ms,
@@ -11527,6 +13545,78 @@ impl App {
         self.camera.pitch = -sample.view_angles[0].to_radians();
         if latch_input_available {
             self.render_view_latch = ViewLatchMode::Direct;
+        }
+    }
+
+    fn apply_demo_fake_camera(&mut self, sample: DemoCameraSample, fake: DemoFakeView) {
+        self.render_view_latch = ViewLatchMode::Disabled;
+        match self.spectator_camera.mode {
+            SpectatorCameraMode::FirstPerson => {
+                self.camera.position = glam::Vec3::from_array(fake.eye_position);
+                self.camera.yaw = fake.view_angles[1].to_radians();
+                self.camera.pitch = -fake.view_angles[0].to_radians();
+            }
+            SpectatorCameraMode::ThirdPerson | SpectatorCameraMode::Orbit => {
+                let mut third_person = self.third_person;
+                third_person.enabled = true;
+                let mut camera_angles = fake.view_angles;
+                match self.spectator_camera.mode {
+                    SpectatorCameraMode::FirstPerson => unreachable!("handled above"),
+                    SpectatorCameraMode::ThirdPerson => {
+                        third_person.angle = if self.spectator_camera.motion_direction { -1.0 } else { 0.0 };
+                    }
+                    SpectatorCameraMode::Orbit => {
+                        third_person.angle = 0.0;
+                        third_person.range = self.spectator_camera.orbit_range;
+                        third_person.camera_damp = 1.0;
+                        camera_angles = self.spectator_camera_state.orbit_angles(fake.view_angles);
+                    }
+                }
+                if self.live_buttons.contains("+zoom") {
+                    let zoom = self.japro_zoom_fov_integer();
+                    third_person.range = if zoom < 1 {
+                        third_person.range * third_person.range
+                    } else if zoom > 176 {
+                        third_person.range * third_person.range / 176.0
+                    } else {
+                        third_person.range * third_person.range / zoom as f32
+                    };
+                }
+                if let Some(world) = self.map_collision.as_mut() {
+                    let view = offset_third_person_view(
+                        world,
+                        third_person,
+                        &mut self.third_person_camera,
+                        ThirdPersonViewInput {
+                            origin: fake.native_origin,
+                            view_angles: camera_angles,
+                            velocity: fake.velocity,
+                            // Remote EntityState has no viewheight/dead_yaw.
+                            // 26 is JKA's standing viewheight and matches the
+                            // first-person approximation used by demo_fake_view.
+                            view_height: 26,
+                            // Same rule for reconstructed remote demo POVs: Orbit
+                            // owns yaw even if remote health is unavailable/zero.
+                            health: if self.spectator_camera.mode == SpectatorCameraMode::Orbit {
+                                fake.health.max(1)
+                            } else {
+                                fake.health
+                            },
+                            dead_yaw: fake.view_angles[1],
+                            client_num: fake.client_num,
+                            time: sample.presentation_time_ms,
+                            teleported: false,
+                        },
+                    );
+                    self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
+                    self.camera.yaw = view.angles[1].to_radians();
+                    self.camera.pitch = -view.angles[0].to_radians();
+                } else {
+                    self.camera.position = glam::Vec3::from_array(fake.eye_position);
+                    self.camera.yaw = fake.view_angles[1].to_radians();
+                    self.camera.pitch = -fake.view_angles[0].to_radians();
+                }
+            }
         }
     }
 
@@ -11555,22 +13645,43 @@ impl App {
     }
 
     fn update_demo_free_camera(&mut self, dt: Duration) {
-        let mut movement = glam::Vec3::ZERO;
-        let forward = self.camera.forward();
-        let flat_forward = glam::Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
-        let right = glam::Vec3::new(-flat_forward.z, 0.0, flat_forward.x);
-        if self.keys.contains(&KeyCode::KeyW) { movement += flat_forward; }
-        if self.keys.contains(&KeyCode::KeyS) { movement -= flat_forward; }
-        if self.keys.contains(&KeyCode::KeyD) { movement += right; }
-        if self.keys.contains(&KeyCode::KeyA) { movement -= right; }
-        if self.keys.contains(&KeyCode::KeyE) { movement += glam::Vec3::Y; }
-        if self.keys.contains(&KeyCode::KeyQ) { movement -= glam::Vec3::Y; }
-        if movement.length_squared() > 0.0 {
-            let boost = if self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight) { 4.0 } else { 1.0 };
-            // ~630 JKA units/s at normal speed. Camera coordinates are native-unit
-            // axes permuted by scene::render_position, so no additional scale exists.
-            self.camera.position += movement.normalize() * 630.0 * boost * dt.as_secs_f32();
+        // +speed is reserved in demos as a temporary cursor/timeline modifier.
+        // While held, suspend free-camera translation; mouse-look is suspended
+        // too because sync_demo_camera_capture releases the cursor.
+        if self.live_buttons.contains("+speed") {
+            return;
         }
+        let mut movement = glam::Vec3::ZERO;
+        // Noclip/FPS semantics: forward/back follow the complete view vector,
+        // including pitch. Strafing remains horizontal and perpendicular to yaw,
+        // while +moveup/+movedown are explicit world-up/world-down controls.
+        let forward = self.camera.forward();
+        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
+        let right = glam::Vec3::new(sin_yaw, 0.0, cos_yaw);
+        // movement_keys stores semantic +forward/+back/etc as canonical keys,
+        // so rebinding movement still drives demo free spec correctly.
+        if self.movement_keys.contains(&KeyCode::KeyW) { movement += forward; }
+        if self.movement_keys.contains(&KeyCode::KeyS) { movement -= forward; }
+        if self.movement_keys.contains(&KeyCode::KeyD) { movement += right; }
+        if self.movement_keys.contains(&KeyCode::KeyA) { movement -= right; }
+        if self.movement_keys.contains(&KeyCode::Space) { movement += glam::Vec3::Y; }
+        if self.movement_keys.contains(&KeyCode::ControlLeft) { movement -= glam::Vec3::Y; }
+        if movement.length_squared() > 0.0 {
+            let speed = DEMO_FREE_SPEEDS[self.demo_free_speed_index.min(DEMO_FREE_SPEEDS.len() - 1)];
+            self.camera.position += movement.normalize() * speed * dt.as_secs_f32();
+        }
+    }
+
+    fn adjust_demo_free_speed(&mut self, direction: i32) {
+        if !self.demo_playback_active() || self.demo_view_mode != DemoViewMode::Free {
+            return;
+        }
+        let last = DEMO_FREE_SPEEDS.len().saturating_sub(1) as i32;
+        self.demo_free_speed_index = (self.demo_free_speed_index as i32 + direction)
+            .clamp(0, last) as usize;
+        let speed = DEMO_FREE_SPEEDS[self.demo_free_speed_index];
+        self.console_status = format!("DEMO FREE CAMERA SPEED: {speed:.0} U/S");
+        self.publish_transient_ui();
     }
 
     fn apply_demo_view(&mut self, sample: DemoCameraSample, dt: Duration) -> i32 {
@@ -11588,14 +13699,11 @@ impl App {
             DemoViewMode::Follow(client) => {
                 let fake = self.game_session.as_ref().and_then(|session| session.demo_fake_view(client));
                 if let Some(fake) = fake.filter(|view| self.demo_point_visible_from_authoritative(sample, view.eye_position)) {
-                    self.third_person_camera.reset();
-                    self.camera.position = glam::Vec3::from_array(fake.eye_position);
-                    self.camera.yaw = fake.view_angles[1].to_radians();
-                    self.camera.pitch = -fake.view_angles[0].to_radians();
+                    self.apply_demo_fake_camera(sample, fake);
                     fake.client_num
                 } else {
                     self.demo_view_mode = DemoViewMode::Authoritative;
-                    self.set_capture(false);
+                    self.sync_demo_camera_capture();
                     self.console_status = "DEMO FOLLOW TARGET LEFT RECORDED VISIBILITY; RETURNED TO RECORDED POV".into();
                     self.apply_demo_camera(sample);
                     sample.client_num
@@ -11612,26 +13720,78 @@ impl App {
         }
     }
 
+    fn sync_demo_camera_capture(&mut self) {
+        let view_mode = self.demo_view_mode;
+        if let Some(session) = self.game_session.as_mut() {
+            let before = session.client_game.presentation_client_num();
+            session.client_game.set_presentation_viewer(if session.live || session.local {
+                PresentationViewer::Snapshot
+            } else {
+                match view_mode {
+                    DemoViewMode::Authoritative => PresentationViewer::Snapshot,
+                    DemoViewMode::Follow(client) => PresentationViewer::Client(client),
+                    DemoViewMode::Free => PresentationViewer::None,
+                }
+            });
+            if before != session.client_game.presentation_client_num() {
+                // These are viewer-local transients. Never carry the recorder's
+                // pickup/timer/reward/no-ammo state across a demo POV switch.
+                session.pending_out_of_ammo.clear();
+                session.pending_weapon_select.clear();
+                session.item_pickup = None;
+                session.timer_bar = None;
+                session.reward_active = None;
+                session.reward_queue.clear();
+                session.force_flash_until = None;
+            }
+        }
+        if !self.demo_playback_active() || self.overlay != OverlayMode::None {
+            return;
+        }
+        // Camera input owns the mouse in every demo view. +speed is the one
+        // temporary UI modifier: reveal/release the cursor while held so the
+        // timeline can be clicked or scrubbed, then recapture on release.
+        self.set_capture(
+            !self.live_buttons.contains("+speed") && !self.demo_scrub_dragging,
+        );
+    }
+
     fn reset_demo_view_authoritative(&mut self) {
         self.demo_view_mode = DemoViewMode::Authoritative;
+        self.demo_free_follow_anchor = None;
         self.demo_view_outside_authoritative = false;
+        self.spectator_camera_state.reset();
         self.third_person_camera.reset();
-        self.set_capture(false);
+        self.sync_demo_camera_capture();
         self.publish_transient_ui();
     }
 
-    fn toggle_demo_free_view(&mut self) {
-        if !self.demo_playback_active() { return; }
-        if self.demo_view_mode == DemoViewMode::Free {
-            self.reset_demo_view_authoritative();
-            self.console_status = "DEMO CAMERA: RECORDED POV".into();
-        } else {
-            self.demo_view_mode = DemoViewMode::Free;
-            self.demo_view_outside_authoritative = false;
-            self.set_capture(true);
-            self.console_status = "DEMO CAMERA: FREE (WASD, Q/E, SHIFT, MOUSE)".into();
-            self.publish_transient_ui();
+    fn enter_demo_free_view(&mut self) {
+        if !self.demo_playback_active() || self.demo_view_mode == DemoViewMode::Free {
+            return;
         }
+        // Remember the POV we detached from so attack/alt-attack in Free Spec
+        // advance relative to that player instead of restarting at the recorder.
+        self.demo_free_follow_anchor = self
+            .game_session
+            .as_ref()
+            .and_then(|session| match self.demo_view_mode {
+                DemoViewMode::Follow(client) => Some(client),
+                DemoViewMode::Authoritative => session.demo_followed_client(),
+                DemoViewMode::Free => None,
+            });
+        // Detach from the exact currently rendered first/third/orbit camera.
+        // Keeping camera.position/yaw/pitch untouched avoids a visual pop.
+        self.demo_view_mode = DemoViewMode::Free;
+        self.demo_view_outside_authoritative = false;
+        self.spectator_camera_state.reset();
+        self.third_person_camera.reset();
+        self.sync_demo_camera_capture();
+        let speed = DEMO_FREE_SPEEDS[self.demo_free_speed_index];
+        self.console_status = format!(
+            "DEMO CAMERA: FREE · {speed:.0} U/S (MOVE BINDS, WEAPNEXT/WEAPPREV SPEED)"
+        );
+        self.publish_transient_ui();
     }
 
     fn cycle_demo_follow(&mut self, direction: i32) {
@@ -11641,12 +13801,14 @@ impl App {
         if players.is_empty() { return; }
         let current = match self.demo_view_mode {
             DemoViewMode::Follow(client) => client,
-            _ => authoritative,
+            DemoViewMode::Free => self.demo_free_follow_anchor.unwrap_or(authoritative),
+            DemoViewMode::Authoritative => authoritative,
         };
         let index = players.iter().position(|(client, _)| *client == current).unwrap_or(0) as i32;
         let next_index = (index + direction).rem_euclid(players.len() as i32) as usize;
         let (next, name) = players[next_index].clone();
-        self.set_capture(false);
+        self.demo_free_follow_anchor = Some(next);
+        self.spectator_camera_state.reset();
         self.third_person_camera.reset();
         if next == authoritative {
             self.demo_view_mode = DemoViewMode::Authoritative;
@@ -11655,6 +13817,7 @@ impl App {
             self.demo_view_mode = DemoViewMode::Follow(next);
             self.console_status = format!("DEMO CAMERA: FAKE POV {name} (CLIENT {next})");
         }
+        self.sync_demo_camera_capture();
         self.publish_transient_ui();
     }
 
@@ -11685,12 +13848,36 @@ impl App {
         let local_frame = self.local_server.as_ref().map(|server| {
             (server.presentation_time(), server.subframe_view_angles())
         });
+        let demo_view_mode = self.demo_view_mode;
+        // The network-owned slot remains "us" even when snapshot presentation is
+        // following another player. VGS needs both identities: presentation for
+        // spatial/listener behavior, connection ownership for our own radio copy.
+        let connection_client_num = self
+            .net
+            .as_ref()
+            .and_then(|net| u16::try_from(net.session().client_num()).ok());
         let (advance, sample, debug_lines) = {
             let playback = self
                 .game_session
                 .as_mut()
                 .ok_or_else(|| "DEMO PLAYBACK STATE DISAPPEARED".to_owned())?;
-            playback.demo_hidden_view_client = if playback.live {
+            playback.client_game.set_presentation_viewer(if playback.live || playback.local {
+                PresentationViewer::Snapshot
+            } else {
+                match demo_view_mode {
+                    DemoViewMode::Authoritative => PresentationViewer::Snapshot,
+                    DemoViewMode::Follow(client) => PresentationViewer::Client(client),
+                    DemoViewMode::Free => PresentationViewer::None,
+                }
+            });
+            playback.demo_spectator_camera_mode = if playback.live || self.demo_view_mode == DemoViewMode::Free {
+                None
+            } else {
+                Some(self.spectator_camera.mode)
+            };
+            playback.demo_hidden_view_client = if playback.live
+                || self.spectator_camera.mode != SpectatorCameraMode::FirstPerson
+            {
                 None
             } else {
                 match self.demo_view_mode {
@@ -11707,6 +13894,7 @@ impl App {
             // build_game_session/map-load paths already install the current world.
             playback.weapon_fx.set_saber_trail(self.saber_trail);
             playback.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
+            playback.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             playback.weapon_fx.set_fx_physics(self.video.fx_physics);
             playback.weapon_fx.set_fx_lod(self.video.fx_lod, self.video.fx_count_scale, self.video.fx_lod_scale);
             playback.player_presenter.set_skinning_mode(self.video.ghoul2_skinning);
@@ -11723,7 +13911,33 @@ impl App {
                 .player_presenter
                 .set_ghoul2_anim_smooth(self.video.ghoul2_anim_smooth);
             playback.player_presenter.set_lod_scale(self.video.lod_scale);
+            playback.player_presenter.set_jiggle_config(
+                self.video.client_physics && self.video.jiggle_physics,
+                self.video.client_physics_hz,
+                self.video.client_physics_max_substeps,
+                self.video.jiggle_strength,
+                self.video.jiggle_breast_strength,
+                self.video.jiggle_glute_strength,
+                self.video.jiggle_stiffness,
+                self.video.jiggle_damping,
+                self.video.jiggle_glute_lift,
+            );
+            playback.player_presenter.set_cloth_config(ClothConfig {
+                enabled: self.video.client_physics && self.video.cloth_physics,
+                hz: self.video.client_physics_hz,
+                max_substeps: self.video.client_physics_max_substeps,
+                body_collision: self.video.cloth_body_collision,
+                body_clearance: self.video.cloth_body_clearance,
+                air_resistance: self.video.cloth_air_resistance,
+                turn_response: self.video.cloth_turn_response,
+                animation_influence: self.video.cloth_animation_influence,
+                wind_velocity: [0.0; 3],
+            });
+            playback.player_presenter.set_cloth_wind(
+                self.video.cloth_wind.then_some(self.video.weather_wind.sanitize()),
+            );
             playback.player_presenter.set_ragdoll_config(RagdollConfig {
+                physics_enabled: self.video.client_physics,
                 enabled: self.video.client_physics && self.video.ragdolls,
                 hz: self.video.client_physics_hz,
                 max_substeps: self.video.client_physics_max_substeps,
@@ -11731,6 +13945,9 @@ impl App {
                 sleeping: self.video.client_physics_sleeping,
                 max_ragdolls: self.video.ragdoll_max,
                 lifetime_seconds: self.video.ragdoll_lifetime,
+                dismemberment: self.video.dismemberment,
+                max_detached_limbs: self.video.dismember_max,
+                detached_limb_lifetime_seconds: self.video.dismember_lifetime,
                 self_collision: self.video.ragdoll_self_collision,
                 weapon_impulses: self.video.physics_weapon_impulses,
                 explosion_impulses: self.video.physics_explosion_impulses,
@@ -11743,8 +13960,16 @@ impl App {
                     || self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
             let blob_shadows_enabled = self.video.dynamic_shadows == DynamicShadowsMode::Blob;
             playback.weapon_fx.set_rt_lighting(self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware);
+            if let Some(sound) = playback.sound_presenter.as_mut() {
+                sound.set_connection_client_num(if playback.live && !playback.local {
+                    connection_client_num
+                } else {
+                    None
+                });
+            }
             playback.player_presenter.set_local_cosmetics(if playback.local { self.network.cosmetics } else { 0 });
             playback.player_presenter.set_sent_cosmetics(if playback.live && !playback.local { self.network.cosmetics } else { 0 });
+            playback.race_ghost_alpha = self.race_ghost_alpha;
             let (advance, sample) = if playback.local {
                 let Some((server_time, _)) = local_frame else {
                     return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
@@ -11757,6 +13982,7 @@ impl App {
                 playback.advance_to(
                     server_time,
                     self.third_person,
+                    self.spectator_camera,
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     self.cg_event_workers,
@@ -11827,6 +14053,7 @@ impl App {
                     server_time,
                     f64::from(server_time),
                     self.third_person,
+                    self.spectator_camera,
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     self.cg_event_workers,
@@ -11840,6 +14067,7 @@ impl App {
                 playback.advance(
                     now,
                     self.third_person,
+                    self.spectator_camera,
                     self.first_person_lightsaber,
                     self.cg_debug_events,
                     self.cg_event_workers,
@@ -11859,15 +14087,13 @@ impl App {
             .as_ref()
             .is_some_and(|session| session.local)
         {
-            // cl_input_subframe remains presentation-only. The authoritative
+            // Subframe input remains presentation-only. The authoritative
             // local snapshots still contain fixed-Pmove angles, while the camera
             // can consume mouse motion immediately between those steps.
-            if self.video.input_subframe {
-                if let Some((_, angles)) = local_frame {
-                    sample.view_angles = angles;
-                }
+            if let Some((_, angles)) = local_frame {
+                sample.view_angles = angles;
             }
-        } else if !(self.video.input_subframe && self.live_remote_view_forced()) {
+        } else if !self.live_remote_view_forced() {
             if let Some(angles) = self.live_view_angles() {
                 sample.view_angles = angles;
             }
@@ -11877,6 +14103,28 @@ impl App {
             sample.client_num
         } else {
             self.apply_demo_view(sample, dt)
+        };
+        // Cinematic strafehelper keeps the exact TaystJK angle/colour decisions,
+        // but submits them through the world FX path. Compute before borrowing
+        // game_session mutably so current_movement_hud_state can read whichever
+        // predicted/followed player is actually driving the HUD this frame.
+        let cinematic_strafe_rays = if self.strafe_helper.flags & ui::SHELPER_CINEMATIC != 0
+            && !self.video.skip_ui
+            && self.loading.is_none()
+            && matches!(
+                self.overlay,
+                OverlayMode::None
+                    | OverlayMode::Chat
+                    | OverlayMode::Vgs
+                    | OverlayMode::HudEdit
+                    | OverlayMode::CameraEdit
+                    | OverlayMode::MapEdit
+            )
+        {
+            let hud = self.current_movement_hud_state();
+            crate::strafehelper::strafe_world_rays(&self.strafe_helper, &hud, self.video.fps_cap)
+        } else {
+            Vec::new()
         };
         // Use the final camera (including third-person orbit/free/fake follow) for spatial audio.
         if let Some(playback) = &mut self.game_session {
@@ -11911,6 +14159,93 @@ impl App {
             } else {
                 None
             };
+            // jaPRO strafe trails are presentation-only. Loaded CFGs are spatially
+            // culled here and then use the normal FxDraw::Line batching path. Live
+            // player sampling and race logging are likewise client-side only.
+            let trail_time = playback.current_snapshot.as_ref().map_or(0, |snapshot| snapshot.server_time);
+            for entity in &playback.presented_entities {
+                if entity.entity_type == ET_PLAYER {
+                    self.strafe_trails.sample_player(usize::from(entity.number), entity.origin, trail_time);
+                }
+            }
+            if let Some(snapshot) = playback.current_snapshot.as_ref() {
+                let ps = &snapshot.player_state;
+                let own_client = ps.field_i32("clientNum").unwrap_or(sample.client_num);
+                if let (Ok(client), Some(origin)) = (usize::try_from(own_client), playerstate_vec3(ps, "origin")) {
+                    self.strafe_trails.sample_player(client, origin, trail_time);
+                    let race_active = playback.client_game.is_japro()
+                        && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
+                        && ps.field_i32("duelTime").unwrap_or(0) != 0;
+                    self.strafe_trails.log_point_if_active(origin, trail_time, race_active);
+                }
+            }
+            let (trail_viewport_width, trail_viewport_height) = self
+                .window
+                .as_ref()
+                .map(|window| {
+                    let size = window.inner_size();
+                    (size.width.max(1), size.height.max(1))
+                })
+                .unwrap_or((640, 480));
+            let trail_fov_y = self
+                .camera
+                .fov_y_for_viewport(trail_viewport_width, trail_viewport_height);
+            let trail_tan_half_y = (trail_fov_y * 0.5).tan().max(1e-3);
+            let trail_tan_half_x = trail_tan_half_y
+                * trail_viewport_width as f32
+                / trail_viewport_height as f32;
+            let trail_view = crate::strafe_trail::TrailView {
+                origin: view.origin,
+                forward: view.axis[0],
+                left: view.axis[1],
+                up: view.axis[2],
+                tan_half_fov_x: trail_tan_half_x,
+                tan_half_fov_y: trail_tan_half_y,
+                focal_length_pixels: trail_viewport_height as f32 / (2.0 * trail_tan_half_y),
+            };
+            self.strafe_trails.append_draws(trail_view, trail_time, &mut playback.fx_draws);
+
+            // Two same-hue additive ribbons produce a soft coloured glow with a
+            // brighter coloured centre. Deliberately do not submit RGBcore1 (or
+            // any white line): Cinematic is saber-ish glow, not a saber blade.
+            // RGBglow1 is jaPRO's tintable glow asset and EntityPresenter already
+            // synthesizes it from stock JKA saber art when the jaPRO texture is
+            // unavailable.
+            for ray in &cinematic_strafe_rays {
+                let alpha = ray.color[3].clamp(0.0, 1.0);
+                let rgba = |gain: f32| {
+                    let channel = |value: f32| {
+                        (value.clamp(0.0, 1.0) * alpha * gain * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    [channel(ray.color[0]), channel(ray.color[1]), channel(ray.color[2]), 255]
+                };
+                playback.fx_draws.push(crate::fx::system::FxDraw::Line {
+                    start: ray.start,
+                    end: ray.end,
+                    width: ray.width * 2.75,
+                    rgba: rgba(0.30),
+                    shader: "gfx/effects/sabers/RGBglow1".to_owned(),
+                });
+                playback.fx_draws.push(crate::fx::system::FxDraw::Line {
+                    start: ray.start,
+                    end: ray.end,
+                    width: ray.width,
+                    rgba: rgba(0.90),
+                    shader: "gfx/effects/sabers/RGBglow1".to_owned(),
+                });
+            }
+            if self.race_ghost_trail {
+                for ghost in &mut playback.race_ghosts {
+                    self.strafe_trails.append_prebuilt_draws(
+                        &mut ghost.track.strafe_trail,
+                        trail_view,
+                        &mut playback.fx_draws,
+                    );
+                }
+            }
+
             playback.client_perf.fx_draws = u32::try_from(playback.fx_draws.len()).unwrap_or(u32::MAX);
             playback.client_perf.fx_sprites = 0;
             playback.client_perf.fx_oriented_quads = 0;
@@ -11920,7 +14255,7 @@ impl App {
             playback.client_perf.fx_cylinders = 0;
             for draw in &playback.fx_draws {
                 match draw {
-                    crate::fx::system::FxDraw::Sprite { .. } => playback.client_perf.fx_sprites += 1,
+                    crate::fx::system::FxDraw::Sprite { .. } | crate::fx::system::FxDraw::SaberGlow { .. } => playback.client_perf.fx_sprites += 1,
                     crate::fx::system::FxDraw::OrientedQuad { .. } => playback.client_perf.fx_oriented_quads += 1,
                     crate::fx::system::FxDraw::Line { .. } => playback.client_perf.fx_lines += 1,
                     crate::fx::system::FxDraw::Quad { .. } => playback.client_perf.fx_quads += 1,
@@ -12866,6 +15201,7 @@ impl App {
             Some(scene::jka_position(self.camera.position.to_array())),
             false,
             true,
+            false,
             None,
         ) {
             Ok(draws) => self.solo_dynamic_models = Arc::new(draws),
@@ -12894,20 +15230,11 @@ impl App {
             return;
         }
         let mut first_person_camera = self.camera;
-        let subframe = self.video.input_subframe;
         let Some((mode, player_view, entity_view, view_angles, presentation_origin, presentation_time)) =
             self.local_server.as_ref().map(|player| {
-                if subframe {
-                    player.camera_subframe(&mut first_person_camera);
-                } else {
-                    player.camera(&mut first_person_camera);
-                }
+                player.camera_subframe(&mut first_person_camera);
                 let player_view = player.view();
-                let view_angles = if subframe {
-                    player.subframe_view_angles()
-                } else {
-                    player_view.view_angles
-                };
+                let view_angles = player.subframe_view_angles();
                 (
                     player.mode,
                     player_view,
@@ -12934,8 +15261,11 @@ impl App {
                 self.first_person_lightsaber,
                 policy,
             );
+        let first_person_saber = mode == JoinMode::Player
+            && !render_third_person
+            && self.first_person_lightsaber
+            && matches!(policy.weapon, 2 | 3);
         let latch_input_available = mode == JoinMode::Player
-            && self.video.input_subframe
             && policy.health > 0
             && policy.vehicle_num == 0;
 
@@ -12946,21 +15276,14 @@ impl App {
                     self.third_person,
                     &mut self.third_person_camera,
                     ThirdPersonViewInput {
-                        origin: if self.presentation_smoothing.smooth_third_person_origin {
-                            presentation_origin
-                        } else {
-                            entity_view.origin
-                        },
+                        origin: presentation_origin,
                         view_angles,
+                        velocity: entity_view.velocity,
                         view_height: entity_view.view_height,
                         health: entity_view.health,
                         dead_yaw: entity_view.dead_yaw as f32,
                         client_num: entity_view.client_num,
-                        time: f64::from(if self.presentation_smoothing.smooth_third_person_time {
-                            presentation_time
-                        } else {
-                            player_view.command_time
-                        }),
+                        time: f64::from(presentation_time),
                         teleported: false,
                     },
                 );
@@ -12998,18 +15321,10 @@ impl App {
                 return;
             }
             let mut render_entity_view = entity_view;
-            if self.presentation_smoothing.smooth_player_origin {
-                render_entity_view.origin = presentation_origin;
-            }
-            if self.presentation_smoothing.subframe_player_angles {
-                render_entity_view.angles = view_angles;
-            }
+            render_entity_view.origin = presentation_origin;
+            render_entity_view.angles = view_angles;
             if let Some(entity) = presented_openjk_player(render_entity_view) {
-                let player_presentation_time = if self.presentation_smoothing.smooth_player_animation {
-                    presentation_time
-                } else {
-                    player_view.command_time
-                };
+                let player_presentation_time = presentation_time;
                 let ghoul2_view = self.current_ghoul2_view();
                 let presenter = self
                     .local_player_presenter
@@ -13027,7 +15342,8 @@ impl App {
                         local_player_alpha(self.third_person.alpha),
                         None,
                         false,
-                        render_third_person,
+                        render_third_person || first_person_saber,
+                        first_person_saber,
                         ghoul2_view,
                     );
                 match result {
@@ -13050,6 +15366,7 @@ impl App {
 
     fn current_map_prepare_options(&self) -> scene::MapPrepareOptions {
         scene::MapPrepareOptions {
+            picmip: self.video.picmip,
             grass: self.video.grass,
             voxel_probe_gi: self.video.voxel_probe_gi,
             ocean: self.video.ocean,
@@ -13338,7 +15655,7 @@ impl App {
         } else {
             format!("LOADING {label} ON MAP WORKER...")
         };
-        println!("map load {label}: background preparation started");
+        rverbose!(1, "map load {label}: background preparation started");
         let seed = self
             .prepared_map_cache
             .as_ref()
@@ -13449,7 +15766,8 @@ impl App {
             "RE-UPLOADING CACHED {label} TO {}...",
             self.video.renderer_backend.label()
         );
-        println!(
+        rverbose!(
+            1,
             "[VID_RESTART] reused prepared map cache; CPU clone {:.1} ms (skipped BSP/assets/collision/shaders/textures/grass/GI/ocean preparation)",
             clone_ms
         );
@@ -13745,6 +16063,37 @@ impl App {
                 self.publish_ui();
                 return;
             }
+            [verb] if verb.eq_ignore_ascii_case("configstrings") => {
+                // TaystJK CL_Configstrings_f: only an active CGame owns the
+                // printable gameState table, and empty configstrings are skipped.
+                let active = self
+                    .game_session
+                    .as_ref()
+                    .filter(|session| session.phase == SessionPhase::Playing)
+                    .map(|session| {
+                        session
+                            .client_game
+                            .configstrings()
+                            .iter()
+                            .filter(|(_, value)| !value.is_empty())
+                            .map(|(&index, value)| {
+                                (index, String::from_utf8_lossy(value).into_owned())
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                let Some(strings) = active else {
+                    self.push_console_line("Not connected to a server.".to_owned());
+                    return;
+                };
+                for (index, value) in strings {
+                    self.push_console_line(format!("{index:4}: {value}"));
+                }
+                return;
+            }
+            [verb, ..] if verb.eq_ignore_ascii_case("configstrings") => {
+                self.push_console_line("^3usage:^7 configstrings".to_owned());
+                return;
+            }
             [verb] if verb.eq_ignore_ascii_case("version") => {
                 self.push_console_line(format!(
                     "^2DinurdoJK^7 {}  ^8compiled^7 {}",
@@ -13772,6 +16121,32 @@ impl App {
                 self.start_camera_edit();
                 return;
             }
+            [verb]
+                if verb.eq_ignore_ascii_case("weapnext")
+                    && self.demo_playback_active()
+                    && self.demo_view_mode == DemoViewMode::Free =>
+            {
+                // Weapon-next / wheel-down slows free movement.
+                self.adjust_demo_free_speed(-1);
+                return;
+            }
+            [verb]
+                if verb.eq_ignore_ascii_case("weapprev")
+                    && self.demo_playback_active()
+                    && self.demo_view_mode == DemoViewMode::Free =>
+            {
+                // Weapon-prev / wheel-up speeds free movement up.
+                self.adjust_demo_free_speed(1);
+                return;
+            }
+            [verb] if verb.eq_ignore_ascii_case("follownext") && self.demo_playback_active() => {
+                self.cycle_demo_follow(1);
+                return;
+            }
+            [verb] if verb.eq_ignore_ascii_case("followprev") && self.demo_playback_active() => {
+                self.cycle_demo_follow(-1);
+                return;
+            }
             [verb] if verb.eq_ignore_ascii_case("followfastest") => {
                 self.follow_fastest_now();
                 return;
@@ -13786,6 +16161,82 @@ impl App {
             }
             [verb, rest @ ..] if verb.eq_ignore_ascii_case("speedometer") => {
                 self.speedometer_command(rest);
+                return;
+            }
+            [verb] if verb.eq_ignore_ascii_case("trailmenu") => {
+                self.open_strafe_trails();
+                return;
+            }
+            [verb, trail] if verb.eq_ignore_ascii_case("loadtrail") => {
+                match self.strafe_trails.request_load(&self.base, self.game.as_deref(), trail, crate::strafe_trail::DEFAULT_SLOT) {
+                    Ok(()) => self.push_console_line(format!("^3loadTrail:^7 queued {trail} (slot {})", crate::strafe_trail::DEFAULT_SLOT)),
+                    Err(error) => self.push_console_line(format!("^1loadTrail:^7 {error}")),
+                }
+                return;
+            }
+            [verb, trail, slot] if verb.eq_ignore_ascii_case("loadtrail") => {
+                let slot = slot.parse::<u8>().ok().filter(|slot| usize::from(*slot) < crate::strafe_trail::MAX_CLIENTS);
+                match slot {
+                    Some(slot) => match self.strafe_trails.request_load(&self.base, self.game.as_deref(), trail, slot) {
+                        Ok(()) => self.push_console_line(format!("^3loadTrail:^7 queued {trail} (slot {slot})")),
+                        Err(error) => self.push_console_line(format!("^1loadTrail:^7 {error}")),
+                    },
+                    None => self.push_console_line("^3usage:^7 loadTrail <name> [slot 0..31]".to_owned()),
+                }
+                return;
+            }
+            [verb, ..] if verb.eq_ignore_ascii_case("loadtrail") => {
+                self.push_console_line("^3usage:^7 loadTrail <name> [slot 0..31]".to_owned());
+                return;
+            }
+            [verb, slot] if verb.eq_ignore_ascii_case("cleartrail") => {
+                match slot.parse::<i32>() {
+                    Ok(slot) if slot == -1 || (0..crate::strafe_trail::MAX_CLIENTS as i32).contains(&slot) => {
+                        let removed = self.strafe_trails.clear(slot);
+                        self.push_console_line(format!("^3clearTrail:^7 cleared matching trail geometry ({removed} loaded file(s))."));
+                    }
+                    _ => self.push_console_line("^3usage:^7 clearTrail <slot 0..31|-1>".to_owned()),
+                }
+                return;
+            }
+            [verb, ..] if verb.eq_ignore_ascii_case("cleartrail") => {
+                self.push_console_line("^3usage:^7 clearTrail <slot 0..31|-1>".to_owned());
+                return;
+            }
+            [verb] if verb.eq_ignore_ascii_case("strafetrail") => {
+                let players = self.game_session.as_ref().map(|session| {
+                    (0..crate::strafe_trail::MAX_CLIENTS)
+                        .filter_map(|client| session.client_game.client_name(client).map(|name| (client, name)))
+                        .collect::<Vec<_>>()
+                }).unwrap_or_default();
+                if players.is_empty() {
+                    self.push_console_line("^3strafeTrail:^7 no player list is available.".to_owned());
+                } else {
+                    self.push_console_line("^3num  Trace  Player".to_owned());
+                    for (client, name) in players {
+                        self.push_console_line(format!("^7{client:>3}   {}    ^7{name}", if self.strafe_trails.is_tracing(client) { "^2X" } else { "^8-" }));
+                    }
+                }
+                return;
+            }
+            [verb, client] if verb.eq_ignore_ascii_case("strafetrail") => {
+                match client.parse::<i32>().map_err(|_| ())
+                    .and_then(|client| self.strafe_trails.toggle_player(client).map(|mask| (client, mask)).map_err(|_| ())) {
+                    Ok((client, mask)) => {
+                        self.mark_config_dirty();
+                        if client == -1 {
+                            self.push_console_line(format!("^3strafeTrail:^7 all-player mask is now {mask:#010x}."));
+                        } else {
+                            let enabled = self.strafe_trails.is_tracing(client as usize);
+                            self.push_console_line(format!("^3strafeTrail {client}:^7 {}", if enabled { "^2ON" } else { "^1OFF" }));
+                        }
+                    }
+                    Err(()) => self.push_console_line("^3usage:^7 strafeTrail [client 0..31|-1]".to_owned()),
+                }
+                return;
+            }
+            [verb, ..] if verb.eq_ignore_ascii_case("strafetrail") => {
+                self.push_console_line("^3usage:^7 strafeTrail [client 0..31|-1]".to_owned());
                 return;
             }
             [verb] if verb.eq_ignore_ascii_case("hudedit") => {
@@ -13938,6 +16389,22 @@ impl App {
                 self.push_console_line("^3demo <demoname>".to_owned());
                 return;
             }
+            [verb, action] if verb.eq_ignore_ascii_case("rGhost") && action.eq_ignore_ascii_case("clear") => {
+                self.clear_race_ghosts();
+                return;
+            }
+            [verb, demo_name] if verb.eq_ignore_ascii_case("rGhost") => {
+                self.load_race_ghost_named(demo_name);
+                return;
+            }
+            [verb] if verb.eq_ignore_ascii_case("rGhost") => {
+                self.push_console_line("^3rGhost <demoname>^7 | ^3rGhost clear".to_owned());
+                return;
+            }
+            [verb, ..] if verb.eq_ignore_ascii_case("rGhost") => {
+                self.push_console_line("^3rGhost <demoname>^7 | ^3rGhost clear".to_owned());
+                return;
+            }
             [verb, filename]
                 if verb.eq_ignore_ascii_case("exec") || verb.eq_ignore_ascii_case("execq") =>
             {
@@ -14052,8 +16519,17 @@ impl App {
                 return;
             };
             let target = if words.len() == 2 {
-                let numeric = current.parse::<f32>().unwrap_or(0.0);
-                if numeric == 0.0 { "1".to_owned() } else { "0".to_owned() }
+                let Some(values) = crate::console::declared_integer_options(entry) else {
+                    self.push_console_line(format!(
+                        "^3toggle:^7 {name} has no declared discrete options; use `{name} !` for a logical 0/1 flip or pass explicit values"
+                    ));
+                    return;
+                };
+                values
+                    .iter()
+                    .position(|candidate| candidate == &current)
+                    .map(|index| values[(index + 1) % values.len()].clone())
+                    .unwrap_or_else(|| values[0].clone())
             } else if words.len() == 3 {
                 self.push_console_line("^3toggle:^7 nothing to toggle to".to_owned());
                 return;
@@ -14213,7 +16689,9 @@ impl App {
                 let was_showing = self.scores_showing;
                 self.scores_showing = true;
                 if !was_showing {
-                    self.request_scores_if_due(true);
+                    if !self.refresh_demo_scoreboard(Instant::now()) {
+                        self.request_scores_if_due(true);
+                    }
                 }
                 self.publish_ui();
                 return;
@@ -14468,6 +16946,7 @@ impl App {
         }
         if clear_stale {
             self.scoreboard = None;
+            self.mark_companion_dirty();
         }
         self.last_scores_request = Some(now);
         if let Some(net) = self.net.as_mut() {
@@ -14475,6 +16954,27 @@ impl App {
                 self.push_console_line(format!("^1score request failed: {error}"));
             }
         }
+    }
+
+    /// Refresh a demo scoreboard from the pre-indexed reliable score timeline.
+    /// Returns true when the active session is a demo (even if the visible
+    /// board contents did not change), so callers know not to issue a live
+    /// `score` request.
+    fn refresh_demo_scoreboard(&mut self, now: Instant) -> bool {
+        let Some(session) = self.game_session.as_ref().filter(|session| !session.live) else {
+            return false;
+        };
+        let Some(board) = session.demo_scoreboard_ui(now, self.score_deaths) else {
+            return true;
+        };
+        if self.scoreboard.as_ref() != Some(&board) {
+            self.scoreboard = Some(board);
+            self.mark_companion_dirty();
+            if self.scores_showing {
+                self.publish_ui();
+            }
+        }
+        true
     }
 
     /// cls.state >= CA_CONNECTED on a live server.
@@ -14498,6 +16998,186 @@ impl App {
             .filter(|name| !name.is_empty())
     }
 
+    fn active_fs_game_name(&self) -> String {
+        self.game
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "base".to_owned())
+    }
+
+    /// Start a lazy live-server chat-log session. No file is created until the
+    /// first CGame chat notice arrives.
+    fn begin_chat_log_for_current_connection(&self) {
+        if !self.chat_log_enabled {
+            return;
+        }
+        let Some(net) = self.net.as_ref() else { return };
+        let started_unix_ms = crate::chat_log::unix_ms_now().saturating_sub(
+            net.connection_started()
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let hostname = self
+            .current_server_hostname()
+            .unwrap_or_else(|| net.server_name.clone());
+        let map_name = self
+            .game_session
+            .as_ref()
+            .filter(|session| session.live && !session.local)
+            .and_then(|session| session.map_name.clone())
+            .unwrap_or_default();
+        self.chat_log.begin(crate::chat_log::SessionMetadata {
+            directory: self.game_write_path("chatlogs"),
+            started_unix_ms,
+            player_name: self.network.name.clone(),
+            server_address: net.session().server(),
+            hostname: crate::logging::strip_jka_colors(&hostname),
+            fs_game: self.active_fs_game_name(),
+            map_name,
+        });
+    }
+
+    fn update_chat_log_live_metadata(&self, map_name: &str) {
+        if !self.chat_log_enabled || self.net.is_none() {
+            return;
+        }
+        let hostname = self
+            .current_server_hostname()
+            .unwrap_or_else(|| self.net.as_ref().map(|net| net.server_name.clone()).unwrap_or_default());
+        self.chat_log.update(crate::chat_log::SessionUpdate {
+            directory: self.game_write_path("chatlogs"),
+            hostname: crate::logging::strip_jka_colors(&hostname),
+            fs_game: self.active_fs_game_name(),
+            map_name: map_name.to_owned(),
+        });
+    }
+
+    /// TaystJK/OpenJK CG_DrawTimer core: cg.time - cgs.levelStartTime,
+    /// formatted without the optional millisecond extension.
+    fn game_timer_text(&self) -> Option<String> {
+        if !self.video.draw_timer {
+            return None;
+        }
+        let session = self.game_session.as_ref()?;
+        let server_time = session.current_snapshot.as_ref()?.server_time;
+        let elapsed_ms = server_time
+            .saturating_sub(session.client_game.match_limits().level_start_time)
+            .max(0);
+        let seconds = elapsed_ms / 1000;
+        Some(format!("{}:{:02}", seconds / 60, seconds % 60))
+    }
+
+    /// TaystJK `cg_drawScores`. Modes 1/2 are the stock/jaPRO upper-right
+    /// mini scoreboard; mode 3 is Tayst's centred team/duel HUD. Team scores
+    /// come from CS_SCORES1/2, while duel scores require the `scores` command
+    /// because Tayst reads each duelist's clientInfo score.
+    fn mini_scores_ui(&self) -> Option<ui::UiMiniScores> {
+        const GT_DUEL: i32 = 3;
+        const GT_TEAM: i32 = 6;
+        const GT_SIEGE: i32 = 7;
+        const SCORE_NOT_PRESENT: i32 = -9999;
+
+        let mode = self.draw_scores;
+        if mode == 0 {
+            return None;
+        }
+        let session = self.game_session.as_ref()?;
+        let gametype = session.client_game.gametype();
+        let limits = session.client_game.match_limits();
+        let score = |value: i32| (value != SCORE_NOT_PRESENT).then_some(value);
+
+        if mode != 3 {
+            // CG_DrawMiniScoreboard explicitly skips Siege.
+            return (gametype >= GT_TEAM && gametype != GT_SIEGE).then_some(ui::UiMiniScores::Team {
+                mode,
+                red: score(limits.scores1),
+                blue: score(limits.scores2),
+            });
+        }
+
+        // CG_DrawTaystHUD calls CG_DrawTeamHUD for every team gametype,
+        // including Siege; this is intentionally different from modes 1/2.
+        if gametype >= GT_TEAM {
+            return Some(ui::UiMiniScores::Team {
+                mode,
+                red: score(limits.scores1),
+                blue: score(limits.scores2),
+            });
+        }
+        if gametype != GT_DUEL {
+            return None;
+        }
+
+        // CG_DrawDuelHUD requires a live snapshot, a living viewed player and
+        // suppresses the jaPRO race-mode overlay. GT_POWERDUEL is excluded by
+        // the GT_DUEL gate above, as in TaystJK.
+        let snapshot_ps = &session.current_snapshot.as_ref()?.player_state;
+        let ps = if session.live {
+            self.live_player_state().unwrap_or(snapshot_ps)
+        } else {
+            snapshot_ps
+        };
+        if ps.stats[0] <= 0 {
+            return None;
+        }
+        let server_mod = session
+            .client_game
+            .configstring(crate::cgame::CS_SERVERINFO)
+            .map(crate::net::mod_support::ServerMod::detect)
+            .unwrap_or(crate::net::mod_support::ServerMod::Unknown);
+        if server_mod == crate::net::mod_support::ServerMod::Japro
+            && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
+        {
+            return None;
+        }
+
+        let duelists = session.client_game.duelists();
+        let d1 = usize::try_from(duelists[0]).ok()?;
+        let d2 = usize::try_from(duelists[1]).ok()?;
+        let clean_name = |name: String| {
+            crate::logging::strip_jka_colors(&name).chars().take(18).collect::<String>()
+        };
+        let d1_info = session.client_game.client_info(d1, &session.siege_classes)?;
+        let d2_info = session.client_game.client_info(d2, &session.siege_classes)?;
+        let d1_name = clean_name(d1_info.name.clone());
+        let d2_name = clean_name(d2_info.name.clone());
+        let icon_key = |info: &crate::cgame::ClientInfo| {
+            format!(
+                "@team-model-icon\t{}\t{}\t{}\t{}\t{}\ngfx/2d/defer",
+                info.model_name,
+                info.skin_name,
+                info.team,
+                info.gametype,
+                u8::from(info.jedi_v_merc),
+            )
+        };
+        let icon_paths = vec![icon_key(&d1_info), icon_key(&d2_info)];
+        let client_score = |client: i32| {
+            self.scoreboard
+                .as_ref()
+                .and_then(|board| board.entries.iter().find(|entry| entry.client == client))
+                .map(|entry| entry.score)
+                .filter(|value| *value != SCORE_NOT_PRESENT)
+        };
+
+        Some(ui::UiMiniScores::Duel {
+            icon_paths,
+            blue: ui::UiDuelMiniScore {
+                name: d1_name,
+                score: client_score(duelists[0]),
+                model_icon: Some(0),
+            },
+            red: ui::UiDuelMiniScore {
+                name: d2_name,
+                score: client_score(duelists[1]),
+                model_icon: Some(1),
+            },
+        })
+    }
+
     /// jaPRO CG_DrawFollow, verbatim: with `cg.snap->ps.pm_flags & PMF_FOLLOW`
     /// (or during demo playback) it draws `cgs.clientinfo[cg.snap->ps.clientNum].name`.
     /// It reads `cg.snap->ps`, never the predicted state: a free spectator's
@@ -14509,8 +17189,24 @@ impl App {
         if ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0 && session.live {
             return None;
         }
-        let client_num = usize::try_from(ps.field_i32("clientNum")?).ok()?;
+        let snapshot_client = ps.field_i32("clientNum")?;
+        let effective_client = if session.live {
+            snapshot_client
+        } else {
+            match self.demo_view_mode {
+                DemoViewMode::Authoritative => snapshot_client,
+                DemoViewMode::Follow(client) => client,
+                DemoViewMode::Free => return None,
+            }
+        };
+        let client_num = usize::try_from(effective_client).ok()?;
         let mut text = session.client_game.client_name(client_num).filter(|name| !name.is_empty())?;
+        // Alternate demo POVs do not have an authoritative PlayerState for the
+        // jaPRO race-style subline. Never show the recorded player's style under
+        // a different followed player's name.
+        if !session.live && effective_client != snapshot_client {
+            return Some(text);
+        }
 
         // "Loda - add their movemnt style here": under the name when the server is
         // jaPRO and the *predicted* playerState is in racemode (verbatim). The
@@ -14532,6 +17228,63 @@ impl App {
             }
         }
         Some(text)
+    }
+
+    /// TaystJK's scoreboard identifies the highlighted score row with
+    /// `cg.snap->ps.clientNum`. In live follow mode that field is the followed
+    /// client; for this client's alternate demo POVs use the explicitly selected
+    /// fake-follow client instead of the recorded POV.
+    fn scoreboard_focus_client(&self) -> Option<i32> {
+        let session = self.game_session.as_ref()?;
+        let snapshot_client = session
+            .client_game
+            .current_snapshot()?
+            .player_state
+            .field_i32("clientNum")?;
+        if session.live {
+            return Some(snapshot_client);
+        }
+        match self.demo_view_mode {
+            DemoViewMode::Authoritative => Some(snapshot_client),
+            DemoViewMode::Follow(client) => Some(client),
+            DemoViewMode::Free => None,
+        }
+    }
+
+    /// `CG_DrawOldScoreboard`: explicit +scores, death, and intermission keep
+    /// the board fully visible. Intermission is also the dedicated 2D path in
+    /// TaystJK, so it must not depend on the +scores key being held.
+    fn scoreboard_forced_by_player_state(&self) -> bool {
+        const PM_DEAD: i32 = 5;
+        let Some(session) = self.game_session.as_ref() else { return false };
+        // `CG_DrawOldScoreboard`: death does not force the board during a
+        // warmup. Explicit +scores still wins because scoreboard_should_show
+        // checks scores_showing separately.
+        let warmup = session
+            .client_game
+            .configstring(crate::cgame::CS_WARMUP)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0);
+        if warmup != 0 {
+            return false;
+        }
+        let snapshot = session.client_game.current_snapshot();
+        let ps = if session.live {
+            self.live_player_state().or_else(|| snapshot.map(|snapshot| &snapshot.player_state))
+        } else {
+            snapshot.map(|snapshot| &snapshot.player_state)
+        };
+        let pm_type = ps.and_then(|ps| ps.field_i32("pm_type")).unwrap_or(0);
+        pm_type == PM_DEAD || pm_type == crate::cgame::PM_INTERMISSION
+    }
+
+    fn scoreboard_should_show(&self) -> bool {
+        self.scores_showing || self.scoreboard_forced_by_player_state()
+    }
+
+    fn visible_scoreboard(&self) -> Option<UiScoreboard> {
+        self.scoreboard_should_show().then(|| self.scoreboard.clone()).flatten()
     }
 
     /// `cg_speedometer & SPEEDOMETER_ENABLE` or `cg_strafeHelper & SHELPER_ACCELMETER`.
@@ -14722,29 +17475,75 @@ impl App {
         let mut state = ui::MovementHudState::default();
         let ps = self.live_player_state();
         let local_session = self.game_session.as_ref().is_some_and(|session| session.local);
+        const PMF_FOLLOW: i32 = 4096;
+        const PM_SPECTATOR: i32 = 4;
+
+        // Follow/free-spectator state belongs to the authoritative snapshot. In
+        // particular, a predicted spectator state can retain stale PMF_FOLLOW
+        // briefly after unfollowing. This is the same distinction used by the
+        // follow HUD: free PM_SPECTATOR movement is the spectator camera, not a
+        // player movement subject for the strafehelper.
+        let snapshot_ps = self
+            .game_session
+            .as_ref()
+            .filter(|session| session.live)
+            .and_then(|session| session.current_snapshot.as_ref())
+            .map(|snapshot| &snapshot.player_state);
+        let spectator_ps = snapshot_ps.or(ps);
+        let following = spectator_ps
+            .is_some_and(|ps| ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0);
+        state.spectator_free_roam = spectator_ps.is_some_and(|ps| {
+            ps.field_i32("pm_type").unwrap_or(0) == PM_SPECTATOR && !following
+        });
+        if spectator_ps.is_none() {
+            state.spectator_free_roam = self
+                .local_server
+                .as_ref()
+                .is_some_and(|player| player.view().pm_type == PM_SPECTATOR);
+        }
         // Command state: a remote game reports the provisional usercmd; every
-        // other source reads the keyboard.
-        match ps.and(self.live_provisional).filter(|_| !local_session) {
-            Some(cmd) => {
+        // other source reads the keyboard. A followed player is the important
+        // exception: our local spectator usercmd says nothing about what the
+        // followed client is pressing. TaystJK reconstructs that command from
+        // snapshot movementDir/flags, so do the same here.
+        if following {
+            if let Some(ps) = ps {
+                let velocity = playerstate_vec3(ps, "velocity").unwrap_or_default();
+                let cmd = crate::strafehelper::spectated_cmd(
+                    ps.field_i32("movementDir").unwrap_or(-1),
+                    velocity,
+                    ps.field_i32("pm_flags").unwrap_or(0),
+                    ps.field_i32("eFlags").unwrap_or(0),
+                    strafehelper_walking_anim(ps.field_i32("legsAnim").unwrap_or(0)),
+                );
                 state.forward_move = cmd.forward_move;
                 state.right_move = cmd.right_move;
                 state.up_move = cmd.up_move;
                 state.buttons = cmd.buttons;
             }
-            None => {
-                let axis = |positive: KeyCode, negative: KeyCode| -> i8 {
-                    match (self.movement_keys.contains(&positive), self.movement_keys.contains(&negative)) {
-                        (true, false) => 127,
-                        (false, true) => -127,
-                        _ => 0,
-                    }
-                };
-                state.forward_move = axis(KeyCode::KeyW, KeyCode::KeyS);
-                state.right_move = axis(KeyCode::KeyD, KeyCode::KeyA);
-                state.up_move = axis(KeyCode::Space, KeyCode::ControlLeft);
-                if self.noclip_primary_down { state.buttons |= jka_movement::BUTTON_ATTACK; }
-                if self.noclip_alt_down { state.buttons |= jka_movement::BUTTON_ALT_ATTACK; }
-                if self.movement_keys.contains(&KeyCode::ShiftLeft) { state.buttons |= jka_movement::BUTTON_WALKING; }
+        } else {
+            match ps.and(self.live_provisional).filter(|_| !local_session) {
+                Some(cmd) => {
+                    state.forward_move = cmd.forward_move;
+                    state.right_move = cmd.right_move;
+                    state.up_move = cmd.up_move;
+                    state.buttons = cmd.buttons;
+                }
+                None => {
+                    let axis = |positive: KeyCode, negative: KeyCode| -> i8 {
+                        match (self.movement_keys.contains(&positive), self.movement_keys.contains(&negative)) {
+                            (true, false) => 127,
+                            (false, true) => -127,
+                            _ => 0,
+                        }
+                    };
+                    state.forward_move = axis(KeyCode::KeyW, KeyCode::KeyS);
+                    state.right_move = axis(KeyCode::KeyD, KeyCode::KeyA);
+                    state.up_move = axis(KeyCode::Space, KeyCode::ControlLeft);
+                    if self.noclip_primary_down { state.buttons |= jka_movement::BUTTON_ATTACK; }
+                    if self.noclip_alt_down { state.buttons |= jka_movement::BUTTON_ALT_ATTACK; }
+                    if self.movement_keys.contains(&KeyCode::ShiftLeft) { state.buttons |= jka_movement::BUTTON_WALKING; }
+                }
             }
         }
         if !strafe_helper_active {
@@ -14761,7 +17560,7 @@ impl App {
         const PM_JETPACK: i32 = 1;
         const EF_JETPACK_ACTIVE: i32 = 1 << 11;
         const STAT_MOVEMENTSTYLE: usize = 13;
-        let subframe = local_session && self.video.input_subframe;
+        let subframe = local_session;
         let (angles, origin, command_time);
         if let Some(ps) = ps {
             let ps_i32 = |name: &str| ps.field_i32(name).unwrap_or(0);
@@ -14799,6 +17598,7 @@ impl App {
             origin = [0.0; 3];
             command_time = 0;
         }
+        state.origin = origin;
         state.view_pitch = angles[0];
         state.view_yaw = angles[1];
         state.view_roll = angles[2];
@@ -14843,25 +17643,97 @@ impl App {
             })
     }
 
+    fn hud_state_from_player_state(&self, ps: &jka_protocol::server::PlayerState) -> HudState {
+        let weapon = ps.field_i32("weapon").unwrap_or(0);
+        let ammo = jka_movement::weapon_info(weapon)
+            .filter(|(ammo_index, _, _)| *ammo_index > 0)
+            .and_then(|(ammo_index, _, _)| ps.ammo.get(ammo_index as usize).copied());
+        HudState {
+            health: ps.stats[0],
+            max_health: ps.stats[8].max(1),
+            armor: ps.stats[5],
+            force_power: Some(ps.field_i32("fd.forcePower").unwrap_or(0)),
+            force_power_max: 100,
+            ammo,
+            weapon,
+            // cg_draw.c shows saberDrawAnimLevel: the server updates it the
+            // moment a style is queued, while saberAnimLevel waits out the swing.
+            saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
+            force_flash: self.force_flash_active(),
+        }
+    }
+
+    /// Best available HUD state for a non-authoritative demo POV. dm_26 only
+    /// records one complete playerState; remote status comes from recorded tinfo
+    /// only, so missing data hides the HUD instead of borrowing the recorder.
+    fn demo_fake_hud_state(&self, client: i32) -> Option<HudState> {
+        let session = self.game_session.as_ref().filter(|session| !session.live)?;
+        // dm_26 records only one complete playerState. For a different POV,
+        // use only recorded tinfo for status values; never borrow or fabricate
+        // the recorder's health/armor/force. In normal team play this means the
+        // HUD is available for teammates when the server sent team-overlay data.
+        let snapshot = session.client_game.current_snapshot()?;
+        let recorder_team = snapshot.player_state.persistant[3];
+        if matches!(recorder_team, 1 | 2) {
+            let followed_team = usize::try_from(client)
+                .ok()
+                .and_then(|client| session.client_game.client_info(client, &session.siege_classes))
+                .map_or(3, |info| info.team);
+            if followed_team != recorder_team {
+                return None;
+            }
+        }
+        let info = session
+            .client_game
+            .team_info()
+            .iter()
+            .find(|info| i32::from(info.client) == client)?;
+        let health = info.health.max(0);
+        let mut armor = info.armor.max(0);
+        let force_power = if session.client_game.is_japro() {
+            let mut force = armor % 100;
+            if force == 0 {
+                force = 100;
+                armor = armor.saturating_sub(100);
+            }
+            armor /= 100;
+            Some(force)
+        } else {
+            None
+        };
+        Some(HudState {
+            health,
+            max_health: health.max(100).max(1),
+            armor,
+            force_power,
+            force_power_max: 100,
+            // Ammo and saber style are not part of tinfo/remote EntityState.
+            ammo: None,
+            weapon: info.weapon,
+            saber_style: 0,
+            force_flash: false,
+        })
+    }
+
     fn current_hud_state(&self) -> Option<HudState> {
         if let Some(ps) = self.live_player_state() {
-            let weapon = ps.field_i32("weapon").unwrap_or(0);
-            let ammo = jka_movement::weapon_info(weapon)
-                .filter(|(ammo_index, _, _)| *ammo_index > 0)
-                .and_then(|(ammo_index, _, _)| ps.ammo.get(ammo_index as usize).copied());
-            return Some(HudState {
-                health: ps.stats[0],
-                max_health: ps.stats[8].max(1),
-                armor: ps.stats[5],
-                force_power: ps.field_i32("fd.forcePower").unwrap_or(0),
-                force_power_max: 100,
-                ammo,
-                weapon,
-                // cg_draw.c shows saberDrawAnimLevel: the server updates it the
-                // moment a style is queued, while saberAnimLevel waits out the swing.
-                saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
-                force_flash: self.force_flash_active(),
-            });
+            return Some(self.hud_state_from_player_state(ps));
+        }
+        if let Some(session) = self.game_session.as_ref().filter(|session| !session.live) {
+            if self.demo_view_mode != DemoViewMode::Free {
+                if let DemoViewMode::Follow(client) = self.demo_view_mode {
+                    let authoritative = session
+                        .current_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"));
+                    if authoritative != Some(client) {
+                        return self.demo_fake_hud_state(client);
+                    }
+                }
+                if let Some(snapshot) = session.current_snapshot.as_ref() {
+                    return Some(self.hud_state_from_player_state(&snapshot.player_state));
+                }
+            }
         }
         self.local_server.as_ref().and_then(|player| {
             (player.mode == JoinMode::Player).then(|| {
@@ -14870,7 +17742,7 @@ impl App {
                     health: view.health,
                     max_health: view.max_health.max(1),
                     armor: view.armor,
-                    force_power: view.force_power,
+                    force_power: Some(view.force_power),
                     force_power_max: view.force_power_max.max(1),
                     ammo: (view.ammo >= 0).then_some(view.ammo),
                     weapon: view.weapon,
@@ -14878,6 +17750,202 @@ impl App {
                     force_flash: self.force_flash_active(),
                 }
             })
+        })
+    }
+
+    /// TaystJK CG_DrawTeamOverlay data projection. `tinfo` remains the only
+    /// remote data source; this function only applies the same client-side
+    /// filtering/unpacking/icon lookup metadata used by cg_draw.c.
+    fn team_overlay_ui(&self) -> Option<ui::TeamOverlayUi> {
+        use crate::cgame::{CS_LOCATIONS, GT_TEAM, TEAM_BLUE, TEAM_RED};
+
+        if self.team_overlay.mode == 0 {
+            return None;
+        }
+        let session = self.game_session.as_ref()?;
+        if session.client_game.gametype() < GT_TEAM {
+            return None;
+        }
+        let snapshot = session.client_game.current_snapshot()?;
+        let ps = &snapshot.player_state;
+        let snapshot_client = ps.field_i32("clientNum").unwrap_or(-1);
+        let (local, team) = if !session.live {
+            match self.demo_view_mode {
+                DemoViewMode::Free => return None,
+                DemoViewMode::Follow(client) if client != snapshot_client => {
+                    let team = usize::try_from(client)
+                        .ok()
+                        .and_then(|client| session.client_game.client_info(client, &session.siege_classes))
+                        .map_or(3, |info| info.team);
+                    (client, team)
+                }
+                _ => (snapshot_client, ps.persistant[3]),
+            }
+        } else {
+            (snapshot_client, ps.persistant[3])
+        };
+        if team != TEAM_RED && team != TEAM_BLUE {
+            return None;
+        }
+        let japro = session.client_game.is_japro();
+        let omit_local = matches!(self.team_overlay.mode, 2 | 4 | 6);
+
+        let mut icon_paths: Vec<String> = Vec::new();
+        let add_icon = |icon_paths: &mut Vec<String>, candidates: Vec<String>| -> Option<u16> {
+            let candidates: Vec<String> = candidates.into_iter().filter(|value| !value.is_empty()).collect();
+            if candidates.is_empty() {
+                return None;
+            }
+            let key = candidates.join("\n");
+            if let Some(index) = icon_paths.iter().position(|existing| existing == &key) {
+                return u16::try_from(index).ok();
+            }
+            let index = u16::try_from(icon_paths.len()).ok()?;
+            icon_paths.push(key);
+            Some(index)
+        };
+
+        // One table walk, not one walk per icon. The overlay may be sampled at
+        // very high frame rates while tinfo itself updates comparatively slowly.
+        static TEAM_OVERLAY_ITEM_ICONS: std::sync::OnceLock<(HashMap<i32, String>, HashMap<i32, String>)> =
+            std::sync::OnceLock::new();
+        let (weapon_icons, powerup_icons_by_tag) = TEAM_OVERLAY_ITEM_ICONS.get_or_init(|| {
+            let mut weapon_icons = HashMap::<i32, String>::new();
+            let mut powerup_icons_by_tag = HashMap::<i32, String>::new();
+            for index in 1..jka_movement::bg_item_count() {
+                let Some(item) = jka_movement::bg_item(index) else { continue };
+                let Some(icon) = jka_movement::bg_item_icon(index) else { continue };
+                if item.item_type == 1 {
+                    weapon_icons.entry(item.tag).or_insert(icon);
+                } else if item.item_type == 5 || item.item_type == 8 {
+                    powerup_icons_by_tag.entry(item.tag).or_insert(icon);
+                }
+            }
+            (weapon_icons, powerup_icons_by_tag)
+        });
+
+        let resolve_location = |raw: &[u8]| -> String {
+            let text = crate::cgame::bytes_to_lossless_ascii(raw);
+            if let Some(key) = text.strip_prefix('@') {
+                if let Some(table) = self.stringed.as_ref() {
+                    let localized = crate::cgame::bytes_to_lossless_ascii(table.get(key));
+                    if !localized.is_empty() {
+                        return localized;
+                    }
+                }
+            }
+            text
+        };
+        // TaystJK computes overlay sizing/hasLocations from every authored map
+        // location, not just the locations occupied by the eight displayed players.
+        let mut location_width = 0usize;
+        let mut has_locations = false;
+        for location in 1..64u16 {
+            let Some(raw) = session.client_game.configstring(CS_LOCATIONS + location) else { continue };
+            let text = resolve_location(raw);
+            if text.is_empty() {
+                continue;
+            }
+            has_locations = true;
+            location_width = location_width.max(ui::visible_jka_chars(&text)).min(16);
+        }
+
+        let mut entries = Vec::with_capacity(8);
+        // Exactly as TaystJK: clamp the sorted tinfo list to eight before
+        // rejecting invalid/opposite-team entries.
+        for team_info in session.client_game.team_info().iter().take(8) {
+            let client_num = usize::from(team_info.client);
+            let Some(info) = session.client_game.client_info(client_num, &session.siege_classes) else { continue };
+            if info.team != team || (omit_local && i32::try_from(client_num).ok() == Some(local)) {
+                continue;
+            }
+
+            let mut health = team_info.health;
+            let mut armor = team_info.armor;
+            let mut force = -1;
+            if japro {
+                force = armor % 100;
+                if force == 0 {
+                    force = 100;
+                    armor -= 100;
+                }
+                armor /= 100;
+            }
+            // Only the recorded/snapshot client owns a complete playerState.
+            // A followed remote client's row must remain on tinfo rather than
+            // borrowing the recorder's health/armor/force.
+            if i32::try_from(client_num).ok() == Some(local) && local == snapshot_client {
+                health = ps.stats[0];
+                armor = ps.stats[5];
+                if japro {
+                    force = ps.field_i32("fd.forcePower").unwrap_or(force);
+                }
+            }
+            health = health.max(0);
+            armor = armor.max(0);
+
+            let location_index = if (0..64).contains(&team_info.location) { team_info.location as u16 } else { 0 };
+            let location = session
+                .client_game
+                .configstring(CS_LOCATIONS + location_index)
+                .map(resolve_location)
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned());
+
+            // CG_LoadClientInfo's modelIcon is registered *after*
+            // BG_ValidateSkinForTeam. Resolve that exact skin on the render
+            // thread where the VFS is available (important for jedi_/rgb skins
+            // whose team handling depends on authored model_*.skin files).
+            let model_icon_key = format!(
+                "@team-model-icon\t{}\t{}\t{}\t{}\t{}",
+                info.model_name,
+                info.skin_name,
+                team,
+                info.gametype,
+                u8::from(info.jedi_v_merc),
+            );
+            let model_icon = add_icon(
+                &mut icon_paths,
+                vec![model_icon_key, "gfx/2d/defer".to_owned()],
+            );
+
+            let weapon_icon = if self.team_overlay.weapons {
+                weapon_icons.get(&team_info.weapon).cloned()
+                    .and_then(|path| add_icon(&mut icon_paths, vec![path, "gfx/2d/defer".to_owned()]))
+            } else {
+                None
+            };
+            let mut powerup_icons = Vec::new();
+            for powerup in 0..32 {
+                if (team_info.powerups & (1_i32.wrapping_shl(powerup))) == 0 {
+                    continue;
+                }
+                if let Some(path) = powerup_icons_by_tag.get(&(powerup as i32)).cloned() {
+                    if let Some(index) = add_icon(&mut icon_paths, vec![path]) {
+                        powerup_icons.push(index);
+                    }
+                }
+            }
+
+            entries.push(ui::TeamOverlayEntry {
+                client: team_info.client,
+                name: info.name,
+                location,
+                health,
+                armor,
+                force,
+                model_icon,
+                weapon_icon,
+                powerup_icons,
+            });
+        }
+        (!entries.is_empty()).then_some(ui::TeamOverlayUi {
+            settings: self.team_overlay,
+            team,
+            location_width,
+            has_locations,
+            icon_paths,
+            entries,
         })
     }
 
@@ -15148,10 +18216,34 @@ impl App {
         }
         let text = if line.split_whitespace().nth(1).is_some() { line } else { verb };
         if let Some(net) = self.net.as_mut() {
-            if let Err(error) = net.session_mut().add_reliable_command(text.as_bytes(), false) {
+            let bytes = crate::cgame::text_to_jka_bytes(text);
+            if let Err(error) = net.session_mut().add_reliable_command(&bytes, false) {
                 self.push_console_line(format!("^1{error}"));
             }
         }
+    }
+
+    /// Queue CL_CheckUserinfo and report whether the reliable command really
+    /// entered the stream. Callers that gate UI state on delivery must not
+    /// silently clear their pending bit when the reliable ring is full.
+    fn queue_userinfo(&mut self) -> Result<(), String> {
+        if !self.live_connected() {
+            return Ok(());
+        }
+        let server_info = self
+            .net
+            .as_ref()
+            .map(|net| crate::net::mod_support::server_info(&net.session().decoder().configstrings).to_vec())
+            .unwrap_or_default();
+        self.refresh_japro_userinfo_state();
+        let info = self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info);
+        let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
+        let Some(net) = self.net.as_mut() else {
+            return Err("network session disappeared while queuing userinfo".to_owned());
+        };
+        net.session_mut()
+            .add_reliable_command(&command, false)
+            .map_err(|error| error.to_string())
     }
 
     /// CL_CheckUserinfo: resend userinfo after a CVAR_USERINFO change.
@@ -15159,36 +18251,102 @@ impl App {
         if !self.live_connected() {
             return;
         }
-        let server_mod = self.connected_server_mod();
-        self.refresh_japro_userinfo_state();
-        let info = self.network.userinfo_for_mod(&self.solo_client_info.model_cvar(), server_mod);
-        let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
-        if let Some(net) = self.net.as_mut() {
-            let _ = net.session_mut().add_reliable_command(&command, false);
+        match self.queue_userinfo() {
+            Ok(()) => self.profile_userinfo_pending = false,
+            Err(error) => self.push_console_line(format!("^1{error}")),
         }
-        self.profile_userinfo_pending = false;
+    }
+
+    /// Queue one already-engine-parsed client command as a reliable server
+    /// command. This is the `cmd ...` payload after the engine strips `cmd`.
+    fn queue_server_command(&mut self, line: &str) -> Result<(), String> {
+        if !self.live_connected() {
+            return Err("not connected to a live server".to_owned());
+        }
+        let bytes = crate::cgame::text_to_jka_bytes(line.trim());
+        let Some(net) = self.net.as_mut() else {
+            return Err("network session disappeared while queuing command".to_owned());
+        };
+        net.session_mut()
+            .add_reliable_command(&bytes, false)
+            .map_err(|error| error.to_string())
+    }
+
+    /// TaystJK `setForce same`: active players send their current team with
+    /// `forcechanged`, while spectators send the bare command. Read the local
+    /// client's CS_PLAYERS entry rather than the viewed snapshot so follow mode
+    /// cannot accidentally use the followed player's team.
+    fn live_forcechanged_team_arg(&self) -> Option<&'static str> {
+        let net = self.net.as_ref()?;
+        let decoder = net.session().decoder();
+        // TaystJK setForce same reads ui_myteam, whose numeric cvar default
+        // is TEAM_FREE (0). Our closest authoritative copy is the local
+        // player configstring. If it has not arrived yet, preserve that
+        // same TEAM_FREE default instead of accidentally sending the bare
+        // spectator form. Follow mode must never use the followed client.
+        let team = usize::try_from(decoder.client_number)
+            .ok()
+            .and_then(|client_num| u16::try_from(client_num).ok())
+            .and_then(|client_num| crate::cgame::CS_PLAYERS.checked_add(client_num))
+            .and_then(|index| decoder.configstrings.get(&index))
+            .and_then(|info| jka_protocol::commands::info_value(info, b"t"))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0);
+        match team {
+            0 => Some("FREE"),
+            1 => Some("RED"),
+            2 => Some("BLUE"),
+            // TEAM_SPECTATOR (and malformed/unknown values) use the bare
+            // command, exactly like UI_UpdateClientForcePowers(NULL).
+            _ => None,
+        }
     }
 
     /// Profile APPLY: commit the staged name, send userinfo once, then the
-    /// jaPRO/JKA `cmd forcechanged` if the Force loadout was touched.
+    /// TaystJK/JKA `cmd forcechanged [current team]` if Force was touched.
     fn apply_profile_changes(&mut self) {
-        let name = self.profile_name_input.trim().to_owned();
-        if !name.is_empty() && name != self.network.name {
+        let staged_name = self.profile_name_input.trim().to_owned();
+        if !staged_name.is_empty() && staged_name != self.network.name {
+            let name = crate::cgame::unicode_input_to_jka_text(&staged_name);
             if let Err(error) = self.profile_set_cvar("name", &name) {
                 self.console_status = error;
+            } else {
+                self.profile_name_input = name.clone();
             }
         }
-        if self.profile_userinfo_pending {
-            self.send_userinfo();
+        let force_touched = self.profile_force_pending;
+        if self.live_connected() {
+            // TaystJK UI_UpdateClientForcePowers writes forcepowers first, then
+            // executes `cmd forcechanged [team]` only when force was touched.
+            // Always put a fresh userinfo immediately before that notification:
+            // the server reads forcepowers from userinfo while handling it.
+            if self.profile_userinfo_pending || force_touched {
+                if let Err(error) = self.queue_userinfo() {
+                    self.push_console_line(format!("^1Could not apply profile userinfo: {error}"));
+                    return;
+                }
+                self.profile_userinfo_pending = false;
+            }
+            if force_touched {
+                let command = self
+                    .live_forcechanged_team_arg()
+                    .map_or_else(|| "forcechanged".to_owned(), |team| format!("forcechanged \"{team}\""));
+                if let Err(error) = self.queue_server_command(&command) {
+                    // Keep the touched bit set so Apply remains available and
+                    // retries the exact Tayst notification next time.
+                    self.push_console_line(format!("^1Could not apply Force loadout: {error}"));
+                    return;
+                }
+                self.profile_force_pending = false;
+                self.push_console_line(format!("^5Force loadout applied: sent userinfo + {command}"));
+            }
+        } else {
+            // No server can consume forcechanged. The cvar is still retained
+            // locally for the next connection/profile use.
             self.profile_userinfo_pending = false;
-        }
-        if std::mem::take(&mut self.profile_force_pending) {
-            if self.live_connected() {
-                self.forward_command_to_server("forcechanged");
-                self.push_console_line("^5Force loadout applied: sent userinfo + forcechanged".to_owned());
-            } else {
-                // Solo/local sessions have no server connection to notify; the
-                // loadout is picked up from the cvar on the next connect.
+            if force_touched {
+                self.profile_force_pending = false;
                 self.push_console_line(
                     "^3Force loadout saved locally; forcechanged not sent (not on a live server)".to_owned(),
                 );
@@ -15289,6 +18447,19 @@ impl App {
         if !self.live_connected() && !local_active {
             return false;
         }
+        // TaystJK CG_AmRun_f is a local CGame command: on jaPRO it XORs
+        // JAPRO_PLUGIN_JAWARUN in cp_pluginDisable after masking to the
+        // supported plugin-disable range. It is never forwarded to the server.
+        if verb_lower == "amrun" {
+            if self.active_server_mod() == crate::net::mod_support::ServerMod::Japro {
+                let bits = crate::japro_cg::toggle_run_animation(self.network.plugin_disable);
+                if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
+                    self.push_console_line(format!("^1amrun:^7 {error}"));
+                }
+            }
+            return true;
+        }
+
         // TaystJK registers flipkick as a local CGame command. It arms the
         // CG_DoAsync jump-tap sequence and is never forwarded to the server.
         if verb_lower == "flipkick" {
@@ -15319,8 +18490,16 @@ impl App {
                 match verb_lower.as_str() {
                     "weapnext" => self.live_input.cycle_weapon(&ps, true),
                     "weapprev" => self.live_input.cycle_weapon(&ps, false),
-                    "forcenext" => self.live_input.cycle_force(&ps, true),
-                    "forceprev" => self.live_input.cycle_force(&ps, false),
+                    "forcenext" => {
+                        self.live_input.cycle_force(&ps, true);
+                        self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                        self.publish_transient_ui();
+                    }
+                    "forceprev" => {
+                        self.live_input.cycle_force(&ps, false);
+                        self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                        self.publish_transient_ui();
+                    }
                     _ => {
                         if let Some(slot) = words.get(1) {
                             self.live_input.select_weapon_slot(&ps, slot);
@@ -15403,7 +18582,7 @@ impl App {
                 self.live_cgame_prep_rx = None;
                 if self.stringed.is_none() {
                     if let Some(table) = prepared.stringed.take() {
-                        println!("STRINGED: {} strings preloaded on CGame worker", table.len());
+                        devprintln!(1, "STRINGED: {} strings preloaded on CGame worker", table.len());
                         self.stringed = Some(table);
                     }
                 }
@@ -15411,7 +18590,7 @@ impl App {
                     let elapsed = timing.elapsed_ms();
                     timing.cgame_ready_ms = Some(elapsed);
                 }
-                println!("[JOIN] CGame CPU prep ready in {:.1} ms", prepared.elapsed_ms);
+                devprintln!(1, "[JOIN] CGame CPU prep ready in {:.1} ms", prepared.elapsed_ms);
                 self.live_cgame_prepared = Some(prepared);
             }
             Ok(Err(error)) => {
@@ -15464,8 +18643,28 @@ impl App {
         if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
             self.live_http_base = crate::download::advertised_http_base(&info, server);
             if let Some(base) = self.live_http_base.as_deref() {
-                println!("[DOWNLOAD] infoResponse HTTP endpoint: {base}");
+                devprintln!(1, "[DOWNLOAD] infoResponse HTTP endpoint: {base}");
             }
+        }
+
+        // TaystJK checks `needpass` before joining from the browser and opens
+        // password_request instead of knowingly sending an empty password. Our
+        // speculative getinfo preflight lets direct `/connect` do the same thing
+        // before its gameplay connect packet is sent.
+        let needs_password = info
+            .get(b"needpass")
+            .is_some_and(|value| !value.is_empty() && value != b"0");
+        if needs_password && self.network.password.is_empty() {
+            let target = self
+                .reconnect_target
+                .clone()
+                .or_else(|| self.net.as_ref().map(|net| net.session().server().to_string()))
+                .unwrap_or_default();
+            self.show_server_password_prompt(
+                target,
+                Some("This server requires a password.".to_owned()),
+            );
+            return;
         }
 
         let Some(map_bytes) = info.get(b"mapname") else {
@@ -15475,7 +18674,8 @@ impl App {
             return;
         };
         let map_name = String::from_utf8_lossy(map_bytes).into_owned();
-        println!(
+        devprintln!(
+            1,
             "[JOIN] infoResponse protocol={} map={} at +{:.1} ms",
             info.protocol,
             map_name,
@@ -15500,7 +18700,7 @@ impl App {
         }
 
         if self.loaded_map_matches(&map_name) || self.loading_map_matches(&map_name) {
-            println!("[JOIN] map {map_name} already loaded/in flight; no prefetch restart");
+            devprintln!(1, "[JOIN] map {map_name} already loaded/in flight; no prefetch restart");
             if let Some(net) = self.net.as_mut() {
                 net.resume_connect();
             }
@@ -15513,14 +18713,16 @@ impl App {
                 if let Some(timing) = self.live_join_timing.as_mut() {
                     timing.prefetched_map = Some(map_name.clone());
                 }
-                self.push_console_line(format!("^5[JOIN]^7 prefetching {map_name} during handshake"));
+                if crate::logging::developer_enabled(1) {
+                    self.push_console_line(format!("^5[JOIN]^7 prefetching {map_name} during handshake"));
+                }
                 self.prefetch_live_map(source);
                 if let Some(net) = self.net.as_mut() {
                     net.resume_connect();
                 }
             }
             Err(error) => {
-                println!("[JOIN] map preflight blocked: {error}");
+                devprintln!(1, "[JOIN] map preflight blocked: {error}");
                 self.console_status = format!("MAP NOT FOUND: {map_name}");
                 self.push_console_line(format!("^3[JOIN]^7 map not found locally: {map_name}"));
                 self.missing_map_prompt = Some(MissingMapPrompt {
@@ -15644,7 +18846,8 @@ impl App {
             None
         };
         let can_legacy = self.network.allow_legacy_downloads && server_allows_legacy;
-        println!(
+        devprintln!(
+            1,
             "[DOWNLOAD] transports: client http={} legacy={}, server http={} legacy={}, endpoint={}",
             self.network.allow_http_downloads,
             self.network.allow_legacy_downloads,
@@ -15981,11 +19184,54 @@ impl App {
         self.show_missing_map_prompt(map_name, format!("Autodownload failed: {error}"));
     }
 
+    fn show_server_password_prompt(&mut self, target: String, message: Option<String>) {
+        // Stop a paused/rejected handshake while the dialog is open. Otherwise
+        // CL_CheckForResend keeps sending the same bad connect packet and the
+        // server keeps repeating the rejection in the console.
+        if self.net.is_some() || self.game_session.is_some() {
+            self.disconnect_to_main_menu();
+        }
+        self.server_password_prompt = Some(ServerPasswordPrompt { target, message });
+        self.console_status = "SERVER PASSWORD REQUIRED".into();
+        self.egui_repaint_requested = true;
+        self.publish_ui();
+    }
+
+    fn submit_server_password_prompt(&mut self) {
+        let Some(prompt) = self.server_password_prompt.clone() else { return };
+        if self.network.password.is_empty() {
+            if let Some(prompt) = self.server_password_prompt.as_mut() {
+                prompt.message = Some("Enter the server password to continue.".to_owned());
+            }
+            self.egui_repaint_requested = true;
+            return;
+        }
+        self.server_password_prompt = None;
+        self.connect_to_server(&prompt.target);
+    }
+
+    fn cancel_server_password_prompt(&mut self) {
+        self.server_password_prompt = None;
+        self.console_status = "CONNECTION CANCELLED".into();
+        self.egui_repaint_requested = true;
+        self.publish_ui();
+    }
+
+    fn is_server_password_rejection(text: &str) -> bool {
+        let lower = crate::logging::strip_jka_colors(text).to_ascii_lowercase();
+        lower.contains("password")
+            && ["invalid", "incorrect", "wrong", "bad", "required", "require", "need"]
+                .iter()
+                .any(|word| lower.contains(word))
+    }
+
     fn connect_to_server(&mut self, target: &str) {
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
         }
         self.disconnect_notice = None;
+        self.server_password_prompt = None;
+        self.japro_autologin_attempted = None;
         // Start before DNS/socket setup so the join metric really measures from
         // the user's connect action to the first rendered world frame.
         self.live_join_timing = Some(LiveJoinTiming::new());
@@ -16014,6 +19260,7 @@ impl App {
                 self.pending_live_server_commands.clear();
                 self.start_live_cgame_prep();
                 self.net = Some(net);
+                self.begin_chat_log_for_current_connection();
                 self.publish_ui();
             }
             Err(error) => {
@@ -16104,19 +19351,16 @@ impl App {
         {
             self.begin_live_session();
         }
-        if self.scores_showing {
+        if self.scoreboard_should_show() || self.companion_scoreboard_visible() {
             self.request_scores_if_due(false);
         }
         let Some(net) = self.net.as_mut() else { return };
         let realtime = net.realtime();
         net.session_mut().set_cgame_time(realtime, self.network.time_nudge);
         if net.state() >= jka_protocol::session::ConnectionState::Primed {
-            // CL_MouseMove: accumulate this frame's mouse into cl.viewangles.
+            // Subframe CL_MouseMove already advanced cl.viewangles on each raw
+            // mouse event. Client-frame work only packages the current angles.
             let playing = self.overlay == OverlayMode::None && self.captured;
-            if playing && (self.mouse_delta.0 != 0.0 || self.mouse_delta.1 != 0.0) {
-                let (mx, my) = self.mouse_input.scale_mouse(self.mouse_delta, frame);
-                self.live_input.apply_mouse(self.mouse_input.yaw * mx, self.mouse_input.pitch * my);
-            }
             if let Some(ps) = self.game_session.as_ref().filter(|s| s.live).and_then(|s| s.current_snapshot.as_ref()) {
                 let ps = ps.player_state.clone();
                 self.live_input.sync_selection(&ps);
@@ -16229,13 +19473,34 @@ impl App {
                 for line in text.lines().filter(|line| !line.is_empty()) {
                     self.push_console_line(line.to_owned());
                 }
+                // A wrong/missing g_password is rejected by the game module as
+                // a connectionless `print`, not as SessionEvent::Disconnected.
+                // Keep the console copy, but surface a password retry dialog
+                // instead of leaving the user stuck at "Awaiting connection".
+                let awaiting_connect = self.net.as_ref().is_some_and(|net| {
+                    matches!(
+                        net.session().state(),
+                        ConnectionState::Connecting | ConnectionState::Challenging
+                    )
+                });
+                if awaiting_connect && Self::is_server_password_rejection(&text) {
+                    let target = self
+                        .reconnect_target
+                        .clone()
+                        .or_else(|| self.net.as_ref().map(|net| net.session().server().to_string()))
+                        .unwrap_or_default();
+                    self.show_server_password_prompt(
+                        target,
+                        Some(crate::logging::strip_jka_colors(&text)),
+                    );
+                }
             }
             SessionEvent::Gamestate => {
                 let elapsed = self.live_join_timing.as_ref().map(LiveJoinTiming::elapsed_ms);
                 if let (Some(timing), Some(elapsed)) = (self.live_join_timing.as_mut(), elapsed) {
                     if timing.gamestate_ms.is_none() {
                         timing.gamestate_ms = Some(elapsed);
-                        println!("[JOIN] gamestate received at +{elapsed:.1} ms");
+                        devprintln!(1, "[JOIN] gamestate received at +{elapsed:.1} ms");
                     }
                 }
                 self.start_live_gamestate();
@@ -16279,6 +19544,12 @@ impl App {
                 let reason = self.translate_server_text(reason.as_bytes());
                 println!("NET: disconnected: {reason}");
                 self.push_console_line(format!("^1{reason}"));
+                if self.chat_log_enabled {
+                    self.chat_log.end(format!(
+                        "Disconnected: {}",
+                        crate::logging::strip_jka_colors(&reason)
+                    ));
+                }
                 self.net = None;
                 self.disconnect_to_main_menu();
                 self.console_status = reason.to_ascii_uppercase();
@@ -16402,6 +19673,7 @@ impl App {
                 return;
             }
         }
+        self.update_chat_log_live_metadata(&map_name);
 
         let source = scene::MapSource::Bsp(map_name.clone());
         if let Err(error) = scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
@@ -16420,8 +19692,10 @@ impl App {
         self.poll_live_cgame_prep();
         if self.live_cgame_prepared.is_none() && self.live_cgame_prep_rx.is_some() {
             if !self.pending_live_gamestate {
-                println!("[JOIN] gamestate arrived before CGame prep; waiting for worker");
-                self.push_console_line("^5[JOIN]^7 gamestate received; finishing overlapped CGame prep".to_owned());
+                devprintln!(1, "[JOIN] gamestate arrived before CGame prep; waiting for worker");
+                if crate::logging::developer_enabled(1) {
+                    self.push_console_line("^5[JOIN]^7 gamestate received; finishing overlapped CGame prep".to_owned());
+                }
             }
             self.pending_live_gamestate = true;
             return;
@@ -16478,8 +19752,11 @@ impl App {
             session.weapon_fx.set_mark_surfaces(self.map_mark_surfaces.clone());
             session.entity_presenter.set_static_models(Arc::clone(&self.map_static_models));
             session.player_presenter.set_collision_world(self.map_collision.clone());
+            session.player_presenter.set_saber_team_colors(self.saber_team_colors);
+            session.player_presenter.set_saber_staff_multi_color(self.saber_staff_multi_color);
             session.weapon_fx.set_saber_trail(self.saber_trail);
             session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
+            session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             session.weapon_fx.set_fx_physics(self.video.fx_physics);
             session.weapon_fx.set_fx_lod(self.video.fx_lod, self.video.fx_count_scale, self.video.fx_lod_scale);
             session.apply_client_options(
@@ -16519,6 +19796,7 @@ impl App {
         self.local_server = None;
         println!("NET: gamestate {map_name} clientNum={client_num} configstrings={}", configstrings.len());
         self.push_console_line(format!("^2Gamestate: {map_name} (client {client_num})"));
+        self.try_japro_autologin();
 
         if self.loaded_map_matches(&map_name) {
             if self.front_end {
@@ -16528,7 +19806,7 @@ impl App {
                 self.menu_selected = 0;
                 self.sync_render_fps_cap();
             }
-            println!("[JOIN] adopting already-rendered prefetched map {map_name}");
+            devprintln!(1, "[JOIN] adopting already-rendered prefetched map {map_name}");
             self.live_join_ui = None;
             self.egui_repaint_requested = true;
             self.prime_live_session(&map_name);
@@ -16545,8 +19823,10 @@ impl App {
             if self.front_end {
                 self.pending_frontend_map_launch = true;
             }
-            println!("[JOIN] reusing in-flight map prefetch for {map_name}");
-            self.push_console_line(format!("^5[JOIN]^7 reusing in-flight {map_name} prefetch"));
+            devprintln!(1, "[JOIN] reusing in-flight map prefetch for {map_name}");
+            if crate::logging::developer_enabled(1) {
+                self.push_console_line(format!("^5[JOIN]^7 reusing in-flight {map_name} prefetch"));
+            }
             return;
         }
 
@@ -16623,10 +19903,10 @@ impl App {
             Ok(true) => {
                 self.previous_tick = Instant::now();
                 if is_local {
-                    println!("LOCAL SERVER: first active snapshot; shared CGame running");
-                    self.push_console_line("^2Entered local game through server shim.");
+                    devprintln!(1, "LOCAL SERVER: first active snapshot; shared CGame running");
+                    self.push_console_line("^2Entered local game.");
                 } else {
-                    println!("NET: first active snapshot; CGame running");
+                    devprintln!(1, "NET: first active snapshot; CGame running");
                     self.push_console_line("^2Entered the game.");
                 }
                 let summary = if !is_local {
@@ -16644,8 +19924,10 @@ impl App {
                     None
                 };
                 if let Some(summary) = summary {
-                    println!("{summary}");
-                    self.push_console_line(format!("^5{}", summary));
+                    devprintln!(1, "{summary}");
+                    if crate::logging::developer_enabled(1) {
+                        self.push_console_line(format!("^5{}", summary));
+                    }
                 }
             }
             Ok(false) => {}
@@ -16662,7 +19944,7 @@ impl App {
             let table = jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
                 .map(|mut assets| crate::cgame::stringed::StringEd::load(&mut assets))
                 .unwrap_or_default();
-            println!("STRINGED: {} strings loaded", table.len());
+            devprintln!(1, "STRINGED: {} strings loaded", table.len());
             self.stringed = Some(table);
         }
         let translated = self.stringed.as_ref().expect("loaded above").translate_server_text(text);
@@ -16740,6 +20022,9 @@ impl App {
     fn drain_cgame_notices(&mut self) {
         let Some(session) = self.game_session.as_mut() else { return };
         let gametype = session.client_game.gametype();
+        let log_live_chat = self.chat_log_enabled && session.live && !session.local;
+        let chat_server_time = session.client_game.current_snapshot().map(|snapshot| snapshot.server_time);
+        let rewards_match_viewer = session.client_game.presentation_player_state().is_some();
         let notices = session.client_game.drain_notices();
         let misses = std::mem::take(&mut self.predictor.misses);
         for miss in misses {
@@ -16753,8 +20038,11 @@ impl App {
                         self.push_console_line(line.to_owned());
                     }
                 }
-                crate::cgame::CgameNotice::Chat { kind, text, .. } => {
+                crate::cgame::CgameNotice::Chat { team, kind, text } => {
                     let text = crate::cgame::bytes_to_lossless_ascii(&text);
+                    if log_live_chat {
+                        self.chat_log.message(kind, team, text.clone(), chat_server_time);
+                    }
                     self.play_chat_sound(kind, &text);
                     self.push_console_line(text.clone());
                     if self.chat_lines.len() >= 16 {
@@ -16787,6 +20075,27 @@ impl App {
                     }
                     self.publish_transient_ui();
                 }
+                crate::cgame::CgameNotice::Obituary { target, attacker, key } => {
+                    // OpenJK asks StringEd for MP_INGAME_<key> and prints the
+                    // result with names reset to white. Loading the table lazily
+                    // keeps live play and demos on the same localization path.
+                    let _ = self.translate_server_text(b"x");
+                    let full_key = format!("MP_INGAME_{key}");
+                    let localized = self
+                        .stringed
+                        .as_ref()
+                        .map(|table| crate::cgame::bytes_to_lossless_ascii(table.get(&full_key)))
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or_else(|| {
+                            if attacker.is_some() { "was killed by".to_owned() } else { "died".to_owned() }
+                        });
+                    let line = if let Some(attacker) = attacker {
+                        format!("{target}^7 {localized} {attacker}^7")
+                    } else {
+                        format!("{target}^7 {localized}")
+                    };
+                    self.push_console_line(line);
+                }
                 crate::cgame::CgameNotice::KillMessage { target, rank, score, gametype } => {
                     let mode = self.audio.game.kill_message;
                     if mode == 0 {
@@ -16812,7 +20121,15 @@ impl App {
                     // EternalJK/TaystJK's score/position suffix is an FFA
                     // convenience. Mode 2 explicitly suppresses it.
                     let text = if mode != 2 && gametype == 0 {
-                        format!("{killed} {target}.\n{} {place_with} {score}.", tayst_place_string(rank))
+                        match (rank, score) {
+                            (Some(rank), Some(score)) => format!(
+                                "{killed} {target}.\n{} {place_with} {score}.",
+                                tayst_place_string(rank),
+                            ),
+                            // A reconstructed demo POV has no authoritative
+                            // PERS_RANK/PERS_SCORE; do not append recorder data.
+                            _ => format!("{killed} {target}"),
+                        }
                     } else {
                         format!("{killed} {target}")
                     };
@@ -16828,7 +20145,12 @@ impl App {
                     self.publish_transient_ui();
                 }
                 crate::cgame::CgameNotice::Reward { kind, count } => {
-                    self.queue_tayst_reward(kind, count);
+                    // Reward counters live only in the recorded playerState. A
+                    // reconstructed demo POV must not inherit the recorder's
+                    // Excellent/medal/spree feedback.
+                    if rewards_match_viewer {
+                        self.queue_tayst_reward(kind, count);
+                    }
                 }
                 crate::cgame::CgameNotice::ItemPickupLine { classname } => {
                     let _ = self.translate_server_text(b"x");
@@ -16876,6 +20198,45 @@ impl App {
                     }
                 }
                 crate::cgame::CgameNotice::Scores { team_scores, entries } => {
+                    let local_deaths = self
+                        .game_session
+                        .as_ref()
+                        .map(|session| session.client_deaths)
+                        .unwrap_or([0; 32]);
+                    let score_deaths_mode = self.score_deaths;
+                    let mapped_entries: Vec<UiScoreEntry> = entries
+                        .into_iter()
+                        .map(|entry| {
+                            let counted = usize::try_from(entry.client)
+                                .ok()
+                                .filter(|&client| client < local_deaths.len())
+                                .map(|client| local_deaths[client]);
+                            let deaths = match score_deaths_mode {
+                                0 => None,
+                                1 => entry.deaths,
+                                // TaystJK mode 2 prefers the server's JA+/jaPRO
+                                // death field and falls back to CG_Obituary count.
+                                2 => entry.deaths.or(counted),
+                                // Mode 3 is the explicit local/debug counter.
+                                3 => counted,
+                                _ => entry.deaths,
+                            };
+                            UiScoreEntry {
+                                client: entry.client,
+                                name: entry.name,
+                                score: entry.score,
+                                deaths,
+                                ping: entry.ping,
+                                time: entry.time,
+                                team: entry.team,
+                            }
+                        })
+                        .collect();
+                    // TaystJK suppresses score/deaths in Duel and CTF. Power
+                    // Duel has the win/loss score path, so keep it there too.
+                    let show_deaths = score_deaths_mode != 0
+                        && !matches!(gametype, 3 | 4 | 8)
+                        && mapped_entries.iter().any(|entry| entry.deaths.is_some());
                     self.scoreboard = Some(UiScoreboard {
                         team_scores,
                         // JKA team modes start at GT_TEAM (6): Team FFA, Siege,
@@ -16883,19 +20244,14 @@ impl App {
                         team_game: gametype >= 6,
                         // GT_DUEL / GT_POWERDUEL.
                         spectator_scores: matches!(gametype, 3 | 4),
-                        entries: entries
-                            .into_iter()
-                            .map(|entry| UiScoreEntry {
-                                name: entry.name,
-                                score: entry.score,
-                                ping: entry.ping,
-                                time: entry.time,
-                                team: entry.team,
-                            })
-                            .collect(),
+                        show_deaths,
+                        entries: mapped_entries,
                     });
-                    if self.scores_showing {
+                    if self.scoreboard_should_show() {
                         self.publish_ui();
+                    }
+                    if self.companion_scoreboard_visible() {
+                        self.mark_companion_dirty();
                     }
                 }
                 crate::cgame::CgameNotice::MapRestart => {
@@ -16903,6 +20259,7 @@ impl App {
                     if let Some(session) = self.game_session.as_mut() {
                         session.reward_active = None;
                         session.reward_queue.clear();
+                        session.client_deaths = [0; 32];
                     }
                     self.push_console_line("^3map_restart");
                 }
@@ -17088,10 +20445,303 @@ impl App {
         self.publish_snapshot();
     }
 
+    fn player_names_restricted(&self) -> bool {
+        const RESTRICT_PLAYERLABELS: i32 = 1 << 6;
+        self.game_session
+            .as_ref()
+            .and_then(|session| session.client_game.configstring(crate::cgame::CS_SERVERINFO))
+            .and_then(|serverinfo| jka_protocol::commands::info_value(serverinfo, b"restricts"))
+            .map_or(0, jka_protocol::commands::atoi)
+            & RESTRICT_PLAYERLABELS
+            != 0
+    }
+
+    /// TaystJK `CG_PlayerLabels` visibility discovery. The original walks and
+    /// traces every client during HUD drawing; DinurdoJK samples only the
+    /// expensive visibility decision at 30 Hz. Accepted labels are projected
+    /// against the final render camera every frame on the render thread.
+    fn update_player_name_visibility(&mut self, now: Instant) {
+        use crate::cgame::crosshair;
+        use jka_movement::TraceWorld;
+        const SCAN_INTERVAL: Duration = Duration::from_millis(33);
+        const ENTITYNUM_WORLD: i32 = 1022;
+        const MAX_CLIENTS: usize = 32;
+        const TEAM_SPECTATOR: i32 = 3;
+        const EF_DEAD: i32 = 1 << 1;
+        const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4;
+        const MAX_LABEL_DISTANCE_SQ: f32 = 3000.0 * 3000.0;
+
+        let overlay_allows_labels =
+            matches!(self.overlay, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs);
+        let normal_active = self.player_names.mode != 0
+            && overlay_allows_labels
+            && self.game_session.is_some()
+            && !self.player_names_restricted()
+            && self
+                .game_session
+                .as_ref()
+                .map_or(true, |session| session.client_game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES == 0);
+        let ghost_active = overlay_allows_labels
+            && (self.race_ghost_name || self.race_ghost_velocity_delta || self.race_ghost_distance_delta)
+            && self
+                .game_session
+                .as_ref()
+                .is_some_and(|session| !session.race_ghosts.is_empty());
+        if !normal_active && !ghost_active {
+            self.player_name_visible = [false; MAX_CLIENTS];
+            self.race_ghost_label_visible = [false; 128];
+            return;
+        }
+        if now.saturating_duration_since(self.player_name_scan_at) < SCAN_INTERVAL {
+            return;
+        }
+        self.player_name_scan_at = now;
+
+        let Some(session) = self.game_session.as_ref() else { return };
+        let Some(snapshot) = session.client_game.current_snapshot() else { return };
+        let viewer = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
+        let own = self.net.as_ref().map_or(viewer, |net| net.session().client_num());
+        let start = session
+            .race_ghost_live_sample
+            .map(|sample| sample.origin)
+            .or_else(|| playerstate_vec3(&snapshot.player_state, "origin"))
+            .unwrap_or_default();
+        let viewer_state = session
+            .presented_entities
+            .iter()
+            .find(|entity| i32::from(entity.number) == viewer)
+            .map(|entity| &entity.state);
+        let solids = crate::net::solid_entities(&session.presented_entities, snapshot.server_time);
+        let candidates = if normal_active {
+            session
+                .presented_entities
+                .iter()
+                .filter_map(|entity| {
+                    let client = usize::from(entity.number);
+                    if client >= MAX_CLIENTS
+                        || entity.entity_type != ET_PLAYER
+                        || i32::from(entity.number) == viewer
+                        || i32::from(entity.number) == own
+                        || entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
+                    {
+                        return None;
+                    }
+                    let team = u16::try_from(client)
+                        .ok()
+                        .and_then(|client| crate::cgame::CS_PLAYERS.checked_add(client))
+                        .and_then(|index| session.client_game.configstring(index))
+                        .and_then(|info| jka_protocol::commands::info_value(info, b"t"))
+                        .map_or(0, jka_protocol::commands::atoi);
+                    if team == TEAM_SPECTATOR
+                        || crosshair::is_mind_tricked(&entity.state, viewer, viewer_state)
+                    {
+                        return None;
+                    }
+                    let delta = [
+                        entity.origin[0] - start[0],
+                        entity.origin[1] - start[1],
+                        entity.origin[2] - start[2],
+                    ];
+                    let distance2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+                    (distance2 < MAX_LABEL_DISTANCE_SQ).then_some((client, entity.origin))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let ghost_candidates = if ghost_active {
+            session
+                .race_ghosts
+                .iter()
+                .filter_map(|ghost| {
+                    let slot = usize::from(ghost.entity_num.saturating_sub(60_000));
+                    let sample = ghost.visual_sample?;
+                    if slot >= 128 {
+                        return None;
+                    }
+                    let delta = [
+                        sample.origin[0] - start[0],
+                        sample.origin[1] - start[1],
+                        sample.origin[2] - start[2],
+                    ];
+                    let distance2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+                    (distance2 < MAX_LABEL_DISTANCE_SQ).then_some((slot, sample.origin))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let mut visible = [false; MAX_CLIENTS];
+        let mut ghost_visible = [false; 128];
+        let Some(world) = self.map_collision.as_mut() else {
+            self.player_name_visible = visible;
+            self.race_ghost_label_visible = ghost_visible;
+            return;
+        };
+        let mut prediction_world = crate::net::PredictionWorld { world, solids: &solids, client_num: own };
+        for (client, end) in candidates {
+            let trace = prediction_world.trace(jka_movement::TraceQuery {
+                start,
+                mins: [0.0; 3],
+                maxs: [0.0; 3],
+                end,
+                pass_entity: own,
+                mask: 0x1 | 0x100, // CONTENTS_SOLID | CONTENTS_BODY
+            });
+            // TaystJK rejects only a world hit here; another body between the
+            // viewer and target does not suppress the target's label.
+            visible[client] = trace.entity != ENTITYNUM_WORLD;
+        }
+        for (slot, end) in ghost_candidates {
+            let trace = prediction_world.trace(jka_movement::TraceQuery {
+                start,
+                mins: [0.0; 3],
+                maxs: [0.0; 3],
+                end,
+                pass_entity: own,
+                mask: 0x1 | 0x100,
+            });
+            ghost_visible[slot] = trace.entity != ENTITYNUM_WORLD;
+        }
+        self.player_name_visible = visible;
+        self.race_ghost_label_visible = ghost_visible;
+    }
+
+    fn world_player_names(&self) -> Option<ui::UiWorldPlayerNames> {
+        const MAX_CLIENTS: usize = 32;
+        const TEAM_SPECTATOR: i32 = 3;
+        const EF_DEAD: i32 = 1 << 1;
+        const GT_TEAM: i32 = 6;
+        let overlay_allows_labels =
+            matches!(self.overlay, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs);
+        if !overlay_allows_labels {
+            return None;
+        }
+        let session = self.game_session.as_ref()?;
+        let normal_active = self.player_names.mode != 0
+            && !self.player_names_restricted()
+            && session.client_game.japro_cinfo2() & (1 << 4) == 0;
+        let ghost_active = self.race_ghost_name
+            || self.race_ghost_velocity_delta
+            || self.race_ghost_distance_delta;
+        if !normal_active && !ghost_active {
+            return None;
+        }
+
+        let mut labels = Vec::new();
+        if normal_active {
+            let snapshot = session.client_game.current_snapshot()?;
+            let viewer_team = snapshot.player_state.persistant[3];
+            let gametype = session.client_game.gametype();
+            for entity in &session.presented_entities {
+                let client = usize::from(entity.number);
+                if client >= MAX_CLIENTS
+                    || !self.player_name_visible[client]
+                    || entity.entity_type != ET_PLAYER
+                    || entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
+                {
+                    continue;
+                }
+                let team = u16::try_from(client)
+                    .ok()
+                    .and_then(|client| crate::cgame::CS_PLAYERS.checked_add(client))
+                    .and_then(|index| session.client_game.configstring(index))
+                    .and_then(|info| jka_protocol::commands::info_value(info, b"t"))
+                    .map_or(0, jka_protocol::commands::atoi);
+                let Some(name) = session.client_game.client_name(client) else { continue };
+                if team == TEAM_SPECTATOR || name.is_empty() {
+                    continue;
+                }
+                let mut anchor = entity.origin;
+                anchor[2] += 64.0;
+                let (health_fraction, health_color) = if self.player_names.mode > 1 {
+                    let health = entity.state.field_i32("health").unwrap_or(0);
+                    let max_health = entity.state.field_i32("maxhealth").unwrap_or(0);
+                    if max_health > 0 && health > 0 {
+                        let teamowner = entity.state.field_i32("teamowner").unwrap_or(0);
+                        let color = if teamowner == 0 || gametype < GT_TEAM {
+                            [1.0, 1.0, 0.0, 0.4]
+                        } else if teamowner == viewer_team {
+                            [0.0, 1.0, 0.0, 0.4]
+                        } else {
+                            [1.0, 0.0, 0.0, 0.4]
+                        };
+                        (Some(health.max(0) as f32 / max_health as f32), color)
+                    } else {
+                        (None, [1.0, 1.0, 0.0, 0.4])
+                    }
+                } else {
+                    (None, [1.0, 1.0, 0.0, 0.4])
+                };
+                labels.push(ui::UiWorldPlayerLabel {
+                    anchor: scene::render_position(anchor),
+                    text: name,
+                    health_fraction,
+                    health_color,
+                });
+            }
+        }
+
+        if ghost_active {
+            let live = session.race_ghost_live_sample;
+            for ghost in &session.race_ghosts {
+                let slot = usize::from(ghost.entity_num.saturating_sub(60_000));
+                let Some(sample) = ghost.visual_sample else { continue };
+                if slot >= self.race_ghost_label_visible.len() || !self.race_ghost_label_visible[slot] {
+                    continue;
+                }
+
+                let mut first_line = String::new();
+                if self.race_ghost_name {
+                    first_line.push_str(&ghost.track.display_name);
+                }
+                let mut stats = Vec::with_capacity(2);
+                if self.race_ghost_velocity_delta {
+                    if let Some(live) = live {
+                        let ghost_speed = sample.velocity[0].hypot(sample.velocity[1]);
+                        let live_speed = live.velocity[0].hypot(live.velocity[1]);
+                        stats.push(format!("dSpeed {:+.0} ups", ghost_speed - live_speed));
+                    }
+                }
+                if self.race_ghost_distance_delta {
+                    if let Some(live) = live {
+                        let dx = sample.origin[0] - live.origin[0];
+                        let dy = sample.origin[1] - live.origin[1];
+                        let dz = sample.origin[2] - live.origin[2];
+                        stats.push(format!("gap {:.0}u", (dx * dx + dy * dy + dz * dz).sqrt()));
+                    }
+                }
+                if first_line.is_empty() && stats.is_empty() {
+                    continue;
+                }
+                if !stats.is_empty() {
+                    if !first_line.is_empty() {
+                        first_line.push('\n');
+                    }
+                    first_line.push_str(&stats.join("  "));
+                }
+                let mut anchor = sample.origin;
+                anchor[2] += 64.0;
+                labels.push(ui::UiWorldPlayerLabel {
+                    anchor: scene::render_position(anchor),
+                    text: first_line,
+                    health_fraction: None,
+                    health_color: [1.0, 1.0, 1.0, 0.0],
+                });
+            }
+        }
+
+        (!labels.is_empty()).then(|| ui::UiWorldPlayerNames {
+            scale: self.player_names.scale,
+            labels: Arc::new(labels),
+        })
+    }
+
     /// jaPRO CG_ScanForCrosshairEntity plus the colour half of CG_DrawCrosshair and
     /// CG_DrawCrosshairNames. The trace is CG_CrosshairTrace: world and solid
-    /// bodies, own client ignored. It runs at ~30 Hz, not every frame, because it
-    /// walks the entity list; the colour and name are published only on change.
+    /// bodies, own client ignored. Static target/name scans retain the old ~30 Hz
+    /// cadence; dynamic placement/autofocus additionally follow fresh subframe input.
     fn update_crosshair_target(&mut self, now: Instant) {
         use crate::cgame::crosshair::{self, CrosshairViewer};
         use jka_movement::TraceWorld;
@@ -17100,45 +20750,231 @@ impl App {
         const MAX_CLIENTS: i32 = 32;
         const TEAM_SPECTATOR: i32 = 3;
         const STAT_HEALTH: usize = 0;
+        // WP_MuzzlePoint from the vendored jaPRO/OpenJK bg_weapons.c.
+        const MUZZLE: [[f32; 3]; 17] = [
+            [0.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 8.0, 0.0], [8.0, 16.0, 0.0],
+            [12.0, 6.0, -6.0], [12.0, 6.0, -6.0], [12.0, 6.0, -6.0], [12.0, 2.0, -6.0],
+            [12.0, 4.5, -6.0], [12.0, 6.0, -6.0], [12.0, 6.0, -6.0], [12.0, 8.0, -4.0],
+            [12.0, 0.0, -4.0], [12.0, 0.0, -10.0], [12.0, 0.0, -4.0], [12.0, 6.0, -6.0],
+            [12.0, 6.0, -6.0],
+        ];
 
         let settings = self.crosshair;
+        let session_supports_crosshair = self.game_session.as_ref().is_some_and(|session| {
+            session.live
+                || (!session.live
+                    && session.phase == SessionPhase::Playing
+                    && session.demo_index.is_some())
+        });
+        // A dynamic crosshair needs its trace even when target colouring/names are disabled.
+        // DOF autofocus also consumes this endpoint when available.
         let active = settings.style != 0
-            && (settings.identify_target || settings.names != 0.0)
+            && (settings.dynamic != 0
+                || settings.identify_target
+                || settings.names != 0.0
+                || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus))
             && matches!(self.overlay, OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs)
-            && self.game_session.as_ref().is_some_and(|session| session.live);
+            && session_supports_crosshair;
         if !active {
             self.crosshair_seen = None;
+            self.crosshair_hit_world = None;
             if self.crosshair_target != ui::UiCrosshairTarget::default() {
                 self.crosshair_target = ui::UiCrosshairTarget::default();
                 self.publish_transient_ui();
             }
             return;
         }
-        if now.saturating_duration_since(self.crosshair_scan_at) < SCAN_INTERVAL {
+        let dof_autofocus = self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus;
+        let scan_interval = if settings.dynamic != 0 || dof_autofocus { Duration::ZERO } else { SCAN_INTERVAL };
+        if now.saturating_duration_since(self.crosshair_scan_at) < scan_interval {
             return;
         }
         self.crosshair_scan_at = now;
 
+        // TaystJK uses cg.predictedPlayerState for the live viewer. Keep local
+        // in-process play on its snapshot path because it intentionally has no
+        // client predictor; remote live play uses the predictor when available.
+        let live_ps = self.live_player_state().cloned();
         let Some(session) = self.game_session.as_ref() else { return };
         let Some(snapshot) = session.client_game.current_snapshot() else { return };
-        let ps = &snapshot.player_state;
-        let viewer = CrosshairViewer {
-            client: ps.field_i32("clientNum").unwrap_or(0),
-            team: ps.persistant[3],
-            duel_in_progress: ps.field_i32("duelInProgress").unwrap_or(0) != 0,
-            duel_index: ps.field_i32("duelIndex").unwrap_or(0),
-            weapon: ps.field_i32("weapon").unwrap_or(0),
-        };
-        let alive = ps.stats[STAT_HEALTH] > 0;
+        let ps = if session.live { live_ps.as_ref().unwrap_or(&snapshot.player_state) } else { &snapshot.player_state };
         let entities = &session.presented_entities;
         let find = |number: i32| entities.iter().find(|entity| i32::from(entity.number) == number);
+        let snapshot_client = ps.field_i32("clientNum").unwrap_or(0);
+        let (viewer, alive) = if session.live || self.demo_view_mode == DemoViewMode::Authoritative {
+            (
+                CrosshairViewer {
+                    client: snapshot_client,
+                    team: ps.persistant[3],
+                    duel_in_progress: ps.field_i32("duelInProgress").unwrap_or(0) != 0,
+                    duel_index: ps.field_i32("duelIndex").unwrap_or(0),
+                    weapon: ps.field_i32("weapon").unwrap_or(0),
+                },
+                ps.stats[STAT_HEALTH] > 0,
+            )
+        } else {
+            match self.demo_view_mode {
+                DemoViewMode::Follow(client) => {
+                    let state = find(client).map(|entity| &entity.state);
+                    let team = usize::try_from(client)
+                        .ok()
+                        .and_then(|index| session.client_game.client_info(index, &session.siege_classes))
+                        .map_or(TEAM_SPECTATOR, |info| info.team);
+                    (
+                        CrosshairViewer {
+                            client,
+                            team,
+                            duel_in_progress: false,
+                            duel_index: 0,
+                            weapon: state.and_then(|state| state.field_i32("weapon")).unwrap_or(0),
+                        },
+                        state.and_then(|state| state.field_i32("health")).unwrap_or(1) > 0,
+                    )
+                }
+                DemoViewMode::Free => (
+                    CrosshairViewer { client: -1, team: TEAM_SPECTATOR, ..CrosshairViewer::default() },
+                    true,
+                ),
+                DemoViewMode::Authoritative => unreachable!("handled above"),
+            }
+        };
 
-        // CG_CrosshairTrace: CONTENTS_SOLID | CONTENTS_BODY, from the view along its axis.
+        // TaystJK staticCrosshairOverride(): mode 1 is unconditionally dynamic;
+        // mode 2 goes static for the authored weapon/racemode/strafehelper cases.
+        // WSW/Weze strafehelper add-ons are intentionally absent from this client,
+        // so there are no corresponding flags to test here.
+        let static_override = if settings.dynamic == 2 {
+            matches!(viewer.weapon, 0 | 1 | 2 | 3)
+                || ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
+                || self.strafe_helper.flags & (ui::SHELPER_UPDATED | ui::SHELPER_CGAZ) != 0
+        } else {
+            false
+        };
+        let dynamic = settings.dynamic != 0 && !static_override && viewer.client >= 0;
+
+        // CG_CrosshairTrace. TaystJK deliberately uses two different angle sources in
+        // third person: predictedPlayerState.viewangles for the trace direction, but
+        // cg_entities[clientNum].lerpAngles for CG_CalcMuzzlePoint's weapon offset.
+        // Keep that split. DinurdoJK's subframe renderer can present newer viewangles
+        // than the App camera, so use its newest input angles for the trace and leave
+        // final framebuffer projection to the render thread's late-latched camera.
+        let policy = PlayerViewPolicyState::from_player_state(ps);
+        let third_person = rendering_third_person(
+            self.third_person,
+            self.first_person_lightsaber,
+            policy,
+        );
+        let viewer_entity = session
+            .audio_followed_entity
+            .as_ref()
+            .filter(|entity| i32::from(entity.number) == viewer.client)
+            .or_else(|| find(viewer.client));
+        let ps_angles = playerstate_vec3(ps, "viewangles").unwrap_or([
+            -self.camera.pitch.to_degrees(),
+            self.camera.yaw.to_degrees(),
+            0.0,
+        ]);
+        let entity_angles = viewer_entity.map(|entity| entity.angles).unwrap_or(ps_angles);
+
+        // OpenJK/TaystJK's first-person source is cg.refdef.viewangles; third-person
+        // trace direction is cg.predictedPlayerState.viewangles. With subframe input,
+        // the Rust equivalent of both is the newest cl.viewangles sample that the
+        // renderer itself will late-latch. Do not substitute lerpAngles here: those
+        // are intentionally only the third-person muzzle-offset basis.
+        let newest_input_angles = if self.live_remote_view_forced() {
+            None
+        } else {
+            self.live_view_angles().or_else(|| {
+                self.local_server
+                    .as_ref()
+                    .filter(|server| server.view().view_forced == 0)
+                    .map(|server| server.subframe_view_angles())
+            })
+        };
+        let refdef_angles = newest_input_angles.unwrap_or([
+            -self.camera.pitch.to_degrees(),
+            self.camera.yaw.to_degrees(),
+            0.0,
+        ]);
+        let trace_angles = if third_person {
+            newest_input_angles.unwrap_or(ps_angles)
+        } else {
+            refdef_angles
+        };
+
         let mut hit = None;
+        self.crosshair_hit_world = None;
         if let Some(world) = self.map_collision.as_mut() {
-            let start = scene::jka_position(self.camera.position.to_array());
-            let dir = scene::jka_position(self.camera.forward().to_array());
-            let end = std::array::from_fn(|axis| start[axis] + dir[axis] * 131_072.0);
+            let camera_start = scene::jka_position(self.camera.position.to_array());
+            // Static crosshair scans/autofocus still refer to the current refdef
+            // centre ray. Under subframe input that means the newest input angles,
+            // not the previous App-camera orientation.
+            let (refdef_forward, _, _) = crate::camera::angle_vectors(refdef_angles);
+            let (start, dir, distance) = if dynamic {
+                // CG_ScanForCrosshairEntity traces from CG_CalcMuzzlePoint along
+                // predicted/refdef viewangles. CG_CalcMuzzlePoint itself uses the
+                // player's lerpAngles for the third-person weapon-offset basis.
+                let mut direction_angles = trace_angles;
+                let emplaced_index = ps.field_i32("emplacedIndex").unwrap_or(0);
+                let emplaced = viewer.weapon == 17 && emplaced_index != 0;
+                if emplaced && direction_angles[0] > 40.0 {
+                    direction_angles[0] = 40.0;
+                }
+                let (aim_forward, _, _) = crate::camera::angle_vectors(direction_angles);
+
+                let muzzle_basis = if third_person { entity_angles } else { refdef_angles };
+                let (muzzle_forward, muzzle_right, _) = crate::camera::angle_vectors(muzzle_basis);
+                let mut muzzle = if third_person {
+                    viewer_entity
+                        .map(|entity| entity.origin)
+                        .or_else(|| playerstate_vec3(ps, "origin"))
+                        .unwrap_or(camera_start)
+                } else {
+                    camera_start
+                };
+
+                // CG_CalcMuzzlePoint's emplaced-gun special case. Its muzzle basis
+                // is pitch-constrained independently from the trace direction.
+                let mut offset_forward = muzzle_forward;
+                let mut offset_right = muzzle_right;
+                if emplaced {
+                    if let Some(gun) = find(emplaced_index) {
+                        muzzle = gun.origin;
+                        muzzle[2] += 46.0;
+                        let mut pitch_constraint = muzzle_basis;
+                        if pitch_constraint[0] > 40.0 {
+                            pitch_constraint[0] = 40.0;
+                        }
+                        let (forward, right, _) = crate::camera::angle_vectors(pitch_constraint);
+                        offset_forward = forward;
+                        offset_right = right;
+                    }
+                }
+
+                let weapon = usize::try_from(viewer.weapon)
+                    .ok()
+                    .filter(|&weapon| weapon < MUZZLE.len())
+                    .unwrap_or(0);
+                let offset = if matches!(viewer.weapon, 1 | 2 | 3 | 6 | 17 | 18) {
+                    [0.0; 3]
+                } else {
+                    MUZZLE[weapon]
+                };
+                muzzle[0] += offset_forward[0] * offset[0] + offset_right[0] * offset[1];
+                muzzle[1] += offset_forward[1] * offset[0] + offset_right[1] * offset[1];
+                muzzle[2] += offset_forward[2] * offset[0] + offset_right[2] * offset[1];
+                if !emplaced {
+                    if third_person {
+                        muzzle[2] += ps.field_i32("viewheight").unwrap_or(0) as f32 + offset[2];
+                    } else {
+                        muzzle[2] += offset[2];
+                    }
+                }
+                (muzzle, aim_forward, self.map_distance_cull.max(1.0))
+            } else {
+                (camera_start, refdef_forward, 131_072.0)
+            };
+            let end = std::array::from_fn(|axis| start[axis] + dir[axis] * distance);
             let solids = crate::net::solid_entities(entities, snapshot.server_time);
             let result = crate::net::PredictionWorld { world, solids: &solids, client_num: viewer.client }.trace(
                 jka_movement::TraceQuery {
@@ -17150,10 +20986,16 @@ impl App {
                     mask: 0x1 | 0x100,
                 },
             );
+            let render_end = scene::render_position(result.end);
+            self.crosshair_hit_world = Some(render_end);
             if result.fraction < 1.0 && result.entity >= 0 {
                 hit = Some(result.entity);
             }
         }
+        // Dynamic placement remains in world space. RenderSnapshot/LatestViewState
+        // pair this endpoint with the same input angles and the render thread projects
+        // it only after the final camera latch.
+
         let viewer_state = find(viewer.client).map(|entity| &entity.state);
         let hit_entity = hit.filter(|&number| number < ENTITYNUM_WORLD).and_then(find);
         let tricked = hit_entity.is_some_and(|entity| {
@@ -17164,7 +21006,6 @@ impl App {
         let mut seen = self.crosshair_seen.map(|seen| CrosshairSeen { on_target: false, ..seen });
         let mut color = None;
         if tricked {
-            // An entity mind-tricking us is not shown at all.
             if seen.is_some_and(|seen| seen.entity == hit.unwrap_or(-1)) {
                 seen = None;
             }
@@ -17201,7 +21042,7 @@ impl App {
             .map(|name| ui::UiCrosshairName { text: name.text, color: name.color, alpha: name.alpha });
 
         self.crosshair_seen = seen;
-        let target = ui::UiCrosshairTarget { color: identify, name };
+        let target = ui::UiCrosshairTarget { color: identify, dynamic, name };
         if target != self.crosshair_target {
             self.crosshair_target = target;
             self.publish_transient_ui();
@@ -18153,6 +21994,7 @@ impl App {
         // asset-override policy alter prepared material/texture data in both
         // directions, so any mismatch is restart-sensitive.
         (requested.voxel_probe_gi && !prepared.voxel_probe_gi)
+            || requested.picmip != prepared.picmip
             || requested.gen_normal_maps != prepared.gen_normal_maps
             || requested.float_lightmap != prepared.float_lightmap
             || !Self::reflection_prep_serves(
@@ -18259,6 +22101,13 @@ impl App {
 
         if let Some(prepared) = self.loaded_map_prepare_options() {
             let requested = self.active_map_prepare_options();
+            if requested.picmip != prepared.picmip {
+                add(
+                    "picmip",
+                    "Texture quality",
+                    format!("r_picmip {} -> {}", prepared.picmip, requested.picmip),
+                );
+            }
             if requested.voxel_probe_gi && !prepared.voxel_probe_gi {
                 add("voxel_probe_gi", "Voxel / probe GI", "Off -> On".to_owned());
             }
@@ -18762,6 +22611,7 @@ impl App {
             "auto".to_owned(),
         ) {
             Ok(render) => {
+                self.attach_companion_to_renderer(&render);
                 self.render = Some(render);
                 // Renderer restarts recreate these lightweight runtime flags;
                 // immediately restore the classic world-lighting controls from
@@ -18809,10 +22659,11 @@ impl App {
                 // The frontend now owns a passive duel3 world too, so restore it
                 // exactly like a gameplay world but never create a local player.
                 if self.live_without_world || self.demo_without_world {
-                    println!("[VID_RESTART] active session has no local BSP; keeping renderer worldless");
+                    rverbose!(1, "[VID_RESTART] active session has no local BSP; keeping renderer worldless");
                 } else if self.front_end && self.frontend_cinematic.is_some() {
                     if !self.reupload_cached_map() {
-                        println!(
+                        rverbose!(
+                            1,
                             "[VID_RESTART] frontend map cache unavailable/incompatible; rebuilding cinematic background"
                         );
                         self.request_frontend_background();
@@ -18820,7 +22671,8 @@ impl App {
                 } else if !self.front_end && !self.reupload_cached_map() {
                     self.preserve_game_state_on_next_map_upload = true;
                     let source = self.initial_source.clone();
-                    println!(
+                    rverbose!(
+                        1,
                         "[VID_RESTART] prepared map cache unavailable/incompatible; rebuilding CPU map data"
                     );
                     self.request_map(source);
@@ -18939,7 +22791,8 @@ impl App {
                         self.publish_ui();
                     } else {
                         render.shutdown();
-                        println!(
+                        rverbose!(
+                            1,
                             "[VID_RESTART] old renderer shutdown {:.1} ms",
                             started.elapsed().as_secs_f64() * 1000.0
                         );
@@ -18984,12 +22837,14 @@ impl App {
                 pending.stage = PendingRendererRestartStage::SpawnRenderer;
                 pending.ready_at = now + Duration::from_millis(16);
                 self.pending_renderer_restart = Some(pending);
-                println!(
+                rverbose!(
+                    1,
                     "[VID_RESTART] target Win32 display mode applied; waiting one frame before WGPU surface creation"
                 );
             }
             PendingRendererRestartStage::SpawnRenderer => {
-                println!(
+                rverbose!(
+                    1,
                     "[VID_RESTART] Win32 display transition settled; creating {} renderer",
                     pending.target.renderer_backend.label()
                 );
@@ -19080,7 +22935,7 @@ impl App {
         if let Some(render) = self.render.take() {
             render.request_shutdown();
             self.retiring_render = Some((render, Instant::now()));
-            println!("[VID_RESTART] old renderer shutdown requested");
+            rverbose!(1, "[VID_RESTART] old renderer shutdown requested");
         }
         self.pending_renderer_restart = Some(PendingRendererRestart {
             previous,
@@ -19116,7 +22971,8 @@ impl App {
                 stage: PendingRendererRestartStage::RecreateWindow,
                 ready_at: Instant::now(),
             });
-            println!(
+            rverbose!(
+                1,
                 "[VID_RESTART] backend {} -> {}{}; recreating the OS window",
                 previous.renderer_backend.label(),
                 target.renderer_backend.label(),
@@ -19156,7 +23012,8 @@ impl App {
                 stage: PendingRendererRestartStage::ApplyTargetDisplayMode,
                 ready_at: Instant::now() + Duration::from_millis(16),
             });
-            println!(
+            rverbose!(
+                1,
                 "[VID_RESTART] released old Win32 fullscreen state; deferring target mode for one frame"
             );
             return;
@@ -19167,7 +23024,7 @@ impl App {
         // so its WGPU surface/device are gone before the replacement is created.
         self.applied_fullscreen = target.fullscreen;
         self.applied_resolution = target.resolution;
-        println!("[VID_RESTART] display mode unchanged; skipped Win32 mode transition");
+        rverbose!(1, "[VID_RESTART] display mode unchanged; skipped Win32 mode transition");
         self.spawn_restarted_renderer(window, previous, confirm_on_change);
     }
 
@@ -19198,6 +23055,22 @@ impl App {
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(self.video.gamma + direction as f32 * 0.05),
             ui::VIDEO_ROW_ANTI_ALIASING => self.cycle_anti_aliasing(direction),
             ui::VIDEO_ROW_TEXTURE_FILTER => self.cycle_texture_filter(direction),
+            ui::VIDEO_ROW_PICMIP => {
+                // Menu quality runs low -> high; r_picmip runs high -> low.
+                const VALUES: [u32; 5] = [4, 3, 2, 1, 0];
+                let current = VALUES
+                    .iter()
+                    .position(|value| *value == self.video.picmip.min(4))
+                    .unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(VALUES.len() as i32) as usize;
+                self.video.picmip = VALUES[next];
+                self.render_command(RenderCommand::SetPicmip(self.video.picmip));
+                self.console_status = format!(
+                    "TEXTURE QUALITY: r_picmip {} - APPLY VIDEO SETTINGS TO RELOAD THE CURRENT MAP",
+                    self.video.picmip
+                );
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_DETAIL_TEXTURES => {
                 let current = DetailTextureMode::ALL
                     .iter()
@@ -19600,11 +23473,20 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_DEVELOPER_TOOLS => {
-                self.video.developer_tools = !self.video.developer_tools;
+                self.video.developer_level =
+                    ((i32::from(self.video.developer_level) + direction).rem_euclid(4)) as u8;
+                self.video.developer_tools = self.video.developer_level != 0;
+                crate::logging::set_developer_level(self.video.developer_level);
                 if !self.video.developer_tools {
                     self.forget_trace();
                     self.render_command(RenderCommand::ClearSurfaceInspection);
                 }
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_RENDERER_VERBOSE => {
+                self.video.renderer_verbose =
+                    ((i32::from(self.video.renderer_verbose) + direction).rem_euclid(4)) as u8;
+                crate::logging::set_renderer_verbose_level(self.video.renderer_verbose);
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PERF_TRACE => {
@@ -20105,11 +23987,11 @@ impl App {
     fn insert_console_text(&mut self, value: &str) -> bool {
         self.console_cursor = self.console_cursor.min(self.console_input.len());
         let before = self.console_input.len();
-        for ch in value.chars() {
+        for ch in value.chars().map(crate::cgame::unicode_input_char_to_jka_char) {
             if ch.is_control() || matches!(ch, '`' | '~') {
                 continue;
             }
-            if self.console_input.len() + ch.len_utf8() > 160 {
+            if crate::cgame::text_to_jka_bytes(&self.console_input).len() >= 160 {
                 break;
             }
             self.console_input.insert(self.console_cursor, ch);
@@ -20147,7 +24029,7 @@ impl App {
                     self.console_search_open = false;
                     self.publish_ui();
                 }
-                KeyCode::Enter if !event.repeat => {
+                KeyCode::Enter | KeyCode::NumpadEnter if !event.repeat => {
                     self.step_console_search(self.modifiers.shift_key());
                     self.publish_ui();
                 }
@@ -20227,7 +24109,7 @@ impl App {
                 self.publish_ui();
             }
             KeyCode::Escape => self.set_overlay(self.overlay_after_console()),
-            KeyCode::Enter if !event.repeat => {
+            KeyCode::Enter | KeyCode::NumpadEnter if !event.repeat => {
                 if !self.accept_picked_console_suggestion() {
                     self.execute_console();
                 }
@@ -20319,9 +24201,26 @@ impl App {
             return;
         }
         if self.modifiers.control_key() && code == KeyCode::KeyV && !event.repeat {
-            if let Err(error) = Self::paste_into(&mut self.chat_input, 160, false) {
-                self.console_status = format!("CLIPBOARD ERROR: {error}");
-                self.push_console_line(format!("^1{}", self.console_status));
+            match crate::clipboard::get_text() {
+                Ok(value) => {
+                    let before = self.chat_input.len();
+                    for ch in value.chars().map(crate::cgame::unicode_input_char_to_jka_char) {
+                        if ch.is_control() {
+                            continue;
+                        }
+                        if crate::cgame::text_to_jka_bytes(&self.chat_input).len() >= 160 {
+                            break;
+                        }
+                        self.chat_input.push(ch);
+                    }
+                    if self.chat_input.len() != before {
+                        self.chat_player_completion = None;
+                    }
+                }
+                Err(error) => {
+                    self.console_status = format!("CLIPBOARD ERROR: {error}");
+                    self.push_console_line(format!("^1{}", self.console_status));
+                }
             }
             self.publish_ui();
             return;
@@ -20329,15 +24228,21 @@ impl App {
         match code {
             KeyCode::Escape => {
                 self.chat_input.clear();
+                self.chat_player_completion = None;
                 self.set_overlay(OverlayMode::None);
             }
             KeyCode::Enter if !event.repeat => self.submit_chat(),
             KeyCode::Tab => {
-                if !event.repeat && self.chatbox_completion {
-                    self.complete_chat_player_name();
+                if !event.repeat {
+                    if self.chatbox_completion {
+                        self.complete_chat_player_name();
+                    } else {
+                        self.chat_player_completion = None;
+                    }
                 }
             }
             KeyCode::Backspace => {
+                self.chat_player_completion = None;
                 self.chat_input.pop();
                 self.publish_ui();
             }
@@ -20347,13 +24252,14 @@ impl App {
                 }
                 if let Some(value) = &event.text {
                     let mut changed = false;
-                    for ch in value.chars() {
-                        if !ch.is_control() && self.chat_input.len() < 160 {
+                    for ch in value.chars().map(crate::cgame::unicode_input_char_to_jka_char) {
+                        if !ch.is_control() && crate::cgame::text_to_jka_bytes(&self.chat_input).len() < 160 {
                             self.chat_input.push(ch);
                             changed = true;
                         }
                     }
                     if changed {
+                        self.chat_player_completion = None;
                         self.publish_ui();
                     }
                 }
@@ -20411,6 +24317,14 @@ impl App {
             return;
         }
         if commands_executed && self.overlay == OverlayMode::Console {
+            self.publish_ui();
+        }
+        self.poll_race_ghost_loads();
+        self.poll_race_ghost_web();
+        let trail_lines = self.strafe_trails.poll();
+        let trail_changed = !trail_lines.is_empty();
+        for line in trail_lines { self.push_console_line(line); }
+        if trail_changed && matches!(self.overlay, OverlayMode::Console | OverlayMode::StrafeTrails) {
             self.publish_ui();
         }
         let _activity = crate::thread_activity::activity(
@@ -20486,33 +24400,14 @@ impl App {
 
             if let Some(server) = &mut self.local_server {
                 server.set_mouse_input_settings(self.mouse_input);
-                let subframe = self.video.input_subframe;
-                let mouse_input = if subframe {
-                    None
-                } else {
-                    self.pending_mouse_input.take()
-                };
-                let simulation_at = Instant::now();
-                let mouse_delta = if subframe {
-                    (0.0, 0.0)
-                } else {
-                    self.mouse_delta
-                };
                 match server.update(
                     dt,
                     &self.movement_keys,
-                    mouse_delta,
+                    (0.0, 0.0),
                     local_cmd,
                 ) {
                     Ok(stamps) => deformation_stamps = stamps,
                     Err(error) => local_movement_error = Some(error),
-                }
-                if let Some((sequence, event_at)) = mouse_input {
-                    self.last_simulated_mouse_input = Some(InputLatencySample {
-                        sequence,
-                        event_at,
-                        simulation_at,
-                    });
                 }
             }
             if local_movement_error.is_none() {
@@ -20542,8 +24437,15 @@ impl App {
                         println!("{summary}");
                         self.push_console_line(format!("^2{summary}"));
                     }
-                    self.disconnect_to_main_menu();
-                    return;
+                    if let Some(playback) = self.game_session.as_mut() {
+                        if let Err(error) = playback.hold_demo_end(now) {
+                            self.console_status = error;
+                            self.push_console_line(format!("^1{}", self.console_status));
+                        } else {
+                            self.console_status = "DEMO COMPLETE - PAUSED ON FINAL FRAME".into();
+                        }
+                    }
+                    self.publish_transient_ui();
                 }
                 Err(error) => {
                     self.console_status = error;
@@ -20565,6 +24467,24 @@ impl App {
                 }
             }
             self.drain_cgame_notices();
+            let duel_mini_scores = self.draw_scores == 3
+                && self
+                    .game_session
+                    .as_ref()
+                    .is_some_and(|session| session.client_game.gametype() == 3);
+            if self.scoreboard_should_show() || self.companion_scoreboard_visible() || duel_mini_scores {
+                let demo_scores = self.refresh_demo_scoreboard(now);
+                if duel_mini_scores && !demo_scores {
+                    // Tayst's duel HUD reads clientInfo.score; keep our equivalent
+                    // score records fresh even when the full scoreboard is hidden.
+                    self.request_scores_if_due(false);
+                }
+            }
+        }
+
+        if self.force_select_until.is_some_and(|until| now >= until) {
+            self.force_select_until = None;
+            self.publish_transient_ui();
         }
 
         self.refresh_authored_oceans();
@@ -20572,32 +24492,60 @@ impl App {
             self.tick_frontend_cinematic(now);
             self.update_solo_player_view_and_presentation();
         }
-        if self.video.depth_of_field_strength > 0.001 {
-            if let Some(server) = &mut self.local_server {
-                self.dof_focus_target = server.autofocus_distance(&self.camera, 16384.0);
+        if self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus {
+            if let Some(hit) = self.crosshair_hit_world {
+                self.dof_focus_target = self
+                    .camera
+                    .position
+                    .distance(glam::Vec3::from_array(hit))
+                    .clamp(32.0, 16_384.0);
+            } else if let Some(world) = self.map_collision.as_mut() {
+                use jka_movement::TraceWorld;
+                let start = scene::jka_position(self.camera.position.to_array());
+                let direction = scene::jka_position(self.camera.forward().to_array());
+                let end = std::array::from_fn(|axis| start[axis] + direction[axis] * 16_384.0);
+                let result = world.trace(jka_movement::TraceQuery {
+                    start,
+                    mins: [0.0; 3],
+                    maxs: [0.0; 3],
+                    end,
+                    pass_entity: -1,
+                    mask: 0x1 | 0x1000,
+                });
+                let hit = glam::Vec3::from_array(scene::render_position(result.end));
+                self.dof_focus_target = self.camera.position.distance(hit).clamp(32.0, 16_384.0);
             }
         }
         for stamp in deformation_stamps {
             crate::surface_deformation::trace_stamp(stamp);
             self.render_command(RenderCommand::AddSurfaceDeformation(stamp));
         }
-        self.mouse_delta = (0.0, 0.0);
+        self.update_player_name_visibility(now);
         self.publish_snapshot();
 
         let follow_name = self.current_follow_name();
+        let game_timer = self.game_timer_text();
+        let mini_scores = self.mini_scores_ui();
         let race_timer = self.game_session.as_ref().and_then(|session| session.race_timer_ui.clone());
         let vote_line = self.vote_hud_line();
+        let team_overlay = self.team_overlay_ui();
         self.update_speedometer(now);
         self.update_lagometer();
         if follow_name != self.follow_name_shown
+            || game_timer != self.game_timer_shown
+            || mini_scores != self.mini_scores_shown
             || race_timer != self.race_timer_shown
             || vote_line != self.vote_line_shown
+            || team_overlay != self.team_overlay_shown
             || self.speedometer_ui != self.speedometer_shown
             || self.lagometer_ui != self.lagometer_shown
         {
             self.follow_name_shown = follow_name;
+            self.game_timer_shown = game_timer;
+            self.mini_scores_shown = mini_scores;
             self.race_timer_shown = race_timer;
             self.vote_line_shown = vote_line;
+            self.team_overlay_shown = team_overlay;
             self.speedometer_shown = self.speedometer_ui.clone();
             self.lagometer_shown = self.lagometer_ui.clone();
             self.publish_transient_ui();
@@ -20718,6 +24666,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        self.attach_companion_to_renderer(&render);
         self.window = Some(window);
         self.render = Some(render);
         self.sync_classic_world_lighting();
@@ -20752,6 +24701,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ScreenshotFinished(result) => {
                 match result {
                     Ok(ScreenshotOutput::Saved(path)) => {
+                        self.screenshot_catalog_loaded = false;
+                        self.screenshot_preview_pending = None;
                         self.console_status = format!("WROTE {}", path.display());
                         self.push_console_path_line(
                             format!("^2{}", self.console_status),
@@ -20810,6 +24761,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.show_window_after_restart();
+            }
+            UserEvent::CompanionReady { id } => {
+                if self.companion.as_ref().is_some_and(|companion| companion.id.0 == id) {
+                    self.console_status = "COMPANION WINDOW: READY".into();
+                    self.mark_companion_dirty();
+                    self.egui_repaint_requested = true;
+                }
+            }
+            UserEvent::CompanionError { id, error } => {
+                if self.companion.as_ref().is_some_and(|companion| companion.id.0 == id) {
+                    self.console_status = format!("COMPANION WINDOW ERROR: {error}");
+                    self.push_console_line(format!("^1{}", self.console_status));
+                    self.companion_target_enabled = false;
+                }
             }
             UserEvent::RendererFirstFrame => {
                 if self.startup_first_frame_seen {
@@ -20962,14 +24927,6 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::SurfaceInspected(mut info) => {
                 if let Some(info) = &mut info {
                     self.enrich_surface_inspector(info);
-                    // Also log the result so scripted `trace` runs can read it.
-                    println!("TRACE INSPECTOR [{}]: {}", info.kind, info.title);
-                    for (label, value) in &info.summary {
-                        println!("TRACE INSPECTOR:   {label}: {value}");
-                    }
-                    for line in &info.lines {
-                        println!("TRACE INSPECTOR:   {line}");
-                    }
                 }
                 match info {
                     Some(info) => self.push_trace_entry(info),
@@ -21171,7 +25128,8 @@ impl ApplicationHandler<UserEvent> for App {
                     prepare_options: self.latest_prepare_options,
                     map: Arc::new(map.as_ref().clone()),
                 });
-                println!(
+                rverbose!(
+                    2,
                     "Map restart cache: retained prepared CPU map in {:.1} ms",
                     cache_started.elapsed().as_secs_f64() * 1000.0
                 );
@@ -21218,28 +25176,32 @@ impl ApplicationHandler<UserEvent> for App {
                     self.map_editor = None;
                     self.source_map_edit_on_load = false;
                 }
-                crate::logging::write_line_with_path(
-                    crate::logging::Level::Info,
-                    format_args!(
-                        "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
-                        name,
-                        map.triangles,
-                        map.batches.len(),
-                        map.textures.len(),
-                        map.lightmap_pages,
-                        map.source.display()
-                    ),
-                    map.source.clone(),
-                );
+                if crate::logging::renderer_verbose_enabled(1) {
+                    crate::logging::write_line_with_path(
+                        crate::logging::Level::Info,
+                        format_args!(
+                            "{}: {} triangles, {} draw batches, {} textures, {} lightmap pages; source {}",
+                            name,
+                            map.triangles,
+                            map.batches.len(),
+                            map.textures.len(),
+                            map.lightmap_pages,
+                            map.source.display()
+                        ),
+                        map.source.clone(),
+                    );
+                }
                 if let Some(distance_cull) = map.distance_cull {
-                    println!(
+                    rverbose!(
+                        1,
                         "{}: worldspawn distanceCull {:.0} map units -> zFar cap {:.0}",
                         name,
                         distance_cull,
                         crate::camera::far_distance_for_cull(distance_cull),
                     );
                 } else {
-                    println!(
+                    rverbose!(
+                        1,
                         "{}: no worldspawn distanceCull; using JKA default {:.0} -> zFar cap {:.0}",
                         name,
                         crate::camera::DEFAULT_DISTANCE_CULL,
@@ -21247,7 +25209,8 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
                 if let Some(stats) = map.map_file_stats {
-                    println!(
+                    rverbose!(
+                        2,
                         "Source .map: {} entities, {} brushes parsed ({} worldspawn + {} func_group static), {} rendered faces, {} runtime/non-static entity brushes skipped, {} patches skipped, {} degenerate faces, {} invalid brushes skipped",
                         stats.entities,
                         stats.brushes,
@@ -21259,7 +25222,8 @@ impl ApplicationHandler<UserEvent> for App {
                         stats.degenerate_faces,
                         stats.skipped_brushes,
                     );
-                    println!(
+                    rverbose!(
+                        2,
                         "Source .map runtime prep: {} utility faces dropped, {} spatial chunks, {} geometry groups -> {} WGPU draw batches, spatial batching={}; {} gameplay collision brushes; brush reconstruction {:.2} ms on {} map worker(s)",
                         stats.utility_faces_skipped,
                         stats.spatial_chunks,
@@ -21275,7 +25239,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if map.map_file_stats.is_some() {
                         println!("Warning: {warning}");
                     } else {
-                        println!("Material: {warning}");
+                        rverbose!(1, "Material: {warning}");
                     }
                 }
                 self.live_without_world = false;
@@ -21356,8 +25320,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.mouse_buttons_down.clear();
                     self.noclip_primary_down = false;
                     self.noclip_alt_down = false;
-                    self.mouse_delta = (0.0, 0.0);
-                    self.last_mouse_motion_at = None;
+                                self.last_mouse_motion_at = None;
                     self.previous_tick = Instant::now();
                     self.console_status = format!("MAIN MENU BACKGROUND: {name}");
                     println!("Frontend cinematic: loaded {name} with no local player/session");
@@ -21419,15 +25382,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.console_status = format!("PHYSICS FPS ERROR: {error}");
                                 }
                                 server.camera(&mut self.camera);
-                                self.dof_focus_target =
-                                    server.autofocus_distance(&self.camera, 16384.0);
                                 match self.build_local_game_session(&server) {
                                     Ok(mut session) => {
                                         if let Some(snapshot) = server.take_snapshot(true) {
                                             session.snapshots = 1;
                                             session.live_snapshots.push_back(snapshot);
                                         }
-                                        println!(
+                                        devprintln!(
+                                            1,
                                             "LOCAL SERVER: shim ready for {} (decoded snapshot/CGame boundary)",
                                             server.map_name()
                                         );
@@ -21447,6 +25409,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 eprintln!("Local server setup: {error}");
                             }
                         }
+                        self.apply_pending_screenshot_jump(&name);
                         self.keys.clear();
                         self.movement_keys.clear();
                         self.live_buttons.clear();
@@ -21457,8 +25420,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.mouse_buttons_down.clear();
                         self.noclip_primary_down = false;
                         self.noclip_alt_down = false;
-                        self.mouse_delta = (0.0, 0.0);
-                        self.last_mouse_motion_at = None;
+                                        self.last_mouse_motion_at = None;
                         self.previous_tick = Instant::now();
                     }
                 }
@@ -21666,105 +25628,125 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(timing) = self.live_join_timing.as_mut() {
                         timing.first_world_frame_ms = Some(elapsed);
                     }
-                    println!("[JOIN] connect -> first rendered world frame {elapsed:.1} ms ({name})");
-                    self.push_console_line(format!(
-                        "^5[JOIN]^7 connect -> first rendered world frame {elapsed:.1} ms"
-                    ));
+                    rverbose!(1, "[JOIN] connect -> first rendered world frame {elapsed:.1} ms ({name})");
+                    if crate::logging::renderer_verbose_enabled(1) {
+                        self.push_console_line(format!(
+                            "^5[JOIN]^7 connect -> first rendered world frame {elapsed:.1} ms"
+                        ));
+                    }
                 }
                 if let Some(restart_started) = self.renderer_restart_started.take() {
                     let total_ms = restart_started.elapsed().as_secs_f64() * 1000.0;
-                    println!("[VID_RESTART] backend/display restart to first world frame {:.1} ms", total_ms);
+                    rverbose!(1, "[VID_RESTART] backend/display restart to first world frame {:.1} ms", total_ms);
+                    if crate::logging::renderer_verbose_enabled(1) {
+                        self.push_console_line(format!(
+                            "^5[VID_RESTART]^7 total {:.1} ms to first world frame",
+                            total_ms
+                        ));
+                    }
+                }
+                if crate::logging::renderer_verbose_enabled(1) {
                     self.push_console_line(format!(
-                        "^5[VID_RESTART]^7 total {:.1} ms to first world frame",
-                        total_ms
+                        "^5[MAP LOAD]^7 {name} {:.1} ms first-frame | prep {:.1} | bsp {:.1} | collision {:.1} | shaders {:.1} | textures decode {:.1} | geometry {:.1} | render-upload {:.1} | workers {}",
+                        first_frame_ms,
+                        timings.prepare_wall_ms,
+                        timings.bsp_parse_ms,
+                        timings.collision_ms,
+                        timings.shader_parse_wall_ms,
+                        timings.texture_decode_ms,
+                        timings.geometry_ms,
+                        upload_ms,
+                        timings.worker_count,
                     ));
                 }
-                self.push_console_line(format!(
-                    "^5[MAP LOAD]^7 {name} {:.1} ms first-frame | prep {:.1} | bsp {:.1} | collision {:.1} | shaders {:.1} | textures decode {:.1} | geometry {:.1} | render-upload {:.1} | workers {}",
-                    first_frame_ms,
-                    timings.prepare_wall_ms,
-                    timings.bsp_parse_ms,
-                    timings.collision_ms,
-                    timings.shader_parse_wall_ms,
-                    timings.texture_decode_ms,
-                    timings.geometry_ms,
-                    upload_ms,
-                    timings.worker_count,
-                ));
                 let post_upload_wait_ms =
                     (first_frame_ms - timings.prepare_wall_ms - upload_ms).max(0.0);
-                self.push_console_line(format!(
-                    "^6[MAP FIRST FRAME]^7 prep {:.1} ms | render upload {:.1} ms | queue/present wait {:.1} ms",
-                    timings.prepare_wall_ms,
-                    upload_ms,
-                    post_upload_wait_ms,
-                ));
-                self.push_console_line(format!(
-                    "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms | PVS plans {:.1} ms",
-                    timings.grass_ms,
-                    timings.grass_cpu_ms,
-                    timings.gi_ms,
-                    timings.ocean_ms,
-                    timings.steam_audio_ms,
-                    timings.portal_plans_ms,
-                ));
-                self.push_console_line(format!(
-                    "^6[MAP PREP STAGES]^7 asset index {:.1} | bsp read {:.1} | movement {:.1} | shader read {:.1} | shader parse wall {:.1} (cpu {:.1}) | lightmaps {:.1} | materials {:.1} | geometry {:.1} | tex preload wall {:.1} (read {:.1}, decode {:.1}, mip {:.1}, {} image(s)) | portal plans {:.1} | generated normals {:.1} ms ({} map(s))",
-                    timings.asset_index_ms,
-                    timings.bsp_read_ms,
-                    timings.movement_ms,
-                    timings.shader_read_ms,
-                    timings.shader_parse_wall_ms,
-                    timings.shader_parse_cpu_ms,
-                    timings.lightmap_ms,
-                    timings.material_ms,
-                    timings.geometry_ms,
-                    timings.texture_preload_wall_ms,
-                    timings.texture_read_ms,
-                    timings.texture_decode_ms,
-                    timings.texture_mip_ms,
-                    timings.texture_images,
-                    timings.portal_plans_ms,
-                    timings.generated_normal_ms,
-                    timings.generated_normals,
-                ));
-                self.push_console_line(format!(
-                    "^6[MAP PREP TIMELINE]^7 loader thread, in order: {}",
-                    scene::PREP_PHASES
-                        .iter()
-                        .zip(timings.phase_ms)
-                        .map(|(label, ms)| format!("{label} {ms:.1}"))
-                        .collect::<Vec<_>>()
-                        .join(" | "),
-                ));
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP FIRST FRAME]^7 prep {:.1} ms | render upload {:.1} ms | queue/present wait {:.1} ms",
+                        timings.prepare_wall_ms,
+                        upload_ms,
+                        post_upload_wait_ms,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms | PVS plans {:.1} ms",
+                        timings.grass_ms,
+                        timings.grass_cpu_ms,
+                        timings.gi_ms,
+                        timings.ocean_ms,
+                        timings.steam_audio_ms,
+                        timings.portal_plans_ms,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP PREP STAGES]^7 asset index {:.1} | bsp read {:.1} | movement {:.1} | shader read {:.1} | shader parse wall {:.1} (cpu {:.1}) | lightmaps {:.1} | materials {:.1} | geometry {:.1} | tex preload wall {:.1} (read {:.1}, decode {:.1}, mip {:.1}, {} image(s)) | portal plans {:.1} | generated normals {:.1} ms ({} map(s))",
+                        timings.asset_index_ms,
+                        timings.bsp_read_ms,
+                        timings.movement_ms,
+                        timings.shader_read_ms,
+                        timings.shader_parse_wall_ms,
+                        timings.shader_parse_cpu_ms,
+                        timings.lightmap_ms,
+                        timings.material_ms,
+                        timings.geometry_ms,
+                        timings.texture_preload_wall_ms,
+                        timings.texture_read_ms,
+                        timings.texture_decode_ms,
+                        timings.texture_mip_ms,
+                        timings.texture_images,
+                        timings.portal_plans_ms,
+                        timings.generated_normal_ms,
+                        timings.generated_normals,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(3) {
+                    self.push_console_line(format!(
+                        "^6[MAP PREP TIMELINE]^7 loader thread, in order: {}",
+                        scene::PREP_PHASES
+                            .iter()
+                            .zip(timings.phase_ms)
+                            .map(|(label, ms)| format!("{label} {ms:.1}"))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    ));
+                }
                 let detail = timings.geometry_detail_ms;
-                self.push_console_line(format!(
-                    "^6[MAP PREP GEOMETRY]^7 dlight surfaces {:.1} | surface walk {:.1} wall (PVS signatures {:.1} CPU summed over threads) | piece pack {:.1} (ordering {:.1} summed over groups) | archive handles opened {} in {:.1} ms (summed over threads)",
-                    detail[0],
-                    detail[1],
-                    detail[2],
-                    detail[3],
-                    detail[4],
-                    timings.archive_opens,
-                    timings.archive_open_ms,
-                ));
-                self.push_console_line(format!(
-                    "^6[MAP TEXTURE DECODE]^7 tga {} image(s) {:.1} ms | jpg {} image(s) {:.1} ms | png {} image(s) {:.1} ms (CPU summed over workers)",
-                    timings.texture_format_images[0],
-                    timings.texture_format_decode_ms[0],
-                    timings.texture_format_images[1],
-                    timings.texture_format_decode_ms[1],
-                    timings.texture_format_images[2],
-                    timings.texture_format_decode_ms[2],
-                ));
-                self.push_console_line(format!(
-                    "^6[OCEAN MESH]^7 promoted water surfaces {} | clipmap {} verts / {} tris, inner cell {:.0}u, outer cell {:.0}u",
-                    upload_timings.ocean_water_batches,
-                    upload_timings.ocean_clipmap_vertices,
-                    upload_timings.ocean_clipmap_tris,
-                    upload_timings.ocean_clipmap_spacing,
-                    upload_timings.ocean_coarsest_spacing,
-                ));
+                if crate::logging::renderer_verbose_enabled(3) {
+                    self.push_console_line(format!(
+                        "^6[MAP PREP GEOMETRY]^7 dlight surfaces {:.1} | surface walk {:.1} wall (PVS signatures {:.1} CPU summed over threads) | piece pack {:.1} (ordering {:.1} summed over groups) | archive handles opened {} in {:.1} ms (summed over threads)",
+                        detail[0],
+                        detail[1],
+                        detail[2],
+                        detail[3],
+                        detail[4],
+                        timings.archive_opens,
+                        timings.archive_open_ms,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP TEXTURE DECODE]^7 tga {} image(s) {:.1} ms | jpg {} image(s) {:.1} ms | png {} image(s) {:.1} ms (CPU summed over workers)",
+                        timings.texture_format_images[0],
+                        timings.texture_format_decode_ms[0],
+                        timings.texture_format_images[1],
+                        timings.texture_format_decode_ms[1],
+                        timings.texture_format_images[2],
+                        timings.texture_format_decode_ms[2],
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[OCEAN MESH]^7 promoted water surfaces {} | clipmap {} verts / {} tris, inner cell {:.0}u, outer cell {:.0}u",
+                        upload_timings.ocean_water_batches,
+                        upload_timings.ocean_clipmap_vertices,
+                        upload_timings.ocean_clipmap_tris,
+                        upload_timings.ocean_clipmap_spacing,
+                        upload_timings.ocean_coarsest_spacing,
+                    ));
+                }
                 let upload_accounted_ms = upload_timings.vertex_buffer_ms
                     + upload_timings.texture_upload_ms
                     + upload_timings.lightmap_upload_ms
@@ -21784,31 +25766,35 @@ impl ApplicationHandler<UserEvent> for App {
                     + upload_timings.frame_plan_ms
                     + upload_timings.variant_ms;
                 let upload_other_ms = (upload_ms - upload_accounted_ms).max(0.0);
-                self.push_console_line(format!(
-                    "^6[MAP RENDER-UPLOAD 2]^7 load_map pre-build {:.1} | snow shell {:.1} | CPU copies (inspector/AO) {:.1} | cull+froxel bind groups {:.1} | videos/lights/AO request/weather/fog {:.1} | planar+frame plan {:.1} | pipeline variant {:.1}",
-                    upload_timings.pre_build_ms,
-                    upload_timings.snow_shell_ms,
-                    upload_timings.prelude_ms,
-                    upload_timings.post_bind_groups_ms,
-                    upload_timings.post_misc_ms,
-                    upload_timings.frame_plan_ms,
-                    upload_timings.variant_ms,
-                ));
-                self.push_console_line(format!(
-                    "^6[MAP RENDER-UPLOAD]^7 vertex {:.1} | textures {:.1} | lightmaps {:.1} | probes {:.1} | batches {:.1} | cull {:.1} | lighting {:.1} | pipelines {:.1} | visibility {:.1} | grass {:.1} | finalize {:.1} | other {:.1}",
-                    upload_timings.vertex_buffer_ms,
-                    upload_timings.texture_upload_ms,
-                    upload_timings.lightmap_upload_ms,
-                    upload_timings.reflection_probe_upload_ms,
-                    upload_timings.batch_bind_groups_ms,
-                    upload_timings.cull_resources_ms,
-                    upload_timings.lighting_resources_ms,
-                    upload_timings.pipeline_create_ms,
-                    upload_timings.visibility_tables_ms,
-                    upload_timings.grass_upload_ms,
-                    upload_timings.finalize_ms,
-                    upload_other_ms,
-                ));
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP RENDER-UPLOAD 2]^7 load_map pre-build {:.1} | snow shell {:.1} | CPU copies (inspector/AO) {:.1} | cull+froxel bind groups {:.1} | videos/lights/AO request/weather/fog {:.1} | planar+frame plan {:.1} | pipeline variant {:.1}",
+                        upload_timings.pre_build_ms,
+                        upload_timings.snow_shell_ms,
+                        upload_timings.prelude_ms,
+                        upload_timings.post_bind_groups_ms,
+                        upload_timings.post_misc_ms,
+                        upload_timings.frame_plan_ms,
+                        upload_timings.variant_ms,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP RENDER-UPLOAD]^7 vertex {:.1} | textures {:.1} | lightmaps {:.1} | probes {:.1} | batches {:.1} | cull {:.1} | lighting {:.1} | pipelines {:.1} | visibility {:.1} | grass {:.1} | finalize {:.1} | other {:.1}",
+                        upload_timings.vertex_buffer_ms,
+                        upload_timings.texture_upload_ms,
+                        upload_timings.lightmap_upload_ms,
+                        upload_timings.reflection_probe_upload_ms,
+                        upload_timings.batch_bind_groups_ms,
+                        upload_timings.cull_resources_ms,
+                        upload_timings.lighting_resources_ms,
+                        upload_timings.pipeline_create_ms,
+                        upload_timings.visibility_tables_ms,
+                        upload_timings.grass_upload_ms,
+                        upload_timings.finalize_ms,
+                        upload_other_ms,
+                    ));
+                }
                 if let (Some(stats), Some(sound)) = (
                     bsp_stats.as_ref(),
                     self.game_session
@@ -21821,12 +25807,14 @@ impl ApplicationHandler<UserEvent> for App {
                     playback.weapon_fx.set_inline_model_bounds(Arc::clone(&stats.inline_model_bounds));
                 }
                 if let Some(stats) = bsp_stats {
-                    self.push_console_line(format!(
-                        "^5[MAP STATS]^7 brushes {} | brushsides {} | clipping planes {} | surfaces {} | bsp verts {} | bsp indices {} | render tris {} | batches {} | nodes {} | leaves {} | clusters {}",
-                        stats.brushes, stats.brush_sides, stats.planes, stats.surfaces,
-                        stats.vertices, stats.indices, triangles, batches, stats.collision_nodes,
-                        stats.collision_leaves, stats.pvs_clusters,
-                    ));
+                    if crate::logging::renderer_verbose_enabled(2) {
+                        self.push_console_line(format!(
+                            "^5[MAP STATS]^7 brushes {} | brushsides {} | clipping planes {} | surfaces {} | bsp verts {} | bsp indices {} | render tris {} | batches {} | nodes {} | leaves {} | clusters {}",
+                            stats.brushes, stats.brush_sides, stats.planes, stats.surfaces,
+                            stats.vertices, stats.indices, triangles, batches, stats.collision_nodes,
+                            stats.collision_leaves, stats.pvs_clusters,
+                        ));
+                    }
                 }
                 self.console_status =
                     format!("LOADED {name}: {:.3} seconds", first_frame_ms / 1000.0);
@@ -21872,6 +25860,14 @@ impl ApplicationHandler<UserEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        let companion_matches = self
+            .companion
+            .as_ref()
+            .is_some_and(|companion| companion.window.id() == window_id);
+        if companion_matches {
+            self.handle_companion_window_event(window_id, event);
+            return;
+        }
         let window_matches = match self.window.as_ref() {
             Some(window) => window.id() == window_id,
             None => false,
@@ -21887,7 +25883,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if let WindowEvent::MouseInput { state, button, .. } = &event {
-            if self.overlay == OverlayMode::None && self.captured {
+            // Demo playback reuses spectator mouse bindings. +speed temporarily
+            // releases the cursor for timeline interaction; non-left spectator
+            // buttons may still be explicit controls while that modifier is held.
+            let demo_spectator_button = self.spectator_binding_context()
+                && !matches!(*button, MouseButton::Left);
+            if self.overlay == OverlayMode::None && (self.captured || demo_spectator_button) {
                 let down = *state == ElementState::Pressed;
                 let button_number = match button {
                     MouseButton::Left => Some(1),
@@ -21966,6 +25967,36 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if let Some(key) = key { self.bind_control_key(key); }
             }
+            WindowEvent::MouseWheel { delta, .. }
+                if self.overlay == OverlayMode::None && self.captured && self.spectator_orbit_follow_active() =>
+            {
+                let (amount, key) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) if y > 0.0 => (y, Some(BindKey::WheelUp)),
+                    MouseScrollDelta::LineDelta(_, y) if y < 0.0 => (y, Some(BindKey::WheelDown)),
+                    MouseScrollDelta::PixelDelta(position) if position.y > 0.0 => {
+                        ((position.y as f32 / 120.0).clamp(-8.0, 8.0), Some(BindKey::WheelUp))
+                    }
+                    MouseScrollDelta::PixelDelta(position) if position.y < 0.0 => {
+                        ((position.y as f32 / 120.0).clamp(-8.0, 8.0), Some(BindKey::WheelDown))
+                    }
+                    _ => (0.0, None),
+                };
+                // Orbit owns the wheel by default, but an explicit spectator
+                // override wins. Inherited gameplay wheel binds do not disable
+                // orbit zoom.
+                if let Some(key) = key {
+                    if self.bindings.get_spectator(key).is_some() {
+                        self.execute_binding_press(key);
+                        return;
+                    }
+                }
+                if amount.abs() > f32::EPSILON {
+                    self.spectator_camera.orbit_range = (self.spectator_camera.orbit_range * (-amount * 0.12).exp())
+                        .clamp(MIN_SPECTATOR_ORBIT_RANGE, MAX_SPECTATOR_ORBIT_RANGE);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } if self.overlay == OverlayMode::None && self.captured => {
                 let key = match delta {
                     MouseScrollDelta::LineDelta(_, y) if y > 0.0 => Some(BindKey::WheelUp),
@@ -22011,8 +26042,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.noclip_alt_down = false;
                 self.modifiers = ModifiersState::empty();
                 self.set_capture(false);
-                self.mouse_delta = (0.0, 0.0);
-                if let Some(player) = &mut self.local_server {
+                        if let Some(player) = &mut self.local_server {
                     player.pause();
                 }
             }
@@ -22187,7 +26217,13 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if self.overlay == OverlayMode::None => self.set_capture(true),
+            } if self.overlay == OverlayMode::None => {
+                if self.demo_playback_active() {
+                    self.sync_demo_camera_capture();
+                } else {
+                    self.set_capture(true);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
@@ -22233,7 +26269,7 @@ impl ApplicationHandler<UserEvent> for App {
                     && code == KeyCode::KeyC
                     && matches!(
                         self.overlay,
-                        OverlayMode::None | OverlayMode::Game | OverlayMode::Video | OverlayMode::Trace
+                        OverlayMode::None | OverlayMode::Game | OverlayMode::Video | OverlayMode::Trace | OverlayMode::StrafeTrails | OverlayMode::RaceGhosts
                     )
                     && self.surface_inspector.is_some()
                 {
@@ -22293,6 +26329,18 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    OverlayMode::StrafeTrails => {
+                        if event.state == ElementState::Pressed && !event.repeat && code == KeyCode::Escape {
+                            self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
+                    OverlayMode::RaceGhosts => {
+                        if event.state == ElementState::Pressed && !event.repeat && code == KeyCode::Escape {
+                            self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
                     OverlayMode::MapEdit => {
                         if event.state == ElementState::Pressed && !event.repeat && code == KeyCode::Escape {
                             if let Some(editor) = self.map_editor.as_mut() { editor.cancel_drag(); }
@@ -22309,10 +26357,6 @@ impl ApplicationHandler<UserEvent> for App {
                     && !event.repeat
                 {
                     match code {
-                        KeyCode::KeyF => {
-                            self.toggle_demo_free_view();
-                            return;
-                        }
                         KeyCode::BracketLeft => {
                             self.cycle_demo_follow(-1);
                             return;
@@ -22324,10 +26368,6 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::Home => {
                             self.reset_demo_view_authoritative();
                             self.console_status = "DEMO CAMERA: RECORDED POV".into();
-                            return;
-                        }
-                        KeyCode::Space => {
-                            self.toggle_demo_pause_ui();
                             return;
                         }
                         KeyCode::ArrowLeft => {
@@ -22365,7 +26405,10 @@ impl ApplicationHandler<UserEvent> for App {
                         self.cycle_spawn();
                         return;
                     }
-                    if let Some(binding) = self.bindings.get(keybinds::bind_key_for_code(code)).map(str::to_owned) {
+                    if let Some(binding) = self.bindings
+                        .get_resolved(keybinds::bind_key_for_code(code), self.spectator_binding_context())
+                        .map(str::to_owned)
+                    {
                         if let Some(player) = &mut self.local_server {
                             for command in keybinds::split_binding_commands(&binding) {
                                 let canonical = match command.split_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
@@ -22398,6 +26441,28 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
+            if self.spectator_orbit_follow_active() {
+                let yaw_degrees = delta.0 as f32 * self.mouse_input.sensitivity * self.mouse_input.yaw;
+                let pitch_degrees = delta.1 as f32 * self.mouse_input.sensitivity * self.mouse_input.pitch;
+                let fallback = match self.demo_view_mode {
+                    DemoViewMode::Follow(client) if self.demo_playback_active() => self
+                        .game_session
+                        .as_ref()
+                        .and_then(|session| session.demo_fake_view(client))
+                        .map(|view| view.view_angles),
+                    _ => None,
+                }
+                .or_else(|| {
+                    self.game_session
+                        .as_ref()
+                        .and_then(|session| session.current_snapshot.as_ref())
+                        .and_then(|snapshot| playerstate_vec3(&snapshot.player_state, "viewangles"))
+                })
+                .unwrap_or([0.0; 3]);
+                self.spectator_camera_state
+                    .apply_orbit_mouse(yaw_degrees, pitch_degrees, fallback);
+                return;
+            }
             if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
                 let yaw_degrees = delta.0 as f32 * self.mouse_input.sensitivity * self.mouse_input.yaw;
                 let pitch_degrees = delta.1 as f32 * self.mouse_input.sensitivity * self.mouse_input.pitch;
@@ -22413,71 +26478,84 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mouse_input_sequence = 1;
             }
 
-            if self.video.input_subframe {
-                let elapsed = self
-                    .last_mouse_motion_at
-                    .replace(event_at)
-                    .map(|last| event_at.saturating_duration_since(last))
-                    .unwrap_or(Duration::from_millis(1));
-                if self.net.as_ref().is_some_and(|net| {
-                    net.state() >= jka_protocol::session::ConnectionState::Primed
-                }) {
-                    // Event-rate CL_MouseMove. This only advances cl.viewangles;
-                    // Pmove/usercmd cadence remains unchanged. The next normal
-                    // client frame consumes the same viewangles for prediction,
-                    // while the renderer may expose this real mouse sample to
-                    // first person or the safe no-trace third-person latch path.
+            let elapsed = self
+                .last_mouse_motion_at
+                .replace(event_at)
+                .map(|last| event_at.saturating_duration_since(last))
+                .unwrap_or(Duration::from_millis(1));
+            if self.net.as_ref().is_some_and(|net| {
+                net.state() >= jka_protocol::session::ConnectionState::Primed
+            }) {
+                // Event-rate CL_MouseMove. This only advances cl.viewangles;
+                // Pmove/usercmd cadence remains unchanged. The next normal
+                // client frame consumes the same viewangles for prediction,
+                // while the renderer may expose this real mouse sample to
+                // first person or the safe no-trace third-person latch path.
+                let simulation_at = Instant::now();
+                let (mx, my) = self.mouse_input.scale_mouse(delta, elapsed);
+                self.live_input
+                    .apply_mouse(self.mouse_input.yaw * mx, self.mouse_input.pitch * my);
+                let sample = InputLatencySample {
+                    sequence: self.mouse_input_sequence,
+                    event_at,
+                    simulation_at,
+                };
+                self.last_simulated_mouse_input = Some(sample);
+                // Keep the crosshair endpoint coherent with this exact raw-input
+                // view sample before publishing the pair to the render seqlock.
+                if self.crosshair.dynamic != 0
+                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus)
+                {
+                    self.update_crosshair_target(event_at);
+                }
+                self.publish_live_subframe_view(sample);
+            } else {
+                let mut applied = false;
+                let mut applied_sample = None;
+                if let Some(player) = &mut self.local_server {
                     let simulation_at = Instant::now();
-                    let (mx, my) = self.mouse_input.scale_mouse(delta, elapsed);
-                    self.live_input
-                        .apply_mouse(self.mouse_input.yaw * mx, self.mouse_input.pitch * my);
+                    player.set_mouse_input_settings(self.mouse_input);
+                    player.apply_mouse_look_timed(delta, elapsed);
                     let sample = InputLatencySample {
                         sequence: self.mouse_input_sequence,
                         event_at,
                         simulation_at,
                     };
                     self.last_simulated_mouse_input = Some(sample);
-                    self.publish_live_subframe_view(sample);
-                } else {
-                    let mut applied = false;
-                    let mut applied_sample = None;
-                    if let Some(player) = &mut self.local_server {
-                        let simulation_at = Instant::now();
-                        player.set_mouse_input_settings(self.mouse_input);
-                        player.apply_mouse_look_timed(delta, elapsed);
-                        let sample = InputLatencySample {
-                            sequence: self.mouse_input_sequence,
-                            event_at,
-                            simulation_at,
-                        };
-                        self.last_simulated_mouse_input = Some(sample);
-                        applied_sample = Some(sample);
-                        applied = true;
+                    applied_sample = Some(sample);
+                    applied = true;
+                }
+                if applied {
+                    // Trace first, then publish rotation + endpoint together. This
+                    // prevents the renderer from late-latching a new angle while
+                    // still drawing the previous mouse sample's dynamic crosshair.
+                    if self.crosshair.dynamic != 0
+                        || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus)
+                    {
+                        self.update_crosshair_target(event_at);
                     }
-                    if applied {
-                        // OpenJK-forced views still accumulate mouse into future usercmds,
-                        // but they do no render-only subframe camera work.
-                        let subframe_event_handled = self
-                            .local_server
-                            .as_ref()
-                            .is_some_and(|server| server.view().view_forced != 0)
-                            || applied_sample
-                                .is_some_and(|sample| self.publish_local_subframe_view(sample));
-                        if !subframe_event_handled {
-                            // The no-trace third-person latch is unavailable
-                            // (for example camera collision/damping). Preserve the
-                            // old local fallback and rerun the authoritative CGame
-                            // camera rather than approximating through geometry.
-                            self.update_solo_player_view_and_presentation();
-                            self.publish_snapshot();
+                    // OpenJK-forced views still accumulate mouse into future usercmds,
+                    // but they do no render-only subframe camera work.
+                    let subframe_event_handled = self
+                        .local_server
+                        .as_ref()
+                        .is_some_and(|server| server.view().view_forced != 0)
+                        || applied_sample
+                            .is_some_and(|sample| self.publish_local_subframe_view(sample));
+                    if !subframe_event_handled {
+                        // The no-trace third-person latch is unavailable
+                        // (for example camera collision/damping). Preserve the
+                        // old local fallback and rerun the authoritative CGame
+                        // camera rather than approximating through geometry.
+                        self.update_solo_player_view_and_presentation();
+                        if self.crosshair.dynamic != 0
+                            || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus)
+                        {
+                            self.update_crosshair_target(event_at);
                         }
+                        self.publish_snapshot();
                     }
                 }
-            } else {
-                self.last_mouse_motion_at = Some(event_at);
-                self.mouse_delta.0 += delta.0;
-                self.mouse_delta.1 += delta.1;
-                self.pending_mouse_input = Some((self.mouse_input_sequence, event_at));
             }
         }
     }
@@ -22487,7 +26565,9 @@ impl ApplicationHandler<UserEvent> for App {
         // turns so Windows can finish changing the HWND/display mode before the
         // next WGPU surface is created.
         self.continue_pending_renderer_restart(event_loop);
+        self.sync_companion_window(event_loop);
         self.tick();
+        self.tick_companion_ui();
         if self.quit_requested {
             self.flush_config();
             event_loop.exit();
@@ -22507,6 +26587,10 @@ impl App {
     /// Flush what must survive and end the process without orderly teardown.
     fn exit_process(&mut self) -> ! {
         self.flush_config();
+        // Chat logging is the only buffered durable gameplay output. Give its
+        // dedicated writer a short bounded window to append the footer/flush
+        // before the Windows fast-exit path terminates all worker threads.
+        self.chat_log.shutdown(Duration::from_millis(250));
         // CL_Disconnect on quit: tell the server instead of timing out.
         if let Some(mut net) = self.net.take() {
             net.disconnect();
@@ -22523,8 +26607,8 @@ impl App {
         #[cfg(windows)]
         {
             extern "system" {
-                fn GetCurrentProcess() -> isize;
-                fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
             }
             unsafe { TerminateProcess(GetCurrentProcess(), 0) };
         }

@@ -40,8 +40,10 @@ const SNOWFLOW_BERM_SCALE: f32 = 1.5;
 const SNOWFLOW_MAX_BERM: f32 = 0.34 * SNOWFLOW_BERM_SCALE * UNITS_PER_METRE;
 const SNOWFLOW_WIND_ANGLE: f32 = 42.0_f32.to_radians();
 
-fn footprint_log(args: std::fmt::Arguments<'_>) {
-    crate::logging::write_line(crate::logging::Level::Info, args);
+fn footprint_log(level: u8, args: std::fmt::Arguments<'_>) {
+    if crate::logging::developer_enabled(level) {
+        crate::logging::write_line(crate::logging::Level::Info, args);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +98,7 @@ pub struct LocalFootContactShim {
 
 impl LocalFootContactShim {
     pub fn new(origin: [f32; 3]) -> Self {
-        footprint_log(format_args!(
+        footprint_log(2, format_args!(
             "[footprints shim] initialized grounded-distance source at {:.1},{:.1},{:.1}",
             origin[0], origin[1], origin[2]
         ));
@@ -249,7 +251,7 @@ fn trace_walk<W: TraceWorld>(
 
 pub fn trace_stamp(stamp: SurfaceDeformationStamp) {
     if stamp.kind == SurfaceDeformationKind::Foot {
-        footprint_log(format_args!(
+        footprint_log(3, format_args!(
             "[footprints stamp] {:?} material={} pos={:.2},{:.2},{:.2}",
             stamp.foot, stamp.material, stamp.position[0], stamp.position[1], stamp.position[2],
         ));

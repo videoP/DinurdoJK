@@ -1,7 +1,7 @@
 //! Jedi Academy Siege class model/skin metadata ported from OpenJK `codemp/game/bg_saga.c`.
 //!
 //! This intentionally implements only the fields consumed by `CG_NewClientInfo` for player
-//! presentation: class `name`, forced `model`, and forced `skin`. Parsing follows the same
+//! presentation: class `name`, forced `model`/`skin`, and forced saber colors. Parsing follows the same
 //! `BG_SiegeGetValueGroup` / `BG_SiegeGetPairedValue` grammar rather than substituting JSON or a
 //! generic key/value parser.
 
@@ -16,6 +16,8 @@ pub struct SiegeClassVisual {
     pub name: String,
     pub forced_model: String,
     pub forced_skin: String,
+    pub forced_saber_color: Option<i32>,
+    pub forced_saber2_color: Option<i32>,
 }
 
 pub fn load_siege_class_visuals(
@@ -61,10 +63,18 @@ pub fn parse_siege_class_visual(bytes: &[u8]) -> Result<Option<SiegeClassVisual>
         .ok_or_else(|| "Siege class without name entry".to_owned())?;
     let forced_model = siege_paired_value(&class_info, "model")?.unwrap_or_default();
     let forced_skin = siege_paired_value(&class_info, "skin")?.unwrap_or_default();
+    // BG_SiegeParseClassFile uses atoi and a separate hasForced* flag, so a present
+    // but malformed value deliberately resolves to 0 (SABER_RED).
+    let forced_saber_color = siege_paired_value(&class_info, "sabercolor")?
+        .map(|value| value.trim().parse::<i32>().unwrap_or(0));
+    let forced_saber2_color = siege_paired_value(&class_info, "saber2color")?
+        .map(|value| value.trim().parse::<i32>().unwrap_or(0));
     Ok(Some(SiegeClassVisual {
         name,
         forced_model,
         forced_skin,
+        forced_saber_color,
+        forced_saber2_color,
     }))
 }
 
@@ -294,6 +304,8 @@ mod tests {
                 name "Jedi Guardian"
                 model jedi_hm
                 skin |head_a1|torso_a1|lower_a1
+                sabercolor 3
+                saber2color 5
                 weapons WP_SABER
                 Nested { model ignored }
             }
@@ -304,6 +316,8 @@ mod tests {
                 name: "Jedi Guardian".to_owned(),
                 forced_model: "jedi_hm".to_owned(),
                 forced_skin: "|head_a1|torso_a1|lower_a1".to_owned(),
+                forced_saber_color: Some(3),
+                forced_saber2_color: Some(5),
             })
         );
     }
@@ -314,6 +328,8 @@ mod tests {
             name: "Heavy Weapons".to_owned(),
             forced_model: "stormtrooper".to_owned(),
             forced_skin: "default".to_owned(),
+            forced_saber_color: None,
+            forced_saber2_color: None,
         }];
         assert_eq!(
             find_siege_class_visual(&classes, "heavy weapons")

@@ -10,8 +10,8 @@
 use super::{
     item_presenter::{cg_item, item_cone_origin, ItemDraw, ItemInput, IT_WEAPON},
     weapon_fx::WeaponFx,
-    player_presenter::{blend_for_alpha, Ghoul2PresentationView, PlayerPresenter},
-    ClientGameState, EntityPresentationKind, PresentedEntity,
+    player_presenter::{blend_for_alpha, openjk_vectoangles, Ghoul2PresentationView, PlayerPresenter},
+    suppressed_during_intermission, ClientGameState, EntityPresentationKind, PresentedEntity,
 };
 use crate::{
     materials::{self, TextureData, Textures},
@@ -34,9 +34,15 @@ use std::{
 
 const MAX_MD3_BYTES: usize = 64 * 1024 * 1024;
 const EF_NODRAW: i32 = 1 << 8;
+const EF_DEAD: i32 = 1 << 1;
+/// bg_public.h: authoritative spawn protection flag consumed by CG_Player.
+const EF_INVULNERABLE: i32 = 1 << 27;
 const EF2_HYPERSPACE: i32 = 1 << 5;
 const SOLID_BMODEL: i32 = 0x00ff_ffff;
 const WP_SABER: i32 = 3;
+const G2_MODEL_PART: i32 = 50;
+const INVULNERABILITY_MODEL: &str = "models/weaphits/testboom.md3";
+const INVULNERABILITY_SHADER: &str = "powerups/invulnerabilityshell";
 
 #[derive(Clone)]
 struct Md3SurfaceAsset {
@@ -110,12 +116,13 @@ impl EntityPresenter {
         let mut shader_warnings = Vec::new();
         let (shaders, diagnostics) =
             materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
-        println!(
+        devprintln!(
+            1,
             "ENTITY ASSETS: shaderDefs={} mtrDefs={}",
             diagnostics.shader_definitions, diagnostics.mtr_definitions,
         );
         for warning in shader_warnings {
-            println!("ENTITY MATERIAL WARNING: {warning}");
+            rverbose!(1, "ENTITY MATERIAL WARNING: {warning}");
         }
         Ok(Self {
             assets,
@@ -235,7 +242,8 @@ impl EntityPresenter {
             cull_origin[2] += 1.0 + placement.zoffset;
             props.push(StaticProp { surfaces, origin: placement.origin, cull_origin, radius });
         }
-        println!(
+        devprintln!(
+            1,
             "STATIC MODELS: {} of {} misc_model_static placement(s) built, {} surface(s)",
             props.len(),
             source.len(),
@@ -257,9 +265,10 @@ impl EntityPresenter {
             materials::shader_library(&mut self.assets, &mut shader_warnings, self.pbr)?;
         self.shaders = shaders;
         for warning in shader_warnings {
-            println!("ENTITY MATERIAL REFRESH WARNING: {warning}");
+            rverbose!(1, "ENTITY MATERIAL REFRESH WARNING: {warning}");
         }
-        println!(
+        devprintln!(
+            1,
             "ENTITY ASSET REFRESH: shaderDefs={} mtrDefs={}",
             diagnostics.shader_definitions, diagnostics.mtr_definitions
         );
@@ -285,13 +294,22 @@ impl EntityPresenter {
         let mut draws = Vec::new();
         let mut inline_models = Vec::new();
         let mut summary = EntityDispatchSummary::default();
+        let intermission = game.rendering_intermission();
 
         for entity in entities {
+            // TaystJK CG_AddCEntity returns before lerp/effects/dispatch for
+            // general/player/invisible entities during intermission, and for
+            // vehicle NPCs. Player/NPC meshes are owned by PlayerPresenter in
+            // this client, but applying the same gate here keeps generic models
+            // and vehicle-side work aligned with the original dispatcher.
+            if suppressed_during_intermission(intermission, entity) {
+                continue;
+            }
             match entity.presentation_kind() {
                 EntityPresentationKind::General
                 | EntityPresentationKind::Holocron => {
                     summary.general += 1;
-                    self.present_configstring_model(entity, game, &mut draws);
+                    self.present_configstring_model(entity, game, time, ghoul2, &mut draws);
                 }
                 EntityPresentationKind::Body => {
                     // ET_BODY is a Ghoul2 corpse copied from a client entity.
@@ -347,7 +365,7 @@ impl EntityPresenter {
                     summary.other += 1;
                     let key = format!("kind:{kind:?}");
                     if self.logged_unsupported.insert(key) {
-                        println!("ENTITY DISPATCH TODO: {kind:?}");
+                        devprintln!(2, "ENTITY DISPATCH TODO: {kind:?}");
                     }
                 }
             }
@@ -376,10 +394,129 @@ impl EntityPresenter {
         (draws, inline_models, summary)
     }
 
+    /// TaystJK/OpenJK `CG_DrawPlayerSphere` for `EF_INVULNERABLE`.
+    ///
+    /// This is intentionally driven only by the network `eFlags` bit. Do not
+    /// infer a spawn timer locally: server mods control exactly when protection
+    /// begins and ends. TaystJK registers `models/weaphits/testboom.md3`, moves
+    /// it 9 units above the player origin, faces the half-shield toward
+    /// `cg.refdef.vieworg`, and overrides its material with
+    /// `powerups/invulnerabilityshell`.
+    pub fn present_invulnerability_bubbles(
+        &mut self,
+        entities: &[PresentedEntity],
+        followed: Option<&PresentedEntity>,
+        game: &ClientGameState,
+        view_origin: [f32; 3],
+    ) -> Vec<DynamicModelSurface> {
+        let intermission = game.rendering_intermission();
+        let mut seen = HashSet::new();
+        let mut draws = Vec::new();
+        for entity in followed.into_iter().chain(entities.iter()) {
+            if entity.entity_type != super::ET_PLAYER
+                || suppressed_during_intermission(intermission, entity)
+                || !seen.insert(entity.number)
+            {
+                continue;
+            }
+            let flags = entity.state.field_i32("eFlags").unwrap_or(0);
+            if flags & EF_INVULNERABLE == 0 || flags & EF_DEAD != 0 {
+                continue;
+            }
+            let Some((origin, axis)) = invulnerability_sphere_transform(entity.origin, view_origin) else {
+                continue;
+            };
+            match self.present_custom_md3_stages(
+                entity.number,
+                INVULNERABILITY_MODEL,
+                origin,
+                axis,
+                [1.0; 4],
+                INVULNERABILITY_SHADER,
+            ) {
+                Ok(mut sphere) => draws.append(&mut sphere),
+                Err(error) => {
+                    let key = format!("invulnerability:{}", entity.number);
+                    if self.logged_unsupported.insert(key) {
+                        rverbose!(1, "INVULNERABILITY BUBBLE: {error}");
+                    }
+                }
+            }
+        }
+        draws
+    }
+
+    /// A `customShader` can be multi-stage. The ordinary entity override path
+    /// predates that requirement and takes its first stage; the player sphere
+    /// uses this complete variant so its authored shell material is not reduced
+    /// to an arbitrary single pass.
+    fn present_custom_md3_stages(
+        &mut self,
+        entity_num: u16,
+        qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        shader_name: &str,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let asset = self.load_md3(qpath)?;
+        let materials = self.fx_material_stages(shader_name);
+        let mut draws = Vec::with_capacity(asset.surfaces.len() * materials.len().max(1));
+        for surface_asset in &asset.surfaces {
+            let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else { continue };
+            let Some(source_vertices) = surface.frame_vertices(0) else { continue };
+            if source_vertices.is_empty() || surface.indices.is_empty() {
+                continue;
+            }
+            let mut indices = surface.indices.clone();
+            for triangle in indices.chunks_exact_mut(3) {
+                triangle.swap(1, 2);
+            }
+            let indices = Arc::new(indices);
+            for material in &materials {
+                let color = [
+                    if material.rgb_vertex { rgba[0] } else { material.rgb_const[0] },
+                    if material.rgb_vertex { rgba[1] } else { material.rgb_const[1] },
+                    if material.rgb_vertex { rgba[2] } else { material.rgb_const[2] },
+                    if material.alpha_vertex { rgba[3] } else { material.alpha_const },
+                ];
+                let vertices = source_vertices
+                    .iter()
+                    .map(|vertex| DynamicModelVertex {
+                        position: transform_model_point(vertex.position, axis, origin, 1.0),
+                        normal: transform_model_normal(vertex.normal, axis),
+                        uv: vertex.uv,
+                        color,
+                        depth_hack: 0.0,
+                    })
+                    .collect::<Vec<_>>();
+                draws.push(DynamicModelSurface {
+                    entity_num,
+                    wireframe_class: DynamicWireframeClass::Entity,
+                    raster_visible: true,
+                    vertices: Arc::new(vertices),
+                    indices: Arc::clone(&indices),
+                    lighting_origin: Some(origin),
+                    // A translucent presentation shell must never become a
+                    // physical RT shadow caster.
+                    rt_rigid: None,
+                    rt_skinned_key: None,
+                    ghoul2_gpu: None,
+                    fx_gpu_sprites: None,
+                    texture: material.texture.clone(),
+                    alpha_mode: blend_for_alpha(material.blend.custom_shader_alpha_mode(), color[3]),
+                });
+            }
+        }
+        Ok(draws)
+    }
+
     fn present_configstring_model(
         &mut self,
         entity: &PresentedEntity,
         game: &ClientGameState,
+        time: i32,
+        ghoul2: &mut PlayerPresenter,
         draws: &mut Vec<DynamicModelSurface>,
     ) {
         // Holocrons are gameplay pickups that share this path, not map props.
@@ -391,16 +528,39 @@ impl EntityPresenter {
         if entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0 {
             return;
         }
-        if entity.state.field_i32("modelGhoul2").unwrap_or(0) != 0 {
+        let model_ghoul2 = entity.state.field_i32("modelGhoul2").unwrap_or(0);
+        if model_ghoul2 != 0 {
+            // OpenJK uses 127 as the "Ghoul2 requested but not initialized"
+            // sentinel and CG_General returns without drawing it.
+            if model_ghoul2 == 127 {
+                return;
+            }
             // OpenJK does not present an in-flight player saber through the
             // generic ET_GENERAL model path. CG_Player owns saberEntityNum and
             // manually submits the saber Ghoul2 instance/blades. The Rust
-            // PlayerPresenter mirrors that path, so do not also report it as
-            // an unsupported generic Ghoul2 model here.
-            if entity.state.field_i32("weapon").unwrap_or(0) == WP_SABER {
+            // PlayerPresenter mirrors that path, so do not also present saber
+            // or detached Ghoul2 model-part entities as generic props.
+            if matches!(entity.state.field_i32("weapon").unwrap_or(0), WP_SABER | G2_MODEL_PART) {
                 return;
             }
-            self.log_entity_once(entity, "Ghoul2 generic model not implemented yet");
+
+            let model_index = entity.state.field_i32("modelindex").unwrap_or(0);
+            let Some(qpath) = game.model_qpath(model_index) else {
+                self.log_entity_once(entity, &format!("unresolved Ghoul2 CS_MODELS index {model_index}"));
+                return;
+            };
+            match ghoul2.present_static_glm(
+                entity.number,
+                &qpath,
+                entity.origin,
+                angles_to_axis(entity.angles),
+                entity_color(entity),
+                None,
+                time,
+            ) {
+                Ok(mut model_draws) => draws.append(&mut model_draws),
+                Err(error) => self.log_entity_once(entity, &format!("Ghoul2 {qpath}: {error}")),
+            }
             return;
         }
         self.present_model_index(entity, game, entity.state.field_i32("modelindex").unwrap_or(0), draws);
@@ -570,6 +730,7 @@ impl EntityPresenter {
                     normal: transform_model_normal(vertex.normal, submission.axis),
                     uv: vertex.uv,
                     color: submission.rgba,
+                    depth_hack: 0.0,
                 })
                 .collect::<Vec<_>>();
             let mut indices = surface.indices.clone();
@@ -660,6 +821,7 @@ impl EntityPresenter {
                     normal: transform_model_normal(vertex.normal, axis),
                     uv: vertex.uv,
                     color,
+                    depth_hack: 0.0,
                 })
                 .collect::<Vec<_>>();
             let mut indices = surface.indices.clone();
@@ -702,6 +864,171 @@ impl EntityPresenter {
         Ok(draws)
     }
 
+    /// TaystJK/OpenJK `CG_AddViewWeapon` + first-person half of
+    /// `CG_AddPlayerWeapon`. The hand MD3 is a tag parent only; JKA submits the
+    /// weapon/barrel models, not the hand mesh itself. Coordinates remain in
+    /// native JKA space until the ordinary dynamic-model transform so this uses
+    /// the same model/material path as other MD3 entities.
+    pub fn present_view_weapon(
+        &mut self,
+        entity_num: u16,
+        weapon_num: i32,
+        mut view_origin: [f32; 3],
+        mut view_angles: [f32; 3],
+        velocity: [f32; 3],
+        bob_cycle: i32,
+        current_time: i32,
+        land_offset: f32,
+        hand_frame: usize,
+        hand_oldframe: usize,
+        hand_backlerp: f32,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        const WP_NONE: i32 = 0;
+        const WP_STUN_BATON: i32 = 1;
+        const WP_MELEE: i32 = 2;
+        const WP_SABER: i32 = 3;
+        const WP_DISRUPTOR: i32 = 6;
+        const WP_REPEATER: i32 = 8;
+        const WP_FLECHETTE: i32 = 10;
+        const WP_ROCKET_LAUNCHER: i32 = 11;
+        const WP_CONCUSSION: i32 = 15;
+        const WP_EMPLACED_GUN: i32 = 17;
+
+        // Saber/melee are drawn by the local Ghoul2 body in first person.
+        // CG_AddPlayerWeapon explicitly returns for the emplaced gun.
+        if matches!(weapon_num, WP_NONE | WP_MELEE | WP_SABER | WP_EMPLACED_GUN) {
+            return Ok(Vec::new());
+        }
+
+        // CG_RegisterWeapon walks bg_itemlist to find the IT_WEAPON entry with
+        // this giTag. There is one authoritative view_model in the pinned table;
+        // never synthesize a weapon filename from the world model.
+        let item = (1..jka_movement::bg_item_count())
+            .filter_map(jka_movement::bg_item)
+            .find(|item| item.item_type == IT_WEAPON && item.tag == weapon_num)
+            .ok_or_else(|| format!("weapon {weapon_num} has no IT_WEAPON bg_itemlist entry"))?;
+        if item.view_model.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hand_qpath = replace_md3_suffix(&item.view_model, "_hand.md3");
+        let hand = self.load_md3(&hand_qpath)?;
+        if hand.model.tags.is_empty() {
+            return Err(format!("{hand_qpath}: view hand has no MD3 tags"));
+        }
+
+        // CG_CalculateWeaponPosition. cg.bobcycle is just the high bit of
+        // ps->bobCycle after CG_OffsetFirstPersonView; cg.bobfracsin comes from
+        // the low 7 bits. TaystJK's cg_weaponBob/cg_fallingBob defaults retain
+        // the stock behavior, which is the path ported here.
+        let xyspeed = (velocity[0] * velocity[0] + velocity[1] * velocity[1])
+            .sqrt()
+            .min(270.0);
+        let bob_phase = (bob_cycle & 127) as f32 / 127.0 * std::f32::consts::PI;
+        let bobfracsin = bob_phase.sin().abs();
+        let scale = if ((bob_cycle & 128) >> 7) != 0 { -xyspeed } else { xyspeed };
+        view_angles[2] += scale * bobfracsin * 0.005;
+        view_angles[1] += scale * bobfracsin * 0.01;
+        view_angles[0] += xyspeed * bobfracsin * 0.005;
+        view_origin[2] += land_offset;
+        let idle_scale = xyspeed + 40.0;
+        let idle = (current_time as f32 * 0.001).sin();
+        view_angles[2] += idle_scale * idle * 0.01;
+        view_angles[1] += idle_scale * idle * 0.01;
+        view_angles[0] += idle_scale * idle * 0.01;
+
+        let hand_axis = angles_to_axis(view_angles);
+        let tag_weapon = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, "tag_weapon")
+            .ok_or_else(|| format!("{hand_qpath}: missing tag_weapon"))?;
+        let (gun_origin, gun_axis) = position_on_md3_tag(view_origin, hand_axis, tag_weapon);
+
+        let mut draws = self.present_view_md3(entity_num, &item.view_model, gun_origin, gun_axis)?;
+
+        // CG_AddPlayerWeapon bolts these barrels directly to the hand model,
+        // not to the gun model. Keep that slightly surprising original rule.
+        if weapon_num == WP_STUN_BATON {
+            const BATON_BARRELS: [(&str, &str); 3] = [
+                ("models/weapons2/stun_baton/baton_barrel.md3", "tag_barrel"),
+                ("models/weapons2/stun_baton/baton_barrel2.md3", "tag_barrel2"),
+                ("models/weapons2/stun_baton/baton_barrel3.md3", "tag_barrel3"),
+            ];
+            for (qpath, tag_name) in BATON_BARRELS {
+                if let Some(tag) = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, tag_name) {
+                    let (origin, axis) = position_on_md3_tag(view_origin, hand_axis, tag);
+                    draws.extend(self.present_view_md3(entity_num, qpath, origin, axis)?);
+                }
+            }
+        } else if matches!(
+            weapon_num,
+            WP_DISRUPTOR | WP_REPEATER | WP_FLECHETTE | WP_ROCKET_LAUNCHER | WP_CONCUSSION
+        ) {
+            let barrel_qpath = replace_md3_suffix(&item.view_model, "_barrel.md3");
+            if let Some(tag) = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, "tag_barrel") {
+                let (origin, axis) = position_on_md3_tag(view_origin, hand_axis, tag);
+                // CG_RegisterWeapon treats a missing optional barrel as handle 0;
+                // do the same instead of making the whole view weapon disappear.
+                if let Ok(mut barrel) = self.present_view_md3(entity_num, &barrel_qpath, origin, axis) {
+                    draws.append(&mut barrel);
+                }
+            }
+        }
+
+        Ok(draws)
+    }
+
+    /// Submit an MD3 with OpenJK `RF_DEPTHHACK | RF_FIRST_PERSON` geometry
+    /// semantics. RF_FIRST_PERSON mainly controls portal/mirror inclusion in
+    /// the legacy renderer; Dinurdo's main scene has no separate mirror entity
+    /// list, while the depth-range remap is preserved per vertex.
+    fn present_view_md3(
+        &mut self,
+        entity_num: u16,
+        qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let asset = self.load_md3(qpath)?;
+        let mut draws = Vec::with_capacity(asset.surfaces.len());
+        for surface_asset in &asset.surfaces {
+            let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else { continue };
+            let Some(vertices) = surface.frame_vertices(0) else { continue };
+            if vertices.is_empty() || surface.indices.is_empty() {
+                continue;
+            }
+            let vertices = vertices
+                .iter()
+                .map(|vertex| DynamicModelVertex {
+                    position: transform_model_point(vertex.position, axis, origin, 1.0),
+                    normal: transform_model_normal(vertex.normal, axis),
+                    uv: vertex.uv,
+                    color: [1.0; 4],
+                    depth_hack: 1.0,
+                })
+                .collect::<Vec<_>>();
+            let mut indices = surface.indices.clone();
+            for triangle in indices.chunks_exact_mut(3) {
+                triangle.swap(1, 2);
+            }
+            draws.push(DynamicModelSurface {
+                entity_num,
+                wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
+                vertices: Arc::new(vertices),
+                indices: Arc::new(indices),
+                lighting_origin: Some(origin),
+                // View weapons are camera-space presentation and must never be
+                // inserted into the world RT acceleration structure.
+                rt_rigid: None,
+                rt_skinned_key: None,
+                ghoul2_gpu: None,
+                fx_gpu_sprites: None,
+                texture: surface_asset.texture.clone(),
+                alpha_mode: surface_asset.alpha_mode,
+            });
+        }
+        Ok(draws)
+    }
+
     /// Developer Asset Viewer path: submit an arbitrary MD3 through the same
     /// material/texture registration used by live CGame entities, without
     /// fabricating a protocol entity just to inspect a model.
@@ -734,6 +1061,7 @@ impl EntityPresenter {
                     normal: transform_model_normal(vertex.normal, axis),
                     uv: vertex.uv,
                     color: rgba,
+                    depth_hack: 0.0,
                 })
                 .collect::<Vec<_>>();
             let mut indices = surface.indices.clone();
@@ -800,7 +1128,8 @@ impl EntityPresenter {
                     alpha_mode,
                 });
             }
-            println!(
+            devprintln!(
+                2,
                 "ENTITY MD3: {} frames={} tags/frame={} surfaces={}",
                 key,
                 model.frames.len(),
@@ -915,7 +1244,8 @@ impl EntityPresenter {
                 // path is genuinely unresolved here: keep the engine-wide
                 // magenta/checker convention instead of silently inventing a
                 // material.
-                println!(
+                rverbose!(
+                    1,
                     "FX MATERIAL WARNING: {shader_name}: shader has no renderable image stage; using shared missing texture placeholder"
                 );
                 materials.push(FxMaterial {
@@ -954,9 +1284,10 @@ impl EntityPresenter {
                             });
                         } else {
                             if let Some(warning) = self.textures.warnings.last() {
-                                println!("FX TEXTURE WARNING: {warning}");
+                                rverbose!(1, "FX TEXTURE WARNING: {warning}");
                             }
-                            println!(
+                            rverbose!(
+                                1,
                                 "FX MATERIAL WARNING: {shader_name}: no shader definition or implicit image; using shared missing texture placeholder"
                             );
                             materials.push(FxMaterial {
@@ -1015,7 +1346,7 @@ impl EntityPresenter {
             Some(texture) => texture,
             None => {
                 if let Some(warning) = self.textures.warnings.last() {
-                    println!("{log_prefix} TEXTURE WARNING: {warning}");
+                    rverbose!(1, "{log_prefix} TEXTURE WARNING: {warning}");
                 }
                 Arc::clone(&self.missing_texture)
             }
@@ -1049,7 +1380,8 @@ impl EntityPresenter {
     fn log_entity_once(&mut self, entity: &PresentedEntity, reason: &str) {
         let key = format!("{}:{}:{reason}", entity.number, entity.entity_type);
         if self.logged_unsupported.insert(key) {
-            println!(
+            devprintln!(
+                2,
                 "ENTITY PRESENTATION TODO: entity={} type={} modelindex={} {reason}",
                 entity.number,
                 entity.entity_type,
@@ -1075,6 +1407,81 @@ fn entity_color(entity: &PresentedEntity) -> [f32; 4] {
     rgba.map(|channel| channel.clamp(0, 255) as f32 / 255.0)
 }
 
+fn replace_md3_suffix(qpath: &str, suffix: &str) -> String {
+    let normalized = qpath.replace('\\', "/");
+    let stem = normalized
+        .strip_suffix(".md3")
+        .or_else(|| normalized.strip_suffix(".MD3"))
+        .unwrap_or(&normalized);
+    format!("{stem}{suffix}")
+}
+
+/// Renderer `R_LerpTag`: linearly interpolate the same named tag between the
+/// two MD3 frames, normalize the three basis rows, and return the lerped tag.
+fn lerp_md3_tag(
+    model: &Md3Model,
+    oldframe: usize,
+    frame: usize,
+    front_lerp: f32,
+    name: &str,
+) -> Option<md3::Tag> {
+    let oldframe = oldframe.min(model.tags.len().saturating_sub(1));
+    let frame = frame.min(model.tags.len().saturating_sub(1));
+    let old = model.tags.get(oldframe)?.iter().find(|tag| tag.name.eq_ignore_ascii_case(name))?;
+    let new = model.tags.get(frame)?.iter().find(|tag| tag.name.eq_ignore_ascii_case(name))?;
+    let front = front_lerp.clamp(0.0, 1.0);
+    let back = 1.0 - front;
+    let mut axis = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            axis[row][col] = old.axis[row][col] * back + new.axis[row][col] * front;
+        }
+        normalize3_in_place(&mut axis[row]);
+    }
+    Some(md3::Tag {
+        name: name.to_owned(),
+        origin: [
+            old.origin[0] * back + new.origin[0] * front,
+            old.origin[1] * back + new.origin[1] * front,
+            old.origin[2] * back + new.origin[2] * front,
+        ],
+        axis,
+    })
+}
+
+fn normalize3_in_place(v: &mut [f32; 3]) {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 0.0 {
+        v[0] /= len;
+        v[1] /= len;
+        v[2] /= len;
+    }
+}
+
+/// `CG_PositionEntityOnTag`. Axis arrays use the same basis-row convention as
+/// the MD3 loader and `angles_to_axis`.
+fn position_on_md3_tag(
+    parent_origin: [f32; 3],
+    parent_axis: [[f32; 3]; 3],
+    tag: md3::Tag,
+) -> ([f32; 3], [[f32; 3]; 3]) {
+    let mut origin = parent_origin;
+    for basis in 0..3 {
+        for component in 0..3 {
+            origin[component] += tag.origin[basis] * parent_axis[basis][component];
+        }
+    }
+    let mut axis = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            axis[row][col] = tag.axis[row][0] * parent_axis[0][col]
+                + tag.axis[row][1] * parent_axis[1][col]
+                + tag.axis[row][2] * parent_axis[2][col];
+        }
+    }
+    (origin, axis)
+}
+
 fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
@@ -1091,6 +1498,32 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
         cr * cp,
     ];
     [forward, [-right[0], -right[1], -right[2]], up]
+}
+
+/// Exact transform portion of TaystJK `CG_DrawPlayerSphere`: the model origin
+/// is raised 9 units, then the half-shield is rotated to face the current
+/// refdef view origin. `testboom.md3` is already authored at the correct size,
+/// so the stock invulnerability path uses scale 1.0.
+fn invulnerability_sphere_transform(
+    player_origin: [f32; 3],
+    view_origin: [f32; 3],
+) -> Option<([f32; 3], [[f32; 3]; 3])> {
+    let origin = [player_origin[0], player_origin[1], player_origin[2] + 9.0];
+    let to_sphere = [
+        origin[0] - view_origin[0],
+        origin[1] - view_origin[1],
+        origin[2] - view_origin[2],
+    ];
+    let length_sq = to_sphere[0] * to_sphere[0]
+        + to_sphere[1] * to_sphere[1]
+        + to_sphere[2] * to_sphere[2];
+    if length_sq <= 0.01 {
+        return None;
+    }
+    let mut angles = openjk_vectoangles(to_sphere);
+    angles[2] += 180.0; // ROLL
+    angles[0] += 180.0; // PITCH
+    Some((origin, angles_to_axis(angles)))
 }
 
 fn transform_model_point(
@@ -1126,6 +1559,22 @@ fn transform_model_normal(normal: [f32; 3], axis: [[f32; 3]; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invulnerability_sphere_matches_taystjk_origin_and_faces_view() {
+        let player = [100.0, 200.0, 32.0];
+        let view = [20.0, 200.0, 41.0];
+        let (origin, axis) = invulnerability_sphere_transform(player, view).expect("sphere");
+        assert_eq!(origin, [100.0, 200.0, 41.0]);
+        // CG_DrawPlayerSphere starts from the vector sphere-view and applies
+        // its 180-degree pitch/roll correction. At minimum keep a normalized
+        // refEntity axis and the exact +9 origin contract locked down.
+        for basis in axis {
+            let len = (basis[0] * basis[0] + basis[1] * basis[1] + basis[2] * basis[2]).sqrt();
+            assert!((len - 1.0).abs() < 1.0e-4, "{basis:?}");
+        }
+        assert!(invulnerability_sphere_transform(origin, origin).is_none());
+    }
 
     /// Developer profile of what a demo asks CGame to present. Prints the
     /// entity-type histogram, per-type resource keys and event counts.

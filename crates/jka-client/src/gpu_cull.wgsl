@@ -137,7 +137,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let record = records[index];
     var reason = 0u;
     var visible = true;
-    if (outside_frustum(record)) {
+    // Sky draw records are a background domain. Their authored BSP brush bounds
+    // can extend beyond the distanceCull-limited projection far plane, but the
+    // sky vertex path renders them at far depth. Match the CPU submission path
+    // by exempting sky from geometric frustum rejection; otherwise GPU-driven
+    // culling can zero instance_count before the sky vertex shader ever runs.
+    if (record.draw.z == 0u && outside_frustum(record)) {
         visible = false;
         reason = 1u;
     } else if (occluded_by_hiz(record)) {

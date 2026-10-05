@@ -18,7 +18,7 @@ int jka_player_set_entities(void *player, const jka_prediction_entity *entities,
 }
 int jka_player_clip_entity(const void *player, const jka_prediction_entity *entity) {
     const mod_player *p = player;
-    return p->settings.server_mod == 1 ? japro_clip_entity(p->japro, entity) : 1;
+    return p->settings.backend == 1 ? japro_clip_entity(p->japro, entity) : 1;
 }
 extern void stock_jka_player_jump_level(void *player, int level);
 extern void japro_jka_player_jump_level(void *player, int level);
@@ -62,7 +62,7 @@ extern int stock_jka_load_animations(const unsigned char *, int);
 extern int japro_jka_load_animations(const unsigned char *, int);
 extern const char *stock_jka_movement_error(void);
 extern const char *japro_jka_movement_error(void);
-static int is_japro(const mod_player *p) { return p->settings.server_mod == 1; }
+static int uses_tayst_backend(const mod_player *p) { return p->settings.backend == 1; }
 int jka_load_animations(const unsigned char *data, int length) {
     last_backend = 0;
     if (!stock_jka_load_animations(data, length)) return 0;
@@ -101,14 +101,15 @@ void *jka_player_clone(const void *player) {
  * view-angle updates. Changing backend transfers only the wire contract. */
 int jka_player_configure(void *player, const jka_predict_settings *settings) {
     mod_player *p = player;
-    if (settings->server_mod != 0 && settings->server_mod != 1) return 0;
+    if (settings->backend != 0 && settings->backend != 1) return 0;
+    if (settings->server_mod < 0 || settings->server_mod > 2) return 0;
     if (settings->pmove_fixed && (settings->pmove_msec < 1 || settings->pmove_msec > 66)) return 0;
-    if (is_japro(p) != (settings->server_mod == 1)) {
+    if (uses_tayst_backend(p) != (settings->backend == 1)) {
         int count = jka_ps_field_count(), stats[16], persistant[16], ammo[16], powerups[16];
         int *fields = malloc(count * sizeof(int));
         int ok;
         if (!fields) return 0;
-        if (is_japro(p)) {
+        if (uses_tayst_backend(p)) {
             ok = japro_jka_player_get_network(p->japro, fields, count, stats, persistant, ammo, powerups);
             if (ok) ok = stock_jka_player_set_network(p->base, fields, count, stats, persistant, ammo, powerups);
         } else {
@@ -119,13 +120,13 @@ int jka_player_configure(void *player, const jka_predict_settings *settings) {
         if (!ok) return 0;
     }
     p->settings = *settings;
-    if (is_japro(p)) japro_configure(settings);
+    if (uses_tayst_backend(p)) japro_configure(settings);
     return 1;
 }
 
 void jka_player_jump_level(void *player, int level) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_jump_level(p->japro, level);
         return;
     }
@@ -134,7 +135,7 @@ void jka_player_jump_level(void *player, int level) {
 
 void jka_player_knockback(void *player, const float *velocity, int duration) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_knockback(p->japro, velocity, duration);
         return;
     }
@@ -143,7 +144,7 @@ void jka_player_knockback(void *player, const float *velocity, int duration) {
 
 void jka_player_set_noclip(void *player, int enabled) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_set_noclip(p->japro, enabled);
         return;
     }
@@ -152,7 +153,7 @@ void jka_player_set_noclip(void *player, int enabled) {
 
 void jka_player_teleport(void *player, const float *origin, const float *angles, int speed) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_teleport(p->japro, origin, angles, speed);
         return;
     }
@@ -161,7 +162,7 @@ void jka_player_teleport(void *player, const float *origin, const float *angles,
 
 void jka_player_give_all(void *player) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_give_all(p->japro);
         return;
     }
@@ -185,7 +186,7 @@ int jka_player_set_foot_bolts(void *player, const float *left, const float *righ
 
 void jka_player_offline_force_tick(void *player, int time, int requested_power) {
     mod_player *p = player;
-    last_backend = is_japro(p);
+    last_backend = uses_tayst_backend(p);
     if (last_backend) {
         japro_configure(&p->settings);
         japro_jka_player_offline_force_tick(p->japro, time, requested_power);
@@ -196,7 +197,7 @@ void jka_player_offline_force_tick(void *player, int time, int requested_power) 
 
 int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn trace, jka_contents_fn contents, void *context) {
     mod_player *p = player;
-    last_backend = is_japro(p);
+    last_backend = uses_tayst_backend(p);
     if (last_backend) {
         japro_configure(&p->settings);
         return japro_jka_player_step(p->japro, input, tick, trace, contents, context);
@@ -206,7 +207,7 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
 
 void jka_player_view(const void *player, jka_view *view) {
     const mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_view(p->japro, view);
         return;
     }
@@ -215,7 +216,7 @@ void jka_player_view(const void *player, jka_view *view) {
 
 void jka_player_entity_view(const void *player, jka_entity_view *view) {
     const mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         japro_jka_player_entity_view(p->japro, view);
         return;
     }
@@ -224,7 +225,7 @@ void jka_player_entity_view(const void *player, jka_entity_view *view) {
 
 int jka_player_set_network(void *player, const int32_t *fields, int count, const int32_t *stats, const int32_t *persistant, const int32_t *ammo, const int32_t *powerups) {
     mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         return japro_jka_player_set_network(p->japro, fields, count, stats, persistant, ammo, powerups);
     }
     return stock_jka_player_set_network(p->base, fields, count, stats, persistant, ammo, powerups);
@@ -232,7 +233,7 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
 
 int jka_player_get_network(const void *player, int32_t *fields, int count, int32_t *stats, int32_t *persistant, int32_t *ammo, int32_t *powerups) {
     const mod_player *p = player;
-    if (is_japro(p)) {
+    if (uses_tayst_backend(p)) {
         return japro_jka_player_get_network(p->japro, fields, count, stats, persistant, ammo, powerups);
     }
     return stock_jka_player_get_network(p->base, fields, count, stats, persistant, ammo, powerups);
@@ -240,7 +241,7 @@ int jka_player_get_network(const void *player, int32_t *fields, int count, int32
 
 void jka_player_update_view_angles(void *player, const jka_cmd *input) {
     mod_player *p = player;
-    last_backend = is_japro(p);
+    last_backend = uses_tayst_backend(p);
     if (last_backend) {
         japro_configure(&p->settings);
         japro_jka_player_update_view_angles(p->japro, input);
@@ -252,7 +253,7 @@ void jka_player_update_view_angles(void *player, const jka_cmd *input) {
 int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_settings *settings, jka_trace_fn trace, jka_contents_fn contents, void *context) {
     mod_player *p = player;
     if (!jka_player_configure(player, settings)) return 0;
-    last_backend = is_japro(p);
+    last_backend = uses_tayst_backend(p);
     if (last_backend) {
         japro_configure(&p->settings);
         return japro_jka_player_predict(p->japro, input, settings, trace, contents, context);

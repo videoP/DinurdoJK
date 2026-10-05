@@ -31,6 +31,7 @@ struct VertexIn {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) depth_hack: f32,
 };
 
 struct VertexOut {
@@ -45,6 +46,12 @@ struct VertexOut {
 fn vs_main(input: VertexIn) -> VertexOut {
     var output: VertexOut;
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    // OpenJK RF_DEPTHHACK uses glDepthRange(0, 0.3) for view weapons.
+    // The main camera is reverse-Z (near=1, far=0), so the equivalent range
+    // is [0.7, 1.0]: d' = 0.7 + 0.3*d. Apply it in homogeneous clip space.
+    if (input.depth_hack > 0.5) {
+        output.clip_position.z = output.clip_position.z * 0.3 + output.clip_position.w * 0.7;
+    }
     output.uv = input.uv;
     output.normal = normalize(input.normal);
     output.color = input.color;

@@ -1,0 +1,29 @@
+diff a/crates/jka-client/src/app/frontend.rs b/crates/jka-client/src/app/frontend.rs	(rejected hunks)
+@@ -898,6 +898,7 @@ pub(super) struct DemoScoreEntry {
+     pub client: i32,
+     pub name: String,
+     pub score: i32,
++    pub deaths: Option<i32>,
+     pub ping: i32,
+     pub time: i32,
+     pub team: i32,
+@@ -1180,9 +1181,8 @@ fn parse_scoreboard(
+     let mut entries = Vec::with_capacity(count.min(body_fields / stride.max(1)));
+     for row in 0..count {
+         let base = 4 + row * stride;
+-        // The stock fields are always present; jaPRO's optional deaths field is
+-        // deliberately ignored because the current native scoreboard does not
+-        // render it yet.
++        // The stock fields are always present; JA+/jaPRO append deaths as the
++        // 15th field for clients advertising the compatible score extension.
+         if args.len() < base + 14 {
+             break;
+         }
+@@ -1191,6 +1191,7 @@ fn parse_scoreboard(
+             client,
+             name: scoreboard_client_name(configstrings, client),
+             score: atoi(&args[base + 1]),
++            deaths: (stride == 15).then(|| atoi(&args[base + 14])),
+             ping: atoi(&args[base + 2]),
+             time: atoi(&args[base + 3]),
+             team: client_team(configstrings, client),

@@ -113,7 +113,8 @@ pub fn load_cached_bake(
     };
     let validation = validate_serialized_bake(&cached)?;
     cached.runtime_validated = true;
-    println!(
+    devprintln!(
+        1,
         "{}: Steam Audio bake cache HIT: {} probes, {:.2} MiB serialized; runtime validation OK (reflections {:.2} MiB, pathing {:.2} MiB)",
         cache.map_name,
         validation.probe_count,
@@ -138,7 +139,8 @@ pub fn load_or_bake(
             return Ok(cached);
         }
         Ok(None) => {
-            println!(
+            devprintln!(
+                1,
                 "{}: Steam Audio bake cache MISS: preparing scene/probes",
                 cache.map_name
             );
@@ -187,13 +189,15 @@ pub fn load_or_bake(
     probe_batch.add_probe_array(&probe_array);
     probe_batch.commit();
 
-    println!(
+    devprintln!(
+        1,
         "{}: Steam Audio probes ready: {} floor probes @ {:.1} m spacing / {:.1} m height; {} bake thread(s)",
         cache.map_name, probe_count, PROBE_SPACING_M, PROBE_HEIGHT_M, threads,
     );
 
     let reverb_id = reverb_identifier();
-    println!(
+    devprintln!(
+        1,
         "{}: Steam Audio reflections bake starting ({} rays, {} diffuse samples, {} bounces)",
         cache.map_name, REFLECTION_RAYS, REFLECTION_DIFFUSE_SAMPLES, REFLECTION_BOUNCES
     );
@@ -227,7 +231,7 @@ pub fn load_or_bake(
         .map_err(|error| format!("Steam Audio reflections bake failed: {error}"))?;
 
     let path_id = path_identifier();
-    println!("{}: Steam Audio pathing bake starting", cache.map_name);
+    devprintln!(1, "{}: Steam Audio pathing bake starting", cache.map_name);
     PathBaker::<DefaultRayTracer>::new()
         .bake_with_progress_callback(
             &context,
@@ -278,7 +282,8 @@ pub fn load_or_bake(
     let validation = validate_serialized_bake(&data)
         .map_err(|error| format!("fresh Steam Audio bake failed runtime validation: {error}"))?;
     data.runtime_validated = true;
-    println!(
+    devprintln!(
+        1,
         "{}: Steam Audio runtime assets validated: scene + {} probes; reflections {:.2} MiB, pathing {:.2} MiB",
         cache.map_name,
         validation.probe_count,
@@ -293,7 +298,8 @@ pub fn load_or_bake(
     if let Some(progress) = &progress {
         progress(1.0);
     }
-    println!(
+    devprintln!(
+        1,
         "{}: Steam Audio bake complete in {:.1} s: reflections {:.2} MiB, pathing {:.2} MiB, serialized {:.2} MiB",
         cache.map_name,
         started.elapsed().as_secs_f64(),
@@ -384,7 +390,8 @@ fn bake_progress_callback(
         let bucket = (percent / 10).min(10);
         let previous = last_bucket.swap(bucket, Ordering::Relaxed);
         if previous != bucket {
-            println!(
+            devprintln!(
+                2,
                 "{map_name}: Steam Audio {stage} bake {}%",
                 u16::from(bucket) * 10
             );

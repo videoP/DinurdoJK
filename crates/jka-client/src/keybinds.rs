@@ -83,6 +83,14 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Other" },
 ];
 
+/// Bind overrides that only apply while spectating a live game. Normal `bind`
+/// entries remain the fallback, so existing configs keep working unchanged.
+pub const SPECTATOR_CONTROL_ACTIONS: &[ControlAction] = &[
+    ControlAction { label: "NEXT PLAYER", command: "follownext", group: "Spectate" },
+    ControlAction { label: "PREVIOUS PLAYER", command: "followprev", group: "Spectate" },
+    ControlAction { label: "CHANGE CAMERA TYPE", command: "toggle cg_specCamera", group: "Spectate" },
+];
+
 /// Commands whose current DinurdoJK implementation is specifically tied to
 /// TaystJK/jaPRO integration. They are intentionally not shown on the Base JKA
 /// Controls page; the MOD page exposes them only while a jaPRO server is active.
@@ -102,11 +110,21 @@ pub fn japro_selection(index: usize) -> usize {
     CONTROL_ACTIONS.len() + index
 }
 
+pub fn spectator_selection(index: usize) -> usize {
+    CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len() + index
+}
+
 pub fn control_action(selection: usize) -> Option<&'static ControlAction> {
     if let Some(action) = CONTROL_ACTIONS.get(selection) {
         return Some(action);
     }
-    JAPRO_CONTROL_ACTIONS.get(selection.saturating_sub(CONTROL_ACTIONS.len()))
+    let japro_index = selection.saturating_sub(CONTROL_ACTIONS.len());
+    if let Some(action) = JAPRO_CONTROL_ACTIONS.get(japro_index) {
+        return Some(action);
+    }
+    SPECTATOR_CONTROL_ACTIONS.get(
+        selection.saturating_sub(CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()),
+    )
 }
 
 pub fn is_japro_selection(selection: usize) -> bool {
@@ -114,15 +132,22 @@ pub fn is_japro_selection(selection: usize) -> bool {
         && selection < CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()
 }
 
+pub fn is_spectator_selection(selection: usize) -> bool {
+    selection >= CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()
+        && selection
+            < CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len() + SPECTATOR_CONTROL_ACTIONS.len()
+}
+
 
 #[derive(Debug, Clone)]
 pub struct Bindings {
     map: HashMap<BindKey, String>,
+    spectator_map: HashMap<BindKey, String>,
 }
 
 impl Default for Bindings {
     fn default() -> Self {
-        let mut bindings = Self { map: HashMap::new() };
+        let mut bindings = Self { map: HashMap::new(), spectator_map: HashMap::new() };
         // Mirrors the stock MP mpdefault.cfg, which jaPRO also runs on (it ships no
         // default binds of its own). Commands this client does not implement yet
         // (+strafe, +lookup/+lookdown, +left/+right, centerview, +mlook,
@@ -194,6 +219,9 @@ impl Default for Bindings {
         ] {
             bindings.set(key, command);
         }
+        // Sparse override: normal Mouse3 remains saberAttackCycle in gameplay,
+        // while spectators use it to cycle their presentation camera.
+        bindings.set_spectator(BindKey::Mouse(3), "toggle cg_specCamera");
         bindings
     }
 }
@@ -223,6 +251,20 @@ impl Bindings {
         self.map.get(&key).map(String::as_str)
     }
 
+    pub fn get_spectator(&self, key: BindKey) -> Option<&str> {
+        self.spectator_map.get(&key).map(String::as_str)
+    }
+
+    /// Spectator binds override normal binds one key at a time. Missing
+    /// spectator entries inherit the normal bind instead of becoming unbound.
+    pub fn get_resolved(&self, key: BindKey, spectating: bool) -> Option<&str> {
+        if spectating {
+            self.get_spectator(key).or_else(|| self.get(key))
+        } else {
+            self.get(key)
+        }
+    }
+
     pub fn set(&mut self, key: BindKey, command: impl Into<String>) {
         let command = command.into();
         if command.is_empty() {
@@ -240,6 +282,23 @@ impl Bindings {
         self.map.clear();
     }
 
+    pub fn set_spectator(&mut self, key: BindKey, command: impl Into<String>) {
+        let command = command.into();
+        if command.is_empty() {
+            self.spectator_map.remove(&key);
+        } else {
+            self.spectator_map.insert(key, command);
+        }
+    }
+
+    pub fn unbind_spectator(&mut self, key: BindKey) -> bool {
+        self.spectator_map.remove(&key).is_some()
+    }
+
+    pub fn clear_spectator(&mut self) {
+        self.spectator_map.clear();
+    }
+
     pub fn unbind_command(&mut self, command: &str) -> usize {
         let mut changed = 0;
         for value in self.map.values_mut() {
@@ -254,6 +313,23 @@ impl Bindings {
             changed += 1;
         }
         self.map.retain(|_, value| !value.is_empty());
+        changed
+    }
+
+    pub fn unbind_spectator_command(&mut self, command: &str) -> usize {
+        let mut changed = 0;
+        for value in self.spectator_map.values_mut() {
+            if !binding_contains_command(value, command) {
+                continue;
+            }
+            let kept: Vec<_> = split_binding_commands(value)
+                .filter(|part| !part.trim().eq_ignore_ascii_case(command.trim()))
+                .map(str::to_owned)
+                .collect();
+            *value = kept.join("; ");
+            changed += 1;
+        }
+        self.spectator_map.retain(|_, value| !value.is_empty());
         changed
     }
 
@@ -274,8 +350,33 @@ impl Bindings {
         }
     }
 
+    pub fn spectator_keys_for_command(&self, command: &str) -> Vec<BindKey> {
+        let mut keys: Vec<_> = self.spectator_map.iter()
+            .filter_map(|(key, value)| binding_contains_command(value, command).then_some(*key))
+            .collect();
+        keys.sort_by_key(|key| key_name(*key));
+        keys
+    }
+
+    pub fn display_for_spectator_command(&self, command: &str) -> String {
+        let keys = self.spectator_keys_for_command(command);
+        if keys.is_empty() {
+            "INHERIT NORMAL".into()
+        } else {
+            keys.into_iter().map(key_name).collect::<Vec<_>>().join(" OR ")
+        }
+    }
+
     pub fn sorted(&self) -> Vec<(BindKey, String)> {
         let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value.clone())).collect();
+        entries.sort_by_key(|(key, _)| key_name(*key));
+        entries
+    }
+
+    pub fn spectator_sorted(&self) -> Vec<(BindKey, String)> {
+        let mut entries: Vec<_> = self.spectator_map.iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
         entries.sort_by_key(|(key, _)| key_name(*key));
         entries
     }
@@ -284,6 +385,14 @@ impl Bindings {
         out.push_str("\n// Key bindings. OpenJK-compatible bind syntax.\nunbindall\n");
         for (key, command) in self.sorted() {
             out.push_str("bind ");
+            out.push_str(&key_name(key));
+            out.push_str(" \"");
+            out.push_str(&escape_cfg(&command));
+            out.push_str("\"\n");
+        }
+        out.push_str("\n// Spectator-only bind overrides. Missing keys inherit normal binds.\nunbindspecall\n");
+        for (key, command) in self.spectator_sorted() {
+            out.push_str("bindspec ");
             out.push_str(&key_name(key));
             out.push_str(" \"");
             out.push_str(&escape_cfg(&command));
@@ -305,9 +414,21 @@ fn apply_cfg(bindings: &mut Bindings, text: &str) -> bool {
             saw_bindings = true;
             continue;
         }
+        if words[0].eq_ignore_ascii_case("unbindspecall") {
+            bindings.clear_spectator();
+            saw_bindings = true;
+            continue;
+        }
         if words[0].eq_ignore_ascii_case("bind") && words.len() >= 3 {
             if let Some(key) = parse_key(&words[1]) {
                 bindings.set(key, words[2..].join(" "));
+                saw_bindings = true;
+            }
+            continue;
+        }
+        if words[0].eq_ignore_ascii_case("bindspec") && words.len() >= 3 {
+            if let Some(key) = parse_key(&words[1]) {
+                bindings.set_spectator(key, words[2..].join(" "));
                 saw_bindings = true;
             }
         }
@@ -509,6 +630,25 @@ mod tests {
     }
 
     #[test]
+    fn spectator_bindings_override_and_fall_back() {
+        let bindings = Bindings::default();
+        assert_eq!(bindings.get(BindKey::Mouse(3)), Some("saberAttackCycle"));
+        assert_eq!(bindings.get_spectator(BindKey::Mouse(3)), Some("toggle cg_specCamera"));
+        assert_eq!(bindings.get_resolved(BindKey::Mouse(3), false), Some("saberAttackCycle"));
+        assert_eq!(bindings.get_resolved(BindKey::Mouse(3), true), Some("toggle cg_specCamera"));
+        assert_eq!(bindings.get_resolved(BindKey::Keyboard(KeyCode::KeyY), true), Some("messagemode"));
+    }
+
+    #[test]
+    fn spectator_cfg_round_trip_syntax_is_distinct() {
+        let bindings = Bindings::default();
+        let mut text = String::new();
+        bindings.write_cfg(&mut text);
+        assert!(text.contains("unbindspecall"));
+        assert!(text.contains("bindspec MOUSE3 \"toggle cg_specCamera\""));
+    }
+
+    #[test]
     fn parameterized_controls_match_exact_binding_command() {
         assert!(binding_contains_command("weapon 1", "weapon 1"));
         assert!(!binding_contains_command("weapon 13", "weapon 1"));
@@ -516,9 +656,15 @@ mod tests {
     }
 
     #[test]
-    fn japro_controls_have_disjoint_selection_range() {
-        let selection = japro_selection(0);
-        assert!(is_japro_selection(selection));
-        assert_eq!(control_action(selection).map(|action| action.command), Some("voicechat"));
+    fn contextual_controls_have_disjoint_selection_ranges() {
+        let japro = japro_selection(0);
+        assert!(is_japro_selection(japro));
+        assert!(!is_spectator_selection(japro));
+        assert_eq!(control_action(japro).map(|action| action.command), Some("+button12"));
+
+        let spectator = spectator_selection(0);
+        assert!(is_spectator_selection(spectator));
+        assert!(!is_japro_selection(spectator));
+        assert_eq!(control_action(spectator).map(|action| action.command), Some("follownext"));
     }
 }

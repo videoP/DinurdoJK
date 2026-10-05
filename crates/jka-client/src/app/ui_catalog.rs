@@ -9,7 +9,10 @@
 use super::frontend::{
     self, AssetEntry, ProfileModelEntry, ProfileSaberEntry, SoloMapEntry,
 };
-use crate::thread_activity::{self, Task, ThreadSlot};
+use crate::{
+    chat_log::{BrowserDetail as ChatLogDetail, BrowserIndexEntry as ChatLogIndexEntry},
+    thread_activity::{self, Task, ThreadSlot},
+};
 use jka_assets::pk3::AssetSearchPath;
 use std::{
     collections::HashSet,
@@ -27,6 +30,8 @@ pub(super) struct DecodedImage {
 
 pub(super) enum CatalogRequest {
     AssetViewer,
+    ChatLogs,
+    ChatLogDetail { path: PathBuf },
     Profile,
     SoloMaps,
     SourceMaps,
@@ -34,18 +39,24 @@ pub(super) enum CatalogRequest {
     ProfileIcon { key: String, model: String, skin: String },
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
     CrosshairImage { index: u8 },
+    ScreenshotCatalog,
+    ScreenshotImage { path: PathBuf },
 }
 
 type ProfileCatalog = (Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>);
 
 pub(super) enum CatalogPayload {
     AssetViewer(Result<Vec<AssetEntry>, String>),
+    ChatLogs(Result<Vec<ChatLogIndexEntry>, String>),
+    ChatLogDetail { path: PathBuf, detail: Result<ChatLogDetail, String> },
     Profile(Result<ProfileCatalog, String>),
     SoloMaps(Result<Vec<SoloMapEntry>, String>),
     SourceMaps(Result<Vec<SoloMapEntry>, String>),
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
     ProfileIcon { key: String, image: Option<DecodedImage> },
     CrosshairImage { index: u8, image: Option<DecodedImage> },
+    ScreenshotCatalog(Result<Vec<crate::screenshot::ScreenshotEntry>, String>),
+    ScreenshotImage { path: PathBuf, image: Result<DecodedImage, String> },
 }
 
 pub(super) struct CatalogResult {
@@ -64,9 +75,12 @@ struct Job {
 #[derive(Default, Clone, Copy)]
 pub(super) struct PendingCatalogs {
     pub asset_viewer: bool,
+    pub chat_logs: bool,
+    pub chat_log_detail: bool,
     pub profile: bool,
     pub solo_maps: bool,
     pub source_maps: bool,
+    pub screenshots: bool,
 }
 
 pub(super) struct UiCatalog {
@@ -161,6 +175,50 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         let _activity = thread_activity::activity(ThreadSlot::UiCatalog, Task::UiCatalog);
         let started = Instant::now();
 
+        // Chat logs are ordinary writable files, not VFS assets. Keep their
+        // potentially large recursive scan/parsing on this worker, but do not
+        // pay for opening/reopening the game PK3 search path.
+        match &job.request {
+            CatalogRequest::ChatLogs => {
+                let payload = CatalogPayload::ChatLogs(crate::chat_log::scan_browser_index(&job.base));
+                devprintln!(
+                    2,
+                    "UI catalog: chat log scan took {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            CatalogRequest::ChatLogDetail { path } => {
+                let path = path.clone();
+                let detail = crate::chat_log::read_browser_detail(&path);
+                let payload = CatalogPayload::ChatLogDetail { path, detail };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            _ => {}
+        }
+
+        // Screenshot browsing is a loose-filesystem job, not a JKA VFS job.
+        // Handle it before opening/reopening AssetSearchPath so visiting the
+        // browser cannot trigger package work that it does not need.
+        match &job.request {
+            CatalogRequest::ScreenshotCatalog => {
+                let payload = CatalogPayload::ScreenshotCatalog(
+                    crate::screenshot::scan_screenshots(&job.base)
+                );
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            CatalogRequest::ScreenshotImage { path } => {
+                let image = crate::screenshot::read_image_rgba(path).map(|(size, rgba)| DecodedImage { size, rgba });
+                let payload = CatalogPayload::ScreenshotImage { path: path.clone(), image };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            _ => {}
+        }
+
         let reusable = vfs.as_ref().is_some_and(|open| {
             open.generation == job.generation && open.base == job.base && open.game == job.game
         });
@@ -176,6 +234,8 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     let error = error.to_string();
                     let payload = match job.request {
                         CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error))),
+                        // Handled before VFS open above.
+                        CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => None,
                         CatalogRequest::Profile => Some(CatalogPayload::Profile(Err(error))),
                         CatalogRequest::SoloMaps => Some(CatalogPayload::SoloMaps(Err(error))),
                         CatalogRequest::SourceMaps => Some(CatalogPayload::SourceMaps(Err(error))),
@@ -188,6 +248,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         CatalogRequest::CrosshairImage { index } => {
                             Some(CatalogPayload::CrosshairImage { index, image: None })
                         }
+                        CatalogRequest::ScreenshotCatalog | CatalogRequest::ScreenshotImage { .. } => unreachable!("filesystem-only screenshot request reached VFS open"),
                     };
                     if let Some(payload) = payload {
                         let _ = results.send(CatalogResult { generation: job.generation, payload });
@@ -195,7 +256,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     continue;
                 }
             };
-            eprintln!("UI catalog: VFS opened in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+            devprintln!(2, "UI catalog: VFS opened in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
         }
         let assets = &mut vfs.as_mut().expect("VFS opened above").assets;
 
@@ -205,6 +266,9 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 "asset viewer",
                 CatalogPayload::AssetViewer(frontend::scan_asset_viewer_assets(assets)),
             ),
+            CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => {
+                unreachable!("chat log requests are handled before VFS open")
+            }
             CatalogRequest::Profile => (
                 "profile",
                 CatalogPayload::Profile(frontend::scan_profile_catalog(assets)),
@@ -232,6 +296,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     .and_then(|asset| decode(asset, &format!("Crosshair image {index}")));
                 ("crosshair image", CatalogPayload::CrosshairImage { index, image })
             }
+            CatalogRequest::ScreenshotCatalog | CatalogRequest::ScreenshotImage { .. } => unreachable!("filesystem-only screenshot request reached VFS scan"),
         };
         // Bulk scans are the interesting ones; per-image jobs are too chatty.
         if !matches!(
@@ -240,7 +305,8 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 | CatalogPayload::ProfileIcon { .. }
                 | CatalogPayload::CrosshairImage { .. }
         ) {
-            eprintln!(
+            devprintln!(
+                2,
                 "UI catalog: {label} scan took {:.1} ms",
                 scan_started.elapsed().as_secs_f64() * 1000.0
             );

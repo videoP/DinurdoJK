@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn item(classname: &str, model: &str, item_type: i32, tag: i32, quantity: i32) -> ItemInfo {
-        ItemInfo { classname: classname.into(), world_model: model.into(), world_model2: String::new(), item_type, tag, quantity }
+        ItemInfo { classname: classname.into(), world_model: model.into(), world_model2: String::new(), view_model: String::new(), item_type, tag, quantity }
     }
 
     fn input(time: i32) -> ItemInput {

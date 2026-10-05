@@ -41,7 +41,7 @@ fn vs_main(input: VertexInput) -> @builtin(position) vec4<f32> {
         prepared_instances.words[base + 1u],
         prepared_instances.words[base + 2u],
     ));
-    let authored_height_scale = bitcast<f32>(prepared_instances.words[base + 3u]);
+    let authored_height_scale = bitcast<f32>(prepared_instances.words[base + 3u] & 0xffffff00u);
     let hw = unpack2x16float(prepared_instances.words[base + 5u]);
     let turn = unpack2x16float(prepared_instances.words[base + 6u]);
     let bend0 = unpack2x16float(prepared_instances.words[base + 7u]);

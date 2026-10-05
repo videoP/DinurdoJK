@@ -8,11 +8,32 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { crate::logging::write_line(crate::logging::Level::Error, format_args!($($arg)*)) };
 }
 
+/// Global diagnostic output. `developer 0` is quiet, 1 is basic lifecycle
+/// information, 2 is verbose per-entity/per-job diagnostics, and 3 is trace-level.
+macro_rules! devprintln {
+    ($level:expr, $($arg:tt)*) => {{
+        if crate::logging::developer_enabled($level) {
+            println!($($arg)*);
+        }
+    }};
+}
+
+/// Renderer-specific verbose output. `r_verbose` can enable this without also
+/// enabling cgame/client diagnostics; a matching `developer` level also enables it.
+macro_rules! rverbose {
+    ($level:expr, $($arg:tt)*) => {{
+        if crate::logging::renderer_verbose_enabled($level) {
+            println!($($arg)*);
+        }
+    }};
+}
+
 mod app;
 mod asset_jobs;
 mod audio;
 mod camera;
 mod cgame;
+mod chat_log;
 mod clipboard;
 mod cloud_noise;
 mod cloud_wind;
@@ -20,6 +41,7 @@ mod color_lut;
 mod config;
 mod console;
 mod crash;
+mod credential_store;
 mod download;
 mod entity_graph;
 mod fx;
@@ -37,15 +59,18 @@ mod model_frame_log;
 mod net;
 mod ocean;
 mod player;
+mod pipeline_jobs;
 mod pure;
 mod renderer;
 mod runtime;
 mod scene;
+mod screenshot;
 mod server_browser;
 mod speedometer;
 mod surface_deformation;
 mod steam_audio;
 mod strafehelper;
+mod strafe_trail;
 mod thread_activity;
 mod ui;
 mod vgs;
@@ -103,6 +128,10 @@ struct Options {
     validate: bool,
     /// OpenJK-style `+command args` startup lines (e.g. `+connect host`).
     startup_commands: Vec<String>,
+    /// Image supplied as a positional argument, e.g. by dragging a screenshot
+    /// onto DinurdoJK.exe in Explorer.
+    screenshot_path: Option<PathBuf>,
+    screenshot_metadata: Option<screenshot::ScreenshotMetadata>,
 }
 
 impl Options {
@@ -124,6 +153,8 @@ impl Options {
             game: None,
             validate: false,
             startup_commands: Vec::new(),
+            screenshot_path: None,
+            screenshot_metadata: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -143,6 +174,23 @@ impl Options {
                 command if command.starts_with('+') && command.len() > 1 => {
                     options.startup_commands.push(command[1..].to_owned());
                 }
+                image if !image.starts_with('-')
+                    && options.startup_commands.is_empty()
+                    && is_screenshot_path(std::path::Path::new(image)) =>
+                {
+                    if options.screenshot_path.is_some() {
+                        return Err("only one startup screenshot can be opened at a time".into());
+                    }
+                    let path = PathBuf::from(image);
+                    options.screenshot_metadata = match screenshot::read_metadata_file(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            eprintln!("Screenshot metadata: {error}");
+                            None
+                        }
+                    };
+                    options.screenshot_path = Some(path);
+                }
                 word if !word.starts_with("--") && !options.startup_commands.is_empty() => {
                     let line = options.startup_commands.last_mut().expect("checked non-empty");
                     line.push(' ');
@@ -150,14 +198,41 @@ impl Options {
                 }
                 _ => {
                     return Err(
-                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [+command args ...]"
+                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [screenshot.jpg] [+command args ...]"
                             .into(),
                     )
                 }
             }
         }
+        if let Some(metadata) = options
+            .screenshot_metadata
+            .clone()
+            .filter(|metadata| metadata.can_go_to_spot())
+        {
+            if let Some(map_name) = metadata.map_name.as_deref() {
+                options.source = scene::MapSource::Bsp(map_name.to_owned());
+                options.launch_map = true;
+                options.game = if metadata.game.trim().is_empty()
+                    || metadata.game.eq_ignore_ascii_case("base")
+                {
+                    None
+                } else {
+                    Some(metadata.game.clone())
+                };
+            }
+        }
         Ok(options)
     }
+}
+
+fn is_screenshot_path(path: &std::path::Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png")
+            })
 }
 
 fn main() -> std::process::ExitCode {
@@ -353,6 +428,8 @@ fn main() -> std::process::ExitCode {
     let proxy = event_loop.create_proxy();
     let terminal_proxy = proxy.clone();
     let startup_commands = options.startup_commands;
+    let startup_screenshot_path = options.screenshot_path.clone();
+    let startup_screenshot_metadata = options.screenshot_metadata.clone();
     let mut application = match app::App::new(
         options.base,
         game_dir,
@@ -361,6 +438,9 @@ fn main() -> std::process::ExitCode {
         proxy,
     ) {
         Ok(mut application) => {
+            if let Some(path) = startup_screenshot_path {
+                application.configure_startup_screenshot(path, startup_screenshot_metadata);
+            }
             application.queue_startup_commands(startup_commands);
             application
         }

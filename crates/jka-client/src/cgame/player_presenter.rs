@@ -8,7 +8,7 @@
 
 use crate::{
     asset_jobs::{self, AssetPriority, AssetRegistry, AssetSource, AssetState, Requested},
-    cgame::{ClientGameState, ForcedPlayerModels, Ghoul2ServerCommand, PresentationEvent, PresentedEntity, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE},
+    cgame::{suppressed_during_intermission, ClientGameState, ForcedPlayerModels, Ghoul2ServerCommand, PresentationEvent, PresentedEntity, ET_BODY, ET_GENERAL, ET_NPC, ET_PLAYER, GT_SIEGE},
     materials::{self, TextureData, Textures},
     renderer::{
         DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex, FxGpuSpriteInstance,
@@ -19,7 +19,7 @@ use crate::{
     ui::Ghoul2SkinningMode,
 };
 use jka_assets::{
-    animation::{animation_index, load_humanoid_animations, AnimationSet},
+    animation::{animation_index, is_death_animation, load_humanoid_animations, AnimationSet},
     ghoul2::{
         model_bolt_matrix, multiply_3x4, openjk_default_gla, parse_gla, parse_glm,
         skin_glm_surface, smooth_ghoul2_pose, GlaAnimation, Ghoul2Animator, Ghoul2SkinnedSurface, GlmModel,
@@ -35,7 +35,9 @@ use jka_assets::{
     skin::load_skin,
     vehicle::{load_vehicle_definitions, VehicleDefinition, VehicleDefinitions},
 };
+use super::cloth::{ClothCapsule, ClothConfig, ClothMotion, ClothOutput, ClothSurfaceFrame, ClothSystem};
 use super::footsteps::{self, FootstepImpact, FootstepStages};
+use super::jiggle::{JiggleProfile, JiggleSystem};
 use super::player_animation::PlayerAnimationState;
 
 /// The viewer's model animation, as fed to `CG_PlayerAnimation` and as played.
@@ -83,7 +85,10 @@ pub struct ViewerAnimDebug {
     pub blade_length: [[f32; 8]; 2],
     pub blade_submitted: [[bool; 8]; 2],
 }
-use super::ragdoll::{PhysicsMapMesh, RagdollConfig, RagdollMode, RagdollWorld};
+use super::ragdoll::{
+    DetachedLimbGeneration, DetachedLimbSpawn, PhysicsMapMesh, RagdollConfig, RagdollMode,
+    RagdollWorld,
+};
 use super::saber_throw::{blade_angles, SaberThrowState};
 use jka_movement::{
     bg_g2_player_angles, CollisionWorld, PlayerAngleEntity, PlayerAngleState, TraceQuery, TraceWorld,
@@ -101,6 +106,15 @@ use std::{
 const EF_TELEPORT_BIT: i32 = 1 << 3;
 const WP_SABER: i32 = 3;
 const WP_BRYAR_PISTOL: i32 = 4;
+// OpenJK bg_public.h: server-authored detached Ghoul2 limb entities.
+const G2_MODEL_PART: i32 = 50;
+const G2_MODELPART_HEAD: i32 = 10;
+const G2_MODELPART_WAIST: i32 = 11;
+const G2_MODELPART_LARM: i32 = 12;
+const G2_MODELPART_RARM: i32 = 13;
+const G2_MODELPART_RHAND: i32 = 14;
+const G2_MODELPART_LLEG: i32 = 15;
+const G2_MODELPART_RLEG: i32 = 16;
 const EF_NODRAW: i32 = 1 << 8;
 const EF_DEAD: i32 = 1 << 1;
 const EF_RAG: i32 = 1 << 6;
@@ -123,6 +137,7 @@ const MASK_PLAYERSOLID: i32 = 0x0000_0001 | 0x0000_0010 | 0x0000_0100 | 0x0000_1
 const MAX_GLM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GLA_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SKIN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_JIGGLE_BYTES: usize = 64 * 1024;
 
 
 /// Renderer-view data used by the Ghoul2 presenter for the same whole-model
@@ -202,6 +217,21 @@ impl Ghoul2PresentationView {
 
     pub(crate) fn distance_cull(self) -> f32 {
         self.distance_cull
+    }
+
+    pub(crate) fn aspect(self) -> f32 {
+        self.aspect
+    }
+
+    pub(crate) fn fov_x_degrees(self) -> f32 {
+        (2.0 * (self.tan_half_fov_y * self.aspect).atan()).to_degrees()
+    }
+
+    /// Camera origin converted back to JKA's native Z-up coordinates. Auxiliary
+    /// CGame refEntities such as the invulnerability half-shield orient
+    /// themselves from `cg.refdef.vieworg`, not from the player's viewangles.
+    pub(crate) fn jka_position(self) -> [f32; 3] {
+        scene::jka_position(self.position.to_array())
     }
 
     /// Straight-line distance from the view to a JKA-space point.
@@ -306,6 +336,11 @@ fn ghoul2_lod_for_view(
 
 #[derive(Debug)]
 struct Ghoul2GpuMeshSource {
+    /// Original GLM geometry key/topology used whenever jiggle is off.
+    base_key: Arc<str>,
+    base_vertices: Arc<Vec<Ghoul2GpuVertex>>,
+    cpu_indices: Arc<Vec<u32>>,
+    /// GPU/promoted topology. Jiggle surfaces use one Phong-style subdivision.
     key: Arc<str>,
     vertices: Arc<Vec<Ghoul2GpuVertex>>,
     indices: Arc<Vec<u32>>,
@@ -352,6 +387,12 @@ struct ResolvedMaterial {
 #[derive(Clone)]
 struct PlayerSurfaceAsset {
     surface_index: usize,
+    /// Ghoul2/skin default state. Dismemberment keeps authored `*off` cap
+    /// surfaces resident and force-enables them only after a server sever event.
+    default_visible: bool,
+    /// Ghoul2 hierarchy name. Kept so runtime surface on/off rules such as
+    /// TaystJK cg_fpls can be applied without rebuilding the model.
+    surface_name: String,
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
     /// Asset Viewer only: this surface had no usable authored material, so
@@ -370,11 +411,42 @@ struct PlayerSurfaceAsset {
     gpu_meshes: Vec<Option<Arc<Ghoul2GpuMeshSource>>>,
 }
 
+const FPLS_MODE3_OFF_SURFACES: &[&str] = &[
+    // EternalJK CG_ForceFPLSPlayerModel: every FPLS mode removes the head
+    // variants and the TIE-pilot hoses so first person never sits inside them.
+    "head_eyes_mouth",
+    "heada_eyes_mouth",
+    "head",
+    "heada",
+    "heada_face",
+    "headb",
+    "headb_face",
+    "headb_eyes_mouth",
+    "torso_l_hose",
+    "torso_r_hose",
+    // EternalJK modes 2/3 additionally turn these exact surfaces off; its
+    // source describes that state as "removes everything but the saber hilt".
+    // Dinurdo's cg_fpls is boolean, so enabled maps to mode 3: no player body,
+    // normal first-person camera, held saber hilt/blades retained.
+    "hips",
+    "hipsa",
+    "torso",
+    "torsoa",
+];
+
+fn fpls_mode3_surface_hidden(name: &str) -> bool {
+    FPLS_MODE3_OFF_SURFACES
+        .iter()
+        .any(|surface| name.eq_ignore_ascii_case(surface))
+}
+
 struct PlayerModelAsset {
     key: String,
     glm: Arc<GlmModel>,
     gla: Arc<GlaAnimation>,
     surfaces: Vec<PlayerSurfaceAsset>,
+    /// Optional post-Ghoul2 soft-tissue profile loaded beside model.glm.
+    jiggle: Option<Arc<JiggleProfile>>,
 }
 
 struct SaberModelAsset {
@@ -397,6 +469,404 @@ struct BodyQueueCopyState {
     /// Ghoul2 model index 2 survives the body copy independently. OpenJK uses
     /// it for the second saber and does not strip it with the model-1 rule.
     model2_saber: bool,
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DismemberPart {
+    Head,
+    Waist,
+    LeftArm,
+    RightArm,
+    RightHand,
+    LeftLeg,
+    RightLeg,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DismemberSpec {
+    /// Ghoul2 bone OpenJK uses to position/orient the detached copy.
+    rotate_bone: &'static str,
+    limb_root: &'static str,
+    stub_root: &'static str,
+    limb_tag: &'static str,
+    stub_tag: &'static str,
+    /// Bone endpoints used only for the single cheap Rapier collider.
+    collider_a: &'static str,
+    collider_b: Option<&'static str>,
+    radius: f32,
+    mass_kg: f32,
+}
+
+impl DismemberPart {
+    fn from_model_part(value: i32) -> Option<Self> {
+        Some(match value {
+            G2_MODELPART_HEAD => Self::Head,
+            G2_MODELPART_WAIST => Self::Waist,
+            G2_MODELPART_LARM => Self::LeftArm,
+            G2_MODELPART_RARM => Self::RightArm,
+            G2_MODELPART_RHAND => Self::RightHand,
+            G2_MODELPART_LLEG => Self::LeftLeg,
+            G2_MODELPART_RLEG => Self::RightLeg,
+            _ => return None,
+        })
+    }
+
+    fn model_part(self) -> i32 {
+        match self {
+            Self::Head => G2_MODELPART_HEAD,
+            Self::Waist => G2_MODELPART_WAIST,
+            Self::LeftArm => G2_MODELPART_LARM,
+            Self::RightArm => G2_MODELPART_RARM,
+            Self::RightHand => G2_MODELPART_RHAND,
+            Self::LeftLeg => G2_MODELPART_LLEG,
+            Self::RightLeg => G2_MODELPART_RLEG,
+        }
+    }
+
+    fn allowed_at_level(self, level: u8) -> bool {
+        level >= 2 || (level >= 1 && !matches!(self, Self::Head | Self::Waist))
+    }
+
+    fn spec(self) -> DismemberSpec {
+        match self {
+            // Exact OpenJK CG_General names/tags. Collider bones are a modern
+            // Rapier-only approximation and never feed gameplay or sever choice.
+            Self::Head => DismemberSpec {
+                rotate_bone: "cranium",
+                limb_root: "head",
+                stub_root: "torso",
+                limb_tag: "*head_cap_torso",
+                stub_tag: "*torso_cap_head",
+                collider_a: "cranium",
+                collider_b: None,
+                radius: 5.5,
+                mass_kg: 5.0,
+            },
+            Self::Waist => DismemberSpec {
+                rotate_bone: "thoracic",
+                limb_root: "torso",
+                stub_root: "hips",
+                limb_tag: "*torso_cap_hips",
+                stub_tag: "*hips_cap_torso",
+                collider_a: "lower_lumbar",
+                collider_b: Some("cranium"),
+                radius: 7.0,
+                mass_kg: 30.0,
+            },
+            Self::LeftArm => DismemberSpec {
+                rotate_bone: "lradius",
+                limb_root: "l_arm",
+                stub_root: "torso",
+                limb_tag: "*l_arm_cap_torso",
+                stub_tag: "*torso_cap_l_arm",
+                collider_a: "lhumerus",
+                collider_b: Some("lhand"),
+                radius: 3.2,
+                mass_kg: 4.3,
+            },
+            Self::RightArm => DismemberSpec {
+                rotate_bone: "rradius",
+                limb_root: "r_arm",
+                stub_root: "torso",
+                limb_tag: "*r_arm_cap_torso",
+                stub_tag: "*torso_cap_r_arm",
+                collider_a: "rhumerus",
+                collider_b: Some("rhand"),
+                radius: 3.2,
+                mass_kg: 4.3,
+            },
+            Self::RightHand => DismemberSpec {
+                rotate_bone: "rhand",
+                limb_root: "r_hand",
+                stub_root: "r_arm",
+                limb_tag: "*r_hand_cap_r_arm",
+                stub_tag: "*r_arm_cap_r_hand",
+                collider_a: "rhand",
+                collider_b: None,
+                radius: 2.8,
+                mass_kg: 0.7,
+            },
+            Self::LeftLeg => DismemberSpec {
+                rotate_bone: "ltibia",
+                limb_root: "l_leg",
+                stub_root: "hips",
+                limb_tag: "*l_leg_cap_hips",
+                stub_tag: "*hips_cap_l_leg",
+                collider_a: "lfemurYZ",
+                collider_b: Some("ltalus"),
+                radius: 4.0,
+                mass_kg: 12.0,
+            },
+            Self::RightLeg => DismemberSpec {
+                rotate_bone: "rtibia",
+                limb_root: "r_leg",
+                stub_root: "hips",
+                limb_tag: "*r_leg_cap_hips",
+                stub_tag: "*hips_cap_r_leg",
+                collider_a: "rfemurYZ",
+                collider_b: Some("rtalus"),
+                radius: 4.0,
+                mass_kg: 12.0,
+            },
+        }
+    }
+
+    fn removes_weapon(self) -> bool {
+        matches!(self, Self::Waist | Self::RightArm | Self::RightHand)
+    }
+}
+
+#[derive(Clone)]
+struct DismemberSourceSnap {
+    model: Arc<PlayerModelAsset>,
+    pose: Vec<Matrix3x4>,
+    axis: [[f32; 3]; 3],
+    origin: [f32; 3],
+    model_scale: f32,
+    body_rgba: [f32; 4],
+    body_rgb: [f32; 3],
+    /// Ghoul2 model slot 1 as it existed before CG_General mutates the source.
+    /// OpenJK duplicates this slot onto the detached copy after first removing
+    /// model slot 2 (the second saber) and model slot 3 (jetpack).
+    model1_weapon: Option<i32>,
+    model1_primary_saber: bool,
+    client_info: crate::cgame::ClientInfo,
+}
+
+#[derive(Clone)]
+struct DetachedLimbVisual {
+    generation: DetachedLimbGeneration,
+    source_entity: u16,
+    part: DismemberPart,
+    model: Arc<PlayerModelAsset>,
+    pose: Vec<Matrix3x4>,
+    surfaces: HashSet<usize>,
+    spawn_entity_matrix: Matrix3x4,
+    spawn_body_matrix: Matrix3x4,
+    body_rgba: [f32; 4],
+    body_rgb: [f32; 3],
+    model1_weapon: Option<i32>,
+    model1_primary_saber: bool,
+    client_info: crate::cgame::ClientInfo,
+    next_smoke_time: i32,
+}
+
+fn dismember_source_entity(entity: &PresentedEntity) -> Option<u16> {
+    if entity.entity_type != ET_GENERAL
+        || entity.state.field_i32("weapon").unwrap_or(0) != G2_MODEL_PART
+        || DismemberPart::from_model_part(entity.state.field_i32("modelGhoul2").unwrap_or(0)).is_none()
+    {
+        return None;
+    }
+    let model_index = entity.state.field_i32("modelindex").unwrap_or(-1);
+    let source = if model_index >= 0 {
+        model_index
+    } else {
+        entity.state.field_i32("otherEntityNum2").unwrap_or(-1)
+    };
+    u16::try_from(source).ok()
+}
+
+fn dismember_generation(entity: &PresentedEntity, source_entity: u16, part: DismemberPart) -> DetachedLimbGeneration {
+    DetachedLimbGeneration {
+        source_entity,
+        kind: part.model_part() as u8,
+        trajectory_time: entity.state.field_i32("pos.trTime").unwrap_or(0),
+    }
+}
+
+fn dismember_source_ready(
+    source_entity: &PresentedEntity,
+    presented_torso_anim: Option<i32>,
+) -> bool {
+    // Stock CG_General waits until the owner's EF_DEAD and death animation have
+    // reached the client before cloning the Ghoul2 instance. Without this gate,
+    // a newly received model-part entity can visually sever a still-living pose.
+    if source_entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD == 0 {
+        return false;
+    }
+
+    let state_anim = source_entity.state.field_i32("torsoAnim").unwrap_or(0) & !ANIM_TOGGLEBIT;
+    let chopped_hand = animation_index("BOTH_RIGHTHANDCHOPPEDOFF")
+        .and_then(|index| i32::try_from(index).ok());
+    if chopped_hand == Some(state_anim) {
+        return true;
+    }
+
+    let Some(presented_anim) = presented_torso_anim else {
+        // CG_General also requires clEnt->pe.torso.animationNumber to be a
+        // death animation. If this source has not been presented yet, wait one
+        // frame rather than assuming its lerp-frame state already caught up.
+        return false;
+    };
+    let presented_anim = presented_anim & !ANIM_TOGGLEBIT;
+    is_death_animation(state_anim) && is_death_animation(presented_anim)
+}
+
+fn hierarchy_surface_index(glm: &GlmModel, name: &str) -> Option<usize> {
+    glm.hierarchy
+        .iter()
+        .position(|surface| surface.name.eq_ignore_ascii_case(name))
+}
+
+/// OpenJK asks `BG_GetRootSurfNameWithVariant` for limb/stub roots. Player
+/// skins use one-letter root variants (`r_arma`, `torsoa`, `hipsa`, ...), while
+/// `_1`/`_2` suffixes are LOD surface names and must not be mistaken for a skin
+/// variant. Prefer the unsuffixed stock root, then accept exactly one ASCII
+/// alphabetic variant character.
+fn resolve_dismember_root(glm: &GlmModel, base: &str) -> Option<usize> {
+    hierarchy_surface_index(glm, base).or_else(|| {
+        let base = base.to_ascii_lowercase();
+        glm.hierarchy.iter().position(|surface| {
+            let name = surface.name.to_ascii_lowercase();
+            let Some(suffix) = name.strip_prefix(&base) else { return false };
+            suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_alphabetic()
+        })
+    })
+}
+
+fn collect_surface_subtree(glm: &GlmModel, root: usize, out: &mut HashSet<usize>) {
+    if !out.insert(root) {
+        return;
+    }
+    if let Some(surface) = glm.hierarchy.get(root) {
+        for &child in &surface.children {
+            collect_surface_subtree(glm, child, out);
+        }
+    }
+}
+
+fn variant_cap_name(glm: &GlmModel, root: usize, base_root: &str, default_tag: &str) -> String {
+    let default_cap = default_tag.trim_start_matches('*');
+    let Some(root_name) = glm.hierarchy.get(root).map(|surface| surface.name.as_str()) else {
+        return default_cap.to_owned();
+    };
+    if root_name.eq_ignore_ascii_case(base_root) {
+        return default_cap.to_owned();
+    }
+    let suffix = default_cap.strip_prefix(base_root).unwrap_or(default_cap);
+    format!("{root_name}{suffix}")
+}
+
+fn default_surface_set(model: &PlayerModelAsset) -> HashSet<usize> {
+    model
+        .surfaces
+        .iter()
+        .filter(|surface| surface.default_visible)
+        .map(|surface| surface.surface_index)
+        .collect()
+}
+
+fn source_dismember_surface_set(
+    model: &PlayerModelAsset,
+    parts: Option<&HashSet<DismemberPart>>,
+) -> Option<HashSet<usize>> {
+    let parts = parts.filter(|parts| !parts.is_empty())?;
+    let mut visible = default_surface_set(model);
+    let drawable = model.surfaces.iter().map(|surface| surface.surface_index).collect::<HashSet<_>>();
+    for part in parts {
+        let spec = part.spec();
+        let Some(limb_root) = resolve_dismember_root(&model.glm, spec.limb_root) else { continue };
+        let mut hidden = HashSet::new();
+        collect_surface_subtree(&model.glm, limb_root, &mut hidden);
+        visible.retain(|index| !hidden.contains(index));
+
+        let Some(stub_root) = resolve_dismember_root(&model.glm, spec.stub_root) else { continue };
+        let cap = variant_cap_name(&model.glm, stub_root, spec.stub_root, spec.stub_tag);
+        if let Some(cap_index) = hierarchy_surface_index(&model.glm, &cap).filter(|index| drawable.contains(index)) {
+            visible.insert(cap_index);
+        }
+    }
+    Some(visible)
+}
+
+fn detached_limb_surface_set(
+    model: &PlayerModelAsset,
+    current: DismemberPart,
+    all_parts: Option<&HashSet<DismemberPart>>,
+) -> HashSet<usize> {
+    let spec = current.spec();
+    let drawable = model.surfaces.iter().map(|surface| surface.surface_index).collect::<HashSet<_>>();
+    let Some(root) = resolve_dismember_root(&model.glm, spec.limb_root) else { return HashSet::new() };
+    let mut subtree = HashSet::new();
+    collect_surface_subtree(&model.glm, root, &mut subtree);
+    let mut visible = model
+        .surfaces
+        .iter()
+        .filter(|surface| surface.default_visible && subtree.contains(&surface.surface_index))
+        .map(|surface| surface.surface_index)
+        .collect::<HashSet<_>>();
+
+    let cap = variant_cap_name(&model.glm, root, spec.limb_root, spec.limb_tag);
+    if let Some(cap_index) = hierarchy_surface_index(&model.glm, &cap).filter(|index| drawable.contains(index)) {
+        visible.insert(cap_index);
+    }
+
+    // The detached Ghoul2 copy inherits older sever flags from the source.
+    if let Some(parts) = all_parts {
+        for part in parts.iter().copied().filter(|part| *part != current) {
+            let prior = part.spec();
+            if let Some(prior_root) = resolve_dismember_root(&model.glm, prior.limb_root) {
+                let mut hidden = HashSet::new();
+                collect_surface_subtree(&model.glm, prior_root, &mut hidden);
+                visible.retain(|index| !hidden.contains(index));
+            }
+        }
+    }
+    visible
+}
+
+fn presentation_matrix(axis: [[f32; 3]; 3], origin: [f32; 3]) -> Matrix3x4 {
+    [
+        [axis[0][0], axis[1][0], axis[2][0], origin[0]],
+        [axis[0][1], axis[1][1], axis[2][1], origin[1]],
+        [axis[0][2], axis[1][2], axis[2][2], origin[2]],
+    ]
+}
+
+fn scaled_bone_matrix(mut matrix: Matrix3x4, scale: f32) -> Matrix3x4 {
+    matrix[0][3] *= scale;
+    matrix[1][3] *= scale;
+    matrix[2][3] *= scale;
+    matrix
+}
+
+fn affine_inverse_3x4(matrix: &Matrix3x4) -> Option<Matrix3x4> {
+    let m = glam::Mat4::from_cols(
+        glam::Vec4::new(matrix[0][0], matrix[1][0], matrix[2][0], 0.0),
+        glam::Vec4::new(matrix[0][1], matrix[1][1], matrix[2][1], 0.0),
+        glam::Vec4::new(matrix[0][2], matrix[1][2], matrix[2][2], 0.0),
+        glam::Vec4::new(matrix[0][3], matrix[1][3], matrix[2][3], 1.0),
+    );
+    if m.determinant().abs() < 1.0e-8 {
+        return None;
+    }
+    let inv = m.inverse();
+    Some([
+        [inv.x_axis.x, inv.y_axis.x, inv.z_axis.x, inv.w_axis.x],
+        [inv.x_axis.y, inv.y_axis.y, inv.z_axis.y, inv.w_axis.y],
+        [inv.x_axis.z, inv.y_axis.z, inv.z_axis.z, inv.w_axis.z],
+    ])
+}
+
+fn presentation_axis_origin(matrix: &Matrix3x4) -> ([[f32; 3]; 3], [f32; 3]) {
+    (
+        [
+            [matrix[0][0], matrix[1][0], matrix[2][0]],
+            [matrix[0][1], matrix[1][1], matrix[2][1]],
+            [matrix[0][2], matrix[1][2], matrix[2][2]],
+        ],
+        [matrix[0][3], matrix[1][3], matrix[2][3]],
+    )
+}
+
+fn affine_point(matrix: &Matrix3x4, point: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * point[0] + matrix[0][1] * point[1] + matrix[0][2] * point[2] + matrix[0][3],
+        matrix[1][0] * point[0] + matrix[1][1] * point[1] + matrix[1][2] * point[2] + matrix[1][3],
+        matrix[2][0] * point[0] + matrix[2][1] * point[1] + matrix[2][2] * point[2] + matrix[2][3],
+    ]
 }
 
 /// OpenJK stores current/desired blade length in clientInfo_t::saber[].blade[].
@@ -586,6 +1056,11 @@ pub enum PlayerFxRequest {
 }
 
 const EF_BODYPUSH: i32 = 1 << 19;
+const EF_JETPACK_ACTIVE: i32 = 1 << 11;
+const EF_JETPACK: i32 = 1 << 29;
+const EF_JETPACK_FLAMING: i32 = 1 << 30;
+const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4;
+const JETPACK_MODEL: &str = "models/weapons2/jetpack/model.glm";
 const PW_DISINT_4: i32 = 9;
 const FP_GRIP: i32 = 6;
 const MAX_GRIP_DISTANCE: f32 = 256.0;
@@ -926,55 +1401,60 @@ fn skin_surface_timed(
     result
 }
 
-fn build_gpu_mesh_source(
-    model_qpath: &str,
-    lod_index: usize,
+fn gpu_vertex_from_glm(
     surface: &GlmSurface,
-    two_sided: bool,
-) -> Result<Arc<Ghoul2GpuMeshSource>, String> {
-    if surface.vertices.len() != surface.texcoords.len() {
+    vertex_index: usize,
+    jiggle_profile: Option<&JiggleProfile>,
+    lod_index: usize,
+) -> Result<Ghoul2GpuVertex, String> {
+    let vertex = surface.vertices.get(vertex_index).ok_or_else(|| {
+        format!("GLM surface {} missing vertex {vertex_index}", surface.surface_index)
+    })?;
+    let uv = *surface.texcoords.get(vertex_index).ok_or_else(|| {
+        format!("GLM surface {} missing texcoord {vertex_index}", surface.surface_index)
+    })?;
+    if vertex.weights.is_empty() || vertex.weights.len() > 4 {
         return Err(format!(
-            "GLM surface {} has {} vertices but {} texcoords",
-            surface.surface_index, surface.vertices.len(), surface.texcoords.len()
+            "GLM surface {} vertex {} has unsupported weight count {}",
+            surface.surface_index, vertex_index, vertex.weights.len()
         ));
     }
-    let mut vertices = Vec::with_capacity(surface.vertices.len());
-    for (vertex_index, (vertex, &uv)) in surface.vertices.iter().zip(&surface.texcoords).enumerate() {
-        if vertex.weights.is_empty() || vertex.weights.len() > 4 {
-            return Err(format!(
-                "GLM surface {} vertex {} has unsupported weight count {}",
-                surface.surface_index, vertex_index, vertex.weights.len()
-            ));
-        }
-        let mut bone_indices = [0u32; 4];
-        let mut weights = [0.0f32; 4];
-        for (weight_index, weight) in vertex.weights.iter().enumerate() {
-            let skeleton_bone = *surface.bone_references.get(weight.local_bone_index).ok_or_else(|| {
-                format!(
-                    "GLM surface {} vertex {} references missing local bone {}",
-                    surface.surface_index, vertex_index, weight.local_bone_index
-                )
-            })?;
-            bone_indices[weight_index] = u32::try_from(skeleton_bone)
-                .map_err(|_| format!("GLM skeleton bone index {skeleton_bone} exceeds GPU u32"))?;
-            weights[weight_index] = weight.weight;
-        }
-        vertices.push(Ghoul2GpuVertex {
-            position: vertex.position,
-            normal: vertex.normal,
-            uv,
-            bone_indices,
-            weights,
-            weight_count: vertex.weights.len() as u32,
-            _padding: [0; 3],
-        });
+    let mut bone_indices = [0u32; 4];
+    let mut weights = [0.0f32; 4];
+    for (weight_index, weight) in vertex.weights.iter().enumerate() {
+        let skeleton_bone = *surface.bone_references.get(weight.local_bone_index).ok_or_else(|| {
+            format!(
+                "GLM surface {} vertex {} references missing local bone {}",
+                surface.surface_index, vertex_index, weight.local_bone_index
+            )
+        })?;
+        bone_indices[weight_index] = u32::try_from(skeleton_bone)
+            .map_err(|_| format!("GLM skeleton bone index {skeleton_bone} exceeds GPU u32"))?;
+        weights[weight_index] = weight.weight;
     }
+    let (jiggle_region, jiggle_weight, jiggle_coord) = jiggle_profile
+        .map(|profile| profile.gpu_vertex_binding(lod_index, surface.surface_index, vertex_index))
+        .unwrap_or((u32::MAX, 0.0, 4.0));
+    Ok(Ghoul2GpuVertex {
+        position: vertex.position,
+        normal: vertex.normal,
+        uv,
+        bone_indices,
+        weights,
+        weight_count: vertex.weights.len() as u32,
+        jiggle_region,
+        jiggle_weight,
+        jiggle_coord,
+    })
+}
+
+fn append_surface_indices(
+    surface: &GlmSurface,
+    two_sided: bool,
+) -> Result<Vec<u32>, String> {
     let mut indices = Vec::with_capacity(surface.triangles.len() * 3 * if two_sided { 2 } else { 1 });
     for (triangle_index, triangle) in surface.triangles.iter().enumerate() {
-        if triangle
-            .iter()
-            .any(|&index| index as usize >= surface.vertices.len())
-        {
+        if triangle.iter().any(|&index| index as usize >= surface.vertices.len()) {
             return Err(format!(
                 "GLM surface {} triangle {} has out-of-range vertex",
                 surface.surface_index, triangle_index
@@ -985,33 +1465,294 @@ fn build_gpu_mesh_source(
         indices.extend_from_slice(&triangle);
     }
     if two_sided {
-        // Dynamic-model pipelines always cull back faces; `cull twosided` is
-        // honoured by also emitting every triangle with reversed winding.
         let front_count = indices.len();
         for triangle in 0..front_count / 3 {
             let base = triangle * 3;
             indices.extend_from_slice(&[indices[base], indices[base + 2], indices[base + 1]]);
         }
     }
-    Ok(Arc::new(Ghoul2GpuMeshSource {
-        key: Arc::<str>::from(format!(
-            "{}#lod{}#surface{}{}",
-            model_qpath.replace('\\', "/").to_ascii_lowercase(),
-            lod_index,
-            surface.surface_index,
-            if two_sided { "#twosided" } else { "" }
-        )),
-        vertices: Arc::new(vertices),
-        indices: Arc::new(indices),
-    }))
+    Ok(indices)
 }
 
+fn blend_gpu_influences(a: &Ghoul2GpuVertex, b: &Ghoul2GpuVertex) -> ([u32; 4], [f32; 4], u32) {
+    let mut combined = HashMap::<u32, f32>::new();
+    for source in [a, b] {
+        for index in 0..source.weight_count.min(4) as usize {
+            *combined.entry(source.bone_indices[index]).or_default() += source.weights[index] * 0.5;
+        }
+    }
+    let mut influences = combined.into_iter().collect::<Vec<_>>();
+    influences.sort_by(|left, right| right.1.total_cmp(&left.1));
+    influences.truncate(4);
+    let total = influences.iter().map(|(_, weight)| *weight).sum::<f32>().max(0.0001);
+    let mut bone_indices = [0u32; 4];
+    let mut weights = [0.0f32; 4];
+    for (index, (bone, weight)) in influences.iter().enumerate() {
+        bone_indices[index] = *bone;
+        weights[index] = *weight / total;
+    }
+    (bone_indices, weights, influences.len().max(1) as u32)
+}
+
+fn promoted_midpoint(
+    a: &Ghoul2GpuVertex,
+    b: &Ghoul2GpuVertex,
+    curve_position: bool,
+) -> Ghoul2GpuVertex {
+    let pa = Vec3::from_array(a.position);
+    let pb = Vec3::from_array(b.position);
+    let na = Vec3::from_array(a.normal).normalize_or_zero();
+    let nb = Vec3::from_array(b.normal).normalize_or_zero();
+    let linear = (pa + pb) * 0.5;
+    let projected_a = linear - na * (linear - pa).dot(na);
+    let projected_b = linear - nb * (linear - pb).dot(nb);
+    let curved = if curve_position {
+        linear.lerp((projected_a + projected_b) * 0.5, 0.75)
+    } else {
+        // Surface boundaries/UV seams must remain on the source edge so an
+        // adjacent unpromoted surface cannot develop a crack.
+        linear
+    };
+    let normal = (na + nb).normalize_or_zero();
+    let (bone_indices, weights, weight_count) = blend_gpu_influences(a, b);
+    let (jiggle_region, jiggle_weight, jiggle_coord) = match (a.jiggle_region, b.jiggle_region) {
+        (ra, rb) if ra == rb => (
+            ra,
+            (a.jiggle_weight + b.jiggle_weight) * 0.5,
+            (a.jiggle_coord + b.jiggle_coord) * 0.5,
+        ),
+        (u32::MAX, rb) => (rb, b.jiggle_weight * 0.5, b.jiggle_coord),
+        (ra, u32::MAX) => (ra, a.jiggle_weight * 0.5, a.jiggle_coord),
+        (ra, _) if a.jiggle_weight >= b.jiggle_weight => (ra, a.jiggle_weight * 0.5, a.jiggle_coord),
+        (_, rb) => (rb, b.jiggle_weight * 0.5, b.jiggle_coord),
+    };
+    Ghoul2GpuVertex {
+        position: curved.to_array(),
+        normal: if normal.length_squared() > 0.0 { normal.to_array() } else { a.normal },
+        uv: [(a.uv[0] + b.uv[0]) * 0.5, (a.uv[1] + b.uv[1]) * 0.5],
+        bone_indices,
+        weights,
+        weight_count,
+        jiggle_region,
+        jiggle_weight,
+        jiggle_coord,
+    }
+}
+
+fn jiggle_promotion_weight(vertex: &Ghoul2GpuVertex) -> f32 {
+    if vertex.jiggle_coord.abs() < 2.0 {
+        // Match the default live glute-height trim while deciding where extra
+        // topology is worth caching. This keeps upper-thigh triangles at stock
+        // density even for older explicit model.jiggle files.
+        let edge0 = -0.70 + 0.15;
+        let edge1 = -0.15 + 0.15;
+        let t = ((vertex.jiggle_coord - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        return vertex.jiggle_weight * (t * t * (3.0 - 2.0 * t));
+    }
+    vertex.jiggle_weight
+}
+
+fn subdivide_jiggle_region(
+    source_vertices: &[Ghoul2GpuVertex],
+    source_indices: &[u32],
+    threshold: f32,
+) -> (Vec<Ghoul2GpuVertex>, Vec<u32>) {
+    let selected = source_indices
+        .chunks_exact(3)
+        .map(|triangle| {
+            triangle.iter().any(|&index| {
+                source_vertices
+                    .get(index as usize)
+                    .is_some_and(|vertex| jiggle_promotion_weight(vertex) > threshold)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut vertices = source_vertices.to_vec();
+    let mut edge_use = HashMap::<(u32, u32), u32>::new();
+    for (triangle_index, triangle) in source_indices.chunks_exact(3).enumerate() {
+        if !selected.get(triangle_index).copied().unwrap_or(false) {
+            continue;
+        }
+        for (a, b) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            *edge_use.entry(key).or_default() += 1;
+        }
+    }
+
+    // Create every edge midpoint required by a selected triangle before
+    // emitting indices.  Unselected neighbours can then consume the exact same
+    // midpoint and remain conforming instead of leaving a T-junction.
+    let mut edges = HashMap::<(u32, u32), u32>::new();
+    for (&key, &selected_uses) in &edge_use {
+        let (a, b) = key;
+        let (Some(va), Some(vb)) = (
+            vertices.get(a as usize).copied(),
+            vertices.get(b as usize).copied(),
+        ) else {
+            continue;
+        };
+        let index = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        vertices.push(promoted_midpoint(&va, &vb, selected_uses > 1));
+        edges.insert(key, index);
+    }
+
+    let edge_mid = |a: u32, b: u32| {
+        let key = if a < b { (a, b) } else { (b, a) };
+        edges.get(&key).copied()
+    };
+    let mut indices = Vec::with_capacity(source_indices.len() * 2);
+    for (triangle_index, triangle) in source_indices.chunks_exact(3).enumerate() {
+        let a = triangle[0];
+        let b = triangle[1];
+        let c = triangle[2];
+        let ab = edge_mid(a, b);
+        let bc = edge_mid(b, c);
+        let ca = edge_mid(c, a);
+
+        if selected.get(triangle_index).copied().unwrap_or(false) {
+            let (Some(ab), Some(bc), Some(ca)) = (ab, bc, ca) else {
+                indices.extend_from_slice(&[a, b, c]);
+                continue;
+            };
+            indices.extend_from_slice(&[
+                a, ab, ca,
+                ab, b, bc,
+                ca, bc, c,
+                ab, bc, ca,
+            ]);
+            continue;
+        }
+
+        // Boundary neighbour: split only the edges that the promoted region
+        // already introduced.  This does not add curvature or spread the high
+        // density area, it only makes the transition watertight.
+        match (ab, bc, ca) {
+            (None, None, None) => indices.extend_from_slice(&[a, b, c]),
+            (Some(ab), None, None) => {
+                indices.extend_from_slice(&[a, ab, c, ab, b, c]);
+            }
+            (None, Some(bc), None) => {
+                indices.extend_from_slice(&[a, b, bc, a, bc, c]);
+            }
+            (None, None, Some(ca)) => {
+                indices.extend_from_slice(&[a, b, ca, b, c, ca]);
+            }
+            (Some(ab), Some(bc), None) => {
+                indices.extend_from_slice(&[ab, b, bc, a, ab, bc, a, bc, c]);
+            }
+            (None, Some(bc), Some(ca)) => {
+                indices.extend_from_slice(&[bc, c, ca, b, bc, ca, b, ca, a]);
+            }
+            (Some(ab), None, Some(ca)) => {
+                indices.extend_from_slice(&[ca, a, ab, c, ca, ab, c, ab, b]);
+            }
+            (Some(ab), Some(bc), Some(ca)) => {
+                indices.extend_from_slice(&[
+                    a, ab, ca,
+                    ab, b, bc,
+                    ca, bc, c,
+                    ab, bc, ca,
+                ]);
+            }
+        }
+    }
+    (vertices, indices)
+}
+
+/// Two cached, local Phong-style subdivision passes.  Only triangles touching
+/// the soft mask are promoted: the transition ring gets 4x topology and the
+/// weighted core can reach 16x.  The rest of torso/hips remains original JKA.
+fn promote_jiggle_mesh(
+    source_vertices: &[Ghoul2GpuVertex],
+    source_indices: &[u32],
+) -> (Vec<Ghoul2GpuVertex>, Vec<u32>) {
+    let (vertices, indices) = subdivide_jiggle_region(source_vertices, source_indices, 0.0125);
+    subdivide_jiggle_region(&vertices, &indices, 0.045)
+}
+
+fn build_gpu_mesh_source(
+    model_qpath: &str,
+    lod_index: usize,
+    surface: &GlmSurface,
+    two_sided: bool,
+    jiggle_profile: Option<&JiggleProfile>,
+) -> Result<Arc<Ghoul2GpuMeshSource>, String> {
+    if surface.vertices.len() != surface.texcoords.len() {
+        return Err(format!(
+            "GLM surface {} has {} vertices but {} texcoords",
+            surface.surface_index, surface.vertices.len(), surface.texcoords.len()
+        ));
+    }
+    let mut vertices = Vec::with_capacity(surface.vertices.len());
+    for vertex_index in 0..surface.vertices.len() {
+        vertices.push(gpu_vertex_from_glm(surface, vertex_index, jiggle_profile, lod_index)?);
+    }
+
+    let cpu_indices = append_surface_indices(surface, two_sided)?;
+    let base_vertices = Arc::new(vertices.clone());
+    let promote = jiggle_profile.is_some_and(|profile| {
+        profile.gpu_supported() && profile.affects_surface(lod_index, surface.surface_index)
+    });
+    let (vertices, mut indices) = if promote {
+        // Promote only the front winding; append mirrored triangles afterwards
+        // for the rare two-sided material so midpoint topology is shared.
+        let front_count = surface.triangles.len() * 3;
+        let (vertices, mut promoted) = promote_jiggle_mesh(&vertices, &cpu_indices[..front_count]);
+        if two_sided {
+            let promoted_front = promoted.len();
+            for triangle in 0..promoted_front / 3 {
+                let base = triangle * 3;
+                promoted.extend_from_slice(&[
+                    promoted[base],
+                    promoted[base + 2],
+                    promoted[base + 1],
+                ]);
+            }
+        }
+        (vertices, promoted)
+    } else {
+        (vertices, cpu_indices.clone())
+    };
+
+    // Keep capacity tight after midpoint generation; these Arcs live with the
+    // model asset for its whole residency.
+    indices.shrink_to_fit();
+    let base_key = Arc::<str>::from(format!(
+        "{}#lod{}#surface{}{}",
+        model_qpath.replace('\\', "/").to_ascii_lowercase(),
+        lod_index,
+        surface.surface_index,
+        if two_sided { "#twosided" } else { "" },
+    ));
+    let key = if promote {
+        Arc::<str>::from(format!("{base_key}#jiggle16xlocal"))
+    } else {
+        Arc::clone(&base_key)
+    };
+    let vertices = if promote { Arc::new(vertices) } else { Arc::clone(&base_vertices) };
+    let cpu_indices = Arc::new(cpu_indices);
+    let indices = if promote { Arc::new(indices) } else { Arc::clone(&cpu_indices) };
+    Ok(Arc::new(Ghoul2GpuMeshSource {
+        base_key,
+        base_vertices,
+        cpu_indices,
+        key,
+        vertices,
+        indices,
+    }))
+}
 
 fn build_lod_gpu_meshes(
     model_qpath: &str,
     glm: &GlmModel,
     surface_index: usize,
     two_sided: bool,
+    jiggle_profile: Option<&JiggleProfile>,
 ) -> Result<Vec<Option<Arc<Ghoul2GpuMeshSource>>>, String> {
     glm.lods
         .iter()
@@ -1020,11 +1761,20 @@ fn build_lod_gpu_meshes(
             lod.surfaces
                 .iter()
                 .find(|surface| surface.surface_index == surface_index)
-                .map(|surface| build_gpu_mesh_source(model_qpath, lod_index, surface, two_sided))
+                .map(|surface| {
+                    build_gpu_mesh_source(
+                        model_qpath,
+                        lod_index,
+                        surface,
+                        two_sided,
+                        jiggle_profile,
+                    )
+                })
                 .transpose()
         })
         .collect()
 }
+
 
 fn gpu_bones_from_pose(pose: &[Matrix3x4]) -> Arc<Vec<Ghoul2GpuBone>> {
     Arc::new(
@@ -1049,6 +1799,12 @@ fn is_asset_pending(error: &str) -> bool {
 /// OpenJK cache key for a player's model + skin registration.
 fn player_model_key(info: &crate::cgame::ClientInfo) -> String {
     format!("{}|{}", info.model_qpath(), info.skin_qpath()).to_ascii_lowercase()
+}
+
+fn sibling_default_skin_qpath(model_qpath: &str) -> Option<String> {
+    let normalized = model_qpath.replace('\\', "/");
+    let slash = normalized.rfind('/')?;
+    Some(format!("{}model_default.skin", &normalized[..=slash]))
 }
 
 fn static_model_key(model_qpath: &str, custom_skin: Option<&str>, preview_fallback: bool) -> String {
@@ -1083,6 +1839,7 @@ enum ModelResolution {
 /// share exactly the same OpenJK registration logic in `build_*`.
 trait ModelSource {
     fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String>;
+    fn read_optional(&mut self, qpath: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
     fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String>;
     fn load_skin(&mut self, qpath: &str) -> Result<Vec<jka_assets::skin::SkinSurface>, String>;
     fn resolve_material(&mut self, shader_name: &str) -> ResolvedMaterial;
@@ -1103,6 +1860,14 @@ impl ModelSource for SyncModelSource<'_> {
             .map_err(|error| format!("{qpath}: {error}"))?
             .ok_or_else(|| format!("missing {qpath}"))?
             .bytes)
+    }
+
+    fn read_optional(&mut self, qpath: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+        self.presenter
+            .assets
+            .read(qpath, max_bytes)
+            .map_err(|error| format!("{qpath}: {error}"))
+            .map(|asset| asset.map(|asset| asset.bytes))
     }
 
     fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String> {
@@ -1150,6 +1915,13 @@ impl ModelSource for WorkerModelSource<'_> {
             .map_err(|error| format!("{qpath}: {error}"))?
             .ok_or_else(|| format!("missing {qpath}"))?
             .bytes)
+    }
+
+    fn read_optional(&mut self, qpath: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+        self.vfs
+            .read(qpath, max_bytes)
+            .map_err(|error| format!("{qpath}: {error}"))
+            .map(|asset| asset.map(|asset| asset.bytes))
     }
 
     fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String> {
@@ -1240,7 +2012,7 @@ impl WorkerModelSource<'_> {
                     .map(|index| Arc::new(textures.images.swap_remove(index)));
                 if texture.is_none() {
                     if let Some(warning) = textures.warnings.last() {
-                        println!("PLAYER TEXTURE WARNING: {warning}");
+                        rverbose!(1, "PLAYER TEXTURE WARNING: {warning}");
                     }
                 }
                 texture
@@ -1498,6 +2270,12 @@ fn material_layers<'a>(shaders: &'a BTreeMap<String, Shader>, shader_name: &'a s
     MaterialLayers { base, entity_tint: primary.entity_rgb, overlay, stages, two_sided }
 }
 
+fn player_jiggle_qpath(model_qpath: &str) -> String {
+    model_qpath
+        .rsplit_once('.')
+        .map_or_else(|| format!("{model_qpath}.jiggle"), |(base, _)| format!("{base}.jiggle"))
+}
+
 /// OpenJK `CG_RegisterClientModelname`: GLM + GLA + skin -> drawable surfaces.
 fn build_player_model(
     source: &mut dyn ModelSource,
@@ -1526,12 +2304,60 @@ fn build_player_model(
         ));
     }
 
+    let jiggle_qpath = player_jiggle_qpath(&model_qpath);
+    let explicit_jiggle = match source.read_optional(&jiggle_qpath, MAX_JIGGLE_BYTES) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes)
+            .map_err(|error| format!("not UTF-8: {error}"))
+            .and_then(|text| JiggleProfile::parse(&text, &glm, &gla))
+        {
+            Ok(profile) => {
+                devprintln!(
+                    2,
+                    "PLAYER JIGGLE: {jiggle_qpath} override loaded regions={}",
+                    profile.region_count(),
+                );
+                Some(profile)
+            }
+            Err(error) => {
+                rverbose!(
+                    1,
+                    "PLAYER JIGGLE WARNING: {jiggle_qpath}: {error}; trying _humanoid auto profile"
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            rverbose!(1, "PLAYER JIGGLE WARNING: {error}; trying _humanoid auto profile");
+            None
+        }
+    };
+    let jiggle = match explicit_jiggle {
+        Some(profile) => Some(Arc::new(profile)),
+        None => match JiggleProfile::auto_humanoid(&glm, &gla) {
+            Ok(Some(profile)) => {
+                devprintln!(
+                    2,
+                    "PLAYER JIGGLE: {model_qpath} auto regions={} (model.jiggle override supported)",
+                    profile.region_count(),
+                );
+                Some(Arc::new(profile))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                rverbose!(1, "PLAYER JIGGLE AUTO WARNING: {model_qpath}: {error}");
+                None
+            }
+        },
+    };
+
     let skin_qpath = info.skin_qpath();
     let skin = match source.load_skin(&skin_qpath) {
         Ok(skin) => skin,
         Err(primary_error) => {
             let fallback = info.default_skin_qpath();
-            println!(
+            rverbose!(
+                1,
                 "PLAYER SKIN FALLBACK: {skin_qpath}: {primary_error}; trying {fallback}"
             );
             source.load_skin(&fallback)?
@@ -1552,10 +2378,20 @@ fn build_player_model(
             .hierarchy
             .get(surface.surface_index)
             .ok_or_else(|| format!("{model_qpath}: missing hierarchy for surface {}", surface.surface_index))?;
-        let shader_name = skin_map
+        let skin_shader = skin_map
             .get(&hierarchy.name.to_ascii_lowercase())
-            .map(String::as_str)
-            .unwrap_or(hierarchy.shader.as_str());
+            .map(String::as_str);
+        let skin_off = skin_shader.is_some_and(|shader| shader.eq_ignore_ascii_case("*off"));
+        const G2SURFACEFLAG_OFF: u32 = 0x0000_0002;
+        let default_visible = !skin_off && hierarchy.flags & G2SURFACEFLAG_OFF == 0;
+        // OpenJK keeps `*off` surfaces in the Ghoul2 instance and only toggles
+        // their runtime flags. Keep a drawable material resident for those
+        // dormant surfaces so stump/limb caps can be enabled without I/O.
+        let shader_name = if skin_off {
+            hierarchy.shader.as_str()
+        } else {
+            skin_shader.unwrap_or(hierarchy.shader.as_str())
+        };
         if shader_name.is_empty() || shader_name.eq_ignore_ascii_case("*off") {
             continue;
         }
@@ -1563,17 +2399,26 @@ fn build_player_model(
         let two_sided = material.two_sided;
         surfaces.push(PlayerSurfaceAsset {
             surface_index: surface.surface_index,
+            default_visible,
+            surface_name: hierarchy.name.clone(),
             texture: material.texture,
             alpha_mode: material.alpha_mode,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
             fallback_gray: false,
-            gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index, two_sided)?,
+            gpu_meshes: build_lod_gpu_meshes(
+                &model_qpath,
+                &glm,
+                surface.surface_index,
+                two_sided,
+                jiggle.as_deref(),
+            )?,
         });
     }
 
-    println!(
+    devprintln!(
+        2,
         "PLAYER MODEL: {} skin={} surfaces={} gla={} bones={}",
         model_qpath,
         skin_qpath,
@@ -1587,6 +2432,7 @@ fn build_player_model(
         glm,
         gla,
         surfaces,
+        jiggle,
     })
 }
 
@@ -1622,7 +2468,8 @@ fn build_static_glm(
                 .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
                 .collect::<HashMap<_, _>>(),
             Err(error) if preview_fallback => {
-                println!(
+                rverbose!(
+                    1,
                     "ASSET VIEWER GLM SKIN FALLBACK: model={} skin={} error={}; using embedded shaders/gray fallback",
                     model_qpath, skin_qpath, error,
                 );
@@ -1674,16 +2521,19 @@ fn build_static_glm(
                 || (!shader_name.eq_ignore_ascii_case("$whiteimage") && material.texture.is_none()));
         surfaces.push(PlayerSurfaceAsset {
             surface_index: surface.surface_index,
+            default_visible: true,
+            surface_name: hierarchy.name.clone(),
             texture: material.texture,
             alpha_mode: material.alpha_mode,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
             fallback_gray,
-            gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index, false)?,
+            gpu_meshes: build_lod_gpu_meshes(&model_qpath, &glm, surface.surface_index, false, None)?,
         });
     }
-    println!(
+    devprintln!(
+        2,
         "GHOUL2 STATIC MODEL REGISTERED: name={} model={} skin={} surfaces={} glmBones={} glaBones={} gla={}",
         label,
         model_qpath,
@@ -1771,6 +2621,15 @@ pub struct PlayerPresenter {
     viewer_style: crate::japro_cg::StyleViewer,
     /// Appearance of the player currently being presented (set per entity).
     look: crate::japro_cg::Appearance,
+    /// jaPRO `jcinfo2` feature bits used by CG_Player presentation. In
+    /// particular WTTRIBES swaps the stock Boba jet nozzles for the Tribes
+    /// thrust presentation.
+    japro_cinfo2: i32,
+    /// TaystJK cg_saberTeamColors (archive, default 1). Skin forcing is unconditional
+    /// in ordinary team games; this only controls saber normalization.
+    saber_team_colors: bool,
+    /// TaystJK cg_saberStaffMultiColor (archive, default 0).
+    saber_staff_multi_color: bool,
     /// Glow brightness (0..1) of the private-duel shell while the viewer duels.
     duel_shell_gray: Option<f32>,
     /// Cosmetic MD3s bolted to players this frame (drained by the caller).
@@ -1817,6 +2676,17 @@ pub struct PlayerPresenter {
     /// need results on the very next call). `cg_asyncAssets` is the global switch.
     async_loading: bool,
     entities: HashMap<u16, EntityPlayerState>,
+    /// Presentation-only entities (race ghosts, future auxiliary players) that
+    /// are not part of the authoritative snapshot list but still own persistent
+    /// Ghoul2 animation/model state across frames.
+    external_live_entities: HashSet<u16>,
+    /// Lightweight post-Ghoul2 soft-tissue secondary motion. Stock `_humanoid`
+    /// models auto-compile chest/glute masks; `model.jiggle` remains an override.
+    jiggle: JiggleSystem,
+    /// Experimental presentation-only cloth on authored cape/cloak/robe surfaces.
+    cloth: ClothSystem,
+    cloth_weather_wind: Option<crate::ocean::OceanWind>,
+    cloth_body_templates: HashMap<(String, usize, Vec<usize>), Vec<(usize, ClothCapsule)>>,
     /// Broadsword-compatible presentation seam backed by Rapier.
     ragdolls: RagdollWorld,
     /// Vanilla entityState does not transmit forceGripEntityNum. Preserve the
@@ -1838,6 +2708,12 @@ pub struct PlayerPresenter {
     thrown_sabers: HashMap<u16, SaberThrowState>,
     /// OpenJK CG_BodyQueueCopy state delivered by reliable `ircg`.
     body_queue_copies: HashMap<u16, BodyQueueCopyState>,
+    /// Runtime surface state from authoritative server G2_MODEL_PART entities.
+    dismembered: HashMap<u16, HashSet<DismemberPart>>,
+    /// Last fully evaluated player/body pose, used to clone the severed Ghoul2
+    /// subset at the exact visual frame the server part first appears.
+    dismember_source_snaps: HashMap<u16, DismemberSourceSnap>,
+    detached_limb_visuals: HashMap<u16, DetachedLimbVisual>,
     /// OpenJK clientInfo_t saber blade current/desired lengths.
     saber_blade_lengths: HashMap<SaberBladeLengthKey, SaberBladeLengthState>,
     failed_models: HashMap<String, String>,
@@ -1871,6 +2747,9 @@ pub struct PlayerPresenter {
     /// `val>0.0f&&val<1.0f` gate: `0` or `>= 1` disables it, so `1.0` is
     /// "off", not "maximum".
     ghoul2_anim_smooth: f32,
+    /// TaystJK CG_MapTorsoToWeaponFrame's process-wide busy-holster state.
+    view_weapon_frame: i32,
+    view_weapon_frame_time: i32,
     skinning_pool: rayon::ThreadPool,
 }
 
@@ -1925,6 +2804,7 @@ impl PlayerPresenter {
         self.fx_requests.clear();
         self.footsteps.clear();
         self.entities.clear();
+        self.jiggle.clear();
         self.team_power.clear();
         self.body_fade.clear();
         self.gore.clear();
@@ -1939,9 +2819,15 @@ impl PlayerPresenter {
         self.force_gesture_anim.clear();
         self.thrown_sabers.clear();
         self.body_queue_copies.clear();
+        self.dismembered.clear();
+        self.dismember_source_snaps.clear();
+        self.detached_limb_visuals.clear();
         self.saber_blade_lengths.clear();
         self.blob_shadow_instances.clear();
+        self.cloth.reset();
         self.ragdolls.reset_dynamic_for_seek();
+        self.view_weapon_frame = 0;
+        self.view_weapon_frame_time = 0;
     }
 
     pub fn vehicle_definition_for_model_request(&self, requested: &str) -> Option<&VehicleDefinition> {
@@ -1965,7 +2851,8 @@ impl PlayerPresenter {
         let mut shader_warnings = Vec::new();
         let (shaders, diagnostics) =
             materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
-        println!(
+        devprintln!(
+            1,
             "PLAYER ASSETS: humanoid animations={} saberDefs={} vehicleDefs={} shaderDefs={} mtrDefs={}",
             animations.animations.len(),
             saber_definitions.len(),
@@ -1974,7 +2861,7 @@ impl PlayerPresenter {
             diagnostics.mtr_definitions,
         );
         for warning in shader_warnings {
-            println!("PLAYER MATERIAL WARNING: {warning}");
+            rverbose!(1, "PLAYER MATERIAL WARNING: {warning}");
         }
         let asset_source = AssetSource::from_search_path(&assets);
         let shaders = Arc::new(shaders);
@@ -1988,7 +2875,7 @@ impl PlayerPresenter {
             .thread_name(|index| format!("jka-g2-skin-{index}"))
             .build()
             .map_err(|error| format!("could not start Ghoul2 skinning workers: {error}"))?;
-        println!("Ghoul2 skinning worker pool: {worker_count} thread(s)");
+        devprintln!(1, "Ghoul2 skinning worker pool: {worker_count} thread(s)");
         let mut presenter = Self {
             assets,
             pbr,
@@ -2021,6 +2908,9 @@ impl PlayerPresenter {
             japro: crate::japro_cg::JaproCgame::default(),
             viewer_style: crate::japro_cg::StyleViewer::default(),
             look: crate::japro_cg::Appearance::NORMAL,
+            japro_cinfo2: 0,
+            saber_team_colors: true,
+            saber_staff_multi_color: false,
             duel_shell_gray: None,
             cosmetic_draws: Vec::new(),
             local_cosmetics: 0,
@@ -2034,6 +2924,11 @@ impl PlayerPresenter {
             last_gpu: HashMap::new(),
             vehicle_snaps: HashMap::new(),
             entities: HashMap::new(),
+            external_live_entities: HashSet::new(),
+            jiggle: JiggleSystem::default(),
+            cloth: ClothSystem::default(),
+            cloth_weather_wind: None,
+            cloth_body_templates: HashMap::new(),
             ragdolls: RagdollWorld::new(),
             force_grip_targets: HashMap::new(),
             force_gripped_entities: HashSet::new(),
@@ -2044,6 +2939,9 @@ impl PlayerPresenter {
             force_gesture_anim: HashMap::new(),
             thrown_sabers: HashMap::new(),
             body_queue_copies: HashMap::new(),
+            dismembered: HashMap::new(),
+            dismember_source_snaps: HashMap::new(),
+            detached_limb_visuals: HashMap::new(),
             saber_blade_lengths: HashMap::new(),
             failed_models: HashMap::new(),
             player_diagnostics: HashMap::new(),
@@ -2065,10 +2963,89 @@ impl PlayerPresenter {
             lod_bias: 0,
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             ghoul2_anim_smooth: 0.3,
+            view_weapon_frame: 0,
+            view_weapon_frame_time: 0,
             skinning_pool,
         };
         presenter.prime_default_player_models();
         Ok(presenter)
+    }
+
+    /// TaystJK `CG_MapTorsoToWeaponFrame`: sample the already-advanced local
+    /// Ghoul2 lower_lumbar animation and map it onto the MD3 hand animation.
+    /// The returned `(frame, oldframe, backlerp)` is consumed by the viewmodel
+    /// tag interpolation exactly like refEntity_t.
+    pub fn view_weapon_frames(
+        &mut self,
+        entity_num: u16,
+        current_time: i32,
+        torso_anim: i32,
+        force_hand_extend: i32,
+    ) -> (usize, usize, f32) {
+        const HANDEXTEND_NONE: i32 = 0;
+
+        // WEAPON_FORCE_BUSY_HOLSTER from TaystJK: advance frames 6..10 at
+        // 10 ms steps while a hand-extend is active, then retain frame 10 for
+        // 100 ms so the weapon cannot snap to idle for one render frame.
+        if force_hand_extend != HANDEXTEND_NONE || self.view_weapon_frame_time > current_time {
+            if self.view_weapon_frame < 6 {
+                self.view_weapon_frame = 6;
+                self.view_weapon_frame_time = current_time + 10;
+            } else if self.view_weapon_frame_time < current_time && self.view_weapon_frame < 10 {
+                self.view_weapon_frame += 1;
+                self.view_weapon_frame_time = current_time + 10;
+            } else if force_hand_extend != HANDEXTEND_NONE && self.view_weapon_frame == 10 {
+                self.view_weapon_frame_time = current_time + 100;
+            }
+            let frame = self.view_weapon_frame.max(0) as usize;
+            return (frame, frame, 0.0);
+        }
+        self.view_weapon_frame = 0;
+        self.view_weapon_frame_time = 0;
+
+        let current_frame = self.entities.get_mut(&entity_num).and_then(|state| {
+            let lower_lumbar = Ghoul2Animator::bone_index(&state.model.gla, "lower_lumbar")?;
+            state
+                .animation
+                .animator
+                .bone_frame(&state.model.gla, lower_lumbar, current_time)
+                .ok()
+                .flatten()
+        });
+        let Some(current_frame) = current_frame else {
+            return (0, 0, 0.0);
+        };
+
+        let Some(animation) = self.animations.get(torso_anim) else {
+            return (0, 0, 0.0);
+        };
+        let first = i32::from(animation.first_frame);
+        let map = |frame: i32| -> Option<usize> {
+            let offset = frame - first;
+            match AnimationSet::name(torso_anim) {
+                Some("TORSO_DROPWEAP1") if (0..5).contains(&offset) => Some((offset + 6) as usize),
+                Some("TORSO_RAISEWEAP1") if (0..4).contains(&offset) => Some((offset + 10) as usize),
+                Some(
+                    "BOTH_ATTACK1"
+                    | "BOTH_ATTACK2"
+                    | "BOTH_ATTACK3"
+                    | "BOTH_ATTACK4"
+                    | "BOTH_ATTACK10"
+                    | "BOTH_THERMAL_THROW",
+                ) if (0..6).contains(&offset) => Some((offset + 1) as usize),
+                _ => None,
+            }
+        };
+
+        let frame = map(current_frame.ceil() as i32);
+        let oldframe = map(current_frame.floor() as i32);
+        match (frame, oldframe) {
+            (None, _) => (0, 0, 0.0),
+            (Some(frame), None) => (frame, frame, 0.0),
+            (Some(frame), Some(oldframe)) => {
+                (frame, oldframe, 1.0 - current_frame.fract())
+            }
+        }
     }
 
     /// `cg_footsteps` picks the sound and dust stages; prints follow the
@@ -2101,6 +3078,14 @@ impl PlayerPresenter {
     /// to relay it back as `c5`.
     pub fn set_local_cosmetics(&mut self, mask: u32) {
         self.local_cosmetics = mask;
+    }
+
+    pub fn set_saber_team_colors(&mut self, enabled: bool) {
+        self.saber_team_colors = enabled;
+    }
+
+    pub fn set_saber_staff_multi_color(&mut self, enabled: bool) {
+        self.saber_staff_multi_color = enabled;
     }
 
     /// The `cp_cosmetics` this client sends a jaPRO server (diagnostics only).
@@ -2143,6 +3128,15 @@ impl PlayerPresenter {
                 // then applies knownWeapon only to model index 1.
                 // A reused body-queue slot starts a fresh life.
                 self.body_fade.remove(&body_entity);
+                if let Some(parts) = self.dismembered.get(&source_client).cloned() {
+                    self.dismembered.insert(body_entity, parts);
+                } else {
+                    self.dismembered.remove(&body_entity);
+                }
+                // Preserve the already-solved corpse articulation across the
+                // live-player -> ET_BODY ownership transfer. OpenJK copies the
+                // existing Ghoul2 instance here rather than replaying death.
+                self.ragdolls.body_queue_copy(source_client, body_entity);
                 self.body_queue_copies.insert(
                     body_entity,
                     BodyQueueCopyState {
@@ -2171,6 +3165,34 @@ impl PlayerPresenter {
                 source.cent_weapon = 0;
                 source.ghoul2_weapon = None;
                 self.thrown_sabers.remove(&source_client);
+                // CG_ReattachLimb restores the live player's original Ghoul2
+                // surface flags after the body queue copy. The corpse retains
+                // the cloned cut state above.
+                self.dismembered.remove(&source_client);
+            }
+            Ghoul2ServerCommand::KillEntity { entity } => {
+                // CG_KillGhoul2_f / CG_KillCEntityG2: drop the persistent
+                // presentation instance. If a later snapshot still references
+                // this slot it will be recreated from its current entity state.
+                self.entities.remove(&entity);
+                self.ragdolls.remove_entity(entity);
+                self.body_queue_copies.remove(&entity);
+                self.body_fade.remove(&entity);
+                self.dismembered.remove(&entity);
+                self.dismember_source_snaps.remove(&entity);
+                self.detached_limb_visuals.remove(&entity);
+                self.thrown_sabers.remove(&entity);
+                self.team_power.remove(&entity);
+                self.force_grip_targets.remove(&entity);
+                self.force_grip_targets.retain(|_, target| *target != entity);
+                self.force_gripped_entities.remove(&entity);
+                self.pending_impulse_ragdolls.remove(&entity);
+                self.active_impulse_ragdolls.remove(&entity);
+                self.previous_impulse_velocity.remove(&entity);
+                self.force_gesture_anim.remove(&entity);
+                self.last_gpu.remove(&entity);
+                self.vehicle_snaps.remove(&entity);
+                self.player_diagnostics.remove(&entity);
             }
         }
     }
@@ -2436,6 +3458,7 @@ impl PlayerPresenter {
                         specular: None,
                         bulge_height: 0.0,
                         env_map: false,
+                        jiggle_offsets: skin.jiggle_offsets,
                     }),
                     fx_gpu_sprites: None,
                     texture: texture.clone(),
@@ -2446,8 +3469,53 @@ impl PlayerPresenter {
         draws.extend(extra);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_jiggle_config(
+        &mut self,
+        enabled: bool,
+        hz: u32,
+        max_substeps: u32,
+        overall_strength: f32,
+        breast_strength: f32,
+        glute_strength: f32,
+        stiffness_scale: f32,
+        damping_scale: f32,
+        glute_lift: f32,
+    ) {
+        self.jiggle.set_config(
+            enabled,
+            hz,
+            max_substeps,
+            super::jiggle::JiggleTuning {
+                overall_strength,
+                breast_strength,
+                glute_strength,
+                stiffness_scale,
+                damping_scale,
+                glute_lift,
+            },
+        );
+    }
+
+    pub(crate) fn set_cloth_config(&mut self, config: ClothConfig) {
+        self.cloth.set_config(config);
+    }
+
+    pub(crate) fn set_cloth_wind(&mut self, wind: Option<crate::ocean::OceanWind>) {
+        self.cloth_weather_wind = wind;
+    }
+
     pub fn set_ragdoll_config(&mut self, config: RagdollConfig) {
+        let previous_dismemberment = self.ragdolls.dismemberment_level();
+        let dismemberment = config.dismemberment;
         self.ragdolls.set_config(config);
+        if previous_dismemberment != dismemberment {
+            // Surface mutations are presentation state. Rebuild them from the
+            // currently transmitted G2_MODEL_PART entities on the next frame.
+            self.dismembered.clear();
+            self.dismember_source_snaps.clear();
+            self.detached_limb_visuals.clear();
+        }
     }
 
     pub fn set_physics_map_mesh(&mut self, mesh: &PhysicsMapMesh) -> Result<(), String> {
@@ -2809,6 +3877,16 @@ impl PlayerPresenter {
         self.early_frustum_cull = enabled;
     }
 
+    /// Keep auxiliary presentation-only player runtimes alive when the ordinary
+    /// snapshot player pass prunes stale centity state.
+    pub fn set_external_live_entities(
+        &mut self,
+        entities: impl IntoIterator<Item = u16>,
+    ) {
+        self.external_live_entities.clear();
+        self.external_live_entities.extend(entities);
+    }
+
     pub fn set_rt_shadow_casters_enabled(&mut self, enabled: bool) {
         self.rt_shadow_casters_enabled = enabled;
     }
@@ -2899,13 +3977,146 @@ impl PlayerPresenter {
         };
     }
 
+    fn cloth_surface_name<'a>(glm: &'a GlmModel, surface: &GlmSurface) -> Option<&'a str> {
+        glm.hierarchy
+            .get(surface.surface_index)
+            .map(|entry| entry.name.as_str())
+    }
+
+    fn cloth_body_capsules(
+        &mut self, model_label: &str, glm: &GlmModel,
+        surface_assets: &[PlayerSurfaceAsset], lod_index: usize,
+        gla: &GlaAnimation, pose: &[Matrix3x4],
+    ) -> Vec<ClothCapsule> {
+        let visible = surface_assets.iter().map(|asset| asset.surface_index).collect::<Vec<_>>();
+        let key = (model_label.to_owned(), lod_index, visible);
+        let templates = self.cloth_body_templates.entry(key.clone()).or_insert_with(||
+            super::cloth_body::build_body_templates(glm, gla, &key.2, lod_index));
+        super::cloth_body::pose_body_capsules(templates, gla, pose)
+    }
+    fn cloth_surface_frame(
+        glm: &GlmModel,
+        surface: &GlmSurface,
+        skinned: &Ghoul2SkinnedSurface,
+        pose: &[Matrix3x4],
+    ) -> Option<ClothSurfaceFrame> {
+        let surface_name = Self::cloth_surface_name(glm, surface)?;
+        if !ClothSystem::is_cloth_surface_name(surface_name) {
+            return None;
+        }
+        // These transforms let the garment solver derive attachment motion
+        // from the actual skin weights. No bone names or animation IDs enter
+        // the rule for how hanging fabric follows those attachments.
+        let skin_transforms = surface.vertices.iter().map(|vertex| {
+            let mut matrix = [[0.0; 4]; 3];
+            for weight in &vertex.weights {
+                let index = *surface.bone_references.get(weight.local_bone_index)?;
+                let bone = pose.get(index)?;
+                for row in 0..3 {
+                    for column in 0..4 {
+                        matrix[row][column] += bone[row][column] * weight.weight;
+                    }
+                }
+            }
+            Some(matrix)
+        }).collect::<Option<Vec<_>>>()?;
+        Some(ClothSurfaceFrame {
+            surface_index: surface.surface_index,
+            surface_name: surface_name.to_owned(),
+            bind_positions: surface.vertices.iter().map(|vertex| vertex.position).collect(),
+            posed_positions: skinned.vertices.iter().map(|vertex| vertex.position).collect(),
+            posed_normals: skinned.vertices.iter().map(|vertex| vertex.normal).collect(),
+            skin_transforms,
+            triangles: surface.triangles.clone(),
+        })
+    }
+
+
+    fn simulate_cloth_frames(
+        &mut self,
+        entity_num: u16,
+        model_label: &str,
+        lod_index: usize,
+        frames: &[ClothSurfaceFrame],
+        glm: &GlmModel,
+        surface_assets: &[PlayerSurfaceAsset],
+        gla: &GlaAnimation,
+        pose: &[Matrix3x4],
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+    ) -> HashMap<usize, ClothOutput> {
+        if !self.cloth.enabled() || frames.is_empty() {
+            return HashMap::new();
+        }
+        let capsules = self.cloth_body_capsules(model_label, glm, surface_assets, lod_index, gla, pose);
+        let wind = self.cloth_weather_wind.map(|wind| {
+            let velocity = wind.at(self.stage_time_ms as f32 * 0.001);
+            // Shared weather uses render X/Z; cloth uses JKA X/Y/Z.
+            scene::jka_position([velocity[0], 0.0, velocity[1]])
+        }).unwrap_or([0.0; 3]);
+        self.cloth.set_wind_velocity(wind);
+        self.cloth
+            .simulate_garment(
+                entity_num,
+                model_label,
+                lod_index,
+                frames,
+                &capsules,
+                ClothMotion { axis, origin },
+                self.stage_time_ms,
+            )
+            .unwrap_or_default()
+    }
+
+    fn cpu_surface_vertices_with_cloth(
+        skinned: Ghoul2SkinnedSurface,
+        cloth_output: Option<ClothOutput>,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        color: [f32; 4],
+    ) -> Vec<DynamicModelVertex> {
+        if let Some(output) = cloth_output {
+            if output.positions.len() == skinned.vertices.len()
+                && output.normals.len() == skinned.vertices.len()
+            {
+                return skinned
+                    .vertices
+                    .into_iter()
+                    .zip(output.positions)
+                    .zip(output.normals)
+                    .map(|((vertex, position), normal)| DynamicModelVertex {
+                        position: transform_model_point(position, axis, origin),
+                        normal: transform_model_normal(normal, axis),
+                        uv: vertex.uv,
+                        color,
+                        depth_hack: 0.0,
+                    })
+                    .collect();
+            }
+        }
+
+        skinned
+            .vertices
+            .into_iter()
+            .map(|vertex| DynamicModelVertex {
+                position: transform_model_point(vertex.position, axis, origin),
+                normal: transform_model_normal(vertex.normal, axis),
+                uv: vertex.uv,
+                color,
+                depth_hack: 0.0,
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_glm_surfaces(
         &mut self,
         entity_num: u16,
         model_label: &str,
         glm: &GlmModel,
+        gla: &GlaAnimation,
         surface_assets: &[PlayerSurfaceAsset],
+        jiggle_profile: Option<&JiggleProfile>,
         pose: &[Matrix3x4],
         lod_index: usize,
         axis: [[f32; 3]; 3],
@@ -2918,7 +4129,9 @@ impl PlayerPresenter {
             entity_num,
             model_label,
             glm,
+            gla,
             surface_assets,
+            jiggle_profile,
             pose,
             lod_index,
             axis,
@@ -2940,7 +4153,9 @@ impl PlayerPresenter {
         entity_num: u16,
         model_label: &str,
         glm: &GlmModel,
+        gla: &GlaAnimation,
         surface_assets: &[PlayerSurfaceAsset],
+        jiggle_profile: Option<&JiggleProfile>,
         pose: &[Matrix3x4],
         lod_index: usize,
         axis: [[f32; 3]; 3],
@@ -2949,6 +4164,30 @@ impl PlayerPresenter {
         entity_rgb: [f32; 3],
         custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode)>,
         apply_alpha_blend: bool,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        self.render_glm_surfaces_tinted_selected(
+            entity_num, model_label, glm, gla, surface_assets, jiggle_profile, pose, lod_index,
+            axis, origin, rgba, entity_rgb, custom_material, apply_alpha_blend, None,
+        )
+    }
+
+    fn render_glm_surfaces_tinted_selected(
+        &mut self,
+        entity_num: u16,
+        model_label: &str,
+        glm: &GlmModel,
+        gla: &GlaAnimation,
+        surface_assets: &[PlayerSurfaceAsset],
+        jiggle_profile: Option<&JiggleProfile>,
+        pose: &[Matrix3x4],
+        lod_index: usize,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        rgba: [f32; 4],
+        entity_rgb: [f32; 3],
+        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode)>,
+        apply_alpha_blend: bool,
+        surface_selection: Option<&HashSet<usize>>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let tinted = entity_rgb != [1.0; 3] && custom_material.is_none();
         let stage_seconds = self.stage_time_ms as f32 * 0.001;
@@ -2961,6 +4200,11 @@ impl PlayerPresenter {
         let jobs = surface_assets
             .iter()
             .filter_map(|asset| {
+                let visible = surface_selection
+                    .map_or(asset.default_visible, |selection| selection.contains(&asset.surface_index));
+                if !visible {
+                    return None;
+                }
                 let surface = lod
                     .surfaces
                     .iter()
@@ -2970,19 +4214,87 @@ impl PlayerPresenter {
             })
             .collect::<Vec<_>>();
 
+        let jiggle_profile = jiggle_profile.filter(|_| self.jiggle.enabled());
+        let jiggle_offsets = jiggle_profile.map(|profile| {
+            self.jiggle.simulate(
+                entity_num,
+                model_label,
+                profile,
+                pose,
+                axis,
+                origin,
+                self.stage_time_ms,
+            )
+        });
+        let gpu_jiggle_offsets = if let (Some(profile), Some(offsets)) =
+            (jiggle_profile, jiggle_offsets.as_deref())
+        {
+            if profile.gpu_supported() {
+                profile.gpu_offsets(offsets, self.jiggle.tuning())
+            } else {
+                [[0.0; 4]; 4]
+            }
+        } else {
+            [[0.0; 4]; 4]
+        };
+
         if self.skinning_mode == Ghoul2SkinningMode::Gpu {
             let bones = gpu_bones_from_pose(pose);
             let empty_vertices = Arc::new(Vec::new());
-            let mut draws = Vec::with_capacity(jobs.len());
-            for (asset, _, gpu_mesh) in jobs {
-                if gpu_mesh.vertices.is_empty() || gpu_mesh.indices.is_empty() {
+
+            // Cloth remains a CPU post-skin deformation path. Jiggle stays on
+            // GPU whenever its profile fits the four-region vertex payload; only
+            // cloth (or an oversized explicit jiggle profile) falls back to CPU.
+            let mut deformed_skinned = HashMap::<usize, Ghoul2SkinnedSurface>::new();
+            let mut cloth_frames = Vec::<ClothSurfaceFrame>::new();
+            for (_, surface, _) in &jobs {
+                let cloth_candidate = self.cloth.enabled()
+                    && Self::cloth_surface_name(glm, surface)
+                        .is_some_and(ClothSystem::is_cloth_surface_name);
+                let jiggle_candidate = jiggle_profile
+                    .is_some_and(|profile| profile.affects_surface(lod_index, surface.surface_index));
+                let jiggle_cpu_fallback = jiggle_candidate
+                    && jiggle_profile.is_some_and(|profile| !profile.gpu_supported());
+                if !cloth_candidate && !jiggle_cpu_fallback {
                     continue;
                 }
-                self.perf.surfaces_skinned = self.perf.surfaces_skinned.saturating_add(1);
-                self.perf.vertices_skinned = self
-                    .perf
-                    .vertices_skinned
-                    .saturating_add(gpu_mesh.vertices.len() as u64);
+
+                let mut skinned = skin_surface_timed(&mut self.perf, surface, pose)?;
+                if jiggle_candidate {
+                    if let (Some(profile), Some(offsets)) = (jiggle_profile, jiggle_offsets.as_deref()) {
+                        profile.deform_surface(
+                            lod_index,
+                            surface.surface_index,
+                            offsets,
+                            self.jiggle.tuning(),
+                            &mut skinned,
+                        );
+                    }
+                }
+                if cloth_candidate {
+                    if let Some(frame) = Self::cloth_surface_frame(glm, surface, &skinned, pose) {
+                        cloth_frames.push(frame);
+                    }
+                }
+                deformed_skinned.insert(surface.surface_index, skinned);
+            }
+            let mut cloth_outputs =
+                self.simulate_cloth_frames(entity_num, model_label, lod_index, &cloth_frames, glm, surface_assets, gla, pose, axis, origin);
+
+            let mut draws = Vec::with_capacity(jobs.len());
+            for (asset, surface, gpu_mesh) in jobs {
+                let gpu_jiggle_surface = jiggle_profile.is_some_and(|profile| {
+                    profile.gpu_supported()
+                        && profile.affects_surface(lod_index, surface.surface_index)
+                });
+                let (draw_key, draw_vertices, draw_indices) = if gpu_jiggle_surface {
+                    (&gpu_mesh.key, &gpu_mesh.vertices, &gpu_mesh.indices)
+                } else {
+                    (&gpu_mesh.base_key, &gpu_mesh.base_vertices, &gpu_mesh.cpu_indices)
+                };
+                if draw_vertices.is_empty() || draw_indices.is_empty() {
+                    continue;
+                }
                 let (texture, base_alpha_mode) = custom_material
                     .clone()
                     .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode));
@@ -2999,19 +4311,58 @@ impl PlayerPresenter {
                     base_alpha_mode
                 };
                 let overlay_at = draws.len() + 1;
+
+                if let Some(skinned) = deformed_skinned.remove(&surface.surface_index) {
+                    let vertices = Self::cpu_surface_vertices_with_cloth(
+                        skinned,
+                        cloth_outputs.remove(&surface.surface_index),
+                        axis,
+                        origin,
+                        surface_rgba,
+                    );
+                    if !vertices.is_empty() {
+                        draws.push(DynamicModelSurface {
+                            entity_num,
+                            wireframe_class: DynamicWireframeClass::Player,
+                            raster_visible: true,
+                            vertices: Arc::new(vertices),
+                            indices: Arc::clone(&gpu_mesh.cpu_indices),
+                            lighting_origin: Some(origin),
+                            rt_rigid: None,
+                            rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.base_key)),
+                            ghoul2_gpu: None,
+                            fx_gpu_sprites: None,
+                            texture,
+                            alpha_mode,
+                        });
+                        if tinted && asset.entity_tint {
+                            Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3]);
+                        }
+                        if custom_material.is_none() {
+                            Self::push_stage_draws(&mut draws, overlay_at, asset, rgba[3], stage_seconds, &stage_frame);
+                        }
+                    }
+                    continue;
+                }
+
+                self.perf.surfaces_skinned = self.perf.surfaces_skinned.saturating_add(1);
+                self.perf.vertices_skinned = self
+                    .perf
+                    .vertices_skinned
+                    .saturating_add(draw_vertices.len() as u64);
                 draws.push(DynamicModelSurface {
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Player,
                     raster_visible: true,
                     vertices: Arc::clone(&empty_vertices),
-                    indices: Arc::clone(&gpu_mesh.indices),
+                    indices: Arc::clone(draw_indices),
                     lighting_origin: Some(origin),
                     rt_rigid: None,
-                    rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.key)),
+                    rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(draw_key)),
                     ghoul2_gpu: Some(Ghoul2GpuSkinning {
-                        mesh_key: Arc::clone(&gpu_mesh.key),
-                        vertices: Arc::clone(&gpu_mesh.vertices),
-                        indices: Arc::clone(&gpu_mesh.indices),
+                        mesh_key: Arc::clone(draw_key),
+                        vertices: Arc::clone(draw_vertices),
+                        indices: Arc::clone(draw_indices),
                         bones: Arc::clone(&bones),
                         axis,
                         origin,
@@ -3020,6 +4371,7 @@ impl PlayerPresenter {
                         specular: None,
                         bulge_height: 0.0,
                         env_map: false,
+                        jiggle_offsets: gpu_jiggle_offsets,
                     }),
                     fx_gpu_sprites: None,
                     texture,
@@ -3036,7 +4388,7 @@ impl PlayerPresenter {
         }
 
         let used_workers = self.skinning_mode == Ghoul2SkinningMode::CpuWorkers && jobs.len() > 1;
-        let skinned = if used_workers {
+        let mut skinned = if used_workers {
             let started = Instant::now();
             let results = self.skinning_pool.install(|| {
                 jobs.par_iter()
@@ -3051,8 +4403,39 @@ impl PlayerPresenter {
                 .collect::<Vec<_>>()
         };
 
+        if let (Some(profile), Some(offsets)) = (jiggle_profile, jiggle_offsets.as_deref()) {
+            for ((_, surface, _), result) in jobs.iter().zip(skinned.iter_mut()) {
+                if !profile.affects_surface(lod_index, surface.surface_index) {
+                    continue;
+                }
+                if let Ok(skinned_surface) = result {
+                    profile.deform_surface(
+                        lod_index,
+                        surface.surface_index,
+                        offsets,
+                        self.jiggle.tuning(),
+                        skinned_surface,
+                    );
+                }
+            }
+        }
+
+        let cloth_frames = if self.cloth.enabled() {
+            jobs.iter()
+                .zip(skinned.iter())
+                .filter_map(|((_, surface, _), skinned)| {
+                    let skinned = skinned.as_ref().ok()?;
+                    Self::cloth_surface_frame(glm, surface, skinned, pose)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut cloth_outputs =
+            self.simulate_cloth_frames(entity_num, model_label, lod_index, &cloth_frames, glm, surface_assets, gla, pose, axis, origin);
+
         let mut draws = Vec::with_capacity(jobs.len());
-        for ((asset, _, gpu_mesh), skinned) in jobs.into_iter().zip(skinned) {
+        for ((asset, surface, gpu_mesh), skinned) in jobs.into_iter().zip(skinned) {
             let skinned = skinned?;
             let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
                 [0.58, 0.58, 0.58, rgba[3]]
@@ -3068,17 +4451,14 @@ impl PlayerPresenter {
                     .vertices_skinned
                     .saturating_add(skinned.vertices.len() as u64);
             }
-            let vertices = skinned
-                .vertices
-                .into_iter()
-                .map(|vertex| DynamicModelVertex {
-                    position: transform_model_point(vertex.position, axis, origin),
-                    normal: transform_model_normal(vertex.normal, axis),
-                    uv: vertex.uv,
-                    color: surface_rgba,
-                })
-                .collect::<Vec<_>>();
-            if vertices.is_empty() || gpu_mesh.indices.is_empty() {
+            let vertices = Self::cpu_surface_vertices_with_cloth(
+                skinned,
+                cloth_outputs.remove(&surface.surface_index),
+                axis,
+                origin,
+                surface_rgba,
+            );
+            if vertices.is_empty() || gpu_mesh.cpu_indices.is_empty() {
                 continue;
             }
             let (texture, base_alpha_mode) = custom_material
@@ -3095,10 +4475,10 @@ impl PlayerPresenter {
                 wireframe_class: DynamicWireframeClass::Player,
                 raster_visible: true,
                 vertices: Arc::new(vertices),
-                indices: Arc::clone(&gpu_mesh.indices),
+                indices: Arc::clone(&gpu_mesh.cpu_indices),
                 lighting_origin: Some(origin),
                 rt_rigid: None,
-                rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.key)),
+                rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&gpu_mesh.base_key)),
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
                 texture,
@@ -3253,6 +4633,7 @@ impl PlayerPresenter {
             specular: skin.specular,
             bulge_height: bulge_height.unwrap_or(skin.bulge_height),
             env_map: env_map.unwrap_or(skin.env_map),
+            jiggle_offsets: skin.jiggle_offsets,
         });
         let vertices = if ghoul2_gpu.is_some() {
             Arc::clone(&surface.vertices)
@@ -3378,7 +4759,9 @@ impl PlayerPresenter {
             entity.number,
             &requested,
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            None,
             &pose,
             lod,
             axis,
@@ -3405,6 +4788,350 @@ impl PlayerPresenter {
         self.viewer_anim_debug
     }
 
+    fn queue_dismember_smoke(
+        &mut self,
+        model: &PlayerModelAsset,
+        pose: &[Matrix3x4],
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        tag: &str,
+    ) -> Result<(), String> {
+        let Some(matrix) = model_bolt_matrix_timed(
+            &mut self.perf,
+            &model.glm,
+            &model.gla,
+            pose,
+            tag,
+        )? else {
+            return Ok(());
+        };
+        let smoke_origin = transform_jka_model_point(
+            [matrix[0][3], matrix[1][3], matrix[2][3]],
+            axis,
+            origin,
+        );
+        // Public G2API_GetBoltMatrix's NEGATIVE_Y convention corresponds to
+        // -column 1 of the internal bolt matrix used by this presenter.
+        let smoke_dir = normalize_vec3(transform_jka_model_vector(
+            [-matrix[0][1], -matrix[1][1], -matrix[2][1]],
+            axis,
+        ));
+        self.fx_requests.push(PlayerFxRequest::EffectDir {
+            name: "blaster/smoke_bolton".to_owned(),
+            origin: smoke_origin,
+            dir: smoke_dir,
+        });
+        Ok(())
+    }
+
+    fn present_detached_limb(
+        &mut self,
+        entity: &PresentedEntity,
+        source_entity: Option<&PresentedEntity>,
+        current_time: i32,
+        view: Option<Ghoul2PresentationView>,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let level = self.ragdolls.dismemberment_level();
+        let Some(part) = DismemberPart::from_model_part(entity.state.field_i32("modelGhoul2").unwrap_or(0)) else {
+            return Ok(Vec::new());
+        };
+        if !part.allowed_at_level(level) {
+            return Ok(Vec::new());
+        }
+        let Some(source_num) = dismember_source_entity(entity) else {
+            return Ok(Vec::new());
+        };
+        let generation = dismember_generation(entity, source_num, part);
+        let needs_visual = self
+            .detached_limb_visuals
+            .get(&entity.number)
+            .is_none_or(|visual| visual.generation != generation);
+
+        if needs_visual {
+            let Some(source_entity) = source_entity else {
+                return Ok(Vec::new());
+            };
+            let presented_torso_anim = self
+                .entities
+                .get(&source_num)
+                .map(|runtime| runtime.animation.torso.animation_number);
+            if !dismember_source_ready(source_entity, presented_torso_anim) {
+                return Ok(Vec::new());
+            }
+            let Some(source) = self.dismember_source_snaps.get(&source_num).cloned() else {
+                // OpenJK waits for a valid source Ghoul2/death pose too. The
+                // next presentation frame will retry after the source is posed.
+                return Ok(Vec::new());
+            };
+            let spec = part.spec();
+            let surfaces = detached_limb_surface_set(
+                &source.model,
+                part,
+                self.dismembered.get(&source_num),
+            );
+            if surfaces.is_empty() {
+                return Err(format!(
+                    "{} has no Ghoul2 subtree for dismember part {:?}",
+                    source.model.key, part
+                ));
+            }
+
+            let rotate_bone = if part == DismemberPart::Waist
+                && model_bolt_matrix_timed(
+                    &mut self.perf,
+                    &source.model.glm,
+                    &source.model.gla,
+                    &source.pose,
+                    spec.rotate_bone,
+                )?
+                .is_none()
+            {
+                // Exact OpenJK non-humanoid fallback.
+                "pelvis"
+            } else {
+                spec.rotate_bone
+            };
+            let Some(bone_model) = model_bolt_matrix_timed(
+                &mut self.perf,
+                &source.model.glm,
+                &source.model.gla,
+                &source.pose,
+                rotate_bone,
+            )? else {
+                return Err(format!("{} has no dismember bone {rotate_bone}", source.model.key));
+            };
+            let source_world = presentation_matrix(source.axis, source.origin);
+            let spawn_body_matrix = multiply_3x4(
+                &source_world,
+                &scaled_bone_matrix(bone_model, source.model_scale),
+            );
+            let spawn_entity_matrix = source_world;
+
+            let capsule_local = if let Some(end_name) = spec.collider_b {
+                let endpoint_world = |presenter: &mut PlayerPresenter, bone: &str| -> Result<Option<[f32; 3]>, String> {
+                    Ok(model_bolt_matrix_timed(
+                        &mut presenter.perf,
+                        &source.model.glm,
+                        &source.model.gla,
+                        &source.pose,
+                        bone,
+                    )?
+                    .map(|matrix| {
+                        let matrix = scaled_bone_matrix(matrix, source.model_scale);
+                        affine_point(&source_world, [matrix[0][3], matrix[1][3], matrix[2][3]])
+                    }))
+                };
+                let a = endpoint_world(self, spec.collider_a)?;
+                let b = endpoint_world(self, end_name)?;
+                match (a, b, affine_inverse_3x4(&spawn_body_matrix)) {
+                    (Some(a), Some(b), Some(inverse)) => Some((
+                        affine_point(&inverse, a),
+                        affine_point(&inverse, b),
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let source_origin = source_entity.origin;
+            let outward = normalize_vec3([
+                entity.origin[0] - source_origin[0],
+                entity.origin[1] - source_origin[1],
+                entity.origin[2] - source_origin[2],
+            ]);
+            let network_velocity = super::entity_vec3(&source_entity.state, "pos.trDelta")
+                .unwrap_or([0.0; 3]);
+            let inherited = self
+                .ragdolls
+                .ragdoll_bone_velocity(source_num, &source.model.gla, rotate_bone)
+                .unwrap_or(network_velocity);
+            // Server G_Dismember adds an 80 u/s outward kick before optional
+            // saber-swing contribution. We can observe the source trajectory but
+            // not the server's private saber swing vector, so preserve the exact
+            // visible component and let Rapier take over from there.
+            let mut linear_velocity = [
+                inherited[0] + outward[0] * 80.0,
+                inherited[1] + outward[1] * 80.0,
+                inherited[2] + outward[2] * 80.0,
+            ];
+            if matches!(part, DismemberPart::Head | DismemberPart::Waist) {
+                // Exact server G_Dismember baseline before optional saber-swing
+                // contribution.
+                linear_velocity[2] += 10.0;
+            }
+            let mut spin_axis = [outward[1], -outward[0], 0.35];
+            spin_axis = normalize_vec3(spin_axis);
+            let spin = 2.6 + f32::from((entity.number % 5) as u8) * 0.35;
+            let angular_velocity = [spin_axis[0] * spin, spin_axis[1] * spin, spin_axis[2] * spin];
+
+            // Stock CG_General emits one blaster/smoke_bolton puff from both
+            // exposed cap tags when the sever is created. The detached cap then
+            // repeats every 400 ms while the server part is moving.
+            self.queue_dismember_smoke(
+                &source.model,
+                &source.pose,
+                source.axis,
+                source.origin,
+                spec.limb_tag,
+            )?;
+            self.queue_dismember_smoke(
+                &source.model,
+                &source.pose,
+                source.axis,
+                source.origin,
+                spec.stub_tag,
+            )?;
+
+            self.ragdolls.ensure_detached_limb(
+                DetachedLimbSpawn {
+                    entity: entity.number,
+                    generation,
+                    body_world: spawn_body_matrix,
+                    capsule_local,
+                    radius: spec.radius * source.model_scale,
+                    mass_kg: spec.mass_kg * source.model_scale.powi(3),
+                    linear_velocity,
+                    angular_velocity,
+                },
+                current_time,
+            );
+
+            self.detached_limb_visuals.insert(
+                entity.number,
+                DetachedLimbVisual {
+                    generation,
+                    source_entity: source_num,
+                    part,
+                    model: Arc::clone(&source.model),
+                    pose: source.pose,
+                    surfaces,
+                    spawn_entity_matrix,
+                    spawn_body_matrix,
+                    body_rgba: source.body_rgba,
+                    body_rgb: source.body_rgb,
+                    model1_weapon: source.model1_weapon,
+                    model1_primary_saber: source.model1_primary_saber,
+                    client_info: source.client_info,
+                    next_smoke_time: current_time.saturating_add(400),
+                },
+            );
+        }
+
+        let Some(visual) = self.detached_limb_visuals.get(&entity.number).cloned() else {
+            return Ok(Vec::new());
+        };
+        if visual.generation != generation {
+            return Ok(Vec::new());
+        }
+
+        // Rapier renders at display rate from the fixed-step interpolation. If
+        // client physics is off/unavailable, preserve OpenJK's server ExPhys
+        // translation while keeping the sever pose rigid.
+        let current_body = self
+            .ragdolls
+            .detached_limb_matrix(entity.number, generation)
+            .unwrap_or_else(|| {
+                let mut matrix = visual.spawn_body_matrix;
+                matrix[0][3] = entity.origin[0];
+                matrix[1][3] = entity.origin[1];
+                matrix[2][3] = entity.origin[2];
+                matrix
+            });
+        let render_matrix = affine_inverse_3x4(&visual.spawn_body_matrix)
+            .map(|inverse| multiply_3x4(&multiply_3x4(&current_body, &inverse), &visual.spawn_entity_matrix))
+            .unwrap_or(visual.spawn_entity_matrix);
+        let (axis, origin) = presentation_axis_origin(&render_matrix);
+        let lod = view.map_or(0, |view| {
+            ghoul2_lod_for_view(
+                view,
+                entity,
+                origin,
+                visual.model.glm.lods.len(),
+                self.lod_bias,
+                self.lod_scale,
+            )
+        });
+        let mut draws = self.render_glm_surfaces_tinted_selected(
+            entity.number,
+            &format!("{}#dismember-{:?}", visual.model.key, visual.part),
+            &visual.model.glm,
+            &visual.model.gla,
+            &visual.model.surfaces,
+            None,
+            &visual.pose,
+            lod,
+            axis,
+            origin,
+            visual.body_rgba,
+            visual.body_rgb,
+            None,
+            true,
+            Some(&visual.surfaces),
+        )?;
+        // Detached pieces are one rigid caster, not another articulated skin.
+        // CPU and GPU skinning both retain the frozen sever pose; the entity
+        // transform above supplies all subsequent movement.
+        for draw in &mut draws {
+            draw.lighting_origin = Some(origin);
+        }
+
+        // CG_General duplicates Ghoul2 after removing model slot 2/3 from the
+        // owner, so a held model-slot-1 weapon/hilt remains attached to the
+        // detached copy. Generic limb entities never run CG_AddSaberBlade, so
+        // saber hilts are rendered here without live blades/trails.
+        if visual.model1_primary_saber {
+            if let Err(error) = self.append_player_sabers(
+                &mut draws,
+                entity,
+                &visual.client_info,
+                &visual.model,
+                &visual.pose,
+                axis,
+                origin,
+                current_time,
+                visual.body_rgba[3],
+                [true, false],
+                false,
+            ) {
+                self.report_saber_warning_once(entity.number, &format!("dismember saber hilt: {error}"));
+            }
+        } else if let Some(weapon) = visual.model1_weapon {
+            if let Err(error) = self.append_held_weapon(
+                &mut draws,
+                entity,
+                weapon,
+                &visual.model,
+                &visual.pose,
+                axis,
+                origin,
+                current_time,
+                visual.body_rgba[3],
+            ) {
+                self.report_saber_warning_once(entity.number, &format!("dismember held weapon {weapon}: {error}"));
+            }
+        }
+
+        let tr_delta = super::entity_vec3(&entity.state, "pos.trDelta").unwrap_or([0.0; 3]);
+        let moving = tr_delta.iter().any(|value| value.abs() > f32::EPSILON);
+        if moving && current_time > visual.next_smoke_time {
+            let spec = visual.part.spec();
+            self.queue_dismember_smoke(
+                &visual.model,
+                &visual.pose,
+                axis,
+                origin,
+                spec.limb_tag,
+            )?;
+            if let Some(live) = self.detached_limb_visuals.get_mut(&entity.number) {
+                if live.generation == generation {
+                    live.next_smoke_time = current_time.saturating_add(400);
+                }
+            }
+        }
+        Ok(draws)
+    }
+
     pub fn present_snapshot_players(
         &mut self,
         entities: &[PresentedEntity],
@@ -3417,6 +5144,8 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        self.japro_cinfo2 = game.japro_cinfo2();
+        self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
         if let Some(snapshot) = game.current_snapshot() {
             let viewer_client = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
@@ -3438,12 +5167,15 @@ impl PlayerPresenter {
         let mut draws = Vec::new();
         let mut live_entities = HashSet::new();
         let mut live_ragdolls = HashSet::new();
+        let mut live_detached_limbs = HashSet::new();
+        let mut detached_entities = Vec::new();
         if let Some(entity_num) = preserve_entity {
             // The local/followed player is presented separately just like
             // OpenJK's predictedPlayerEntity, but it still owns persistent
             // centity/playerEntity state across frames.
             live_entities.insert(entity_num);
         }
+        live_entities.extend(self.external_live_entities.iter().copied());
         // CG_Player resolves lookTarget against cg_entities before BG_G2PlayerAngles.
         let entity_origins = entities
             .iter()
@@ -3451,10 +5183,52 @@ impl PlayerPresenter {
             .collect::<HashMap<_, _>>();
         self.duel_shell_gray = self.duel_shell_brightness(game, &entity_origins, preserve_entity);
 
+        // Authoritative dismemberment is transmitted as ET_GENERAL/G2_MODEL_PART.
+        // Apply the source surface mutation before CG_Player draws the corpse,
+        // then draw the detached copies after source poses have been evaluated.
+        let dismemberment_level = self.ragdolls.dismemberment_level();
+        if dismemberment_level == 0 {
+            self.dismembered.clear();
+            self.dismember_source_snaps.clear();
+            self.detached_limb_visuals.clear();
+        } else {
+            // OpenJK CG_ReattachLimb restores a living client instance.
+            for entity in entities.iter().filter(|entity| entity.entity_type == ET_PLAYER || entity.entity_type == ET_NPC) {
+                if entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD == 0 {
+                    self.dismembered.remove(&entity.number);
+                }
+            }
+            for entity in entities {
+                let Some(source) = dismember_source_entity(entity) else { continue };
+                let Some(part) = DismemberPart::from_model_part(entity.state.field_i32("modelGhoul2").unwrap_or(0)) else { continue };
+                if !part.allowed_at_level(dismemberment_level) {
+                    continue;
+                }
+                let Some(source_entity) = entities.iter().find(|candidate| candidate.number == source) else {
+                    continue;
+                };
+                // Match CG_General's creation gate before mutating the source
+                // surfaces. At this prepass point the cached torso animation is
+                // from the last presented frame; if no runtime exists yet, wait
+                // rather than cutting a source before its death pose is valid.
+                let presented_torso_anim = self
+                    .entities
+                    .get(&source)
+                    .map(|runtime| runtime.animation.torso.animation_number);
+                if !dismember_source_ready(source_entity, presented_torso_anim) {
+                    continue;
+                }
+                self.dismembered.entry(source).or_default().insert(part);
+                live_detached_limbs.insert(entity.number);
+                detached_entities.push(entity);
+            }
+        }
+
         // ET_PLAYER uses CG_Player and ET_NPC uses CG_G2Animated. ET_BODY is
         // CG_General in OpenJK; this Rust presenter still owns the shared body
         // mesh/ragdoll submission, but its weapon state comes only from ircg.
         // NPCs resolve `ci = cent->npcClient` instead of cgs.clientinfo[].
+        let intermission = game.rendering_intermission();
         for entity in entities
             .iter()
             .filter(|entity| {
@@ -3463,7 +5237,16 @@ impl PlayerPresenter {
                     || entity.entity_type == ET_BODY
             })
         {
+            // Hidden intermission entities remain live centities in TaystJK;
+            // only their CG_AddCEntity presentation is skipped. Preserve the
+            // cached Ghoul2 owner while withholding its draw/update work.
             live_entities.insert(entity.number);
+            // TaystJK CG_AddCEntity suppresses ET_PLAYER outright during
+            // intermission and suppresses ET_NPC only for vehicles. ET_BODY
+            // intentionally remains eligible, matching the original switch.
+            if suppressed_during_intermission(intermission, entity) {
+                continue;
+            }
             let entity_eflags = entity.state.field_i32("eFlags").unwrap_or(0);
             if entity.entity_type == ET_BODY
                 || entity_eflags & (EF_DEAD | EF_RAG) != 0
@@ -3580,6 +5363,7 @@ impl PlayerPresenter {
                 look_target_origin,
                 false,
                 hidden_first_person_entity != Some(entity.number),
+                false,
                 view,
             ) {
                 Ok(mut player_draws) => draws.append(&mut player_draws),
@@ -3607,17 +5391,40 @@ impl PlayerPresenter {
             }
         }
 
+        // G2_MODEL_PART is created by the server, but its old ExPhys motion is
+        // only 20 Hz. Clone the exact posed Ghoul2 subtree and hand one compact
+        // rigid body to Rapier; the server entity still decides that the sever
+        // happened and which part it was.
+        for limb in detached_entities {
+            let source_num = dismember_source_entity(limb);
+            let source = source_num.and_then(|source| entities.iter().find(|entity| entity.number == source));
+            match self.present_detached_limb(limb, source, current_time, view) {
+                Ok(mut limb_draws) => draws.append(&mut limb_draws),
+                Err(error) => self.report_player_status(limb.number, format!("dismember submitted=0 reason={error}")),
+            }
+        }
+        self.ragdolls.retain_detached_limbs(&live_detached_limbs);
+        self.detached_limb_visuals
+            .retain(|entity, _| live_detached_limbs.contains(entity));
+
         // The followed/local player may not exist in packet entities but can
         // still be an exact forceGripCripple victim. Keep that live ragdoll
         // until present_player_entity runs later in the frame.
         live_ragdolls.extend(self.force_gripped_entities.iter().copied());
         live_ragdolls.extend(self.active_impulse_ragdolls.keys().copied());
         self.entities.retain(|entity_num, _| live_entities.contains(entity_num));
+        self.jiggle.retain_entities(&live_entities);
+        let mut live_dismember_sources = live_entities.clone();
+        live_dismember_sources.extend(self.detached_limb_visuals.values().map(|visual| visual.source_entity));
+        self.dismember_source_snaps
+            .retain(|entity_num, _| live_dismember_sources.contains(entity_num));
+        self.dismembered.retain(|entity_num, _| live_dismember_sources.contains(entity_num));
         self.ragdolls.retain_visible(&live_ragdolls);
         self.thrown_sabers.retain(|entity_num, _| live_entities.contains(entity_num));
         self.player_diagnostics.retain(|entity_num, _| live_entities.contains(entity_num));
         if !self.logged_first_draw && !draws.is_empty() {
-            println!(
+            devprintln!(
+                1,
                 "PLAYER DRAW READY: players={} surfaces={}",
                 live_entities.len(),
                 draws.len(),
@@ -3639,6 +5446,7 @@ impl PlayerPresenter {
         look_target_origin: Option<[f32; 3]>,
         force_reset: bool,
         submit_geometry: bool,
+        first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let mut entity_alpha = entity_alpha;
@@ -3670,6 +5478,7 @@ impl PlayerPresenter {
             look_target_origin,
             force_reset,
             submit_geometry,
+            first_person_saber,
             view,
         );
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
@@ -3682,6 +5491,50 @@ impl PlayerPresenter {
         result
     }
 
+    /// Present a visual-only race ghost through the same player model/animation
+    /// path without player sprites, blob shadows, gameplay classification, or RT
+    /// shadow casting. Geometry still uses the normal depth test and view culling.
+    pub fn present_race_ghost_entity(
+        &mut self,
+        entity: &PresentedEntity,
+        info: &crate::cgame::ClientInfo,
+        current_time: i32,
+        entity_alpha: f32,
+        force_reset: bool,
+        view: Option<Ghoul2PresentationView>,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let previous_look = self.look;
+        self.look = crate::japro_cg::Appearance::NORMAL;
+        let footstep_count = self.footsteps.len();
+        let fx_request_count = self.fx_requests.len();
+        let footstep_stages = self.footstep_stages;
+        self.footstep_stages = FootstepStages { sounds: false, effects: false, marks: false };
+        let result = self.present_player(
+            entity,
+            info,
+            current_time,
+            entity_alpha.clamp(0.02, 1.0),
+            None,
+            force_reset,
+            true,
+            false,
+            view,
+        );
+        self.look = previous_look;
+        // The ghost is deliberately silent and visual-only. Do not even run
+        // footstep ground traces, and let no animation/force FX escape to the
+        // shared event/audio/WeaponFx queues. Cosmetic model draws are retained.
+        self.footstep_stages = footstep_stages;
+        self.footsteps.truncate(footstep_count);
+        self.fx_requests.truncate(fx_request_count);
+        let mut draws = result?;
+        for draw in &mut draws {
+            draw.rt_rigid = None;
+            draw.rt_skinned_key = None;
+        }
+        Ok(draws)
+    }
+
     fn present_player(
         &mut self,
         entity: &PresentedEntity,
@@ -3691,9 +5544,30 @@ impl PlayerPresenter {
         look_target_origin: Option<[f32; 3]>,
         force_reset: bool,
         submit_geometry: bool,
+        first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         self.poll_asset_completions();
+
+        // CG_NewClientInfo/CG_RegisterClientModelname normalize team presentation
+        // before model registration. Do the same here after any cg_forceModel
+        // rewrite, so model caching and async requests see the final team skin.
+        let mut team_info = info.clone();
+        if team_info.gametype >= crate::cgame::GT_TEAM
+            && team_info.gametype != crate::cgame::GT_SIEGE
+            && !team_info.jedi_v_merc
+        {
+            team_info.team_color_override = crate::cgame::validate_skin_for_team(
+                &team_info.model_name,
+                &mut team_info.skin_name,
+                team_info.team,
+                |qpath| self.assets.contains_qpath(qpath),
+            );
+        } else {
+            team_info.team_color_override = None;
+        }
+        let info = &team_info;
+
         let cached_model = self
             .entities
             .get(&entity.number)
@@ -3959,8 +5833,25 @@ impl PlayerPresenter {
                 }
             }
         }
-        let attached_weapon = runtime.attached_weapon;
-        let attached_sabers = [runtime.primary_saber_attached, runtime.secondary_saber_attached];
+        // Preserve model slot 1 before applying CG_General's source-instance
+        // mutations. The detached Ghoul2 copy is made after slot 2/3 are
+        // removed but before slot 1 is removed for weapon-arm/waist severs.
+        let detached_model1_weapon = runtime.attached_weapon;
+        let detached_model1_primary_saber = runtime.primary_saber_attached;
+        let mut attached_weapon = runtime.attached_weapon;
+        let mut attached_sabers = [runtime.primary_saber_attached, runtime.secondary_saber_attached];
+        if let Some(parts) = self.dismembered.get(&entity.number) {
+            // OpenJK removes Ghoul2 model index 2 from the source before every
+            // limb duplicate (and model index 3/jetpack as well). The duplicate
+            // therefore never contains the second saber.
+            attached_sabers[1] = false;
+            // After duplicating, model index 1 is removed from the source only
+            // when its weapon-holding subtree was actually severed.
+            if parts.iter().copied().any(DismemberPart::removes_weapon) {
+                attached_weapon = None;
+                attached_sabers[0] = false;
+            }
+        }
 
         // OpenJK renders ET_BODY through CG_General using the Ghoul2 instance
         // copied at respawn. Our renderer still owns the equivalent corpse pose
@@ -4323,7 +6214,10 @@ impl PlayerPresenter {
         let look = self.look;
         let (body_rgba, body_rgb, body_custom) = match look.ghost {
             crate::japro_cg::Ghost::None => {
-                let mut rgb = player_entity_rgb(entity);
+                let mut rgb = info.team_color_override.map_or_else(
+                    || player_entity_rgb(entity),
+                    |rgb| rgb.map(|channel| f32::from(channel) / 255.0),
+                );
                 if look.duel_bubble {
                     // Duelists seen from outside: shaderRGBA = 50 with RF_RGB_TINT.
                     rgb = [50.0 / 255.0; 3];
@@ -4339,11 +6233,52 @@ impl PlayerPresenter {
                 (rgba, [1.0; 3], Some(self.ghost_material(ghost)))
             }
         };
-        let mut draws = self.render_glm_surfaces_tinted(
+        let dismember_selection = source_dismember_surface_set(
+            &model,
+            self.dismembered.get(&entity.number),
+        );
+        if dismember_selection.is_some() {
+            self.dismember_source_snaps.insert(
+                entity.number,
+                DismemberSourceSnap {
+                    model: Arc::clone(&model),
+                    pose: pose.clone(),
+                    axis: render_axis,
+                    origin: render_origin,
+                    model_scale: ghoul2_model_scale(entity),
+                    body_rgba,
+                    body_rgb,
+                    model1_weapon: detached_model1_weapon,
+                    model1_primary_saber: detached_model1_primary_saber,
+                    client_info: info.clone(),
+                },
+            );
+        }
+
+        // EternalJK FPLS mode 3 keeps the local Ghoul2 instance alive so its
+        // attached saber hilt/blade presentation still works, but turns off the
+        // player-body roots. Do not replace this with a hand/gun viewmodel:
+        // EternalJK's saber FPLS path is the local Ghoul2 saber with the body
+        // hidden, while CG_AddViewWeapon is the separate firearm viewmodel path.
+        let fpls_surfaces;
+        let body_surfaces = if first_person_saber {
+            fpls_surfaces = model
+                .surfaces
+                .iter()
+                .filter(|surface| !fpls_mode3_surface_hidden(&surface.surface_name))
+                .cloned()
+                .collect::<Vec<_>>();
+            fpls_surfaces.as_slice()
+        } else {
+            model.surfaces.as_slice()
+        };
+        let mut draws = self.render_glm_surfaces_tinted_selected(
             entity.number,
             &model.key,
             &model.glm,
-            &model.surfaces,
+            &model.gla,
+            body_surfaces,
+            model.jiggle.as_deref(),
             &pose,
             body_lod,
             render_axis,
@@ -4352,7 +6287,27 @@ impl PlayerPresenter {
             body_rgb,
             body_custom,
             true,
+            dismember_selection.as_ref(),
         )?;
+
+        // TaystJK CG_Player model index 3: when EF_JETPACK is present, bolt
+        // models/weapons2/jetpack/model.glm to the player's *chestg bolt. The
+        // same child pose owns torso_ljet/torso_rjet, which are also the
+        // authoritative origins/directions for the stock Boba exhaust EFX.
+        if e_flags & EF_JETPACK != 0 && e_flags & EF_DEAD == 0 {
+            if let Err(error) = self.append_jetpack(
+                &mut draws,
+                entity,
+                &model,
+                &pose,
+                render_axis,
+                render_origin,
+                current_time,
+                entity_alpha,
+            ) {
+                self.report_saber_warning_once(entity.number, &format!("jetpack: {error}"));
+            }
+        }
 
         self.report_player_status(entity.number, format!(
             "clientNum={} requested={}/{} resolved={} bodySurfaces={} submitted={}",
@@ -4368,6 +6323,7 @@ impl PlayerPresenter {
                         vertices: Arc::clone(&skin.vertices),
                         indices: Arc::clone(&skin.indices),
                         bones: Arc::clone(&skin.bones),
+                        jiggle_offsets: skin.jiggle_offsets,
                         axis: skin.axis,
                         origin: skin.origin,
                     })
@@ -4453,6 +6409,149 @@ impl PlayerPresenter {
         Ok(draws)
     }
 
+    /// TaystJK/OpenJK CG_Player jetpack model-slot-3 presentation.
+    ///
+    /// The legacy renderer copies a preloaded Ghoul2 jetpack instance into
+    /// model index 3, whose parent bolt is player bolt 2 (`*chestg`). This
+    /// renderer has no mutable multi-model Ghoul2 instance, so the equivalent
+    /// is a child GLM pose rooted directly at the chest bolt.
+    #[allow(clippy::too_many_arguments)]
+    fn append_jetpack(
+        &mut self,
+        draws: &mut Vec<DynamicModelSurface>,
+        entity: &PresentedEntity,
+        player_model: &PlayerModelAsset,
+        player_pose: &[Matrix3x4],
+        player_axis: [[f32; 3]; 3],
+        player_origin: [f32; 3],
+        current_time: i32,
+        entity_alpha: f32,
+    ) -> Result<(), String> {
+        let Some(chest_bolt) = model_bolt_matrix_timed(
+            &mut self.perf,
+            &player_model.glm,
+            &player_model.gla,
+            player_pose,
+            "*chestg",
+        )? else {
+            return Err(format!("{} has no Ghoul2 *chestg bolt", player_model.key));
+        };
+
+        let jetpack = self.load_static_glm_in_game(JETPACK_MODEL, None, JETPACK_MODEL)?;
+        let pose_started = Instant::now();
+        let jetpack_pose = Ghoul2Animator::new(&jetpack.gla)
+            .evaluate_pose(&jetpack.gla, current_time, chest_bolt)?;
+        record_pose_eval(&mut self.perf, pose_started);
+
+        let mut jetpack_draws = self.render_glm_surfaces(
+            entity.number,
+            JETPACK_MODEL,
+            &jetpack.glm,
+            &jetpack.gla,
+            &jetpack.surfaces,
+            None,
+            &jetpack_pose,
+            0,
+            player_axis,
+            player_origin,
+            [1.0, 1.0, 1.0, entity_alpha],
+            None,
+            true,
+        )?;
+        draws.append(&mut jetpack_draws);
+
+        let e_flags = entity.state.field_i32("eFlags").unwrap_or(0);
+        if e_flags & EF_JETPACK_ACTIVE == 0 {
+            return Ok(());
+        }
+
+        if self.japro_cinfo2 & JAPRO_CINFO2_WTTRIBES != 0 {
+            // TaystJK's WTTRIBES branch does not use the model nozzle bolts:
+            // two vertical effects are placed around lerpOrigin using
+            // AngleVectors(turAngles).
+            // cent->turAngles is the legs angle output of BG_G2PlayerAngles;
+            // player_axis is the same AnglesToAxis result (possibly uniformly
+            // model-scaled), so normalize its basis back to directions.
+            let forward = normalize_vec3(player_axis[0]);
+            // AnglesToAxis stores model-left in axis[1]; AngleVectors returns
+            // right, so negate it to match the C code.
+            let model_left = normalize_vec3(player_axis[1]);
+            let right = [-model_left[0], -model_left[1], -model_left[2]];
+            let mut flame_pos = entity.origin;
+            for i in 0..3 {
+                flame_pos[i] -= 6.0 * forward[i];
+            }
+            flame_pos[2] += 22.0;
+            for i in 0..3 {
+                flame_pos[i] -= 6.0 * right[i];
+            }
+            self.fx_requests.push(PlayerFxRequest::EffectDir {
+                name: "effects/tribes/jet.efx".to_owned(),
+                origin: flame_pos,
+                dir: [0.0, 0.0, 1.0],
+            });
+            for i in 0..3 {
+                flame_pos[i] += 10.0 * right[i];
+            }
+            self.fx_requests.push(PlayerFxRequest::EffectDir {
+                name: "effects/tribes/jet.efx".to_owned(),
+                origin: flame_pos,
+                dir: [0.0, 0.0, 1.0],
+            });
+            return Ok(());
+        }
+
+        // G2API_GetBoltMatrix applies the legacy Ghoul2 270-degree yaw fixup
+        // before BG_GiveMeVectorFromMatrix sees the matrix. Our helper exposes
+        // the lower/raw matrix, so reconstruct the same public X/Y axes here:
+        // public +X = -raw column 1, public +Y = raw column 0.
+        for (index, tag) in ["torso_ljet", "torso_rjet"].into_iter().enumerate() {
+            let Some(matrix) = model_bolt_matrix_timed(
+                &mut self.perf,
+                &jetpack.glm,
+                &jetpack.gla,
+                &jetpack_pose,
+                tag,
+            )? else {
+                continue;
+            };
+            let mut origin = transform_jka_model_point(
+                [matrix[0][3], matrix[1][3], matrix[2][3]],
+                player_axis,
+                player_origin,
+            );
+            let positive_x = normalize_vec3(transform_jka_model_vector(
+                [-matrix[0][1], -matrix[1][1], -matrix[2][1]],
+                player_axis,
+            ));
+            let negative_y = normalize_vec3(transform_jka_model_vector(
+                [-matrix[0][0], -matrix[1][0], -matrix[2][0]],
+                player_axis,
+            ));
+            let (first_dir, final_dir) = if index == 0 {
+                (negative_y, positive_x)
+            } else {
+                (positive_x, negative_y)
+            };
+            for i in 0..3 {
+                origin[i] -= 9.5 * first_dir[i];
+                origin[i] -= 13.5 * final_dir[i];
+            }
+            let request = || PlayerFxRequest::EffectDir {
+                name: "effects/boba/jet.efx".to_owned(),
+                origin,
+                dir: final_dir,
+            };
+            self.fx_requests.push(request());
+            // EF_JETPACK_FLAMING deliberately submits the same authored EFX
+            // twice, matching TaystJK's FIXME-era behavior exactly.
+            if e_flags & EF_JETPACK_FLAMING != 0 {
+                self.fx_requests.push(request());
+            }
+        }
+        Ok(())
+    }
+
     /// Ghoul2 model index 1: the weapon's world GLM bolted to the player's
     /// right hand (G2API_SetBoltInfo(instance, 0, 0) -> bolt 0 = *r_hand).
     #[allow(clippy::too_many_arguments)]
@@ -4480,7 +6579,9 @@ impl PlayerPresenter {
             entity.number,
             &qpath,
             &weapon_model.glm,
+            &weapon_model.gla,
             &weapon_model.surfaces,
+            None,
             &pose,
             0,
             player_axis,
@@ -4511,7 +6612,7 @@ impl PlayerPresenter {
 
     fn report_player_status(&mut self, entity_num: u16, status: String) {
         if self.player_diagnostics.get(&entity_num) != Some(&status) {
-            println!("PLAYER PRESENTATION: entity={entity_num} {status}");
+            devprintln!(2, "PLAYER PRESENTATION: entity={entity_num} {status}");
             self.player_diagnostics.insert(entity_num, status);
         }
     }
@@ -4691,7 +6792,7 @@ impl PlayerPresenter {
             materials::shader_library(&mut self.assets, &mut shader_warnings, self.pbr)?;
         self.shaders = Arc::new(shaders);
         for warning in shader_warnings {
-            println!("PLAYER MATERIAL REFRESH WARNING: {warning}");
+            rverbose!(1, "PLAYER MATERIAL REFRESH WARNING: {warning}");
         }
         println!(
             "PLAYER ASSET REFRESH: shaderDefs={} mtrDefs={}",
@@ -4711,7 +6812,7 @@ impl PlayerPresenter {
         self.blob_shadow_texture_resolved = false;
         self.blob_shadow_asset_warned = false;
         if retried > 0 {
-            println!("[ASSET] retrying {retried} previously failed player asset(s)");
+            devprintln!(1, "[ASSET] retrying {retried} previously failed player asset(s)");
         }
         Ok(retried)
     }
@@ -4771,7 +6872,7 @@ impl PlayerPresenter {
     }
 
     fn report_saber_diagnostic_once(&mut self, key: String, message: String) {
-        if self.reported_saber_diagnostics.insert(key) {
+        if crate::logging::developer_enabled(2) && self.reported_saber_diagnostics.insert(key) {
             println!("{message}");
         }
     }
@@ -4856,7 +6957,9 @@ impl PlayerPresenter {
                 entity.number,
                 &definition.model,
                 &hilt.glm,
+                &hilt.gla,
                 &hilt.surfaces,
+                None,
                 &hilt_pose,
                 0,
                 player_axis,
@@ -4985,7 +7088,12 @@ impl PlayerPresenter {
                     );
                     0.0
                 };
-                let saber_color = blade_color(info, saber_color, &blade);
+                let client_color = if saber_num == 0 && self.saber_staff_multi_color && blade_index >= 1 {
+                    info.saber2_color
+                } else {
+                    saber_color
+                };
+                let saber_color = blade_color(info, client_color, &blade, Some(self.saber_team_colors));
                 if i32::from(entity.number) == self.viewer_client && blade_index < 8 {
                     if let Some(debug) = self.viewer_anim_debug.as_mut() {
                         debug.blade_world[saber_num][blade_index] = Some(origin_world);
@@ -5145,7 +7253,9 @@ impl PlayerPresenter {
             saber_entity.number,
             &definition.model,
             &hilt.glm,
+            &hilt.gla,
             &hilt.surfaces,
+            None,
             &hilt_pose,
             0,
             saber_axis,
@@ -5226,7 +7336,12 @@ impl PlayerPresenter {
             let presented_length = self.presented_saber_blade_length(
                 info.client_num, 0, blade_index, blade.length, -1.0, current_time,
             );
-            let saber_color = blade_color(info, info.saber_color, &blade);
+            let client_color = if self.saber_staff_multi_color && blade_index >= 1 {
+                info.saber2_color
+            } else {
+                info.saber_color
+            };
+            let saber_color = blade_color(info, client_color, &blade, Some(self.saber_team_colors));
             if i32::from(owner.number) == self.viewer_client && blade_index < 8 {
                 if let Some(debug) = self.viewer_anim_debug.as_mut() {
                     debug.blade_world[0][blade_index] = Some(origin_world);
@@ -5310,7 +7425,8 @@ impl PlayerPresenter {
         )
         .to_ascii_lowercase();
         if self.reported_vehicle_fallbacks.insert(warning_key) {
-            println!(
+            rverbose!(
+                1,
                 "VEHICLE MODEL FALLBACK: entity={} requested={} resolved={} skin={} reason={}; using {}",
                 entity_num,
                 requested,
@@ -5938,7 +8054,21 @@ impl PlayerPresenter {
         custom_shader: Option<&str>,
         current_time: i32,
     ) -> Result<Vec<DynamicModelSurface>, String> {
-        let model = self.load_static_glm(model_qpath, None, model_qpath)?;
+        let mut model = self.load_static_glm(model_qpath, None, model_qpath)?;
+        // TaystJK/OpenJK CG_General initializes the Ghoul2 model first, then
+        // checks G2API_SkinlessModel and, when needed, applies the sibling
+        // `model_default.skin`. Our no-skin registration yields no drawable
+        // surfaces for that same class of GLM, so perform the identical
+        // fallback before submitting the entity. A missing default skin is
+        // non-fatal in OpenJK (R_RegisterSkin returns handle 0), so retain the
+        // original registration if this optional lookup fails.
+        if model.surfaces.is_empty() {
+            if let Some(default_skin) = sibling_default_skin_qpath(model_qpath) {
+                if let Ok(skinned) = self.load_static_glm(model_qpath, Some(&default_skin), model_qpath) {
+                    model = skinned;
+                }
+            }
+        }
         let pose_started = Instant::now();
         let pose = Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
         record_pose_eval(&mut self.perf, pose_started);
@@ -5947,7 +8077,9 @@ impl PlayerPresenter {
             entity_num,
             model_qpath,
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            None,
             &pose,
             0,
             axis,
@@ -5980,7 +8112,9 @@ impl PlayerPresenter {
             0,
             &info.model_qpath(),
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            model.jiggle.as_deref(),
             &pose,
             0,
             axis,
@@ -6060,7 +8194,9 @@ impl PlayerPresenter {
             0,
             &info.model_qpath(),
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            model.jiggle.as_deref(),
             &pose,
             0,
             axis,
@@ -6098,7 +8234,9 @@ impl PlayerPresenter {
                     0,
                     &definition.model,
                     &hilt.glm,
+                    &hilt.gla,
                     &hilt.surfaces,
+                    None,
                     &hilt_pose,
                     0,
                     axis,
@@ -6162,7 +8300,7 @@ impl PlayerPresenter {
                     let origin_world = transform_jka_model_point(origin_model, axis, origin);
                     let dir_world = normalize_vec3(transform_jka_model_vector(dir_model, axis));
                     let blade = definition.blade(blade_index);
-                    let color = blade_color(info, client_color, &blade);
+                    let color = blade_color(info, client_color, &blade, None);
                     let secondary_style = definition.blade_style2_start > 0
                         && blade_index >= definition.blade_style2_start;
                     let trail_style = if secondary_style { definition.trail_style2 } else { definition.trail_style };
@@ -6235,7 +8373,9 @@ impl PlayerPresenter {
             0,
             &definition.model,
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            None,
             &pose,
             0,
             axis,
@@ -6278,7 +8418,9 @@ impl PlayerPresenter {
             entity_num,
             model_qpath,
             &model.glm,
+            &model.gla,
             &model.surfaces,
+            None,
             &pose,
             0,
             axis,
@@ -6364,7 +8506,7 @@ impl PlayerPresenter {
             });
         if texture.is_none() {
             if let Some(warning) = self.textures.warnings.last() {
-                println!("PLAYER TEXTURE WARNING: {warning}");
+                rverbose!(1, "PLAYER TEXTURE WARNING: {warning}");
             }
         }
         (texture, stage.alpha_mode)
@@ -7409,7 +9551,7 @@ models/players/test/plain_opaque
                         let client = followed.state.field_i32("clientNum").unwrap_or(0) as usize;
                         let Some(info) = game.client_info(client, &[]) else { continue };
                         let draws = presenter
-                            .present_player_entity(&followed, &info, snapshot.server_time, 1.0, None, false, true, None)
+                            .present_player_entity(&followed, &info, snapshot.server_time, 1.0, None, false, true, false, None)
                             .unwrap();
                         let weapon = followed.state.field_i32("weapon").unwrap_or(0);
                         let attached = presenter.entities[&followed.number].attached_weapon;
@@ -7870,8 +10012,11 @@ fn blade_color(
     info: &crate::cgame::ClientInfo,
     client_color: i32,
     blade: &jka_assets::saber::SaberBladeDefinition,
+    saber_team_colors: Option<bool>,
 ) -> i32 {
     let color = if info.definition_saber_colors { blade.color } else { client_color };
+    let color = saber_team_colors
+        .map_or(color, |force| crate::cgame::team_saber_color(info, color, force));
     crate::cgame::apply_plugin_saber_color(color, info.plugin_disable)
 }
 

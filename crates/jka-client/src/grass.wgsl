@@ -11,8 +11,8 @@ struct CameraUniform {
     camera_forward: vec4<f32>,
 };
 
-// Pipeline-specialized: false compiles the self-applied Legacy fog out entirely.
-// Rebuilt only when FogSystem::legacy_self_fog toggles, never checked per frame.
+// Pipeline-specialized: false compiles self-applied Legacy fog out entirely.
+// Rebuilt only when global/manual or source-local Legacy fog activation changes.
 override ENABLE_LEGACY_FOG: bool = false;
 
 struct GrassGlobals {
@@ -25,8 +25,11 @@ struct GrassGlobals {
     weather_wind: vec4<f32>,
     // Self-applied Legacy fog: linear RGB, depthForOpaque.
     legacy_fog_color_depth: vec4<f32>,
-    // x: 0 off, 1 authored global EXP2, 2 manual; y: strength scale.
+    // x: 0 off, 1 authored global EXP2, 2 manual; y: self-fog scale;
+    // z: local brush-fog authored scale.
     legacy_fog_params: vec4<f32>,
+    // Slot 0 is none. Slots 1..255 mirror local BSP fogs used by grass roots.
+    local_fog_color_depth: array<vec4<f32>, 256>,
 };
 
 struct ShadowSettings {
@@ -74,6 +77,7 @@ struct VertexOutput {
     @location(4) blade_random: f32,
     @location(5) baked_light: vec3<f32>,
     @location(6) ground_tint: vec4<f32>,
+    @location(7) @interpolate(flat) fog_slot: u32,
 };
 
 // Source: https://www.shadertoy.com/view/Xt3cDn
@@ -265,6 +269,7 @@ struct LoadedGrassInstance {
     baked_light: vec4<f32>,
     ground_tint: vec4<f32>,
     clump_values: vec3<f32>,
+    fog_slot: u32,
 };
 
 fn load_grass_instance(index: u32) -> LoadedGrassInstance {
@@ -278,7 +283,9 @@ fn load_grass_instance(index: u32) -> LoadedGrassInstance {
         grass_instances.words[base + 1u],
         grass_instances.words[base + 2u],
     ));
-    result.height = bitcast<f32>(grass_instances.words[base + 3u]);
+    let height_fog_word = grass_instances.words[base + 3u];
+    result.height = bitcast<f32>(height_fog_word & 0xffffff00u);
+    result.fog_slot = height_fog_word & 0xffu;
     let baked_word = grass_instances.words[base + 4u];
     let ground_word = grass_instances.words[base + 5u];
     result.baked_light = unpack4x8unorm(baked_word);
@@ -443,16 +450,39 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.blade_random = hash1;
     out.baked_light = instance.baked_light.rgb;
     out.ground_tint = instance.ground_tint;
+    out.fog_slot = instance.fog_slot;
     return out;
+}
+
+fn grass_legacy_srgb_channel_to_linear(value: f32) -> f32 {
+    let c = clamp(value, 0.0, 1.0);
+    return select(c / 12.92, pow((c + 0.055) / 1.055, 2.4), c > 0.04045);
+}
+
+fn grass_legacy_authored_fog_color(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        grass_legacy_srgb_channel_to_linear(color.r),
+        grass_legacy_srgb_channel_to_linear(color.g),
+        grass_legacy_srgb_channel_to_linear(color.b)
+    );
 }
 
 // Legacy fog: procedural grass is not a BSP material stage, so it fogs itself
 // with the same curves as bsp.wgsl legacy_fog_color_amount (see
 // FogSystem::legacy_self_fog). Legacy 1 authored global fog is instead composited
 // in post over the grass using the ground depth behind it.
-fn apply_grass_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
+fn apply_grass_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>, fog_slot: u32) -> vec3<f32> {
     if (!ENABLE_LEGACY_FOG) {
         return rgb;
+    }
+    if (fog_slot != 0u) {
+        let local_fog = grass.local_fog_color_depth[min(fog_slot, 255u)];
+        if (local_fog.a > 0.0) {
+            let radial = distance(world_position, camera.camera_pos_time.xyz)
+                / max(local_fog.a, 0.001);
+            let amount = clamp(radial * grass.legacy_fog_params.z, 0.0, 1.0);
+            return mix(rgb, grass_legacy_authored_fog_color(local_fog.rgb), amount);
+        }
     }
     let mode = grass.legacy_fog_params.x;
     if (mode < 0.5) {
@@ -582,7 +612,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let ambient = baked_tint * ambient_strength;
 
     let lit = albedo * (ambient + direct) + edge_transmission;
-    return vec4<f32>(apply_grass_legacy_fog(lit, input.world_position), 1.0);
+    return vec4<f32>(apply_grass_legacy_fog(lit, input.world_position, input.fog_slot), 1.0);
 }
 
 @fragment

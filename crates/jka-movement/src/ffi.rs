@@ -74,6 +74,7 @@ unsafe extern "C" {
         classname: *mut *const c_char,
         world_model: *mut *const c_char,
         world_model2: *mut *const c_char,
+        view_model: *mut *const c_char,
         item_type: *mut i32,
         tag: *mut i32,
         quantity: *mut i32,

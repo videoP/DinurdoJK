@@ -99,9 +99,15 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
             );
         }
         if (kind == 5u) {
-            let wave = a.y
-                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
-            uv = uv + vec2<f32>(wave);
+            // Matches OpenJK's RB_CalcTurbulentTexCoords: driven by vertex
+            // world position (scaled), not by the surface's own UV, which
+            // aliases badly on any surface that tiles many times.
+            let now = a.w + time * b.x;
+            let wave = vec2<f32>(
+                sin((now + (input.position.x + input.position.y) * 0.0009765625) * 6.28318530718) * a.z,
+                sin((now - input.position.z * 0.0009765625) * 6.28318530718) * a.z
+            );
+            uv = uv + wave;
         }
     }
     return uv;

@@ -111,6 +111,16 @@ pub fn plugin_disable_option(bit: u8) -> Option<&'static PluginDisableOption> {
     JAPRO_PLUGIN_DISABLE_OPTIONS.iter().find(|option| option.bit == bit)
 }
 
+/// TaystJK `CG_AmRun_f`: keep only the declared cp_pluginDisable range, then
+/// XOR the jaPRO Jawa/new-run-animation preference bit.
+///
+/// TaystJK's plugin-disable range currently occupies bits 0..=28.
+const PLUGIN_DISABLE_MASK: i32 = (1i32 << 29) - 1;
+
+pub fn toggle_run_animation(bits: i32) -> i32 {
+    plugin_disable::JAWA_RUN ^ (bits & PLUGIN_DISABLE_MASK)
+}
+
 /// `cg_stylePlayer` bits (jaPRO cg_local.h `JAPRO_STYLE_*`).
 pub mod style {
     /// Draw the private-duel glow shell (brighter the closer your opponent is).
@@ -392,12 +402,10 @@ impl Appearance {
 
 pub const MV_COOP_JKA: i32 = 15;
 
-/// jaPRO `IntegerToRaceName`: `movementStyle_e` -> lowercase style name. For
-/// `MV_COOP_JKA` the partner (`duelIndex`, only while `duelInProgress`) is
-/// appended when their clientinfo is valid and named. `partner_name` is that
-/// lookup, already `None` for an invalid/unnamed partner.
-pub fn integer_to_race_name(style: i32, dueling: bool, partner_name: Option<&str>) -> String {
-    let name = match style {
+/// Stable lowercase jaPRO movement-style slug. These names are also used by
+/// the public race archive (`.../{course}-{style}.json`).
+pub fn movement_style_slug(style: i32) -> Option<&'static str> {
+    Some(match style {
         0 => "siege",
         1 => "jka",
         2 => "qw",
@@ -417,8 +425,16 @@ pub fn integer_to_race_name(style: i32, dueling: bool, partner_name: Option<&str
         16 => "ocpm",
         17 => "tribes",
         18 => "surf",
-        _ => return "ERROR".to_owned(),
-    };
+        _ => return None,
+    })
+}
+
+/// jaPRO `IntegerToRaceName`: `movementStyle_e` -> lowercase style name. For
+/// `MV_COOP_JKA` the partner (`duelIndex`, only while `duelInProgress`) is
+/// appended when their clientinfo is valid and named. `partner_name` is that
+/// lookup, already `None` for an invalid/unnamed partner.
+pub fn integer_to_race_name(style: i32, dueling: bool, partner_name: Option<&str>) -> String {
+    let Some(name) = movement_style_slug(style) else { return "ERROR".to_owned() };
     if style != MV_COOP_JKA {
         return name.to_owned();
     }
@@ -846,6 +862,22 @@ mod tests {
             seen |= option.mask();
             assert_eq!(plugin_disable_option(option.bit), Some(option));
         }
+    }
+
+    #[test]
+    fn amrun_matches_taystjk_xor_and_mask_behavior() {
+        assert_eq!(toggle_run_animation(0), plugin_disable::JAWA_RUN);
+        assert_eq!(toggle_run_animation(plugin_disable::JAWA_RUN), 0);
+
+        let other = plugin_disable::NO_ROLL | plugin_disable::CHATBOX_CP;
+        assert_eq!(toggle_run_animation(other), other | plugin_disable::JAWA_RUN);
+        assert_eq!(
+            toggle_run_animation(other | plugin_disable::JAWA_RUN),
+            other
+        );
+
+        // CG_AmRun_f masks cp_pluginDisable before XORing the Jawa-run bit.
+        assert_eq!(toggle_run_animation(1i32 << 30), plugin_disable::JAWA_RUN);
     }
 
     #[test]

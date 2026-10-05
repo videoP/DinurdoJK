@@ -5,6 +5,7 @@ use support::{animations, player, Map};
 
 fn japro() -> PredictSettings {
     PredictSettings {
+        backend: 1,
         server_mod: 1,
         ..PredictSettings::default()
     }
@@ -142,6 +143,24 @@ fn player_styles_replay_deterministically_across_interleaved_backends() {
                 .all(|v| v.is_finite()));
         }
     }
+}
+
+#[test]
+fn japlus_uses_tayst_backend_with_its_own_server_identity_and_cinfo() {
+    let mut p = player(24.125);
+    let settings = PredictSettings {
+        backend: 1,
+        server_mod: 2,
+        cinfo: (1 << 0) | (1 << 3), // JA+ flipkick + fixroll3
+        hook_pull: 800,
+        ..PredictSettings::default()
+    };
+    p.configure(&settings).unwrap();
+    // Configuration must not alter the authoritative wire state. The actual
+    // JA+ feature branches are exercised inside the vendored TaystJK Pmove.
+    let before = p.network();
+    p.configure(&settings).unwrap();
+    assert_eq!(p.network(), before);
 }
 
 #[test]

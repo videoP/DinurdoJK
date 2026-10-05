@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>Cloth replay: production solver and real assets</title>
+<style>body{background:#171a20;color:#eee;font:15px system-ui;margin:20px}canvas{background:#252a35;width:100%;height:76vh}label{margin:10px}select{max-width:95%;padding:6px}p{color:#aaa}</style>
+<h2>Cloth replay — worst frame per scenario</h2>
+<button id="play">Play / pause</button> <select id="frame"></select><label><input type="checkbox" id="authored">Authored cloth</label><label><input type="checkbox" id="caps">Body proxies</label>
+<p>Drag to rotate · wheel to zoom. Brown: simulated cloth. Green: body mesh. Wire outline: authored cloth. This is geometry inspection, without game textures or lighting.</p><canvas id="view"></canvas>
+<script>
+const data=__SNAPSHOTS__;
+const list=document.querySelector('#frame'),canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d');
+data.forEach((f,i)=>{const o=document.createElement('option');o.value=i;o.textContent=f.label;list.append(o)});
+list.value=new URLSearchParams(location.search).get('frame')||0;
+let yaw=+(new URLSearchParams(location.search).get('yaw')||.6),pitch=.15,zoom=7,drag=null,playing=null;
+document.querySelector('#play').onclick=()=>{if(playing){clearInterval(playing);playing=null}else{playing=setInterval(()=>{list.value=(+list.value+1)%data.length;render()},125)}};
+function project(p){const x=p[0]*Math.cos(yaw)-p[1]*Math.sin(yaw),depth=p[0]*Math.sin(yaw)+p[1]*Math.cos(yaw);
+return [canvas.width/2+x*zoom,canvas.height*.68-(p[2]*Math.cos(pitch)-depth*Math.sin(pitch))*zoom,depth*Math.cos(pitch)+p[2]*Math.sin(pitch)];}
+function render(){canvas.width=canvas.clientWidth;canvas.height=canvas.clientHeight;ctx.clearRect(0,0,canvas.width,canvas.height);
+const f=data[+list.value],tris=[];
+for(const mesh of [...f.body.map(m=>({...m,color:'#577c67'})),...f.cloth.map(m=>({...m,color:'#785040'}))]){
+const p=mesh.points.map(project);for(const t of mesh.triangles)tris.push({p:t.map(i=>p[i]),color:mesh.color})}
+tris.sort((a,b)=>a.p.reduce((s,p)=>s+p[2],0)-b.p.reduce((s,p)=>s+p[2],0));
+for(const t of tris){ctx.beginPath();t.p.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));ctx.closePath();ctx.fillStyle=t.color;ctx.fill();ctx.strokeStyle='#1114';ctx.stroke()}
+if(document.querySelector('#authored').checked){ctx.strokeStyle='#91cfb680';for(const m of f.cloth){const p=m.authored.map(project);for(const t of m.triangles){ctx.beginPath();t.forEach((i,j)=>j?ctx.lineTo(...p[i].slice(0,2)):ctx.moveTo(...p[i].slice(0,2)));ctx.closePath();ctx.stroke()}}}
+if(document.querySelector('#caps').checked){for(const c of f.capsules){
+if(c.basis){ctx.lineWidth=1.5;ctx.strokeStyle='#e3a8ffaa';for(const [u,v] of [[0,1],[0,2],[1,2]]){ctx.beginPath();for(let i=0;i<=48;i++){const t=i/48*Math.PI*2,p=c.a.map((a,j)=>a+c.basis[u][j]*Math.cos(t)+c.basis[v][j]*Math.sin(t)),q=project(p);i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1])}ctx.stroke()}}
+else{const a=project(c.a),b=project(c.b);ctx.strokeStyle='#d196db55';ctx.lineCap='round';ctx.lineWidth=c.radius*2*zoom;ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke()}}ctx.lineWidth=1}
+ctx.fillStyle='#fff';ctx.fillText(f.label,12,24)}
+list.onchange=render;document.querySelector('#authored').onchange=render;document.querySelector('#caps').onchange=render;
+canvas.onpointerdown=e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId)};
+canvas.onpointermove=e=>{if(drag){yaw+=(e.clientX-drag[0])*.008;pitch+=(e.clientY-drag[1])*.008;drag=[e.clientX,e.clientY];render()}};
+canvas.onpointerup=()=>drag=null;canvas.onwheel=e=>{e.preventDefault();zoom*=Math.exp(-e.deltaY*.001);render()};
+window.onresize=render;render();
+</script>

@@ -18,6 +18,7 @@ pub(crate) struct GpuSnap {
     pub vertices: Arc<Vec<Ghoul2GpuVertex>>,
     pub indices: Arc<Vec<u32>>,
     pub bones: Arc<Vec<Ghoul2GpuBone>>,
+    pub jiggle_offsets: [[f32; 4]; 4],
     pub axis: [[f32; 3]; 3],
     pub origin: [f32; 3],
 }
@@ -64,7 +65,7 @@ pub(crate) fn skin_vertex(vertex: &Ghoul2GpuVertex, snap: &GpuSnap) -> ([f32; 3]
         }
         out
     };
-    let model = match vertex.weight_count {
+    let mut model = match vertex.weight_count {
         0 | 1 => point(0),
         2 => {
             let (p0, p1) = (point(0), point(1));
@@ -73,6 +74,23 @@ pub(crate) fn skin_vertex(vertex: &Ghoul2GpuVertex, snap: &GpuSnap) -> ([f32; 3]
         3 => lerp3(&[(point(0), w[0]), (point(1), w[1]), (point(2), 1.0 - w[0] - w[1])]),
         _ => lerp3(&[(point(0), w[0]), (point(1), w[1]), (point(2), w[2]), (point(3), 1.0 - w[0] - w[1] - w[2])]),
     };
+    if vertex.jiggle_weight > 0.0 && vertex.jiggle_region < 4 {
+        let offset = snap.jiggle_offsets[vertex.jiggle_region as usize];
+        let overall = snap.jiggle_offsets[0][3];
+        let effective_weight = if vertex.jiggle_coord.abs() < 2.0 {
+            let lift = snap.jiggle_offsets[3][3];
+            let t = ((vertex.jiggle_coord - (-0.70 + lift))
+                / ((-0.15 + lift) - (-0.70 + lift)))
+                .clamp(0.0, 1.0);
+            let vertical = t * t * (3.0 - 2.0 * t);
+            vertex.jiggle_weight * overall * snap.jiggle_offsets[2][3] * vertical
+        } else {
+            vertex.jiggle_weight * overall * snap.jiggle_offsets[1][3]
+        };
+        for axis in 0..3 {
+            model[axis] += offset[axis] * effective_weight;
+        }
+    }
     let model_normal = bone(0).map_or(vertex.normal, |bone| transform_vector(bone, vertex.normal));
     let to_world = |m: [f32; 3], with_origin: bool| -> [f32; 3] {
         std::array::from_fn(|i| {
@@ -242,7 +260,9 @@ mod tests {
             bone_indices: [0; 4],
             weights: [1.0, 0.0, 0.0, 0.0],
             weight_count: 1,
-            _padding: [0; 3],
+            jiggle_region: u32::MAX,
+            jiggle_weight: 0.0,
+            jiggle_coord: 4.0,
         }
     }
 
@@ -259,6 +279,7 @@ mod tests {
             ]),
             indices: Arc::new(vec![0, 1, 2, 0, 2, 3]),
             bones: Arc::new(vec![bone]),
+            jiggle_offsets: [[0.0; 4]; 4],
             axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             origin: [0.0, 0.0, 0.0],
         }

@@ -315,7 +315,12 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 
 // Stage tcMods (scroll/scale/rotate/transform/turb) applied to base coordinates.
 // Shared by the per-vertex generated_uv and the per-pixel sky cloud layer.
-fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
+// `world_pos` is the vertex position in this renderer's [x, z, -y] render
+// space (JKA [x, y, z]); it only matters for tcMod turb (kind 5), which
+// OpenJK's RB_CalcTurbulentTexCoords drives from (JKA x + JKA z) for S and
+// JKA y for T, scaled by 1/128 * 0.125, NOT from the surface's own UV -
+// using UV there aliases badly on any surface that tiles many times.
+fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
     let time = camera.camera_pos_time.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
@@ -345,9 +350,12 @@ fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
             );
         }
         if (kind == 5u) {
-            let wave = a.y
-                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
-            uv = uv + vec2<f32>(wave);
+            let now = a.w + time * b.x;
+            let wave = vec2<f32>(
+                sin((now + (world_pos.x + world_pos.y) * 0.0009765625) * 6.28318530718) * a.z,
+                sin((now - world_pos.z * 0.0009765625) * 6.28318530718) * a.z
+            );
+            uv = uv + wave;
         }
     }
     return uv;
@@ -376,7 +384,7 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
 
-    return apply_tc_mods(uv);
+    return apply_tc_mods(uv, input.position);
 }
 
 // Promoted water does not draw its authored brush face. It draws a clipmap
@@ -687,6 +695,30 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOut {
     return world_vertex(input, instance_index, legacy_dlight_surface_id);
+}
+
+// OpenJK does not rasterize the authored sky brush at its literal world-space
+// depth. The brush polygons only determine which angular part of the sky is
+// visible; the generated outer sky is placed at zFar. Keep the original X/Y/W
+// projection here so the BSP polygon remains the visibility mask, but force the
+// reversed-Z depth to 0 (the camera far plane). This prevents distanceCull from
+// clipping distant sky brushes while leaving ordinary world geometry unchanged.
+fn sky_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: u32) -> VertexOut {
+    var output = world_vertex(input, instance_index, legacy_dlight_surface_id);
+    output.clip_position.z = 0.0;
+    return output;
+}
+
+@vertex fn vs_sky(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return sky_vertex(input, instance_index, 0xffffffffu);
+}
+
+@vertex fn vs_sky_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return sky_vertex(input, instance_index, legacy_dlight_surface_id);
 }
 
 fn geometric_frame(input: VertexOut) -> mat3x3<f32> {
@@ -1988,12 +2020,14 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     if (drawfog_mode < 1.5) {
         return color;
     }
-    // Legacy 2 is emitted as one post-material EXP2 geometry pass for all
-    // authored BSP fog in DinurdoJK. Mixing an in-stage path with a fallback
-    // path produced visibly different fog strengths between materials even at
-    // the same depth. The separate pass preserves one equation/order for every
-    // fogged BSP surface while still leaving dynamic entities untouched.
-    if (drawfog_mode >= 1.5 && map_has_authored_fog && has_map_fog) {
+    // Legacy 2 uses fixed-function-style per-stage fog when the material can
+    // reproduce it exactly; that path is required for OpenJK's black/white fog
+    // overrides on additive/filter stages. Complex destination-dependent
+    // materials still fall back to the post-material geometry pass.
+    if (drawfog_mode >= 1.5
+        && map_has_authored_fog
+        && has_map_fog
+        && surface_fog.flags.z < 0.5) {
         return color;
     }
     // If this map has authored fog, the strength control scales that authored
@@ -2069,13 +2103,14 @@ fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
     // Legacy 1 global opaque/depth-writing geometry is fogged later in
     // display-space to match OpenJK's old gamma/LDR framebuffer blend. Local
     // fog and transparent-only global geometry still use this pass. Legacy 2
-    // routes every authored fogged BSP surface through this geometry pass so
-    // all materials share the same EXP2 equation and ordering.
+    // uses it only when the material cannot safely reproduce fixed-function
+    // fog per stage.
     let legacy1_geometry = drawfog_mode < 1.5
         && (surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5);
     let legacy2_geometry = drawfog_mode >= 1.5
         && map_has_authored_fog
-        && has_map_fog;
+        && has_map_fog
+        && surface_fog.flags.z < 0.5;
     let separate_pass = legacy1_geometry || legacy2_geometry;
     if (!separate_pass) {
         return vec4<f32>(0.0);
@@ -3069,7 +3104,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     if (d.z < 0.0 && a.z >= a.x && a.z >= a.y) {
         discard;
     }
-    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z));
+    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
     var stage_color = material.color;
     if ((material.header.z & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);

@@ -80,6 +80,7 @@ struct LoadedGrassInstance {
     baked_light: u32,
     ground_tint: u32,
     clump_values: vec3<f32>,
+    fog_slot: u32,
 };
 
 fn load_grass_instance(index: u32) -> LoadedGrassInstance {
@@ -90,7 +91,9 @@ fn load_grass_instance(index: u32) -> LoadedGrassInstance {
         grass_instances.words[base + 1u],
         grass_instances.words[base + 2u],
     ));
-    result.height = bitcast<f32>(grass_instances.words[base + 3u]);
+    let height_fog_word = grass_instances.words[base + 3u];
+    result.height = bitcast<f32>(height_fog_word & 0xffffff00u);
+    result.fog_slot = height_fog_word & 0xffu;
     result.baked_light = grass_instances.words[base + 4u];
     result.ground_tint = grass_instances.words[base + 5u];
     let packed_clump = ((result.baked_light >> 24u) & 0xffu)
@@ -107,6 +110,7 @@ fn store_prepared(
     output_index: u32,
     root_world: vec3<f32>,
     authored_height_scale: f32,
+    fog_slot: u32,
     camera_distance_m: f32,
     crushed_factor: f32,
     height_offset: f32,
@@ -124,7 +128,8 @@ fn store_prepared(
     prepared_instances.words[base + 0u] = bitcast<u32>(root_world.x);
     prepared_instances.words[base + 1u] = bitcast<u32>(root_world.y);
     prepared_instances.words[base + 2u] = bitcast<u32>(root_world.z);
-    prepared_instances.words[base + 3u] = bitcast<u32>(authored_height_scale);
+    prepared_instances.words[base + 3u] =
+        (bitcast<u32>(authored_height_scale) & 0xffffff00u) | (fog_slot & 0xffu);
     // Half precision is ample for a 200 m grass radius and frees the other half
     // of this existing word for the source-faithful player crush factor.
     prepared_instances.words[base + 4u] = pack2x16float(vec2<f32>(camera_distance_m, crushed_factor));
@@ -319,6 +324,7 @@ fn cs_main(
         output_index,
         root_world,
         authored_height_scale,
+        instance.fog_slot,
         camera_distance_m,
         crushed_factor,
         height_offset,

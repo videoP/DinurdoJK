@@ -7,6 +7,9 @@
 mod player_animation;
 pub(crate) mod footsteps;
 pub(crate) mod ragdoll;
+pub(crate) mod cloth;
+pub(crate) mod cloth_body;
+pub(crate) mod jiggle;
 mod saber_throw;
 pub mod item_presenter;
 pub mod weapon_fx;
@@ -38,18 +41,43 @@ use jka_protocol::{
 // OpenJK `bg_public.h` / q_shared configstring layout. CS_PLAYERS evaluates to 1131 in
 // protocol 26 (CS_ICONS + MAX_ICONS). Keep these wire-visible indexes fixed.
 pub const CS_SERVERINFO: u16 = 0;
+pub const CS_MUSIC: u16 = 2;
+pub const CS_WARMUP: u16 = 5;
 pub const CS_SCORES1: u16 = 6;
 pub const CS_SCORES2: u16 = 7;
 pub const CS_LEVEL_START_TIME: u16 = 21;
-pub const CS_ITEMS: u16 = 27; // OpenJK: server-built item precache bitstring
+pub const CS_INTERMISSION: u16 = 22;
+pub const CS_FLAGSTATUS: u16 = 23;
+pub const CS_SHADERSTATE: u16 = 24;
+pub const CS_ITEMS: u16 = 27;
+pub const CS_CLIENT_JEDIMASTER: u16 = 28;
+pub const CS_CLIENT_DUELWINNER: u16 = 29;
+pub const CS_CLIENT_DUELISTS: u16 = 30;
+pub const CS_CLIENT_DUELHEALTHS: u16 = 31;
+pub const CS_LEGACY_FIXES: u16 = 36;
+pub const CS_SIEGE_STATE: u16 = 293;
+pub const CS_SIEGE_OBJECTIVES: u16 = 294;
+pub const CS_SIEGE_TIMEOVERRIDE: u16 = 295;
+pub const CS_SIEGE_WINTEAM: u16 = 296;
 // OpenJK/TaystJK protocol-26 configstring layout from bg_public.h. Keeping these
 // in the cgame layer lets demos and a future live net source resolve the same
 // model/sound/effect indexes without renderer-owned lookup tables.
 pub const CS_MODELS: u16 = 298;
 pub const CS_SOUNDS: u16 = 811;
 pub const CS_PLAYERS: u16 = 1131;
+/// CS_PLAYERS + MAX_CLIENTS + MAX_G2BONES in protocol 26.
+pub const CS_LOCATIONS: u16 = 1227;
 pub const CS_EFFECTS: u16 = 1355;
+pub const CS_LIGHT_STYLES: u16 = CS_EFFECTS + 64;
+pub const MAX_LIGHT_STYLE_CONFIGSTRINGS: u16 = 64 * 3;
+pub const GT_TEAM: i32 = 6;
 pub const GT_SIEGE: i32 = 7;
+pub const TEAM_RED: i32 = 1;
+pub const TEAM_BLUE: i32 = 2;
+pub const SABER_RED: i32 = 0;
+pub const SABER_BLUE: i32 = 4;
+pub const SABER_PURPLE: i32 = 5;
+const MAX_QPATH: usize = 64;
 
 /// Shared OpenJK `CG_SetNextSnap` interpolation break conditions. Camera sampling and entity
 /// presentation must agree on these or the body/camera can interpolate across different players,
@@ -70,6 +98,10 @@ pub struct ClientInfo {
     pub name: String,
     pub team: i32,
     pub gametype: i32,
+    /// TaystJK serverinfo exception: team skin/saber forcing is disabled in Jedi-vs-Merc mode.
+    pub jedi_v_merc: bool,
+    /// BG_ValidateSkinForTeam's RGB/Jedi-model fallback tint. Zero/None means use customRGBA.
+    pub team_color_override: Option<[u8; 3]>,
     /// CG_NewClientInfo's `ds` gender hint selects the missing-model fallback.
     pub female: bool,
     pub model_name: String,
@@ -102,6 +134,8 @@ impl ClientInfo {
             name: "Kyle".to_owned(),
             team: 0,
             gametype: 0,
+            jedi_v_merc: false,
+            team_color_override: None,
             female: false,
             model_name: "kyle".to_owned(),
             skin_name: "default".to_owned(),
@@ -182,7 +216,7 @@ const DEFAULT_GRAVITY: f32 = 800.0;
 const CLASS_VEHICLE: i32 = 53;
 const GIB_HEALTH: i32 = -40;
 const PM_SPECTATOR: i32 = 4;
-const PM_INTERMISSION: i32 = 7;
+pub(crate) const PM_INTERMISSION: i32 = 7;
 const PERS_TEAM: usize = 3;
 const PERS_PLAYEREVENTS: usize = 5;
 const PERS_IMPRESSIVE_COUNT: usize = 9;
@@ -439,6 +473,8 @@ pub struct ScoreEntry {
     pub assist_count: i32,
     pub perfect: i32,
     pub captures: i32,
+    /// jaPRO/JA+ cjp_client extension; absent on stock 14-field scores records.
+    pub deaths: Option<i32>,
     pub name: String,
     pub team: i32,
 }
@@ -459,6 +495,83 @@ pub enum Ghoul2ServerCommand {
     RestoreClient {
         source_client: u16,
     },
+    /// TaystJK/OpenJK `kg2`: destroy a non-client Ghoul2 instance.
+    KillEntity { entity: u16 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamInfoEntry {
+    pub client: u16,
+    pub location: i32,
+    pub health: i32,
+    pub armor: i32,
+    pub weapon: i32,
+    pub powerups: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosmeticUnlock {
+    pub bitvalue: i32,
+    pub mapname: String,
+    pub style: i32,
+    pub duration: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderRemap {
+    pub from: String,
+    pub to: String,
+    pub time_offset: String,
+}
+
+/// Reliable cgame side effects which belong outside pure snapshot state. The
+/// first four compatibility passes intentionally preserve these commands even
+/// where the final Siege/UI consumer is implemented later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgameServerAction {
+    KillLoopSounds { entities: Vec<u16> },
+    ShaderRemap(ShaderRemap),
+    RestartMapMusic,
+    LightStyleChanged { index: u16 },
+    NewForceRank { rank: i32, open_menu: bool, team: i32 },
+    SiegeBriefing { team: i32 },
+    SiegeClassSelect,
+    SiegeProfile,
+    SiegeExtendedData(Vec<u8>),
+    ClientLevelShot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigStringState {
+    jedi_master: i32,
+    duel_winner: i32,
+    duelists: [i32; 3],
+    duelist_healths: [i32; 3],
+    intermission: bool,
+    flag_status: [i32; 2],
+    siege_state: Vec<u8>,
+    siege_objectives: Vec<u8>,
+    siege_time_override: i32,
+    siege_win_team: i32,
+    shader_remaps: BTreeMap<String, ShaderRemap>,
+}
+
+impl Default for ConfigStringState {
+    fn default() -> Self {
+        Self {
+            jedi_master: -1,
+            duel_winner: -1,
+            duelists: [-1; 3],
+            duelist_healths: [-1; 3],
+            intermission: false,
+            flag_status: [-1; 2],
+            siege_state: Vec::new(),
+            siege_objectives: Vec::new(),
+            siege_time_override: 0,
+            siege_win_team: 0,
+            shader_remaps: BTreeMap::new(),
+        }
+    }
 }
 
 /// Which server command produced a chat line; jaPRO's `cg_chatSounds` picks the
@@ -526,9 +639,19 @@ pub enum CgameNotice {
     /// viewer's own non-suicide kills. Localisation/presentation stays app-side.
     KillMessage {
         target: String,
-        rank: i32,
-        score: i32,
+        /// Only available when the viewed client owns the recorded playerState.
+        rank: Option<i32>,
+        /// Only available when the viewed client owns the recorded playerState.
+        score: Option<i32>,
         gametype: i32,
+    },
+    /// OpenJK `CG_Obituary` console line generated directly from EV_OBITUARY.
+    /// Demos carry the event, not a separate server `print`, so this must live
+    /// in cgame presentation to work identically live and during playback.
+    Obituary {
+        target: String,
+        attacker: Option<String>,
+        key: &'static str,
     },
     /// JKA/TaystJK playerState reward counter transition. The app chooses
     /// cg_drawRewards mode assets and owns the visual FIFO.
@@ -554,6 +677,16 @@ pub enum CgameNotice {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationViewer {
+    /// Ordinary OpenJK ownership: the current snapshot/playerState client.
+    Snapshot,
+    /// Presentation is following another client whose full playerState is not recorded.
+    Client(i32),
+    /// Free camera / no player owns local-only presentation.
+    None,
+}
+
 pub struct ClientGameState {
     entities: Vec<CEntity>,
     /// jaPRO `cg_entities[client].vChatTime`: until when a client's voice-chat
@@ -562,6 +695,9 @@ pub struct ClientGameState {
     notices: VecDeque<CgameNotice>,
     big_config: jka_protocol::commands::BigConfigString,
     configstrings: BTreeMap<u16, Vec<u8>>,
+    /// Effective player whose local-only HUD/audio/event feedback is being viewed.
+    /// Demos may follow a client other than the one whose playerState was recorded.
+    presentation_viewer: PresentationViewer,
     /// Local `cp_pluginDisable`, needed by client-only jaPRO presentation rules
     /// such as bit 3 (black-saber suppression). Server-consumed bits still
     /// travel through userinfo in `NetworkSettings`.
@@ -588,6 +724,12 @@ pub struct ClientGameState {
     presentation_events: PresentationEventQueue,
     pending_event_traces: VecDeque<EventCheckTrace>,
     pending_ghoul2_commands: VecDeque<Ghoul2ServerCommand>,
+    pending_server_actions: VecDeque<CgameServerAction>,
+    pending_audio_actions: VecDeque<CgameServerAction>,
+    team_info: Vec<TeamInfoEntry>,
+    cosmetic_unlocks: Vec<CosmeticUnlock>,
+    force_rank_change: Option<(i32, bool, i32)>,
+    config_state: ConfigStringState,
 }
 
 impl Default for ClientGameState {
@@ -598,6 +740,7 @@ impl Default for ClientGameState {
             notices: VecDeque::new(),
             big_config: jka_protocol::commands::BigConfigString::default(),
             configstrings: BTreeMap::new(),
+            presentation_viewer: PresentationViewer::Snapshot,
             plugin_disable: 1536,
             queued_server_commands: VecDeque::new(),
             executed_server_command: 0,
@@ -611,6 +754,12 @@ impl Default for ClientGameState {
             presentation_events: PresentationEventQueue::default(),
             pending_event_traces: VecDeque::new(),
             pending_ghoul2_commands: VecDeque::new(),
+            pending_server_actions: VecDeque::new(),
+            pending_audio_actions: VecDeque::new(),
+            team_info: Vec::new(),
+            cosmetic_unlocks: Vec::new(),
+            force_rank_change: None,
+            config_state: ConfigStringState::default(),
         }
     }
 }
@@ -624,6 +773,33 @@ impl ClientGameState {
         self.plugin_disable = bits;
     }
 
+    pub fn set_presentation_viewer(&mut self, viewer: PresentationViewer) {
+        self.presentation_viewer = viewer;
+    }
+
+    /// Effective local/viewed client for presentation-only behavior. Live/local
+    /// sessions use cg.snap->ps.clientNum; demos can explicitly follow a remote
+    /// entity or have no player owner while in free camera.
+    pub fn presentation_client_num(&self) -> Option<i32> {
+        match self.presentation_viewer {
+            PresentationViewer::Snapshot => self
+                .current_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.player_state.field_i32("clientNum")),
+            PresentationViewer::Client(client) => Some(client),
+            PresentationViewer::None => None,
+        }
+    }
+
+    /// A complete playerState exists only when the effective viewer is the
+    /// playerState stored in the snapshot. Never expose the demo recorder's
+    /// playerState while presentation is following a different client.
+    pub fn presentation_player_state(&self) -> Option<&PlayerState> {
+        let snapshot = self.current_snapshot.as_ref()?;
+        let client = snapshot.player_state.field_i32("clientNum")?;
+        (self.presentation_client_num() == Some(client)).then_some(&snapshot.player_state)
+    }
+
     pub fn reset_gamestate(
         &mut self,
         configstrings: &BTreeMap<u16, Vec<u8>>,
@@ -633,6 +809,7 @@ impl ClientGameState {
         self.vchat_until = [0; MAX_CLIENTS];
         self.big_config = jka_protocol::commands::BigConfigString::default();
         self.configstrings.clone_from(configstrings);
+        self.presentation_viewer = PresentationViewer::Snapshot;
         self.queued_server_commands.clear();
         self.executed_server_command = server_command_sequence;
         self.current_snapshot = None;
@@ -645,11 +822,54 @@ impl ClientGameState {
         self.presentation_events.clear();
         self.pending_event_traces.clear();
         self.pending_ghoul2_commands.clear();
+        self.pending_server_actions.clear();
+        self.pending_audio_actions.clear();
+        self.team_info.clear();
+        self.cosmetic_unlocks.clear();
+        self.force_rank_change = None;
+        self.rebuild_configstring_state();
     }
 
     pub fn drain_ghoul2_commands(&mut self) -> Vec<Ghoul2ServerCommand> {
         self.pending_ghoul2_commands.drain(..).collect()
     }
+
+    pub fn drain_server_actions(&mut self) -> Vec<CgameServerAction> {
+        self.pending_server_actions.drain(..).collect()
+    }
+
+    /// Audio side effects have their own queue so unconsumed Siege/UI actions
+    /// never get rescanned every frame.
+    pub fn drain_audio_server_actions(&mut self) -> Vec<CgameServerAction> {
+        self.pending_audio_actions.drain(..).collect()
+    }
+
+    pub fn team_info(&self) -> &[TeamInfoEntry] {
+        &self.team_info
+    }
+
+    pub fn cosmetic_unlocks(&self) -> &[CosmeticUnlock] {
+        &self.cosmetic_unlocks
+    }
+
+    pub fn force_rank_change(&self) -> Option<(i32, bool, i32)> {
+        self.force_rank_change
+    }
+
+    pub fn shader_remaps(&self) -> &BTreeMap<String, ShaderRemap> {
+        &self.config_state.shader_remaps
+    }
+
+    pub fn duelists(&self) -> [i32; 3] { self.config_state.duelists }
+    pub fn duelist_healths(&self) -> [i32; 3] { self.config_state.duelist_healths }
+    pub fn jedi_master(&self) -> i32 { self.config_state.jedi_master }
+    pub fn duel_winner(&self) -> i32 { self.config_state.duel_winner }
+    pub fn flag_status(&self) -> [i32; 2] { self.config_state.flag_status }
+    pub fn intermission_started(&self) -> bool { self.config_state.intermission }
+    pub fn siege_state(&self) -> &[u8] { &self.config_state.siege_state }
+    pub fn siege_objectives(&self) -> &[u8] { &self.config_state.siege_objectives }
+    pub fn siege_time_override(&self) -> i32 { self.config_state.siege_time_override }
+    pub fn siege_win_team(&self) -> i32 { self.config_state.siege_win_team }
 
     pub fn push_notice(&mut self, notice: CgameNotice) {
         self.notices.push_back(notice);
@@ -669,11 +889,100 @@ impl ClientGameState {
         self.configstrings.get(&index).map(Vec::as_slice)
     }
 
+    /// Client-visible configstring table, in protocol index order. This mirrors
+    /// the client `gameState_t` backing TaystJK/OpenJK's `configstrings` command.
+    pub fn configstrings(&self) -> &BTreeMap<u16, Vec<u8>> {
+        &self.configstrings
+    }
+
     /// Semantic configstring update used by non-wire sources such as the
     /// in-process local server. Network/demo paths still arrive through the
     /// normal `cs` server-command machinery.
     pub fn set_configstring(&mut self, index: u16, value: Vec<u8>) {
         self.configstrings.insert(index, value);
+        self.configstring_modified(index);
+    }
+
+    /// Rust equivalent of TaystJK/OpenJK `CG_ConfigStringModified`: the wire
+    /// table is already current when this runs, and this method performs the
+    /// configstrings that have cgame side effects instead of treating every
+    /// entry as passive lookup data. Asset registration remains lazy in this
+    /// client, so model/sound/effect ranges need no synchronous registration.
+    fn configstring_modified(&mut self, index: u16) {
+        self.apply_configstring_state(index, true);
+    }
+
+    fn rebuild_configstring_state(&mut self) {
+        self.config_state = ConfigStringState::default();
+        for index in [
+            CS_CLIENT_JEDIMASTER,
+            CS_CLIENT_DUELWINNER,
+            CS_CLIENT_DUELISTS,
+            CS_CLIENT_DUELHEALTHS,
+            CS_INTERMISSION,
+            CS_FLAGSTATUS,
+            CS_SHADERSTATE,
+            CS_SIEGE_STATE,
+            CS_SIEGE_OBJECTIVES,
+            CS_SIEGE_TIMEOVERRIDE,
+            CS_SIEGE_WINTEAM,
+        ] {
+            self.apply_configstring_state(index, false);
+        }
+    }
+
+    fn apply_configstring_state(&mut self, index: u16, emit_actions: bool) {
+        let value = self.configstring(index).unwrap_or_default().to_vec();
+        let integer = parse_i32_ascii(&value).unwrap_or(0);
+        match index {
+            CS_MUSIC => {
+                if emit_actions {
+                    self.pending_audio_actions.push_back(CgameServerAction::RestartMapMusic);
+                }
+            }
+            CS_CLIENT_JEDIMASTER => self.config_state.jedi_master = integer,
+            CS_CLIENT_DUELWINNER => self.config_state.duel_winner = integer,
+            CS_CLIENT_DUELISTS => self.config_state.duelists = parse_pipe_numbers::<3>(&value),
+            CS_CLIENT_DUELHEALTHS => self.config_state.duelist_healths = parse_duelist_healths(&value),
+            CS_INTERMISSION => self.config_state.intermission = integer != 0,
+            CS_FLAGSTATUS => {
+                // g_team.c transmits 0=at base, 1=taken, 2=dropped. CGame
+                // remaps the compact wire digit back to flagStatus_t, where
+                // FLAG_DROPPED is 4 because the one-flag states occupy 2/3.
+                let decode = |byte: Option<&u8>| match byte.copied() {
+                    Some(b'0') => 0,
+                    Some(b'1') => 1,
+                    Some(b'2') => 4,
+                    _ => -1,
+                };
+                self.config_state.flag_status = [decode(value.first()), decode(value.get(1))];
+            }
+            CS_SHADERSTATE => {
+                self.config_state.shader_remaps.clear();
+                for remap in parse_shader_state(&value) {
+                    if emit_actions {
+                        self.pending_server_actions.push_back(CgameServerAction::ShaderRemap(remap.clone()));
+                    }
+                    self.config_state.shader_remaps.insert(remap.from.to_ascii_lowercase(), remap);
+                }
+            }
+            CS_SIEGE_STATE => self.config_state.siege_state = value,
+            CS_SIEGE_OBJECTIVES => self.config_state.siege_objectives = value,
+            CS_SIEGE_TIMEOVERRIDE => self.config_state.siege_time_override = integer,
+            CS_SIEGE_WINTEAM => self.config_state.siege_win_team = integer,
+            index if (CS_LIGHT_STYLES..CS_LIGHT_STYLES + MAX_LIGHT_STYLE_CONFIGSTRINGS).contains(&index) => {
+                if emit_actions {
+                    self.pending_server_actions.push_back(CgameServerAction::LightStyleChanged {
+                        index: index - CS_LIGHT_STYLES,
+                    });
+                }
+            }
+            // Serverinfo, warmup, scores, votes, player configstrings and
+            // resource configstrings are read directly from the current table
+            // by their consumers. This is equivalent to TaystJK's assignment /
+            // registration side effects without duplicating cache ownership.
+            _ => {}
+        }
     }
 
     pub fn model_qpath(&self, model_index: i32) -> Option<String> {
@@ -985,10 +1294,22 @@ impl ClientGameState {
         })
     }
 
-    /// jaPRO cgame draws `SABER_RGB` blades only on JA+ / jaPRO servers.
+    /// TaystJK advertises cjp_client to both JA+ and jaPRO; those servers then
+    /// append a 15th `deaths` integer to every scores record.
+    pub fn supports_score_deaths(&self) -> bool {
+        self.configstring(CS_SERVERINFO).is_some_and(|info| {
+            matches!(
+                crate::net::mod_support::ServerMod::detect(info),
+                crate::net::mod_support::ServerMod::Japro | crate::net::mod_support::ServerMod::Japlus
+            )
+        })
+    }
+
+    /// TaystJK accepts RGB sabers on JA+/jaPRO and on any server explicitly
+    /// advertising the RGB capability in `taystJKinfo`.
     pub fn rgb_sabers_supported(&self) -> bool {
         self.configstring(CS_SERVERINFO)
-            .is_some_and(|info| crate::net::mod_support::ServerMod::detect(info).supports_rgb_sabers())
+            .is_some_and(crate::net::mod_support::supports_rgb_sabers)
     }
 
     /// `cgs.jcinfo2`.
@@ -1032,6 +1353,15 @@ impl ClientGameState {
             .and_then(|info| info_value(info, b"g_gametype"))
             .and_then(parse_i32_ascii)
             .unwrap_or(0)
+    }
+
+    /// TaystJK `cgs.jediVmerc`, parsed from CS_SERVERINFO. Team presentation forcing is disabled there.
+    pub fn jedi_v_merc(&self) -> bool {
+        self.configstring(CS_SERVERINFO)
+            .and_then(|info| info_value(info, b"g_jediVmerc"))
+            .and_then(parse_i32_ascii)
+            .unwrap_or(0)
+            != 0
     }
 
     /// The `cgs.timelimit` / `fraglimit` / `levelStartTime` / `scores1` / `scores2`
@@ -1090,6 +1420,24 @@ impl ClientGameState {
         Some(bytes_to_lossless_ascii(name))
     }
 
+    /// OpenJK `clientInfo_t.gender` source used by CG_Obituary. The protocol
+    /// exposes it as the `ds` client-info key (`f`, `n`, otherwise male).
+    pub fn client_gender(&self, client: usize) -> i32 {
+        let Some(index) = u16::try_from(client).ok().and_then(|client| CS_PLAYERS.checked_add(client)) else {
+            return 0;
+        };
+        match self
+            .configstring(index)
+            .and_then(|info| info_value(info, b"ds"))
+            .and_then(|value| value.first().copied())
+            .map(|byte| byte.to_ascii_lowercase())
+        {
+            Some(b'f') => 1,
+            Some(b'n') => 2,
+            _ => 0,
+        }
+    }
+
     /// Visual subset of OpenJK `CG_NewClientInfo` with `cg_forceModel == 0`. Siege model/skin
     /// overrides are applied from the same class definitions loaded by `BG_SiegeLoadClasses`.
     pub fn client_info(
@@ -1127,12 +1475,12 @@ impl ClientGameState {
             .unwrap_or_default();
         // jaPRO relays `cp_sbRGB1/2` as c3/c4; they only apply to SABER_RGB.
         let rgb_capable = self.rgb_sabers_supported();
-        let saber_color = resolve_saber_color(
+        let mut saber_color = resolve_saber_color(
             info_value(configstring, b"c1").and_then(parse_i32_ascii).unwrap_or(4),
             info_value(configstring, b"c3").and_then(parse_i32_ascii).unwrap_or(0),
             rgb_capable,
         );
-        let saber2_color = resolve_saber_color(
+        let mut saber2_color = resolve_saber_color(
             info_value(configstring, b"c2").and_then(parse_i32_ascii).unwrap_or(4),
             info_value(configstring, b"c4").and_then(parse_i32_ascii).unwrap_or(0),
             rgb_capable,
@@ -1146,6 +1494,12 @@ impl ClientGameState {
                 if !class.forced_skin.is_empty() {
                     skin_name.clone_from(&class.forced_skin);
                 }
+                if let Some(color) = class.forced_saber_color {
+                    saber_color = color;
+                }
+                if let Some(color) = class.forced_saber2_color {
+                    saber2_color = color;
+                }
             }
         }
 
@@ -1154,6 +1508,8 @@ impl ClientGameState {
             name,
             team,
             gametype: self.gametype(),
+            jedi_v_merc: self.jedi_v_merc(),
+            team_color_override: None,
             female: info_value(configstring, b"ds")
                 .is_some_and(|value| value.first() == Some(&b'f')),
             model_name,
@@ -1210,6 +1566,8 @@ impl ClientGameState {
             name: String::new(),
             team: 0, // TEAM_FREE
             gametype: self.gametype(),
+            jedi_v_merc: self.jedi_v_merc(),
+            team_color_override: None,
             female: false,
             model_name: folder.to_owned(),
             skin_name: skin.to_owned(),
@@ -1341,6 +1699,15 @@ impl ClientGameState {
 
     pub fn current_snapshot(&self) -> Option<&Snapshot> {
         self.current_snapshot.as_ref()
+    }
+
+    /// TaystJK `CG_AddCEntity` keys its intermission presentation gate from
+    /// `cg.predictedPlayerState.pm_type`. The current snapshot is the
+    /// authoritative base for that predicted state in this client.
+    pub(crate) fn rendering_intermission(&self) -> bool {
+        self.current_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.player_state.field_i32("pm_type").unwrap_or(0) == PM_INTERMISSION
+        })
     }
 
     /// OpenJK `CG_AddPacketEntities` frame interpolation + `CG_CalcEntityLerpPositions`.
@@ -1520,20 +1887,71 @@ impl ClientGameState {
             self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text) });
             return Ok(());
         }
+        if name.eq_ignore_ascii_case(b"cps") {
+            // CG_CenterPrintSE_f takes a direct StringEd key (optionally with
+            // one leading @). Re-express it through the same @@@ translation
+            // path already used by ordinary server text.
+            let key_arg = arg(1);
+            let key = key_arg.as_slice().strip_prefix(b"@").unwrap_or(key_arg.as_slice());
+            self.notices.push_back(CgameNotice::CenterPrint([b"@@@".as_slice(), key].concat()));
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"tinfo") {
+            // TaystJK CG_ParseTeamInfo: six integers per sorted team member.
+            const FIELDS: usize = 6;
+            let count = parts.get(1).copied().and_then(parse_i32_ascii).unwrap_or(0).clamp(0, MAX_CLIENTS as i32) as usize;
+            let mut entries = Vec::with_capacity(count);
+            for i in 0..count {
+                let base = 2 + i * FIELDS;
+                if parts.len() < base + FIELDS { break; }
+                let number = |offset: usize| parts.get(base + offset).copied().and_then(parse_i32_ascii).unwrap_or(0);
+                let client = number(0);
+                if !(0..MAX_CLIENTS as i32).contains(&client) { continue; }
+                entries.push(TeamInfoEntry {
+                    client: client as u16,
+                    location: number(1),
+                    health: number(2),
+                    armor: number(3),
+                    weapon: number(4),
+                    powerups: number(5),
+                });
+            }
+            self.team_info = entries;
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"cosmetics") {
+            // jaPRO/TaystJK sends colon/newline/tab delimited quadruples in
+            // argv(1): bitvalue, mapname, style, duration.
+            let text = arg(1);
+            let fields: Vec<&[u8]> = text
+                .split(|b| matches!(*b, b':' | b'\n' | b'\t'))
+                .filter(|field| !field.is_empty())
+                .collect();
+            self.cosmetic_unlocks.clear();
+            for row in fields.chunks_exact(4).take(64) {
+                self.cosmetic_unlocks.push(CosmeticUnlock {
+                    bitvalue: parse_i32_ascii(row[0]).unwrap_or(0),
+                    mapname: bytes_to_lossless_ascii(row[1]),
+                    style: parse_i32_ascii(row[2]).unwrap_or(0),
+                    duration: parse_i32_ascii(row[3]).unwrap_or(0),
+                });
+            }
+            return Ok(());
+        }
         if name.eq_ignore_ascii_case(b"scores") {
             // OpenJK CG_ParseScores / g_cmds.c DeathmatchScoreboardMessage:
             // argv(1) count, argv(2..=3) red/blue totals, then a fixed number
             // of integer fields for each client. Stock is 14; jaPRO appends a
-            // 15th (deaths) for clients that send cjp_client, which this
-            // client does on jaPRO servers. A wrong stride shifts every record
-            // and scrambles the client numbers (hence names).
+            // 15th (deaths) for clients that send cjp_client. DinurdoJK, like
+            // TaystJK, advertises that userinfo key to JA+/jaPRO. A wrong stride
+            // shifts every record and scrambles the client numbers (hence names).
             const MAX_SCORE_CLIENTS: usize = 32;
             let integer = |index: usize| {
-                parts.get(index).and_then(|value| parse_i32_ascii(value)).unwrap_or(0)
+                parts.get(index).copied().and_then(parse_i32_ascii).unwrap_or(0)
             };
             let count = integer(1).clamp(0, MAX_SCORE_CLIENTS as i32) as usize;
             let team_scores = [integer(2), integer(3)];
-            let score_offset = score_record_stride(self.is_japro(), count, parts.len());
+            let score_offset = score_record_stride(self.supports_score_deaths(), count, parts.len());
             let mut entries = Vec::with_capacity(count);
             for score_index in 0..count {
                 let base = 4 + score_index * score_offset;
@@ -1568,6 +1986,7 @@ impl ClientGameState {
                     assist_count: integer(base + 11),
                     perfect: integer(base + 12),
                     captures: integer(base + 13),
+                    deaths: (score_offset == SCORE_FIELDS_JAPRO).then(|| integer(base + 14)),
                     name,
                     team,
                 });
@@ -1575,7 +1994,87 @@ impl ClientGameState {
             self.notices.push_back(CgameNotice::Scores { team_scores, entries });
             return Ok(());
         }
-        if name == b"map_restart" {
+        if name.eq_ignore_ascii_case(b"clientLevelShot") {
+            self.pending_server_actions.push_back(CgameServerAction::ClientLevelShot);
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"loaddefered") {
+            // Intentionally a no-op: DinurdoJK never defers player models; its
+            // async asset workers are the equivalent of the completed load.
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"nfr") {
+            // TaystJK checks for rank + menu and reads the team with CG_Argv(3),
+            // which yields an empty/zero argument when older servers omit it.
+            if parts.len() >= 3 {
+                let rank = parts.get(1).copied().and_then(parse_i32_ascii).unwrap_or(0);
+                let open_menu = parts.get(2).copied().and_then(parse_i32_ascii).unwrap_or(0) != 0;
+                let team = parts.get(3).copied().and_then(parse_i32_ascii).unwrap_or(0);
+                self.force_rank_change = Some((rank, open_menu, team));
+                self.pending_server_actions.push_back(CgameServerAction::NewForceRank { rank, open_menu, team });
+            }
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"kg2") {
+            for value in parts.iter().skip(1).copied() {
+                let Some(entity) = parse_i32_ascii(value) else { continue; };
+                if entity < MAX_CLIENTS as i32 {
+                    // CG_KillGhoul2_f refuses to destroy client Ghoul2.
+                    return Ok(());
+                }
+                if (0..MAX_GENTITIES as i32).contains(&entity) {
+                    self.pending_ghoul2_commands.push_back(Ghoul2ServerCommand::KillEntity { entity: entity as u16 });
+                }
+            }
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"kls") {
+            let entities = parts
+                .iter()
+                .skip(1)
+                .take(2)
+                .copied()
+                .filter_map(parse_i32_ascii)
+                .filter(|entity| (0..MAX_GENTITIES as i32).contains(entity))
+                .map(|entity| entity as u16)
+                .collect::<Vec<_>>();
+            if !entities.is_empty() {
+                self.pending_audio_actions.push_back(CgameServerAction::KillLoopSounds { entities });
+            }
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"remapShader") {
+            if parts.len() == 4 {
+                let remap = ShaderRemap {
+                    from: bytes_to_lossless_ascii(parts[1]),
+                    to: bytes_to_lossless_ascii(parts[2]),
+                    time_offset: bytes_to_lossless_ascii(parts[3]),
+                };
+                self.config_state.shader_remaps.insert(remap.from.to_ascii_lowercase(), remap.clone());
+                self.pending_server_actions.push_back(CgameServerAction::ShaderRemap(remap));
+            }
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"sb") {
+            let team = parts.get(1).copied().and_then(parse_i32_ascii).unwrap_or(0);
+            self.pending_server_actions.push_back(CgameServerAction::SiegeBriefing { team });
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"scl") {
+            self.pending_server_actions.push_back(CgameServerAction::SiegeClassSelect);
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"spc") {
+            self.pending_server_actions.push_back(CgameServerAction::SiegeProfile);
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"sxd") {
+            self.pending_server_actions.push_back(CgameServerAction::SiegeExtendedData(
+                parts.get(1..).unwrap_or_default().join(&b' '),
+            ));
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case(b"map_restart") {
             self.notices.push_back(CgameNotice::MapRestart);
             return Ok(());
         }
@@ -1583,10 +2082,10 @@ impl ClientGameState {
             // OpenJK CG_RestoreClientGhoul_f: ircg <client> <body> <weapon> <side>.
             // Keep this byte/token parser aligned with the protocol command; do
             // not reconstruct corpse equipment from snapshot guesses.
-            let source_client = parts.get(1).and_then(|v| parse_i32_ascii(v));
-            let body_entity = parts.get(2).and_then(|v| parse_i32_ascii(v));
-            let known_weapon = parts.get(3).and_then(|v| parse_i32_ascii(v));
-            let light_side = parts.get(4).and_then(|v| parse_i32_ascii(v)).unwrap_or(0) != 0;
+            let source_client = parts.get(1).copied().and_then(parse_i32_ascii);
+            let body_entity = parts.get(2).copied().and_then(parse_i32_ascii);
+            let known_weapon = parts.get(3).copied().and_then(parse_i32_ascii);
+            let light_side = parts.get(4).copied().and_then(parse_i32_ascii).unwrap_or(0) != 0;
             let (Some(source_client), Some(body_entity), Some(known_weapon)) =
                 (source_client, body_entity, known_weapon)
             else {
@@ -1608,7 +2107,7 @@ impl ClientGameState {
         if name.eq_ignore_ascii_case(b"rcg") {
             // Same OpenJK handler without a body-copy target. It still resets
             // clent->weapon / clent->ghoul2weapon so respawn reattaches cleanly.
-            let Some(source_client) = parts.get(1).and_then(|v| parse_i32_ascii(v)) else {
+            let Some(source_client) = parts.get(1).copied().and_then(parse_i32_ascii) else {
                 return Ok(());
             };
             if !(0..MAX_CLIENTS as i32).contains(&source_client) {
@@ -1631,7 +2130,7 @@ impl ClientGameState {
         // CL_ConfigstringModified consumes Cmd_ArgsFrom(2): join tokens with a
         // single space while preserving every byte inside quoted arguments.
         let value = parts.get(2..).unwrap_or_default().join(&b' ');
-        self.configstrings.insert(index, value);
+        self.set_configstring(index, value);
         Ok(())
     }
 }
@@ -1643,6 +2142,45 @@ pub struct MatchLimits {
     pub level_start_time: i32,
     pub scores1: i32,
     pub scores2: i32,
+}
+
+fn parse_pipe_numbers<const N: usize>(value: &[u8]) -> [i32; N] {
+    let mut out = [-1; N];
+    for (slot, field) in out.iter_mut().zip(value.split(|byte| *byte == b'|')) {
+        if let Some(number) = parse_i32_ascii(field) {
+            *slot = number;
+        }
+    }
+    out
+}
+
+fn parse_duelist_healths(value: &[u8]) -> [i32; 3] {
+    let mut fields = value.split(|byte| *byte == b'|');
+    let first = fields.next().and_then(parse_i32_ascii).unwrap_or(0);
+    let second = fields.next().and_then(parse_i32_ascii).unwrap_or(0);
+    let third = fields.next().map_or(-1, |field| {
+        if field.first() == Some(&b'!') { -1 } else { parse_i32_ascii(field).unwrap_or(0) }
+    });
+    [first, second, third]
+}
+
+fn parse_shader_state(value: &[u8]) -> Vec<ShaderRemap> {
+    // CS_SHADERSTATE is `old=new:time@old2=new2:time2@...`. Shader qpaths and
+    // time offsets are protocol ASCII; preserving malformed entries by simply
+    // ignoring them matches CG_ShaderStateChanged's break/continue behavior.
+    value
+        .split(|byte| *byte == b'@')
+        .filter_map(|entry| {
+            if entry.is_empty() { return None; }
+            let equals = entry.iter().position(|byte| *byte == b'=')?;
+            let tail = &entry[equals + 1..];
+            let colon = tail.iter().position(|byte| *byte == b':')?;
+            let from = bytes_to_lossless_ascii(&entry[..equals]);
+            let to = bytes_to_lossless_ascii(&tail[..colon]);
+            let time_offset = bytes_to_lossless_ascii(&tail[colon + 1..]);
+            (!from.is_empty() && !to.is_empty()).then_some(ShaderRemap { from, to, time_offset })
+        })
+        .collect()
 }
 
 fn info_value<'a>(info: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
@@ -1723,6 +2261,95 @@ pub fn apply_plugin_saber_color(color: i32, plugin_disable: i32) -> i32 {
     }
 }
 
+/// OpenJK/TaystJK `BG_IsValidCharacterModel`: reject bundled non-MP skins.
+pub fn is_valid_character_model(model_name: &str, skin_name: &str) -> bool {
+    if skin_name.eq_ignore_ascii_case("menu") {
+        return false;
+    }
+    if model_name.eq_ignore_ascii_case("kyle")
+        && matches!(skin_name.to_ascii_lowercase().as_str(), "fpls" | "fpls2" | "fpls3")
+    {
+        return false;
+    }
+    true
+}
+
+/// Port of TaystJK/OpenJK `BG_ValidateSkinForTeam`.
+///
+/// `file_exists` is the JKA virtual filesystem check used for custom `_red`/`_blue` skins.
+/// The returned RGB value is `clientInfo_t::colorOverride` for `jedi_*` / RGB models.
+pub fn validate_skin_for_team<F>(
+    model_name: &str,
+    skin_name: &mut String,
+    team: i32,
+    mut file_exists: F,
+) -> Option<[u8; 3]>
+where
+    F: FnMut(&str) -> bool,
+{
+    let red_path = format!("models/players/{model_name}/model_red.skin");
+    let blue_path = format!("models/players/{model_name}/model_blue.skin");
+    let jedi_custom = model_name.len() > 5
+        && model_name.as_bytes().get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"jedi_"));
+    let rgb_without_team_variants = skin_name.as_bytes()
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"rgb"))
+        && (!file_exists(&red_path) || !file_exists(&blue_path));
+
+    if jedi_custom || rgb_without_team_variants {
+        return match team {
+            TEAM_RED => Some([255, 0, 0]),
+            TEAM_BLUE => Some([0, 0, 255]),
+            _ => None,
+        };
+    }
+
+    let (team_name, opponent_name, suffix) = match team {
+        TEAM_RED => ("red", "blue", "_red"),
+        TEAM_BLUE => ("blue", "red", "_blue"),
+        _ => return None,
+    };
+    if skin_name.eq_ignore_ascii_case(team_name) {
+        return None;
+    }
+
+    if skin_name.eq_ignore_ascii_case(opponent_name)
+        || skin_name.eq_ignore_ascii_case("default")
+        || skin_name.contains('|')
+        || !is_valid_character_model(model_name, skin_name)
+    {
+        *skin_name = team_name.to_owned();
+        return None;
+    }
+
+    let suffix_word = suffix.trim_start_matches('_');
+    if !skin_name.ends_with(suffix_word) {
+        if skin_name.len() + suffix.len() >= MAX_QPATH {
+            *skin_name = team_name.to_owned();
+            return None;
+        }
+        skin_name.push_str(suffix);
+    }
+    let candidate = format!("models/players/{model_name}/model_{skin_name}.skin");
+    if !file_exists(&candidate) {
+        *skin_name = team_name.to_owned();
+    }
+    None
+}
+
+/// TaystJK `CG_AddSaberBlade` team-color normalization. With cg_saberTeamColors=0,
+/// vanilla still rejects the opposing base color and extended/custom colors.
+pub fn team_saber_color(info: &ClientInfo, color: i32, saber_team_colors: bool) -> i32 {
+    if info.gametype < GT_TEAM || info.gametype == GT_SIEGE || info.jedi_v_merc {
+        return color;
+    }
+    match info.team {
+        TEAM_RED if saber_team_colors || color == SABER_BLUE || color > SABER_PURPLE => SABER_RED,
+        TEAM_BLUE if saber_team_colors || color == SABER_RED || color > SABER_PURPLE => SABER_BLUE,
+        _ => color,
+    }
+}
+
 /// Integer fields every `scores` record carries (stock OpenJK layout).
 const SCORE_FIELDS: usize = 14;
 /// jaPRO's extended record adds a trailing deaths field.
@@ -1732,8 +2359,8 @@ const SCORE_FIELDS_JAPRO: usize = 15;
 /// name). The mod decides it, as in jaPRO's CG_ParseScores. When the token
 /// count exactly fits only the other layout - e.g. a mod that sends the extended
 /// record to a client it did not detect as jaPRO - trust the wire instead.
-fn score_record_stride(japro: bool, count: usize, token_count: usize) -> usize {
-    let (preferred, other) = if japro {
+fn score_record_stride(extended_deaths: bool, count: usize, token_count: usize) -> usize {
+    let (preferred, other) = if extended_deaths {
         (SCORE_FIELDS_JAPRO, SCORE_FIELDS)
     } else {
         (SCORE_FIELDS, SCORE_FIELDS_JAPRO)
@@ -1748,6 +2375,52 @@ fn score_record_stride(japro: bool, count: usize, token_count: usize) -> usize {
 
 pub fn bytes_to_lossless_ascii(value: &[u8]) -> String {
     value.iter().map(|&byte| byte as char).collect()
+}
+
+/// Convert Dinurdo's lossless one-byte JKA text representation back to protocol/
+/// font bytes. Rust strings are UTF-8, but JKA text and its 256-glyph fonts are
+/// byte indexed; using `str::as_bytes()` turns e.g. byte 0xA4 into UTF-8 C2 A4
+/// and renders/sends two bogus glyphs. Characters outside the legacy 0..255
+/// range have no stock JKA glyph and are replaced rather than corrupting the
+/// following text.
+pub fn text_to_jka_bytes(value: &str) -> Vec<u8> {
+    value
+        .chars()
+        .map(|ch| u8::try_from(ch as u32).unwrap_or(b'?'))
+        .collect()
+}
+
+/// Unicode characters Windows produces for the old no-leading-zero ALT codes.
+/// JKA itself is byte-indexed, so map those semantic CP437 characters back to
+/// the exact 0x80..0xFF byte the original client would have queued. This is
+/// deliberately only for *typed/pasted input*; strings decoded from the JKA
+/// protocol already use U+00xx as a lossless raw-byte container.
+const CP437_HIGH_UNICODE: [u32; 128] = [
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7, 0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+    0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9, 0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+    0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA, 0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+    0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F, 0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B, 0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4, 0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+    0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248, 0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+];
+
+pub fn unicode_input_char_to_jka_char(ch: char) -> char {
+    let code = ch as u32;
+    if code < 0x80 {
+        return ch;
+    }
+    if let Some(index) = CP437_HIGH_UNICODE.iter().position(|&candidate| candidate == code) {
+        return char::from(0x80u8 + index as u8);
+    }
+    // Leading-zero Windows ALT codes and Latin-1 paste paths can already carry
+    // the desired raw 8-bit value. Preserve those when CP437 has no match.
+    char::from(u8::try_from(code).unwrap_or(b'?'))
+}
+
+pub fn unicode_input_to_jka_text(value: &str) -> String {
+    value.chars().map(unicode_input_char_to_jka_char).collect()
 }
 
 fn split_model_skin(value: &str) -> (String, String) {
@@ -2167,6 +2840,21 @@ fn evaluate_trajectory_at(tr: Trajectory, mut at_time_ms: f64) -> Result<[f32; 3
     Ok(result)
 }
 
+/// TaystJK `CG_AddCEntity` intermission visibility gate. Keep this shared by
+/// the generic entity and Ghoul2 player presenters so the Rust split does not
+/// accidentally render something that the original single dispatcher skipped.
+pub(crate) fn suppressed_during_intermission(
+    intermission: bool,
+    entity: &PresentedEntity,
+) -> bool {
+    intermission
+        && match entity.entity_type {
+            ET_GENERAL | ET_PLAYER | ET_INVISIBLE => true,
+            ET_NPC => entity.state.field_i32("NPC_class").unwrap_or(0) == CLASS_VEHICLE,
+            _ => false,
+        }
+}
+
 fn vector_ma(base: &mut [f32; 3], scale: f32, delta: [f32; 3]) {
     for axis in 0..3 {
         base[axis] += scale * delta[axis];
@@ -2369,6 +3057,17 @@ pub fn presented_player_state_entity(ps: &PlayerState) -> Option<PresentedEntity
     presented_player_state(ps, None, 0.0)
 }
 
+/// Presentation-only interpolation for auxiliary playerState sources such as
+/// race ghosts. This intentionally reuses the exact predicted-player conversion
+/// instead of maintaining a second animation/state translation table.
+pub(crate) fn presented_player_state_interpolated(
+    current: &PlayerState,
+    next: Option<&PlayerState>,
+    alpha: f32,
+) -> Option<PresentedEntity> {
+    presented_player_state(current, next, alpha)
+}
+
 fn presented_player_state(
     current: &PlayerState,
     next: Option<&PlayerState>,
@@ -2527,6 +3226,89 @@ mod tests {
     }
 
     #[test]
+    fn tayst_server_command_table_preserves_team_ghoul_audio_and_remap_state() {
+        let mut game = ClientGameState::new();
+        game.execute_server_command(&ServerCommand {
+            sequence: 78,
+            text: b"tinfo 2 3 11 100 50 3 4 7 22 75 25 5 8".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            game.team_info(),
+            &[
+                TeamInfoEntry { client: 3, location: 11, health: 100, armor: 50, weapon: 3, powerups: 4 },
+                TeamInfoEntry { client: 7, location: 22, health: 75, armor: 25, weapon: 5, powerups: 8 },
+            ]
+        );
+
+        game.execute_server_command(&ServerCommand { sequence: 79, text: b"kg2 71 72".to_vec() }).unwrap();
+        assert_eq!(
+            game.drain_ghoul2_commands(),
+            vec![Ghoul2ServerCommand::KillEntity { entity: 71 }, Ghoul2ServerCommand::KillEntity { entity: 72 }]
+        );
+
+        game.execute_server_command(&ServerCommand { sequence: 80, text: b"kls 71 72".to_vec() }).unwrap();
+        assert_eq!(
+            game.drain_audio_server_actions(),
+            vec![CgameServerAction::KillLoopSounds { entities: vec![71, 72] }]
+        );
+
+        game.execute_server_command(&ServerCommand {
+            sequence: 81,
+            text: b"remapShader textures/old textures/new 1250".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(game.shader_remaps()["textures/old"].to, "textures/new");
+        assert_eq!(
+            game.drain_server_actions(),
+            vec![CgameServerAction::ShaderRemap(ShaderRemap {
+                from: "textures/old".to_owned(),
+                to: "textures/new".to_owned(),
+                time_offset: "1250".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn configstring_modified_tracks_duel_siege_shader_and_music_state() {
+        let mut game = ClientGameState::new();
+        game.set_configstring(CS_CLIENT_JEDIMASTER, b"9".to_vec());
+        game.set_configstring(CS_CLIENT_DUELWINNER, b"4".to_vec());
+        game.set_configstring(CS_CLIENT_DUELISTS, b"4|8|12".to_vec());
+        game.set_configstring(CS_CLIENT_DUELHEALTHS, b"100|67|!".to_vec());
+        game.set_configstring(CS_FLAGSTATUS, b"20".to_vec());
+        game.set_configstring(CS_SIEGE_STATE, b"round-live".to_vec());
+        game.set_configstring(CS_SIEGE_OBJECTIVES, b"obj-data".to_vec());
+        game.set_configstring(CS_SIEGE_TIMEOVERRIDE, b"45000".to_vec());
+        game.set_configstring(CS_SIEGE_WINTEAM, b"2".to_vec());
+        game.set_configstring(
+            CS_SHADERSTATE,
+            b"textures/a=textures/b:0@textures/c=textures/d:1.5@".to_vec(),
+        );
+        game.set_configstring(CS_MUSIC, b"music/intro.mp3 music/loop.mp3".to_vec());
+
+        assert_eq!(game.jedi_master(), 9);
+        assert_eq!(game.duel_winner(), 4);
+        assert_eq!(game.duelists(), [4, 8, 12]);
+        assert_eq!(game.duelist_healths(), [100, 67, -1]);
+        assert_eq!(game.flag_status(), [4, 0]);
+        assert_eq!(game.siege_state(), b"round-live");
+        assert_eq!(game.siege_objectives(), b"obj-data");
+        assert_eq!(game.siege_time_override(), 45000);
+        assert_eq!(game.siege_win_team(), 2);
+        assert_eq!(game.shader_remaps().len(), 2);
+        assert_eq!(game.shader_remaps()["textures/c"].time_offset, "1.5");
+
+        let audio = game.drain_audio_server_actions();
+        assert_eq!(audio, vec![CgameServerAction::RestartMapMusic]);
+        let remaining = game.drain_server_actions();
+        assert_eq!(
+            remaining.iter().filter(|action| matches!(action, CgameServerAction::ShaderRemap(_))).count(),
+            2
+        );
+    }
+
+    #[test]
     fn scores_server_command_parses_openjk_14_int_records() {
         let mut game = ClientGameState::new();
         game.configstrings.insert(
@@ -2552,6 +3334,7 @@ mod tests {
         assert_eq!(entries[0].ping, 55);
         assert_eq!(entries[0].time, 7);
         assert_eq!(entries[0].captures, 11);
+        assert_eq!(entries[0].deaths, None);
     }
 
     #[test]
@@ -2576,6 +3359,8 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!((entries[0].client, entries[0].name.as_str(), entries[0].score), (2, "Alice", 42));
         assert_eq!((entries[1].client, entries[1].name.as_str(), entries[1].score), (5, "Bob", 10));
+        assert_eq!(entries[0].deaths, Some(9));
+        assert_eq!(entries[1].deaths, Some(4));
     }
 
     #[test]
@@ -2714,6 +3499,31 @@ mod tests {
         assert!(presented_player_state_entity(&ps).is_some());
         ps.persistant[PERS_TEAM] = TEAM_SPECTATOR;
         assert!(presented_player_state_entity(&ps).is_none());
+    }
+
+    #[test]
+    fn intermission_entity_suppression_matches_taystjk_dispatch() {
+        let presented = |entity_type: i32, npc_class: i32| {
+            let state = entity(
+                1,
+                &[("eType", entity_type as u32), ("NPC_class", npc_class as u32)],
+            );
+            PresentedEntity {
+                number: 1,
+                entity_type,
+                origin: [0.0; 3],
+                angles: [0.0; 3],
+                state,
+            }
+        };
+
+        assert!(suppressed_during_intermission(true, &presented(ET_GENERAL, 0)));
+        assert!(suppressed_during_intermission(true, &presented(ET_PLAYER, 0)));
+        assert!(suppressed_during_intermission(true, &presented(ET_INVISIBLE, 0)));
+        assert!(suppressed_during_intermission(true, &presented(ET_NPC, CLASS_VEHICLE)));
+        assert!(!suppressed_during_intermission(true, &presented(ET_NPC, 0)));
+        assert!(!suppressed_during_intermission(true, &presented(ET_MOVER, 0)));
+        assert!(!suppressed_during_intermission(false, &presented(ET_PLAYER, 0)));
     }
 
     #[test]
@@ -3028,6 +3838,51 @@ mod client_info_tests {
     }
 
     #[test]
+    fn team_skin_validation_matches_openjk_fallbacks() {
+        let mut skin = "default".to_owned();
+        assert_eq!(validate_skin_for_team("kyle", &mut skin, TEAM_RED, |_| true), None);
+        assert_eq!(skin, "red");
+
+        let mut skin = "custom".to_owned();
+        assert_eq!(validate_skin_for_team("reelo", &mut skin, TEAM_BLUE, |path| {
+            path.ends_with("model_custom_blue.skin")
+        }), None);
+        assert_eq!(skin, "custom_blue");
+
+        let mut skin = "rgb_default".to_owned();
+        assert_eq!(
+            validate_skin_for_team("custom", &mut skin, TEAM_BLUE, |_| false),
+            Some([0, 0, 255])
+        );
+        assert_eq!(skin, "rgb_default");
+
+        let mut skin = "head_a1|torso_a1|lower_a1".to_owned();
+        assert_eq!(
+            validate_skin_for_team("jedi_hm", &mut skin, TEAM_RED, |_| false),
+            Some([255, 0, 0])
+        );
+        assert_eq!(skin, "head_a1|torso_a1|lower_a1");
+    }
+
+    #[test]
+    fn team_saber_colors_match_taystjk_rules_and_exceptions() {
+        let red = ClientInfo {
+            team: TEAM_RED,
+            gametype: GT_TEAM,
+            ..ClientInfo::solo_kyle()
+        };
+        assert_eq!(team_saber_color(&red, SABER_BLUE, true), SABER_RED);
+        assert_eq!(team_saber_color(&red, 3, true), SABER_RED);
+        assert_eq!(team_saber_color(&red, SABER_BLUE, false), SABER_RED);
+        assert_eq!(team_saber_color(&red, 3, false), 3);
+
+        let siege = ClientInfo { gametype: GT_SIEGE, ..red.clone() };
+        assert_eq!(team_saber_color(&siege, SABER_BLUE, true), SABER_BLUE);
+        let jedi_v_merc = ClientInfo { jedi_v_merc: true, ..red };
+        assert_eq!(team_saber_color(&jedi_v_merc, SABER_BLUE, true), SABER_BLUE);
+    }
+
+    #[test]
     fn siege_class_forces_model_and_skin() {
         let mut game = ClientGameState::new();
         game.configstrings
@@ -3040,10 +3895,14 @@ mod client_info_tests {
             name: "jedi guardian".to_owned(),
             forced_model: "jedi_hm".to_owned(),
             forced_skin: "head_a1|torso_a1|lower_a1".to_owned(),
+            forced_saber_color: Some(0),
+            forced_saber2_color: Some(4),
         }];
         let info = game.client_info(3, &classes).unwrap();
         assert_eq!(info.model_name, "jedi_hm");
         assert_eq!(info.skin_name, "head_a1|torso_a1|lower_a1");
+        assert_eq!(info.saber_color, SABER_RED);
+        assert_eq!(info.saber2_color, SABER_BLUE);
         assert_eq!(
             info.skin_qpath(),
             "models/players/jedi_hm/|head_a1|torso_a1|lower_a1"

@@ -568,6 +568,7 @@ impl MapEditor {
                     normal,
                     uv: [0.0, 0.0],
                     color,
+                    depth_hack: 0.0,
                 });
             }
             for triangle in 1..polygon.vertices.len() - 1 {

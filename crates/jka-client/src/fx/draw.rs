@@ -73,6 +73,8 @@ pub enum FxBlend {
     Alpha,
     /// GL_DST_COLOR GL_ZERO / GL_ZERO GL_SRC_COLOR.
     Modulate,
+    /// GL_DST_COLOR GL_ONE: src*dst + dst. Used by the stock personal shield.
+    DstColorAdd,
     /// GL_DST_COLOR GL_SRC_COLOR: Quake 3/JKA 2x modulation.
     /// RGB = src*dst + dst*src = 2*src*dst. Stock rivetmark uses this.
     Modulate2x,
@@ -88,12 +90,9 @@ impl FxBlend {
         match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             ["add"] | ["gl_one", "gl_one"] => Self::Add,
             ["gl_src_alpha", "gl_one"] => Self::AddAlpha,
-            // GL_DST_COLOR GL_ONE (dst*src + dst, e.g. gfx/misc/personalshield's
-            // chrome stage): never darkens, so additive is the closer of our
-            // fixed blend states, unlike the generic alpha-blend fallback below
-            // which would key off a texture alpha channel these "shiny" stages
-            // were never authored to carry, making the stage nearly invisible.
-            ["gl_dst_color", "gl_one"] => Self::Add,
+            // Stock personalshield chrome stage. Preserve the fixed-function
+            // equation exactly: source*destination + destination.
+            ["gl_dst_color", "gl_one"] => Self::DstColorAdd,
             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
             ["gl_dst_color", "gl_src_color"] => Self::Modulate2x,
             ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
@@ -117,6 +116,7 @@ impl FxBlend {
             Self::Add => DynamicModelAlphaMode::AdditiveOne,
             Self::AddAlpha => DynamicModelAlphaMode::Additive,
             Self::Modulate => DynamicModelAlphaMode::Modulate,
+            Self::DstColorAdd => DynamicModelAlphaMode::DstColorAdd,
             Self::Modulate2x => DynamicModelAlphaMode::Modulate2x,
             Self::Darken => DynamicModelAlphaMode::Darken,
             Self::Alpha | Self::Opaque => DynamicModelAlphaMode::BlendUnlit,
@@ -181,7 +181,11 @@ impl FxMaterial {
         let rgb = if self.rgb_vertex { [rgba[0], rgba[1], rgba[2]] } else { self.rgb_const };
         let alpha = match self.blend {
             // GL_ONE-style stages ignore source alpha in their blend equation.
-            FxBlend::Add | FxBlend::Modulate | FxBlend::Modulate2x | FxBlend::Darken => 1.0,
+            FxBlend::Add
+            | FxBlend::Modulate
+            | FxBlend::DstColorAdd
+            | FxBlend::Modulate2x
+            | FxBlend::Darken => 1.0,
             _ if self.alpha_vertex => rgba[3],
             _ => self.alpha_const,
         };
@@ -203,6 +207,7 @@ impl Batch {
             normal: [0.0, 1.0, 0.0],
             uv,
             color,
+            depth_hack: 0.0,
         });
         index
     }
@@ -238,6 +243,7 @@ pub fn tessellate(
     for draw in draws {
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
+            | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
@@ -310,6 +316,7 @@ pub fn tessellate_workers(
     for (draw_index, draw) in draws.iter().enumerate() {
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
+            | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
@@ -407,6 +414,7 @@ pub fn tessellate_gpu_particles(
     for draw in draws {
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
+            | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
@@ -519,6 +527,7 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
                 f32::from(color[2]) / 255.0,
                 f32::from(color[3]) / 255.0,
             ],
+            depth_hack: 0.0,
         })
         .collect();
     let count = vertices.len() as u32;
@@ -556,6 +565,29 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
             batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
+        }
+        FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } => {
+            // TaystJK/OpenJK RB_SurfaceSaberGlow. The renderer receives one
+            // RT_SABER_GLOW entity, then walks billboards from blade tip back
+            // toward the hilt. Radius grows by exactly 0.017 per blob and the
+            // step is exactly 65% of the current radius; do not clamp it here.
+            let color = mat.vertex_color(*rgba);
+            let mut distance = *length;
+            let mut glow_radius = *radius;
+            while distance > 0.0 {
+                let point = add(*origin, scale(*direction, distance));
+                let left = scale(view.axis[1], glow_radius);
+                let up = scale(view.axis[2], glow_radius);
+                batch.quad_stamp(point, left, up, color);
+                distance -= glow_radius * 0.65;
+                glow_radius += 0.017;
+            }
+            // RB_SurfaceSaberGlow always stamps the separate pulsing hilt blob.
+            if *hilt_radius > 0.0 {
+                let left = scale(view.axis[1], *hilt_radius);
+                let up = scale(view.axis[2], *hilt_radius);
+                batch.quad_stamp(*origin, left, up, color);
+            }
         }
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
@@ -708,7 +740,10 @@ mod tests {
         );
         assert_eq!(FxBlend::from_blend_func(""), FxBlend::Opaque);
         assert_eq!(FxBlend::from_blend_func("GL_ONE GL_ZERO"), FxBlend::Opaque);
-        assert_eq!(FxBlend::from_blend_func("GL_DST_COLOR GL_ONE"), FxBlend::Add);
+        assert_eq!(
+            FxBlend::from_blend_func("GL_DST_COLOR GL_ONE"),
+            FxBlend::DstColorAdd
+        );
     }
 
     #[test]
@@ -722,6 +757,29 @@ mod tests {
         assert_eq!(jka[2], [100.0, -2.0, -2.0]);
         assert_eq!(surface.vertices[0].color, [1.0, 128.0 / 255.0, 0.0, 1.0]);
         assert_eq!(surface.indices.len(), 12, "two triangles, both windings");
+    }
+
+    #[test]
+    fn saber_glow_matches_jka_bead_chain_and_hilt_blob() {
+        let draws = [FxDraw::SaberGlow {
+            origin: [0.0, 0.0, 0.0],
+            direction: [1.0, 0.0, 0.0],
+            length: 10.0,
+            radius: 2.0,
+            hilt_radius: 5.625,
+            rgba: [255; 4],
+            shader: "saber".into(),
+        }];
+        let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Add)]);
+        assert_eq!(surfaces.len(), 1);
+        let surface = &surfaces[0];
+        // 10-unit blade at radius 2 produces eight RT_SABER_GLOW beads
+        // with the exact 0.65 step / +0.017 growth, plus the hilt blob.
+        assert_eq!(surface.vertices.len(), 9 * 4);
+        assert_eq!(surface.indices.len(), 9 * 12);
+        let jka: Vec<_> = surface.vertices.iter().map(|v| scene::jka_position(v.position)).collect();
+        assert_eq!(jka[0], [10.0, 2.0, 2.0], "first bead is at the blade tip");
+        assert_eq!(jka[8 * 4], [0.0, 5.625, 5.625], "last quad is the hilt pulse");
     }
 
     #[test]

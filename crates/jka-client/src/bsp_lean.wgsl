@@ -254,7 +254,12 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 
 // Stage tcMods (scroll/scale/rotate/transform/turb) applied to base coordinates.
 // Shared by the per-vertex generated_uv and the per-pixel sky cloud layer.
-fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
+// `world_pos` is the vertex position in this renderer's [x, z, -y] render
+// space (JKA [x, y, z]); it only matters for tcMod turb (kind 5), which
+// OpenJK's RB_CalcTurbulentTexCoords drives from (JKA x + JKA z) for S and
+// JKA y for T, scaled by 1/128 * 0.125, NOT from the surface's own UV -
+// using UV there aliases badly on any surface that tiles many times.
+fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
     let time = camera.camera_pos_time.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
@@ -284,9 +289,12 @@ fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
             );
         }
         if (kind == 5u) {
-            let wave = a.y
-                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
-            uv = uv + vec2<f32>(wave);
+            let now = a.w + time * b.x;
+            let wave = vec2<f32>(
+                sin((now + (world_pos.x + world_pos.y) * 0.0009765625) * 6.28318530718) * a.z,
+                sin((now - world_pos.z * 0.0009765625) * 6.28318530718) * a.z
+            );
+            uv = uv + wave;
         }
     }
     return uv;
@@ -315,7 +323,7 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
 
-    return apply_tc_mods(uv);
+    return apply_tc_mods(uv, input.position);
 }
 
 struct VertexLightgridSample {
@@ -499,6 +507,30 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOut {
     return world_vertex(input, instance_index, legacy_dlight_surface_id);
+}
+
+// OpenJK does not rasterize the authored sky brush at its literal world-space
+// depth. The brush polygons only determine which angular part of the sky is
+// visible; the generated outer sky is placed at zFar. Keep the original X/Y/W
+// projection here so the BSP polygon remains the visibility mask, but force the
+// reversed-Z depth to 0 (the camera far plane). This prevents distanceCull from
+// clipping distant sky brushes while leaving ordinary world geometry unchanged.
+fn sky_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: u32) -> VertexOut {
+    var output = world_vertex(input, instance_index, legacy_dlight_surface_id);
+    output.clip_position.z = 0.0;
+    return output;
+}
+
+@vertex fn vs_sky(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return sky_vertex(input, instance_index, 0xffffffffu);
+}
+
+@vertex fn vs_sky_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return sky_vertex(input, instance_index, legacy_dlight_surface_id);
 }
 
 fn geometric_frame(input: VertexOut) -> mat3x3<f32> {
@@ -2315,7 +2347,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     if (d.z < 0.0 && a.z >= a.x && a.z >= a.y) {
         discard;
     }
-    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z));
+    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
     var stage_color = material.color;
     if ((material.header.z & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);

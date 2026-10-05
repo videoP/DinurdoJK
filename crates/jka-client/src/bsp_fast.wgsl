@@ -108,7 +108,12 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 
 // Stage tcMods (scroll/scale/rotate/transform/turb) applied to base coordinates.
 // Shared by the per-vertex generated_uv and the per-pixel sky cloud layer.
-fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
+// `world_pos` is the vertex position in this renderer's [x, z, -y] render
+// space (JKA [x, y, z]); it only matters for tcMod turb (kind 5), which
+// OpenJK's RB_CalcTurbulentTexCoords drives from (JKA x + JKA z) for S and
+// JKA y for T, scaled by 1/128 * 0.125, NOT from the surface's own UV -
+// using UV there aliases badly on any surface that tiles many times.
+fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
     let time = camera.camera_pos_time.w;
     for (var i = 0u; i < 4u; i = i + 1u) {
@@ -138,9 +143,12 @@ fn apply_tc_mods(base_uv: vec2<f32>) -> vec2<f32> {
             );
         }
         if (kind == 5u) {
-            let wave = a.y
-                + sin((a.w + time * b.x + uv.x + uv.y) * 6.28318530718) * a.z;
-            uv = uv + vec2<f32>(wave);
+            let now = a.w + time * b.x;
+            let wave = vec2<f32>(
+                sin((now + (world_pos.x + world_pos.y) * 0.0009765625) * 6.28318530718) * a.z,
+                sin((now - world_pos.z * 0.0009765625) * 6.28318530718) * a.z
+            );
+            uv = uv + wave;
         }
     }
     return uv;
@@ -169,10 +177,10 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
 
-    return apply_tc_mods(uv);
+    return apply_tc_mods(uv, input.position);
 }
 
-@vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     var output: VertexOut;
     let deformation = deform_surface_deformation_vertex(
         input.position,
@@ -202,6 +210,19 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
     let shell_kind = select(0u, 1u, instance_index != 0u);
     output.shell_kind = shell_kind | (camera.render_flags.z << 1u);
     output.shell_coverage = deformation.w;
+    return output;
+}
+
+@vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return fast_world_vertex(input, instance_index);
+}
+
+// Match the full world path/OpenJK sky semantics: authored sky BSP polygons are
+// an angular visibility mask, while the visible sky itself lives at zFar. In
+// reversed-Z, depth 0 is the camera far plane.
+@vertex fn vs_sky(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    var output = fast_world_vertex(input, instance_index);
+    output.clip_position.z = 0.0;
     return output;
 }
 
@@ -328,7 +349,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     if (d.z < 0.0 && a.z >= a.x && a.z >= a.y) {
         discard;
     }
-    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z));
+    let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
     var stage_color = material.color;
     if ((material.header.z & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);

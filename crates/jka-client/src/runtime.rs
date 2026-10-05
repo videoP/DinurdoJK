@@ -61,7 +61,7 @@ pub struct SurfaceInspectorInfo {
     pub summary: Vec<(String, String)>,
     /// Human-oriented grouped details. The raw diagnostic dump stays in `lines`.
     pub sections: Vec<SurfaceInspectorSection>,
-    /// Complete diagnostic dump copied by Ctrl+C and printed for scripted traces.
+    /// Complete diagnostic dump exported by Ctrl+C from the Trace popup.
     pub lines: Vec<String>,
     /// Protocol entity hit by the trace, when applicable. App-side enrichment uses
     /// this to add classname/spawn vars/client state without moving game state to
@@ -121,6 +121,8 @@ pub enum UserEvent {
         supported_msaa: Vec<u32>,
         wireframe_supported: bool,
     },
+    CompanionReady { id: u32 },
+    CompanionError { id: u32, error: String },
     RendererFirstFrame,
     /// Footsteps and landings the renderer found in standing water; the game
     /// thread plays the engine's own splash effects for them.

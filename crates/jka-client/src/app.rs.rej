@@ -1,0 +1,20 @@
+diff a/crates/jka-client/src/app.rs b/crates/jka-client/src/app.rs	(rejected hunks)
+@@ -5045,7 +5060,8 @@ impl App {
+             follow_name,
+             race_timer,
+             vote_line,
+-            scoreboard: self.scores_showing.then(|| self.scoreboard.clone()).flatten(),
++            scoreboard,
++            scoreboard_focus_client,
+             demo_timeline: self.demo_timeline_ui(Instant::now()),
+             prediction_debug,
+             hud,
+@@ -5519,6 +5537,8 @@ impl App {
+             follow_name,
+             race_timer,
+             vote_line,
++            scoreboard,
++            scoreboard_focus_client,
+             speedometer,
+             lagometer: self.lagometer_ui.clone(),
+             team_overlay,

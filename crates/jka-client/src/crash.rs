@@ -283,7 +283,7 @@ mod win {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub fn write_minidump(
+    fn write_minidump(
         prefix: &str,
         exception: *const ExceptionPointers,
         thread_id: u32,

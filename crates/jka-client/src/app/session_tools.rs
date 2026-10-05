@@ -108,6 +108,22 @@ impl App {
         self.spectating_live().is_some()
     }
 
+    /// Spectator-specific binds are also the demo controls in every demo view.
+    /// The map is sparse, so movement/weapon commands still inherit normal binds
+    /// unless the user explicitly gave that key a spectator override.
+    pub(super) fn spectator_binding_context(&self) -> bool {
+        self.is_spectating_live() || self.demo_playback_active()
+    }
+
+    /// Orbit input only owns the mouse while actually following somebody. A
+    /// free spectator keeps the ordinary noclip/free-look controls.
+    pub(super) fn spectator_orbit_follow_active(&self) -> bool {
+        let live_follow = self.spectating_live().is_some_and(|info| info.followed.is_some());
+        let demo_follow = self.demo_playback_active() && self.demo_view_mode != DemoViewMode::Free;
+        self.spectator_camera.mode == crate::camera::SpectatorCameraMode::Orbit
+            && (live_follow || demo_follow)
+    }
+
     /// jaPRO `followFastest`: follow whoever is moving fastest right now.
     pub(super) fn follow_fastest_now(&mut self) {
         let Some(info) = self.spectating_live() else {

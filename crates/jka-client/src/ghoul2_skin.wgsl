@@ -31,6 +31,10 @@ struct SkinDraw {
     uv_xform: vec4<f32>,
     spec_light: vec4<f32>,
     spec_viewer: vec4<f32>,
+    jiggle0: vec4<f32>,
+    jiggle1: vec4<f32>,
+    jiggle2: vec4<f32>,
+    jiggle3: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -75,6 +79,9 @@ struct VertexIn {
     @location(3) bone_indices: vec4<u32>,
     @location(4) weights: vec4<f32>,
     @location(5) weight_count: u32,
+    @location(6) jiggle_region: u32,
+    @location(7) jiggle_weight: f32,
+    @location(8) jiggle_coord: f32,
 };
 
 struct VertexOut {
@@ -127,6 +134,25 @@ fn skin_position(
         + residual * p3;
 }
 
+fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
+    switch region {
+        case 0u: { return draw.jiggle0.xyz; }
+        case 1u: { return draw.jiggle1.xyz; }
+        case 2u: { return draw.jiggle2.xyz; }
+        case 3u: { return draw.jiggle3.xyz; }
+        default: { return vec3<f32>(0.0); }
+    }
+}
+
+fn jiggle_effective_weight(draw: SkinDraw, weight: f32, coord: f32) -> f32 {
+    let overall = draw.jiggle0.w;
+    if (abs(coord) < 2.0) {
+        let vertical = smoothstep(-0.70 + draw.jiggle3.w, -0.15 + draw.jiggle3.w, coord);
+        return weight * overall * draw.jiggle2.w * vertical;
+    }
+    return weight * overall * draw.jiggle1.w;
+}
+
 fn model_to_world(draw: SkinDraw, model_position: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
         draw.origin.x + draw.axis0.x * model_position.x + draw.axis1.x * model_position.y + draw.axis2.x * model_position.z,
@@ -150,6 +176,10 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         input.weight_count,
         draw.params.x,
     );
+    if (input.jiggle_weight > 0.0 && input.jiggle_region < 4u) {
+        let jiggle_weight = jiggle_effective_weight(draw, input.jiggle_weight, input.jiggle_coord);
+        model_position += jiggle_offset(draw, input.jiggle_region) * jiggle_weight;
+    }
 
     // OpenJK's fast Ghoul2 path transforms the normal only by weight-0's bone.
     let model_normal = transform_vector(

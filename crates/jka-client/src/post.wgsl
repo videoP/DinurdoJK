@@ -2571,6 +2571,71 @@ fn saber_glow_over_clouds(uv: vec2<f32>, scene_depth: f32, background: vec3<f32>
     return max(background - sky / sky_samples, vec3<f32>(0.0)) * weight;
 }
 
+// Projected cloud shadows are evaluated after additive FX have already entered
+// scene_texture. Multiplying the whole pixel would therefore shadow the saber
+// itself. Estimate only the blade's additive foreground contribution by
+// sampling the same receiver just outside its screen-space capsule; callers can
+// shadow the receiver normally and add this contribution back unshadowed.
+fn saber_glow_over_receiver(uv: vec2<f32>, scene_depth: f32) -> vec3<f32> {
+    let count = u32(settings.cloud_foreground.x);
+    if (count == 0u || !valid_depth(scene_depth)) {
+        return vec3<f32>(0.0);
+    }
+    let viewport = max(settings.aa.yz, vec2<f32>(1.0));
+    let pixel = uv * viewport;
+    var weight = 0.0;
+    var blade_centre = pixel;
+    var blade_side = vec2<f32>(1.0, 0.0);
+    var blade_reach = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let segment = settings.cloud_blades[i * 2u];
+        let extent = settings.cloud_blades[i * 2u + 1u];
+        // Blade segment is behind the visible receiver at this pixel.
+        if (scene_depth < extent.y - 4.0) {
+            continue;
+        }
+        let along = segment.zw - segment.xy;
+        let from_start = pixel - segment.xy;
+        let h = clamp(dot(from_start, along) / max(dot(along, along), 1.0e-4), 0.0, 1.0);
+        let closest = segment.xy + along * h;
+        let distance_px = length(pixel - closest);
+        let w = 1.0 - smoothstep(extent.x * 0.35, extent.x, distance_px);
+        if (w > weight) {
+            weight = w;
+            blade_centre = closest;
+            blade_side = vec2<f32>(-along.y, along.x) / max(length(along), 1.0e-3);
+            blade_reach = extent.x * 1.5;
+        }
+    }
+    if (weight <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    var receiver = vec3<f32>(0.0);
+    var receiver_samples = 0.0;
+    for (var side = 0u; side < 2u; side = side + 1u) {
+        let direction = select(-1.0, 1.0, side == 0u);
+        let reference_uv = clamp(
+            (blade_centre + blade_side * blade_reach * direction) / viewport,
+            vec2<f32>(0.0),
+            vec2<f32>(1.0)
+        );
+        let reference_depth = depth_at_uv(reference_uv);
+        // Only compare against the same local receiver. This rejects samples
+        // that crossed a silhouette/edge while stepping outside the glow.
+        if (valid_depth(reference_depth)
+            && abs(reference_depth - scene_depth) <= max(scene_depth, 1.0) * 0.02) {
+            receiver += textureSampleLevel(scene_texture, scene_sampler, reference_uv, 0.0).rgb;
+            receiver_samples += 1.0;
+        }
+    }
+    if (receiver_samples <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let centre = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb;
+    return max(centre - receiver / receiver_samples, vec3<f32>(0.0)) * weight;
+}
+
 fn render_clouds(background: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     if (settings.clouds.x <= 0.5) {
         return background;
@@ -2736,7 +2801,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
         let normal = surface_normal(pixel);
-        color *= projected_cloud_shadow_factor(world, normal, pixel);
+        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
+        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
+        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
         let puddle = post_puddle_amount(world, normal.y);
         color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);
@@ -2835,7 +2902,9 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
         let normal = surface_normal(pixel);
-        color *= projected_cloud_shadow_factor(world, normal, pixel);
+        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
+        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
+        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
         let puddle = post_puddle_amount(world, normal.y);
         color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);

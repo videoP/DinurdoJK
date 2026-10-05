@@ -139,7 +139,7 @@ impl AssetWorkerPool {
         if started == 0 {
             return None;
         }
-        println!("[ASSET] async asset worker pool: {started} thread(s)");
+        devprintln!(1, "[ASSET] async asset worker pool: {started} thread(s)");
         Some(Self {
             shared,
             workers: started,
@@ -377,7 +377,7 @@ impl<T: Send + Sync + 'static> AssetRegistry<T> {
         self.states.insert(key.to_owned(), AssetState::Pending);
         self.pending += 1;
         self.stats.queued += 1;
-        println!("[ASSET] {} request key={key} state=missing -> queued ({priority:?})", self.label);
+        devprintln!(3, "[ASSET] {} request key={key} state=missing -> queued ({priority:?})", self.label);
         Requested::Pending
     }
 
@@ -400,7 +400,8 @@ impl<T: Send + Sync + 'static> AssetRegistry<T> {
                         .insert(done.key.clone(), AssetState::Ready(Arc::new(asset)));
                     let integrate_ms = integrate_started.elapsed().as_secs_f64() * 1000.0;
                     self.stats.integrate_ms += integrate_ms;
-                    println!(
+                    devprintln!(
+                        3,
                         "[ASSET] {} ready key={} queue_ms={:.2} worker_ms={:.2} integrate_ms={:.2}",
                         self.label, done.key, done.queue_ms, done.worker_ms, integrate_ms,
                     );
@@ -418,7 +419,8 @@ impl<T: Send + Sync + 'static> AssetRegistry<T> {
         }
         if completed > 0 && self.pending == 0 {
             let stats = self.stats;
-            println!(
+            devprintln!(
+                2,
                 "[ASSET] {} idle: queued={} duplicates_avoided={} completed={} failed={} rejected={} worker_ms={:.1} integrate_ms={:.2}",
                 self.label,
                 stats.queued,

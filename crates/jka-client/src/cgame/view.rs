@@ -4,6 +4,7 @@
 //! local play, and a future live network client all reduce their player state to
 //! `PlayerViewPolicyState`, then use the same third-person decision and local-player alpha rules.
 
+use super::PM_INTERMISSION;
 use crate::camera::ThirdPersonSettings;
 use jka_assets::animation::AnimationSet;
 use jka_movement::{PlayerEntityView, PM_SPECTATOR};
@@ -129,6 +130,13 @@ pub fn rendering_third_person(
     const HANDEXTEND_KNOCKDOWN: i32 = 8;
     const TEAM_SPECTATOR: i32 = 3;
 
+    // TaystJK CG_CalcViewValues handles PM_INTERMISSION before any ordinary
+    // first/third-person offsets. Never let saber/melee/death policy turn the
+    // fixed intermission viewpoint into a chase camera.
+    if state.pm_type == PM_INTERMISSION {
+        return false;
+    }
+
     let mut third_person = settings.enabled || state.health <= 0;
     if state.health > 0 {
         if state.weapon == WP_EMPLACED_GUN && state.emplaced_index != 0 {
@@ -224,5 +232,15 @@ mod tests {
                 state,
             ));
         }
+    }
+
+    #[test]
+    fn intermission_bypasses_third_person_policy() {
+        let mut settings = ThirdPersonSettings::default();
+        settings.enabled = true;
+        let mut state = ordinary();
+        state.pm_type = PM_INTERMISSION;
+        state.weapon = 3;
+        assert!(!rendering_third_person(settings, false, state));
     }
 }
