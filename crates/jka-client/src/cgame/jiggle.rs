@@ -18,11 +18,24 @@ const TELEPORT_DISTANCE: f32 = 96.0;
 pub(crate) const MAX_GPU_JIGGLE_REGIONS: usize = 4;
 const NO_GPU_JIGGLE_REGION: u32 = u32::MAX;
 
-/// Live user tuning layered on top of the per-model/auto profile. The solver
-/// keeps KawaiiPhysics-style damping/stiffness in the 0..1 domain; these are
-/// multipliers so model.jiggle remains the authored baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JiggleSolver {
+    KawaiiPhysics,
+    JigglePhysics,
+}
+
+impl JiggleSolver {
+    pub(crate) fn from_u8(value: u8) -> Self {
+        if value == 1 { Self::JigglePhysics } else { Self::KawaiiPhysics }
+    }
+}
+
+/// Live user tuning layered on top of the per-model/auto profile. KawaiiPhysics
+/// keeps its damping/stiffness multipliers; JigglePhysics exposes the upstream
+/// one-child Motionless Root controls separately so the two solvers stay A/B-able.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JiggleTuning {
+    pub solver: JiggleSolver,
     pub overall_strength: f32,
     pub breast_strength: f32,
     pub glute_strength: f32,
@@ -31,17 +44,33 @@ pub(crate) struct JiggleTuning {
     /// Normalized vertical shift of the lower glute falloff. Positive moves the
     /// effective region upward without rebuilding GLM/GPU buffers.
     pub glute_lift: f32,
+    /// naelstrof/JigglePhysics parameters. These follow the source's authorable
+    /// 0..1 controls for a one-child rig with Motionless Root, which is the
+    /// source's recommended setup for breasts.
+    pub jp_stiffness: f32,
+    pub jp_drag: f32,
+    pub jp_air_drag: f32,
+    pub jp_stretch: f32,
+    pub jp_soften: f32,
+    pub jp_gravity: f32,
 }
 
 impl Default for JiggleTuning {
     fn default() -> Self {
         Self {
+            solver: JiggleSolver::KawaiiPhysics,
             overall_strength: 1.0,
             breast_strength: 1.0,
             glute_strength: 1.0,
             stiffness_scale: 1.0,
             damping_scale: 1.0,
-            glute_lift: 0.15,
+            glute_lift: 0.0,
+            jp_stiffness: 0.4,
+            jp_drag: 0.4,
+            jp_air_drag: 0.1,
+            jp_stretch: 0.8,
+            jp_soften: 0.0,
+            jp_gravity: 0.0,
         }
     }
 }
@@ -74,6 +103,10 @@ struct RegionSpec {
     surfaces: Vec<String>,
     anchor_override: Option<usize>,
     anchor_terms: Vec<AnchorTerm>,
+    /// Parent/root for the naelstrof/JigglePhysics one-child virtual rig. Auto
+    /// regions use thoracic/pelvis; explicit profiles fall back to the dominant
+    /// anchor bone after mask compilation.
+    solver_root_bone: Option<usize>,
     center: [f32; 3],
     radius: [f32; 3],
     response: [f32; 3],
@@ -345,6 +378,7 @@ impl JiggleProfile {
                         surfaces: torso_surfaces.clone(),
                         anchor_override: None,
                         anchor_terms: Vec::new(),
+                        solver_root_bone: Some(thoracic),
                         center,
                         radius,
                         response: [0.28, 1.00, 0.65],
@@ -380,22 +414,27 @@ impl JiggleProfile {
                     &hips_surfaces,
                     side,
                     &semantic,
-                    // Keep the automatic glute footprint above the upper thigh.
-                    // The live glute-height control can further trim/lift it.
-                    back[2] - 10.5,
-                    back[2] + 2.5,
-                    [3.4, 4.8],
+                    // Keep most of the automatic footprint on the glute, but let
+                    // the lower falloff reach into the upper thigh. The helper
+                    // marker is a better anatomical reference than a fixed JKA Z.
+                    back[2] - 11.5,
+                    back[2] + 1.2,
+                    [3.4, 5.0],
                     [6.0, 7.5],
                 ) {
                     center[0] = back[0] * 0.85;
-                    center[2] += 1.25;
+                    // The previous auto fit sat a little too high and then trimmed
+                    // the lower half aggressively. Shift the fitted region down by
+                    // roughly one JKA unit and keep a slightly deeper lower falloff.
+                    center[2] += 0.35;
                     radius[0] = (back[0].abs() * 1.35).clamp(4.0, 5.5);
-                    radius[2] = (radius[2] * 0.82).clamp(4.2, 6.0);
+                    radius[2] = (radius[2] * 0.88).clamp(4.6, 6.4);
                     regions.push(RegionSpec {
                         name: name.into(),
                         surfaces: hips_surfaces.clone(),
                         anchor_override: None,
                         anchor_terms: Vec::new(),
+                        solver_root_bone: Some(pelvis),
                         center,
                         radius,
                         response: [0.20, 0.85, 0.85],
@@ -513,6 +552,13 @@ impl JiggleProfile {
 
         for region in &mut regions {
             region.anchor_terms = compile_region_anchor(glm, gla, region)?;
+            if region.solver_root_bone.is_none() {
+                region.solver_root_bone = region
+                    .anchor_terms
+                    .iter()
+                    .max_by(|a, b| a.weight.total_cmp(&b.weight))
+                    .map(|term| term.bone_index);
+            }
         }
 
         Ok(Self { regions, lod_masks, gpu_compatible })
@@ -591,6 +637,7 @@ impl JiggleProfile {
             surfaces,
             anchor_override,
             anchor_terms: Vec::new(),
+            solver_root_bone: anchor_override,
             center,
             radius,
             response,
@@ -746,6 +793,7 @@ struct RegionState {
     position_world: [f32; 3],
     prev_position_world: [f32; 3],
     last_anchor_world: [f32; 3],
+    last_root_world: [f32; 3],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -783,19 +831,26 @@ impl JiggleSystem {
         max_substeps: u32,
         tuning: JiggleTuning,
     ) {
-        if self.enabled && !enabled {
+        if (self.enabled && !enabled) || self.tuning.solver != tuning.solver {
             self.entities.clear();
         }
         self.enabled = enabled;
         self.hz = hz.clamp(30, 240);
         self.max_substeps = max_substeps.clamp(1, 8) as usize;
         self.tuning = JiggleTuning {
+            solver: tuning.solver,
             overall_strength: tuning.overall_strength.clamp(0.0, 2.0),
             breast_strength: tuning.breast_strength.clamp(0.0, 2.0),
             glute_strength: tuning.glute_strength.clamp(0.0, 2.0),
             stiffness_scale: tuning.stiffness_scale.clamp(0.0, 3.0),
             damping_scale: tuning.damping_scale.clamp(0.0, 3.0),
             glute_lift: tuning.glute_lift.clamp(-0.40, 0.60),
+            jp_stiffness: tuning.jp_stiffness.clamp(0.0, 1.0),
+            jp_drag: tuning.jp_drag.clamp(0.0, 1.0),
+            jp_air_drag: tuning.jp_air_drag.clamp(0.0, 1.0),
+            jp_stretch: tuning.jp_stretch.clamp(0.0, 1.0),
+            jp_soften: tuning.jp_soften.clamp(0.0, 1.0),
+            jp_gravity: tuning.jp_gravity.clamp(0.0, 2.0),
         };
     }
 
@@ -875,45 +930,123 @@ impl JiggleSystem {
                 continue;
             }
             let anchor_world = model_to_jka_world(anchor_model, axis, origin);
+            let root_world = region
+                .solver_root_bone
+                .and_then(|bone_index| pose.get(bone_index))
+                .map(|matrix| model_to_jka_world(transform_point(matrix, [0.0; 3]), axis, origin))
+                .unwrap_or(anchor_world);
             let teleported = region_state.initialized
-                && distance(region_state.last_anchor_world, anchor_world) > TELEPORT_DISTANCE;
+                && (distance(region_state.last_anchor_world, anchor_world) > TELEPORT_DISTANCE
+                    || distance(region_state.last_root_world, root_world) > TELEPORT_DISTANCE);
 
             if !region_state.initialized || time_discontinuity || teleported {
                 region_state.initialized = true;
                 region_state.position_world = anchor_world;
                 region_state.prev_position_world = anchor_world;
                 region_state.last_anchor_world = anchor_world;
+                region_state.last_root_world = root_world;
                 continue;
             }
 
             if steps > 0 {
                 let start_anchor = region_state.last_anchor_world;
-                let damping = (region.damping * self.tuning.damping_scale).clamp(0.0, 0.999);
-                let stiffness = (region.stiffness * self.tuning.stiffness_scale).clamp(0.0, 0.999);
-                // Port the current KawaiiPhysics Verlet core to one virtual
-                // soft-region point.  In its fixed-substep path DeltaTimeOld
-                // and StepDeltaTime are both FixedDt; damping is deliberately
-                // raw per-step, while stiffness keeps the source exponent form.
-                let damping_factor = 1.0 - damping;
-                let stiffness_pull =
-                    1.0 - (1.0 - stiffness).powf(self.hz as f32 * fixed_step);
-                for step in 0..steps {
-                    let t = (step + 1) as f32 / steps as f32;
-                    let target = lerp(start_anchor, anchor_world, t);
-                    let previous = region_state.position_world;
-                    let velocity = mul(
-                        sub(region_state.position_world, region_state.prev_position_world),
-                        1.0 / fixed_step,
-                    );
-                    region_state.prev_position_world = previous;
-                    region_state.position_world = add(
-                        region_state.position_world,
-                        mul(velocity, damping_factor * fixed_step),
-                    );
-                    region_state.position_world = add(
-                        region_state.position_world,
-                        mul(sub(target, region_state.position_world), stiffness_pull),
-                    );
+                let start_root = region_state.last_root_world;
+                match self.tuning.solver {
+                    JiggleSolver::KawaiiPhysics => {
+                        let damping = (region.damping * self.tuning.damping_scale).clamp(0.0, 0.999);
+                        let stiffness = (region.stiffness * self.tuning.stiffness_scale).clamp(0.0, 0.999);
+                        // Port the current KawaiiPhysics Verlet core to one virtual
+                        // soft-region point. In its fixed-substep path DeltaTimeOld
+                        // and StepDeltaTime are both FixedDt; damping is raw per-step,
+                        // while stiffness keeps the source exponent form.
+                        let damping_factor = 1.0 - damping;
+                        let stiffness_pull =
+                            1.0 - (1.0 - stiffness).powf(self.hz as f32 * fixed_step);
+                        for step in 0..steps {
+                            let t = (step + 1) as f32 / steps as f32;
+                            let target = lerp(start_anchor, anchor_world, t);
+                            let previous = region_state.position_world;
+                            let velocity = mul(
+                                sub(region_state.position_world, region_state.prev_position_world),
+                                1.0 / fixed_step,
+                            );
+                            region_state.prev_position_world = previous;
+                            region_state.position_world = add(
+                                region_state.position_world,
+                                mul(velocity, damping_factor * fixed_step),
+                            );
+                            region_state.position_world = add(
+                                region_state.position_world,
+                                mul(sub(target, region_state.position_world), stiffness_pull),
+                            );
+                        }
+                    }
+                    JiggleSolver::JigglePhysics => {
+                        // Ported from naelstrof/JigglePhysics (MIT); see
+                        // LICENSE-JigglePhysics-MIT. This is the Motionless Root
+                        // one-child solve relevant to our mesh soft regions.
+                        let drag = self.tuning.jp_drag.clamp(0.0, 1.0);
+                        let air_drag = self.tuning.jp_air_drag.clamp(0.0, 1.0);
+                        let stiffness = self.tuning.jp_stiffness.clamp(0.0, 1.0);
+                        let soften = self.tuning.jp_soften.clamp(0.0, 1.0);
+                        let stretch = self.tuning.jp_stretch.clamp(0.0, 1.0);
+                        let gravity = self.tuning.jp_gravity.clamp(0.0, 2.0);
+                        let angle_elasticity = stiffness * stiffness;
+                        let length_elasticity = (1.0 + (stiffness - 1.0) * stretch).powi(2);
+                        let gravity_step = [0.0, 0.0, -800.0 * gravity * fixed_step * fixed_step];
+                        let mut previous_root = start_root;
+
+                        for step in 0..steps {
+                            let t = (step + 1) as f32 / steps as f32;
+                            let target = lerp(start_anchor, anchor_world, t);
+                            let root = lerp(start_root, root_world, t);
+                            let particle_delta =
+                                sub(region_state.position_world, region_state.prev_position_world);
+                            let parent_delta = sub(root, previous_root);
+                            let local_space_velocity = sub(particle_delta, parent_delta);
+                            // Exact JigglePhysics Verlet decomposition: parent/world
+                            // motion uses Air Drag; child-local motion uses Drag.
+                            let world_space_velocity = sub(particle_delta, local_space_velocity);
+                            let previous = region_state.position_world;
+                            let mut next = add(
+                                region_state.position_world,
+                                add(
+                                    mul(world_space_velocity, 1.0 - air_drag),
+                                    mul(local_space_velocity, 1.0 - drag),
+                                ),
+                            );
+                            next = add(next, gravity_step);
+
+                            // Direct-child Motionless Root angle/rest constraint.
+                            let rest_length = distance(root, target).max(0.001);
+                            let normalized_error =
+                                (distance(next, target) / rest_length).clamp(0.0, 1.0);
+                            let soften_factor = normalized_error.powf(soften * 2.0);
+                            next = lerp(
+                                next,
+                                target,
+                                (angle_elasticity * soften_factor).clamp(0.0, 1.0),
+                            );
+
+                            // Preserve the authored root->child length with the
+                            // source-shaped stretch/elasticity control.
+                            let from_root = sub(next, root);
+                            let from_root_len = length(from_root);
+                            if from_root_len > 0.0001 {
+                                let length_target =
+                                    add(root, mul(from_root, rest_length / from_root_len));
+                                next = lerp(
+                                    next,
+                                    length_target,
+                                    length_elasticity.clamp(0.0, 1.0),
+                                );
+                            }
+
+                            region_state.prev_position_world = previous;
+                            region_state.position_world = next;
+                            previous_root = root;
+                        }
+                    }
                 }
             }
 
@@ -922,16 +1055,26 @@ impl JiggleSystem {
             if offset_length > region.max_offset {
                 let scale = region.max_offset / offset_length;
                 world_offset = mul(world_offset, scale);
-                region_state.position_world = add(anchor_world, world_offset);
-                // Kawaii/Verlet state stores velocity implicitly in the previous
-                // position. Collapse only the outward component at the clamp so
-                // the next step does not immediately re-launch past the limit.
-                let implicit_velocity = sub(region_state.position_world, region_state.prev_position_world);
-                let radial = dot(implicit_velocity, world_offset)
-                    / (region.max_offset * region.max_offset).max(0.0001);
-                if radial > 0.0 {
-                    let corrected = sub(implicit_velocity, mul(world_offset, radial));
-                    region_state.prev_position_world = sub(region_state.position_world, corrected);
+
+                // The fixed-step state must only advance when a fixed step ran.
+                // At very high render FPS, mutating it on zero-step frames used to
+                // erase almost all straight-line component motion before the next
+                // 60/120 Hz solve. We still clamp the *rendered* offset every frame,
+                // but preserve the source solver state until a substep consumes it.
+                if steps > 0 {
+                    region_state.position_world = add(anchor_world, world_offset);
+                    // Kawaii/Verlet state stores velocity implicitly in the previous
+                    // position. Collapse only the outward component at the clamp so
+                    // the next step does not immediately re-launch past the limit.
+                    let implicit_velocity =
+                        sub(region_state.position_world, region_state.prev_position_world);
+                    let radial = dot(implicit_velocity, world_offset)
+                        / (region.max_offset * region.max_offset).max(0.0001);
+                    if radial > 0.0 {
+                        let corrected = sub(implicit_velocity, mul(world_offset, radial));
+                        region_state.prev_position_world =
+                            sub(region_state.position_world, corrected);
+                    }
                 }
             }
 
@@ -940,7 +1083,15 @@ impl JiggleSystem {
                 model_offset[component] *= region.response[component];
             }
             offsets[index] = model_offset;
-            region_state.last_anchor_world = anchor_world;
+
+            // Keep the interpolation endpoints at the last *simulated* target.
+            // Updating these on render-only frames makes fixed substeps see just
+            // the last render delta, which is especially destructive at the very
+            // high frame rates this client targets.
+            if steps > 0 {
+                region_state.last_anchor_world = anchor_world;
+                region_state.last_root_world = root_world;
+            }
         }
 
         state.last_time_ms = time_ms;

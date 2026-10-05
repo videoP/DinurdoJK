@@ -116,8 +116,22 @@ impl App {
                 }
                 for section in &entry.sections {
                     theme::label(ui, theme::plain(&section.title, 10.5, theme::TEXT_FAINT));
-                    for line in &section.lines {
-                        wrapped(ui, line, theme::TEXT);
+                    if section.title == "SHADER SCRIPT" {
+                        let script = section.lines.join("\n");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(script)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(theme::TEXT),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    } else {
+                        for line in &section.lines {
+                            wrapped(ui, line, theme::TEXT);
+                        }
                     }
                     ui.add_space(8.0);
                 }

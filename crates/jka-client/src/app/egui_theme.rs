@@ -611,6 +611,10 @@ pub(super) enum Reset {
     None,
     /// A `ui::VIDEO_ROW_*` row.
     Video(usize),
+    /// A split-toning control, identified by its archived cvar.
+    Color(&'static str),
+    /// One split-toning color picker backed by hue + saturation cvars.
+    ColorPair(&'static str, &'static str),
     /// A `ui::ENV_ROW_*` row.
     Environment(usize),
     /// A `ui::CLOUD_ROW_*` row.

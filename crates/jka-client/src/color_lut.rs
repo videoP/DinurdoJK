@@ -1,6 +1,6 @@
 use crate::ui::ColorLutPreset;
-use oximedia_lut::creative_grade::FilmPreset;
 use jka_assets::pk3::AssetSearchPath;
+use oximedia_lut::creative_grade::FilmPreset;
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -204,6 +204,78 @@ pub fn build_rgba8(preset: ColorLutPreset, base: &Path, game: Option<&Path>) -> 
     }
 }
 
+/// Combine LUT intensity and split toning into the existing texture. Disabled
+/// split toning returns the original bytes, preserving the original film looks.
+pub fn build_graded_rgba8(
+    preset: ColorLutPreset,
+    strength: f32,
+    split_toning: crate::color_grading::SplitToningSettings,
+    gamma: f32,
+    base: &Path,
+    game: Option<&Path>,
+) -> (u32, Vec<u8>) {
+    let split_toning = split_toning.sanitize();
+    if !split_toning.active() {
+        return build_rgba8(preset, base, game);
+    }
+    let (size, data) = build_rgba8(preset, base, game);
+    // Preserve exact input values when no film look is selected, avoiding
+    // quantizing an identity grid before applying the split-tone transform.
+    let source = (size == LUT_SIZE).then_some(data.as_slice());
+    (
+        LUT_SIZE,
+        bake_split_toning_rgba8(source, strength, split_toning, gamma),
+    )
+}
+
+fn bake_split_toning_rgba8(
+    source: Option<&[u8]>,
+    strength: f32,
+    split_toning: crate::color_grading::SplitToningSettings,
+    gamma: f32,
+) -> Vec<u8> {
+    let strength = if strength.is_finite() {
+        strength.clamp(0.0, 1.0) as f64
+    } else {
+        1.0
+    };
+    let gamma = if gamma.is_finite() {
+        gamma.clamp(0.5, 3.0) as f64
+    } else {
+        1.0
+    };
+    let size = LUT_SIZE as usize;
+    let denom = (size - 1) as f64;
+    let mut data = Vec::with_capacity(size.pow(3) * 4);
+    for index in 0..size.pow(3) {
+        // The existing shaders sample the LUT after pow(color, 1/gamma).
+        // Undo that on the CPU, tone in linear light using the original scene
+        // as the range reference, then redo gamma before storing each texel.
+        // No extra shader instructions or texture samples are required.
+        let input = [
+            (index % size) as f64 / denom,
+            ((index / size) % size) as f64 / denom,
+            (index / (size * size)) as f64 / denom,
+        ];
+        let reference = input.map(|v| v.powf(gamma));
+        let graded = std::array::from_fn(|c| {
+            let mixed = match source {
+                Some(source) if strength > 0.0 => {
+                    input[c] + (source[index * 4 + c] as f64 / 255.0 - input[c]) * strength
+                }
+                _ => input[c],
+            };
+            mixed.powf(gamma)
+        });
+        let output = split_toning.apply_with_reference(graded, reference);
+        for v in output {
+            data.push((v.powf(1.0 / gamma).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        }
+        data.push(255);
+    }
+    data
+}
+
 /// Bake the selected OxiMedia film transform into a compact 33^3 RGBA8 3D LUT.
 /// This runs only when the user changes presets; per-frame cost is one filtered
 /// 3D texture lookup in the existing post pass.
@@ -308,7 +380,191 @@ mod vfs_tests {
         }
         assert_eq!(
             ColorLutPreset::from_config("bluehour"),
-            Some(ColorLutPreset::External(find_external("BlueHour.cube").unwrap()))
+            Some(ColorLutPreset::External(
+                find_external("BlueHour.cube").unwrap()
+            ))
         );
+    }
+}
+
+#[cfg(test)]
+mod grading_tests {
+    use super::*;
+    use crate::color_grading::SplitToningSettings;
+
+    #[test]
+    fn disabled_grading_preserves_existing_lut_bytes() {
+        for preset in [
+            ColorLutPreset::Off,
+            ColorLutPreset::KodakVision3_250d,
+            ColorLutPreset::KodakPortra400,
+            ColorLutPreset::FujiEterna500,
+            ColorLutPreset::FujiVelvia50,
+        ] {
+            let original = build_rgba8(preset, Path::new("."), None);
+            let graded = build_graded_rgba8(
+                preset,
+                0.4,
+                SplitToningSettings::default(),
+                2.5,
+                Path::new("."),
+                None,
+            );
+            assert_eq!(graded, original);
+        }
+    }
+
+    #[test]
+    fn split_toning_works_without_a_film_lut() {
+        let (size, data) = build_graded_rgba8(
+            ColorLutPreset::Off,
+            1.0,
+            SplitToningSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            1.0,
+            Path::new("."),
+            None,
+        );
+        assert_eq!(size, LUT_SIZE);
+        assert_eq!(data.len(), (LUT_SIZE as usize).pow(3) * 4);
+        assert_ne!(data, identity_rgba8(LUT_SIZE));
+        assert!(data.chunks_exact(4).all(|rgba| rgba[3] == 255));
+    }
+
+    #[test]
+    fn zero_lut_strength_keeps_independent_split_toning() {
+        let settings = SplitToningSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let (_, film) = build_graded_rgba8(
+            ColorLutPreset::KodakPortra400,
+            0.0,
+            settings,
+            1.0,
+            Path::new("."),
+            None,
+        );
+        let (_, plain) = build_graded_rgba8(
+            ColorLutPreset::Off,
+            0.0,
+            settings,
+            1.0,
+            Path::new("."),
+            None,
+        );
+        assert_eq!(film, plain);
+        assert_ne!(film, identity_rgba8(LUT_SIZE));
+    }
+
+    // Model the shader's filtered 3D lookup, including RGBA8 quantization.
+    fn sample_lut(data: &[u8], rgb: [f64; 3]) -> [f64; 3] {
+        let position = rgb.map(|v| v.clamp(0.0, 1.0) * (LUT_SIZE - 1) as f64);
+        let low = position.map(|v| v.floor() as usize);
+        let fraction: [f64; 3] = std::array::from_fn(|c| position[c] - low[c] as f64);
+        let mut result = [0.0; 3];
+        for corner in 0..8 {
+            let mut coord = low;
+            let mut weight = 1.0;
+            for c in 0..3 {
+                if corner & (1 << c) != 0 {
+                    coord[c] = (coord[c] + 1).min(LUT_SIZE as usize - 1);
+                    weight *= fraction[c];
+                } else {
+                    weight *= 1.0 - fraction[c];
+                }
+            }
+            let index =
+                ((coord[2] * LUT_SIZE as usize + coord[1]) * LUT_SIZE as usize + coord[0]) * 4;
+            for c in 0..3 {
+                result[c] += data[index + c] as f64 / 255.0 * weight;
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn baked_lut_keeps_black_white_and_tone_ranges_across_gamma() {
+        let settings = SplitToningSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut max_error: f64 = 0.0;
+        let mut worst = (0.0, 0.0, 0usize);
+        let mut normal_gamma_error: f64 = 0.0;
+        for gamma in [0.5f32, 0.75, 1.0, 1.5, 2.0, 3.0] {
+            let (_, data) = build_graded_rgba8(
+                ColorLutPreset::Off,
+                1.0,
+                settings,
+                gamma,
+                Path::new("."),
+                None,
+            );
+            assert_eq!(sample_lut(&data, [0.0; 3]), [0.0; 3]);
+            assert_eq!(sample_lut(&data, [1.0; 3]), [1.0; 3]);
+            for step in 1..100 {
+                let perceived = step as f64 / 100.0;
+                let grey = if perceived <= 0.04045 {
+                    perceived / 12.92
+                } else {
+                    ((perceived + 0.055) / 1.055).powf(2.4)
+                };
+                let input = [grey.powf(1.0 / gamma as f64); 3];
+                let output = sample_lut(&data, input).map(|v| v.powf(gamma as f64));
+                let expected = settings.apply_with_reference([grey; 3], [grey; 3]);
+                for c in 0..3 {
+                    let error = (output[c] - expected[c]).abs();
+                    if gamma >= 1.0 {
+                        normal_gamma_error = normal_gamma_error.max(error);
+                    }
+                    if error > max_error {
+                        max_error = error;
+                        worst = (gamma, grey, c);
+                    }
+                }
+                if (0.15..=0.35).contains(&perceived) {
+                    assert!(
+                        output[2] > output[0],
+                        "gamma {gamma}, shadow {grey}: {output:?}"
+                    );
+                }
+                if (0.65..=0.95).contains(&perceived) {
+                    assert!(
+                        output[0] > output[2],
+                        "gamma {gamma}, highlight {grey}: {output:?}"
+                    );
+                }
+            }
+        }
+        println!("Gamma-compensated 33^3 RGBA8 ramp: max linear channel error {max_error:.6}, at gamma/grey/channel {worst:?}; gamma >= 1 error {normal_gamma_error:.6}");
+        // Gamma below one compresses dark inputs into the first LUT cells.
+        // Check a bounded approximation error as well as actual tint direction.
+        assert!(max_error < 0.025, "LUT approximation error {max_error}");
+        assert!(
+            normal_gamma_error < 0.008,
+            "LUT approximation error {normal_gamma_error}"
+        );
+    }
+
+    #[test]
+    fn external_lut_values_are_toned_after_lut_intensity() {
+        let settings = SplitToningSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        // A flat synthetic external LUT isolates the composition order.
+        let source = [51, 102, 153, 255].repeat((LUT_SIZE as usize).pow(3));
+        let data = bake_split_toning_rgba8(Some(&source), 1.0, settings, 1.0);
+        for node in [2usize, 16, 28] {
+            let index =
+                (node * LUT_SIZE as usize * LUT_SIZE as usize + node * LUT_SIZE as usize + node)
+                    * 4;
+            let expected = settings.apply_with_reference([0.2, 0.4, 0.6], [node as f64 / 32.0; 3]);
+            let expected: [u8; 3] = expected.map(|v| (v * 255.0 + 0.5) as u8);
+            assert_eq!(data[index..index + 3], expected);
+        }
     }
 }

@@ -116,6 +116,8 @@ pub enum ScreenshotOutput {
 
 pub enum UserEvent {
     ConsoleCommand(String),
+    GammaPrepared(u64),
+    HardwareGamma(crate::display_gamma::Status),
     ScreenshotFinished(Result<ScreenshotOutput, String>),
     RendererReady {
         supported_msaa: Vec<u32>,

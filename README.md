@@ -29,3 +29,9 @@ Install Rust, then double-click `build.cmd`, or run in PowerShell:
 ```
 
 Place your own game assets in `GameData/base` beside the executable, or pass a base directory with `--base`. Launch `launch.cmd` or `target/release/DinurdoJK.exe`. The diagnostic tool is `target/release/jka-probe.exe`.
+
+## Source layout
+
+See [the client source layout](docs/source-layout.md) for module responsibilities and frame-time constraints.
+
+The Video -> Color menu groups film/external LUTs, split toning and brightness controls. See [color grading](docs/color-grading.md) for the saved settings and rendering cost.

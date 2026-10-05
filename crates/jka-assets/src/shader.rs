@@ -265,6 +265,12 @@ pub struct Stage {
 
 #[derive(Debug, Clone, Default)]
 pub struct Shader {
+    /// Canonical, human-readable form of the authored shader block. This is
+    /// retained for developer tooling (for example `/trace`) so diagnostics
+    /// can show the material as shader script instead of only flattened parsed
+    /// fields. Comments/spacing are normalized, but directive order and stage
+    /// braces are preserved.
+    pub definition_text: Option<String>,
     pub cull: String,
     /// Classic id Tech 3 portal/mirror surface. The renderer can use this as
     /// an authored planar-reflection mask instead of guessing from gloss.
@@ -630,6 +636,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
             cursor += 1;
             continue;
         }
+        let definition_start = cursor;
         let name = tokens[cursor].to_ascii_lowercase();
         cursor += 1;
         while tokens.get(cursor).is_some_and(|t| t == "\n") {
@@ -1133,9 +1140,62 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
         if !closed {
             return Err(format!("unterminated shader {name}"));
         }
+        shader.definition_text = Some(format_definition_tokens(
+            &tokens[definition_start..cursor],
+        ));
         result.entry(name).or_insert(shader);
     }
     Ok(result)
+}
+
+/// Formats one tokenized shader definition in the conventional id Tech 3
+/// brace/stage layout. Tokenization already strips comments, so this deliberately
+/// represents the authored directives rather than pretending to be byte-for-byte
+/// source text.
+fn format_definition_tokens(tokens: &[String]) -> String {
+    fn push_line(out: &mut String, indent: usize, words: &mut Vec<String>) {
+        if words.is_empty() {
+            return;
+        }
+        out.push_str(&"    ".repeat(indent));
+        for (index, word) in words.drain(..).enumerate() {
+            if index != 0 {
+                out.push(' ');
+            }
+            if word.chars().any(char::is_whitespace) {
+                out.push('"');
+                out.push_str(&word);
+                out.push('"');
+            } else {
+                out.push_str(&word);
+            }
+        }
+        out.push('\n');
+    }
+
+    let mut out = String::new();
+    let mut words = Vec::new();
+    let mut indent = 0usize;
+    for token in tokens {
+        match token.as_str() {
+            "\n" => push_line(&mut out, indent, &mut words),
+            "{" => {
+                push_line(&mut out, indent, &mut words);
+                out.push_str(&"    ".repeat(indent));
+                out.push_str("{\n");
+                indent += 1;
+            }
+            "}" => {
+                push_line(&mut out, indent, &mut words);
+                indent = indent.saturating_sub(1);
+                out.push_str(&"    ".repeat(indent));
+                out.push_str("}\n");
+            }
+            _ => words.push(token.clone()),
+        }
+    }
+    push_line(&mut out, indent, &mut words);
+    out.trim_end().to_owned()
 }
 
 fn tokenize(text: &str) -> Result<Vec<String>, String> {
@@ -1631,6 +1691,22 @@ map models/players/test/torso_04
         }
         assert!(find_shader(&shaders, "models/players/test/other.tga").is_none());
         assert!(find_shader(&shaders, "models/players.dir/test").is_none());
+    }
+
+    #[test]
+    fn retains_canonical_shader_definition_text_for_trace() {
+        let shaders = parse(
+            "textures/byss/byss_basic1_piller_light\n{\n    {\n        map $lightmap\n    }\n    {\n        map textures/byss/byss_basic1_piller_light\n        blendFunc GL_DST_COLOR GL_ZERO\n    }\n    {\n        map textures/byss/byss_piller_glow\n        blendFunc GL_ONE GL_ONE\n        glow\n    }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shaders["textures/byss/byss_basic1_piller_light"]
+                .definition_text
+                .as_deref(),
+            Some(
+                "textures/byss/byss_basic1_piller_light\n{\n    {\n        map $lightmap\n    }\n    {\n        map textures/byss/byss_basic1_piller_light\n        blendFunc GL_DST_COLOR GL_ZERO\n    }\n    {\n        map textures/byss/byss_piller_glow\n        blendFunc GL_ONE GL_ONE\n        glow\n    }\n}"
+            )
+        );
     }
 
 }

@@ -41,3 +41,6 @@ naga = { version = "=29.0.4", features = ["wgsl-in"] }
 
 [build-dependencies]
 png = "=0.18.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security"] }

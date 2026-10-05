@@ -885,8 +885,6 @@ impl EntityPresenter {
     ) -> Result<Vec<DynamicModelSurface>, String> {
         const WP_NONE: i32 = 0;
         const WP_STUN_BATON: i32 = 1;
-        const WP_MELEE: i32 = 2;
-        const WP_SABER: i32 = 3;
         const WP_DISRUPTOR: i32 = 6;
         const WP_REPEATER: i32 = 8;
         const WP_FLECHETTE: i32 = 10;
@@ -894,9 +892,10 @@ impl EntityPresenter {
         const WP_CONCUSSION: i32 = 15;
         const WP_EMPLACED_GUN: i32 = 17;
 
-        // Saber/melee are drawn by the local Ghoul2 body in first person.
-        // CG_AddPlayerWeapon explicitly returns for the emplaced gun.
-        if matches!(weapon_num, WP_NONE | WP_MELEE | WP_SABER | WP_EMPLACED_GUN) {
+        // EternalJK CG_AddViewWeapon forwards saber/melee through the same
+        // first-person viewModel path as the other weapons.
+        // CG_AddPlayerWeapon only special-cases the emplaced gun here.
+        if matches!(weapon_num, WP_NONE | WP_EMPLACED_GUN) {
             return Ok(Vec::new());
         }
 
@@ -912,9 +911,19 @@ impl EntityPresenter {
         }
 
         let hand_qpath = replace_md3_suffix(&item.view_model, "_hand.md3");
-        let hand = self.load_md3(&hand_qpath)?;
+        let (hand, resolved_hand_qpath) = match self.load_md3(&hand_qpath) {
+            Ok(hand) => (hand, hand_qpath.as_str()),
+            Err(_) => {
+                // CG_RegisterWeapon falls back to the stock Bryar hand when
+                // a weapon-specific *_hand.md3 is absent. Keep that exact
+                // registration behavior instead of dropping the whole view gun.
+                const FALLBACK_HAND: &str =
+                    "models/weapons2/briar_pistol/briar_pistol_hand.md3";
+                (self.load_md3(FALLBACK_HAND)?, FALLBACK_HAND)
+            }
+        };
         if hand.model.tags.is_empty() {
-            return Err(format!("{hand_qpath}: view hand has no MD3 tags"));
+            return Err(format!("{resolved_hand_qpath}: view hand has no MD3 tags"));
         }
 
         // CG_CalculateWeaponPosition. cg.bobcycle is just the high bit of
@@ -939,7 +948,7 @@ impl EntityPresenter {
 
         let hand_axis = angles_to_axis(view_angles);
         let tag_weapon = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, "tag_weapon")
-            .ok_or_else(|| format!("{hand_qpath}: missing tag_weapon"))?;
+            .ok_or_else(|| format!("{resolved_hand_qpath}: missing tag_weapon"))?;
         let (gun_origin, gun_axis) = position_on_md3_tag(view_origin, hand_axis, tag_weapon);
 
         let mut draws = self.present_view_md3(entity_num, &item.view_model, gun_origin, gun_axis)?;

@@ -31,6 +31,7 @@ dependencies = [
  "serde_json",
  "smaa",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit 0.30.13",
 ]
 

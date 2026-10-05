@@ -37,6 +37,9 @@ mod chat_log;
 mod clipboard;
 mod cloud_noise;
 mod cloud_wind;
+mod color_grading;
+mod gamma;
+mod display_gamma;
 mod color_lut;
 mod config;
 mod console;
@@ -236,6 +239,9 @@ fn is_screenshot_path(path: &std::path::Path) -> bool {
 }
 
 fn main() -> std::process::ExitCode {
+    if let Some(code) = display_gamma::helper_entry() {
+        return std::process::ExitCode::from(code as u8);
+    }
     match logging::init() {
         Ok(path) => {
             logging::write_line_with_path(
@@ -247,6 +253,10 @@ fn main() -> std::process::ExitCode {
             crash::log_environment();
         }
         Err(error) => std::eprintln!("Logging initialization failed: {error}"),
+    }
+
+    for error in display_gamma::recover_before_launch() {
+        eprintln!("Display gamma recovery: {error}");
     }
 
     let options = match Options::parse() {
