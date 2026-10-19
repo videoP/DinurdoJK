@@ -135,7 +135,11 @@ pub fn compose(source: &Path, variant: &Value) -> Result<Psa, String> {
     Ok(result)
 }
 
-fn repair_additive_reference(clip: &mut Psa, old: &Psa, correct: &Psa) -> Result<(), String> {
+pub(crate) fn repair_additive_reference(
+    clip: &mut Psa,
+    old: &Psa,
+    correct: &Psa,
+) -> Result<(), String> {
     let bones = clip.bones.len();
     for reference in [old, correct] {
         if reference.bones.len() != bones
