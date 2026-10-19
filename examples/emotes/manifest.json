@@ -1,0 +1,14 @@
+{
+  "emotes": [
+    {
+      "id": "EID_DanceMoves",
+      "name": "Dance Moves",
+      "gla": "models/players/_humanoid/emotes/dance_moves.gla",
+      "first_frame": 0,
+      "end_frame": 204,
+      "fps": 30.0,
+      "loop": false,
+      "audio": []
+    }
+  ]
+}

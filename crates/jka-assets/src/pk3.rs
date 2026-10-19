@@ -267,6 +267,23 @@ impl AssetSearchPath {
         self.shared.entries.iter().map(|entry| entry.key.as_str())
     }
 
+    /// Locate a stored member without loading its payload. Nested archives use
+    /// this to seek directly into the package through the same VFS priority.
+    pub fn stored_location(&mut self, name: &str) -> Result<Option<(PathBuf, Option<(u64,u64)>)>, Box<dyn Error>> {
+        validate_asset_name(name)?;
+        let Some(provider)=self.provider_for_ordinary_read(&normalize_asset_name(name)) else { return Ok(None) };
+        match provider {
+            Provider::Loose { path } => Ok(Some((path,None))),
+            Provider::Archive { archive, entry } => {
+                let path=self.shared.archive_paths[archive].clone();
+                let file=self.archive_handle(archive)?.by_index(entry)?;
+                if normalize_asset_name(file.name()) != normalize_asset_name(name) { return Err("package changed since indexing".into()) }
+                if file.compression()!=zip::CompressionMethod::Stored { return Err(format!("{name}: nested bundles must use ZIP Store").into()) }
+                Ok(Some((path,Some((file.data_start().ok_or("package member has no offset")?,file.size())))))
+            }
+        }
+    }
+
     /// Fast indexed existence check for an exact virtual qpath. This mirrors
     /// BG_FileExists-style lookups without opening the asset.
     pub fn contains_qpath(&self, name: &str) -> bool {

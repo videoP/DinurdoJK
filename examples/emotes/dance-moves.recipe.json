@@ -1,0 +1,23 @@
+{
+  "id": "EID_DanceMoves",
+  "name": "Dance Moves",
+  "source_root": "export/EID_DanceMoves",
+  "animation": {
+    "psa": "Animations/DanceMoves.psa",
+    "target_base": "GameData/base",
+    "retarget": {
+      "start_seconds": 0.0,
+      "end_seconds": 6.8
+    }
+  },
+  "loop": false,
+  "audio": [
+    {
+      "at_ms": 0,
+      "lane": "music",
+      "audience": "both",
+      "wav": "Audio/dance_soldier_03.wav"
+    },
+    { "at_ms": 6800, "lane": "music", "audience": "both" }
+  ]
+}

@@ -19,3 +19,8 @@
 /tools/jiggle-shape-preview/anny/*
 !/tools/jiggle-shape-preview/anny/*.py
 !/tools/jiggle-shape-preview/anny/README.md
+# Emote bundles and libraries are build artefacts (large); they are produced
+# with djk-fnemote and installed into a game `base`, never committed.
+/base/emotes/*.djk_fnemote
+/base/emotes-*/
+/base/fnemote*.pk3
