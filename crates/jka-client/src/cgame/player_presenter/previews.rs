@@ -355,6 +355,10 @@ impl PlayerPresenter {
             self.emote_fx.draws.append(&mut fx.draws);
             self.emote_fx.lights.append(&mut fx.lights);
         }
+        let mut idle=Self::idle_effect_frame(&model,&pose,axis,origin,0,current_time);
+        self.cosmetic_draws.append(&mut idle.meshes);
+        self.emote_fx.draws.append(&mut idle.draws);
+        self.emote_fx.lights.append(&mut idle.lights);
         // The UI anchors use the *same animated Ghoul2 pose* as skinning,
         // including cursor-driven cranium/cervical edits and model yaw.
         // No fixed screen percentages or arbitrary player-space guesses.

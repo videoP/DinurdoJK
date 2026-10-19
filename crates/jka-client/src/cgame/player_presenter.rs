@@ -28,7 +28,7 @@ mod view;
 #[cfg(test)]
 use assets::loading::{material_layers, resolved_stage, stage_uv_xform};
 use assets::loading::{
-    specular_alpha, stage_uv_affine, wave_value, ModelLoadShared, ModelResolution, StageFrame,
+    environment_uv, specular_alpha, stage_uv_affine, wave_value, ModelLoadShared, ModelResolution, StageFrame,
 };
 use assets::types::{
     fpls_mode3_surface_hidden, Ghoul2GpuMeshSource, PlayerModelAsset, PlayerSurfaceAsset,

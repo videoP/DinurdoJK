@@ -168,6 +168,43 @@ pub struct SourceJiggleBinding {
     pub length: f32,
 }
 
+/// One vertex of a rig input, in its source format's model space, with every
+/// skinning influence as (source bone index, weight).
+#[derive(Clone, Debug)]
+pub struct RigVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub influences: Vec<(usize, f32)>,
+}
+
+/// One drawable surface's triangles in one LOD, indexing that LOD's vertex pool.
+/// `key` identifies the surface across LODs.
+#[derive(Clone, Debug)]
+pub struct RigDraw {
+    pub key: (usize, usize, usize),
+    pub indices: Vec<u32>,
+}
+
+/// A surface as named by LOD0, in GLM surface order.
+#[derive(Clone, Debug)]
+pub struct RigSurfaceSpec {
+    pub key: (usize, usize, usize),
+    pub name: String,
+    /// GLM hierarchy shader (a JKA shader or image path, or a Source texture name).
+    pub shader: String,
+    pub vmt_candidates: Vec<String>,
+}
+
+/// Format-neutral character geometry: everything [`build_rig`] needs besides
+/// the skeleton. Source models and Unreal skeletal meshes both convert to it.
+#[derive(Clone, Debug, Default)]
+pub struct RigGeometry {
+    pub surfaces: Vec<RigSurfaceSpec>,
+    /// Per LOD: the vertex pool and the draws indexing it.
+    pub lods: Vec<(Vec<RigVertex>, Vec<RigDraw>)>,
+}
+
 pub struct SourceRig {
     pub source_jiggles: Vec<SourceJiggleBinding>,
     pub glm: GlmModel,
@@ -1162,6 +1199,99 @@ pub fn build_source_rig(
     gla: &GlaAnimation,
     options: &SourceRigOptions,
 ) -> Result<SourceRig, String> {
+    let geometry = source_rig_geometry(mdl, vvd, vtx, materials, options)?;
+    build_rig(model_qpath, skeleton, &geometry, gla, options)
+}
+
+/// Read a Source model's bodypart/LOD geometry into the neutral rig input.
+/// Surface identity must be stable across LODs, so it is keyed on the MDL
+/// (bodypart, model, mesh) triple rather than on per-LOD ordering.
+fn source_rig_geometry(
+    mdl: &[u8],
+    vvd: &SourceVvd,
+    vtx: &SourceVtx,
+    materials: &SourceMaterialTable,
+    options: &SourceRigOptions,
+) -> Result<RigGeometry, String> {
+    let bodyparts = parse_source_bodyparts(mdl)?;
+    let lod_count = vvd
+        .lod_count
+        .min(vtx.lod_count)
+        .min(options.max_lods.max(1));
+    let base_draws = assemble_source_lod(mdl, vvd, vtx, 0, &options.bodygroups)?;
+    let mut surfaces = Vec::with_capacity(base_draws.len());
+    for draw in &base_draws {
+        let body = &bodyparts[draw.bodypart];
+        let model_stem = body.models[draw.model]
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".smd")
+            .trim_end_matches(".SMD");
+        let sanitize = |text: &str| -> String {
+            let cleaned: String = text
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            cleaned.trim_matches('_').to_owned()
+        };
+        let texture_index = materials.texture_index(options.skin_family, draw.skin_ref);
+        surfaces.push(RigSurfaceSpec {
+            key: (draw.bodypart, draw.model, draw.mesh),
+            name: format!(
+                "{}_{}_{}",
+                sanitize(&body.name),
+                sanitize(model_stem),
+                draw.mesh
+            ),
+            shader: texture_index
+                .and_then(|slot| materials.textures.get(slot).cloned())
+                .unwrap_or_default(),
+            vmt_candidates: texture_index
+                .map(|slot| materials.vmt_candidates(slot))
+                .unwrap_or_default(),
+        });
+    }
+    let mut lods = Vec::with_capacity(lod_count);
+    for lod in 0..lod_count {
+        let pool = source_lod_vertices(vvd, lod)?
+            .iter()
+            .map(|v| RigVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                influences: (0..(v.bone_count as usize).min(3))
+                    .map(|k| (v.bones[k] as usize, v.weights[k]))
+                    .collect(),
+            })
+            .collect();
+        let draws = if lod == 0 {
+            base_draws.clone()
+        } else {
+            assemble_source_lod(mdl, vvd, vtx, lod, &options.bodygroups)?
+        };
+        lods.push((
+            pool,
+            draws
+                .into_iter()
+                .map(|d| RigDraw { key: (d.bodypart, d.model, d.mesh), indices: d.indices })
+                .collect(),
+        ));
+    }
+    Ok(RigGeometry { surfaces, lods })
+}
+
+/// Fit, rebind and reweight any skeleton plus geometry onto `gla`. The
+/// skeleton's bone names select the mapping (ValveBiped names, or the GLA's own).
+pub fn build_rig(
+    model_qpath: &str,
+    skeleton: &SourceSkeleton,
+    geometry: &RigGeometry,
+    gla: &GlaAnimation,
+    options: &SourceRigOptions,
+) -> Result<SourceRig, String> {
     let rest_world = source_rest_world(skeleton)?;
 
     // StudioMDL stores an independent inverse bind. Comparing it against the one
@@ -1396,59 +1526,24 @@ pub fn build_source_rig(
         .iter().map(|(&bone, matrix)| (bone, dual_quat_from_scaled_matrix(matrix)))
         .collect();
 
-    // Surface identity must be stable across LODs, so it is keyed on the MDL
-    // (bodypart, model, mesh) triple rather than on per-LOD ordering.
-    let bodyparts = parse_source_bodyparts(mdl)?;
-    let lod_count = vvd
-        .lod_count
-        .min(vtx.lod_count)
-        .min(options.max_lods.max(1));
-    let base_draws = assemble_source_lod(mdl, vvd, vtx, 0, &options.bodygroups)?;
     let mut surface_index_of = BTreeMap::new();
-    let mut surfaces = Vec::with_capacity(base_draws.len());
-    let mut hierarchy = Vec::with_capacity(base_draws.len());
-    for draw in &base_draws {
-        let index = surfaces.len();
-        surface_index_of.insert((draw.bodypart, draw.model, draw.mesh), index);
-        let body = &bodyparts[draw.bodypart];
-        let model_stem = body.models[draw.model]
-            .name
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(".smd")
-            .trim_end_matches(".SMD");
-        let sanitize = |text: &str| -> String {
-            let cleaned: String = text
-                .to_ascii_lowercase()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            cleaned.trim_matches('_').to_owned()
-        };
-        let name = format!(
-            "{}_{}_{}",
-            sanitize(&body.name),
-            sanitize(model_stem),
-            draw.mesh
-        );
-        let texture_index = materials.texture_index(options.skin_family, draw.skin_ref);
+    let mut surfaces = Vec::with_capacity(geometry.surfaces.len());
+    let mut hierarchy = Vec::with_capacity(geometry.surfaces.len());
+    for spec in &geometry.surfaces {
+        surface_index_of.insert(spec.key, surfaces.len());
         hierarchy.push(GlmSurfaceHierarchy {
-            name: name.clone(),
+            name: spec.name.clone(),
             flags: 0,
-            shader: texture_index
-                .and_then(|slot| materials.textures.get(slot).cloned())
-                .unwrap_or_default(),
+            shader: spec.shader.clone(),
             parent_index: -1,
             children: Vec::new(),
         });
         surfaces.push(SourceRigSurface {
-            name,
-            vmt_candidates: texture_index
-                .map(|slot| materials.vmt_candidates(slot))
-                .unwrap_or_default(),
+            name: spec.name.clone(),
+            vmt_candidates: spec.vmt_candidates.clone(),
         });
     }
+    let lod_count = geometry.lods.len();
 
     let mut weight_truncations = 0usize;
     let mut source_jiggle_weighted_vertices = 0usize;
@@ -1457,23 +1552,16 @@ pub fn build_source_rig(
     let mut rest_max = [f32::NEG_INFINITY; 3];
     let mut lods = Vec::with_capacity(lod_count);
     let mut lod_stats = Vec::with_capacity(lod_count);
-    for lod in 0..lod_count {
-        let pool = source_lod_vertices(vvd, lod)?;
-        let draws = if lod == 0 {
-            base_draws.clone()
-        } else {
-            assemble_source_lod(mdl, vvd, vtx, lod, &options.bodygroups)?
-        };
+    for (lod, (pool, draws)) in geometry.lods.iter().enumerate() {
         let mut lod_surfaces = Vec::with_capacity(draws.len());
         let mut lod_vertices = 0usize;
         let mut lod_triangles = 0usize;
-        for draw in &draws {
-            let Some(&surface_index) = surface_index_of.get(&(draw.bodypart, draw.model, draw.mesh))
-            else {
+        for draw in draws {
+            let Some(&surface_index) = surface_index_of.get(&draw.key) else {
                 // A coarser LOD may only drop meshes, never introduce new ones.
                 return Err(format!(
-                    "{model_qpath}: LOD{lod} introduces bodypart {} model {} mesh {} that LOD0 does not have",
-                    draw.bodypart, draw.model, draw.mesh
+                    "{model_qpath}: LOD{lod} introduces surface {:?} that LOD0 does not have",
+                    draw.key
                 ));
             };
             if draw.indices.is_empty() {
@@ -1499,7 +1587,7 @@ pub fn build_source_rig(
                         let source = pool.get(pool_index as usize).ok_or_else(|| {
                             format!("{model_qpath}: LOD{lod} vertex {pool_index} outside the gathered pool")
                         })?;
-                        let influences = source.bone_count as usize;
+                        let influences = source.influences.len();
                         let mut total = 0.0f32;
                         let mut merged = BTreeMap::<usize, f32>::new();
                         // Collected instead of blended immediately: the
@@ -1508,15 +1596,13 @@ pub fn build_source_rig(
                         // into its hemisphere, not an arbitrary bone-table one.
                         let mut parts: Vec<(f32, [f32; 4], [f32; 4])> = Vec::with_capacity(influences);
                         let mut scale_sum = 0.0f32;
-                        for k in 0..influences {
-                            let bone = source.bones[k] as usize;
+                        for &(bone, weight) in &source.influences {
                             let rebind = rebinds.get(bone).ok_or_else(|| {
                                 format!(
                                     "{model_qpath}: vertex {pool_index} references Source bone {bone}, but the skeleton has {}",
                                     rebinds.len()
                                 )
                             })?;
-                            let weight = source.weights[k];
                             if !weight.is_finite() || weight < 0.0 {
                                 return Err(format!(
                                     "{model_qpath}: vertex {pool_index} has invalid weight {weight}"

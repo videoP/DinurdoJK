@@ -86,3 +86,8 @@ cargo test -p jka-ue-assets
 `tests/import_export_dir.rs` builds a minimal export directory (one triangle,
 one material, one texture) and runs the whole import, so it doubles as an
 executable example of the input contract.
+
+## Characters as player models
+
+Skeletal-mesh characters (body, head, hat, ...) can be packaged as ordinary player models with
+`scripts/ue-skin-package.py`: see [SKINS.md](SKINS.md).

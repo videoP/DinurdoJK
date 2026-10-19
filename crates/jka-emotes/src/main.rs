@@ -4,7 +4,7 @@ use jka_emotes::compiler::{compile, read, target_from_model, DEFAULT_TARGET_MODE
 use jka_emotes::library::{
     batch, catalog, loop_audit, presentation_import, reconcile, reground, shipping,
 };
-use jka_emotes::{effect_preview, niagara_bake, program_audit};
+use jka_emotes::{effect_preview, idle_effects, niagara_bake, program_audit};
 use jka_emotes::{Bundle, MAX_MEMBER_BYTES};
 use serde_json::json;
 use std::{fs, path::Path};
@@ -81,6 +81,11 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "invalid asset scale")?;
             import_assets(Path::new(&args[1]), Path::new(&args[2]), scale)
         }
+        "bake-idle" if args.len() == 4 => idle_effects::run(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+        ),
         "audit-ue-programs" if args.len() == 3 => {
             program_audit::run(Path::new(&args[1]), Path::new(&args[2]))
         }
@@ -274,6 +279,7 @@ Library tooling for Fortnite-style source exports (see crates/jka-emotes/LIBRARY
 
 Native assets and effects (see crates/jka-emotes/EFFECTS.md):
   import-assets <UE export dir> <fresh output.pk3> [cm to game units = 0.4]
+  bake-idle <native report.json> <request.json> <out dir>   character idle effects (see SKINS.md)
   audit-ue-programs <UE export dir> <out.json>    which Blueprint/Niagara programs decode
   niagara-audit <UE export dir> <out.json> [seconds = 3] [name filter]
   niagara-preview <UE export dir> <name filter> <out.png> [seconds = 3]

@@ -7,12 +7,16 @@
 //! therefore need no Source-specific code at all, and normal GLM players are
 //! completely unaffected: nothing below runs unless
 //! `models/players/<name>/source_model.json` exists.
+//!
+//! The same descriptor with `"format": "ue_skeletal"` names exported Unreal
+//! skeletal meshes (for example a Fortnite body, head and hat) instead of a
+//! `.mdl`; they are merged by `jka_ue_assets::character` and rebound the same way.
 use super::*;
 use jka_assets::source1::{parse_source1_materials, parse_source1_skeleton};
 use jka_assets::source1_geometry::{parse_source_vtx, parse_source_vvd};
 use jka_assets::source1_rig::{
-    attach_humanoid_bolts_between_rigs, build_source_rig, SourceRebindMode, SourceRigDiagnostics,
-    SourceRigOptions,
+    attach_humanoid_bolts_between_rigs, build_rig, build_source_rig, SourceRebindMode,
+    SourceRigDiagnostics, SourceRigOptions,
 };
 
 // `PlayerModelAsset`, `PlayerSurfaceAsset`, `build_lod_gpu_meshes`, `Arc`,
@@ -25,6 +29,7 @@ use crate::renderer::SourceMaterialParams;
 pub(in crate::cgame::player_presenter) const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 const MAX_VMT_BYTES: usize = 1024 * 1024;
 const MAX_VTF_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UE_MESH_BYTES: usize = 128 * 1024 * 1024;
 /// Gameplay animation source. Mesh binding uses the separate JK2 reference.
 const HUMANOID_GLA: &str = "models/players/_humanoid/_humanoid.gla";
 /// Bolts come from a stock humanoid's `*` tag surfaces. Kyle is OpenJK's own
@@ -54,6 +59,150 @@ struct SourceDescriptor {
     /// `"bolt_donor"`: stock `_humanoid` GLM whose `*` tag surfaces supply this
     /// character's bolts. A Source `.mdl` has no tag surfaces of its own.
     bolt_donor: String,
+    /// `"ue_skeletal"` parts: exported skeletal mesh qpath and one shader per
+    /// material section (empty hides the section). Empty for Source models.
+    ue_parts: Vec<UePart>,
+    /// `"idle_effects"`: baked looping particle tracks on a `_humanoid` bone.
+    idle_effects: Vec<IdleEffectRef>,
+    /// `"bone_map"` (`ue_skeletal` only): source bone name (any case) to the
+    /// ValveBiped / `_humanoid` bone it should follow, for skeletons that do not
+    /// use the standard UE mannequin names.
+    bone_map: std::collections::HashMap<String, String>,
+}
+
+struct IdleEffectRef {
+    track: String,
+    bone: String,
+    loop_start: f32,
+    renderers: Vec<jka_emotes::effects::Renderer>,
+}
+
+fn parse_idle_effects(qpath: &str, metadata: &serde_json::Value) -> Result<Vec<IdleEffectRef>, String> {
+    let Some(list) = metadata.get("idle_effects") else { return Ok(Vec::new()) };
+    let list = list.as_array().filter(|a| a.len() <= 16).ok_or_else(|| format!("{qpath}: idle_effects must be a list of at most 16"))?;
+    list.iter().enumerate().map(|(i, e)| {
+        let track = e.get("track").and_then(|v| v.as_str()).filter(|t| t.starts_with("models/") && safe_qpath(t))
+            .ok_or_else(|| format!("{qpath}: idle effect {i} has no safe track path"))?;
+        let renderers = e.get("renderers").and_then(|v| v.as_array()).filter(|r| r.len() <= jka_emotes::effects::MAX_RENDERERS)
+            .ok_or_else(|| format!("{qpath}: idle effect {i} has no renderers"))?
+            .iter().map(jka_emotes::effects::Renderer::parse).collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("{qpath}: idle effect {i}: {error}"))?;
+        Ok(IdleEffectRef {
+            track: track.to_owned(),
+            bone: e.get("bone").and_then(|v| v.as_str()).unwrap_or("model_root").to_owned(),
+            loop_start: e.get("loop_start").and_then(|v| v.as_f64()).unwrap_or(0.).max(0.) as f32,
+            renderers,
+        })
+    }).collect()
+}
+
+struct UePart {
+    name: String,
+    mesh: String,
+    shaders: Vec<String>,
+    /// `"normals"`: per-section normal map (RGB tangent normal, A = phong
+    /// mask) for the normal-mapped Source lighting path; empty for none.
+    normals: Vec<String>,
+    /// `"attach": {"bone", "location": [x,y,z], "rotation": [pitch,yaw,roll]}`
+    /// for rigid accessories mounted on a socket.
+    attach: Option<jka_ue_assets::character::Socket>,
+}
+
+fn parse_socket(value: &serde_json::Value) -> Option<jka_ue_assets::character::Socket> {
+    let triple = |key: &str| -> Option<[f32; 3]> {
+        let a = value.get(key)?.as_array().filter(|a| a.len() == 3)?;
+        let v = [a[0].as_f64()? as f32, a[1].as_f64()? as f32, a[2].as_f64()? as f32];
+        v.iter().all(|c| c.is_finite() && c.abs() < 1e5).then_some(v)
+    };
+    Some(jka_ue_assets::character::Socket {
+        bone: value.get("bone")?.as_str().filter(|b| !b.is_empty() && b.len() < 128)?.to_owned(),
+        location: triple("location").unwrap_or([0.; 3]),
+        rotation: triple("rotation").unwrap_or([0.; 3]),
+    })
+}
+
+impl SourceDescriptor {
+    /// Normal map per rig surface, in the order `character_rig_input` creates
+    /// surfaces (parts in order, sections with a shader).
+    fn ue_surface_normals(&self) -> Vec<String> {
+        self.ue_parts.iter().flat_map(|part| {
+            part.shaders.iter().enumerate().filter(|(_, shader)| !shader.is_empty())
+                .map(|(s, _)| part.normals.get(s).cloned().unwrap_or_default())
+        }).collect()
+    }
+}
+
+/// A PNG/TGA normal map as linear texels (no mip chain).
+fn decode_normal_image(qpath: &str, bytes: &[u8]) -> Result<TextureData, String> {
+    let image = image::load_from_memory(bytes).map_err(|e| format!("{qpath}: {e}"))?.to_rgba8();
+    Ok(TextureData {
+        label: qpath.to_owned(),
+        source: None,
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: false,
+        srgb: false,
+    })
+}
+
+/// Lighting for Unreal character surfaces with a normal map: soft Fortnite-like
+/// specular masked by the map's alpha, and a faint rim.
+fn ue_surface_lighting(normal_map: Arc<TextureData>) -> SourceMaterialParams {
+    SourceMaterialParams {
+        normal_map: Some(normal_map),
+        phong_boost: 1.5,
+        phong_exponent: 16.0,
+        // $phongfresnelranges [0.2 0.5 1], packed ((mid-min)*2, mid, (max-mid)*2).
+        phong_fresnel: [0.6, 0.5, 1.0],
+        rimlight_boost: 0.6,
+        rimlight_exponent: 6.0,
+        half_lambert: false,
+    }
+}
+
+fn safe_qpath(path: &str) -> bool {
+    !path.is_empty() && !path.contains("..") && !path.contains('\\') && !path.contains(':')
+}
+
+fn parse_ue_parts(qpath: &str, metadata: &serde_json::Value) -> Result<Vec<UePart>, String> {
+    let parts = metadata.get("parts").and_then(|v| v.as_array()).filter(|a| !a.is_empty() && a.len() <= 16)
+        .ok_or_else(|| format!("{qpath}: ue_skeletal needs 1-16 parts"))?;
+    parts.iter().enumerate().map(|(i, part)| {
+        let mesh = part.get("mesh").and_then(|v| v.as_str()).filter(|m| m.starts_with("models/") && safe_qpath(m))
+            .ok_or_else(|| format!("{qpath}: part {i} has no safe mesh path"))?;
+        let shaders = part.get("shaders").and_then(|v| v.as_array()).ok_or_else(|| format!("{qpath}: part {i} has no shaders"))?
+            .iter().map(|s| s.as_str().filter(|s| s.is_empty() || safe_qpath(s)).map(str::to_owned)
+                .ok_or_else(|| format!("{qpath}: part {i} has an invalid shader")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let name: String = part.get("name").and_then(|v| v.as_str()).unwrap_or("part")
+            .chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        let attach = match part.get("attach") {
+            None => None,
+            Some(value) => Some(parse_socket(value).ok_or_else(|| format!("{qpath}: part {i} has an invalid attach socket"))?),
+        };
+        let normals = match part.get("normals") {
+            None => Vec::new(),
+            Some(list) => list.as_array().ok_or_else(|| format!("{qpath}: part {i} normals must be a list"))?
+                .iter().map(|n| n.as_str().filter(|n| n.is_empty() || (n.starts_with("models/") && safe_qpath(n))).map(str::to_owned)
+                    .ok_or_else(|| format!("{qpath}: part {i} has an invalid normal map path")))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(UePart { name: format!("{name}{i}"), mesh: mesh.to_owned(), shaders, normals, attach })
+    }).collect()
+}
+
+fn parse_bone_map(qpath: &str, metadata: &serde_json::Value) -> Result<std::collections::HashMap<String, String>, String> {
+    let Some(map) = metadata.get("bone_map") else { return Ok(Default::default()) };
+    let map = map.as_object().filter(|m| m.len() <= 512).ok_or_else(|| format!("{qpath}: bone_map must be an object of at most 512 entries"))?;
+    map.iter()
+        .map(|(from, to)| match to.as_str() {
+            Some(to) if !from.is_empty() && from.len() <= 128 && !to.is_empty() && to.len() <= 128 => Ok((from.to_ascii_lowercase(), to.to_owned())),
+            _ => Err(format!("{qpath}: bone_map entries must map a name to a name of at most 128 characters")),
+        })
+        .collect()
 }
 
 fn descriptor_number(value: Option<&serde_json::Value>, what: &str) -> Result<usize, String> {
@@ -69,22 +218,31 @@ fn descriptor_number(value: Option<&serde_json::Value>, what: &str) -> Result<us
 fn parse_descriptor(qpath: &str, bytes: &[u8]) -> Result<SourceDescriptor, String> {
     let metadata: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| format!("{qpath}: {error}"))?;
-    if metadata.get("format").and_then(|v| v.as_str()) != Some("source1") {
-        return Err(format!("{qpath}: not a source1 descriptor"));
-    }
+    let ue = match metadata.get("format").and_then(|v| v.as_str()) {
+        Some("source1") => false,
+        Some("ue_skeletal") => true,
+        _ => return Err(format!("{qpath}: not a source1 or ue_skeletal descriptor")),
+    };
     if metadata.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
         return Err(format!("{qpath}: unsupported schema_version"));
     }
-    let model = metadata
-        .get("model")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("{qpath}: missing model path"))?;
+    let ue_parts = if ue { parse_ue_parts(qpath, &metadata)? } else { Vec::new() };
+    let idle_effects = parse_idle_effects(qpath, &metadata)?;
+    let model = if ue {
+        qpath
+    } else {
+        metadata
+            .get("model")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{qpath}: missing model path"))?
+    };
     // The descriptor names a file inside the package, so reject anything that
     // could escape the virtual filesystem's `models/` root.
-    if !model.starts_with("models/")
-        || !model.ends_with(".mdl")
-        || model.contains("..")
-        || model.contains('\\')
+    if !ue
+        && (!model.starts_with("models/")
+            || !model.ends_with(".mdl")
+            || model.contains("..")
+            || model.contains('\\'))
     {
         return Err(format!("{qpath}: unsafe model path {model:?}"));
     }
@@ -146,6 +304,9 @@ fn parse_descriptor(qpath: &str, bytes: &[u8]) -> Result<SourceDescriptor, Strin
                 format!("{qpath}: unknown rebind mode {name:?} (direction, translation, bone_frame)")
             })?,
         },
+        ue_parts,
+        idle_effects,
+        bone_map: parse_bone_map(qpath, &metadata)?,
     })
 }
 
@@ -290,6 +451,38 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
     jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
     let descriptor = parse_descriptor(descriptor_qpath, descriptor_bytes)?;
+    let animation_gla = source.load_gla(HUMANOID_GLA)?;
+    let gla = jka_assets::skeleton::humanoid_reference(jka_assets::skeleton::HumanoidRig::Jk2_72);
+    let retargeter = Some(jka_assets::skeleton::cached_retargeter(&animation_gla.skeleton, &gla.skeleton)?);
+    let options = SourceRigOptions {
+        bodygroups: descriptor.bodygroups.clone(),
+        skin_family: descriptor.skin_family,
+        max_lods: descriptor.max_lods,
+        scale: descriptor.scale,
+        rebind: descriptor.rebind,
+    };
+    let rig = if descriptor.ue_parts.is_empty() {
+        build_source_model_rig(source, descriptor_qpath, &descriptor, &gla, &options)?
+    } else {
+        let meshes = descriptor.ue_parts.iter()
+            .map(|part| read_required(source, &part.mesh, MAX_UE_MESH_BYTES))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parts = descriptor.ue_parts.iter().zip(&meshes)
+            .map(|(part, mesh)| jka_ue_assets::character::CharacterPart { name: &part.name, mesh, shaders: &part.shaders, attach: part.attach.as_ref() })
+            .collect::<Vec<_>>();
+        let (skeleton, geometry) = jka_ue_assets::character::character_rig_input_mapped(model_name, &parts, &descriptor.bone_map)?;
+        build_rig(descriptor_qpath, &skeleton, &geometry, &gla, &options)?
+    };
+    finish_source_player_model(source, model_name, key, descriptor, rig, gla, animation_gla, retargeter, jiggle_remesh)
+}
+
+fn build_source_model_rig(
+    source: &mut dyn ModelSource,
+    descriptor_qpath: &str,
+    descriptor: &SourceDescriptor,
+    gla: &GlaAnimation,
+    options: &SourceRigOptions,
+) -> Result<jka_assets::source1_rig::SourceRig, String> {
     let base = descriptor
         .model
         .strip_suffix(".mdl")
@@ -308,32 +501,29 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         parse_source1_skeleton(&mdl).map_err(|error| format!("{}: {error}", descriptor.model))?;
     let materials =
         parse_source1_materials(&mdl).map_err(|error| format!("{}: {error}", descriptor.model))?;
-    let animation_gla = source.load_gla(HUMANOID_GLA)?;
-    let gla = jka_assets::skeleton::humanoid_reference(jka_assets::skeleton::HumanoidRig::Jk2_72);
-    let retargeter = Some(jka_assets::skeleton::cached_retargeter(&animation_gla.skeleton, &gla.skeleton)?);
+    build_source_rig(&descriptor.model, &mdl, &vvd, &vtx, &skeleton, &materials, gla, options)
+}
 
-    let mut rig = build_source_rig(
-        &descriptor.model,
-        &mdl,
-        &vvd,
-        &vtx,
-        &skeleton,
-        &materials,
-        &gla,
-        &SourceRigOptions {
-            bodygroups: descriptor.bodygroups.clone(),
-            skin_family: descriptor.skin_family,
-            max_lods: descriptor.max_lods,
-            scale: descriptor.scale,
-            rebind: descriptor.rebind,
-        },
-    )?;
+#[allow(clippy::too_many_arguments)]
+fn finish_source_player_model(
+    source: &mut dyn ModelSource,
+    model_name: &str,
+    key: String,
+    descriptor: SourceDescriptor,
+    mut rig: jka_assets::source1_rig::SourceRig,
+    gla: Arc<GlaAnimation>,
+    animation_gla: Arc<GlaAnimation>,
+    retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
+    jiggle_remesh: JiggleRemeshTuning,
+) -> Result<PlayerModelAsset, String> {
     let mut body_shape_available = false;
     let mut body_shape_binding = None;
     let shape_qpath = format!("models/players/{model_name}/model.bodyshape");
     if let Some(bytes) = source.read_optional(&shape_qpath, 64 * 1024 * 1024)? {
+        let fingerprint_path = descriptor.ue_parts.first().map_or(descriptor.model.as_str(), |part| part.mesh.as_str());
+        let model_bytes = read_required(source, fingerprint_path, MAX_UE_MESH_BYTES)?;
         match jka_assets::body_shape::BodyShapeGrid::parse(
-            &bytes, &rig.glm, jka_assets::body_shape::model_fingerprint(&mdl),
+            &bytes, &rig.glm, jka_assets::body_shape::model_fingerprint(&model_bytes),
         ) {
             Ok(grid) => {
                 body_shape_available = true;
@@ -409,7 +599,51 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
     let joined_breast_bakes = build_joined_breast_bakes(&glm, jiggle.as_deref(), jiggle_remesh)?;
 
     let mut surfaces = Vec::with_capacity(rig.surfaces.len());
+    let ue_normals = descriptor.ue_surface_normals();
     for (surface_index, surface) in rig.surfaces.iter().enumerate() {
+        if !descriptor.ue_parts.is_empty() {
+            // Unreal parts name ordinary JKA shaders / images per section.
+            let material = source.resolve_material(&glm.hierarchy[surface_index].shader);
+            let two_sided = material.two_sided;
+            // Single-stage surfaces with a normal map take the normal-mapped
+            // Source lighting path; a missing map just leaves them flat.
+            let lighting = match ue_normals.get(surface_index).filter(|n| !n.is_empty() && material.stages.is_empty()) {
+                Some(qpath) => match source.read_optional(qpath, MAX_VTF_BYTES)?.map(|bytes| decode_normal_image(qpath, &bytes)) {
+                    Some(Ok(texture)) => Some(ue_surface_lighting(Arc::new(texture))),
+                    Some(Err(error)) => {
+                        println!("SOURCE MATERIAL WARNING: {error}");
+                        None
+                    }
+                    None => None,
+                },
+                None => None,
+            };
+            surfaces.push(PlayerSurfaceAsset {
+                surface_index,
+                default_visible: true,
+                surface_name: surface.name.clone(),
+                texture: material.texture,
+                alpha_mode: material.alpha_mode,
+                authored_glow: material.authored_glow,
+                shader_time_offset: material.shader_time_offset,
+                shader_clamp_time: material.shader_clamp_time,
+                entity_tint: material.entity_tint,
+                overlay: material.overlay,
+                stages: material.stages,
+                fallback_gray: false,
+                source_material: lighting,
+                gpu_meshes: build_lod_gpu_meshes(
+                    &descriptor.model,
+                    &glm,
+                    surface_index,
+                    two_sided,
+                    jiggle.as_deref(),
+                    jiggle_remesh,
+                    &joined_breast_bakes,
+                )?,
+            });
+            continue;
+        }
         let material = resolve_source_material(source, &surface.vmt_candidates)?;
         surfaces.push(PlayerSurfaceAsset {
             surface_index,
@@ -445,9 +679,30 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
             descriptor.jigglebones);
     }
 
+    // A missing or unreadable effect must not cost the character itself.
+    let mut idle_effects = Vec::new();
+    for effect in &descriptor.idle_effects {
+        let Some(bone) = gla.skeleton.iter().position(|b| b.name.eq_ignore_ascii_case(&effect.bone)) else {
+            println!("SOURCE PLAYER WARNING: {model_name} idle effect bone {} is not in _humanoid", effect.bone);
+            continue;
+        };
+        match source.read_optional(&effect.track, MAX_UE_MESH_BYTES).map(|bytes| bytes.map(|b| jka_emotes::effects::Track::parse(&b))) {
+            Ok(Some(Ok(track))) => idle_effects.push(super::assets::types::IdleEffect {
+                bone,
+                renderers: effect.renderers.clone(),
+                track: Arc::new(track),
+                loop_start: effect.loop_start,
+            }),
+            Ok(Some(Err(error))) => println!("SOURCE PLAYER WARNING: {model_name} idle effect {}: {error}", effect.track),
+            Ok(None) => println!("SOURCE PLAYER WARNING: {model_name} idle effect {} is missing", effect.track),
+            Err(error) => println!("SOURCE PLAYER WARNING: {model_name} idle effect {}: {error}", effect.track),
+        }
+    }
+
     Ok(PlayerModelAsset {
         body_shape_available,
         body_shape_binding,
+        idle_effects,
         key,
         glm,
         gla,
@@ -523,7 +778,8 @@ fn log_source_diagnostics(
     }
     // Source stores at most three influences per vertex and merging onto GLA bones
     // can only reduce that, so Ghoul2's four-weight limit is unreachable here.
-    if diagnostics.weight_truncations > 0 {
+    // Unreal vertices carry up to eight, so truncating some of them is expected.
+    if diagnostics.weight_truncations > 0 && descriptor.ue_parts.is_empty() {
         println!(
             "SOURCE PLAYER WARNING: {model_name} truncated {} vertices to four weights, \
              which should be impossible for a 3-influence Source vertex",

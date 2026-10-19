@@ -44,6 +44,8 @@ pub(in crate::cgame::player_presenter) struct ResolvedStage {
     /// Authored affine tcMods evaluated at the current shader time.
     /// Position-dependent turbulence remains unsupported on this path.
     pub(in crate::cgame::player_presenter) tc_mods: Vec<TcMod>,
+    /// `tcGen environment`: reflection-vector coordinates (then `tc_mods`).
+    pub(in crate::cgame::player_presenter) env_map: bool,
     pub(in crate::cgame::player_presenter) authored_glow: bool,
 }
 
@@ -185,6 +187,18 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     /// TaystJK/OpenJK `CG_LoadCISounds` gender derived from this model/skin's
     /// authored `sounds*.cfg`, not from a server-provided userinfo hint.
     pub(in crate::cgame::player_presenter) female: bool,
+    /// Looping character particle effects (Unreal `IdleEffectNiagara`).
+    pub(in crate::cgame::player_presenter) idle_effects: Vec<IdleEffect>,
+}
+
+/// A baked idle effect loop: particles relative to `bone`'s bind origin, in
+/// model axes, moved by that bone's skin matrix (see `emote_effects`).
+pub(in crate::cgame::player_presenter) struct IdleEffect {
+    pub(in crate::cgame::player_presenter) bone: usize,
+    pub(in crate::cgame::player_presenter) renderers: Vec<jka_emotes::effects::Renderer>,
+    pub(in crate::cgame::player_presenter) track: Arc<jka_emotes::effects::Track>,
+    /// Start of the steady-state loop, in seconds; playback stays inside it.
+    pub(in crate::cgame::player_presenter) loop_start: f32,
 }
 
 impl PlayerModelAsset {

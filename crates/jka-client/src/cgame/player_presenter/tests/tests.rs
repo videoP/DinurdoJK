@@ -213,6 +213,7 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
         source_jiggles_enabled: false, humanoid: true, animations: None,
         emote_contacts: Default::default(),
         anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,
+        idle_effects: Vec::new(),
     };
     let mut animator = Ghoul2Animator::new(&animation);
     animator.set_bone_angles_postmult(&animation, "lower_lumbar", [14., 6., 0.], 3, 4, 5).unwrap();
@@ -451,12 +452,17 @@ models/players/GlowTink/black
                 DynamicModelAlphaMode::AdditiveOne
             ),
             (
+                "models/players/glowtink/tink3_cel",
+                DynamicModelAlphaMode::DstColorAdd
+            ),
+            (
                 "models/players/glowtink/tink3_e",
                 DynamicModelAlphaMode::AdditiveOne
             ),
         ],
-        "the GL_DST_COLOR environment filter is not drawn"
+        "every stage, including the tcGen environment GL_DST_COLOR filter, is drawn"
     );
+    assert!(resolved_stage(layers.stages[2].0, layers.stages[2].1, None).env_map);
     assert!(resolved_stage(layers.stages[0].0, layers.stages[0].1, None).specular_alpha);
     let glow = resolved_stage(layers.stages[1].0, layers.stages[1].1, None);
     // The shader parser clamps rgbGen const to 0..1.

@@ -6,6 +6,7 @@ pub mod effect_bake;
 pub mod effect_materials;
 pub mod effect_preview;
 pub mod effects;
+pub mod idle_effects;
 pub mod library;
 pub mod manifest;
 pub mod montage;

@@ -314,8 +314,8 @@ fn blended_alpha_mode(stage: &jka_assets::shader::Stage) -> DynamicModelAlphaMod
 /// The pass mode of one stage of a blended player shader, or `None` when this
 /// path cannot draw it.  Preserve TaystJK's framebuffer-dependent blend stages
 /// (filter/modulate/darken) in their authored order; silently dropping these
-/// changes the appearance of the remaining passes.  Non-base tcGen and alpha
-/// tests still need a dedicated GPU implementation.
+/// changes the appearance of the remaining passes.  `tcGen environment` is
+/// drawn; other generated coordinates and alpha tests still are not.
 pub(in crate::cgame::player_presenter) fn blended_stage_mode(
     stage: &jka_assets::shader::Stage,
     allow_opaque: bool,
@@ -325,7 +325,7 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
         || (stage.image.starts_with('$') && !stage.image.eq_ignore_ascii_case("$whiteimage"))
         || stage.entity_rgb
         || !stage.alpha_test.trim().is_empty()
-        || !matches!(stage.tc_gen, TcGen::Base)
+        || !matches!(stage.tc_gen, TcGen::Base | TcGen::Environment)
     {
         return None;
     }
@@ -436,6 +436,7 @@ pub(in crate::cgame::player_presenter) fn resolved_stage(
         },
         specular_alpha: stage.alpha_gen == AlphaGen::LightingSpecular,
         tc_mods: stage.tc_mods.clone(),
+        env_map: stage.tc_gen == TcGen::Environment,
         authored_glow: stage.glow,
     }
 }
@@ -485,6 +486,21 @@ pub(in crate::cgame::player_presenter) fn specular_alpha(
     } else {
         (l * l * l * l).min(1.0)
     }
+}
+
+/// q3 `RB_CalcEnvironmentTexCoords` for one CPU-skinned vertex in render
+/// space, with the viewer in JKA space (the GPU path's ghoul2_skin.wgsl twin).
+pub(in crate::cgame::player_presenter) fn environment_uv(
+    position: [f32; 3],
+    normal: [f32; 3],
+    viewer: [f32; 3],
+) -> [f32; 2] {
+    // Render space is [x, z, -y] of JKA space.
+    let to_jka = |v: [f32; 3]| Vec3::new(v[0], -v[2], v[1]);
+    let normal = to_jka(normal).normalize_or_zero();
+    let to_viewer = (Vec3::from_array(viewer) - to_jka(position)).normalize_or_zero();
+    let reflected = normal * (2.0 * normal.dot(to_viewer)) - to_viewer;
+    [0.5 + reflected.y * 0.5, 0.5 - reflected.z * 0.5]
 }
 
 /// Compose id Tech 3 affine tcMods in authored order.  The 2x3 matrix
@@ -967,6 +983,7 @@ fn build_character_model(
     Ok(PlayerModelAsset {
         body_shape_available,
         body_shape_binding,
+        idle_effects: Vec::new(),
         key,
         glm,
         gla,

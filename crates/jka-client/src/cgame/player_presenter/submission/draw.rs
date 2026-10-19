@@ -1,6 +1,6 @@
 //! Submission draw.
 use crate::cgame::player_presenter::{
-    blend_for_alpha, gpu_bones_from_pose, skin_glm_surface, skin_surface_timed, specular_alpha,
+    blend_for_alpha, gpu_bones_from_pose, skin_glm_surface, skin_surface_timed, specular_alpha, environment_uv,
     stage_uv_affine, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
@@ -662,11 +662,16 @@ impl PlayerPresenter {
         surface.texture = stage.texture.clone();
         surface.alpha_mode = stage.alpha_mode;
         surface.authored_glow = stage.authored_glow;
+        // Without a viewer (asset previews) reflect a camera straight ahead.
+        let env_viewer = stage.env_map.then(|| frame.viewer.unwrap_or_else(|| {
+            std::array::from_fn(|i| frame.origin[i] + frame.axis[0][i] * 4096.0)
+        }));
         if let Some(skin) = surface.ghoul2_gpu.as_mut() {
             skin.color = color;
             skin.uv_xform = xform;
             skin.uv_cross = cross;
             skin.specular = specular;
+            skin.env_map = stage.env_map;
         } else {
             surface.vertices = Arc::new(
                 surface
@@ -678,10 +683,14 @@ impl PlayerPresenter {
                             color[3] *=
                                 specular_alpha(vertex.position, vertex.normal, light, viewer);
                         }
+                        let uv = match env_viewer {
+                            Some(viewer) => environment_uv(vertex.position, vertex.normal, viewer),
+                            None => vertex.uv,
+                        };
                         DynamicModelVertex {
                             uv: [
-                                vertex.uv[0] * xform[0] + vertex.uv[1] * cross[0] + xform[2],
-                                vertex.uv[0] * cross[1] + vertex.uv[1] * xform[1] + xform[3],
+                                uv[0] * xform[0] + uv[1] * cross[0] + xform[2],
+                                uv[0] * cross[1] + uv[1] * xform[1] + xform[3],
                             ],
                             color,
                             ..*vertex

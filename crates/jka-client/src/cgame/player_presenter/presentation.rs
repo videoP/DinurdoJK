@@ -1356,6 +1356,10 @@ impl PlayerPresenter {
                 self.emote_fx.draws.append(&mut fx.draws);
                 self.emote_fx.lights.append(&mut fx.lights);
             }
+            let mut idle=Self::idle_effect_frame(&model,&pose,render_axis,render_origin,entity.number,current_time);
+            self.cosmetic_draws.append(&mut idle.meshes);
+            self.emote_fx.draws.append(&mut idle.draws);
+            self.emote_fx.lights.append(&mut idle.lights);
         }
         if ragdoll_requested {
             self.ragdolls.apply_to_pose(

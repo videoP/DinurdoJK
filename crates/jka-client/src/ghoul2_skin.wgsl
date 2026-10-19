@@ -267,15 +267,16 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
     // directly in render space (an orthogonal axis relabeling of JKA space,
     // so the reflection vector's components just swap/flip accordingly:
     // JKA .y = render -.z, JKA .z = render .y).
+    // As in q3, the stage's tcMods transform the generated coordinates too.
+    var base_uv = input.uv;
     if (draw.params.w != 0u) {
         let viewer = normalize(camera.camera_pos_time.xyz - render_position);
         let d = 2.0 * dot(render_normal, viewer);
         let reflected = render_normal * d - viewer;
-        output.uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
-    } else {
-        output.uv = input.uv * draw.uv_xform.xy + draw.uv_xform.zw
-            + vec2<f32>(input.uv.y * draw.uv_cross.x, input.uv.x * draw.uv_cross.y);
+        base_uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
+    output.uv = base_uv * draw.uv_xform.xy + draw.uv_xform.zw
+        + vec2<f32>(base_uv.y * draw.uv_cross.x, base_uv.x * draw.uv_cross.y);
     output.normal = render_normal;
     output.draw_index = draw_index;
     var draw_color = draw.color;
