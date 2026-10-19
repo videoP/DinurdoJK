@@ -1756,6 +1756,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jka-ue-runtime"
+version = "0.1.0"
+dependencies = [
+ "glam 0.32.1",
+ "half",
+ "jka-ue-assets",
+ "serde_json",
+]
+
+[[package]]
 name = "jka-water"
 version = "0.1.0"
 
