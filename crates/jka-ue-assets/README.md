@@ -71,6 +71,10 @@ Blueprint/Niagara/material code a package carries, without executing it).
   identifiers must be 24-hex ids and namespaces are validated, so an untrusted
   export cannot write outside the PK3 or exhaust memory.
 
+## Props for mapping
+
+The same import can feed Radiant / q3map2: see [MAPPING.md](MAPPING.md).
+
 ## Not included
 
 Full PBR, world-position offset / vertex animation textures, Niagara,
