@@ -136,6 +136,7 @@ impl App {
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
                 sound.set_music_volume(self.effective_music_volume());
+                sound.set_emote_music_volume(self.effective_emote_music_volume());
                 sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
@@ -268,6 +269,7 @@ impl App {
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
                 sound.set_music_volume(self.effective_music_volume());
+                sound.set_emote_music_volume(self.effective_emote_music_volume());
                 sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),

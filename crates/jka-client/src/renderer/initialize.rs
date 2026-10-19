@@ -2493,6 +2493,7 @@ impl Renderer {
             egui_pending_free: Vec::new(),
             asset_preview_mode: false,
             asset_preview_viewport: None,
+            asset_preview_background: None,
             menu_backdrop: None,
             world: None,
             world_videos: Vec::new(),

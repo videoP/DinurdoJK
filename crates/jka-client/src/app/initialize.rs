@@ -62,6 +62,8 @@ impl App {
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::ConfigReady);
         let fps_cap_input = video.fps_cap.to_string();
         let default_video = VideoSettings::default();
+        crate::emotes::set_cubic_interpolation(video.emote_cubic);
+        crate::emotes::set_effects_enabled(video.emote_effects);
         let sun_custom_initialized = video.sun_override
             || (video.sun_yaw - default_video.sun_yaw).abs() > 0.0001
             || (video.sun_pitch - default_video.sun_pitch).abs() > 0.0001
@@ -122,6 +124,8 @@ impl App {
         }
         let saved_accounts = Vec::new();
         let account_credential_error = None;
+        crate::emotes::start_catalog(&base);
+        let emote_wheel = super::emote_wheel::EmoteWheel::load(&base);
         let mut app = Self {
             extensions,
             base,
@@ -209,6 +213,9 @@ impl App {
             menu_look_play: false,
             menu_look_oneshot: false,
             asset_preview_viewport_key: None,
+            profile_background_requested: None,
+            profile_background_available: false,
+            profile_background_maps: None,
             profile_models: Vec::new(),
             profile_sabers: Vec::new(),
             profile_catalog_loaded: false,
@@ -351,6 +358,8 @@ impl App {
             stringed: None,
             startup_commands: Vec::new(),
             audio,
+            menu_emote_sound: None,
+            emote_wheel,
             window_focused: true,
             pending_frontend_map_launch: false,
             frontend_background_request_id: None,

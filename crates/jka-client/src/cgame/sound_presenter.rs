@@ -200,6 +200,7 @@ pub(crate) fn prepare_sound_event(
 }
 
 pub struct SoundPresenter {
+    emote_warmup: Option<std::sync::mpsc::Receiver<SoundDecodeResult>>,
     assets: SoundAssets,
     backend: Option<AudioBackend>,
     eal_map: Option<Arc<crate::eal::EalMap>>,
@@ -254,6 +255,13 @@ struct Announcer {
     last_hits: Option<(i32, i32, i32)>,
 }
 
+fn emote_owner(connection: Option<u16>, listener: &Listener, entities: &[PresentedEntity], followed: Option<&PresentedEntity>) -> (u16,[f32;3]) {
+    let id=connection.unwrap_or(listener.entity);
+    let origin=entities.iter().chain(followed.into_iter()).find(|entity|entity.number==id)
+        .map(|entity|entity.origin).unwrap_or(listener.origin);
+    (id,origin)
+}
+
 impl SoundPresenter {
     pub fn new(mut assets: AssetSearchPath, steam_audio_enabled: bool, steam_audio_binaural_enabled: bool, steam_audio_environmental_enabled: bool) -> Self {
         let saber_definitions = load_saber_definitions(&mut assets).unwrap_or_else(|error| {
@@ -263,9 +271,9 @@ impl SoundPresenter {
         let backend = match AudioBackend::open(steam_audio_enabled, steam_audio_binaural_enabled, steam_audio_environmental_enabled) {
             Ok(backend) => {
                 let info = backend.info();
-                devprintln!(
-                    1,
-                    "AUDIO READY: Rodio/CPAL {}ch {}Hz {} buffer={} | WAV+MP3 | 32 voices | output limiter",
+                // Always logged: the first thing to check when a player hears nothing.
+                eprintln!(
+                    "AUDIO READY: default output device {}ch {}Hz {} buffer={} | 32 voices | output limiter",
                     info.channels, info.sample_rate, info.sample_format, info.buffer_size
                 );
                 Some(backend)
@@ -276,6 +284,7 @@ impl SoundPresenter {
         let ambient_sets = load_ambient_sets(&mut assets);
         Self {
             assets,
+            emote_warmup: None,
             backend,
             eal_map: None,
             eal_file: None,
@@ -377,6 +386,10 @@ impl SoundPresenter {
     pub fn set_music_volume(&mut self, level: f32) {
         self.music_base = level;
         self.apply_music_level();
+    }
+
+    pub fn set_emote_music_volume(&mut self, level: f32) {
+        if let Some(backend) = &mut self.backend { backend.set_emote_music_volume(level); }
     }
 
     fn apply_music_level(&mut self) {
@@ -509,6 +522,92 @@ impl SoundPresenter {
 
     /// `S_UpdateAmbientSet` for the worldspawn set plus `S_AddLocalSet` for every
     /// entity carrying a `soundSetIndex` (movers use theirs for door sounds only).
+    /// Source audio and animation are scheduled by crate::emotes from the
+    /// same monotonic clock. World sounds travel through the normal Steam Audio
+    /// spatialization; preview sounds are head-locked 1P sources.
+    pub fn play_emote_sound(
+        &mut self, qpath: &str,
+        lane: crate::emotes::AudioLane,
+        mode: crate::emotes::AudioMode,
+        source: Option<(u16, [f32; 3])>,
+        loop_start_sample: Option<u64>,
+    ) {
+        self.poll_emote_warmup();
+        const CHAN_EMOTE_MUSIC: i32 = 14;
+        const CHAN_EMOTE_FOLEY: i32 = 15;
+        if self.backend.is_none() { return; }
+        let (entity, origin) = match mode {
+            crate::emotes::AudioMode::Preview => (1023, SoundOrigin::Local),
+            crate::emotes::AudioMode::World => {
+                let Some((entity, position)) = source else { return; };
+                (entity, SoundOrigin::Entity(position))
+            }
+        };
+        let channel = match lane {
+            crate::emotes::AudioLane::Music => CHAN_EMOTE_MUSIC,
+            crate::emotes::AudioLane::Foley => CHAN_EMOTE_FOLEY,
+        };
+        let prepared = if qpath.starts_with("emotes/.bundles/") { self.assets.prepared_emote(qpath) } else { self.assets.register(qpath) };
+        match prepared {
+            Ok(sound) => {
+                if let Some(backend) = &mut self.backend {
+                    backend.mute(entity, channel);
+                    backend.play_emote(SoundRequest {
+                        qpath: qpath.to_owned(), entity, channel, origin,
+                    }, sound, loop_start_sample);
+                }
+            }
+            Err(error) => self.warn_once(qpath, &error),
+        }
+    }
+
+    /// Predecode a bounded set of favorite tracks while the hold wheel is open.
+    pub fn warm_emote_audio(&mut self, paths: &[String]) {
+        self.poll_emote_warmup();
+        if self.emote_warmup.is_some() || self.backend.is_none() { return; }
+        let mut seen = HashSet::new();
+        let paths: Vec<_> = paths.iter().filter(|p| !self.assets.emote_cached(p) && seen.insert((*p).clone()))
+            .take(8).cloned().collect();
+        if paths.is_empty() { return; }
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        if std::thread::Builder::new().name("emote-audio-cache".into()).spawn(move || {
+            let mut budget = 8 * 1024 * 1024;
+            for path in paths {
+                // Bundle I/O and decoding both happen on this worker.
+                let Ok(Some(bytes)) = crate::emotes::read_asset(&path, budget) else { continue; };
+                budget -= bytes.len();
+                let job = crate::audio::SoundDecodeJob::from_emote(path, bytes);
+                if tx.send(job.decode()).is_err() { break; }
+            }
+        }).is_ok() { self.emote_warmup = Some(rx); }
+    }
+    fn poll_emote_warmup(&mut self) {
+        let Some(rx) = self.emote_warmup.as_ref() else { return; };
+        let mut done = false;
+        loop {
+            match rx.try_recv() {
+                Ok(result) => { let _ = self.assets.cache_emote_decode(result); }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { done = true; break; }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if done { self.emote_warmup = None; }
+    }
+
+    pub fn stop_emote_sound(
+        &mut self, entity: Option<u16>, lane: Option<crate::emotes::AudioLane>,
+    ) {
+        if let Some(backend) = &mut self.backend {
+            let number = entity.unwrap_or(1023);
+            if lane.is_none() || lane == Some(crate::emotes::AudioLane::Music) {
+                backend.mute(number, 14);
+            }
+            if lane.is_none() || lane == Some(crate::emotes::AudioLane::Foley) {
+                backend.mute(number, 15);
+            }
+        }
+    }
+
     fn update_ambient(
         &mut self,
         game: &ClientGameState,
@@ -663,6 +762,31 @@ impl SoundPresenter {
         entities: &[PresentedEntity],
         followed_entity: Option<&PresentedEntity>,
     ) {
+        // Offline sessions have no connection ID; first-person presentation may
+        self.poll_emote_warmup();
+        for result in crate::emotes::poll_prepared_audio() { let _ = self.assets.cache_emote_decode(result); }
+        // also omit the local body from entities. The listener is still valid.
+        let owner = Some(emote_owner(self.prep.connection_client_num, &listener, entities, followed_entity));
+        let commands = if self.backend.is_some() { crate::emotes::poll_audio() } else { Vec::new() };
+        for command in commands {
+            match command {
+                crate::emotes::AudioCommand::StopAll => {
+                    self.stop_emote_sound(None, None);
+                    if let Some((entity, _)) = owner {
+                        self.stop_emote_sound(Some(entity), None);
+                    }
+                }
+                crate::emotes::AudioCommand::StopLane(lane) => {
+                    self.stop_emote_sound(None, Some(lane));
+                    if let Some((entity, _)) = owner {
+                        self.stop_emote_sound(Some(entity), Some(lane));
+                    }
+                }
+                crate::emotes::AudioCommand::Play { wav, lane, mode, loop_start_sample } => {
+                    self.play_emote_sound(&wav, lane, mode, owner, loop_start_sample);
+                }
+            }
+        }
         if let Some(backend) = &mut self.backend {
             backend.frame(
                 listener,
@@ -2461,6 +2585,13 @@ fn saber_hum_loops(
 mod tests {
     use super::*;
     use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+
+    #[test]
+    fn offline_emote_sound_has_an_owner_without_a_presented_local_body() {
+        let listener=Listener { entity:7,origin:[1.0,2.0,3.0],ahead:[1.0,0.0,0.0],up:[0.0,0.0,1.0],left:[0.0,1.0,0.0] };
+        assert_eq!(emote_owner(None,&listener,&[],None),(7,[1.0,2.0,3.0]));
+        assert_eq!(emote_owner(Some(9),&listener,&[],None),(9,[1.0,2.0,3.0]));
+    }
 
     fn event(event: EntityEvent, parm: i32) -> PresentationEvent {
         let mut state = EntityState { number: 3, fields: [0; ENTITY_FIELDS.len()] };

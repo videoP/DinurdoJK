@@ -12,6 +12,7 @@ mod maps;
 mod movement;
 mod profile;
 mod profile_studio;
+mod profile_emotes;
 mod resume;
 mod screenshots;
 mod servers;
@@ -74,7 +75,7 @@ pub(in crate::app) const FRONTEND_SCENE_FADE_IN_SECS: f32 = 0.55;
 const PROFILE_MODEL: usize = 1;
 const PROFILE_FORCE: usize = 2;
 const PROFILE_COSMETICS: usize = 4;
-
+const PROFILE_EMOTES: usize = 5;
 // OpenJK bg_misc.c / TaystJK ui_force.c. Keep Profile force editing on the
 // protocol-26 rank-side-18digits representation rather than inventing a new
 // loadout format.

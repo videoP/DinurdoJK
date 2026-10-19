@@ -31,6 +31,12 @@ Install Rust, then double-click `build.cmd`, or run in PowerShell:
 
 Place your own game assets in `GameData/base` beside the executable, or pass a base directory with `--base`. Launch `launch.cmd` or `target/release/DinurdoJK.exe`. The diagnostic tool is `target/release/jka-probe.exe`.
 
+## Emotes
+
+The client can play local, cosmetic emotes from compiled bundles (none are included in this
+repository). See [base/emotes/readme.md](base/emotes/readme.md) to use them and
+[crates/jka-emotes](crates/jka-emotes/README.md) to build them.
+
 ## Source layout
 
 See [the client source layout](docs/source-layout.md) for module responsibilities and frame-time constraints.

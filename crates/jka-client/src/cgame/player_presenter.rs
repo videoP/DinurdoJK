@@ -16,6 +16,8 @@ mod pose;
 mod powerups;
 mod presentation;
 mod previews;
+mod emote_props;
+mod emote_effects;
 mod sabers;
 mod state;
 mod submission;
@@ -205,6 +207,8 @@ pub struct PlayerPresenter {
     duel_shell_gray: Option<f32>,
     /// Cosmetic MD3s bolted to players this frame (drained by the caller).
     cosmetic_draws: Vec<CosmeticDraw>,
+    /// Baked emote particles for this frame (drained into the FX frame).
+    emote_fx: emote_effects::EmoteEffectFrame,
     /// `cp_cosmetics` of this client in a local (solo) game, which has no `c5`.
     local_cosmetics: u32,
     /// Local choice used when a solo session has no player configstring relay.

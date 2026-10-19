@@ -61,6 +61,8 @@ struct Md3SurfaceAsset {
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
     authored_glow: bool,
+    source_material: Option<crate::renderer::SourceMaterialParams>,
+    gpu_vertices: Option<Arc<Vec<crate::renderer::Ghoul2GpuVertex>>>,
     material_trace: Arc<str>,
     /// Current effective shader has no color/depth effect. This only gates
     /// submission; the model and vertices remain cached for later remaps.
@@ -187,6 +189,12 @@ pub struct EntityPresenter {
     /// `cent->damageTime` / `damageAngles` set by `CG_PlayerShieldHit`
     /// (EV_SHIELD_HIT: armor absorbed part of a hit), keyed by client number.
     shield_hits: HashMap<u16, ShieldHit>,
+    material_clock: std::time::Instant,
+    imported_props: HashMap<String,Arc<jka_emotes::prop_mesh::Mesh>>,
+    prop_gpu_vertices:HashMap<String,Arc<Vec<crate::renderer::Ghoul2GpuVertex>>>,
+    prop_normals:HashMap<String,Option<Arc<TextureData>>>,
+    ue_materials:HashMap<String,Option<Arc<jka_ue_assets::material::Program>>>,
+    material_eye:[f32;3],
     turret_states: HashMap<u16, TurretState>,
 }
 
@@ -280,6 +288,12 @@ impl EntityPresenter {
             static_lod_scratch: Vec::new(),
             static_props_rt: false,
             shield_hits: HashMap::new(),
+            material_clock: std::time::Instant::now(),
+            imported_props:HashMap::new(),
+            prop_gpu_vertices:HashMap::new(),
+            prop_normals:HashMap::new(),
+            ue_materials:HashMap::new(),
+            material_eye:[0.;3],
             turret_states: HashMap::new(),
         })
     }
@@ -1219,15 +1233,31 @@ impl EntityPresenter {
     ) -> Vec<DynamicModelSurface> {
         let mut draws = Vec::new();
         for cosmetic in cosmetics {
+            if cosmetic.model.ends_with(".djk_prop") {
+                match self.present_imported_prop(cosmetic.entity_num,&cosmetic.model,cosmetic.origin,cosmetic.axis,cosmetic.rgba,cosmetic.skin_pose.as_deref().map(|v|v.as_slice())) {
+                    Ok(mut surfaces)=>draws.append(&mut surfaces),
+                    Err(error)=>{if self.missing_cosmetics.insert(cosmetic.model.clone()){println!("EMOTE PROP {}: {error}",cosmetic.model);}}
+                }
+                continue;
+            }
+            let axis = match cosmetic.face_camera {
+                Some(locked) => facing_axis(cosmetic.axis, cosmetic.origin, self.material_eye, locked),
+                None => cosmetic.axis,
+            };
             let submission = ItemDraw {
                 model: cosmetic.model.to_owned(),
                 origin: cosmetic.origin,
-                axis: cosmetic.axis,
+                axis,
                 rgba: cosmetic.rgba,
                 custom_shader: cosmetic.custom_shader,
             };
             match self.present_md3_ref_entity(cosmetic.entity_num, &submission) {
-                Ok(mut surfaces) => draws.append(&mut surfaces),
+                Ok(mut surfaces) => {
+                    if cosmetic.custom_shader.is_some_and(|s| s.starts_with("fnemote/fx/")) {
+                        self.fresnel_fade_fx_mesh(&mut surfaces);
+                    }
+                    draws.append(&mut surfaces)
+                }
                 Err(error) => {
                     if self.missing_cosmetics.insert(cosmetic.model.clone()) {
                         println!("COSMETIC UNAVAILABLE: {}: {error}", cosmetic.model);
@@ -1236,6 +1266,96 @@ impl EntityPresenter {
             }
         }
         draws
+    }
+
+    pub fn set_material_eye(&mut self,eye:[f32;3]) { self.material_eye=eye; }
+    /// Translucent effect meshes (glow bodies, light cones, shells) get their
+    /// opacity from a Fresnel/angle term in their UE material graph, not from
+    /// particle alpha; the port keeps only a white or mask texture. Fade them
+    /// where the surface faces the viewer so they read as volumes, not solids.
+    fn fresnel_fade_fx_mesh(&self, surfaces: &mut [DynamicModelSurface]) {
+        let eye = scene::render_position(self.material_eye);
+        for surface in surfaces {
+            let translucent = matches!(surface.alpha_mode, DynamicModelAlphaMode::Blend | DynamicModelAlphaMode::BlendUnlit | DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::AdditiveOne);
+            let flat = surface.texture.as_ref().is_some_and(|t| {
+                let l = t.label.to_ascii_lowercase();
+                l.contains("/fx/white") || l.contains("/fx/soft") || l.contains("/fx/hard") || l.rsplit('_').next().is_some_and(|tail| tail.starts_with('m') && tail.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+            });
+            if !translucent || !flat {
+                continue;
+            }
+            let rgb_scaled = surface.alpha_mode == DynamicModelAlphaMode::AdditiveOne;
+            for v in Arc::make_mut(&mut surface.vertices) {
+                let to_eye = [eye[0] - v.position[0], eye[1] - v.position[1], eye[2] - v.position[2]];
+                let len = (to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2]).sqrt().max(1e-4);
+                let nl = (v.normal[0] * v.normal[0] + v.normal[1] * v.normal[1] + v.normal[2] * v.normal[2]).sqrt().max(1e-4);
+                let facing = ((v.normal[0] * to_eye[0] + v.normal[1] * to_eye[1] + v.normal[2] * to_eye[2]) / (len * nl)).abs();
+                let k = (1. - facing).powi(2);
+                if rgb_scaled {
+                    for c in &mut v.color[..3] {
+                        *c *= k;
+                    }
+                } else {
+                    v.color[3] *= k;
+                }
+            }
+        }
+    }
+    fn ue_material(&mut self,shader:&str)->Option<Arc<jka_ue_assets::material::Program>> {
+        if let Some(cached)=self.ue_materials.get(shader){return cached.clone()}
+        let program=match self.assets.read(&format!("{shader}.djk_material"),256*1024){
+            Ok(Some(asset))=>match jka_ue_assets::material::Program::parse(&asset.bytes){Ok(p)=>Some(Arc::new(p)),Err(error)=>{eprintln!("UE MATERIAL {shader}: {error}");None}},
+            Ok(None)=>None,Err(error)=>{eprintln!("UE MATERIAL {shader}: {error}");None}
+        };
+        self.ue_materials.insert(shader.into(),program.clone());program
+    }
+    fn present_imported_prop(&mut self,entity_num:u16,path:&str,origin:[f32;3],axis:[[f32;3];3],rgba:[f32;4],pose:Option<&[jka_assets::ghoul2::Matrix3x4]>)->Result<Vec<DynamicModelSurface>,String>{
+        let mesh=if let Some(mesh)=self.imported_props.get(path){mesh.clone()}else{
+            let mesh=if let Some(mesh)=crate::emotes::prepared_prop_mesh(path){mesh}else{
+            let bytes=self.assets.read(path,32*1024*1024).map_err(|e|e.to_string())?.ok_or("missing skeletal prop")?.bytes;
+            Arc::new(jka_emotes::prop_mesh::Mesh::parse(&bytes)?)};
+            if self.imported_props.values().map(|m|m.vertices.len()*std::mem::size_of::<jka_emotes::prop_mesh::Vertex>()+m.indices.len()*4).sum::<usize>()>64*1024*1024{self.imported_props.clear();self.prop_gpu_vertices.clear();self.prop_normals.clear();}
+            self.imported_props.insert(path.into(),mesh.clone());mesh
+        };
+        if pose.is_some_and(|p|p.len()!=mesh.bones.len()){return Err("prop animation/skeleton mismatch".into());}
+        let vertices=mesh.vertices.iter().map(|v|{
+            let mut p=[0.;3];let mut n=[0.;3];
+            for i in 0..4{if v.weights[i]==0.{continue;}let (point,normal)=if let Some(pose)=pose{let m=&pose[v.bones[i]];(std::array::from_fn(|r|m[r][0]*v.position[0]+m[r][1]*v.position[1]+m[r][2]*v.position[2]+m[r][3]),std::array::from_fn(|r|m[r][0]*v.normal[0]+m[r][1]*v.normal[1]+m[r][2]*v.normal[2]))}else{(v.position,v.normal)};for r in 0..3{p[r]+=point[r]*v.weights[i];n[r]+=normal[r]*v.weights[i];}}
+            DynamicModelVertex{position:transform_model_point(p,axis,origin,1.),normal:transform_model_normal(n,axis),uv:v.uv,color:rgba,depth_hack:0.,water_wetness:0.}
+        }).collect::<Vec<_>>();
+        if vertices.iter().any(|v|v.position.iter().chain(&v.normal).any(|n|!n.is_finite())){return Err("non-finite prop pose".into());}
+        let mut draws=Vec::new();let seconds=self.material_clock.elapsed().as_secs_f32();
+        let bones=Arc::new((0..mesh.bones.len()).map(|i|{
+            let m=pose.map(|p|p[i]).unwrap_or([[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.]]);crate::renderer::Ghoul2GpuBone{row0:m[0],row1:m[1],row2:m[2]}
+        }).collect::<Vec<_>>());
+        for section in &mesh.sections {
+            let program=self.ue_material(&section.shader);
+            let definition=jka_assets::shader::find_shader(&self.shaders,&section.shader).cloned();
+            let normal=definition.as_ref().and_then(Shader::primary).and_then(|s|s.normal_map.clone());
+            let normal=normal.and_then(|name|{
+                if let Some(normal)=self.prop_normals.get(&name){return normal.clone();}
+                let normal=self.load_texture_arc(&name,false).map(|n|{let mut n=(*n).clone();n.srgb=false;Arc::new(n)});
+                self.prop_normals.insert(name,normal.clone());normal
+            });
+            for (stage,material) in self.fx_material_stages(&section.shader).into_iter().enumerate(){
+            let color=material.float_vertex_color(rgba);let mut tinted=vertices.clone();for v in &mut tinted{v.color=color;for modifier in &material.tc_mods{v.uv=crate::fx::draw::modified_uv(v.uv,v.position,*modifier,seconds-material.shader_time_offset);}}
+            if let Some(program)=&program {
+                for vertex in &mut tinted {
+                    let sample=jka_ue_runtime::material::Sample{seconds,position:glam::Vec3::from_array(vertex.position)-glam::Vec3::from_array(scene::render_position(origin)),normal:glam::Vec3::from_array(vertex.normal),uv:vertex.uv,eye:glam::Vec3::from_array(scene::render_position(self.material_eye))-glam::Vec3::from_array(scene::render_position(origin))};
+                    let value=jka_ue_runtime::material::evaluate(program,&sample)?;
+                    vertex.color=std::array::from_fn(|i|value[i]*rgba[i]);
+                }
+            }
+            let mut indices=Vec::new();for tri in mesh.indices[section.first..section.end].chunks_exact(3){indices.extend([tri[0],tri[2],tri[1]]);}
+            if definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided")){let front=indices.clone();for tri in front.chunks_exact(3){indices.extend([tri[2],tri[1],tri[0]]);}}
+            let indices=Arc::new(indices);
+            let gpu=if stage==0&&material.tc_mods.is_empty()&&program.is_none(){normal.as_ref().map(|normal|{
+                let vertices=self.prop_gpu_vertices.entry(path.into()).or_insert_with(||Arc::new(mesh.vertices.iter().map(|v|crate::renderer::Ghoul2GpuVertex{position:v.position,normal:v.normal,uv:v.uv,bone_indices:v.bones.map(|n|n as u32),weights:v.weights,weight_count:4,jiggle_region:u32::MAX,jiggle_weight:0.,jiggle_coord:4.}).collect())).clone();
+                crate::renderer::Ghoul2GpuSkinning{mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:[[0.;4];4],source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
+            })}else{None};
+            let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
+            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
+        }}Ok(draws)
     }
 
     /// Retain only the latest pose for each entity/model/surface/stage slot.
@@ -1364,6 +1484,9 @@ impl EntityPresenter {
         entity_num: u16,
         submission: &ItemDraw,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        if submission.custom_shader.is_none() && submission.model.starts_with("models/fnemote/") {
+            return self.present_static_md3(entity_num,&submission.model,submission.origin,submission.axis,submission.rgba,0);
+        }
         self.present_md3_ref_entity_lod(entity_num, submission, None)
     }
 
@@ -1759,6 +1882,7 @@ impl EntityPresenter {
         frame: usize,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let asset = self.load_md3(qpath)?;
+        if qpath.starts_with("models/fnemote/"){return self.present_emote_md3(&asset,entity_num,origin,axis,rgba,frame);}
         let frame = frame.min(asset.model.frames.len().saturating_sub(1));
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
@@ -1819,6 +1943,30 @@ impl EntityPresenter {
             );
         }
         Ok(draws)
+    }
+
+    /// Imported material ports retain all passes, their tint, UV operations,
+    /// alpha test and emissive output. The regular MD3 path only has one pass.
+    fn present_emote_md3(&mut self,asset:&Arc<Md3Asset>,entity_num:u16,origin:[f32;3],axis:[[f32;3];3],rgba:[f32;4],frame:usize)->Result<Vec<DynamicModelSurface>,String> {
+        let mut draws=Vec::new();let seconds=self.material_clock.elapsed().as_secs_f32();
+        let frame=frame.min(asset.model.frames.len().saturating_sub(1));
+        for surface in &asset.surfaces {
+            let shader_name=&asset.model.surfaces[surface.surface_index].shader;
+            let definition=jka_assets::shader::find_shader(&self.shaders,shader_name).cloned();
+            let materials=self.fx_material_stages(shader_name);
+            for (stage,material) in materials.iter().enumerate(){
+                let color=material.float_vertex_color(rgba);
+                let (mut vertices,mut indices)=self.md3_geometry(asset,surface,entity_num,stage,frame,axis,origin,1.,color,0.);
+                if !material.tc_mods.is_empty(){for vertex in Arc::make_mut(&mut vertices){for modifier in &material.tc_mods{vertex.uv=crate::fx::draw::modified_uv(vertex.uv,vertex.position,*modifier,seconds-material.shader_time_offset);}}}
+                if definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided")){let original=indices.clone();for tri in original.chunks_exact(3){Arc::make_mut(&mut indices).extend([tri[2],tri[1],tri[0]]);}}
+                let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
+                let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning {
+                    mesh_key:Arc::from(format!("{}#surface{}",asset.key,surface.surface_index)),vertices:gpu.clone(),indices:indices.clone(),
+                    bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:[[0.;4];4],source_material:surface.source_material.clone()
+                })}else{None};
+                draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
+            }
+        }Ok(draws)
     }
 
     /// Retain the original MD3 source and shader decision, not just the final
@@ -1931,8 +2079,18 @@ impl EntityPresenter {
             }
         }
         let material_trace = self.md3_material_trace(key, surface, texture.as_ref(), alpha_mode);
+        // Imported emote props carry a normal map; light them on the GPU path.
+        let normal = definition.as_ref().and_then(Shader::primary).and_then(|s| s.normal_map.clone());
+        let source_material = if key.starts_with("models/fnemote/") {
+            normal.and_then(|name| self.load_texture_arc(&name, false)).map(|texture| {
+                let mut linear = (*texture).clone();
+                linear.srgb = false;
+                crate::renderer::SourceMaterialParams { normal_map: Some(Arc::new(linear)), phong_boost: 0.15, phong_exponent: 32., phong_fresnel: [0., 0.5, 1.], rimlight_boost: 0., rimlight_exponent: 1., half_lambert: false }
+            })
+        } else { None };
+        let gpu_vertices = source_material.as_ref().map(|_| Arc::new(surface.vertices.iter().map(|v| crate::renderer::Ghoul2GpuVertex { position: v.position, normal: v.normal, uv: v.uv, bone_indices: [0; 4], weights: [1., 0., 0., 0.], weight_count: 1, jiggle_region: u32::MAX, jiggle_weight: 0., jiggle_coord: 4. }).collect()));
         Md3SurfaceAsset { surface_index, cached_indices, texture, alpha_mode,
-            authored_glow, material_trace, invisible_without_override,
+            authored_glow, source_material, gpu_vertices, material_trace, invisible_without_override,
             extra_stages, two_sided_indices, authored_lighting }
     }
 
@@ -2097,14 +2255,17 @@ impl EntityPresenter {
         }
 
         let result = (|| {
-            let bytes = self
-                .assets
-                .read(&key, MAX_MD3_BYTES)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("missing {key}"))?
-                .bytes;
-            let hash = md3_lod::content_hash(&bytes);
-            let model = md3::parse(&bytes)?;
+            let (model, hash) = if let Some(model) = crate::emotes::prepared_prop_md3(&key) {
+                ((*model).clone(), md3_lod::content_hash(key.as_bytes()))
+            } else {
+                let bytes = self
+                    .assets
+                    .read(&key, MAX_MD3_BYTES)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("missing {key}"))?
+                    .bytes;
+                (md3::parse(&bytes)?, md3_lod::content_hash(&bytes))
+            };
             devprintln!(
                 2,
                 "ENTITY MD3: {} frames={} tags/frame={} surfaces={}",
@@ -2834,9 +2995,52 @@ fn transform_model_normal(normal: [f32; 3], axis: [[f32; 3]; 3]) -> [f32; 3] {
     }
 }
 
+/// Niagara camera-facing mesh basis: X towards the eye, Z up when locked
+/// (else the world up made orthogonal), each axis keeping its length (scale).
+fn facing_axis(axis: [[f32; 3]; 3], origin: [f32; 3], eye: [f32; 3], locked: bool) -> [[f32; 3]; 3] {
+    let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let norm = |v: [f32; 3]| { let l = len(v).max(1e-6); [v[0] / l, v[1] / l, v[2] / l] };
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let mut x = [eye[0] - origin[0], eye[1] - origin[1], if locked { 0.0 } else { eye[2] - origin[2] }];
+    if len(x) < 1e-3 {
+        return axis;
+    }
+    x = norm(x);
+    let up = if x[2].abs() > 0.99 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let y = norm(cross(up, x));
+    let z = cross(x, y);
+    let s = [len(axis[0]), len(axis[1]), len(axis[2])];
+    [x.map(|c| c * s[0]), y.map(|c| c * s[1]), z.map(|c| c * s[2])]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires DJK_FN_ASSET_BASE with a converted native prop PK3"]
+    fn imported_static_props_render_with_native_materials() {
+        let root=std::path::PathBuf::from(std::env::var("DJK_FN_ASSET_BASE").unwrap());
+        let mut assets=AssetSearchPath::open(&root).unwrap();
+        let data=assets.read("models/fnemote/index.json",16*1024*1024).unwrap().unwrap();
+        let index:serde_json::Value=serde_json::from_slice(&data.bytes).unwrap();
+        let mut presenter=EntityPresenter::new(assets,false).unwrap();
+        let mut count=0;
+        for model in index["models"].as_array().unwrap() {
+            let path=model["model"].as_str().unwrap();
+            let draws=presenter.present_static_md3(1023,path,[0.;3],[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]],[1.;4],0).unwrap();
+            assert!(!draws.is_empty(),"no geometry for {path}");
+            for surface in draws {
+                assert!(!surface.indices.is_empty());
+                assert!(surface.vertices.iter().flat_map(|v|v.position).all(f32::is_finite));
+                let texture=surface.texture.as_ref().expect("missing material texture");
+                assert!(texture.source.is_some(),"failed to decode authored or neutral texture for {path}");
+            }
+            count+=1;
+        }
+        assert!(count>0);
+        println!("Rendered {count} imported prop models through the native MD3 presenter");
+    }
 
     fn synthetic_md3_presenter() -> (crate::cvar_compatibility::Fixture, EntityPresenter) {
         let fixture = crate::cvar_compatibility::Fixture::new();
@@ -2858,6 +3062,7 @@ mod tests {
             surfaces: vec![Md3SurfaceAsset {
                 surface_index: 0, cached_indices: Arc::new(vec![0, 2, 1]), texture: None,
                 alpha_mode: DynamicModelAlphaMode::Opaque, authored_glow: true,
+                source_material:None,gpu_vertices:None,
                 material_trace: Arc::from("synthetic"), invisible_without_override: false,
                 extra_stages: Vec::new(), two_sided_indices: None, authored_lighting: false,
             }],
@@ -3086,6 +3291,42 @@ models/map_objects/factory/glass_b
         let cached = presenter.fx_material_stages("test");
         assert!(Arc::ptr_eq(&cached[0].animation.as_ref().unwrap().frames[1], &frames[1]));
         assert!(presenter.load_texture_arc("textures/test/b", true).unwrap().srgb);
+    }
+
+    #[test]
+    fn imported_materials_keep_tint_and_emissive_passes(){
+        let fixture=crate::cvar_compatibility::Fixture::new();std::fs::create_dir_all(fixture.0.join("shaders")).unwrap();
+        std::fs::write(fixture.0.join("shaders/ports.shader"),"models/fnemote/test\n{\n { map $whiteimage\n rgbGen const ( 0.2 0.3 0.4 ) }\n { map $whiteimage\n blendFunc add\n glow\n rgbGen const ( 0.1 0 0 ) }\n}\n").unwrap();
+        let (_old,mut original)=synthetic_md3_presenter();let mut model=original.md3_models.remove("synthetic.md3").unwrap();
+        let mut copied=(*model.model).clone();copied.surfaces[0].shader="models/fnemote/test".into();Arc::get_mut(&mut model).unwrap().model=Arc::new(copied);
+        let mut presenter=EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(),false).unwrap();presenter.md3_models.insert("models/fnemote/test.md3".into(),model);
+        let draws=presenter.present_static_md3(0,"models/fnemote/test.md3",[0.;3],[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]],[1.;4],0).unwrap();
+        assert_eq!(draws.len(),2);assert_eq!(draws[0].vertices[0].color,[0.2,0.3,0.4,1.]);assert!(draws[1].authored_glow);assert_eq!(draws[1].vertices[0].color,[0.1,0.,0.,1.]);
+    }
+
+    #[test]
+    fn independent_prop_skinning_uses_local_bones_and_rejects_bad_bindings(){
+        let fixture=crate::cvar_compatibility::Fixture::new();std::fs::create_dir_all(fixture.0.join("models/fnemote")).unwrap();
+        let vertices=(0..3).map(|i|serde_json::json!({"position":[i,0,0],"normal":[0,0,1],"uv":[0,0],"bones":[0,0,0,0],"weights":[1,0,0,0]})).collect::<Vec<_>>();
+        let mesh=serde_json::json!({"version":1,"bones":["Root"],"vertices":vertices,"indices":[0,1,2],"sections":[{"first":0,"end":3,"shader":"solid"}]});
+        std::fs::write(fixture.0.join("models/fnemote/test.djk_prop"),serde_json::to_vec(&mesh).unwrap()).unwrap();
+        let mut presenter=EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(),false).unwrap();let axis=[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]];
+        let pose=[[[1.,0.,0.,5.],[0.,1.,0.,6.],[0.,0.,1.,7.]]];
+        let draws=presenter.present_imported_prop(0,"models/fnemote/test.djk_prop",[10.,20.,30.],axis,[1.;4],Some(&pose)).unwrap();
+        assert_eq!(draws[0].vertices[0].position,scene::render_position([15.,26.,37.]));
+        assert!(presenter.present_imported_prop(0,"models/fnemote/test.djk_prop",[0.;3],axis,[1.;4],Some(&[])).is_err());
+    }
+    #[test]
+    fn imported_hologram_program_keeps_blue_glow_in_profile_lighting(){
+        let fixture=crate::cvar_compatibility::Fixture::new();std::fs::create_dir_all(fixture.0.join("models/fnemote")).unwrap();
+        let vertices=(0..3).map(|i|serde_json::json!({"position":[i,0,0],"normal":[0,0,1],"uv":[0,0],"bones":[0,0,0,0],"weights":[1,0,0,0]})).collect::<Vec<_>>();
+        let mesh=serde_json::json!({"version":1,"bones":["Root"],"vertices":vertices,"indices":[0,1,2],"sections":[{"first":0,"end":3,"shader":"models/fnemote/hologram"}]});
+        std::fs::write(fixture.0.join("models/fnemote/test.djk_prop"),serde_json::to_vec(&mesh).unwrap()).unwrap();
+        std::fs::write(fixture.0.join("models/fnemote/hologram.djk_material"),br#"{"version":1,"unlit":true,"output":0,"nodes":[{"op":"constant","value":[0.009131,0.310453,0.913099,0.8]}]}"#).unwrap();
+        let mut presenter=EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(),false).unwrap();
+        let mut draws=presenter.present_imported_prop(0,"models/fnemote/test.djk_prop",[0.;3],[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]],[1.;4],None).unwrap();
+        let before=draws[0].vertices[0].color;assert!(before[2]>before[1]&&before[1]>before[0]);assert!(draws[0].authored_glow);assert!(draws[0].lighting_origin.is_none());
+        crate::cgame::player_presenter::apply_profile_studio_light(&mut draws,true);assert_eq!(draws[0].vertices[0].color,before);
     }
 
     #[test]

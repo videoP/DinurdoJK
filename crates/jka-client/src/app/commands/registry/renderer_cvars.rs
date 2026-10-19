@@ -2428,6 +2428,40 @@ app_cvars! {
         ]
     }
 
+    APP_CG_EMOTECUBIC {
+        runtime: CvarDef::new("cg_emoteCubic", "1", "0|1", "Bounded four-frame Catmull-Rom interpolation for emote body, props and source contact heights at render rate. Does not change playback speed or audio timing.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.emote_cubic)),
+            |app,value|App::cvar_set_cg_emotecubic(app,APP_CG_EMOTECUBIC.entry.name,&value.to_string())).with_text_setter(App::cvar_set_cg_emotecubic,None),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context|{settings.emote_cubic=parse_bool(value).unwrap_or(settings.emote_cubic);}),
+            archive:Some((29,|state|bool_value(state.video.emote_cubic))),
+            ..CvarBinding::NONE
+        },
+        implementations:[impl App {
+            fn cvar_set_cg_emotecubic(&mut self,name:&str,value:&str)->Result<(),String>{
+                self.video.emote_cubic=Self::parse_cvar_bool(name,value)?;
+                crate::emotes::set_cubic_interpolation(self.video.emote_cubic);
+                self.mark_config_dirty();self.publish_ui();Ok(())
+            }
+        }]
+    }
+    APP_CG_EMOTEEFFECTS {
+        runtime: CvarDef::new("cg_emoteEffects", "1", "0|1", "Draw baked Niagara particle effects (sparkles, smoke, confetti, lights) on emotes. Effects are compiled offline; this does not run Unreal code.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.emote_effects)),
+            |app,value|App::cvar_set_cg_emoteeffects(app,APP_CG_EMOTEEFFECTS.entry.name,&value.to_string())).with_text_setter(App::cvar_set_cg_emoteeffects,None),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context|{settings.emote_effects=parse_bool(value).unwrap_or(settings.emote_effects);}),
+            archive:Some((29,|state|bool_value(state.video.emote_effects))),
+            ..CvarBinding::NONE
+        },
+        implementations:[impl App {
+            fn cvar_set_cg_emoteeffects(&mut self,name:&str,value:&str)->Result<(),String>{
+                self.video.emote_effects=Self::parse_cvar_bool(name,value)?;
+                crate::emotes::set_effects_enabled(self.video.emote_effects);
+                self.mark_config_dirty();self.publish_ui();Ok(())
+            }
+        }]
+    }
     APP_R_GHOUL2ANIMSMOOTH {
         runtime: CvarDef::new("r_ghoul2AnimSmooth", "", "0..1 (exclusive)", "jaPRO CBoneCache::SmoothLow renderer bone-history filter (jaPRO default 0.3): blends each player's final composed Ghoul2 pose toward last frame's filtered pose before skinning/attachments. Only active strictly between 0 and 1, matching jaPRO: 0 or >=1 disables it (1 is 'off', not 'maximum'). Does not apply while ragdolled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2animsmooth(app)), |app, value| App::cvar_set_r_ghoul2animsmooth(app, APP_R_GHOUL2ANIMSMOOTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2animsmooth, None),
         config: CvarBinding {

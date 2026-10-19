@@ -6,6 +6,7 @@ use super::egui_dev_radial::{paint_annular_sector, paint_arc};
 use super::egui_theme as theme;
 use super::*;
 use crate::net::mod_support::ServerMod;
+use std::borrow::Cow;
 use std::f32::consts::{FRAC_PI_2, PI};
 
 const CATEGORY_INNER: f32 = 0.13;
@@ -17,31 +18,33 @@ const SECTOR_GAP: f32 = 0.016;
 pub(in crate::app) enum EmoteCategory {
     Taunts,
     Standard,
-    Fortnite,
+    Library,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     Category(EmoteCategory),
     Command(&'static str),
+    /// A starred emote from the installed library, by catalog ID.
+    Emote(String),
     Disabled,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
-    label: &'static str,
-    sub: &'static str,
+    label: Cow<'static, str>,
+    sub: Cow<'static, str>,
     action: Action,
 }
 
 impl Entry {
     const fn new(label: &'static str, sub: &'static str, action: Action) -> Self {
-        Self { label, sub, action }
+        Self { label: Cow::Borrowed(label), sub: Cow::Borrowed(sub), action }
     }
     const fn cmd(label: &'static str, command: &'static str) -> Self {
         Self::new(label, command, Action::Command(command))
     }
-    fn enabled(self) -> bool {
+    fn enabled(&self) -> bool {
         self.action != Action::Disabled
     }
 }
@@ -133,13 +136,14 @@ fn categories() -> [Entry; 4] {
     [
         Entry::new("TAUNTS", "SABER + GESTURES", Action::Category(EmoteCategory::Taunts)),
         Entry::new("STANDARD", "SERVER MOD", Action::Category(EmoteCategory::Standard)),
-        Entry::new("FORTNITE", "ANIMATION LIBRARY", Action::Category(EmoteCategory::Fortnite)),
+        Entry::new("LIBRARY", "STARRED EMOTES", Action::Category(EmoteCategory::Library)),
         Entry::new("FAVORITES", "COMING SOON", Action::Disabled),
     ]
 }
 
 /// Every emote in one uninterrupted ring: no Back, Prev, Next, or page slots.
-fn entries(category: EmoteCategory, server_mod: ServerMod) -> &'static [Entry] {
+/// `library` is the user's starred library emotes (see `library_entries`).
+fn entries<'a>(category: EmoteCategory, server_mod: ServerMod, library: &'a [Entry]) -> &'a [Entry] {
     match category {
         EmoteCategory::Taunts => const { &[
             Entry::cmd("TAUNT", "taunt"),
@@ -149,11 +153,23 @@ fn entries(category: EmoteCategory, server_mod: ServerMod) -> &'static [Entry] {
             Entry::cmd("MEDITATE", "meditate"),
         ] },
         EmoteCategory::Standard => standard_catalog(server_mod),
-        EmoteCategory::Fortnite => const { &[
-            // The client has experimental emote wire IDs but no installed
-            // playable animation catalog. Do not invent animation commands.
-            Entry::new("NOT INSTALLED", "LIBRARY NOT WIRED", Action::Disabled),
-        ] },
+        EmoteCategory::Library => library,
+    }
+}
+
+/// Starred emotes in Profile order, or one disabled entry saying why the
+/// tier is empty. Never the whole library: the ring does not paginate.
+fn library_entries(favorites: Result<Vec<crate::emotes::Emote>, &'static str>) -> Vec<Entry> {
+    match favorites {
+        Ok(emotes) => emotes
+            .into_iter()
+            .map(|emote| Entry {
+                label: Cow::Owned(crate::emotes::display_title(&emote).to_uppercase()),
+                sub: Cow::Owned(emote.id.clone()),
+                action: Action::Emote(emote.id),
+            })
+            .collect(),
+        Err(reason) => vec![Entry::new(reason, "PROFILE > EMOTES", Action::Disabled)],
     }
 }
 
@@ -224,24 +240,41 @@ impl App {
         }
         let mod_id = self.ui_mod().unwrap_or(self.connected_server_mod());
         let selected = if let Some(category) = self.emote_radial_category {
-            let choices = entries(category, mod_id);
+            let library = self.radial_library_entries(category);
+            let choices = entries(category, mod_id, &library);
             if choices.is_empty() { return; }
-            choices[selected_sector(self.dev_radial_offset, choices.len())]
+            choices[selected_sector(self.dev_radial_offset, choices.len())].clone()
         } else {
             let choices = categories();
-            choices[selected_sector(self.dev_radial_offset, choices.len())]
+            choices[selected_sector(self.dev_radial_offset, choices.len())].clone()
         };
         match selected.action {
             Action::Category(category) => {
                 self.emote_radial_category = Some(category);
                 self.dev_radial_offset = [0.0, -0.28];
                 self.egui_repaint_requested = true;
+                if category == EmoteCategory::Library {
+                    self.warm_favorite_emote_audio();
+                }
             }
             Action::Command(command) => {
                 self.close_emote_radial();
                 self.append_console_commands(vec![command.to_owned()]);
             }
+            Action::Emote(id) => {
+                self.close_emote_radial();
+                self.play_favorite_emote(&id);
+            }
             Action::Disabled => {}
+        }
+    }
+
+    /// Only the LIBRARY tier reads the library; other tiers are static.
+    fn radial_library_entries(&self, category: EmoteCategory) -> Vec<Entry> {
+        if category == EmoteCategory::Library {
+            library_entries(self.wheel_favorite_emotes())
+        } else {
+            Vec::new()
         }
     }
 
@@ -255,7 +288,8 @@ impl App {
         let painter = root.painter();
         let server_mod = self.ui_mod().unwrap_or(self.connected_server_mod());
         let chosen_category = self.emote_radial_category;
-        let catalog = chosen_category.map(|category| entries(category, server_mod));
+        let library = chosen_category.map_or_else(Vec::new, |category| self.radial_library_entries(category));
+        let catalog = chosen_category.map(|category| entries(category, server_mod, &library));
         let selected_outer = catalog.and_then(|items| {
             (!items.is_empty()).then(|| selected_sector(self.dev_radial_offset, items.len()))
         });
@@ -276,7 +310,7 @@ impl App {
                 // Aim the label toward the middle of the band, leaving room
                 // around both ends to avoid touching the inner ring.
                 let label_radius = inner + width * 0.5;
-                for (i, choice) in items.iter().copied().enumerate() {
+                for (i, choice) in items.iter().enumerate() {
                     let angle = -FRAC_PI_2 + i as f32 * step;
                     let visual_gap = SECTOR_GAP.min(step * 0.16);
                     let start = angle - step * 0.5 + visual_gap;
@@ -297,8 +331,8 @@ impl App {
                         else if choice.enabled() { theme::TEXT }
                         else { theme::TEXT_DISABLED };
                     let max_length = width - 18.0;
-                    let size = emote_font_size(painter, choice.label, max_length);
-                    paint_radial_label(painter, center, angle, label_radius, choice.label, size, color);
+                    let size = emote_font_size(painter, &choice.label, max_length);
+                    paint_radial_label(painter, center, angle, label_radius, &choice.label, size, color);
                 }
             }
         }
@@ -309,7 +343,7 @@ impl App {
         let step = 2.0 * PI / inner_choices.len() as f32;
         let ring_inner = outer * CATEGORY_INNER;
         let ring_outer = outer * CATEGORY_OUTER;
-        for (i, choice) in inner_choices.iter().copied().enumerate() {
+        for (i, choice) in inner_choices.iter().enumerate() {
             let angle = -FRAC_PI_2 + i as f32 * step;
             let start = angle - step * 0.5 + SECTOR_GAP;
             let end = angle + step * 0.5 - SECTOR_GAP;
@@ -331,7 +365,7 @@ impl App {
                 else if dimmed || !choice.enabled() { theme::TEXT_DISABLED }
                 else { theme::TEXT };
             let anchor = center + egui::vec2(angle.cos(), angle.sin()) * (ring_inner + ring_outer) * 0.5;
-            painter.text(anchor, egui::Align2::CENTER_CENTER, choice.label,
+            painter.text(anchor, egui::Align2::CENTER_CENTER, &*choice.label,
                 egui::FontId::proportional(if outer < 220.0 { 9.0 } else { 11.0 }), fg);
         }
 
@@ -344,8 +378,11 @@ impl App {
         let footer = if let (Some(_category), Some(items), Some(index)) =
             (chosen_category, catalog, selected_outer)
         {
-            let choice = items[index];
-            format!("{}  ·  /{}", choice.label, choice.sub)
+            let choice = &items[index];
+            match choice.action {
+                Action::Command(_) => format!("{}  ·  /{}", choice.label, choice.sub),
+                _ => format!("{}  ·  {}", choice.label, choice.sub),
+            }
         } else if chosen_category.is_some() {
             "NO SERVER EMOTES AVAILABLE".to_owned()
         } else {
@@ -386,8 +423,21 @@ mod tests {
             assert!(JAPRO_EMOTES.iter().any(|entry| entry.sub == command));
         }
         // On selection the user sees every Standard entry, not a single page.
-        assert_eq!(entries(EmoteCategory::Standard, ServerMod::Japro).len(), JAPRO_EMOTES.len());
-        assert_eq!(entries(EmoteCategory::Standard, ServerMod::Japlus).len(), JAPLUS_EMOTES.len());
+        assert_eq!(entries(EmoteCategory::Standard, ServerMod::Japro, &[]).len(), JAPRO_EMOTES.len());
+        assert_eq!(entries(EmoteCategory::Standard, ServerMod::Japlus, &[]).len(), JAPLUS_EMOTES.len());
+    }
+
+    #[test]
+    fn library_tier_lists_starred_emotes_or_says_why_it_is_empty() {
+        let empty = library_entries(Err("STAR EMOTES IN PROFILE"));
+        assert_eq!(empty.len(), 1);
+        assert!(!empty[0].enabled());
+        let emotes = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[
+            {"id":"EID_Floss","name":"Floss","gla":"models/b.gla","first_frame":0,"end_frame":30,"fps":30}]})).unwrap();
+        let tier = library_entries(Ok(emotes));
+        assert_eq!(tier[0].label, "FLOSS");
+        assert_eq!(tier[0].action, Action::Emote("EID_Floss".into()));
+        assert_eq!(entries(EmoteCategory::Library, ServerMod::Base, &tier).len(), 1);
     }
 
     #[test]

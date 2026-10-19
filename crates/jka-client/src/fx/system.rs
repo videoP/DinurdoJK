@@ -140,6 +140,12 @@ pub enum FxDraw {
     },
     /// RT_ORIENTED_QUAD: quad in axis[1]/axis[2] of half-extent `radius`.
     OrientedQuad { origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    /// Camera-facing (or velocity-aligned) quad with independent half extents
+    /// and a texture sub-rectangle, for baked flipbook particles.
+    /// `facing` places the quad in the plane perpendicular to it (custom facing).
+    /// `ground`: world z of the floor under the effect. Sprites that reach
+    /// it fade out towards it instead of being cut by a hard depth edge.
+    Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
     Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: String },
     /// Arbitrary two-sided textured quad. OpenJK saber trails use exactly this

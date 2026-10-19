@@ -458,6 +458,8 @@ impl App {
             true,
         ) {
             self.frontend_page = FrontendPage::AssetViewer;
+            self.render_command(RenderCommand::SetAssetPreviewBackground(None));
+            self.profile_background_requested=None;
             self.render_command(RenderCommand::SetAssetPreviewMode(true));
             self.render_command(RenderCommand::SetAssetPreviewViewport(None));
             self.asset_preview_viewport_key = None;

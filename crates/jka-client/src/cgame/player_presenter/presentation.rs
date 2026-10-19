@@ -473,7 +473,7 @@ impl PlayerPresenter {
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
             self.viewer_anim_debug = None;
         }
-        let result = self.present_player(
+        let mut result = self.present_player(
             entity,
             info,
             None,
@@ -486,6 +486,16 @@ impl PlayerPresenter {
             view,
             normal_pm_movement,
         );
+        if let Err(error) = &result {
+            if error.starts_with("Ghoul2 ") {
+                // A visual pose failure must not escape GameSession::advance
+                // and tear down a live connection. Recreate this entity's
+                // animation state next frame; retain its cached model/assets.
+                log::warn!("player {} pose skipped: {error}", entity.number);
+                self.entities.remove(&entity.number);
+                result = Ok(Vec::new());
+            }
+        }
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
             let surfaces = result.as_ref().map_or(0, |draws| draws.len() as u32);
             let debug = self
@@ -648,7 +658,18 @@ impl PlayerPresenter {
                 },
             }
         };
-
+        let local_emote = if entity.entity_type == ET_PLAYER
+            && i32::from(entity.number) == self.viewer_client
+            && npc_model_request.is_none()
+        {
+            if let Some(active) = crate::emotes::active_preview() {
+                match self.load_emote_gla(&active.emote.gla) {
+                    Ok(gla) if crate::emotes::pose_plan(&gla, &model.gla).is_ok()
+                        && active.emote.end_frame as usize <= active.emote.pose.as_ref().map_or(gla.num_frames, |p| p.frames) => Some((active, gla)),
+                    _ => None,
+                }
+            } else { None }
+        } else { None };
         // OpenJK loads a client's selected saber definitions/models as part of
         // client/Ghoul2 setup, not only on the first frame the saber happens to
         // be visible. Keep the assets cached up front and let currentState.weapon
@@ -1232,7 +1253,8 @@ impl PlayerPresenter {
                 self.footstep_rng = seed;
             }
         }
-
+        // Stock locomotion events are not in sync with a full-body emote.
+        if local_emote.is_some() { footsteps.clear(); }
         let cull_origin = ghoul2_render_origin(entity);
         let mut raster_visible = submit_geometry;
 
@@ -1289,13 +1311,52 @@ impl PlayerPresenter {
         };
 
         let pose_started = Instant::now();
-        let animation_pose = runtime
-            .animation
-            .evaluate_pose_openjk_root(&model.animation_gla, current_time)?;
-        let mut pose = model.bind_animation_pose(animation_pose)?;
+        let animation_pose = if !ragdoll_requested {
+            if let Some((active, gla)) = local_emote.as_ref() {
+                // The compact pose track owns the animation timeline; the
+                // skeleton-only GLA must not receive its multi-frame range.
+                if let Some(clip) = &active.emote.pose {
+                    crate::emotes::sample_body(clip,active)
+                } else {
+                    let mut animator = Ghoul2Animator::new(gla);
+                    for bone in ["model_root", "lower_lumbar", "Motion"] {
+                        if Ghoul2Animator::bone_index(gla, bone).is_some() {
+                            animator.set_bone_anim(
+                                gla, bone, active.emote.first_frame, active.emote.end_frame,
+                                if active.emote.looping {
+                                    jka_assets::ghoul2::BONE_ANIM_OVERRIDE_LOOP
+                                } else {
+                                    jka_assets::ghoul2::BONE_ANIM_OVERRIDE_FREEZE
+                                },
+                                active.emote.fps / 20.0, 0, None, 0,
+                            )?;
+                        }
+                    }
+                    animator.evaluate_pose_openjk_root(gla, active.elapsed_ms)?
+                }
+            } else {
+                runtime.animation.evaluate_pose_openjk_root(&model.animation_gla, current_time)?
+            }
+        } else {
+            runtime.animation.evaluate_pose_openjk_root(&model.animation_gla, current_time)?
+        };
+        let pose_gla = if !ragdoll_requested {
+            local_emote.as_ref().map(|(_, gla)| gla).unwrap_or(&model.animation_gla)
+        } else { &model.animation_gla };
+        let mut pose = model.bind_external_pose(pose_gla, animation_pose)?;
+        if !ragdoll_requested {if let Some((active,_))=local_emote.as_ref(){model.correct_emote_ground(active,&mut pose)?;}}
         record_pose_eval(&mut self.perf, pose_started);
 
         let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);
+        if !ragdoll_requested {
+            if let Some((active,_))=local_emote.as_ref(){
+                self.cosmetic_draws.extend(Self::emote_prop_draws(active,&model,&pose,render_axis,render_origin,entity.number));
+                let mut fx=Self::emote_effect_frame(active,&model,&pose,render_axis,render_origin,entity.number);
+                self.cosmetic_draws.append(&mut fx.meshes);
+                self.emote_fx.draws.append(&mut fx.draws);
+                self.emote_fx.lights.append(&mut fx.lights);
+            }
+        }
         if ragdoll_requested {
             self.ragdolls.apply_to_pose(
                 entity,
@@ -1326,7 +1387,8 @@ impl PlayerPresenter {
         // all three stay consistent with each other. Ragdoll is its own
         // physically continuous pose; skip and reseed rather than blending an
         // animated-pose history across that discontinuity.
-        if self.ghoul2_anim_smooth > 0.0 && self.ghoul2_anim_smooth < 1.0 && !ragdoll_requested {
+        if self.ghoul2_anim_smooth > 0.0 && self.ghoul2_anim_smooth < 1.0 && !ragdoll_requested
+            && local_emote.is_none() {
             // A frustum-culled frame returns before this point without
             // touching `bone_smooth_time`, so a long-culled entity reappearing
             // is still caught here even though nothing reset the history above.

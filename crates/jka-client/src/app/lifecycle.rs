@@ -126,6 +126,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.attach_companion_to_renderer(&render);
         self.window = Some(window);
         self.render = Some(render);
+        self.profile_background_requested=None;
         self.sync_classic_world_lighting();
         self.previous_tick = Instant::now();
         // A config written before this rule, or by hand, can still say 0. Resolve

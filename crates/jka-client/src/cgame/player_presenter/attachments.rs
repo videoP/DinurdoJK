@@ -15,6 +15,12 @@ pub struct CosmeticDraw {
     pub rgba: [f32; 4],
     /// The parent's customShader (ghost racers carry their cosmetics with them).
     pub custom_shader: Option<&'static str>,
+    /// Independently animated imported prop; ordinary MD3 cosmetics have none.
+    pub skin_pose: Option<std::sync::Arc<Vec<Matrix3x4>>>,
+    /// Niagara mesh FacingMode CameraPosition/CameraPlane: the mesh X axis is
+    /// turned towards the viewer at draw time; `true` keeps Z vertical
+    /// (bLockedAxisEnable). `None` keeps `axis` as given.
+    pub face_camera: Option<bool>,
 }
 
 /// Force-power visuals CG_Player hands to the FX system / local entities.

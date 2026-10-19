@@ -31,6 +31,7 @@ macro_rules! rverbose {
 mod app;
 mod asset_jobs;
 mod audio;
+mod emotes;
 mod eal;
 mod eal_openal;
 mod eal_worker;

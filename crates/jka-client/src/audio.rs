@@ -109,6 +109,7 @@ pub struct Listener {
     pub left: [f32; 3],
 }
 
+#[derive(Clone)]
 pub struct RegisteredSound {
     samples: Arc<[f32]>, // mono SFX, as in the legacy software sound path
     sample_rate: rodio::SampleRate,
@@ -122,12 +123,15 @@ pub(crate) struct SoundDecodeJob {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub(crate) struct SoundDecodeResult {
     key: String,
     decoded: Result<RegisteredSound, String>,
 }
 
 impl SoundDecodeJob {
+    pub(crate) fn from_emote(key: String, bytes: Vec<u8>) -> Self { Self { key: key.to_ascii_lowercase(), bytes } }
+    pub(crate) fn byte_len(&self) -> usize { self.bytes.len() }
     pub(crate) fn decode(self) -> SoundDecodeResult {
         SoundDecodeResult {
             key: self.key,
@@ -149,9 +153,26 @@ pub struct SoundAssets {
     failed: HashSet<String>,
     cached_samples: usize,
     sample_rate_counts: HashMap<u32, usize>,
+    emote_usage: HashMap<String, u64>,
+    cache_clock: u64,
 }
 
+impl SoundDecodeResult {
+    pub(crate) fn memory_bytes(&self) -> usize { self.decoded.as_ref().map_or(0, |s| s.samples.len() * 4) }
+}
 impl SoundAssets {
+    pub(crate) fn emote_cached(&self, path: &str) -> bool { self.cache.contains_key(&path.to_ascii_lowercase()) }
+    pub(crate) fn prepared_emote(&mut self, path: &str) -> Result<Arc<RegisteredSound>, String> {
+        let key = path.to_ascii_lowercase();
+        self.cache_clock = self.cache_clock.wrapping_add(1);
+        self.emote_usage.insert(key.clone(), self.cache_clock);
+        self.cache.get(&key).cloned().ok_or_else(|| format!("emote audio not prepared: {path}"))
+    }
+    pub(crate) fn cache_emote_decode(&mut self, result: SoundDecodeResult) -> Result<(), String> {
+        self.cache_clock = self.cache_clock.wrapping_add(1);
+        self.emote_usage.insert(result.key.clone(), self.cache_clock);
+        self.commit_decode(result)
+    }
     pub fn new(assets: AssetSearchPath) -> Self {
         Self {
             assets,
@@ -161,11 +182,17 @@ impl SoundAssets {
             failed: HashSet::new(),
             cached_samples: 0,
             sample_rate_counts: HashMap::new(),
+            emote_usage: HashMap::new(),
+            cache_clock: 0,
         }
     }
 
     pub fn register(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
         let key = qpath.replace('\\', "/").to_ascii_lowercase();
+        if key.starts_with("emotes/.bundles/") {
+            self.cache_clock = self.cache_clock.wrapping_add(1);
+            self.emote_usage.insert(key.clone(), self.cache_clock);
+        }
         if !self.predecoded.is_empty() {
             if let Some(result) = self.predecoded.remove(&key) {
                 self.commit_decode(result)?;
@@ -330,6 +357,7 @@ impl SoundAssets {
         }
         match result.decoded {
             Ok(sound) => {
+                self.reserve_sound_cache(sound.samples.len())?;
                 if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
                     if self.failed.len() < 4096 {
                         self.failed.insert(result.key);
@@ -352,6 +380,9 @@ impl SoundAssets {
     }
 
     fn load_bytes(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
+        if let Some(bytes) = crate::emotes::read_asset(qpath, MAX_SOUND_BYTES)? {
+            return Ok(bytes);
+        }
         // JKA commonly requests a .wav whose shipped asset is an .mp3.
         let stem = qpath.strip_suffix(".wav").or_else(|| qpath.strip_suffix(".mp3")).unwrap_or(qpath);
         let candidates = if qpath.ends_with(".wav") || qpath.ends_with(".mp3") {
@@ -367,25 +398,57 @@ impl SoundAssets {
 
     fn load(&mut self, qpath: &str) -> Result<RegisteredSound, String> {
         let sound = decode_sound(self.load_bytes(qpath)?)?;
+        self.reserve_sound_cache(sound.samples.len())?;
         if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
             return Err("SFX cache limit reached (128 MiB)".into());
         }
         Ok(sound)
     }
+    fn reserve_sound_cache(&mut self, incoming: usize) -> Result<(), String> {
+        let emote_samples: usize = self.emote_usage.keys().filter_map(|key| self.cache.get(key)).map(|s| s.samples.len()).sum();
+        let mut excess = (self.cached_samples + incoming).saturating_sub(MAX_CACHE_SAMPLES)
+            .max((emote_samples + incoming).saturating_sub(MAX_CACHE_SAMPLES / 2));
+        let mut candidates: Vec<_> = self.emote_usage.iter().filter(|(key, _)| self.cache.get(*key).is_some_and(|s| Arc::strong_count(s) == 1))
+            .map(|(key, age)| (crate::emotes::favorite_asset(key), *age, key.clone())).collect();
+        candidates.sort_unstable(); // Ordinary emotes age out before favorites.
+        for (_, _, key) in candidates {
+            if excess == 0 { break; }
+            if let Some(sound) = self.cache.remove(&key) {
+                self.cached_samples -= sound.samples.len();
+                excess = excess.saturating_sub(sound.samples.len());
+                if let Some(count) = self.sample_rate_counts.get_mut(&sound.sample_rate.get()) {
+                    *count -= 1;
+                    if *count == 0 { self.sample_rate_counts.remove(&sound.sample_rate.get()); }
+                }
+            }
+            self.emote_usage.remove(&key);
+        }
+        if self.cached_samples + incoming > MAX_CACHE_SAMPLES { return Err("SFX cache limit reached (128 MiB)".into()); }
+        Ok(())
+    }
 }
 
 fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
+    if bytes.starts_with(b"fLaC") || bytes.starts_with(b"OggS") { jka_emotes::validate_audio(&bytes)?; }
+    let expected_frames = if bytes.starts_with(b"fLaC") || bytes.starts_with(b"OggS") { Some(jka_emotes::audio_frame_count(&bytes)?) } else { None };
     // Gapless playback (rodio's default) trims the encoder delay/padding a
     // LAME/Xing header claims. JKA's short voice/SFX clips carry headers whose
     // claimed delay+padding exceeds the clip, so a gapless decode returns zero
     // samples ("empty sound") and every such sound - character voices, force
     // powers, weapon selects - was silent. The original engine (mpg123/minimp3)
     // ignores that trim, so decode the whole stream.
-    let mut decoder = Decoder::builder()
+    let flac = bytes.starts_with(b"fLaC");
+    let vorbis = bytes.starts_with(b"OggS");
+    let byte_len = bytes.len() as u64;
+    let builder = Decoder::builder()
         .with_data(Cursor::new(bytes))
-        .with_gapless(false)
+        .with_byte_len(byte_len)
+        .with_seekable(true)
+        .with_gapless(vorbis);
+    let builder = if flac { builder.with_hint("flac") } else if vorbis { builder.with_hint("ogg") } else { builder };
+    let mut decoder = builder
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:?}"))?;
     let sample_rate = decoder.sample_rate();
     let channels = usize::from(decoder.channels().get());
     if channels > 2 { return Err("SFX must be mono or stereo".into()); }
@@ -393,10 +456,21 @@ fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
     while let Some(first) = decoder.next() {
         let sample = if channels == 2 { (first + decoder.next().unwrap_or(0.0)) * 0.5 } else { first };
         if !sample.is_finite() { return Err("non-finite sound sample".into()); }
-        if samples.len() == MAX_DECODED_SAMPLES { return Err("decoded SFX size limit".into()); }
+        if samples.len() == MAX_DECODED_SAMPLES + if vorbis { 8192 } else { 0 } { return Err("decoded SFX size limit".into()); }
         samples.push(sample);
+        if samples.len() > MAX_SOUND_BYTES / 2 + if vorbis { 8192 } else { 0 } {
+            return Err("decoded sound exceeds sample limit".into());
+        }
     }
     if samples.is_empty() { return Err("empty sound".into()); }
+    // Symphonia can return the complete final Vorbis transform block despite
+    // gapless mode. The Ogg EOS granule declares the exact PCM endpoint. Trim
+    // only bounded trailing block padding, never invent missing samples.
+    if vorbis {
+        let frames = expected_frames.unwrap() as usize;
+        if samples.len() >= frames && samples.len() - frames <= 8192 { samples.truncate(frames); }
+    }
+    if expected_frames.is_some_and(|n| n != samples.len() as u64) { return Err(format!("decoded compressed sound length mismatch: expected {expected_frames:?}, got {}", samples.len())); }
     Ok(RegisteredSound { samples: samples.into(), sample_rate })
 }
 
@@ -538,6 +612,13 @@ impl Gains {
 }
 
 // A gain adapter, not a mixer: Rodio supplies mixing, resampling and playback.
+fn loop_seam_sample(samples: &[f32], index: usize, start: usize, seam: usize) -> f32 {
+    let sample = samples[index];
+    if seam > 1 && index >= samples.len() - seam {
+        let t = (index - (samples.len() - seam)) as f32 / (seam - 1) as f32;
+        sample + (samples[start] - sample) * (t * t * (3.0 - 2.0 * t))
+    } else { sample }
+}
 // Its callback only reads immutable PCM and atomics, never VFS or CGame state.
 struct StereoSource {
     sound: Arc<RegisteredSound>,
@@ -549,6 +630,8 @@ struct StereoSource {
     fade_step: f32,
     finished: bool,
     looping: bool,
+    loop_start: usize,
+    seam_frames: usize,
 }
 impl StereoSource {
     fn new(sound: Arc<RegisteredSound>, gains: Arc<Gains>) -> Self {
@@ -560,6 +643,8 @@ impl StereoSource {
             fade_step: 1.0 / (STOP_FADE_SECONDS * rate).max(1.0),
             finished: false,
             looping: false,
+            loop_start: 0,
+            seam_frames: 0,
             sound,
             gains,
             cursor: 0,
@@ -587,7 +672,7 @@ impl Iterator for StereoSource {
                     self.finished = true;
                     return None;
                 }
-                self.cursor = 0;
+                self.cursor = self.loop_start * 2;
             }
             // Advance gains once per stereo frame so left/right stay aligned.
             let target = self.gains.get();
@@ -602,7 +687,7 @@ impl Iterator for StereoSource {
                 }
             }
         }
-        let sample = self.sound.samples[self.cursor / 2];
+        let sample = loop_seam_sample(&self.sound.samples, self.cursor / 2, self.loop_start, self.seam_frames);
         if self.cursor % 2 == 0 && self.gains.eal_track_position.load(Ordering::Relaxed) {
             self.gains.eal_position.store((self.cursor as f64 / 2.0).to_bits(), Ordering::Release);
         }
@@ -610,6 +695,15 @@ impl Iterator for StereoSource {
         self.cursor += 1;
         Some(sample * gain)
     }
+}
+fn emote_stereo_source(sound: Arc<RegisteredSound>, gains: Arc<Gains>, start: Option<usize>) -> StereoSource {
+    let mut source = StereoSource::new(sound, gains);
+    if let Some(start) = start {
+        source.looping = true;
+        source.loop_start = start;
+        source.seam_frames = (source.sound.sample_rate.get() as usize / 200).min((source.sound.samples.len() - start) / 8);
+    }
+    source
 }
 impl Source for StereoSource {
     fn current_span_len(&self) -> Option<usize> {
@@ -1034,6 +1128,8 @@ struct SteamAudioSource {
     fade: f32,
     fade_step: f32,
     looping: bool,
+    loop_start: usize,
+    seam_frames: usize,
     input_done: bool,
     finished: bool,
     last_block_hrtf: bool,
@@ -1088,6 +1184,8 @@ impl SteamAudioSource {
             fade: 1.0,
             fade_step: 1.0 / (STOP_FADE_SECONDS * rate).max(1.0),
             looping: false,
+            loop_start: 0,
+            seam_frames: 0,
             input_done: false,
             finished: false,
             last_block_hrtf: false,
@@ -1149,12 +1247,12 @@ impl SteamAudioSource {
         if self.sound.samples.is_empty() { return None; }
         let len = self.sound.samples.len();
         if !self.looping && self.source_position >= len as f64 { return None; }
-        if self.looping && self.source_position >= len as f64 { self.source_position %= len as f64; }
+        if self.looping && self.source_position >= len as f64 { self.source_position = self.loop_start as f64 + (self.source_position - len as f64) % (len - self.loop_start) as f64; }
         let i0 = self.source_position.floor() as usize;
         let frac = (self.source_position - i0 as f64) as f32;
-        let i1 = if i0 + 1 < len { i0 + 1 } else if self.looping { 0 } else { i0 };
-        let a = self.sound.samples[i0.min(len - 1)];
-        let b = self.sound.samples[i1.min(len - 1)];
+        let i1 = if i0 + 1 < len { i0 + 1 } else if self.looping { self.loop_start } else { i0 };
+        let a = loop_seam_sample(&self.sound.samples, i0.min(len - 1), self.loop_start, self.seam_frames);
+        let b = loop_seam_sample(&self.sound.samples, i1.min(len - 1), self.loop_start, self.seam_frames);
         let sample = a + (b - a) * frac;
         self.source_position += self.sound.sample_rate.get() as f64 / self.output_rate.get() as f64;
         Some(sample)
@@ -1625,6 +1723,7 @@ pub struct AudioBackend {
     listener: Listener,
     origins: HashMap<u16, [f32; 3]>,
     effects_volume: f32,
+    emote_music_volume: f32,
     voice_volume: f32,
     separation: f32,
     rate: f32,
@@ -1727,6 +1826,7 @@ impl AudioBackend {
             origins: HashMap::new(),
             listener: Listener { entity: 0, origin: [0.0; 3], ahead: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], left: [0.0, 1.0, 0.0] },
             effects_volume: 0.5,
+            emote_music_volume: 0.5,
             voice_volume: 1.0,
             separation: 0.5,
             rate: 1.0,
@@ -1778,6 +1878,7 @@ impl AudioBackend {
             origins: HashMap::new(),
             listener: Listener { entity: 0, origin: [0.0; 3], ahead: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], left: [0.0, 1.0, 0.0] },
             effects_volume: 0.5,
+            emote_music_volume: 0.5,
             voice_volume: 1.0,
             separation: 0.5,
             rate: 1.0,
@@ -1831,6 +1932,7 @@ impl AudioBackend {
     pub(crate) fn offline_like(&self) -> (Self, rodio::mixer::MixerSource) {
         let (mut backend, output) = Self::offline();
         backend.effects_volume = self.effects_volume;
+        backend.emote_music_volume = self.emote_music_volume;
         backend.voice_volume = self.voice_volume;
         backend.separation = self.separation;
         backend.music_level = self.music_level;
@@ -2256,13 +2358,19 @@ impl AudioBackend {
         self.refresh_voice_gains();
     }
 
+    pub fn set_emote_music_volume(&mut self, level: f32) {
+        self.emote_music_volume = if level.is_finite() { level.clamp(0., 1.) } else { 0.5 };
+        self.refresh_voice_gains();
+    }
+
     fn refresh_voice_gains(&mut self) {
         let listener = self.listener;
         let effects = self.effects_volume;
         let voice = self.voice_volume;
         let separation = self.separation;
         for item in &self.voices {
-            let mut spatial = sound_spatialization(&item.request, listener, effects, voice, separation);
+            let bus = if item.request.channel == 14 { self.emote_music_volume } else { effects };
+            let mut spatial = sound_spatialization(&item.request, listener, bus, voice, separation);
             spatial.stereo = spatial.stereo.map(|gain| gain * item.volume);
             spatial.mono *= item.volume;
             for (previous, next) in item.gains.get().into_iter().zip(spatial.stereo) {
@@ -2510,6 +2618,13 @@ impl AudioBackend {
     }
 
     fn play_scaled(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
+        self.play_with_loop(request, sound, volume, None);
+    }
+    pub fn play_emote(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>, loop_start_sample: Option<u64>) {
+        let start = loop_start_sample.and_then(|sample| usize::try_from(sample).ok()).filter(|&sample| sample < sound.samples.len());
+        self.play_with_loop(request, sound, 1.0, start);
+    }
+    fn play_with_loop(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32, loop_start: Option<usize>) {
         self.voices.retain(|voice| !voice.player.empty());
         if !matches!(request.channel, 0 | 10) { // CHAN_AUTO / CHAN_LESS_ATTEN auto-pick
             let (stomped, kept): (Vec<_>, Vec<_>) =
@@ -2543,7 +2658,7 @@ impl AudioBackend {
         let mut spatial = sound_spatialization(
             &request,
             self.listener,
-            self.effects_volume,
+            if request.channel == 14 { self.emote_music_volume } else { self.effects_volume },
             self.voice_volume,
             self.separation,
         );
@@ -2585,17 +2700,20 @@ impl AudioBackend {
                     Arc::clone(&self.steam_audio_environmental_switch),
                     rodio::SampleRate::new(self.output_sample_rate).expect("audio sample rate is non-zero"),
                 ) {
-                    Ok(source) => (connect_player(&self.mixer, source), true),
+                    Ok(mut source) => {
+                        if let Some(start) = loop_start { source.looping = true; source.loop_start = start; source.seam_frames = (source.sound.sample_rate.get() as usize / 200).min((source.sound.samples.len() - start) / 8); }
+                        (connect_player(&self.mixer, source), true)
+                    },
                     Err(error) => {
                         eprintln!("STEAM AUDIO VOICE FALLBACK: {error}");
-                        (connect_player(&self.mixer, StereoSource::new(sound, Arc::clone(&gains))), false)
+                        (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
                     }
                 }
             } else {
-                (connect_player(&self.mixer, StereoSource::new(sound, Arc::clone(&gains))), false)
+                (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
             }
         } else {
-            (connect_player(&self.mixer, StereoSource::new(sound, Arc::clone(&gains))), false)
+            (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
         };
         if self.rate == 0.0 { player.pause(); } else { player.set_speed(self.rate); }
         self.voices.push(Voice { player, wet_player, sound: retained_sound, gains, request, steam_audio_capable, volume });
@@ -2778,6 +2896,129 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires DJK_EMOTE_AUDIO_LIBRARY with compiled bundles"]
+    fn emote_library_decodes_every_scheduled_track_to_its_declared_length() {
+        let dir = std::path::PathBuf::from(std::env::var("DJK_EMOTE_AUDIO_LIBRARY").unwrap());
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("djk_fnemote"))).collect();
+        paths.sort();
+        let mut tracks = 0;
+        let mut samples = 0u64;
+        for (i, path) in paths.iter().enumerate() {
+            let bundle = jka_emotes::Bundle::open_index(path).unwrap();
+            let entries = jka_emotes::manifest::parse_manifest(&bundle.manifest).unwrap();
+            let mut checked = HashSet::new();
+            for event in entries.iter().flat_map(|e| e.audio.iter().chain(e.variants.iter().flat_map(|v| v.audio.iter()))) {
+                if let Some(member) = &event.wav {
+                    if !checked.insert(member) { continue; }
+                    let bytes = bundle.read(member, jka_emotes::MAX_WAV_BYTES).unwrap();
+                    let sound = decode_sound(bytes).unwrap_or_else(|e| panic!("{} / {member}: {e}", path.display()));
+                    tracks += 1;
+                    samples += sound.samples.len() as u64;
+                }
+            }
+            if (i + 1) % 100 == 0 { println!("Decoded {} bundles, {tracks} tracks", i + 1); }
+        }
+        assert!(tracks > 0);
+        println!("Verified {} bundles, {tracks} unique scheduled tracks, {samples} decoded samples", paths.len());
+    }
+    #[test]
+    fn emote_flac_decodes_losslessly_and_bounds_expansion() {
+        let raw: Vec<i16> = (0..8000).map(|i| ((i as f32 * 0.11).sin() * 30000.0) as i16).collect();
+        let data: Vec<u8> = raw.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend(((data.len() + 36) as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend([1, 0, 1, 0]);
+        wav.extend(8000u32.to_le_bytes()); wav.extend(16000u32.to_le_bytes());
+        wav.extend([2, 0, 16, 0]); wav.extend(b"data");
+        wav.extend((data.len() as u32).to_le_bytes()); wav.extend(data);
+        let flac = jka_emotes::compress_pcm16_mix(&wav).unwrap();
+        assert!(flac.len() < wav.len());
+        let decoded = decode_sound(flac.clone()).unwrap();
+        assert_eq!(decoded.sample_rate.get(), 8000);
+        assert_eq!(decoded.samples.len(), raw.len());
+        for (a, b) in decoded.samples.iter().zip(raw) { assert!((*a - b as f32 / 32768.0).abs() < 1e-6); }
+        let mut corrupt = flac;
+        let word = u64::from_be_bytes(corrupt[18..26].try_into().unwrap()) | 0xf_ffff_ffff;
+        corrupt[18..26].copy_from_slice(&word.to_be_bytes());
+        assert!(decode_sound(corrupt).is_err());
+    }
+    #[test]
+    fn emote_vorbis_is_gapless_and_preserves_declared_sample_count() {
+        let raw: Vec<i16> = (0..24379).map(|n| ((n as f32 * 0.041).sin() * 20000.0) as i16).collect();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend(((raw.len() * 2 + 36) as u32).to_le_bytes()); wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes()); wav.extend([1,0,1,0]);
+        wav.extend(22050u32.to_le_bytes()); wav.extend(44100u32.to_le_bytes());
+        wav.extend([2,0,16,0]); wav.extend(b"data"); wav.extend((raw.len() as u32 * 2).to_le_bytes());
+        wav.extend(raw.iter().flat_map(|n| n.to_le_bytes()));
+        let compressed = jka_emotes::compress_pcm16_vorbis(&wav).unwrap();
+        assert!(compressed.len() < wav.len() / 4);
+        assert_eq!(jka_emotes::audio_frame_count(&compressed).unwrap(), raw.len() as u64);
+        let decoded = decode_sound(compressed.clone()).unwrap();
+        assert_eq!(decoded.samples.len(), raw.len());
+        assert_eq!(decoded.sample_rate.get(), 22050);
+        let rms = (decoded.samples.iter().zip(&raw).map(|(a,b)| (*a - *b as f32 / 32768.0).powi(2)).sum::<f32>() / raw.len() as f32).sqrt();
+        assert!(rms < 0.05, "encoding error: {rms}");
+        assert!(decode_sound(compressed[..compressed.len()-1].to_vec()).is_err());
+    }
+    #[test]
+    fn emote_loop_runs_on_samples_skips_intro_and_keeps_exact_period() {
+        let sound = Arc::new(RegisteredSound { samples: vec![0.7,0.8,0.1,0.2,0.3,0.4].into(), sample_rate: rodio::SampleRate::new(8000).unwrap() });
+        let gains = Arc::new(Gains::new([1.0;2]));
+        let mut source = emote_stereo_source(sound, gains, Some(2));
+        assert!(source.total_duration().is_none());
+        let frames: Vec<_> = (0..18).map(|_| { let left=source.next().unwrap(); assert_eq!(source.next().unwrap(),left); left }).collect();
+        assert_eq!(&frames[..6], &[0.7,0.8,0.1,0.2,0.3,0.4]);
+        for cycle in frames[6..].chunks_exact(4) { assert_eq!(cycle, &[0.1,0.2,0.3,0.4]); }
+        let pcm = [0.4,0.5,0.6,-0.9,-0.8,-0.7,-0.6,-0.5];
+        assert!((loop_seam_sample(&pcm,7,0,4) - pcm[0]).abs() < 1e-6);
+        assert_eq!(loop_seam_sample(&pcm,3,0,4),pcm[3]);
+    }
+    #[test]
+    fn emote_music_bus_is_independent_and_updates_playing_voices() {
+        let (mut backend,_output)=AudioBackend::offline();
+        backend.set_mix(0.,0.5,0.5);backend.set_emote_music_volume(0.8);
+        let mut song=request(14);song.origin=SoundOrigin::Local;
+        backend.play_emote(song,fixture(),None);
+        assert_eq!(backend.voices[0].gains.get(),[0.8;2]);
+        backend.set_mix(0.1,0.5,0.5);
+        assert_eq!(backend.voices[0].gains.get(),[0.8;2]);
+        backend.set_emote_music_volume(0.2);
+        assert_eq!(backend.voices[0].gains.get(),[0.2;2]);
+        let mut foley=request(15);foley.origin=SoundOrigin::Local;
+        backend.play_emote(foley,fixture(),None);
+        assert_eq!(backend.voices[1].gains.get(),[0.1;2]);
+    }
+    #[test]
+    fn emote_cache_evicts_nonfavorites_and_keeps_active_sounds() {
+        let dir = std::env::temp_dir().join(format!("djk-emote-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut assets = SoundAssets::new(AssetSearchPath::open(&dir).unwrap());
+        let prefix = "emotes/.bundles/favorite/";
+        let catalogue = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[{"id":"fav","name":"Fav","gla":format!("{prefix}a.gla"),"first_frame":0,"end_frame":30,"fps":30}]})).unwrap();
+        crate::emotes::update_favorite_assets(&catalogue, &["fav".into()]);
+        let make = || Arc::new(RegisteredSound { samples: vec![0.0; 1024].into(), sample_rate: rodio::SampleRate::new(22050).unwrap() });
+        let favorite = format!("{prefix}a.flac");
+        let ordinary = "emotes/.bundles/ordinary/a.flac".to_owned();
+        let active = "emotes/.bundles/active/a.flac".to_owned();
+        let held = make();
+        assets.cache.insert(favorite.clone(), make());
+        assets.cache.insert(ordinary.clone(), make());
+        assets.cache.insert(active.clone(), held.clone());
+        assets.emote_usage.extend([(favorite.clone(), 1), (ordinary.clone(), 2), (active.clone(), 0)]);
+        assets.cached_samples = MAX_CACHE_SAMPLES - 512; // Account for the ordinary resident SFX pool.
+        assets.sample_rate_counts.insert(22050, 3);
+        assets.reserve_sound_cache(1000).unwrap();
+        assert!(!assets.cache.contains_key(&ordinary));
+        assert!(assets.cache.contains_key(&favorite));
+        assert!(assets.cache.contains_key(&active));
+        crate::emotes::update_favorite_assets(&[], &[]);
+        std::fs::remove_dir(dir).unwrap();
+    }
     use super::*;
 
     #[test]

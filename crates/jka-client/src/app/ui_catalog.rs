@@ -40,6 +40,8 @@ pub(super) enum CatalogRequest {
     SoloMaps,
     SourceMaps,
     Levelshot { source: bool, map_name: String },
+    ProfileBackground { map_name: String },
+    ProfileBackgroundMaps,
     ProfileIcon { key: String, model: String, skin: String },
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
     CrosshairImage { index: u8 },
@@ -63,6 +65,8 @@ pub(super) enum CatalogPayload {
     SoloMaps(Result<Vec<SoloMapEntry>, String>),
     SourceMaps(Result<Vec<SoloMapEntry>, String>),
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
+    ProfileBackground { map_name: String, image: Option<DecodedImage> },
+    ProfileBackgroundMaps(Vec<String>),
     ProfileIcon { key: String, image: Option<DecodedImage> },
     CrosshairImage { index: u8, image: Option<DecodedImage> },
     ShaderNames(Vec<String>),
@@ -275,6 +279,8 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         CatalogRequest::Levelshot { source, map_name } => {
                             Some(CatalogPayload::Levelshot { source, map_name, image: None })
                         }
+                        CatalogRequest::ProfileBackground {map_name}=>Some(CatalogPayload::ProfileBackground{map_name,image:None}),
+                        CatalogRequest::ProfileBackgroundMaps=>Some(CatalogPayload::ProfileBackgroundMaps(Vec::new())),
                         CatalogRequest::ProfileIcon { key, .. } => {
                             Some(CatalogPayload::ProfileIcon { key, image: None })
                         }
@@ -339,6 +345,24 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     .and_then(|asset| decode(asset, &format!("Profile icon {key}")));
                 ("profile icon", CatalogPayload::ProfileIcon { key, image })
             }
+            CatalogRequest::ProfileBackground{map_name}=>{
+                let image=frontend::read_levelshot(assets,&map_name).and_then(|asset|decode(asset,&format!("Profile background {map_name}")))
+                    .map(|image|{
+                        if image.size[0]<=2048&&image.size[1]<=2048{return image;}
+                        let raw=image::RgbaImage::from_raw(image.size[0] as u32,image.size[1] as u32,image.rgba).expect("decoded RGBA size");
+                        let resized=image::DynamicImage::ImageRgba8(raw).thumbnail(2048,2048).into_rgba8();
+                        DecodedImage{size:[resized.width() as usize,resized.height() as usize],rgba:resized.into_raw()}
+                    });
+                ("profile background",CatalogPayload::ProfileBackground{map_name,image})
+            }
+            CatalogRequest::ProfileBackgroundMaps=>{
+                let names:HashSet<_>=assets.names().map(|n|n.to_ascii_lowercase()).collect();
+                let maps=frontend::scan_solo_maps(assets).into_iter().map(|m|m.map_name).filter(|name|{
+                    [name.as_str(),name.rsplit('/').next().unwrap_or(name)].iter().any(|stem|
+                        ["jpg","jpeg","png","tga"].iter().any(|ext|names.contains(&format!("levelshots/{stem}.{ext}"))))
+                }).collect();
+                ("profile map images",CatalogPayload::ProfileBackgroundMaps(maps))
+            }
             CatalogRequest::CrosshairImage { index } => {
                 let image = frontend::read_crosshair_image(assets, index)
                     .and_then(|asset| decode(asset, &format!("Crosshair image {index}")));
@@ -380,6 +404,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         if !matches!(
             payload,
             CatalogPayload::Levelshot { .. }
+                | CatalogPayload::ProfileBackground { .. }
                 | CatalogPayload::ProfileIcon { .. }
                 | CatalogPayload::CrosshairImage { .. }
                 | CatalogPayload::ShaderThumbnail { .. }

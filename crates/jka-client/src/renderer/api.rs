@@ -1225,6 +1225,8 @@ pub enum RenderCommand {
     /// 3D rendering inside this rectangle prevents models/FX/materials from
     /// being drawn underneath translucent browser panes.
     SetAssetPreviewViewport(Option<[u32; 4]>),
+    /// Decoded installed-map levelshot, uploaded once when selected.
+    SetAssetPreviewBackground(Option<([u32;2],Vec<u8>)>),
     UnloadMap,
     /// Grow private inline render slots from the prepared CPU cache while the
     /// current CGame/collision session continues unchanged.

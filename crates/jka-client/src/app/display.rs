@@ -1231,6 +1231,7 @@ impl App {
             Ok(render) => {
                 self.attach_companion_to_renderer(&render);
                 self.render = Some(render);
+                self.profile_background_requested=None;
                 // Renderer restarts recreate these lightweight runtime flags;
                 // immediately restore the classic world-lighting controls from
                 // the retained VideoSettings state.

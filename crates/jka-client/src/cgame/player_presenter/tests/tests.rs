@@ -21,6 +21,179 @@ fn fighter_pilot_nodraw_and_ship_death_flags_suppress_player_model() {
 }
 
 #[test]
+#[ignore="requires JKA_TEST_BASE installed Source models and DJK_EMOTE_TEST_BASE packed library"]
+fn actual_source_emote_grounding_tracks_mesh_contacts_and_airborne_height() {
+    let stock=std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").unwrap());
+    let base=std::path::PathBuf::from(std::env::var_os("DJK_EMOTE_TEST_BASE").unwrap());
+    crate::emotes::refresh_catalog();
+    let deadline=Instant::now()+std::time::Duration::from_secs(30);
+    let entries=loop{if let Ok(entries)=crate::emotes::catalog(&base){break entries;}assert!(Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));};
+    let mut presenter=PlayerPresenter::new(AssetSearchPath::open(&stock).unwrap(),false).unwrap();
+    presenter.set_async_loading(false);
+    let mut poses=0;
+    for id in ["EID_BillyBounce","EID_Cottontail","EID_Cartwheel","EID_Worm","EID_PlankCoverAge"] {
+        crate::emotes::play(crate::emotes::resolve_catalog_id(&entries,id).unwrap());
+        let deadline=Instant::now()+std::time::Duration::from_secs(20);
+        let active=loop{crate::emotes::poll_prepared_audio();if let Some(p)=crate::emotes::active_preview(){break p;}assert!(Instant::now()<deadline,"{id}");std::thread::sleep(std::time::Duration::from_millis(5));};
+        let rig=presenter.load_emote_gla(&active.emote.gla).unwrap();
+        for name in ["10th_brother/default","2_snow_miku_arms/default"] {
+            let model=presenter.load_model(&crate::cgame::ClientInfo::solo_model(name)).unwrap();
+            assert!(model.source_native_pivots.is_some(),"{name} fell back to a native model");
+            for elapsed in [0,250,500,1000,2000,4000,8000] {
+                let mut active=active.clone();active.elapsed_ms=elapsed;
+                let e=&active.emote;
+                let source=crate::emotes::sample_body(e.pose.as_ref().unwrap(),&active);
+                let mut pose=model.bind_external_pose(&rig,source).unwrap();
+                model.correct_emote_ground(&active,&mut pose).unwrap();
+                let markers=model.emote_contacts.get().unwrap();assert!(!markers.is_empty(),"{name} has no mesh contact markers");
+                let floor=markers.iter().map(|marker|marker.weights.iter().map(|&(bone,weight)|{let m=&pose[bone][2];weight*(m[0]*marker.position[0]+m[1]*marker.position[1]+m[2]*marker.position[2]+m[3])}).sum::<f32>()).fold(f32::INFINITY,f32::min);
+                let loop_start=e.loop_start_frame.map(|n|(n-e.first_frame) as usize).or(e.looping.then_some(0));
+                let height=e.contact_pose.as_ref().unwrap().sample_unrooted_interpolated(elapsed,e.fps,loop_start,crate::emotes::interpolation())[0][2][3];
+                assert!((floor-(-24.+height)).abs()<0.002,"{id}/{name}/{elapsed}: floor {floor}, source height {height}");
+                assert!(pose.iter().flatten().flatten().all(|n|n.is_finite()));poses+=1;
+            }
+        }
+        crate::emotes::stop();
+    }
+    println!("Validated {poses} real Source player poses against source contact heights");
+}
+
+/// Real socket tracks must follow the final mesh pose and the same intro/loop
+/// clock, including independently animated props. No Ghoul2 range registration.
+#[test]
+#[ignore = "requires JKA_TEST_BASE stock PK3s and DJK_EMOTE_TEST_BASE native prop library"]
+fn imported_emote_props_follow_model_pose_notify_lifetimes_and_loop_clock() {
+    let stock=std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("JKA_TEST_BASE"));
+    let base=std::path::PathBuf::from(std::env::var_os("DJK_EMOTE_TEST_BASE").expect("DJK_EMOTE_TEST_BASE"));
+    crate::emotes::refresh_catalog();
+    let deadline=Instant::now()+std::time::Duration::from_secs(30);
+    let entries=loop{if let Ok(entries)=crate::emotes::catalog(&base){break entries;}assert!(Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));};
+    let mut presenter=PlayerPresenter::new(AssetSearchPath::open(&stock).unwrap(),false).unwrap();
+    presenter.set_async_loading(false);
+    let mut renderer=crate::cgame::entity_presenter::EntityPresenter::new(AssetSearchPath::open_search_dirs([&base,&stock]).unwrap(),false).unwrap();
+    let axis=[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]];
+    let mut props_tested=0;let mut skinned=0;
+    for id in ["EID_Boombox","EID_AirHorn","EID_AccentWall","EID_AbstractMirror","EID_Basketball","EID_Texting","EID_Noble","EID_YouthFlume","EID_PlankCoverAge","EID_Inflatododo"] {
+        let entry=crate::emotes::resolve_catalog_id(&entries,id).expect(id);
+        assert!(!entry.props.is_empty(),"missing props for {id}");
+        crate::emotes::play(entry);
+        let deadline=Instant::now()+std::time::Duration::from_secs(20);
+        let active=loop{crate::emotes::poll_prepared_audio();if let Some(active)=crate::emotes::active_preview(){break active;}assert!(Instant::now()<deadline,"{id}");std::thread::sleep(std::time::Duration::from_millis(5));};
+        let gla=presenter.load_emote_gla(&active.emote.gla).unwrap();
+        for name in ["kyle/default","jan/default"] {
+            let model=presenter.load_model(&crate::cgame::ClientInfo::solo_model(name)).unwrap();
+            let mut times=vec![0,((active.emote.end_frame-active.emote.first_frame) as f32/active.emote.fps*1000.) as i32+50];
+            for prop in &active.emote.props {assert!(prop.pose.is_some(),"{}",prop.name);if prop.skin_track.is_some(){assert!(prop.skin_pose.is_some(),"{}",prop.name);skinned+=1;}for life in &prop.intervals{times.push(((life[0]+life[1])*500.) as i32);}}
+            for elapsed in times {
+                let mut active=active.clone();active.elapsed_ms=elapsed;
+                let source=active.emote.pose.as_ref().unwrap().sample_range(elapsed,active.emote.fps,active.emote.first_frame as usize,active.emote.end_frame as usize,active.emote.loop_start_frame.map(|n|n as usize));
+                let pose=model.bind_external_pose(&gla,source).unwrap();
+                let draws=PlayerPresenter::emote_prop_draws(&active,&model,&pose,axis,[0.;3],0);
+                let frames=(active.emote.end_frame-active.emote.first_frame) as usize;
+                let loop_start=active.emote.loop_start_frame.map(|n|(n-active.emote.first_frame) as usize).or(active.emote.looping.then_some(0));
+                let seconds=jka_emotes::presentation::clock(elapsed,active.emote.fps,frames,loop_start);
+                assert_eq!(draws.len(),active.emote.props.iter().filter(|p|p.intervals.iter().any(|s|seconds>=s[0]&&seconds<s[1])).count(),"{id}/{name} at {elapsed}");
+                let mut raised=pose.clone();for m in &mut raised {m[2][3]+=11.;}
+                let raised_draws=PlayerPresenter::emote_prop_draws(&active,&model,&raised,axis,[0.;3],0);
+                let delta=transform_jka_model_vector([0.,0.,11.],axis);
+                for (a,b) in draws.iter().zip(&raised_draws){for i in 0..3{assert!((b.origin[i]-a.origin[i]-delta[i]).abs()<0.001,"prop must follow ground correction");}}
+                let expected=draws.len();let surfaces=renderer.present_cosmetics(draws);
+                if expected>0 {assert!(!surfaces.is_empty(),"{id}/{name}");props_tested+=expected;assert!(surfaces.iter().flat_map(|s|s.vertices.iter()).flat_map(|v|v.position).all(f32::is_finite));}
+            }
+        }
+        crate::emotes::stop();
+    }
+    assert!(props_tested>0&&skinned>0);println!("Rendered {props_tested} timed prop placements on Kyle and Jan; {skinned} independently animated bindings");
+}
+
+/// Exercise the actual menu and world presenters, not just the pose decoder:
+/// shipping bundles keep one GLA frame while animation.pose holds the motion.
+#[test]
+#[ignore = "requires JKA_TEST_BASE stock PK3s and DJK_EMOTE_TEST_BASE v4 bundles"]
+fn compact_emote_renders_in_profile_and_world() {
+    use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+    let stock = std::env::var_os("JKA_TEST_BASE").expect("JKA_TEST_BASE");
+    let base = std::env::var_os("DJK_EMOTE_TEST_BASE").expect("DJK_EMOTE_TEST_BASE");
+    let base = std::path::Path::new(&base);
+    crate::emotes::refresh_catalog();
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let entries = loop {
+        if let Ok(entries) = crate::emotes::catalog(base) { break entries; }
+        assert!(Instant::now() < deadline, "catalogue timeout");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let assets = AssetSearchPath::open(std::path::Path::new(&stock)).unwrap();
+    let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+    presenter.set_async_loading(false);
+    presenter.skinning_mode = Ghoul2SkinningMode::Cpu;
+    presenter.early_frustum_cull = false;
+    presenter.viewer_client = 0;
+    let info = crate::cgame::ClientInfo::solo_model("kyle/default");
+    let mut state = EntityState { number: 0, fields: [0; ENTITY_FIELDS.len()] };
+    let stand = animation_index("BOTH_STAND1").unwrap() as u32;
+    for (name, value) in [("eType", ET_PLAYER as u32), ("legsAnim", stand), ("torsoAnim", stand)] {
+        let i = ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap();
+        state.fields[i] = value;
+    }
+    let entity = PresentedEntity { number: 0, entity_type: ET_PLAYER,
+        origin: [0.; 3], angles: [0.; 3], state };
+    let axis = [[1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+    let mut ids = vec!["EID_NoiseClueGust", "EID_DanceMoves", "EID_LaughTrack", "EID_DriedSilk", "EID_Worm", "EID_Floss"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if let Ok(path) = std::env::var("DJK_GROUND_AUDIT_IDS") {
+        let extra: Vec<String> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for id in extra { if !ids.contains(&id) { ids.push(id); } }
+    }
+    for id in &ids {
+        let entry = crate::emotes::resolve_catalog_id(&entries,id).expect(id);
+        for variant in std::iter::once(&entry).chain(entry.variants.iter()) {
+            let gla = presenter.load_emote_gla(&variant.gla).unwrap();
+            assert_eq!(gla.num_frames, 1, "test requires skeleton-only shipping GLA");
+            assert!(variant.end_frame > 1);
+            for world in [false, true] {
+                if world { crate::emotes::play_world(variant.clone()); }
+                else { crate::emotes::play(variant.clone()); }
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let _ = crate::emotes::poll_prepared_audio();
+                    if crate::emotes::active_preview().is_some() { break; }
+                    assert!(Instant::now() < deadline, "preparation timeout: {id}");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                for time in [1000, 1100] {
+                    let draws = if world {
+                        presenter.present_player_entity(&entity, &info, time, 1., None, false, true, false, None)
+                            .unwrap_or_else(|err| panic!("world {id}/{}: {err}", variant.variant_name))
+                    } else {
+                        presenter.present_profile_player_preview(&info, [0.; 3], axis, time,
+                            "BOTH_STAND1", false, [1.; 3], 0, [0.; 2], false, None)
+                            .unwrap_or_else(|err| panic!("profile {id}/{}: {err}", variant.variant_name)).0
+                    };
+                    assert!(!draws.is_empty(), "no geometry: {id}");
+                    assert!(draws.iter().any(|s| !s.vertices.is_empty()), "empty geometry: {id}");
+                    assert!(draws.iter().flat_map(|s| s.vertices.iter()).flat_map(|v| v.position)
+                        .all(f32::is_finite), "invalid geometry: {id}");
+                }
+                crate::emotes::stop();
+            }
+            println!("COMPACT PRESENTER {id}/{} frames={} profile+world OK", variant.variant_name, variant.end_frame);
+        }
+    }
+    // Stopping the override must still restore the stock Ghoul2 stand path.
+    assert!(!presenter.present_profile_player_preview(&info, [0.; 3], axis, 1200,
+        "BOTH_STAND1", false, [1.; 3], 0, [0.5; 2], false, None).unwrap().0.is_empty());
+    // A broken visual animator cannot abort the live-session caller. Its state
+    // is recreated next frame while model caches and authoritative state stay.
+    let runtime=presenter.entities.get_mut(&0).unwrap();
+    let mut other_clip=(*runtime.model.animation_gla).clone();
+    let first=other_clip.num_frames as i32;
+    other_clip.num_frames+=2;
+    runtime.animation.animator.set_bone_anim(&other_clip,"model_root",first,first+2,
+        BONE_ANIM_OVERRIDE_LOOP,1.,1300,None,0).unwrap();
+    assert!(presenter.present_player_entity(&entity, &info, 1300, 1., None, false, true, false, None).unwrap().is_empty());
+    assert!(!presenter.present_player_entity(&entity, &info, 1400, 1., None, false, true, false, None).unwrap().is_empty());
+}
+
+#[test]
 fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices() {
     use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
     let animation = humanoid_reference(HumanoidRig::Jka53);
@@ -38,6 +211,7 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
         animation_gla: Arc::clone(&animation), retargeter: plan,
         source_native_pivots: None, source_jiggles: None,
         source_jiggles_enabled: false, humanoid: true, animations: None,
+        emote_contacts: Default::default(),
         anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,
     };
     let mut animator = Ghoul2Animator::new(&animation);

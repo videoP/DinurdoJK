@@ -282,6 +282,15 @@ impl App {
                         });
                     }
                 }
+                CatalogPayload::ProfileBackgroundMaps(maps)=>{
+                    self.profile_background_maps=Some(maps);
+                }
+                CatalogPayload::ProfileBackground {map_name,image}=>{
+                    if self.profile_background_requested.as_deref()==Some(map_name.as_str()){
+                        self.profile_background_available=image.is_some();
+                        self.render_command(crate::renderer::RenderCommand::SetAssetPreviewBackground(image.map(|image|([image.size[0] as u32,image.size[1] as u32],image.rgba))));
+                    }
+                }
                 CatalogPayload::ProfileIcon { key, image } => {
                     self.ui_catalog.icons_inflight.remove(&key);
                     match image {

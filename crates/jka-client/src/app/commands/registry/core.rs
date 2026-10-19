@@ -3,6 +3,37 @@ use crate::app::{split_console_script, App, ChatMode, ConsoleCvarSetResult};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_djk_emote ["djk_emote"] ("djk_emote [list|refresh|stop|index|EID]", "Play or stop a compiled local emote; never sends a server command.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_, "stop"] => { crate::emotes::stop(); self.console_status = "Emote stopped".into(); }
+            [_, "refresh"] => { crate::emotes::stop(); crate::emotes::refresh_catalog(); self.console_status = "Emote catalog refreshed".into(); }
+            [_] | [_, "list"] => {
+                match crate::emotes::catalog(&self.base) {
+                    Ok(emotes) => self.console_status = emotes.iter().enumerate().map(|(i,e)|format!("{} {}",i+1,crate::emotes::display_title(e))).collect::<Vec<_>>().join("\n"),
+                    Err(error) => self.console_status = error,
+                }
+            }
+            [_, id] => {
+                if self.game_session.is_none() { self.console_status = "Load a game first, or preview in Profile > Emotes".into(); }
+                else {
+                    match crate::emotes::catalog(&self.base) {
+                        Ok(emotes) => match emotes.iter().enumerate().find_map(|(i,e)| {
+                            if e.id.eq_ignore_ascii_case(id) || e.catalog_aliases.iter().any(|alias|alias.eq_ignore_ascii_case(id)) || id.parse::<usize>().ok()==Some(i+1) {Some(e.clone())}
+                            else {e.variants.iter().find(|v|v.id.eq_ignore_ascii_case(id)).cloned()}
+                        }) {
+                            Some(emote) => { crate::emotes::play_world(emote); self.console_status = format!("Playing local emote {id}"); }
+                            None => self.console_status = format!("Unknown emote {id}; use djk_emote list"),
+                        },
+                        Err(error) => self.console_status = error,
+                    }
+                }
+            }
+            _ => self.console_status = "usage: djk_emote [list|refresh|stop|index|EID]".into(),
+        }
+        CommandResult::Status
+    }
+
     cmd_snd_restart ["snd_restart", ] ("snd_restart", "Restart the sound subsystem and apply current audio settings.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

@@ -322,7 +322,8 @@ pub fn tessellate(
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
-            | FxDraw::Cylinder { shader, .. } => shader,
+            | FxDraw::Cylinder { shader, .. }
+            | FxDraw::Billboard { shader, .. } => shader,
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -399,7 +400,8 @@ pub fn tessellate_workers(
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
-            | FxDraw::Cylinder { shader, .. } => shader,
+            | FxDraw::Cylinder { shader, .. }
+            | FxDraw::Billboard { shader, .. } => shader,
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -521,7 +523,8 @@ pub fn tessellate_gpu_particles(
             | FxDraw::Line { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
-            | FxDraw::Cylinder { shader, .. } => shader,
+            | FxDraw::Cylinder { shader, .. }
+            | FxDraw::Billboard { shader, .. } => shader,
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -878,6 +881,46 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
                 batch.quad_stamp(*origin, left, up, color);
             }
         }
+        FxDraw::Billboard { origin, half, rotation, uv, rgba, align, facing, ground, pivot, .. } => {
+            let color = mat.vertex_color(*rgba, view.seconds);
+            let (left, up) = match (facing, align) {
+                // Custom facing: quad in the plane perpendicular to the facing
+                // vector; long axis from the alignment, else rotation about it.
+                (Some(normal), _) => {
+                    let n = normalize(*normal);
+                    let seed = match align {
+                        Some(d) if dot(*d, n).abs() < 0.99 => *d,
+                        _ => if n[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] },
+                    };
+                    let up0 = normalize(sub(seed, scale(n, dot(seed, n))));
+                    let left0 = cross(n, up0);
+                    let (sin, cos) = if align.is_some() { (0.0, 1.0) } else { rotation.to_radians().sin_cos() };
+                    let left = add(scale(left0, cos), scale(up0, sin));
+                    let up = sub(scale(up0, cos), scale(left0, sin));
+                    (scale(left, half[0]), scale(up, half[1]))
+                }
+                (None, align) => match align {
+                // Velocity aligned: long axis along the screen-projected direction.
+                Some(direction) => {
+                    let to_view = normalize(sub(view.origin, *origin));
+                    let along = sub(*direction, scale(to_view, dot(*direction, to_view)));
+                    let up = normalize(along);
+                    let left = normalize(cross(to_view, up));
+                    (scale(left, half[0]), scale(up, half[1]))
+                }
+                None => {
+                    let (sin, cos) = rotation.to_radians().sin_cos();
+                    let (l, u) = (view.axis[1], view.axis[2]);
+                    let left = add(scale(l, cos), scale(u, sin));
+                    let up = sub(scale(u, cos), scale(l, sin));
+                    (scale(left, half[0]), scale(up, half[1]))
+                }
+                },
+            };
+            // Put the pivot UV on the particle: +left is u=0, +up is v=0.
+            let center = sub(sub(*origin, scale(left, 1.0 - 2.0 * pivot[0])), scale(up, 1.0 - 2.0 * pivot[1]));
+            billboard_quad(batch, center, left, up, *uv, color, *ground);
+        }
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
             batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, view.seconds));
@@ -967,7 +1010,7 @@ fn fx_wave(kind: jka_assets::shader::WaveFunc, phase: f32) -> f32 {
     }
 }
 
-fn modified_uv(uv: [f32; 2], position: [f32; 3], modifier: jka_assets::shader::TcMod, seconds: f32) -> [f32; 2] {
+pub(crate) fn modified_uv(uv: [f32; 2], position: [f32; 3], modifier: jka_assets::shader::TcMod, seconds: f32) -> [f32; 2] {
     use jka_assets::shader::TcMod;
     match modifier {
         TcMod::Scale(x, y) => [uv[0] * x, uv[1] * y],
@@ -998,6 +1041,48 @@ fn modified_uv(uv: [f32; 2], position: [f32; 3], modifier: jka_assets::shader::T
 }
 
 /// RB_SurfaceSprite/OrientedQuad rotation of the left/up frame.
+/// Quad corners at (+-left, +-up). With a floor height, a quad that reaches
+/// the floor is tessellated and each vertex's alpha fades with its height
+/// above it: a CPU stand-in for soft particles against the ground plane,
+/// which is where emote effects meet scene depth.
+fn billboard_quad(batch: &mut Batch, origin: [f32; 3], left: [f32; 3], up: [f32; 3], uv: [f32; 4], color: [f32; 4], ground: Option<f32>) {
+    let low = origin[2] - left[2].abs() - up[2].abs();
+    let fade = ground.map(|g| (g, (len(left).max(len(up)) * 0.6).clamp(2.0, 24.0)));
+    let Some((ground, fade)) = fade.filter(|(g, f)| low < g + f) else {
+        let v0 = batch.vertex(add(add(origin, left), up), [uv[0], uv[1]], color);
+        let v1 = batch.vertex(add(sub(origin, left), up), [uv[2], uv[1]], color);
+        let v2 = batch.vertex(sub(sub(origin, left), up), [uv[2], uv[3]], color);
+        let v3 = batch.vertex(sub(add(origin, left), up), [uv[0], uv[3]], color);
+        batch.triangle(v0, v1, v3);
+        batch.triangle(v3, v1, v2);
+        return;
+    };
+    const N: usize = 5;
+    let mut ids = [[0u32; N + 1]; N + 1];
+    for (row, line) in ids.iter_mut().enumerate() {
+        let t = row as f32 / N as f32;
+        for (col, id) in line.iter_mut().enumerate() {
+            let s = col as f32 / N as f32;
+            let p = add(add(origin, scale(left, 1.0 - 2.0 * s)), scale(up, 1.0 - 2.0 * t));
+            let k = ((p[2] - ground) / fade).clamp(0.0, 1.0);
+            let k = k * k * (3.0 - 2.0 * k);
+            let tex = [uv[0] + (uv[2] - uv[0]) * s, uv[1] + (uv[3] - uv[1]) * t];
+            *id = batch.vertex(p, tex, [color[0], color[1], color[2], color[3] * k]);
+        }
+    }
+    for row in 0..N {
+        for col in 0..N {
+            let (a, b, c, d) = (ids[row][col], ids[row][col + 1], ids[row + 1][col + 1], ids[row + 1][col]);
+            batch.triangle(a, b, d);
+            batch.triangle(d, b, c);
+        }
+    }
+}
+
+fn len(v: [f32; 3]) -> f32 {
+    dot(v, v).sqrt()
+}
+
 fn rotated_frame(left_axis: [f32; 3], up_axis: [f32; 3], radius: f32, rotation: f32) -> ([f32; 3], [f32; 3]) {
     if rotation == 0.0 {
         return (scale(left_axis, radius), scale(up_axis, radius));

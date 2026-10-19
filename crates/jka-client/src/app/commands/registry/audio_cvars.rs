@@ -2,6 +2,23 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_S_EMOTEMUSICVOLUME {
+        runtime: CvarDef::new("s_emoteMusicVolume", "0.5", "0..1", "Emote music level, independent of game effects and map music.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(format!("{:.3}", app.audio.emote_music_volume)),
+            |app, value| App::cvar_set_s_emotemusicvolume(app, APP_S_EMOTEMUSICVOLUME.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_emotemusicvolume, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| { if let Some(level)=value.parse::<f32>().ok().filter(|n|n.is_finite()){settings.emote_music_volume=level.clamp(0.,1.);} }),
+            archive: Some((389, |state| format!("{:.3}", state.audio.emote_music_volume))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_emotemusicvolume(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.emote_music_volume=Self::parse_cvar_finite(name,value)?.clamp(0.,1.);
+                self.apply_audio_mix();self.mark_config_dirty();self.publish_ui();Ok(())
+            }
+        }]
+    }
     APP_CG_AMBIENTSOUNDS {
         runtime: CvarDef::new("cg_ambientSounds", "", "0..1", "Level ambience from the map's sound sets (worldspawn soundSet and local ambient entities).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_ambientsounds(app)), |app, value| App::cvar_set_cg_ambientsounds(app, APP_CG_AMBIENTSOUNDS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_ambientsounds, None),
         config: CvarBinding {

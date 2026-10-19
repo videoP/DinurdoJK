@@ -163,6 +163,10 @@ pub struct VideoSettings {
     /// filter factor. Matches jaPRO's own default of 0.3; only active strictly
     /// between 0 and 1 (0 or >=1 disables it).
     pub ghoul2_anim_smooth: f32,
+    /// Four-frame bounded Catmull-Rom for emote body, prop and contact tracks.
+    pub emote_cubic: bool,
+    /// Baked Niagara particle effects on emotes (`cg_emoteEffects`).
+    pub emote_effects: bool,
     /// Request a 1 ms Windows multimedia timer period for timeout/sleep waits.
     /// Raw mouse events already wake the event loop independently.
     pub timer_resolution_1ms: bool,
@@ -692,6 +696,8 @@ impl Default for VideoSettings {
             model_index_upload_cache: true,
             ghoul2_batch_key_cache: true,
             ghoul2_anim_smooth: 0.3,
+            emote_cubic: true,
+            emote_effects: true,
             timer_resolution_1ms: false,
             input_latelatch: false,
             client_physics: false,

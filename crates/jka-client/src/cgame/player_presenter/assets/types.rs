@@ -168,6 +168,7 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     /// Extra procedural bones appended after GLA matrices for Source players.
     pub(in crate::cgame::player_presenter) source_jiggles: Option<Arc<Vec<jka_assets::source1_rig::SourceJiggleBinding>>>,
     pub(in crate::cgame::player_presenter) source_jiggles_enabled: bool,
+    pub(in crate::cgame::player_presenter) emote_contacts: std::sync::OnceLock<Vec<GroundMarker>>,
     /// `players/_humanoid/` skeletons use the normal multiplayer animation/angle
     /// path.  Creature skeletons use the model-local tables cached below.
     pub(in crate::cgame::player_presenter) humanoid: bool,
@@ -187,6 +188,48 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
 }
 
 impl PlayerModelAsset {
+    /// Never fails the frame: a correction that cannot be computed or is out
+    /// of range leaves the pose as authored and is reported once per emote.
+    pub(in crate::cgame::player_presenter) fn correct_emote_ground(&self,active:&crate::emotes::Preview,pose:&mut [crate::cgame::player_presenter::Matrix3x4])->Result<(),String>{
+        if let Err(error)=self.try_correct_emote_ground(active,pose){
+            EMOTE_GROUND_SHIFT_MAX.fetch_max(f32::INFINITY.to_bits(),std::sync::atomic::Ordering::Relaxed);
+            static REPORTED:std::sync::Mutex<Option<std::collections::HashSet<String>>>=std::sync::Mutex::new(None);
+            if REPORTED.lock().map(|mut r|r.get_or_insert_with(Default::default).insert(active.emote.id.clone())).unwrap_or(false){
+                println!("Emote {}: {error}; drawing it without ground correction",active.emote.id);
+            }
+        }
+        Ok(())
+    }
+    fn try_correct_emote_ground(&self,active:&crate::emotes::Preview,pose:&mut [crate::cgame::player_presenter::Matrix3x4])->Result<(),String>{
+        // Stock/native GLMs already use their compiled ground calibration.
+        // Source anatomical pivots need a final correction on the actual mesh.
+        if self.source_native_pivots.is_none(){return Ok(())}
+        let Some(clip)=&active.emote.contact_pose else{return Ok(())};
+        let loop_start=active.emote.loop_start_frame.map(|n|(n-active.emote.first_frame).max(0) as usize).or(active.emote.looping.then_some(0));
+        let height=clip.sample_unrooted_interpolated(active.elapsed_ms,active.emote.fps,loop_start,crate::emotes::interpolation())[0][2][3];
+        let markers=self.emote_contacts.get_or_init(||{
+            let contact=|mut bone:usize|->bool{
+                for _ in 0..self.gla.skeleton.len(){
+                    let Some(b)=self.gla.skeleton.get(bone) else{return false};
+                    if ["ltalus","rtalus","lhand","rhand"].iter().any(|n|b.name.eq_ignore_ascii_case(n)){return true}
+                    let Ok(parent)=usize::try_from(b.parent) else{return false};bone=parent;
+                }false
+            };
+            self.glm.lods.first().into_iter().flat_map(|lod|&lod.surfaces).filter(|surface|self.surfaces.iter().any(|s|s.surface_index==surface.surface_index)).flat_map(|surface|surface.vertices.iter().filter_map(|vertex|{
+                let weights=vertex.weights.iter().filter_map(|w|surface.bone_references.get(w.local_bone_index).map(|&b|(b,w.weight))).collect::<Vec<_>>();
+                (weights.iter().filter(|(b,_)|contact(*b)).map(|(_,w)|w).sum::<f32>()>0.5).then(||GroundMarker{position:vertex.position,weights})
+            })).collect()
+        });
+        ground_source_emote(markers,pose,height)
+    }
+    /// Bind an emote's rig to this mesh, retaining native JK2 digit references.
+    pub(in crate::cgame::player_presenter) fn bind_external_pose(
+        &self, source: &Arc<GlaAnimation>, mut pose: Vec<crate::cgame::player_presenter::Matrix3x4>,
+    ) -> Result<Vec<crate::cgame::player_presenter::Matrix3x4>, String> {
+        let plan = crate::emotes::pose_plan(source, &self.gla)?;
+        pose = plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose))?;
+        self.bind_mesh_pose(pose)
+    }
     pub(in crate::cgame::player_presenter) fn shares_mesh_pose_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.gla, &other.gla)
             && self.source_jiggles_enabled == other.source_jiggles_enabled
@@ -239,6 +282,35 @@ impl PlayerModelAsset {
             }
         }
         Ok(pose)
+    }
+}
+
+/// Largest |ground correction| applied since the last reset (f32 bits;
+/// infinity when one failed). Read and reset by `emote_gallery` per emote.
+pub(crate) static EMOTE_GROUND_SHIFT_MAX:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);
+
+pub(in crate::cgame::player_presenter) struct GroundMarker {pub position:[f32;3],pub weights:Vec<(usize,f32)>}
+fn ground_source_emote(markers:&[GroundMarker],pose:&mut [crate::cgame::player_presenter::Matrix3x4],height:f32)->Result<(),String>{
+    if markers.is_empty(){return Ok(())}
+    let mut floor=f32::INFINITY;
+    for marker in markers {
+        let mut z=0.;for &(bone,weight) in &marker.weights{let m=pose.get(bone).ok_or("ground marker outside model pose")?;z+=weight*(m[2][0]*marker.position[0]+m[2][1]*marker.position[1]+m[2][2]*marker.position[2]+m[2][3]);}
+        floor=floor.min(z);
+    }
+    let shift=-24.+height-floor;
+    if !shift.is_finite()||shift.abs()>256.{return Err(format!("Source emote ground correction outside supported range ({shift:.0})"))}
+    // Non-negative f32 bits order like the values (emote_gallery reads this).
+    EMOTE_GROUND_SHIFT_MAX.fetch_max(shift.abs().to_bits(),std::sync::atomic::Ordering::Relaxed);
+    for m in pose{m[2][3]+=shift;}Ok(())
+}
+
+#[cfg(test)]mod emote_ground_tests{
+    use super::*;
+    #[test]fn source_grounding_preserves_jumps_and_moves_all_attachments_together(){
+        let marker=GroundMarker{position:[0.,0.,0.],weights:vec![(0,1.)]};
+        let identity=[[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,6.]];
+        let mut pose=[identity,identity];ground_source_emote(&[marker],&mut pose,10.).unwrap();
+        assert_eq!(pose[0][2][3],-14.);assert_eq!(pose[1][2][3],-14.);
     }
 }
 

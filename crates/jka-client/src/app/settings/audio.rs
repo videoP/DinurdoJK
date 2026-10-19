@@ -52,12 +52,19 @@ impl App {
     pub(in crate::app) fn apply_audio_mix(&mut self) {
         let (effects, voice, separation) = self.effective_audio_mix();
         let music = self.effective_music_volume();
+        let emote_music = self.effective_emote_music_volume();
         if let Some(playback) = &mut self.game_session {
             if let Some(sound) = &mut playback.sound_presenter {
                 sound.set_mix(effects, voice, separation);
                 sound.set_music_volume(music);
+                sound.set_emote_music_volume(emote_music);
             }
         }
+        if let Some(sound) = &mut self.menu_emote_sound { sound.set_emote_music_volume(emote_music); }
+    }
+
+    pub(in crate::app) fn effective_emote_music_volume(&self) -> f32 {
+        if self.audio.mute_when_unfocused && !self.window_focused { 0. } else { self.audio.emote_music_volume }
     }
 
     /// TaystJK/OpenJK `snd_restart`: reopen the physical audio subsystem and

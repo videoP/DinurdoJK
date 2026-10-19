@@ -237,6 +237,7 @@ pub struct AudioSettings {
     pub effects_volume: f32,
     pub voice_volume: f32,
     pub music_volume: f32,
+    pub emote_music_volume: f32,
     pub separation: f32,
     pub mute_when_unfocused: bool,
     /// Master gate for Valve Steam Audio integration. Off preserves the legacy
@@ -260,6 +261,7 @@ impl Default for AudioSettings {
             effects_volume: 0.5,
             voice_volume: 1.0,
             music_volume: 0.25,
+            emote_music_volume: 0.5,
             separation: 0.5,
             mute_when_unfocused: true,
             steam_audio: false,
@@ -1291,6 +1293,7 @@ mod tests {
         settings.ghoul2_lod_bias = 2;
         settings.ghoul2_batch_draws = Ghoul2BatchMode::Force;
         settings.ghoul2_anim_smooth = 0.3;
+        settings.emote_cubic = false;
 
         let dir = std::env::temp_dir().join(format!(
             "jka-ghoul2-cfg-{}-{:?}",
@@ -1316,11 +1319,13 @@ mod tests {
         assert_eq!(loaded.ghoul2_lod_bias, 2);
         assert_eq!(loaded.ghoul2_batch_draws, Ghoul2BatchMode::Force);
         assert_eq!(loaded.ghoul2_anim_smooth, 0.3);
+        assert!(!loaded.emote_cubic);
         assert!(text.contains("seta r_ghoul2Skinning \"workers\""));
         assert!(text.contains("seta r_ghoul2EarlyCull \"0\""));
         assert!(text.contains("seta r_lodbias \"2\""));
         assert!(text.contains("seta r_ghoul2BatchDraws \"2\""));
         assert!(text.contains("seta r_ghoul2AnimSmooth \"0.3\""));
+        assert!(text.contains("seta cg_emoteCubic \"0\""));
     }
 
     #[test]

@@ -118,12 +118,14 @@ impl PlayerPresenter {
             }
             if let Some(model) = flag_model(bit, gametype, self.viewer_style.japro) {
                 self.cosmetic_draws.push(CosmeticDraw {
+                    face_camera: None,
                     entity_num: entity.number,
                     model: model.to_owned(),
                     origin,
                     axis,
                     rgba: [1.0, 1.0, 1.0, alpha],
                     custom_shader: None,
+                    skin_pose:None,
                 });
             }
         }

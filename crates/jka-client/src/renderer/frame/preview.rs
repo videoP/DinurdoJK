@@ -24,6 +24,9 @@ impl Renderer {
             .min(full_height.saturating_sub(viewport[1]))
             .max(1);
         let view_proj = camera.view_projection(viewport[2], viewport[3]);
+        if let Some(background)=&mut self.asset_preview_background{
+            background.prepare(&self.device,&self.queue,self.config.format,self.msaa_samples,[viewport[2],viewport[3]]);
+        }
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos_time: [
@@ -98,6 +101,7 @@ impl Renderer {
         info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
         let surface_view = self.surface_texture_view(&frame);
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
+        let mut screenshot_readback=self.prepare_screenshot_readback();
 
         let encode_started = Instant::now();
         let mut encoder = self
@@ -144,6 +148,7 @@ impl Renderer {
                     1.0,
                 );
                 pass.set_scissor_rect(viewport[0], viewport[1], viewport[2], viewport[3]);
+                if let Some(background)=&self.asset_preview_background{background.draw(&mut pass);}
                 self.dynamic_model_renderer
                     .draw(&mut pass, &self.camera_bind_group);
             }
@@ -158,8 +163,10 @@ impl Renderer {
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
         if let Some(output) = &self.hdr_output {
-            output.submit(&self.device, &self.queue, &surface_view, false);
+            output.submit(&self.device, &self.queue, &surface_view, screenshot_readback.is_some());
         }
+        // After the HDR output pass: its capture texture holds the final image.
+        if let Some(readback)=&mut screenshot_readback{self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture),readback);}
         self.window.pre_present_notify();
         self.queue.present(frame);
         let present_completed_at = Instant::now();
@@ -173,6 +180,7 @@ impl Renderer {
             .as_secs_f64()
             * 1000.0;
         info.present_call_completed_at = Some(present_completed_at);
+        if let Some(readback)=screenshot_readback{self.finish_screenshot_readback(readback);}
         info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         Ok(info)
     }

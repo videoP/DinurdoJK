@@ -69,6 +69,12 @@ impl App {
             music_volume,
             "s_musicvolume"
         );
+        audio_slider!(
+            "Emote music",
+            "s_emoteMusicVolume. Emote songs in game and Profile, independent of game effects and map music.",
+            emote_music_volume,
+            "s_emoteMusicVolume"
+        );
         theme::row(
             ui,
             "Mute when unfocused",

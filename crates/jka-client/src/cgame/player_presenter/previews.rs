@@ -34,6 +34,21 @@ impl PlayerPresenter {
         )
     }
 
+    pub(in crate::cgame::player_presenter) fn load_emote_gla(
+        &mut self, qpath: &str,
+    ) -> Result<Arc<jka_assets::ghoul2::GlaAnimation>, String> {
+        let cell = {
+            let mut cache = self.load_shared.glas.lock()
+                .map_err(|_| "Ghoul2 animation cache poisoned".to_owned())?;
+            Arc::clone(cache.entry(qpath.to_ascii_lowercase()).or_default())
+        };
+        cell.get_or_init(|| {
+            if let Some(bytes) = crate::emotes::read_asset(qpath, jka_emotes::MAX_MEMBER_BYTES)? {
+                jka_assets::ghoul2::parse_gla(&bytes).map(Arc::new)
+            } else { self.load_glm_animation(qpath) }
+        }).clone()
+    }
+
     /// `TurretClientRun` from TaystJK. This is deliberately separate from
     /// `present_static_glm`: the pickup remains a static registration while
     /// deployed (bolt1) ET_GENERAL entities animate on their own clock.
@@ -189,12 +204,28 @@ impl PlayerPresenter {
         // authored cervical/cranium Ghoul2 look bones.
         head_look: [f32; 2],
         studio_cinematic: bool,
+        // A menu emote is a presentation-only override, never an entityState
+        // animation: the playing preview, or a scrubbed one (emote_gallery).
+        emote_preview: Option<crate::emotes::Preview>,
     ) -> Result<(Vec<DynamicModelSurface>, [Option<[f32; 3]>; 7]), String> {
         // This presentation route doesn't call present_snapshot_players, which
         // normally advances the stage clock. The async jiggle worker needs a
         // monotonically advancing preview timeline to integrate the walk pose.
         self.stage_time_ms = current_time.max(0);
         let model = self.load_model(info)?;
+        // Cache converted GLAs through the existing asset loader.
+        let emote_gla = if let Some(active) = emote_preview.as_ref() {
+            let clip = self.load_emote_gla(&active.emote.gla)?;
+            crate::emotes::pose_plan(&clip, &model.gla)?;
+            if active.emote.end_frame as usize > active.emote.pose.as_ref().map_or(clip.num_frames, |p| p.frames) {
+                return Err(format!("emote {} ends at frame {}, GLA has {} frames",
+                    active.emote.id, active.emote.end_frame, clip.num_frames));
+            }
+            Some(clip)
+        } else {
+            None
+        };
+        let playback_gla = emote_gla.as_ref().unwrap_or(&model.animation_gla);
         let animation_number = animation_index(animation_name)
             .ok_or_else(|| format!("missing animation table entry {animation_name}"))?
             as i32;
@@ -224,49 +255,61 @@ impl PlayerPresenter {
         } else {
             BONE_ANIM_OVERRIDE_FREEZE
         };
-
-        let mut animator = Ghoul2Animator::new(&model.animation_gla);
-        // CG_Player uses model_root for legs and lower_lumbar for torso. For a
-        // full-body menu stand both use the same authored animation; Motion is
-        // updated too, matching the same-animation branch in CG_PlayerAnimation.
-        for bone in ["model_root", "lower_lumbar", "Motion"] {
-            if Ghoul2Animator::bone_index(&model.animation_gla, bone).is_some() {
-                animator.set_bone_anim(
-                    &model.animation_gla,
-                    bone,
-                    first_frame,
-                    last_frame,
-                    flags,
-                    anim_speed,
-                    0,
-                    None,
-                    0,
-                )?;
-            }
-        }
-        // The same cranium/cervical postmult conventions as OpenJK
-        // BG_G2PlayerAngles (POSITIVE_X, NEGATIVE_Y, NEGATIVE_Z). Apply before
-        // pose evaluation, so hats, sabers and the entire model stay coherent.
-        let pitch = (head_look[1] * 15.0).clamp(-15.0, 15.0);
-        let yaw = (head_look[0] * 24.0).clamp(-24.0, 24.0);
-        for (bone, weight) in [("cervical", 0.34), ("cranium", 0.66)] {
-            if Ghoul2Animator::bone_index(&model.animation_gla, bone).is_some() {
-                animator.set_bone_angles_postmult(
-                    &model.animation_gla, bone, [pitch * weight, yaw * weight, 0.0],
-                    jka_movement::G2_POSITIVE_X,
-                    jka_movement::G2_NEGATIVE_Y,
-                    jka_movement::G2_NEGATIVE_Z,
-                )?;
-            }
-        }
+        let baked_pose = emote_preview.as_ref().and_then(|active|
+            active.emote.pose.as_ref().map(|clip|crate::emotes::sample_body(clip,active)));
+        let (first_frame, last_frame, flags, anim_speed, pose_time) =
+            if let Some(active) = emote_preview.as_ref() {
+                let spec = &active.emote;
+                (spec.first_frame, spec.end_frame,
+                    if spec.looping { BONE_ANIM_OVERRIDE_LOOP } else { BONE_ANIM_OVERRIDE_FREEZE },
+                    spec.fps / 20.0, active.elapsed_ms)
+            } else {
+                (first_frame, last_frame, flags, anim_speed, current_time.max(0))
+            };
         let pose_started = Instant::now();
-        // Feed Ghoul2's actual fractional-frame interpolation to the optional
-        // jaPRO SmoothLow filter, exactly as live player presentation does.
-        // Smooth the *animation* skeleton before Source/JKA mesh retargeting;
-        // native Source jigglebones can still apply their own secondary motion.
-        let mut animation_pose =
-            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time.max(0))?;
-        if self.ghoul2_anim_smooth > 0.0 && self.ghoul2_anim_smooth < 1.0 {
+        // Compact bundles use the GLA only as a skeleton. Their frame ranges
+        // belong to animation.pose, so never register them on the one-frame GLA.
+        let mut animation_pose = match baked_pose {
+            Some(pose) => pose,
+            None => {
+                let mut animator = Ghoul2Animator::new(playback_gla);
+                // CG_Player uses model_root for legs and lower_lumbar for torso. For a
+                // full-body menu stand both use the same authored animation; Motion is
+                // updated too, matching the same-animation branch in CG_PlayerAnimation.
+                for bone in ["model_root", "lower_lumbar", "Motion"] {
+                    if Ghoul2Animator::bone_index(playback_gla, bone).is_some() {
+                        animator.set_bone_anim(
+                            playback_gla,
+                            bone,
+                            first_frame,
+                            last_frame,
+                            flags,
+                            anim_speed,
+                            0,
+                            None,
+                            0,
+                        )?;
+                    }
+                }
+                // The same cranium/cervical postmult conventions as OpenJK
+                // BG_G2PlayerAngles (POSITIVE_X, NEGATIVE_Y, NEGATIVE_Z). Apply before
+                // pose evaluation, so hats, sabers and the entire model stay coherent.
+                let pitch = (head_look[1] * 15.0).clamp(-15.0, 15.0);
+                let yaw = (head_look[0] * 24.0).clamp(-24.0, 24.0);
+                for (bone, weight) in [("cervical", 0.34), ("cranium", 0.66)] {
+                    if Ghoul2Animator::bone_index(playback_gla, bone).is_some() {
+                        animator.set_bone_angles_postmult(
+                            playback_gla, bone, [pitch * weight, yaw * weight, 0.0],
+                            jka_movement::G2_POSITIVE_X,
+                            jka_movement::G2_NEGATIVE_Y,
+                            jka_movement::G2_NEGATIVE_Z,
+                        )?;
+                    }
+                }
+                animator.evaluate_pose_openjk_root(playback_gla, pose_time)?
+            }
+        };
+        if emote_preview.is_none() && self.ghoul2_anim_smooth > 0.0 && self.ghoul2_anim_smooth < 1.0 {
             const MAX_HISTORY_GAP_MS: i32 = 250;
             if let Some((old_model, old_animation, old_time, previous)) =
                 self.profile_bone_smooth_history.as_ref()
@@ -290,7 +333,11 @@ impl PlayerPresenter {
         } else {
             self.profile_bone_smooth_history = None;
         }
-        let mut pose = model.bind_animation_pose(animation_pose)?;
+        let mut pose = if emote_preview.is_some() {
+            model.bind_external_pose(playback_gla, animation_pose)?
+        } else {
+            model.bind_animation_pose(animation_pose)?
+        };
         if model.source_jiggles_enabled {
             if let Some(bindings) = model.source_jiggles.as_deref() {
                 self.preview_source_jiggles
@@ -299,6 +346,14 @@ impl PlayerPresenter {
                     .update(bindings, model.gla.skeleton.len(), &mut pose,
                             axis, origin, current_time);
             }
+        }
+        if let Some(active)=emote_preview.as_ref(){model.correct_emote_ground(active,&mut pose)?;}
+        if let Some(active)=emote_preview.as_ref(){
+            self.cosmetic_draws.extend(Self::emote_prop_draws(active,&model,&pose,axis,origin,0));
+            let mut fx=Self::emote_effect_frame(active,&model,&pose,axis,origin,0);
+            self.cosmetic_draws.append(&mut fx.meshes);
+            self.emote_fx.draws.append(&mut fx.draws);
+            self.emote_fx.lights.append(&mut fx.lights);
         }
         // The UI anchors use the *same animated Ghoul2 pose* as skinning,
         // including cursor-driven cranium/cervical edits and model yaw.

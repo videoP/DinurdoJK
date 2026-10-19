@@ -44,6 +44,7 @@ pub fn apply_profile_studio_light(draws: &mut [DynamicModelSurface], cinematic: 
     // Opposite the front key, slightly elevated to pick out silhouette edges.
     let back_direction = Vec3::new(0.25, -0.90, 0.38).normalize();
     for surface in draws {
+        if surface.authored_glow && surface.lighting_origin.is_none() { continue; }
         let vertices = Arc::make_mut(&mut surface.vertices);
         for vertex in vertices.iter_mut() {
             let normal = Vec3::from_array(vertex.normal).normalize_or_zero();
@@ -116,12 +117,14 @@ pub(in crate::cgame::player_presenter) fn cosmetic_draws_for_mask(
             *value -= 2.0 * up;
         }
         out.push(CosmeticDraw {
+            face_camera: None,
             entity_num,
             model: cosmetic.model.to_owned(),
             origin: position,
             axis: columns,
             rgba,
             custom_shader,
+            skin_pose: None,
         });
     }
     out
@@ -160,8 +163,9 @@ pub(in crate::cgame::player_presenter) fn global_cosmetic_draw(
     let mut position = transform_jka_model_point([m[0][3], m[1][3], m[2][3]], axis, origin);
     for i in 0..3 { position[i] = position[i] - 2.0 * columns[2][i] + offset[i]; }
     Some(CosmeticDraw {
+            face_camera: None,
         entity_num, model: path, origin: position, axis: columns,
-        rgba: [1.0, 1.0, 1.0, alpha], custom_shader,
+        rgba: [1.0, 1.0, 1.0, alpha], custom_shader,skin_pose:None,
     })
 }
 

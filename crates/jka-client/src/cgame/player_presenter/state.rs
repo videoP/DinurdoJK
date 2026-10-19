@@ -211,6 +211,7 @@ impl PlayerPresenter {
             saber_staff_multi_color: false,
             duel_shell_gray: None,
             cosmetic_draws: Vec::new(),
+            emote_fx: Default::default(),
             local_cosmetics: 0,
             local_global_hat: String::new(),
             local_global_cape: String::new(),
@@ -417,6 +418,13 @@ impl PlayerPresenter {
     /// entity presenter owns MD3 loading, so the app forwards these to it.
     pub fn drain_cosmetic_draws(&mut self) -> Vec<CosmeticDraw> {
         std::mem::take(&mut self.cosmetic_draws)
+    }
+
+    /// Baked emote particle sprites/ribbons and lights produced since the
+    /// last call. Mesh particles are already in the cosmetic draws.
+    pub fn drain_emote_fx(&mut self) -> (Vec<crate::fx::system::FxDraw>, Vec<crate::fx::system::FxLight>) {
+        let frame = std::mem::take(&mut self.emote_fx);
+        (frame.draws, frame.lights)
     }
 
     /// The viewer's own `cp_cosmetics` in a local game, where there is no server

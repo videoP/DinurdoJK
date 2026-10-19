@@ -975,6 +975,7 @@ fn build_character_model(
         source_native_pivots: body_shape_pivots,
         source_jiggles: None,
         source_jiggles_enabled: false,
+        emote_contacts: Default::default(),
         humanoid,
         animations,
         anim_events,

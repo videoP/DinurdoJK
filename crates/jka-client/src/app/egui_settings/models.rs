@@ -10,6 +10,14 @@ impl App {
             "MODELS",
             "Map props and model detail.",
         );
+        theme::row(ui,"Smooth emotes","Four-frame cubic interpolation for emote body, props and grounding at render rate (including 60 FPS and above). Keeps authored timing and audio; disable to use linear interpolation.",theme::Reset::None,|ui|{
+            let mut enabled=self.video.emote_cubic;
+            if ui.checkbox(&mut enabled,"Enabled").changed(){let _=self.set_console_cvar("cg_emoteCubic",if enabled{"1"}else{"0"});}
+        });
+        theme::row(ui,"Emote effects","Particles, smoke, sparkles, mesh debris and lights compiled offline from each emote's Niagara systems and played back with the animation clock.",theme::Reset::None,|ui|{
+            let mut enabled=self.video.emote_effects;
+            if ui.checkbox(&mut enabled,"Enabled").changed(){let _=self.set_console_cvar("cg_emoteEffects",if enabled{"1"}else{"0"});}
+        });
         self.egui_toggle_row(
             ui,
             "Map models",

@@ -81,6 +81,7 @@ use session::types::{
 mod background_jobs;
 mod companion;
 mod egui_dev_radial;
+mod emote_wheel;
 mod egui_model_placement;
 mod map_mod_ent;
 mod egui_emote_radial;
@@ -311,6 +312,9 @@ pub struct App {
     /// The next `devmap` keeps the menu look (set by `menudevmap`).
     menu_look_oneshot: bool,
     asset_preview_viewport_key: Option<[u32; 4]>,
+    profile_background_requested: Option<String>,
+    profile_background_available: bool,
+    profile_background_maps: Option<Vec<String>>,
     profile_models: Vec<ProfileModelEntry>,
     profile_sabers: Vec<ProfileSaberEntry>,
     profile_catalog_loaded: bool,
@@ -539,6 +543,7 @@ pub struct App {
     /// `+command` lines from the command line, run after the first frame.
     startup_commands: Vec<String>,
     audio: config::AudioSettings,
+    menu_emote_sound: Option<crate::cgame::sound_presenter::SoundPresenter>,
     window_focused: bool,
     pending_frontend_map_launch: bool,
     /// Request id of the passive map currently being prepared for the main menu.
@@ -674,6 +679,7 @@ pub struct App {
     previous_tick: Instant,
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
+    emote_wheel: emote_wheel::EmoteWheel,
     /// Shared by the mutually exclusive `/dev` and `/emote` wheels.
     dev_radial_return_overlay: OverlayMode,
     /// Virtual relative mouse stick for both wheels (not gameplay sensitivity).

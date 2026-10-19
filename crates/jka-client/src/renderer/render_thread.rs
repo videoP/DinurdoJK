@@ -1658,6 +1658,12 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetAssetPreviewViewport(viewport)) => {
                         renderer.asset_preview_viewport = viewport;
                     }
+                    Ok(RenderCommand::SetAssetPreviewBackground(image))=>{
+                        renderer.asset_preview_background=image.and_then(|(size,rgba)|
+                            match super::frame::preview_background::PreviewBackground::new(&renderer.device,&renderer.queue,renderer.config.format,renderer.msaa_samples,size,&rgba){
+                                Ok(background)=>Some(background),Err(error)=>{eprintln!("Profile background: {error}");None}
+                            });
+                    }
                     Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
                     Ok(RenderCommand::GrowInlineInstances { map }) => {
                         renderer.load_map(*map);

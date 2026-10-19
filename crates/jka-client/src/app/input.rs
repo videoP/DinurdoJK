@@ -67,6 +67,7 @@ impl App {
     /// use this same initialization; studio/old tab names are command aliases.
     pub(in crate::app) fn open_profile_studio(&mut self, tab: Option<&str>) {
         self.profile_selected_section = match tab {
+            Some("emotes") => 5,
             Some("force") => 2,
             Some("visibility") | Some("cosmetics") => 4,
             _ => 1, // Look includes sabers and the player name.
@@ -88,6 +89,8 @@ impl App {
         // not while clicking tiles, switching Profile sections, or pressing APPLY.
         // This route is shared by ESC, Back, top-level tabs, and uipage.
         if !active {
+            crate::emotes::stop();
+            self.menu_emote_sound = None;
             if let Some(model) = self.profile_model_staged.take() {
                 if !model.eq_ignore_ascii_case(&self.solo_client_info.model_cvar()) {
                     if let Err(error) = self.set_console_cvar("model", &model) {

@@ -92,6 +92,10 @@ impl App {
         self.prepared_map_cache = None;
         self.stringed = None;
         self.ui_catalog.reset();
+        self.profile_background_maps=None;
+        self.profile_background_requested=None;
+        self.profile_background_available=false;
+        self.render_command(RenderCommand::SetAssetPreviewBackground(None));
         *self.console_map_suggest_cache.borrow_mut() = None;
         *self.console_arg_suggest_cache.borrow_mut() = None;
         self.console_file_catalog_loaded = false;

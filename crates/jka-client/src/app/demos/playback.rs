@@ -1849,6 +1849,7 @@ impl App {
             for draw in &playback.fx_draws {
                 match draw {
                     crate::fx::system::FxDraw::Sprite { .. }
+                    | crate::fx::system::FxDraw::Billboard { .. }
                     | crate::fx::system::FxDraw::SaberGlow { .. } => {
                         playback.client_perf.fx_sprites += 1
                     }

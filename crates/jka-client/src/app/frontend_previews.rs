@@ -173,6 +173,17 @@ impl App {
     }
 
     pub(in crate::app) fn update_profile_preview(&mut self) {
+        if self.game_session.is_none() {
+            let (effects,voice,separation) = self.effective_audio_mix();
+            let emote_music=self.effective_emote_music_volume();
+            if let Some(sound) = self.menu_emote_sound.as_mut() {
+                sound.set_mix(effects,voice,separation);
+                sound.set_emote_music_volume(emote_music);
+                sound.frame(crate::audio::Listener {
+                    entity:1023,origin:[0.0;3],ahead:[1.0,0.0,0.0],up:[0.0,0.0,1.0],left:[0.0,1.0,0.0],
+                }, &[], None);
+            }
+        } else { self.menu_emote_sound = None; }
         if !self.profile_preview_active {
             return;
         }
@@ -252,7 +263,8 @@ impl App {
         // Force demonstrations temporarily override walking, then return to
         // the normal looping walk without changing gameplay animations.
         let animation_name = force_animation.unwrap_or(walk_animation);
-        let with_sabers = studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17));
+        let with_sabers = (studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17)))
+            && crate::emotes::active_preview().is_none();
 
         // The Ghoul2 evaluator already interpolates between authored GLA frames.
         // Feed it continuous millisecond time: rounding the preview clock to
@@ -274,7 +286,7 @@ impl App {
         let key = (
             format!(
                 "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}:{:.2}:{:.2}:{:?}",
-                animation_name,
+                format!("{animation_name}:{:?}", crate::emotes::active_preview().map(|p| p.emote.id)),
                 preview_model,
                 self.network.saber1,
                 self.network.saber2,
@@ -402,6 +414,7 @@ impl App {
                     cosmetics,
                     self.profile_studio_head_look,
                     true,
+                    crate::emotes::active_preview(),
                 )?;
                 let requests = presenter.drain_fx_requests();
                 self.profile_studio_world_anchors = anchors;
@@ -415,13 +428,34 @@ impl App {
                 .expect("profile Ghoul2 presenter initialized")
                 .drain_cosmetic_draws();
             if !worn.is_empty() {
+                // Emote props can produce attachments even with cosmetics and
+                // sabers disabled. Initialize after seeing the actual draw list.
+                self.ensure_asset_preview_entity_presenter()?;
+                self.asset_preview_entity_presenter.as_mut().ok_or("profile attachment presenter unavailable")?.set_material_eye([0.;3]);
                 let mut hats = self
                     .asset_preview_entity_presenter
                     .as_mut()
-                    .expect("profile MD3 presenter initialized")
+                    .ok_or("profile attachment presenter unavailable")?
                     .present_cosmetics(worn);
                 crate::cgame::player_presenter::apply_profile_studio_light(&mut hats, true);
                 draws.append(&mut hats);
+            }
+
+            let (emote_fx, _) = self
+                .asset_preview_player_presenter
+                .as_mut()
+                .expect("profile Ghoul2 presenter initialized")
+                .drain_emote_fx();
+            if !emote_fx.is_empty() {
+                self.ensure_asset_preview_entity_presenter()?;
+                let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
+                let presenter = self
+                    .asset_preview_entity_presenter
+                    .as_mut()
+                    .ok_or("profile effect presenter unavailable")?;
+                draws.extend(crate::fx::draw::tessellate(&emote_fx, &view, &mut |shader| {
+                    presenter.fx_material_stages(shader)
+                }));
             }
 
             if with_sabers {

@@ -812,6 +812,7 @@ struct Renderer {
     egui_pending_free: Vec<egui::TextureId>,
     asset_preview_mode: bool,
     asset_preview_viewport: Option<[u32; 4]>,
+    asset_preview_background: Option<frame::preview_background::PreviewBackground>,
     // Created only after opening a menu page that requests the live blurred/
     // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
     // compile or allocate this pass.

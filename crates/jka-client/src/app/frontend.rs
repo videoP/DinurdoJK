@@ -484,6 +484,13 @@ pub(super) fn scan_asset_viewer_assets(
     // the .shader container itself is only a filter/source label.
     let names = assets.names().map(str::to_owned).collect::<Vec<_>>();
     let mut entries = Vec::new();
+    let mut imported_names=std::collections::HashMap::<String,String>::new();
+    if let Ok(Some(asset))=assets.read("models/fnemote/index.json",SHADER_CATALOG_READ_LIMIT_BYTES){
+        if let Ok(index)=serde_json::from_slice::<serde_json::Value>(&asset.bytes){
+            for model in index["models"].as_array().into_iter().flatten(){if let (Some(path),Some(label))=(model["model"].as_str(),model["display_name"].as_str()){imported_names.insert(path.to_ascii_lowercase(),format!("Fortnite · {label}"));}}
+            for material in index["materials"].as_array().into_iter().flatten(){if let (Some(id),Some(label))=(material["id"].as_str(),material["display_name"].as_str()){let status=if material["status"]=="unsupported_graph"{" · needs graph port"}else{""};imported_names.insert(format!("models/fnemote/m_{id}"),format!("Fortnite · {label}{status}"));}}
+        }
+    }
 
     for name in names {
         let lower = name.to_ascii_lowercase();
@@ -507,12 +514,12 @@ pub(super) fn scan_asset_viewer_assets(
             match jka_assets::shader::parse(&text) {
                 Ok(parsed) => {
                     for shader_name in parsed.keys() {
-                        let display_name = shader_name
+                        let display_name = imported_names.get(&shader_name.to_ascii_lowercase()).cloned().unwrap_or_else(||shader_name
                             .rsplit('/')
                             .next()
                             .filter(|part| !part.is_empty())
                             .unwrap_or(shader_name)
-                            .to_owned();
+                            .to_owned());
                         entries.push(AssetEntry {
                             id: format!("{name}::{shader_name}"),
                             qpath: name.clone(),
@@ -541,7 +548,7 @@ pub(super) fn scan_asset_viewer_assets(
             continue;
         };
         let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
-        let display_name = if kind.is_model() && stem.eq_ignore_ascii_case("model") {
+        let display_name = if let Some(label)=imported_names.get(&lower){label.clone()}else if kind.is_model() && stem.eq_ignore_ascii_case("model") {
             folder
                 .rsplit('/')
                 .next()

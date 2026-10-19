@@ -897,6 +897,7 @@ impl GameSession {
 
         let cosmetics = self.player_presenter.drain_cosmetic_draws();
         if !cosmetics.is_empty() {
+            self.entity_presenter.set_material_eye(sphere_view_origin);
             dynamic_models.extend(self.entity_presenter.present_cosmetics(cosmetics));
         }
         // CG_DrawMiscStaticModels: client-placed map props, culled to the view.
@@ -937,6 +938,9 @@ impl GameSession {
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
         self.weapon_fx.set_fx_light_promotion_level(self.promote_fx_lights);
         let mut fx_frame = self.weapon_fx.end_frame();
+        let (emote_draws, emote_lights) = self.player_presenter.drain_emote_fx();
+        fx_frame.draws.extend(emote_draws);
+        fx_frame.lights.extend(emote_lights);
         // CG_EntityEffects runs once per presented entity on every cgame frame,
         // irrespective of the optional EFX promotion setting.
         fx_frame.lights.extend(self.presented_entities.iter().filter_map(

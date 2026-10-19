@@ -2,7 +2,7 @@
 //! No parallel model loader, invented skeleton or duplicate userinfo cvars.
 use crate::app::egui_menu::{
     theme, App, BTreeMap, ProfileModelEntry,
-    PROFILE_COSMETICS, PROFILE_FORCE, PROFILE_MODEL,
+    PROFILE_COSMETICS, PROFILE_EMOTES, PROFILE_FORCE, PROFILE_MODEL,
 };
 
 const INK: egui::Color32 = egui::Color32::from_rgb(10, 15, 23);
@@ -12,11 +12,11 @@ const EDGE: egui::Color32 = egui::Color32::from_rgb(48, 66, 86);
 const SKY: egui::Color32 = theme::ACCENT;
 const SKY_SOFT: egui::Color32 = egui::Color32::from_rgb(125, 199, 255);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(142, 162, 183);
-
-const STUDIO_NAV: [(usize, &str); 3] = [
+const STUDIO_NAV: [(usize, &str); 4] = [
     (PROFILE_MODEL, "LOOK"),
     (PROFILE_FORCE, "FORCE"),
-    (PROFILE_COSMETICS, "VISIBILITY"),
+    (PROFILE_COSMETICS, "COSMETICS"),
+    (PROFILE_EMOTES, "EMOTES"),
 ];
 
 fn label(ui: &mut egui::Ui, content: impl Into<String>, size: f32, color: egui::Color32) {
@@ -62,7 +62,7 @@ fn studio_button(ui: &mut egui::Ui, text: &str, selected: bool, primary: bool, w
 impl App {
     pub(in crate::app::egui_menu) fn egui_profile_studio(&mut self, ui: &mut egui::Ui) {
         self.ensure_profile_catalog();
-        if !matches!(self.profile_selected_section, PROFILE_MODEL | PROFILE_FORCE | PROFILE_COSMETICS) {
+        if !matches!(self.profile_selected_section, PROFILE_MODEL | PROFILE_FORCE | PROFILE_COSMETICS | PROFILE_EMOTES) {
             self.profile_selected_section = PROFILE_MODEL;
         }
         let available_w = ui.available_width();
@@ -71,7 +71,7 @@ impl App {
         ui.add_space(3.0);
         let opened = self.profile_studio_started.elapsed().as_secs_f32();
         let body_h = ui.available_height().max(320.0);
-        let controls_w = ((available_w - 14.0) * 0.335).clamp(300.0, 450.0)
+        let controls_w = if self.profile_selected_section==PROFILE_EMOTES {((available_w-14.0)*0.55).clamp(300.0,880.0)}else{((available_w - 14.0) * 0.335).clamp(300.0, 450.0)}
             .min((available_w - 190.0).max(220.0));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
@@ -98,13 +98,17 @@ impl App {
                 ui.set_min_height((height - 28.0).max(1.0));
                 // The tabs, appearance options and search never scroll. Only the
                 // model library owns a ScrollArea, within its remaining height.
-                let nav_w = (ui.available_width() - 12.0) / 3.0;
+                let nav_w = (ui.available_width() - 18.0) / 4.0;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for (section, title) in STUDIO_NAV {
                         if studio_button(ui, title, self.profile_selected_section == section, false, nav_w) {
                             self.profile_selected_section = section;
                             self.profile_preview_key = None;
+                            if section != PROFILE_EMOTES {
+                                crate::emotes::stop();
+                                self.studio_emote_audio(None);
+                            }
                         }
                     }
                 });
@@ -116,8 +120,10 @@ impl App {
                             .max_height((height - 125.0).max(150.0)).show(ui, |ui| self.egui_profile_force(ui));
                     }
                     PROFILE_COSMETICS => self.studio_visibility(ui),
+                    PROFILE_EMOTES => self.studio_emotes(ui, (height - 151.0).max(140.0)),
                     _ => {}
                 }
+                if self.profile_selected_section!=PROFILE_EMOTES {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -125,6 +131,7 @@ impl App {
                 if studio_button(ui, if pending { "APPLY CHANGES" } else { "APPLIED ✓" },
                     pending, pending, (ui.available_width() * 0.6).max(125.0)) && pending {
                     self.apply_profile_changes();
+                }
                 }
             });
     }
@@ -778,6 +785,13 @@ impl App {
             egui::Align2::LEFT_BOTTOM, model_name.to_ascii_uppercase(),
             egui::FontId::proportional(19.0), theme::TEXT);
 
+        // Keep the animated stage interactive; character editors belong to
+        // their dedicated tabs and never cover the emote preview.
+        if self.profile_selected_section==PROFILE_EMOTES {
+            self.profile_studio_cosmetic_group=0;
+            return;
+        }
+
         // Name editing lives in the stage header, not a separate navigation tab.
         let name_area = egui::Rect::from_min_size(frame.left_top() + egui::vec2(17.0, 13.0),
             egui::vec2(235.0, 58.0));
@@ -820,6 +834,7 @@ impl App {
         // Callout positions remain legible. Their connector endpoints come
         // exclusively from animated Ghoul2 bolt matrices, projected through
         // the same preview camera used by WGPU (never hardcoded stage percents).
+        if self.profile_selected_section==PROFILE_COSMETICS {
         for (title, bx, by, group, joint) in [
             ("HEADWEAR", 0.19, 0.25, 1u8, 0usize),
             ("FACE", 0.19, 0.35, 2u8, 1usize),
@@ -881,6 +896,7 @@ impl App {
             });
         }
 
+        }
         // Both floating saber controls are full editors. Their connector
         // endpoints track the currently evaluated left/right hand tags.
         for (hand, fx, joint) in [(0usize, 0.055f32, 3usize), (1, 0.70, 4)] {
@@ -901,7 +917,7 @@ impl App {
                     .show(ui, |ui| self.studio_saber_editor(ui, hand));
             });
         }
-        if self.profile_studio_cosmetic_group != 0 {
+        if self.profile_selected_section==PROFILE_COSMETICS && self.profile_studio_cosmetic_group != 0 {
             let group=self.profile_studio_cosmetic_group;
             let title=match group {1=>"Headwear",2=>"Face",_=>"Back & capes"};
             // Keep popover within the viewport, not over the main navigation.
@@ -935,6 +951,24 @@ impl App {
             if !open {self.profile_studio_cosmetic_group=0;}
         }
     }
+
+    /// Emote sounds reuse the active CGame SoundPresenter and its Steam Audio
+    /// HRTF/positional settings. Only the local player may own this channel.
+    pub(in crate::app::egui_menu) fn studio_emote_audio(&mut self, _sound: Option<&str>) {
+        if let Some(session) = self.game_session.as_mut() {
+            let entity = session.presented_player_state.as_ref()
+                .and_then(|state| state.field_i32("clientNum"))
+                .and_then(|id| u16::try_from(id).ok());
+            let source = entity.zip(session.player_position.map(|pos| pos.to_array()));
+            if let Some(audio) = session.sound_presenter.as_mut() {
+                audio.stop_emote_sound(None, None);
+                if let Some(entity) = entity { audio.stop_emote_sound(Some(entity), None); }
+                // Audio starts from SoundPresenter::frame according to the notify clock.
+                let _ = source;
+            }
+        }
+    }
+
 
 }
 
