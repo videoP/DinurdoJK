@@ -161,7 +161,7 @@ fn compact_emote_renders_in_profile_and_world() {
                 }
                 for time in [1000, 1100] {
                     let draws = if world {
-                        presenter.present_player_entity(&entity, &info, time, 1., None, false, true, false, None)
+                        presenter.present_player_entity(&entity, &info, time, 1., None, false, true, false, None, true)
                             .unwrap_or_else(|err| panic!("world {id}/{}: {err}", variant.variant_name))
                     } else {
                         presenter.present_profile_player_preview(&info, [0.; 3], axis, time,
@@ -189,8 +189,8 @@ fn compact_emote_renders_in_profile_and_world() {
     other_clip.num_frames+=2;
     runtime.animation.animator.set_bone_anim(&other_clip,"model_root",first,first+2,
         BONE_ANIM_OVERRIDE_LOOP,1.,1300,None,0).unwrap();
-    assert!(presenter.present_player_entity(&entity, &info, 1300, 1., None, false, true, false, None).unwrap().is_empty());
-    assert!(!presenter.present_player_entity(&entity, &info, 1400, 1., None, false, true, false, None).unwrap().is_empty());
+    assert!(presenter.present_player_entity(&entity, &info, 1300, 1., None, false, true, false, None, true).unwrap().is_empty());
+    assert!(!presenter.present_player_entity(&entity, &info, 1400, 1., None, false, true, false, None, true).unwrap().is_empty());
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
     let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &animation).unwrap();
     assert!(Arc::ptr_eq(&mesh, &animation));
     assert!(plan.is_none());
-    let model = PlayerModelAsset {
+    let mut model = PlayerModelAsset {
         body_shape_available: false,
         body_shape_binding: None,
         key: "test".into(), glm: Arc::new(glm.clone()), gla: mesh,
@@ -224,6 +224,19 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
     assert_eq!(bound, expected);
     assert_eq!(bound.as_ptr(), allocation, "stock path must reuse its existing pose allocation");
     assert_eq!(super::submission::mesh::gpu_bones_from_pose(&bound).len(), 53);
+
+    // An emote must retain the extra Source palette just like locomotion.
+    // Omitting it leaves weighted hair/accessory vertices without matrices.
+    let parent = Ghoul2Animator::bone_index(&model.gla, "cranium").unwrap();
+    model.source_jiggles = Some(Arc::new(vec![jka_assets::source1_rig::SourceJiggleBinding {
+        name: "test_hair".into(), parent_gla: parent, parent_jiggle: None,
+        rest_frame: expected[parent], length: 1.0,
+        parameters: jka_assets::source1::SourceJiggleParams { flags: 0, length: 0.0, tip_mass: 0.0, yaw_stiffness: 0.0, yaw_damping: 0.0, pitch_stiffness: 0.0, pitch_damping: 0.0, along_stiffness: 0.0, along_damping: 0.0, angle_limit: 0.0, min_yaw: 0.0, max_yaw: 0.0, yaw_friction: 0.0, yaw_bounce: 0.0, min_pitch: 0.0, max_pitch: 0.0, pitch_friction: 0.0, pitch_bounce: 0.0, base_mass: 0.0, base_stiffness: 0.0, base_damping: 0.0, base_min_left: 0.0, base_max_left: 0.0, base_left_friction: 0.0, base_min_up: 0.0, base_max_up: 0.0, base_up_friction: 0.0, base_min_forward: 0.0, base_max_forward: 0.0, base_forward_friction: 0.0, boing_impact_speed: 0.0, boing_impact_angle: 0.0, boing_damping_rate: 0.0, boing_frequency: 0.0, boing_amplitude: 0.0 },
+    }]));
+    let emote_pose = model.bind_external_pose(&animation, expected.clone()).unwrap();
+    assert_eq!(emote_pose.len(), animation.skeleton.len() + 1);
+    assert_eq!(emote_pose[animation.skeleton.len()], emote_pose[parent]);
+    assert!(emote_pose.iter().flatten().flatten().all(|v| v.is_finite()));
 
     glm.num_bones = 72;
     let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &animation).unwrap();

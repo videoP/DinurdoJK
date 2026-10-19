@@ -1343,7 +1343,11 @@ impl PlayerPresenter {
         let pose_gla = if !ragdoll_requested {
             local_emote.as_ref().map(|(_, gla)| gla).unwrap_or(&model.animation_gla)
         } else { &model.animation_gla };
-        let mut pose = model.bind_external_pose(pose_gla, animation_pose)?;
+        let mut pose = if !ragdoll_requested && local_emote.is_some() {
+            model.bind_external_pose(pose_gla, animation_pose)?
+        } else {
+            model.bind_animation_pose(animation_pose)?
+        };
         if !ragdoll_requested {if let Some((active,_))=local_emote.as_ref(){model.correct_emote_ground(active,&mut pose)?;}}
         record_pose_eval(&mut self.perf, pose_started);
 

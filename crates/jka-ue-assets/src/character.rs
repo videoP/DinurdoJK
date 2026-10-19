@@ -374,6 +374,7 @@ pub fn character_rig_input_mapped(
                 bind_position: translation.to_array(),
                 bind_quaternion: rotation.to_array(),
                 pose_to_bone: rows3(&rigid[i].inverse()),
+                jiggle: None,
             }
         })
         .collect();

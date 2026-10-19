@@ -71,7 +71,7 @@ class MappingPipeline(unittest.TestCase):
             export, native = os.path.join(tmp, 'export'), os.path.join(tmp, 'native.pk3')
             make_export(export)
             importer = os.environ.get('DJK_UE_IMPORT')
-            command = [importer] if importer else ['cargo', 'run', '-q', '-p', 'jka-ue-assets', '--']
+            command = [importer] if importer else ['cargo', 'run', '--profile', 'fast', '-q', '-p', 'jka-ue-assets', '--']
             subprocess.run([*command, 'import', export, native, '--namespace', 'models/mygame'], check=True, cwd=ROOT)
 
             pack = os.path.join(tmp, 'pack')

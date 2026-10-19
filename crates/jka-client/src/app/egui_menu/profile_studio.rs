@@ -865,6 +865,7 @@ impl App {
             }
         }
 
+        }
         // Anatomy sliders use the same animated-profile anchor projection as
         // saber/cosmetic callouts, with endpoints fitted to the actual model's
         // soft-tissue regions (including Source 1 imports) rather than guessing
@@ -896,7 +897,6 @@ impl App {
             });
         }
 
-        }
         // Both floating saber controls are full editors. Their connector
         // endpoints track the currently evaluated left/right hand tags.
         for (hand, fx, joint) in [(0usize, 0.055f32, 3usize), (1, 0.70, 4)] {
