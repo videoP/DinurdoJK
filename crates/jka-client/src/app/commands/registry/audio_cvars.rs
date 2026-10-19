@@ -9,7 +9,7 @@ app_cvars! {
             .with_text_setter(App::cvar_set_s_emotemusicvolume, None),
         config: CvarBinding {
             load_audio: Some(|settings, _name, value| { if let Some(level)=value.parse::<f32>().ok().filter(|n|n.is_finite()){settings.emote_music_volume=level.clamp(0.,1.);} }),
-            archive: Some((389, |state| format!("{:.3}", state.audio.emote_music_volume))),
+            archive: Some((27348, |state| format!("{:.3}", state.audio.emote_music_volume))),
             ..CvarBinding::NONE
         },
         implementations: [impl App {

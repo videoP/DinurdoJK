@@ -54,6 +54,9 @@ All creation times below are UTC on 2026-10-18.
 - Updated three new presenter test calls for the existing movement-mode
   argument. Added a regression assertion that external emote poses retain
   extra Source jiggle palette entries.
+- Assigned the three new emote settings unused archive positions 27346–27348.
+  Their original PR positions collided with existing settings (29 and 389).
+  Existing archive positions were not reordered.
 
 The CUE4Parse submodule was initialized at its PR-pinned commit
 `ed9897a1a3a8dba84a4b6d2119846e0502d74f19`.
@@ -73,9 +76,24 @@ The CUE4Parse submodule was initialized at its PR-pinned commit
   `source1::tests::refuses_out_of_bounds_jiggle_rule`. Both affected source
   files are byte-for-byte unchanged from the starting commit. These failures
   are outside the integration changes and were not altered.
-- Final client tests and rebuild: pending.
+- Full client suite before the final archive-position fix: **1277 passed,
+  25 failed, 80 ignored**. All player-presenter tests, including the new
+  emote/Source palette regression, passed. Failures include Windows event-loop
+  recreation, stale configuration baselines/counts, material/FX assertions,
+  and ocean shader/layout expectations. The archive-position failure exposed
+  the new setting collisions fixed above. Static verification confirms each
+  new rank is used exactly once; the starting code has other duplicate ranks.
+  The count assertion expects 425 archived settings, whereas the combined
+  registry has 646 (only three were added by these PRs).
+  The starting code was not rebuilt separately, so the remaining failures
+  are not claimed to have been exhaustively reproduced on the baseline.
+  Generated gamma-audit test fixtures are ignored and were not deleted.
+- Final Rust workspace rebuild after the archive-position fix:
+  **compiled successfully** with `build.ps1 -Fast` (fast profile, 1m 23s,
+  warnings remain). The build script exited unsuccessfully during the runtime
+  PK3 copy described below. The latest executable was copied to `target/release`.
 
-An earlier `build.ps1 -Fast` compiled the complete Rust workspace successfully
+`build.ps1 -Fast` compiled the complete Rust workspace successfully
 and copied the game executable into `target/release`. The script then encountered
 access denied while copying `base/dinurdo-assets.pk3`; its destination already
 matches the source SHA-256. This is a runtime asset-copy failure, not a compiler

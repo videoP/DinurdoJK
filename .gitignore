@@ -27,3 +27,5 @@
 # C# exporter build output
 /exporter/*/bin/
 /exporter/*/obj/
+# Generated monitor/gamma test audit fixtures.
+/crates/jka-client/target/gamma-audit/

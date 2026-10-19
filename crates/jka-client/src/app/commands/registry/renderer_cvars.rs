@@ -2434,7 +2434,7 @@ app_cvars! {
             |app,value|App::cvar_set_cg_emotecubic(app,APP_CG_EMOTECUBIC.entry.name,&value.to_string())).with_text_setter(App::cvar_set_cg_emotecubic,None),
         config: CvarBinding {
             load_video: Some(|settings,_name,value,_context|{settings.emote_cubic=parse_bool(value).unwrap_or(settings.emote_cubic);}),
-            archive:Some((29,|state|bool_value(state.video.emote_cubic))),
+            archive:Some((27346,|state|bool_value(state.video.emote_cubic))),
             ..CvarBinding::NONE
         },
         implementations:[impl App {
@@ -2451,7 +2451,7 @@ app_cvars! {
             |app,value|App::cvar_set_cg_emoteeffects(app,APP_CG_EMOTEEFFECTS.entry.name,&value.to_string())).with_text_setter(App::cvar_set_cg_emoteeffects,None),
         config: CvarBinding {
             load_video: Some(|settings,_name,value,_context|{settings.emote_effects=parse_bool(value).unwrap_or(settings.emote_effects);}),
-            archive:Some((29,|state|bool_value(state.video.emote_effects))),
+            archive:Some((27347,|state|bool_value(state.video.emote_effects))),
             ..CvarBinding::NONE
         },
         implementations:[impl App {
