@@ -82,6 +82,8 @@ impl App {
     }
 
     pub(in crate::app) fn sync_profile_preview_mode(&mut self, active: bool) {
+        // A stage emote_gallery owns the isolated preview until it finishes.
+        let active = active || self.emote_gallery_camera().is_some();
         if self.profile_preview_active == active {
             return;
         }

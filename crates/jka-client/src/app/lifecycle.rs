@@ -11,7 +11,28 @@ use crate::app::{
     MAX_SPECTATOR_ORBIT_RANGE, MIN_SPECTATOR_ORBIT_RANGE,
 };
 
+/// `DJK_HEADLESS=1`: offline tools (emote_gallery) render without ever
+/// showing or focusing the window, at below-normal process priority.
+pub(crate) fn headless() -> bool {
+    static HEADLESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HEADLESS.get_or_init(|| {
+        let on = std::env::var("DJK_HEADLESS").is_ok_and(|v| v == "1");
+        #[cfg(windows)]
+        if on {
+            use windows_sys::Win32::System::Threading::{
+                BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+            };
+            // SAFETY: both calls take no pointers; the pseudo-handle is always valid.
+            unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
+        }
+        on
+    })
+}
+
 fn show_startup_window(window: &Window) {
+    if headless() {
+        return;
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::{
@@ -3043,6 +3064,7 @@ impl ApplicationHandler<UserEvent> for App {
         // next WGPU surface is created.
         self.continue_pending_renderer_restart(event_loop);
         self.sync_companion_window(event_loop);
+        self.tick_emote_gallery();
         self.tick();
         self.tick_companion_ui();
         if self.quit_requested {

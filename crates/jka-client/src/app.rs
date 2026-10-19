@@ -82,6 +82,7 @@ mod background_jobs;
 mod companion;
 mod egui_dev_radial;
 mod emote_wheel;
+mod emote_gallery;
 mod egui_model_placement;
 mod map_mod_ent;
 mod egui_emote_radial;
@@ -680,6 +681,12 @@ pub struct App {
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
     emote_wheel: emote_wheel::EmoteWheel,
+    emote_gallery: Option<emote_gallery::EmoteGallery>,
+    /// `emote_gallery` arguments waiting for the emote catalogue to load.
+    emote_gallery_request: Option<Vec<String>>,
+    /// Posed gallery models merged into the world scene.
+    emote_gallery_scene: Arc<Vec<DynamicModelSurface>>,
+    emote_gallery_menu_seen: Option<Instant>,
     /// Shared by the mutually exclusive `/dev` and `/emote` wheels.
     dev_radial_return_overlay: OverlayMode,
     /// Virtual relative mouse stick for both wheels (not gameplay sensitivity).

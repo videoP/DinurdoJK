@@ -71,6 +71,15 @@ impl App {
         } else {
             dynamic_models
         };
+        let dynamic_models = match self.emote_gallery_models() {
+            Some(gallery) if !gallery.is_empty() => {
+                let mut merged = Vec::with_capacity(dynamic_models.len() + gallery.len());
+                merged.extend(dynamic_models.iter().cloned());
+                merged.extend(gallery.iter().cloned());
+                Arc::new(merged)
+            }
+            _ => dynamic_models,
+        };
         let dynamic_models = if !self.model_placement.placed_draws.is_empty()
             || !self.model_placement.preview_draws.is_empty()
             || !self.model_placement.fx_draws.is_empty() {

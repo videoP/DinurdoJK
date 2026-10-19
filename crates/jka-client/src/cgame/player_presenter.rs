@@ -4,6 +4,7 @@ mod swim_tilt;
 mod move_lean;
 mod source_vtf;
 mod assets;
+pub(crate) use assets::types::EMOTE_GROUND_SHIFT_MAX;
 mod attachments;
 mod bodies;
 mod cloth;

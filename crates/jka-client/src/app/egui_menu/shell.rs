@@ -400,6 +400,10 @@ impl App {
     // ------------------------------------------------------------- chrome --
 
     pub(in crate::app::egui_menu) fn build_egui_menu(&mut self, ui: &mut egui::Ui) {
+        // emote_gallery captures include egui; keep the screen clear.
+        if self.emote_gallery_active() {
+            return;
+        }
         if self.video.draw_entities {
             self.egui_entity_labels(ui);
         }

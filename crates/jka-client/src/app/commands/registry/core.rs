@@ -3,6 +3,20 @@ use crate::app::{split_console_script, App, ChatMode, ConsoleCvarSetResult};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_emote_gallery ["emote_gallery"] ("emote_gallery <first> [count] [samples] | ids <EID,...> [samples] | stop", "Render emotes offline on the Profile stage from four angles at scrubbed times; PNGs and report.json go to emote-gallery/.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        if words.get(1) == Some(&"stop") {
+            self.emote_gallery = None;
+            self.emote_gallery_scene = std::sync::Arc::new(Vec::new());
+            self.console_status = "emote_gallery stopped".into();
+        } else {
+            // The catalogue loads in the background; start once it is ready.
+            self.emote_gallery_request = Some(words[1..].iter().map(|w| w.to_string()).collect());
+            self.console_status = "emote_gallery: waiting for the emote catalogue".into();
+        }
+        CommandResult::Handled
+    }
+
     cmd_djk_emote ["djk_emote"] ("djk_emote [list|refresh|stop|index|EID]", "Play or stop a compiled local emote; never sends a server command.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

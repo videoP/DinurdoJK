@@ -99,6 +99,9 @@ impl App {
     }
 
     pub(in crate::app) fn asset_preview_camera(&self) -> Camera {
+        if let Some(camera) = self.emote_gallery_camera() {
+            return camera;
+        }
         if self.profile_preview_active {
             // Lower the studio camera and give it a slight upward pitch. The
             // old origin-level camera made the portrait read as if it were

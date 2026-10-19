@@ -46,6 +46,15 @@ chosen variations, and is never packaged.
 
 All three are also in the Settings menu (Audio, Models).
 
+## Offline QA gallery (developers)
+
+`emote_gallery <first> [count] [samples] | ids <EID,...> [samples] | stop` renders emotes
+offline on the isolated Profile stage (no map) from four angles at scrubbed times, using the
+normal screenshot path, and writes a `report.json` (missing props, track mismatches, audio
+status, effect counts). `DJK_HEADLESS=1` keeps the window hidden and the process at
+below-normal priority. `scripts/emote-gallery.sh` (Git Bash on Windows) runs several instances
+in parallel from a test base folder and builds one contact sheet per emote.
+
 ## How it fits together (for contributors)
 
 | Where | What |
