@@ -1199,7 +1199,13 @@ impl Ghoul2Animator {
                     // Replacing a blend which has not begun yet: OpenJK only changes duration.
                     bone.blend_time = blend_time;
                 } else {
-                    if bone.anim_speed < 0.0 {
+                    if bone.start_frame == bone.end_frame {
+                        // Empty overrides are legal (including 0..0). Timing
+                        // has already resolved their valid held frame; there
+                        // is no end-1 frame or adjacent frame to blend with.
+                        bone.blend_frame = current_frame;
+                        bone.blend_lerp_frame = current_frame as i32;
+                    } else if bone.anim_speed < 0.0 {
                         let frame = current_frame.floor();
                         bone.blend_frame = frame;
                         bone.blend_lerp_frame = frame as i32;
@@ -2063,6 +2069,27 @@ mod tests {
         assert_eq!(animator.bone_anim(0).unwrap().end_frame, 5);
     }
 
+    #[test]
+    fn g2_blend_from_zero_length_override_keeps_a_valid_source_frame() {
+        let mut gla = test_gla_for_animation_range();
+        gla.frame_indices = vec![0; gla.num_frames];
+        gla.compressed_bones = openjk_default_gla().unwrap().compressed_bones;
+        for speed in [1.0, -1.0] {
+            let mut animator = Ghoul2Animator::new(&gla);
+            animator.set_bone_anim_index(&gla, 0, 0, 0,
+                BONE_ANIM_OVERRIDE_FREEZE, speed, 1000, None, 0).unwrap();
+            animator.set_bone_anim_index(&gla, 0, 2, 5,
+                BONE_ANIM_OVERRIDE_FREEZE | BONE_ANIM_BLEND, 1.0, 1200, None, 100).unwrap();
+            let state = animator.bone_anim(0).unwrap();
+            assert!(state.blend_frame >= 0.0);
+            assert_eq!(state.blend_lerp_frame, state.blend_frame as i32);
+            for time in [1200, 1250, 1300] {
+                assert!(animator.evaluate_pose_openjk_root(&gla, time).unwrap()
+                    .iter().flatten().flatten().all(|n| n.is_finite()));
+            }
+        }
+    }
+
     fn test_gla_for_animation_range() -> GlaAnimation {
         let identity: Matrix3x4 = [
             [1.0, 0.0, 0.0, 0.0],
@@ -2542,7 +2569,11 @@ pub fn surface_bolt_matrix(
         || length_sq3(axis1) <= f32::EPSILON
         || length_sq3(axis2) <= f32::EPSILON
     {
-        return Err(format!("Ghoul2 bolt surface {surface_name:?} is degenerate"));
+        // A collapsed bolt triangle (e.g. an animation scaling the head to
+        // zero) has no frame this instant: the bolt is absent, which every
+        // caller already handles, rather than an error that aborts the model.
+        let _ = surface_name;
+        return Ok(None);
     }
 
     let origin = p[TAG_ORIGIN];
