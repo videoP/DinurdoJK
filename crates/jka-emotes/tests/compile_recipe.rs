@@ -42,7 +42,11 @@ fn write_recipe(scratch: &Scratch, audio: Value) -> PathBuf {
     let gla = retarget::encode(
         &jka_assets::ghoul2::openjk_default_gla().unwrap(),
         3,
-        &[(Quat::IDENTITY, Vec3::ZERO), (Quat::IDENTITY, Vec3::X), (Quat::IDENTITY, Vec3::Y)],
+        &[
+            (Quat::IDENTITY, Vec3::ZERO),
+            (Quat::IDENTITY, Vec3::X),
+            (Quat::IDENTITY, Vec3::Y),
+        ],
     )
     .unwrap();
     fs::write(scratch.0.join("export/dance.gla"), gla).unwrap();
@@ -60,7 +64,10 @@ fn write_recipe(scratch: &Scratch, audio: Value) -> PathBuf {
 #[test]
 fn compiles_a_prebaked_animation_and_audio_into_a_valid_bundle() {
     let scratch = Scratch::new("ok");
-    let recipe = write_recipe(&scratch, json!([{"at_ms": 0, "lane": "music", "audience": "both", "wav": "Audio/song.wav"}]));
+    let recipe = write_recipe(
+        &scratch,
+        json!([{"at_ms": 0, "lane": "music", "audience": "both", "wav": "Audio/song.wav"}]),
+    );
     let out = scratch.0.join("EID_Test.djk_fnemote");
     compile(&recipe, &out).unwrap();
 
@@ -82,14 +89,25 @@ fn never_overwrites_and_never_reads_outside_the_source_root() {
     let scratch = Scratch::new("reject");
     let out = scratch.0.join("EID_Test.djk_fnemote");
 
-    let recipe = write_recipe(&scratch, json!([{"at_ms": 0, "lane": "music", "audience": "both", "wav": "../escape.wav"}]));
+    let recipe = write_recipe(
+        &scratch,
+        json!([{"at_ms": 0, "lane": "music", "audience": "both", "wav": "../escape.wav"}]),
+    );
     fs::write(scratch.0.join("escape.wav"), silent_wav()).unwrap();
-    assert!(compile(&recipe, &out).is_err(), "a path leaving source_root must be refused");
-    assert!(!out.exists(), "a failed compile must not leave a bundle behind");
+    assert!(
+        compile(&recipe, &out).is_err(),
+        "a path leaving source_root must be refused"
+    );
+    assert!(
+        !out.exists(),
+        "a failed compile must not leave a bundle behind"
+    );
 
     let recipe = write_recipe(&scratch, json!([]));
     compile(&recipe, &out).unwrap();
-    assert!(compile(&recipe, &out).unwrap_err().contains("already exists"));
+    assert!(compile(&recipe, &out)
+        .unwrap_err()
+        .contains("already exists"));
 
     let wrong_extension = scratch.0.join("EID_Test.zip");
     assert!(compile(&recipe, &wrong_extension).is_err());

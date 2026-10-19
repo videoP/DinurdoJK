@@ -1818,6 +1818,7 @@ dependencies = [
  "image",
  "jka-assets",
  "jka-ue-assets",
+ "jka-ue-runtime",
  "serde_json",
  "vorbis_rs",
  "zip 8.6.0",

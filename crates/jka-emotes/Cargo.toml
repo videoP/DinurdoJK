@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 jka-assets = { path = "../jka-assets" }
 jka-ue-assets = { path = "../jka-ue-assets" }
+jka-ue-runtime = { path = "../jka-ue-runtime" }
 serde_json = "=1.0.151"
 glam = "=0.32.1"
 flacenc = { version = "=0.5.1", default-features = false }

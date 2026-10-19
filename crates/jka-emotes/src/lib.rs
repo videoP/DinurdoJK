@@ -2,18 +2,28 @@
 pub mod audio_mix;
 pub mod compact;
 pub mod compiler;
+pub mod effect_bake;
+pub mod effect_materials;
+pub mod effect_preview;
 pub mod effects;
 pub mod manifest;
 pub mod montage;
+pub mod niagara_bake;
 pub mod package;
 pub mod pose;
 pub mod presentation;
+pub mod program_audit;
 pub mod prop_mesh;
 pub mod psa;
 pub mod retarget;
 pub mod source;
 pub use pose::{Interpolation, PoseClip};
 pub use source::{BundleSource, FileSource};
+
+/// Quake-path folder of the native assets the emote runtime looks for: prop
+/// models, textures, shaders and `index.json`. `djk-fnemote import-assets` and
+/// the effect baker write here; the game reads emote props from here.
+pub const NATIVE_NAMESPACE: &str = "models/fnemote";
 
 use serde_json::Value;
 use std::num::{NonZeroU32, NonZeroU8};
