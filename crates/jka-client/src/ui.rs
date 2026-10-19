@@ -15,6 +15,8 @@ mod chat;
 mod compose;
 mod console;
 mod demo;
+mod frametime_graph;
+pub(crate) use frametime_graph::build_frame_time_graph_vertices;
 mod diagnostics;
 mod geometry;
 mod hud;
@@ -91,7 +93,7 @@ pub use settings::rendering::{
     VIDEO_ROW_PATCH_SUBDIVISIONS, VIDEO_ROW_PATCH_LOD_ERROR, VIDEO_ROW_PATCH_STITCHING,
     VIDEO_ROW_DRAW_CURVES, VIDEO_ROW_PATCH_STATS, VIDEO_ROW_MODEL_LOD_SCALE,
     ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
-    DofQuality, DynamicLightsMode, GlowMode,
+    DofMode, DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
     FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
@@ -108,7 +110,7 @@ pub use settings::rendering::{
     VIDEO_ROW_CULL_DEBUG, VIDEO_ROW_DELUXE_MAPPING, VIDEO_ROW_DELUXE_SPECULAR,
     VIDEO_ROW_DEPTH_OF_FIELD, VIDEO_ROW_DETAIL_TEXTURES, VIDEO_ROW_DEVELOPER_TOOLS,
     VIDEO_ROW_DISTANCE_CULL, VIDEO_ROW_DLIGHT_BRIGHTNESS, VIDEO_ROW_DOF_AUTOFOCUS,
-    VIDEO_ROW_DOF_QUALITY, VIDEO_ROW_DRAW_CLIP_BRUSHES, VIDEO_ROW_DRAW_ENTITIES,
+    VIDEO_ROW_DOF_QUALITY, VIDEO_ROW_DOF_MODE, VIDEO_ROW_DRAW_CLIP_BRUSHES, VIDEO_ROW_DRAW_ENTITIES,
     VIDEO_ROW_DRAW_FPS, VIDEO_ROW_DRAW_MAP_MODELS, VIDEO_ROW_DRAW_TRIGGERS,
     VIDEO_ROW_DYNAMIC_LIGHTS, VIDEO_ROW_DYNAMIC_LIGHT_DEBUG, VIDEO_ROW_DYNAMIC_SHADOWS,
     VIDEO_ROW_EMISSIVE_AREA_LIGHTS, VIDEO_ROW_PROMOTE_FX_LIGHTS,
@@ -955,6 +957,8 @@ pub struct UiSiegeHud {
 
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
+    /// The live frontend Main page: render it at its original color and contrast.
+    pub frontend_main_scene: bool,
     pub setup_selected: usize,
     pub mode: OverlayMode,
     pub console_input: String,
@@ -1050,6 +1054,7 @@ pub struct UiSnapshot {
 impl Default for UiSnapshot {
     fn default() -> Self {
         Self {
+            frontend_main_scene: false,
             setup_selected: 1,
             mode: OverlayMode::None,
             console_input: String::new(),

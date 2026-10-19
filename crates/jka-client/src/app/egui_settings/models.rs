@@ -1,6 +1,6 @@
 //! Models.
 use crate::app::egui_settings::{
-    quality_table_row, segmented_row, theme, ui, App, Ghoul2BatchMode, Ghoul2SkinningMode,
+    quality_table_row, theme, ui, App,
 };
 
 impl App {
@@ -8,7 +8,7 @@ impl App {
         theme::section(
             ui,
             "MODELS",
-            "Map props, Ghoul2 skinning and model detail.",
+            "Map props and model detail.",
         );
         self.egui_toggle_row(
             ui,
@@ -27,7 +27,6 @@ impl App {
                 }
             },
         );
-
         theme::row(ui, "Built-in model surfaces",
             "Render-only shader-path filter for static BSP surfaces authored with models/* materials (e.g. compiled Costa del Sol trees). This is not true model provenance: map geometry sharing a models/* shader will also disappear. Does not affect collision or runtime MD3s.",
             theme::Reset::None,
@@ -37,56 +36,6 @@ impl App {
                 }
             },
         );
-
-        const GHOUL2_SKINNING: [(Ghoul2SkinningMode, &str); 3] = [
-            (Ghoul2SkinningMode::Cpu, "CPU"),
-            (Ghoul2SkinningMode::CpuWorkers, "CPU workers"),
-            (Ghoul2SkinningMode::Gpu, "GPU"),
-        ];
-        if let Some(target) = segmented_row(
-            ui,
-            "Ghoul2 skinning",
-            "GLM vertex deformation path. GPU is the default and keeps JKA pose/bolt evaluation on the CPU while skinning bind-pose vertices in the WGPU vertex shader. CPU remains the fidelity reference.",
-            theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_SKINNING),
-            self.video.ghoul2_skinning,
-            &GHOUL2_SKINNING,
-        ) {
-            let current = Ghoul2SkinningMode::ALL
-                .iter()
-                .position(|mode| *mode == self.video.ghoul2_skinning)
-                .unwrap_or(0);
-            let next = Ghoul2SkinningMode::ALL
-                .iter()
-                .position(|mode| *mode == target)
-                .unwrap_or(current);
-            self.video_selected = ui::VIDEO_ROW_GHOUL2_SKINNING;
-            self.change_video_setting(next as i32 - current as i32);
-        }
-
-        const GHOUL2_BATCHING: [(Ghoul2BatchMode, &str); 3] = [
-            (Ghoul2BatchMode::Off, "Off"),
-            (Ghoul2BatchMode::Adaptive, "Adaptive"),
-            (Ghoul2BatchMode::Force, "Force"),
-        ];
-        if let Some(target) = segmented_row(
-            ui,
-            "Ghoul2 draw batching",
-            "GPU-skinning draw-call batching. Force is the default. Adaptive skips batching below 32 GPU-skinned surfaces, samples at most 64 surfaces for a real 3-instance match, and only then groups matching opaque/masked mesh, material and LOD draws. Force always attempts compatible grouping.",
-            theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_BATCH_DRAWS),
-            self.video.ghoul2_batch_draws,
-            &GHOUL2_BATCHING,
-        ) {
-            let current = Ghoul2BatchMode::ALL
-                .iter()
-                .position(|mode| *mode == self.video.ghoul2_batch_draws)
-                .unwrap_or(1);
-            let next = Ghoul2BatchMode::ALL
-                .iter()
-                .position(|mode| *mode == target)
-                .unwrap_or(current);
-            self.video_selected = ui::VIDEO_ROW_GHOUL2_BATCH_DRAWS;
-            self.change_video_setting(next as i32 - current as i32);
-        }
 
         theme::row(
             ui,
@@ -133,12 +82,5 @@ impl App {
             },
         );
 
-        self.egui_toggle_row(
-            ui,
-            "Offscreen early cull",
-            "Skips the final full Ghoul2 pose and render submission once a model is outside the view frustum, while retaining the lightweight animation/angle state needed for smooth re-entry. Disable for A/B diagnostics.",
-            ui::VIDEO_ROW_GHOUL2_EARLY_CULL,
-            self.video.ghoul2_early_cull,
-        );
     }
 }

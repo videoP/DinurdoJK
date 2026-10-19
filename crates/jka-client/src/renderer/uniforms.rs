@@ -366,7 +366,7 @@ pub(in crate::renderer) struct PostUniform {
     pub(in crate::renderer) legacy_weather: [f32; 4], // sand haze, spacedust haze, acid-rain haze, 2D-precipitation-haze flag
     pub(in crate::renderer) snow_haze: [f32; 4], // x: 2D snow haze density/cloud count (zero in froxel mode)
     pub(in crate::renderer) underwater: [f32; 4], // surface Y over a submerged camera (NO_WATER_SURFACE if dry), absorption distance, promoted ocean plane Y for no-receiver fog, its square half-extent (0 = off)
-    pub(in crate::renderer) cloud_foreground: [f32; 4], // blade count, promoted ocean fog centre X/Z, reserved
+    pub(in crate::renderer) cloud_foreground: [f32; 4], // blade count, promoted ocean fog centre X/Z, 1 / sky-portal scale (0 = no portal depth bound)
     // Two vec4 per blade: [ax, ay, bx, by] pixels, then [glow radius px, nearest distance].
     pub(in crate::renderer) cloud_blades: [[f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
     pub(in crate::renderer) camera_pos_time: [f32; 4],
@@ -565,7 +565,13 @@ pub(in crate::renderer) struct LightingSettings {
     pub(in crate::renderer) map_minlight: [f32; 4], // source-.map q3map2 minlight RGB, normalized; w runtime-dlight falloff mode (0 stock, 1 physical)
     pub(in crate::renderer) baked_sun_direction_strength: [f32; 4], // xyz toward authored sun, w 0..1 extraction strength
     pub(in crate::renderer) baked_sun_radiance: [f32; 4], // normalized RGB * authored intensity / 255
-    pub(in crate::renderer) runtime_sun_radiance: [f32; 4], // normalized RGB * replacement intensity / 255
+    pub(in crate::renderer) original_sun_shadow_view_proj: [[f32; 4]; 4],
+    pub(in crate::renderer) original_sun_shadow_params: [f32; 4], // x requested, y shadow texel size, z cache ready
+    pub(in crate::renderer) baked_indirect_adjust: [f32; 4], // x exposure, y saturation, z shadow softness, w direct cap
+    pub(in crate::renderer) baked_indirect_curve: [f32; 4], // x power (1 disables), y highlight retention (0..1), zw reserved
+    pub(in crate::renderer) baked_sun_debug_mode: [u32; 4], // x: 0 off, 1 removal amount, 2 old-sun visibility; y: cached lightmap RGB
+    pub(in crate::renderer) runtime_sun_direction: [f32; 4],
+    pub(in crate::renderer) runtime_sun_radiance: [f32; 4], // xyz linear radiance, w live BSP sun lighting enabled
 }
 
 #[repr(C)]

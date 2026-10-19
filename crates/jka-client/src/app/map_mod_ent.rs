@@ -2,7 +2,7 @@
 //! This editor deliberately imports only *additive* MD3/inline placements;
 //! external .ent edits to baked BSP entities require a full entity editor.
 use super::*;
-use super::egui_model_placement::{BmodelPlacement, ModelPlacement, PlacementKind, bmodel_pivot};
+use super::egui_model_placement::{BmodelPlacement, FxPlacement, ModelPlacement, PlacementKind, bmodel_pivot};
 use jka_assets::bsp::{Bsp, Entity, MAX_FILE_BYTES};
 use jka_assets::pk3::AssetSearchPath;
 use std::path::PathBuf;
@@ -138,6 +138,15 @@ fn md3_entity(p: &ModelPlacement) -> Entity {
         ("_dinurdo_placement", "md3".into())])
 }
 
+/// A placed effect as an `fx_runner`: `fxFile`, `origin`, aim `angles` and
+/// the replay `delay` in milliseconds (OpenJK's runner keys).
+fn fx_entity(p: &FxPlacement) -> Entity {
+    entity(&[("classname", "fx_runner".into()), ("fxFile", p.effect.clone()),
+        ("origin", xyz(p.origin)), ("angles", xyz(p.angles)),
+        ("delay", p.delay_ms.to_string()),
+        ("_dinurdo_placement", "fx".into())])
+}
+
 fn clean_map_name(label: &str) -> Result<&str, String> {
     let name = label.strip_suffix(".bsp").ok_or(".ent export requires a loaded BSP map")?;
     if name.is_empty() || name.split('/').any(|part| part.is_empty() ||
@@ -174,6 +183,54 @@ impl App {
             .ok_or_else(|| format!("map asset {path} not found"))?;
         Ok(Bsp::parse(&asset.bytes).map_err(|error| error.to_string())?.entities)
     }
+    /// `menuent`: write the built-in main-menu props (stood on this map's
+    /// terrain) as `mapmods/mp/duel9.ent` (original entities + props) and stage
+    /// them as editable placements, exactly as if that file had been imported.
+    pub(in crate::app) fn write_default_menu_ent(&mut self, overwrite: bool) -> Result<String, String> {
+        let cache = self.prepared_map_cache.as_ref().ok_or("no map loaded; run menudevmap first")?;
+        if !cache.label.eq_ignore_ascii_case("mp/duel9.bsp") {
+            return Err(format!("{} is loaded; run menudevmap first", cache.label));
+        }
+        let label = cache.label.clone();
+        let props = crate::scene::default_prop_placements();
+        self.model_placement.map_label = label;
+        self.model_placement.ent_filename = "mp/duel9.ent".to_owned();
+        self.model_placement.ent_overwrite = overwrite;
+        // The menu's own file already exists (your exported layout): load it as
+        // is. `menuent overwrite` rewrites it from the built-in layout instead.
+        if !overwrite && self.map_mod_path()?.exists() {
+            let imported = self.import_map_mod()?;
+            self.enter_placement_edit();
+            return Ok(format!("{imported}. Edit mode on: aim at a model or effect, LMB picks it up, E toggles"));
+        }
+        self.model_placement.placed = props
+            .iter()
+            .map(|prop| ModelPlacement {
+                qpath: prop.model.to_owned(),
+                origin: prop.origin,
+                angles: prop.angles,
+                scale: prop.scale,
+                bounds: ([0.0; 3], [0.0; 3]),
+            })
+            .collect();
+        self.model_placement.fx_placed = crate::scene::default_fx_placements()
+            .into_iter()
+            .map(|fx| FxPlacement {
+                effect: fx.effect.to_owned(),
+                origin: fx.origin,
+                angles: fx.angles,
+                delay_ms: fx.delay_ms,
+            })
+            .collect();
+        self.model_placement.bmodel_placed.clear();
+        let exported = self.export_map_mod()?;
+        // Re-read the file through the importer: it resolves each model's bounds
+        // and stages the placements for the in-game placement tool.
+        let imported = self.import_map_mod()?;
+        self.enter_placement_edit();
+        Ok(format!("{exported}. {imported}. Edit mode on: aim at a model, LMB picks it up, E toggles"))
+    }
+
     pub(in crate::app) fn open_map_mods(&mut self) {
         let Some(cache) = &self.prepared_map_cache else {
             self.console_status = "MAP MODS: LOAD A BSP FIRST".into();
@@ -194,6 +251,7 @@ impl App {
         let mut merged = base;
         merged.extend(self.model_placement.placed.iter().map(md3_entity));
         merged.extend(self.model_placement.bmodel_placed.iter().map(bmodel_entity));
+        merged.extend(self.model_placement.fx_placed.iter().map(fx_entity));
         let data = write_ent(&merged)?;
         let path = self.map_mod_path()?;
         if path.exists() && !self.model_placement.ent_overwrite {
@@ -220,8 +278,9 @@ impl App {
             return Err(format!("Unable to finalize .ent export: {error}"));
         }
         if had_old { let _ = std::fs::remove_file(&backup); }
-        Ok(format!("Exported {} MD3 + {} BMODEL placements with BSP entities to {}",
-            self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(), path.display()))
+        Ok(format!("Exported {} MD3 + {} BMODEL + {} FX placements with BSP entities to {}",
+            self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
+            self.model_placement.fx_placed.len(), path.display()))
     }
     fn import_map_mod(&mut self) -> Result<String, String> {
         let base = self.map_mod_base_entities()?;
@@ -235,9 +294,25 @@ impl App {
         let cache = self.prepared_map_cache.as_ref().ok_or("no prepared map")?;
         let mut md3 = Vec::new();
         let mut bsp_models = Vec::new();
+        let mut effects = Vec::new();
         for (i, entity) in all.iter().enumerate().skip(base.len()) {
             let cls = property(entity, "classname").unwrap_or("");
-            if cls.eq_ignore_ascii_case("misc_model_static") {
+            if cls.eq_ignore_ascii_case("fx_runner") {
+                let effect = property(entity, "fxFile").map(str::trim).filter(|e| !e.is_empty())
+                    .ok_or(format!("entity {i}: fxFile missing"))?;
+                // No aim means straight up, as OpenJK's SP_fx_runner.
+                let aim = if property(entity, "angles").is_some() || property(entity, "angle").is_some() {
+                    angles(entity)?
+                } else {
+                    [-90.0, 0.0, 0.0]
+                };
+                let delay: i32 = property(entity, "delay").unwrap_or("200").trim().parse()
+                    .map_err(|_| format!("entity {i}: invalid delay"))?;
+                effects.push(FxPlacement {
+                    effect: effect.replace('\\', "/"), origin: point(entity)?, angles: aim,
+                    delay_ms: delay.clamp(50, 60_000),
+                });
+            } else if cls.eq_ignore_ascii_case("misc_model_static") {
                 let qpath = property(entity, "model").ok_or(format!("entity {i}: model missing"))?;
                 if !qpath.to_ascii_lowercase().ends_with(".md3") { return Err(format!("entity {i}: only MD3 placements are supported")); }
                 let scale: f32 = property(entity, "modelscale").unwrap_or("1").parse()
@@ -275,20 +350,30 @@ impl App {
         }
         self.model_placement.placed = md3;
         self.model_placement.bmodel_placed = bsp_models;
+        self.model_placement.fx_placed = effects;
+        self.model_placement.fx_selection = None;
+        self.model_placement.fx_held = None;
+        self.model_placement.fx_hover = None;
         self.model_placement.bmodel_collision_dirty = true;
         self.model_placement.placed_dirty = true;
         self.model_placement.active = false;
+        self.model_placement.edit_mode = false;
+        self.model_placement.held = None;
+        self.model_placement.hover = None;
+        self.model_placement.edit_undo.clear();
         self.model_placement.rotating = false;
         self.model_placement.hit_valid = false;
         self.model_placement.preview_key = None;
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.ensure_inline_instance_capacity();
-        Ok(format!("Imported {} MD3 + {} BMODEL placements from {}",
-            self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(), path.display()))
+        Ok(format!("Imported {} MD3 + {} BMODEL + {} FX placements from {}",
+            self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
+            self.model_placement.fx_placed.len(), path.display()))
     }
     pub(super) fn egui_map_mods(&mut self, root: &mut egui::Ui) {
         let mut action = None;
         let mut close = false;
+        let mut edit = false;
         egui::Window::new("MAP MODS · .ENT IMPORT / EXPORT")
             .id(egui::Id::new("map_mod_ent_dialog"))
             .default_width(610.0).resizable(true).collapsible(false)
@@ -311,6 +396,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("IMPORT .ENT (replace local placements)").clicked() { action = Some(false); }
                     if ui.button("EXPORT .ENT").clicked() { action = Some(true); }
+                    if ui.button("EDIT PLACEMENTS (move / copy / delete)").clicked() { edit = true; }
                 });
                 ui.checkbox(&mut self.model_placement.ent_overwrite, "Allow export to overwrite existing .ent file");
                 ui.separator();
@@ -320,6 +406,7 @@ impl App {
                 if !self.model_placement.ent_status.is_empty() { ui.label(&self.model_placement.ent_status); }
             });
         if close { self.set_overlay(OverlayMode::None); }
+        if edit { self.enter_placement_edit(); }
         if let Some(export) = action {
             let result = if export { self.export_map_mod() } else { self.import_map_mod() };
             self.model_placement.ent_status = match result {

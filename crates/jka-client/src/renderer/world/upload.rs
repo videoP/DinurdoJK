@@ -167,6 +167,7 @@ pub(in crate::renderer) fn build_world(
         visibility,
         lights: dynamic_lights,
         source_map_lighting,
+        baked_sun_encoding,
         sun,
         static_light_grid,
         voxel_probe_gi: voxel_probe_gi_data,
@@ -174,6 +175,7 @@ pub(in crate::renderer) fn build_world(
         grass_patches,
         grass_local_fogs,
         surface_sprite_effects: surface_sprite_effect_sources,
+        surface_sprite_bake,
         material_debug,
         inline_vertices,
         inline_batches: inline_batch_sources,
@@ -241,7 +243,22 @@ pub(in crate::renderer) fn build_world(
     // Move the source vectors into Arc without copying texture bytes. Renderer
     // uploads and BC encoder workers only borrow the same immutable pixels.
     let texture_data = Arc::new(texture_data);
+    let mut lightmap_data = lightmap_data;
+    let authored_sun_bake = sun.zip(baked_sun_encoding).and_then(|(sun, encoding)| {
+        crate::renderer::lighting::original_sun::bake_authored_sun_masks(
+            &vertices, &coarse_sources, &texture_data, &mut lightmap_data,
+            &legacy_dlight_triangle_surfaces, legacy_dlight_surfaces.len(), sun, encoding,
+        )
+    });
+    let authored_sun_projected = authored_sun_bake.is_some();
     let lightmap_data = Arc::new(lightmap_data);
+    let baked_sun_calibration = authored_sun_bake.or_else(|| sun.and_then(|sun| {
+        crate::renderer::lighting::original_sun::estimate_baked_sun_radiance(
+            &vertices, &coarse_sources, &lightmap_data,
+            &legacy_dlight_triangle_surfaces, &legacy_dlight_surfaces, sun,
+        )
+    }));
+    let baked_sun_radiance = baked_sun_calibration.as_ref().map(|fit| fit.radiance);
     // Existing GPU textures are safe to alias only when *all* decode/upload
     // inputs agree. In particular, the use classification can change BC
     // format, detail treatment, or picmip eligibility after a remap.
@@ -289,6 +306,7 @@ pub(in crate::renderer) fn build_world(
     // decline the shortcut while a runtime AO replacement is active.
     let reusable_lightmaps = reusable_world.filter(|previous| {
         !previous.static_ao_lightmap_active
+            && !previous.baked_sun_cache.as_ref().is_some_and(|cache| cache.active)
             && previous.lightmaps.len() == lightmap_data.len()
             && previous.lightmap_base_data.len() == lightmap_data.len()
             && previous.lightmap_base_data.iter().zip(lightmap_data.iter()).all(|(a, b)| {
@@ -317,7 +335,9 @@ pub(in crate::renderer) fn build_world(
     } else {
         None
     };
-    let lightmap_encode_rx = if texture_compression >= 2 && reusable_lightmaps.is_none() {
+    // Inverse exposure needs the original bytes and sun-flux alpha. Lossy BC
+    // quantization can turn a small byte error into a large photon error.
+    let lightmap_encode_rx = if texture_compression >= 2 && !authored_sun_projected && reusable_lightmaps.is_none() {
         let data = Arc::clone(&lightmap_data);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         rayon::spawn(move || {
@@ -414,6 +434,7 @@ pub(in crate::renderer) fn build_world(
     let mut ocean_sky_regions = vec![None; crate::ocean::OCEAN_MAX_SURFACES];
     let mut runtime_ocean_clipmaps = Vec::<RuntimeOceanClipmap>::new();
     let mut ocean_coarsest_spacing = 0.0f32;
+    let ocean_mesh_started = Instant::now();
     let mut diffuse_stages = HashMap::new();
     if build_ocean_meshes {
         for source in coarse_sources.iter().chain(full_sources.iter()) {
@@ -639,6 +660,12 @@ pub(in crate::renderer) fn build_world(
             extended, ocean_surfaces.len());
     }
     let _ = ocean_coarsest_spacing;
+    if build_ocean_meshes {
+        rverbose!(2, "[MAP OCEAN GEOMETRY] CPU build {:.1} ms | {} grid vertices (low+high) | {} pools | {} dynamic clipmaps (does not include GPU execution or first render)",
+            ocean_mesh_started.elapsed().as_secs_f64() * 1000.0,
+            upload_timings.ocean_clipmap_vertices,
+            ocean_surfaces.len(), runtime_ocean_clipmaps.len());
+    }
     upload_timings.ocean_water_batches = coarse_sources
         .iter()
         .chain(full_sources.iter())
@@ -896,6 +923,8 @@ pub(in crate::renderer) fn build_world(
             })
         })
         .collect::<Vec<_>>();
+    let surface_sprite_resident =
+        surface_sprite_effect_renderer.build_resident(device, &surface_sprite_effects, &surface_sprite_bake);
     upload_timings.texture_upload_ms = texture_started.elapsed().as_secs_f64() * 1000.0;
     let lightmap_started = Instant::now();
     // r_ext_compress_textures 2 also takes 8-bit lightmaps to BC1; FP16
@@ -1893,7 +1922,17 @@ pub(in crate::renderer) fn build_world(
     } else {
         legacy_dlight_triangle_surfaces.clone()
     };
-    let initial_legacy_masks = vec![0u32; legacy_dlight_surfaces.len().max(1)];
+    let surface_count = legacy_dlight_surfaces.len().max(1);
+    // Keep the writable Legacy masks first. Immutable per-surface fits follow
+    // them, so existing partial mask uploads cannot overwrite the calibration.
+    let mut initial_legacy_masks = vec![0u32; surface_count * 5];
+    if let Some(fit) = baked_sun_calibration {
+        for (surface, data) in fit.surfaces.iter().enumerate() {
+            for (component, value) in data.iter().enumerate() {
+                initial_legacy_masks[surface_count + surface * 4 + component] = value.to_bits();
+            }
+        }
+    }
     let legacy_dlight_surface_mask_buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA Legacy dlight surface masks"),
@@ -2469,8 +2508,13 @@ pub(in crate::renderer) fn build_world(
             light_count,
             local_shadows,
             sun,
+            baked_sun_radiance,
+            baked_sun_encoding: baked_sun_encoding.filter(|_| authored_sun_projected
+                && lightmap_data.iter().all(|image| image.rgba16f.is_none() && image.mip_level_count == 1)),
+            baked_sun_cache: None,
             grass,
             surface_sprite_effects,
+            surface_sprite_resident,
             active_pipeline_variant: shader_variant,
             pipeline_variants,
             fast_pipelines,

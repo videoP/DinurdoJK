@@ -32,7 +32,7 @@ fn marker_vertex(@builtin(vertex_index) vertex_id: u32) -> MarkerVertex {
     let display_grid = sample_grid + forward * 2.5; // 100 JKA units / 40 units per metre
 
     // Raw native vertex displacement at CAMERA XZ, with native mesh LOD filtering.
-    let raw = displacement(sample_grid, mesh_spacing(sample_grid));
+    let raw = jka_hybrid_displacement(sample_grid, mesh_spacing(sample_grid));
     let raw_height = raw.y + wake_height(sample_grid);
 
     // The visible vertices are moved horizontally by displacement.xz. Invert
@@ -40,15 +40,21 @@ fn marker_vertex(@builtin(vertex_index) vertex_id: u32) -> MarkerVertex {
     // whose final rasterized horizontal XZ is directly under the camera.
     var unmoved_grid = sample_grid;
     for (var step: u32 = 0u; step < 3u; step = step + 1u) {
-        let d = displacement(unmoved_grid, mesh_spacing(unmoved_grid));
+        let d = jka_hybrid_displacement(unmoved_grid, mesh_spacing(unmoved_grid));
         unmoved_grid = sample_grid - d.xz;
     }
-    let sampled = displacement(unmoved_grid, mesh_spacing(unmoved_grid));
+    let sampled = jka_hybrid_displacement(unmoved_grid, mesh_spacing(unmoved_grid));
     let wave_height = sampled.y + wake_height(unmoved_grid);
 
     // This is the *native probe eye channel* in shader_composer.rs, so if
     // this differs from yellow, the native probe and raster wave disagree.
-    let probe_height = height_at(sample_grid);
+    var probe_grid = sample_grid;
+    var probe_d = jka_hybrid_displacement(probe_grid, mesh_spacing(probe_grid));
+    for (var step: u32 = 0u; step < 6u; step = step + 1u) {
+        probe_grid = sample_grid - probe_d.xz;
+        probe_d = jka_hybrid_displacement(probe_grid, mesh_spacing(probe_grid));
+    }
+    let probe_height = probe_d.y;
     let eye_height = camera.position.y;
     let at = vec3<f32>(display_grid.x, 0.0, display_grid.y);
     let series = vertex_id / 6u;

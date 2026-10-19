@@ -671,7 +671,10 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn menu_backdrop_requested(&self) -> bool {
-        !self.ui_state.video.skip_ui
+        // The frontend Main scene is artwork, not a page that needs a blurred
+        // and desaturated background. Avoid both the grading and its extra pass.
+        !self.ui_state.frontend_main_scene
+            && !self.ui_state.video.skip_ui
             && self.ui_state.loading.is_none()
             && (self.ui_state.mode == ui::OverlayMode::Game
                 || (self.ui_state.mode == ui::OverlayMode::Video
@@ -804,6 +807,7 @@ impl Renderer {
             && self.ui_vertex_count == 0
             && self.ui_dynamic_vertex_count == 0
             && self.ui_transient_vertex_count == 0
+            && !(self.frame_time_graph.draw_ready() && !self.egui_active)
         {
             return;
         }
@@ -853,6 +857,9 @@ impl Renderer {
                 &self.ui_vertex_buffer,
                 self.ui_vertex_count,
             );
+            if !self.egui_active {
+                self.frame_time_graph.draw(&mut pass, &self.ui_pipeline, &self.ui_bind_group);
+            }
         }
         self.queue.submit([encoder.finish()]);
     }

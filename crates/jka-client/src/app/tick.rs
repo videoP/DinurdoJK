@@ -1,6 +1,6 @@
 //! Tick.
 use crate::app::{
-    scene, App, DemoAdvance, Duration, Instant, OverlayMode, RenderCommand, SessionPhase,
+    scene, ui, App, DemoAdvance, Duration, Instant, OverlayMode, RenderCommand, SessionPhase,
 };
 
 /// Integrate a continuously differentiable speed ramp rather than simply
@@ -60,7 +60,7 @@ impl App {
         self.camera.position = glam::Vec3::from_array(cinematic.position);
         self.camera.position.y += (phase * 0.32).sin() * 0.65;
         self.camera.yaw = cinematic.yaw + (phase * 0.115).sin() * 0.28;
-        self.camera.pitch = (-2.0_f32).to_radians() + (phase * 0.09).sin() * 0.025;
+        self.camera.pitch = cinematic.pitch + (phase * 0.09).sin() * 0.025;
 
         // A broken/missing model must not leave a cold first-run menu black
         // indefinitely; never persist a snapshot without a settled model.
@@ -307,7 +307,8 @@ impl App {
         // dynamic_crosshair_world one main tick behind only while spectating.
         self.update_crosshair_target(now);
         self.update_model_placement();
-        if self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus {
+        if self.video.depth_of_field_strength > 0.001
+            && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus {
             if let Some(hit) = self.crosshair_hit_world {
                 self.dof_focus_target = self
                     .camera
@@ -520,6 +521,7 @@ impl App {
             } else if status==0 {"Coastal GPU solver waiting for bathymetry bake.".into()}
                 else {"Coastal unavailable: load a BSP with r_ocean 1 so its bathymetry can be prepared.".into()});
         }
-        self.render_command(RenderCommand::SetCoastalWater {enabled:self.coastal_enabled,pool:self.coastal_pool,atlas});
+        let upstream_source=job.as_ref().map(|j|std::sync::Arc::clone(&j.upstream_shore));
+        self.render_command(RenderCommand::SetCoastalWater {enabled:self.coastal_enabled,pool:self.coastal_pool,atlas,upstream_source});
     }
 }

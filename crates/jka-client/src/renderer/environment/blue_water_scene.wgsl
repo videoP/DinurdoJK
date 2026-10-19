@@ -13,10 +13,30 @@ struct Frame { inverse_vp:mat4x4<f32>,eye:vec4<f32>,viewport:vec4<f32>,options:v
 @vertex fn vertex(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
  let p=array<vec2<f32>,3>(vec2<f32>(-1.,-1.),vec2<f32>(3.,-1.),vec2<f32>(-1.,3.));return vec4<f32>(p[i],0.,1.);
 }
+// World position of a pixel of the single-sample copy; w is 0 where there is no surface.
+fn world_at(pixel:vec2<i32>)->vec4<f32> {
+ let q=clamp(pixel,vec2<i32>(0),vec2<i32>(textureDimensions(scene_depth))-1);
+ let d=textureLoad(scene_depth,q,0);
+ let uv=(vec2<f32>(q)+0.5)*frame.viewport.zw;
+ let clip=frame.inverse_vp*vec4<f32>(uv.x*2.-1.,1.-uv.y*2.,d,1.);
+ return vec4<f32>(clip.xyz/clip.w,select(0.,1.,d>0.));
+}
+// The step to the neighbour on the side of a depth discontinuity that stays on this pixel's surface. dpdx/dpdy mix the
+// foreground and background of a 2 x 2 quad at a silhouette, which gave the lit gain a wrong normal round every model.
+// Both candidates point the way the pixel index grows, so the cross product keeps its handedness.
+fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
+ let a=forward.xyz-centre;let b=centre-back.xyz;
+ let la=select(1e9,length(a),forward.w>0.&&length(a)>1e-6);
+ let lb=select(1e9,length(b),back.w>0.&&length(b)>1e-6);
+ return select(b,a,la<=lb);
+}
 @fragment fn light(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
  let pixel=vec2<i32>(p.xy);let color=textureLoad(scene_color,pixel,0);let depth=textureLoad(scene_depth,pixel,0);
  let uv=p.xy*frame.viewport.zw;let clip=frame.inverse_vp*vec4<f32>(uv.x*2.-1.,1.-uv.y*2.,depth,1.);
- let world=clip.xyz/clip.w;let dx=dpdx(world);let dy=dpdy(world);let cross_n=cross(dx,dy);
+ let world=clip.xyz/clip.w;
+ let dx=step_across(world,world_at(pixel+vec2<i32>(1,0)),world_at(pixel-vec2<i32>(1,0)));
+ let dy=step_across(world,world_at(pixel+vec2<i32>(0,1)),world_at(pixel-vec2<i32>(0,1)));
+ let cross_n=cross(dx,dy);
  if depth<=0. || dot(cross_n,cross_n)<1e-12 {return color;}
  var normal=normalize(cross_n);if dot(normal,frame.eye.xyz-world)<0. {normal=-normal;}
  let incidence=max(dot(normal,env.light_direction),0.);

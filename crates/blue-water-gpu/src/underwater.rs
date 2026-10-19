@@ -151,8 +151,8 @@ impl UnderwaterBindings {
         });
         let wake = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water underwater wake/boundary"), layout: &pipelines.wake_layout,
-            entries: &[entry_buffer(5, &surface.calm_wake), entry_texture(6, &surface.calm_view),
-                entry_texture(7, &surface.calm_view), entry_sampler(8, &surface.wake_sampler), entry_buffer(16, &surface.boundary)],
+            entries: &[entry_buffer(5, &surface.wake_resources().uniform), entry_texture(6, &surface.wake_resources().displays[0]),
+                entry_texture(7, &surface.wake_resources().displays[1]), entry_sampler(8, &surface.wake_sampler), entry_buffer(16, &surface.boundary)],
         });
         let probe_params = buffer(device, std::mem::size_of::<ProbeParams>() as u64);
         let water_params = buffer(device, std::mem::size_of::<WaterParams>() as u64);

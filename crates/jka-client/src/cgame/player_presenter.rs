@@ -1,5 +1,7 @@
 //! cgame::player_presenter module facade. Implementations are grouped by responsibility.
 mod source_player;
+mod swim_tilt;
+mod move_lean;
 mod source_vtf;
 mod assets;
 mod attachments;
@@ -188,6 +190,12 @@ pub struct PlayerPresenter {
     japro_cinfo2: i32,
     /// cg_headLook (0 off, 1 exact OpenJK, 2 extra visual smoothing).
     head_look_mode: u8,
+    /// cg_swimTilt, client-side visual strength.
+    swim_tilt: f32,
+    /// cg_swimTurnBank, bank into the curvature of swim velocity (max 45°).
+    swim_turn_bank: f32,
+    /// cg_moveLean (0..1): airborne acceleration-first cosmetic lean.
+    move_lean: f32,
     /// TaystJK cg_saberTeamColors (archive, default 1). Skin forcing is unconditional
     /// in ordinary team games; this only controls saber normalization.
     saber_team_colors: bool,
@@ -257,6 +265,8 @@ pub struct PlayerPresenter {
     /// Lightweight post-Ghoul2 soft-tissue secondary motion. Stock `_humanoid`
     /// models auto-compile chest/glute masks.
     jiggle: AsyncJiggleSystem,
+    /// Source 1 Studio pane has its own physics history, separate from world entities.
+    preview_source_jiggles: HashMap<String, jka_assets::source1_jiggle::SourceJiggleAnimator>,
     /// r_jigglePhysics target selection by the loaded model's authored sex.
     jiggle_sex_filter: u8,
     /// Topology-only breast/glute height offsets. A change invalidates the cached
@@ -303,6 +313,8 @@ pub struct PlayerPresenter {
     reported_vehicle_fallbacks: HashSet<String>,
     logged_first_draw: bool,
     skinning_mode: Ghoul2SkinningMode,
+    /// Profile-only CPU skinning of the *promoted* mesh; never affects live drawing.
+    preview_cpu_remesh: bool,
     early_frustum_cull: bool,
     /// When true, camera-culled Ghoul2 models may still be submitted as
     /// shadow-only RT casters. Normal RT-off presentation is unchanged.
@@ -326,6 +338,10 @@ pub struct PlayerPresenter {
     /// `val>0.0f&&val<1.0f` gate: `0` or `>= 1` disables it, so `1.0` is
     /// "off", not "maximum".
     ghoul2_anim_smooth: f32,
+    /// Isolated Profile-preview history for optional jaPRO pose smoothing.
+    /// Never shared with live entity state, and invalidated on model/clip or
+    /// timeline discontinuities (including switching force demonstrations).
+    profile_bone_smooth_history: Option<(String, String, i32, Vec<Matrix3x4>)>,
     /// TaystJK CG_MapTorsoToWeaponFrame's process-wide busy-holster state.
     view_weapon_frame: i32,
     view_weapon_frame_time: i32,

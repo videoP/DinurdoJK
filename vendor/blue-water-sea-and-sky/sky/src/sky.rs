@@ -412,6 +412,7 @@ impl Sky {
                     &sky_layout,
                     targets,
                     hooks_layout.as_ref(),
+                    build.cache,
                 ))
             }),
         )?;
@@ -684,7 +685,7 @@ impl Sky {
             placeholders: placeholders.cloned(),
         };
         // No deck: the fog is the clear sky's own.
-        sky.uniforms.haze = [0.0, 1.0, 0.0, 0.0];
+        sky.uniforms.haze = [0.0, 1.0, 1.0, 0.0];
         sky.set_camera_height(0.03);
         sky.apply(&DEFAULT_SKY_SCENE);
         sky
@@ -930,7 +931,15 @@ impl Sky {
     /// How the air under a closed deck greys (0–1) and dims the clear sky's haze toward the horizon
     /// (`LayerUniforms.haze`): the fog sampler's and the clouds' `overcast`.
     pub fn set_haze(&mut self, grey: f32, shade: f32) {
-        self.uniforms.haze = [grey, shade, 0.0, 0.0];
+        self.uniforms.haze[0] = grey;
+        self.uniforms.haze[1] = shade;
+    }
+
+    /// The dome's night glow and night floor as a share of the authored level (1 is the authored sky, 0 a black
+    /// moonless night). The environment bake keeps the full glow, so the world's night light does not change; the
+    /// stars and the Milky Way are not dimmed. Rides in `SkyUniforms.haze.z`.
+    pub fn set_night_sky_brightness(&mut self, scale: f32) {
+        self.uniforms.haze[2] = if scale.is_finite() { scale.clamp(0.0, 1.0) } else { 1.0 };
     }
 
     /// The accumulated cloud drift (m, world XZ).
@@ -1836,6 +1845,7 @@ fn dome_pipeline(
         sky_layout,
         targets,
         clouds.map(|hooks| &hooks.bind_group_layout),
+        None,
     )
 }
 
@@ -1846,6 +1856,7 @@ fn dome_from_module(
     sky_layout: &wgpu::BindGroupLayout,
     targets: SkyTargets,
     hooks_layout: Option<&wgpu::BindGroupLayout>,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     let groups = match hooks_layout {
         Some(hooks) => vec![None, Some(sky_layout), Some(hooks)],
@@ -1886,7 +1897,7 @@ fn dome_from_module(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 

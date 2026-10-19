@@ -21,12 +21,13 @@ use crate::{
     materials::{self, TextureData, Textures},
     renderer::{
         DynamicModelAlphaMode, DynamicModelSurface, DynamicWireframeClass, DynamicModelVertex,
+        Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
         InlineModelInstance, RayTracedRigidInstance,
     },
     scene,
 };
 use jka_assets::{
-    bsp::StaticModel,
+    bsp::StaticModels,
     md3::{self, Model as Md3Model},
     pk3::AssetSearchPath,
     shader::{AlphaGen, RgbGen, Shader, Stage, TcGen, TcMod},
@@ -147,6 +148,11 @@ pub struct EntityPresenter {
     md3_lod_debug: bool,
     md3_lod_reported: HashSet<(String, usize)>,
     md3_static_report_at: Option<Instant>,
+    /// Developer A/B: reuse the existing resident Ghoul2 mesh/instance renderer
+    /// for repeated misc_model_static MD3s. Off is the original CPU path.
+    static_md3_instances: bool,
+    static_md3_meshes: HashMap<String, (Arc<Vec<Ghoul2GpuVertex>>, Arc<Vec<u32>>)>,
+    static_md3_identity_bone: Arc<Vec<Ghoul2GpuBone>>,
     md3_geometry_cache_enabled: bool,
     md3_geometry: HashMap<Md3GeometrySlot, CachedMd3Geometry>,
     md3_geometry_bytes: usize,
@@ -164,10 +170,17 @@ pub struct EntityPresenter {
     /// jaPRO `cgs.miscStaticModels` source: the map's `misc_model_static`
     /// entities. They are client-only (the game module frees them), so they
     /// come from the BSP entity string rather than from snapshots.
-    static_model_source: Arc<Vec<StaticModel>>,
+    static_model_source: Arc<StaticModels>,
     /// Surfaces for `static_model_source`, built on first use and rebuilt when
     /// the source changes or the entity assets are refreshed.
     static_props: Option<Vec<StaticProp>>,
+    /// Every (prop, LOD, surface) of `static_props` in one draw order fixed at
+    /// build time: opaque then alpha-tested, by stage layer, then texture.
+    /// Emitting visible props in this order makes same-texture surfaces of
+    /// different props adjacent, so the renderer merges them into one draw.
+    static_draw_order: Vec<StaticDrawRef>,
+    /// Per-frame LOD chosen for each static prop (`u8::MAX` = culled).
+    static_lod_scratch: Vec<u8>,
     /// Whether `static_props` carry RT caster sources (they must be rebuilt when
     /// hardware RT shadows are toggled).
     static_props_rt: bool,
@@ -184,17 +197,31 @@ struct ShieldHit {
     angles: [f32; 3],
 }
 
+#[derive(Clone, Copy)]
+struct StaticDrawRef {
+    prop: u32,
+    lod: u8,
+    surface: u32,
+}
+
 /// One placed `misc_model_static` with its world-space surfaces already built.
 struct StaticProp {
     surfaces: Vec<DynamicModelSurface>,
+    /// Optional resident-GPU equivalents. None keeps the exact CPU material path.
+    gpu_surfaces: Vec<Option<DynamicModelSurface>>,
     /// Pretransformed on model registration, switched without re-transforming
     /// thousands of misc_model_static surfaces on every camera move.
     lods: [Option<Vec<DynamicModelSurface>>; 2],
+    gpu_lods: [Option<Vec<Option<DynamicModelSurface>>>; 2],
+    /// Shader-stage index of each surface, per LOD (0 = `surfaces`).
+    layers: [Vec<u8>; 3],
     lod_count: usize,
     lod_radius: f32,
     origin: [f32; 3],
     /// Origin the cull tests use (jaPRO adds 1 + zoffset to z).
     cull_origin: [f32; 3],
+    /// PVS cluster of `cull_origin`; `None` skips the PVS test.
+    cull_cluster: Option<usize>,
     /// `RadiusFromBounds` of the frame-0 bounds scaled by the model scale; 0
     /// when the model has no bounds, which disables the frustum test.
     radius: f32,
@@ -231,6 +258,13 @@ impl EntityPresenter {
             md3_lod_debug: false,
             md3_lod_reported: HashSet::new(),
             md3_static_report_at: None,
+            static_md3_instances: false,
+            static_md3_meshes: HashMap::new(),
+            static_md3_identity_bone: Arc::new(vec![Ghoul2GpuBone {
+                row0: [1.0, 0.0, 0.0, 0.0],
+                row1: [0.0, 1.0, 0.0, 0.0],
+                row2: [0.0, 0.0, 1.0, 0.0],
+            }]),
             md3_geometry_cache_enabled: true,
             md3_geometry: HashMap::new(),
             md3_geometry_bytes: 0,
@@ -242,6 +276,8 @@ impl EntityPresenter {
             draw_map_models: true,
             static_model_source: Arc::default(),
             static_props: None,
+            static_draw_order: Vec::new(),
+            static_lod_scratch: Vec::new(),
             static_props_rt: false,
             shield_hits: HashMap::new(),
             turret_states: HashMap::new(),
@@ -350,6 +386,15 @@ impl EntityPresenter {
         self.draw_map_models = enabled;
     }
 
+    /// Changes only the client-side misc_model_static rendering path. Does not
+    /// alter world/BSP surfaces, runtime entities or GPU Ghoul2 player settings.
+    pub fn set_static_md3_instances(&mut self, enabled: bool) {
+        if self.static_md3_instances != enabled {
+            self.static_md3_instances = enabled;
+            self.static_props = None;
+        }
+    }
+
     pub fn set_md3_geometry_cache(&mut self, enabled: bool) {
         if self.md3_geometry_cache_enabled != enabled {
             self.md3_geometry.clear();
@@ -399,16 +444,19 @@ impl EntityPresenter {
     }
 
     /// Installs the current map's `misc_model_static` placements.
-    pub fn set_static_models(&mut self, models: Arc<Vec<StaticModel>>) {
+    pub fn set_static_models(&mut self, models: Arc<StaticModels>) {
         if Arc::ptr_eq(&self.static_model_source, &models) {
             return;
         }
         self.static_model_source = models;
         self.static_props = None;
+        // Static GPU source data belongs to this BSP's MD3 registration set.
+        // Do not retain it forever while changing maps/mods.
+        self.static_md3_meshes.clear();
     }
 
     /// jaPRO `CG_DrawMiscStaticModels`: every static prop that survives the
-    /// frustum and distance cull, as already-transformed MD3 surfaces. Without a
+    /// frustum, PVS and distance cull, as already-transformed MD3 surfaces. Without a
     /// view (first frame, teleport) nothing is culled. With hardware RT shadows
     /// the props are architecture that must keep shadowing, so culled ones stay
     /// in the list as shadow-only (`raster_visible = false`); that also keeps the
@@ -417,7 +465,7 @@ impl EntityPresenter {
         &mut self,
         view: Option<Ghoul2PresentationView>,
     ) -> Vec<DynamicModelSurface> {
-        if !self.draw_map_models || self.static_model_source.is_empty() {
+        if !self.draw_map_models || self.static_model_source.placements.is_empty() {
             return Vec::new();
         }
         if self.static_props.is_none() || self.static_props_rt != self.rt_rigid_casters_enabled {
@@ -425,46 +473,75 @@ impl EntityPresenter {
             let props = self.build_static_props();
             self.static_props = Some(props);
         }
-        let mut draws = Vec::new();
+        // R_inPVS(vieworg, cullorg): the view cluster's PVS row, areamask
+        // ignored as in jaPRO. A view in solid (no cluster) keeps every prop,
+        // like the world path does.
+        let pvs = self.static_model_source.visibility.as_ref();
+        let view_cluster =
+            view.and_then(|view| pvs.and_then(|vis| vis.cluster_at(view.jka_position())));
+        let Some(props) = self.static_props.as_ref() else { return Vec::new() };
+        let mut chosen = std::mem::take(&mut self.static_lod_scratch);
+        chosen.clear();
         let mut lod_counts = [0usize; 3];
-        for prop in self.static_props.iter().flatten() {
+        for prop in props {
             let culled = view.is_some_and(|view| {
                 let distance_cull = view.distance_cull();
                 (prop.radius > 0.0 && view.sphere_outside(prop.cull_origin, prop.radius))
+                    || pvs.is_some_and(|vis| !vis.r_in_pvs(view_cluster, prop.cull_cluster))
                     || (distance_cull > 0.0
                         && view.distance_to(prop.origin) - prop.radius > distance_cull)
             });
+            if culled {
+                chosen.push(u8::MAX);
+                continue;
+            }
             let lod = md3_lod_for_view(
                 view, prop.origin, prop.lod_radius, prop.lod_count,
                 self.md3_lod_scale, self.md3_lod_bias, false,
             );
-            if !culled { lod_counts[lod] += 1; }
-            let chosen = if lod == 0 { &prop.surfaces } else {
-                prop.lods[lod - 1].as_ref().unwrap_or(&prop.surfaces)
+            lod_counts[lod] += 1;
+            // A missing generated level falls back to the authored surfaces.
+            chosen.push(if lod != 0 && prop.lods[lod - 1].is_none() { 0 } else { lod as u8 });
+        }
+        let mut draws = Vec::new();
+        for entry in &self.static_draw_order {
+            if chosen[entry.prop as usize] != entry.lod { continue; }
+            let prop = &props[entry.prop as usize];
+            let surfaces = match entry.lod {
+                0 => &prop.surfaces,
+                lod => prop.lods[usize::from(lod) - 1].as_ref().unwrap_or(&prop.surfaces),
             };
-            if !culled {
-                if self.rt_rigid_casters_enabled && lod != 0 {
-                    // Keep RT caster geometry at LOD0 so changing raster LOD
-                    // does not rebuild raytracing acceleration structures.
-                    draws.extend(chosen.iter().cloned().map(|mut surface| {
-                        surface.rt_rigid = None;
-                        surface
-                    }));
-                    draws.extend(prop.surfaces.iter().cloned().map(|mut surface| {
-                        surface.raster_visible = false;
-                        surface
-                    }));
-                } else {
-                    draws.extend(chosen.iter().cloned());
-                }
-            } else if self.rt_rigid_casters_enabled {
-                // Offscreen casters likewise remain at stable authored LOD0.
+            // The resident path uses the *same* PVS, distance, frustum and LOD
+            // decisions as A. It swaps only eligible source geometry for an
+            // instanced transform, leaving all unusual material stages intact.
+            // RT falls back to A: rigid BLAS ownership must remain unchanged.
+            let gpu = if self.static_md3_instances && !self.rt_rigid_casters_enabled {
+                match entry.lod {
+                    0 => Some(&prop.gpu_surfaces),
+                    lod => prop.gpu_lods[usize::from(lod) - 1].as_ref(),
+                }.and_then(|level| level.get(entry.surface as usize))
+                    .and_then(Option::as_ref)
+            } else { None };
+            let mut surface = gpu.unwrap_or(&surfaces[entry.surface as usize]).clone();
+            if self.rt_rigid_casters_enabled && entry.lod != 0 {
+                // Keep RT caster geometry at LOD0 so changing raster LOD
+                // does not rebuild raytracing acceleration structures.
+                surface.rt_rigid = None;
+            }
+            draws.push(surface);
+        }
+        if self.rt_rigid_casters_enabled {
+            // Offscreen and lower-LOD props keep their stable authored LOD0
+            // caster as shadow-only geometry.
+            for (prop, &lod) in props.iter().zip(&chosen) {
+                if lod == 0 { continue; }
                 draws.extend(prop.surfaces.iter().cloned().map(|mut surface| {
                     surface.raster_visible = false;
                     surface
                 }));
             }
         }
+        self.static_lod_scratch = chosen;
         if self.md3_lod_debug && self.md3_static_report_at
             .is_none_or(|instant| instant.elapsed().as_secs_f32() >= 1.0) {
             println!("MD3 STATIC LOD: visible LOD0={} LOD1={} LOD2={} (auto={})",
@@ -476,9 +553,18 @@ impl EntityPresenter {
 
     fn build_static_props(&mut self) -> Vec<StaticProp> {
         let source = Arc::clone(&self.static_model_source);
-        let mut props = Vec::with_capacity(source.len());
+        let mut props = Vec::with_capacity(source.placements.len());
         let mut surfaces_total = 0usize;
-        for placement in source.iter() {
+        let mut gpu_surfaces_total = 0usize;
+        // Only promote repeated *model paths*; a singleton already uses the
+        // original efficient indexed path and gains no instance batching.
+        let mut frequencies: HashMap<String, usize> = HashMap::new();
+        if self.static_md3_instances {
+            for p in &source.placements {
+                *frequencies.entry(p.model.to_ascii_lowercase()).or_default() += 1;
+            }
+        }
+        for placement in source.placements.iter() {
             let mut axis = angles_to_axis(placement.angles);
             for (row, scale) in axis.iter_mut().zip(placement.scale) {
                 for component in row.iter_mut() {
@@ -493,7 +579,8 @@ impl EntityPresenter {
                 custom_shader: None,
             };
             // rt_rigid is filled by present_md3_ref_entity while RT casters are on.
-            let surfaces = match self.present_md3_ref_entity(1023, &submission) {
+            let mut layers: [Vec<u8>; 3] = Default::default();
+            let surfaces = match self.present_md3_ref_entity_layers(1023, &submission, None, Some(&mut layers[0])) {
                 Ok(surfaces) => surfaces,
                 Err(error) => {
                     if self.logged_unsupported.insert(format!("static:{}", placement.model)) {
@@ -503,11 +590,27 @@ impl EntityPresenter {
                 }
             };
             surfaces_total += surfaces.len();
+            let repeated = frequencies.get(&placement.model.to_ascii_lowercase())
+                .is_some_and(|count| *count >= 2);
+            let gpu_surfaces = if repeated {
+                self.static_md3_gpu_surfaces(&submission, None, &surfaces)
+            } else { vec![None; surfaces.len()] };
+            gpu_surfaces_total += gpu_surfaces.iter().filter(|s| s.is_some()).count();
+            let mut gpu_lods: [Option<Vec<Option<DynamicModelSurface>>>; 2] = [None, None];
             let mut lods: [Option<Vec<DynamicModelSurface>>; 2] = [None, None];
             let lod_count = self.md3_chain_count(&placement.model);
             for level in 1..lod_count {
-                if let Ok(draws) = self.present_md3_ref_entity_lod(1023, &submission, Some(level)) {
+                let mut level_layers = Vec::new();
+                if let Ok(draws) = self.present_md3_ref_entity_layers(
+                    1023, &submission, Some(level), Some(&mut level_layers),
+                ) {
+                    if repeated {
+                        let gpu = self.static_md3_gpu_surfaces(&submission, Some(level), &draws);
+                        gpu_surfaces_total += gpu.iter().filter(|s| s.is_some()).count();
+                        gpu_lods[level - 1] = Some(gpu);
+                    }
                     lods[level - 1] = Some(draws);
+                    layers[level] = level_layers;
                 }
             }
             let radius = self
@@ -533,16 +636,115 @@ impl EntityPresenter {
                 })).unwrap_or(radius);
             let mut cull_origin = placement.origin;
             cull_origin[2] += 1.0 + placement.zoffset;
-            props.push(StaticProp { surfaces, lods, lod_count, lod_radius, origin: placement.origin, cull_origin, radius });
+            props.push(StaticProp {
+                surfaces,
+                gpu_surfaces,
+                lods,
+                gpu_lods,
+                lod_count,
+                lod_radius,
+                origin: placement.origin,
+                cull_origin,
+                cull_cluster: placement.cull_cluster,
+                radius,
+                layers,
+            });
+        }
+        self.static_draw_order = static_draw_order(&props);
+        if self.static_md3_instances {
+            devprintln!(1, "STATIC MD3 INSTANCES: {} eligible surface placements (across LODs), {} unique resident meshes; RT shadows automatically use CPU baseline",
+                gpu_surfaces_total, self.static_md3_meshes.len());
         }
         devprintln!(
             1,
             "STATIC MODELS: {} of {} misc_model_static placement(s) built, {} surface(s)",
             props.len(),
-            source.len(),
+            source.placements.len(),
             surfaces_total,
         );
         props
+    }
+
+    /// Construct the same immutable, model-space mesh once for every repeated
+    /// MD3 surface/LOD. Ghoul2's raster path already holds these meshes in
+    /// persistent GPU VERTEX/INDEX buffers and batches compatible instances.
+    /// No approximation of authored transforms or alpha blending is allowed.
+    fn static_md3_gpu_surfaces(
+        &mut self, submission: &ItemDraw, forced_lod: Option<usize>,
+        reference: &[DynamicModelSurface],
+    ) -> Vec<Option<DynamicModelSurface>> {
+        let mut result = vec![None; reference.len()];
+        let Ok(asset) = self.select_md3(
+            &submission.model, submission.origin, 0, 1.0, forced_lod, false,
+        ) else { return result; };
+        let mut draw_index = 0;
+        for surface_asset in &asset.surfaces {
+            if surface_asset.invisible_without_override { continue; }
+            let Some(source) = asset.model.surfaces.get(surface_asset.surface_index) else { continue; };
+            if source.frame_vertices(0).is_none_or(|v| v.is_empty()) || source.indices.is_empty() {
+                continue;
+            }
+            // Base and extra authored stages are emitted in this exact order
+            // by present_md3_ref_entity_layers. Don't assume a one-to-one
+            // correspondence between authored surfaces and draw calls.
+            let stages = std::iter::once(None).chain(surface_asset.extra_stages.iter().map(Some));
+            for stage in stages {
+                let Some(draw) = reference.get(draw_index) else { return result; };
+                // The two dynamic backends submit in different passes. Do not
+                // separate coincident authored stages between those passes:
+                // even opaque overlays may use depthEqual or exact stage order.
+                let single_stage = stage.is_none() && surface_asset.extra_stages.is_empty();
+                if single_stage && matches!(draw.alpha_mode,
+                    DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                    && source.frame_vertices(0).is_some_and(|vertices| vertices.iter().all(|v| {
+                        v.normal.iter().all(|n| n.is_finite())
+                            && v.normal.iter().map(|n| n * n).sum::<f32>() > 1.0e-10
+                    }))
+                {
+                    // Geometry source ignores the shader stage, as it does not
+                    // affect model-space vertices or triangle winding.
+                    let key = format!("static-md3:{}:{:016x}:{}:{}",
+                        asset.key, asset.content_hash, surface_asset.surface_index,
+                        u8::from(surface_asset.two_sided_indices.is_some()));
+                    let (vertices, indices) = self.static_md3_meshes.entry(key.clone()).or_insert_with(|| {
+                        let vertices = source.frame_vertices(0).unwrap().iter().map(|v| Ghoul2GpuVertex {
+                            position: v.position, normal: v.normal, uv: v.uv,
+                            bone_indices: [0; 4], weights: [1.0, 0.0, 0.0, 0.0],
+                            weight_count: 1, jiggle_region: u32::MAX,
+                            jiggle_weight: 0.0, jiggle_coord: 4.0,
+                        }).collect();
+                        let indices = surface_asset.two_sided_indices.as_ref()
+                            .unwrap_or(&surface_asset.cached_indices);
+                        (Arc::new(vertices), Arc::clone(indices))
+                    });
+                    let mut gpu_draw = draw.clone();
+                    gpu_draw.vertices = Arc::new(Vec::new());
+                    gpu_draw.indices = Arc::new(Vec::new());
+                    gpu_draw.rt_rigid = None;
+                    gpu_draw.ghoul2_gpu = Some(Ghoul2GpuSkinning {
+                        mesh_key: Arc::from(key),
+                        vertices: Arc::clone(vertices),
+                        indices: Arc::clone(indices),
+                        bones: Arc::clone(&self.static_md3_identity_bone),
+                        axis: submission.axis,
+                        origin: submission.origin,
+                        color: stage.map_or(submission.rgba, |s| md3_stage_color(s, submission.rgba)),
+                        uv_xform: [1.0, 1.0, 0.0, 0.0],
+                        uv_cross: [0.0; 4],
+                        specular: None, bulge_height: 0.0, env_map: false,
+                        jiggle_offsets: [[0.0; 4]; 4], source_material: None,
+                    });
+                    result[draw_index] = Some(gpu_draw);
+                }
+                draw_index += 1;
+            }
+        }
+        // If authored draw/stage enumeration changes, retain the reference
+        // draw list instead of binding GPU geometry to the wrong material.
+        if draw_index != reference.len() {
+            return vec![None; reference.len()];
+        }
+        result
     }
 
     /// Targeted filesystem refresh for model registrations that previously
@@ -1171,6 +1373,18 @@ impl EntityPresenter {
         submission: &ItemDraw,
         forced_lod: Option<usize>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        self.present_md3_ref_entity_layers(entity_num, submission, forced_lod, None)
+    }
+
+    /// `layers` receives each draw's shader-stage index (0 = base stage), so a
+    /// caller that reorders draws can keep coincident stages in authored order.
+    fn present_md3_ref_entity_layers(
+        &mut self,
+        entity_num: u16,
+        submission: &ItemDraw,
+        forced_lod: Option<usize>,
+        mut layers: Option<&mut Vec<u8>>,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
         let asset = self.select_md3(&submission.model, submission.origin, 0, 1.0, forced_lod, false)?;
         if submission.custom_shader.is_some_and(|shader| self.is_noop_shader(shader)) {
             return Ok(Vec::new());
@@ -1241,6 +1455,9 @@ impl EntityPresenter {
                     &mut draws, &asset, surface_asset, entity_num, 0, submission.axis,
                     submission.origin, 1.0, submission.rgba, 0.0,
                 );
+            }
+            if let Some(layers) = layers.as_deref_mut() {
+                layers.extend((0..draws.len() - layers.len()).map(|stage| stage.min(255) as u8));
             }
         }
         Ok(draws)
@@ -2530,6 +2747,44 @@ fn md3_lod_for_view(
     (lod + bias as isize).clamp(0, limit) as usize
 }
 
+/// Draw order for all static prop surfaces. Opaque and alpha-tested stages
+/// write depth and do not blend, so props may be interleaved freely as long as
+/// a coincident later stage of the same surface stays behind its earlier one:
+/// sort by (mode, stage layer, glow, texture). Every other mode keeps the
+/// original per-prop submission order (the sort is stable).
+fn static_draw_order(props: &[StaticProp]) -> Vec<StaticDrawRef> {
+    let mut entries = Vec::new();
+    for (prop_index, prop) in props.iter().enumerate() {
+        let levels = std::iter::once(Some(&prop.surfaces))
+            .chain(prop.lods.iter().map(Option::as_ref));
+        for (lod, surfaces) in levels.enumerate() {
+            let Some(surfaces) = surfaces else { continue };
+            for (surface_index, surface) in surfaces.iter().enumerate() {
+                let class = match surface.alpha_mode {
+                    DynamicModelAlphaMode::Opaque => 0u8,
+                    DynamicModelAlphaMode::Mask => 1,
+                    _ => 2,
+                };
+                let key = if class == 2 { (2, 0, false, 0) } else {
+                    (
+                        class,
+                        prop.layers[lod].get(surface_index).copied().unwrap_or(0),
+                        surface.authored_glow,
+                        surface.texture.as_ref().map_or(0, |texture| Arc::as_ptr(texture) as usize),
+                    )
+                };
+                entries.push((key, StaticDrawRef {
+                    prop: prop_index as u32,
+                    lod: lod as u8,
+                    surface: surface_index as u32,
+                }));
+            }
+        }
+    }
+    entries.sort_by_key(|(key, _)| *key);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
 fn flipped_md3_indices(source: &[u32]) -> Vec<u32> {
     let mut indices = source.to_vec();
     for triangle in indices.chunks_exact_mut(3) { triangle.swap(1, 2); }
@@ -2612,6 +2867,80 @@ mod tests {
 
     fn shader_def(name: &str, stage: &str) -> String {
         format!("{name}\n{{\n{{\n{stage}\n}}\n}}\n")
+    }
+
+    fn test_static_props(models: usize) -> Arc<StaticModels> {
+        Arc::new(StaticModels {
+            placements: (0..models).map(|i| jka_assets::bsp::StaticModel {
+                model: "synthetic.md3".into(),
+                origin: [100.0 + 32.0 * i as f32, 20.0, 10.0],
+                angles: [0.0, i as f32 * 45.0, 0.0],
+                scale: [2.0, -3.0, 0.5],
+                zoffset: 0.0, cull_cluster: None,
+            }).collect(), visibility: None,
+        })
+    }
+
+    #[test]
+    fn repeated_static_md3_a_b_reuses_local_geometry_and_preserves_transforms() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(2));
+        let baseline = presenter.present_static_models(None);
+        assert_eq!(baseline.len(), 2);
+        assert!(baseline.iter().all(|draw| draw.ghoul2_gpu.is_none()));
+        presenter.set_static_md3_instances(true);
+        let instanced = presenter.present_static_models(None);
+        assert_eq!(instanced.len(), baseline.len());
+        assert_eq!(presenter.static_md3_meshes.len(), 1);
+        let left = instanced[0].ghoul2_gpu.as_ref().expect("promoted MD3");
+        let right = instanced[1].ghoul2_gpu.as_ref().expect("promoted MD3");
+        assert_eq!(left.mesh_key, right.mesh_key);
+        assert!(Arc::ptr_eq(&left.vertices, &right.vertices));
+        assert!(Arc::ptr_eq(&left.indices, &right.indices));
+        assert!(Arc::ptr_eq(&left.bones, &right.bones));
+        assert_eq!(left.vertices[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(left.indices.as_slice(), &[0, 2, 1]);
+        for (baseline, gpu) in baseline.iter().zip(instanced.iter()) {
+            let skin = gpu.ghoul2_gpu.as_ref().unwrap();
+            assert_eq!(baseline.alpha_mode, gpu.alpha_mode);
+            assert_eq!(baseline.authored_glow, gpu.authored_glow);
+            assert_eq!(baseline.lighting_origin, gpu.lighting_origin);
+            assert_eq!(baseline.vertices[0].position,
+                transform_model_point(skin.vertices[0].position, skin.axis, skin.origin, 1.0));
+            assert_eq!(baseline.vertices[0].normal,
+                transform_model_normal(skin.vertices[0].normal, skin.axis));
+        }
+        presenter.set_static_md3_instances(false);
+        assert!(presenter.present_static_models(None).iter().all(|draw| draw.ghoul2_gpu.is_none()));
+    }
+
+    #[test]
+    fn static_md3_instancing_keeps_singletons_and_rt_casters_on_cpu() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(1));
+        presenter.set_static_md3_instances(true);
+        assert!(presenter.present_static_models(None).iter().all(|draw| draw.ghoul2_gpu.is_none()));
+        presenter.set_static_models(test_static_props(2));
+        presenter.rt_rigid_casters_enabled = true;
+        let draws = presenter.present_static_models(None);
+        assert_eq!(draws.len(), 2);
+        assert!(draws.iter().all(|draw| draw.ghoul2_gpu.is_none() && draw.rt_rigid.is_some()));
+    }
+
+    #[test]
+    fn static_md3_multistage_stays_on_original_draw_path() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        let asset = Arc::get_mut(presenter.md3_models.get_mut("synthetic.md3").unwrap()).unwrap();
+        asset.surfaces[0].extra_stages.push(Md3ExtraStage {
+            index: 1, texture: None, alpha_mode: DynamicModelAlphaMode::Opaque,
+            authored_glow: false, rgb_gen: RgbGen::Identity, alpha_gen: AlphaGen::Identity,
+            rgb_const: [1.0; 3], alpha_const: 1.0, tc_gen: TcGen::Base, tc_mods: vec![],
+        });
+        presenter.set_static_models(test_static_props(2));
+        presenter.set_static_md3_instances(true);
+        let draws = presenter.present_static_models(None);
+        assert_eq!(draws.len(), 4);
+        assert!(draws.iter().all(|draw| draw.ghoul2_gpu.is_none()));
     }
 
     #[test]

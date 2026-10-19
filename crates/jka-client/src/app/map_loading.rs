@@ -338,6 +338,9 @@ impl App {
             pbr_materials: self.video.pbr,
             allow_asset_overrides: self.video.allow_asset_overrides,
             steam_audio: self.audio.steam_audio,
+            // `menudevmap`: the stage look (water, retextures, fx) without props.
+            menu_look: self.menu_look_play,
+            menu_props: false,
         }
     }
 
@@ -553,7 +556,25 @@ impl App {
     }
 
     pub(in crate::app) fn request_frontend_background(&mut self) {
-        self.request_frontend_background_scene(FRONTEND_BACKGROUND_MAP, FRONTEND_BACKGROUND_MAP);
+        // Back at the menu: a following gameplay load is stock again.
+        self.menu_look_play = false;
+        // The exported props file is part of the cache identity, so an edited
+        // layout never shows a still of the previous one.
+        let props_stamp = std::fs::metadata(
+            self.game.as_deref().unwrap_or(&self.base).join("mapmods").join("mp").join("duel9.ent"),
+        )
+        .ok()
+        .map(|meta| {
+            let seconds = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            format!("{:x}-{:x}", meta.len(), seconds)
+        })
+        .unwrap_or_else(|| "0".to_owned());
+        let scene_id = format!("{}-{props_stamp}", super::constants::FRONTEND_BACKGROUND_SCENE_ID);
+        self.request_frontend_background_scene(&scene_id, FRONTEND_BACKGROUND_MAP);
     }
 
     /// Scene selection entry point: future UI/config can select any map *and*
@@ -575,6 +596,8 @@ impl App {
         options.visual_only = true;
         options.client_physics = false;
         options.steam_audio = false;
+        options.menu_look = true;
+        options.menu_props = true;
         options
     }
 
@@ -1130,7 +1153,8 @@ pub(in crate::app) fn spawn_map_loader(
                         // that parsed data instead of reparsing every .shader file,
                         // but all EFX reads/texture decodes/image sampling happen on
                         // a map-pool worker rather than the presentation thread.
-                        let fx_light_promotion = if request.analyze_fx_light_profiles {
+                        let menu_fx_profiles = request.prepare_options.menu_props && !map.fx_runners.is_empty();
+                        let fx_light_promotion = if request.analyze_fx_light_profiles || menu_fx_profiles {
                             let profile_started = Instant::now();
                             let opened = jka_assets::pk3::AssetSearchPath::open_game(
                                 &base,
@@ -1141,8 +1165,14 @@ pub(in crate::app) fn spawn_map_loader(
                                     fx_assets.set_allow_asset_overrides(
                                         request.prepare_options.allow_asset_overrides,
                                     );
-                                    let effect_names =
-                                        crate::fx::light_promotion::effect_asset_names(&fx_assets);
+                                    let effect_names = if request.analyze_fx_light_profiles {
+                                        crate::fx::light_promotion::effect_asset_names(&fx_assets)
+                                    } else {
+                                        // Profile only this scene's runners on the map
+                                        // worker; reuse the regular classifier and avoid
+                                        // scanning all game FX for the menu.
+                                        crate::fx::light_promotion::runner_effect_asset_names(&map.fx_runners)
+                                    };
                                     let total = effect_names.len().max(1).min(u32::MAX as usize) as u32;
                                     let shaders = Arc::clone(&map.shader_library);
                                     match jobs.submit_progress(

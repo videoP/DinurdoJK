@@ -928,12 +928,14 @@ fn row_inner<R>(
             rect.top() + ROW_H,
         ),
     );
-    let sense = if resettable {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let mut response = ui.interact(label_rect, ui.id().with(("row_label", text)), sense);
+    let mut response = ui.interact(
+        label_rect,
+        ui.id().with(("row_label", text)),
+        egui::Sense::click(),
+    );
+    // Double-clicking the label of a row whose slider knows its default restores
+    // that default (see `slider_with`). Rows without such a slider ignore it.
+    let label_default_requested = response.double_clicked();
     if !tip.is_empty() {
         let hint = if resettable {
             format!("{tip}
@@ -945,7 +947,7 @@ Click the label to restore the default.")
         response = response.on_hover_text(hint);
     }
     let hovered = response.hovered();
-    if response.clicked() {
+    if resettable && response.clicked() {
         ui.ctx()
             .data_mut(|data| data.insert_temp(reset_channel(), reset));
     }
@@ -1036,7 +1038,19 @@ Click the label to restore the default.")
         visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, WARNING);
         visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, WARNING);
     }
-    add(&mut control)
+    if label_default_requested {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(label_default_channel(), true));
+    }
+    let result = add(&mut control);
+    ui.ctx()
+        .data_mut(|data| data.remove::<bool>(label_default_channel()));
+    result
+}
+
+/// Set for the duration of one row's control when its label was double-clicked.
+fn label_default_channel() -> egui::Id {
+    egui::Id::new("jka_row_label_default")
 }
 
 /// Width available to a meter or slider track inside a control column.
@@ -1051,18 +1065,63 @@ pub(super) fn slider(
     range: std::ops::RangeInclusive<f32>,
     readout: &str,
 ) -> bool {
+    slider_with(ui, value, range, readout, None, false)
+}
+
+/// A slider that restores `default` when double-clicked.
+pub(super) fn slider_default(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    readout: &str,
+    default: f32,
+) -> bool {
+    slider_with(ui, value, range, readout, Some(default), false)
+}
+
+/// Full form: optional double-click default, optional logarithmic travel (fine
+/// control near the low end of a range that spans decades).
+pub(super) fn slider_with(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    readout: &str,
+    default: Option<f32>,
+    logarithmic: bool,
+) -> bool {
     // Slider ignores `add_sized` for its rail, so drive it through the spacing
     // width instead. Matching `track_width` keeps every slider readout on the
     // same column as the quality meters' value labels.
     let width = track_width(ui);
     ui.spacing_mut().slider_width = width;
-    let changed = ui
-        .add(
-            egui::Slider::new(value, range)
-                .show_value(false)
-                .trailing_fill(true),
-        )
-        .changed();
+    let response = ui.add(
+        egui::Slider::new(value, range)
+            .show_value(false)
+            .trailing_fill(true)
+            .logarithmic(logarithmic)
+            .smallest_positive(1.0),
+    );
+    let mut changed = response.changed();
+    if let Some(default) = default {
+        // egui's Slider senses drag only, so `response.double_clicked()` never
+        // fires; read the raw pointer double-click over the rail instead. A
+        // double-click on the row's label asks for the same thing.
+        let label_requested = ui
+            .ctx()
+            .data(|data| data.get_temp::<bool>(label_default_channel()))
+            .unwrap_or(false);
+        if label_requested {
+            ui.ctx()
+                .data_mut(|data| data.remove::<bool>(label_default_channel()));
+        }
+        let double_clicked = label_requested
+            || (response.contains_pointer()
+                && ui.input(|input| input.pointer.button_double_clicked(egui::PointerButton::Primary)));
+        if double_clicked && *value != default {
+            *value = default;
+            changed = true;
+        }
+    }
     ui.add_space(10.0);
     glow_label(ui, readout, 12.5, TEXT);
     changed

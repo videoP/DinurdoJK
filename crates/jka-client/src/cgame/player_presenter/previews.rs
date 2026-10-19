@@ -8,6 +8,10 @@ use crate::cgame::player_presenter::{
 };
 
 impl PlayerPresenter {
+    pub(crate) fn profile_body_shape_available(&self, info: &crate::cgame::ClientInfo) -> bool {
+        let key = super::player_model_key(info);
+        matches!(self.lookup_model(&key), super::assets::loading::ModelLookup::Ready(model) if model.body_shape_available)
+    }
     /// Render one externally supplied pose using the model's native mesh rig.
     /// This is the input seam for future animation decoders; sampling, timing
     /// and clip playback remain the caller's responsibility.
@@ -22,10 +26,7 @@ impl PlayerPresenter {
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let model = self.load_model(info)?;
         let plan = jka_assets::skeleton::cached_retargeter(source_skeleton, &model.gla.skeleton)?;
-        let mut pose = plan.retarget(input)?;
-        if let Some(pivots) = &model.source_native_pivots {
-            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(&model.gla, &pose, pivots)?;
-        }
+        let pose = model.bind_mesh_pose(plan.retarget(input)?)?;
         self.render_glm_surfaces(
             0, &info.model_qpath(), &model.glm, &model.gla, &model.surfaces,
             self.jiggle_profile_for_sex(model.jiggle.as_deref(), model.female),
@@ -170,8 +171,8 @@ impl PlayerPresenter {
         )
     }
 
-    /// Modern Profile viewport: stock humanoid stand animation plus the actual
-    /// selected saber hilts bolted to the same hand tags used by CG_Player.
+    /// Modern Profile viewport: stock humanoid walk-in-place animation plus
+    /// the selected saber hilts bolted to the same hand tags used by CG_Player.
     /// This is deliberately a thin presentation path over the normal assets;
     /// model/skin/saber semantics remain OpenJK-compatible userinfo values.
     pub fn present_profile_player_preview(
@@ -188,7 +189,11 @@ impl PlayerPresenter {
         // authored cervical/cranium Ghoul2 look bones.
         head_look: [f32; 2],
         studio_cinematic: bool,
-    ) -> Result<(Vec<DynamicModelSurface>, [Option<[f32; 3]>; 5]), String> {
+    ) -> Result<(Vec<DynamicModelSurface>, [Option<[f32; 3]>; 7]), String> {
+        // This presentation route doesn't call present_snapshot_players, which
+        // normally advances the stage clock. The async jiggle worker needs a
+        // monotonically advancing preview timeline to integrate the walk pose.
+        self.stage_time_ms = current_time.max(0);
         let model = self.load_model(info)?;
         let animation_number = animation_index(animation_name)
             .ok_or_else(|| format!("missing animation table entry {animation_name}"))?
@@ -255,13 +260,50 @@ impl PlayerPresenter {
             }
         }
         let pose_started = Instant::now();
-        let pose = model.bind_animation_pose(
-            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time.max(0))?,
-        )?;
+        // Feed Ghoul2's actual fractional-frame interpolation to the optional
+        // jaPRO SmoothLow filter, exactly as live player presentation does.
+        // Smooth the *animation* skeleton before Source/JKA mesh retargeting;
+        // native Source jigglebones can still apply their own secondary motion.
+        let mut animation_pose =
+            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time.max(0))?;
+        if self.ghoul2_anim_smooth > 0.0 && self.ghoul2_anim_smooth < 1.0 {
+            const MAX_HISTORY_GAP_MS: i32 = 250;
+            if let Some((old_model, old_animation, old_time, previous)) =
+                self.profile_bone_smooth_history.as_ref()
+            {
+                if old_model == &model.key
+                    && old_animation == animation_name
+                    && current_time > *old_time
+                    && current_time.saturating_sub(*old_time) <= MAX_HISTORY_GAP_MS
+                    && previous.len() == animation_pose.len()
+                {
+                    animation_pose = super::smooth_ghoul2_pose(
+                        &model.animation_gla, previous, &animation_pose,
+                        self.ghoul2_anim_smooth,
+                    );
+                }
+            }
+            self.profile_bone_smooth_history = Some((
+                model.key.clone(), animation_name.to_owned(), current_time,
+                animation_pose.clone(),
+            ));
+        } else {
+            self.profile_bone_smooth_history = None;
+        }
+        let mut pose = model.bind_animation_pose(animation_pose)?;
+        if model.source_jiggles_enabled {
+            if let Some(bindings) = model.source_jiggles.as_deref() {
+                self.preview_source_jiggles
+                    .entry(model.key.clone())
+                    .or_default()
+                    .update(bindings, model.gla.skeleton.len(), &mut pose,
+                            axis, origin, current_time);
+            }
+        }
         // The UI anchors use the *same animated Ghoul2 pose* as skinning,
         // including cursor-driven cranium/cervical edits and model yaw.
         // No fixed screen percentages or arbitrary player-space guesses.
-        let mut anchors = [None; 5];
+        let mut anchors = [None; 7];
         for (index, tag) in [(0, "*head_top"), (2, "*back"),
             (3, "*r_hand"), (4, "*l_hand")] {
             if let Some(matrix) = model_bolt_matrix_timed(
@@ -278,8 +320,15 @@ impl PlayerPresenter {
                 }
             }
         }
+        if let Some(profile) = model.jiggle.as_deref() {
+            anchors[5] = profile.studio_body_anchor(false, &pose, axis, origin);
+            anchors[6] = profile.studio_body_anchor(true, &pose, axis, origin);
+        }
         record_pose_eval(&mut self.perf, pose_started);
-        let mut draws = self.render_glm_surfaces_tinted(
+        // The studio is CPU-skinned for cinematic lighting. Use the same
+        // promoted bind-pose mesh as gameplay when drawing its body shape.
+        self.preview_cpu_remesh = true;
+        let body_result = self.render_glm_surfaces_tinted(
             0,
             &info.model_qpath(),
             &model.glm,
@@ -294,7 +343,9 @@ impl PlayerPresenter {
             skin_tint,
             None,
             true,
-        )?;
+        );
+        self.preview_cpu_remesh = false;
+        let mut draws = body_result?;
 
         if with_sabers {
             for (saber_num, saber_name, hand_name) in [

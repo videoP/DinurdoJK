@@ -3,7 +3,7 @@ use crate::renderer::{
     auto_detail_fallback_index, create_fast_world_wireframe_pipeline, create_wireframe_pipeline,
     create_world_pipeline_variant_from_plan, create_world_wireframe_pipeline, pipeline_hash,
     required_auto_detail_indices, try_load_texture_asset_from_search_path, ui, upload_texture,
-    AssetSearchPath, CullDebugMode, DrawClass, DynamicLightsMode, DynamicShadowsMode, FootprintMode,
+    wireframe_cull_slot, AssetSearchPath, CullDebugMode, CullMode, DrawClass, DynamicLightsMode, DynamicShadowsMode, FootprintMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
     WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldPipelineVariant,
@@ -352,22 +352,27 @@ impl Renderer {
         let samples = self.msaa_samples;
         if self.world.is_some()
             && self.wireframe_mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0
-            && self.wireframe_pipeline.is_none()
         {
-            let key = PipelineJobKey::new(
-                "world-wireframe",
-                0,
-                pipeline_hash(&(scene_format, samples)),
-            );
-            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
-                self.wireframe_pipeline = Some(pipeline);
-            } else {
-                let device = self.device.clone();
-                let layout = self.wireframe_pipeline_layout.clone();
-                let shader = self.wireframe_shader.clone();
-                self.pipeline_jobs.request(key, "world wireframe", move || {
-                    create_wireframe_pipeline(&device, &layout, &shader, scene_format, samples)
-                });
+            for cull in [CullMode::None, CullMode::Front, CullMode::Back] {
+                let slot = wireframe_cull_slot(cull);
+                if self.wireframe_pipeline[slot].is_some() {
+                    continue;
+                }
+                let key = PipelineJobKey::new(
+                    "world-wireframe",
+                    slot as u32,
+                    pipeline_hash(&(scene_format, samples)),
+                );
+                if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                    self.wireframe_pipeline[slot] = Some(pipeline);
+                } else {
+                    let device = self.device.clone();
+                    let layout = self.wireframe_pipeline_layout.clone();
+                    let shader = self.wireframe_shader.clone();
+                    self.pipeline_jobs.request(key, "world wireframe", move || {
+                        create_wireframe_pipeline(&device, &layout, &shader, scene_format, samples, cull)
+                    });
+                }
             }
         }
 
@@ -602,11 +607,7 @@ impl Renderer {
             weather_surface: self.weather_surface_needed(),
             classic_render_flags: self.classic_world_render_flags() != 0,
             static_bsp_ao: self.static_bsp_ao_enabled,
-            baked_sun_relight: self.baked_sun_removal > 0.0
-                && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some())
-                && (self.cascaded_shadows_enabled
-                    || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-                        && self.ray_tracing_supported)),
+            baked_sun_relight: self.baked_lighting_shader_needed(),
             planar_debug: self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off,
             deluxe: self.deluxe_shader_enabled(),
             deluxe_specular: self.deluxe_shader_enabled() && self.deluxe_specular > 0.0,
@@ -622,6 +623,18 @@ impl Renderer {
 
     pub(in crate::renderer) fn sky_debug_shader_needed(&self) -> bool {
         self.sky_perf_probe != 0 || self.sky_fractal_override
+    }
+
+    /// Shared by frame routing and shader specialization: the fast renderer
+    /// cannot apply these controls, even when every other effect is disabled.
+    pub(in crate::renderer) fn baked_lighting_shader_needed(&self) -> bool {
+        (self.baked_indirect_scale - 1.0).abs() > 0.0001
+            || (self.baked_indirect_saturation - 1.0).abs() > 0.0001
+            || (self.baked_indirect_power - 1.0).abs() > 0.0001
+            || self.baked_sun_debug_mode != 0
+            || self.sun_lighting
+            || (self.baked_sun_removal > 0.0
+                && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some()))
     }
 
     /// Snow shell, Snowflow and footprint shading only ever touch authored snow
@@ -675,11 +688,7 @@ impl Renderer {
         let needed = self.weather_surface_needed();
         let classic = self.classic_world_render_flags() != 0;
         let static_ao = self.static_bsp_ao_enabled;
-        let baked_sun_relight = self.baked_sun_removal > 0.0
-            && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some())
-            && (self.cascaded_shadows_enabled
-                || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-                    && self.ray_tracing_supported));
+        let baked_sun_relight = self.baked_lighting_shader_needed();
         let planar_debug = self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off;
         let surface_deformation = self.surface_deformation_shader_needed();
         let dynamic_light_debug = self.dynamic_light_debug;

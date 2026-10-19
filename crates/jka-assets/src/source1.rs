@@ -3,10 +3,95 @@
 //! This does NOT pretend that ValveBiped transforms are interchangeable with
 //! Ghoul2's `_humanoid.gla`: `source1_rig` performs an explicit rebind.
 
+
+/// Source SDK `STUDIO_PROC_JIGGLE` (5) and `mstudiojigglebone_t` flags.
+/// These are authored physics constraints, not animation keyframes.
+pub const STUDIO_PROC_JIGGLE: i32 = 5;
+pub const JIGGLE_IS_FLEXIBLE: u32 = 0x01;
+pub const JIGGLE_IS_RIGID: u32 = 0x02;
+pub const JIGGLE_HAS_YAW_CONSTRAINT: u32 = 0x04;
+pub const JIGGLE_HAS_PITCH_CONSTRAINT: u32 = 0x08;
+pub const JIGGLE_HAS_ANGLE_CONSTRAINT: u32 = 0x10;
+pub const JIGGLE_HAS_LENGTH_CONSTRAINT: u32 = 0x20;
+pub const JIGGLE_HAS_BASE_SPRING: u32 = 0x40;
+pub const JIGGLE_IS_BOING: u32 = 0x80;
+
+/// The actual Source 1 binary jiggle rule (35 four-byte fields; v48/v49).
+/// Values are kept in Source's authored units. The secondary-motion solver
+/// converts length into model units after rig fitting.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceJiggleParams {
+    pub flags: u32,
+    pub length: f32,
+    pub tip_mass: f32,
+    pub yaw_stiffness: f32,
+    pub yaw_damping: f32,
+    pub pitch_stiffness: f32,
+    pub pitch_damping: f32,
+    pub along_stiffness: f32,
+    pub along_damping: f32,
+    pub angle_limit: f32,
+    pub min_yaw: f32,
+    pub max_yaw: f32,
+    pub yaw_friction: f32,
+    pub yaw_bounce: f32,
+    pub min_pitch: f32,
+    pub max_pitch: f32,
+    pub pitch_friction: f32,
+    pub pitch_bounce: f32,
+    pub base_mass: f32,
+    pub base_stiffness: f32,
+    pub base_damping: f32,
+    pub base_min_left: f32,
+    pub base_max_left: f32,
+    pub base_left_friction: f32,
+    pub base_min_up: f32,
+    pub base_max_up: f32,
+    pub base_up_friction: f32,
+    pub base_min_forward: f32,
+    pub base_max_forward: f32,
+    pub base_forward_friction: f32,
+    pub boing_impact_speed: f32,
+    pub boing_impact_angle: f32,
+    pub boing_damping_rate: f32,
+    pub boing_frequency: f32,
+    pub boing_amplitude: f32,
+}
+
+fn parse_jiggle_params(bytes: &[u8], offset: usize) -> Result<SourceJiggleParams, String> {
+    // All 35 fields, including fields we don't yet simulate, must be in the
+    // declared MDL; unchecked procindex offsets are not trustworthy.
+    bytes.get(offset..offset.checked_add(140).ok_or("jiggle offset overflow")?)
+        .ok_or("jiggle rule outside MDL")?;
+    let flags = i32_at(bytes, offset)? as u32;
+    let field = |index: usize| f32_at(bytes, offset + index * 4);
+    Ok(SourceJiggleParams {
+        flags, length: field(1)?, tip_mass: field(2)?,
+        yaw_stiffness: field(3)?, yaw_damping: field(4)?,
+        pitch_stiffness: field(5)?, pitch_damping: field(6)?,
+        along_stiffness: field(7)?, along_damping: field(8)?,
+        angle_limit: field(9)?,
+        min_yaw: field(10)?, max_yaw: field(11)?,
+        yaw_friction: field(12)?, yaw_bounce: field(13)?,
+        min_pitch: field(14)?, max_pitch: field(15)?,
+        pitch_friction: field(16)?, pitch_bounce: field(17)?,
+        base_mass: field(18)?, base_stiffness: field(19)?,
+        base_damping: field(20)?, base_min_left: field(21)?,
+        base_max_left: field(22)?, base_left_friction: field(23)?,
+        base_min_up: field(24)?, base_max_up: field(25)?,
+        base_up_friction: field(26)?, base_min_forward: field(27)?,
+        base_max_forward: field(28)?, base_forward_friction: field(29)?,
+        boing_impact_speed: field(30)?, boing_impact_angle: field(31)?,
+        boing_damping_rate: field(32)?, boing_frequency: field(33)?,
+        boing_amplitude: field(34)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceBone {
     pub name: String,
     pub parent: Option<usize>,
+    pub jiggle: Option<SourceJiggleParams>,
     pub bind_position: [f32; 3],
     pub bind_quaternion: [f32; 4],
     /// StudioMDL's authored inverse bind matrix (`mstudiobone_t::poseToBone`).
@@ -169,8 +254,24 @@ pub fn parse_source1_skeleton(bytes: &[u8]) -> Result<SourceSkeleton, String> {
                 *v = f32_at(bytes, base + 96 + (j * 4 + k) * 4)?;
             }
         }
+        // `mstudiobone_t` v48/v49: proctype at +164, procindex at +168.
+        // The index is bone-relative, not file-relative.
+        let proctype = i32_at(bytes, base + 164)?;
+        let procindex = i32_at(bytes, base + 168)?;
+        let jiggle = if proctype == STUDIO_PROC_JIGGLE {
+            if procindex <= 0 {
+                return Err(format!("Source jiggle bone {name} has invalid procindex {procindex}"));
+            }
+            let at = base.checked_add(procindex as usize)
+                .ok_or("jiggle rule offset overflow")?;
+            Some(parse_jiggle_params(bytes, at)
+                .map_err(|error| format!("Source jiggle bone {name}: {error}"))?)
+        } else {
+            None
+        };
         bones.push(SourceBone {
             name,
+            jiggle,
             parent: (parent >= 0).then_some(parent as usize),
             bind_position,
             bind_quaternion,
@@ -297,6 +398,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_compiled_jigglebone_rule() {
+        let mut mdl = v48_stub(640);
+        mdl[156..160].copy_from_slice(&1i32.to_le_bytes());
+        mdl[160..164].copy_from_slice(&256i32.to_le_bytes());
+        mdl[256..260].copy_from_slice(&216i32.to_le_bytes());
+        mdl[472..477].copy_from_slice(b"Hair\0");
+        mdl[256 + 164..256 + 168].copy_from_slice(&STUDIO_PROC_JIGGLE.to_le_bytes());
+        mdl[256 + 168..256 + 172].copy_from_slice(&240i32.to_le_bytes());
+        let rule = 256 + 240;
+        mdl[rule..rule + 4].copy_from_slice(&(JIGGLE_IS_FLEXIBLE | JIGGLE_HAS_ANGLE_CONSTRAINT).to_le_bytes());
+        mdl[rule + 4..rule + 8].copy_from_slice(&12.5f32.to_le_bytes());
+        mdl[rule + 36..rule + 40].copy_from_slice(&0.4f32.to_le_bytes());
+        let bone = &parse_source1_skeleton(&mdl).unwrap().bones[0];
+        let jiggle = bone.jiggle.unwrap();
+        assert_eq!(bone.name, "Hair");
+        assert_eq!(jiggle.length, 12.5);
+        assert_eq!(jiggle.angle_limit, 0.4);
+        assert!(jiggle.flags & JIGGLE_IS_FLEXIBLE != 0);
+    }
+
+    #[test]
+    fn refuses_out_of_bounds_jiggle_rule() {
+        let mut mdl = v48_stub(490);
+        mdl[156..160].copy_from_slice(&1i32.to_le_bytes());
+        mdl[160..164].copy_from_slice(&256i32.to_le_bytes());
+        mdl[256..260].copy_from_slice(&216i32.to_le_bytes());
+        mdl[472..477].copy_from_slice(b"Hair\0");
+        mdl[256 + 164..256 + 168].copy_from_slice(&STUDIO_PROC_JIGGLE.to_le_bytes());
+        mdl[256 + 168..256 + 172].copy_from_slice(&230i32.to_le_bytes());
+        assert!(parse_source1_skeleton(&mdl).unwrap_err().contains("outside MDL"));
+    }
+
+    #[test]
     fn skin_family_resolves_through_the_table() {
         let table = SourceMaterialTable {
             textures: vec!["a".into(), "b".into(), "c".into()],
@@ -313,4 +447,9 @@ mod tests {
             vec!["materials/models/x/c.vmt".to_owned()]
         );
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_parse_jiggle_for_animator(bytes: &[u8]) -> SourceJiggleParams {
+    parse_jiggle_params(bytes, 0).unwrap()
 }

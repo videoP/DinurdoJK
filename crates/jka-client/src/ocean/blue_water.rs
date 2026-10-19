@@ -27,7 +27,13 @@ fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
 pub struct BlueWaterOcean {
     pub field: blue_water_gpu::WaveField,
     pub surface_waves: blue_water_gpu::surface_waves::SurfaceWaves,
+    pub shore_waves: [Option<blue_water_gpu::surface_waves::SurfaceWaves>; super::OCEAN_MAX_SURFACES],
+    pub shore_maps: Option<std::sync::Arc<super::upstream_coast::Maps>>,
+    shore_shelter: bool,
     pub original_surface: Option<super::original_surface::SurfaceRenderer>,
+    /// Blue Water's ship wake (created while `OceanSettings::blue_wake` is on) and the commands waiting for a frame.
+    pub wake: Option<super::blue_wake::BlueWake>,
+    pub wake_pending: Vec<super::blue_wake::WakeCommand>,
     _displacement: wgpu::Texture,
     _normal: wgpu::Texture,
     pub displacement_view: wgpu::TextureView,
@@ -42,6 +48,24 @@ pub struct BlueWaterOcean {
 }
 
 impl BlueWaterOcean {
+    pub fn waves(&self,slot:usize)->&blue_water_gpu::surface_waves::SurfaceWaves {
+        self.shore_waves.get(slot).and_then(Option::as_ref).unwrap_or(&self.surface_waves)
+    }
+
+    pub fn set_shore(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,maps:Option<std::sync::Arc<super::upstream_coast::Maps>>,shelter:bool) {
+        if (self.shore_maps.as_ref().zip(maps.as_ref()).is_some_and(|(a,b)|std::sync::Arc::ptr_eq(a,b))
+            || (self.shore_maps.is_none() && maps.is_none())) && self.shore_shelter == shelter {return;}
+        self.shore_shelter=shelter;
+        self.shore_waves=std::array::from_fn(|_|None);
+        if let Some(maps)=&maps {
+            for (slot,map) in maps.iter().filter(|(slot,_)|*slot<super::OCEAN_MAX_SURFACES) {
+                let waves=blue_water_gpu::surface_waves::SurfaceWaves::with_shore_shelter(device,queue,&self.field,std::sync::Arc::clone(map),shelter);
+                waves.write(queue,&self.field,self.time,1.0,1.0);
+                self.shore_waves[*slot]=Some(waves);
+            }
+        }
+        self.shore_maps=maps;
+    }
     pub fn new(device: &wgpu::Device) -> Self {
         let field = blue_water_gpu::WaveField::new(device, QualityTier::High);
         let surface_waves = blue_water_gpu::surface_waves::SurfaceWaves::new(device, &field);
@@ -147,7 +171,12 @@ impl BlueWaterOcean {
         Self {
             field,
             surface_waves,
+            shore_waves: std::array::from_fn(|_|None),
+            shore_maps: None,
+            shore_shelter: true,
             original_surface: None,
+            wake: None,
+            wake_pending: Vec::new(),
             _displacement: displacement,
             _normal: normal,
             displacement_view,
@@ -175,6 +204,7 @@ impl BlueWaterOcean {
         delta: f32,
         updates_per_second: f32,
         waves: super::BlueWaterWaves,
+        swell: [[f32;4];2],
     ) {
         self.updated_this_frame = false;
         let delta = f64::from(delta.max(0.0));
@@ -203,6 +233,7 @@ impl BlueWaterOcean {
         {
             self.updated_this_frame = true;
             self.surface_waves.write(queue, &self.field, self.time, 1.0, 1.0);
+            for waves in self.shore_waves.iter().flatten() {waves.write_with_swell(queue,&self.field,self.time,1.0,1.0,swell);}
             if !self.adapter_enabled { return; }
             let n = self.field.resolution();
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -238,7 +269,7 @@ mod tests {
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let mut ocean = BlueWaterOcean::new(&device);
             let mut encoder = device.create_command_encoder(&Default::default());
-            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default());
+            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]]);
             let n = ocean.field.resolution();
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Blue Water adapter readback"),

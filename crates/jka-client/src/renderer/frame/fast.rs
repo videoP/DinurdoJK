@@ -1,5 +1,6 @@
 //! Frame fast.
 use crate::renderer::{
+    wireframe_cull_slot,
     world_stage_probe_excludes, aabb_intersects_clip_frustum, active_batch_selection, batch_area_visible, camera_depth_clear,
     draw_snow_shell_fast, draw_world_batch, effective_area_mask, hidden_bsp_model_surface, hidden_inline_batch, inspector_index_range,
     ocean_suppresses_batch, refresh_auto4_lazy_collapse, sample_view_rotation,
@@ -135,10 +136,16 @@ impl Renderer {
                         &self.device,
                         &self.queue,
                         &world.surface_sprite_effects,
+                        world.surface_sprite_resident.as_ref(),
                         &render_camera,
+                        view_proj,
                         pvs_cluster,
                         uniform.camera_pos_time[3] * 1000.0,
+                        self.grass_enabled && world.grass.is_some(),
+                        self.weather_wind,
                     ));
+                info.surface_sprites = prepared_surface_sprite_effects
+                    .as_ref().map(|prepared| prepared.stats).unwrap_or_default();
             }
         }
         let dynamic_prepare_started = Instant::now();
@@ -565,12 +572,15 @@ impl Renderer {
                 }
             }
             if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, false);
                 self.surface_sprite_effect_renderer.draw(
                     &mut pass,
                     &self.camera_bind_group,
                     &world.surface_sprite_effects,
+                    world.surface_sprite_resident.as_ref(),
                     prepared,
                 );
+                self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, true);
             }
             if let Some(ocean) = self.ocean.as_ref() {
                 ocean.draw_spray(
@@ -700,9 +710,8 @@ impl Renderer {
             if self.wireframe_mask != 0 {
                 let mask = self.wireframe_mask;
                 if mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0 {
-                    if let Some(pipeline) = &self.wireframe_pipeline {
-                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
-                        pass.set_pipeline(pipeline);
+                    if self.wireframe_pipeline.iter().all(Option::is_some) {
+                        let mut bound_cull = None;
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(0, &self.camera_bind_group, &[]);
                         for &batch_index in active.indices {
@@ -727,6 +736,14 @@ impl Renderer {
                                     view_proj,
                                 )
                             {
+                                let slot = wireframe_cull_slot(batch.source.pipeline.cull);
+                                if bound_cull != Some(slot) {
+                                    if let Some(pipeline) = &self.wireframe_pipeline[slot] {
+                                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                                        pass.set_pipeline(pipeline);
+                                    }
+                                    bound_cull = Some(slot);
+                                }
                                 if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
@@ -798,6 +815,7 @@ impl Renderer {
                             &mut pass,
                             &self.camera_bind_group,
                             &world.surface_sprite_effects,
+                            world.surface_sprite_resident.as_ref(),
                             prepared,
                         );
                     }

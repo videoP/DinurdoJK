@@ -186,6 +186,9 @@ pub struct SurfaceSpriteEffectEmitter {
     pub clamp: bool,
     pub blend: Option<materials::BlendFunc>,
     pub sprite: jka_assets::shader::SurfaceSprite,
+    pub alpha_cutoff: f32,
+    pub depth_write: bool,
+    pub godot_candidate: bool,
     pub triangles: Vec<SurfaceSpriteEffectTriangle>,
     /// Same camera-cluster visibility signature used by ordinary BSP batches.
     pub pvs_signature: Vec<u64>,
@@ -241,6 +244,9 @@ pub(in crate::scene) fn collect_surface_sprite_effect_emitters(
                 clamp: effect.clamp,
                 blend: effect.blend,
                 sprite: effect.sprite,
+                alpha_cutoff: effect.alpha_cutoff,
+                depth_write: effect.depth_write,
+                godot_candidate: effect.godot_candidate,
                 triangles: triangles.clone(),
                 pvs_signature: pvs_signature.clone(),
             });
@@ -523,6 +529,9 @@ pub(in crate::scene) fn generate_grass_chunk(
     emitters: Vec<GrassEmitterTriangle>,
     lightmaps: Arc<GrassLightmapSources>,
     clump_data: Arc<Vec<u8>>,
+    // Render-space height below which no blade is planted (menu water level);
+    // `f32::NEG_INFINITY` keeps every blade.
+    floor_y: f32,
 ) -> (HashMap<GrassWorkerPatchKey, Vec<GrassInstance>>, usize) {
     let mut groups = HashMap::<GrassWorkerPatchKey, Vec<GrassInstance>>::new();
     let mut blade_count = 0usize;
@@ -554,6 +563,9 @@ pub(in crate::scene) fn generate_grass_chunk(
             let r2 = grass_random(seed, 0x02e5_be93);
             let bary = [1.0 - r1, r1 * (1.0 - r2), r1 * r2];
             let position = positions[0] * bary[0] + positions[1] * bary[1] + positions[2] * bary[2];
+            if position.y < floor_y {
+                continue;
+            }
             let mut color = [0.0_f32; 3];
             for corner in 0..3 {
                 for channel in 0..3 {

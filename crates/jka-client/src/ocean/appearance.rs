@@ -269,6 +269,8 @@ pub fn surface_settings(
     let mut settings = local.unwrap_or_else(|| descriptor.settings(shared));
     settings.backend = shared.backend;
     settings.blue_water_waves = shared.blue_water_waves;
+    settings.hybrid_fft_blend = shared.hybrid_fft_blend;
+    settings.hybrid_swell = shared.hybrid_swell;
     settings.blue_water_optics = shared.blue_water_optics;
     settings.map_size = shared.map_size;
     settings.simulate_when_hidden = shared.simulate_when_hidden;

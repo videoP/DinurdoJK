@@ -19,9 +19,27 @@ pub struct SpectrumStats {
     slope_lengths: [f32; 4],
     heights: [f32; 4],
     tail: f32,
+    shore_tables: [[f32; 4]; FETCH_TABLE],
 }
 
 impl SpectrumStats {
+    /// CPU equivalent of the coastal shader, for an on-demand diagnostic (no GPU readback).
+    pub fn sample_shore(&self, map: &crate::shore::ShoreMap, at: [f64; 2], fft: f32, swell_height: f32) -> crate::shore::ShoreSample {
+        let tables: Vec<[f64; FETCH_TABLE]> = (0..CASCADES)
+            .map(|i| std::array::from_fn(|row| f64::from(self.shore_tables[row][i])))
+            .collect();
+        let mut heights = self.heights.map(|h| f64::from(h * fft));
+        heights[3] = f64::from(swell_height);
+        map.sample(at, &tables, heights)
+    }
+    pub fn set_shore_tables(&mut self, spectrum: &spectrum::WaveSpectrum, wind: f64) {
+        for (i, cascade) in spectrum.cascades.iter().enumerate().take(CASCADES) {
+            let modes = crate::hull_sea::cascade_modes(&cascade.amplitudes, cascade.resolution as usize, cascade.size);
+            for (row, value) in self.shore_tables.iter_mut().zip(crate::shore::band_fetch_table(&modes, wind)) {
+                row[i] = value as f32;
+            }
+        }
+    }
     pub fn from_spectrum(spectrum: &spectrum::WaveSpectrum) -> Self {
         let mut stats = Self {
             tail: spectrum.tail_slope_variance as f32,
@@ -202,6 +220,7 @@ pub struct SurfaceWaves {
     _shore: wgpu::Texture,
     _field_sampler: wgpu::Sampler,
     _shore_sampler: wgpu::Sampler,
+    shore: Option<std::sync::Arc<crate::shore::ShoreMap>>,
 }
 
 impl SurfaceWaves {
@@ -287,6 +306,7 @@ impl SurfaceWaves {
             _shore: shore,
             _field_sampler: field_sampler,
             _shore_sampler: shore_sampler,
+            shore: None,
         }
     }
 
@@ -294,14 +314,68 @@ impl SurfaceWaves {
         &self.layout
     }
 
+    /// A pool-specific coast; FFT textures stay shared, while depth/fetch and wave uniforms belong to this pool.
+    pub fn with_shore(device: &wgpu::Device, queue: &wgpu::Queue, field: &WaveField,
+        map: std::sync::Arc<crate::shore::ShoreMap>) -> Self {
+        Self::with_shore_shelter(device, queue, field, map, true)
+    }
+
+    pub fn with_shore_shelter(device: &wgpu::Device, queue: &wgpu::Queue, field: &WaveField,
+        map: std::sync::Arc<crate::shore::ShoreMap>, shelter: bool) -> Self {
+        let map = if shelter { map } else { std::sync::Arc::new(coast_depth_only(&map)) };
+        let mut waves = Self::new(device, field);
+        let textures = crate::shore::ShoreTextures::new(device, queue, &map);
+        waves.groups = std::array::from_fn(|set| {
+            let views = field.views_for(set);
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Blue Water coastal wave group"), layout: &waves.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {binding:0,resource:wgpu::BindingResource::TextureView(&views[0])},
+                    wgpu::BindGroupEntry {binding:1,resource:wgpu::BindingResource::TextureView(&views[1])},
+                    wgpu::BindGroupEntry {binding:2,resource:wgpu::BindingResource::TextureView(&views[2])},
+                    wgpu::BindGroupEntry {binding:3,resource:wgpu::BindingResource::Sampler(&waves._field_sampler)},
+                    wgpu::BindGroupEntry {binding:4,resource:waves.uniforms.as_entire_binding()},
+                    wgpu::BindGroupEntry {binding:5,resource:waves._hull_sea.as_entire_binding()},
+                    wgpu::BindGroupEntry {binding:6,resource:wgpu::BindingResource::TextureView(&textures.heights)},
+                    wgpu::BindGroupEntry {binding:7,resource:wgpu::BindingResource::TextureView(&textures.exposure)},
+                    wgpu::BindGroupEntry {binding:8,resource:wgpu::BindingResource::Sampler(&waves._shore_sampler)},
+                ],
+            })
+        });
+        waves.shore = Some(map);
+        waves
+    }
+
     pub fn group(&self, field: &WaveField) -> &wgpu::BindGroup {
         &self.groups[field.current_index()]
     }
 
     pub fn write(&self, queue: &wgpu::Queue, field: &WaveField, time: f64, foam_coverage: f64, foam_lifetime: f64) {
-        let uniforms = WaveUniforms::from_field(field, time, foam_coverage, foam_lifetime);
+        self.write_with_swell(queue,field,time,foam_coverage,foam_lifetime,[[0.0;4],[0.0,0.0,1.0,0.0]]);
+    }
+
+    pub fn write_with_swell(&self, queue: &wgpu::Queue, field: &WaveField, time: f64, foam_coverage:f64, foam_lifetime:f64, swell:[[f32;4];2]) {
+        let mut uniforms = WaveUniforms::from_field(field, time, foam_coverage, foam_lifetime);
+        if let Some(map) = &self.shore {
+            uniforms.shore_heights = map.heights.place().frame([0.0;2]);
+            uniforms.shore_exposure = map.exposure.place().frame([0.0;2]);
+            uniforms.shore_fetch = field.surface_stats().shore_tables;
+            for h in &mut uniforms.shore_waves[..3] {*h*=swell[1][2];}
+            uniforms.shore_waves[3]=4.0*swell[0][3].abs()/std::f32::consts::SQRT_2;
+            let k=if swell[0][3]>0.0 {f64::from(swell[0][2])} else {std::f64::consts::TAU/field.sea().peak_wavelength.max(10.0)};
+            let frequency = (spectrum::GRAVITY*k).sqrt();
+            uniforms.shore = [1.0, frequency as f32, (1000.0 / crate::shore::SWELL_SHELTER_M) as f32,
+                (frequency * time).rem_euclid(std::f64::consts::TAU * 64.0) as f32];
+        }
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
     }
+}
+
+/// Keep the original depth/breaking/surf model while bypassing land's wind and swell shelter.
+pub fn coast_depth_only(map: &crate::shore::ShoreMap) -> crate::shore::ShoreMap {
+    let mut map = map.clone();
+    map.exposure.values.fill([crate::shore::OPEN_FETCH_M as f32; 2]);
+    map
 }
 
 #[cfg(test)]

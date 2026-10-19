@@ -6,7 +6,8 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-const TASK_COUNT: usize = 26;
+// One slot per `Task` discriminant; keep in step with the last variant.
+const TASK_COUNT: usize = Task::BackgroundCpu as usize + 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MapJobProgress {

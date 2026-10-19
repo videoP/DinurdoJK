@@ -55,14 +55,18 @@ fn jka_wave_height(position_xz: vec2<f32>, flat_plane: f32) -> f32 {
     if (!JKA_HYBRID_WAVE) { return flat_plane; }
     let p = position_xz / max(ocean.ocean_info.z, 0.001);
     var displacement_y = 0.0;
+    if ocean.map_scales[0].z > 0.0 {
     for (var i = 0u; i < 2u; i += 1u) {
         let scale = ocean.map_scales[i];
         let uv = p * vec2<f32>(1.0, -1.0) * scale.xy;
         displacement_y += textureSampleLevel(wave_displacement, wave_sampler, uv, i32(i), 0.0).y * scale.z;
     }
-    // Hybrid's native adapter carries all FFT cascades and no additional
-    // authored Gerstner sine. JKA world units / metre is ocean_info.z.
-    var height = flat_plane + displacement_y * ocean.ocean_info.z;
+    }
+    // The same analytic swell as the Hybrid Godot mesh and native geometry.
+    // The eye-probe correction below accounts for native stochastic FFT tiling,
+    // the third cascade and displaced-grid inversion near the camera.
+    let phase = dot(p, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
+    var height = flat_plane + (displacement_y + ocean.swell.w * sin(phase)) * ocean.ocean_info.z;
     if (optics.eye_wave.y > 0.5) {
         let near = 1.0 - smoothstep(0.0, 1200.0, distance(position_xz, optics.eye.xz));
         height += optics.eye_wave.x * near;

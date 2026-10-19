@@ -235,6 +235,7 @@ impl Renderer {
             self.sync_baked_brightness_assets();
             return;
         }
+        world.baked_sun_cache = None;
         world.lightmaps = world
             .lightmap_base_data
             .iter()
@@ -243,6 +244,7 @@ impl Renderer {
         self.rebuild_world_surface_bind_groups(&mut world);
         world.static_ao_lightmap_active = false;
         self.world = Some(world);
+        self.update_lighting_settings();
         self.sync_baked_brightness_assets();
     }
 
@@ -327,12 +329,14 @@ impl Renderer {
                 };
                 lightmaps.push(upload_texture(&self.device, &self.queue, &data));
             }
+            world.baked_sun_cache = None;
             world.lightmaps = lightmaps;
             self.rebuild_world_surface_bind_groups(&mut world);
             world.static_ao_lightmap_active = true;
             Ok(())
         })();
         self.world = Some(world);
+        self.update_lighting_settings();
         self.sync_baked_brightness_assets();
         result
     }
@@ -346,13 +350,19 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), String> {
-        let Some(world) = self.world.as_ref() else {
+        let Some(world) = self.world.as_mut() else {
             return Err("world changed before AO tile could be applied".into());
         };
         if !world.static_ao_lightmap_active {
             return Err("progressive AO lightmap was not initialized".into());
         }
-        let Some(lightmap) = world.lightmaps.get(texture) else {
+        let lightmaps = if let Some(cache) = world.baked_sun_cache.as_mut() {
+            // Progressive AO updates the source, never the already-subtracted
+            // result. Recompute that result once before the next rendered frame.
+            cache.strength = None;
+            &cache.original
+        } else { &world.lightmaps };
+        let Some(lightmap) = lightmaps.get(texture) else {
             return Err("AO tile lightmap index is out of range".into());
         };
         if rgba.len() != width as usize * height as usize * 4 {

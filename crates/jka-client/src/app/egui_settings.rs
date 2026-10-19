@@ -8,6 +8,7 @@ mod debug;
 mod display;
 mod effects;
 mod extensions;
+mod streamer;
 mod fog;
 mod game;
 mod geometry;
@@ -17,11 +18,13 @@ mod interface;
 mod lighting;
 mod mod_options;
 mod models;
+mod optimizations;
 mod physics;
 mod preset_preview;
 // Shared with quality::apply_quality_preset_to_page; keeps the cvar-to-page
 // ownership mapping in one place.
 pub(in crate::app) use preset_preview::preset_cvar_section;
+pub(in crate::app) use optimizations::OPTIMIZATION_CVARS;
 mod post;
 mod reflections;
 mod reset;
@@ -314,6 +317,7 @@ fn linked_ocean_slider(
     label: &str,
     tip: &str,
     value: &mut f32,
+    default: f32,
     range: std::ops::RangeInclusive<f32>,
     bit: u8,
     links: &mut u8,
@@ -324,13 +328,35 @@ fn linked_ocean_slider(
         let mut local = *value;
         let readout = format!("{local:.3}");
         let moved = ui
-            .add_enabled_ui(!locked, |ui| theme::slider(ui, &mut local, range, &readout))
+            .add_enabled_ui(!locked, |ui| theme::slider_default(ui, &mut local, range, &readout, default))
             .inner;
         ui.add_space(8.0);
         if let Some(now_locked) = theme::lock_toggle(ui, locked) {
             if now_locked { *links |= bit } else { *links &= !bit }
             *changed = true;
         } else if moved {
+            *value = local;
+            *changed = true;
+        }
+    });
+}
+
+/// [`ocean_slider`] whose slider (and label) also restore `default` on double-click.
+#[allow(clippy::too_many_arguments)]
+fn ocean_slider_dd(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    reset: theme::Reset,
+    value: &mut f32,
+    default: f32,
+    range: std::ops::RangeInclusive<f32>,
+    changed: &mut bool,
+) {
+    theme::row(ui, label, tip, reset, |ui| {
+        let mut local = *value;
+        let readout = format!("{local:.3}");
+        if theme::slider_default(ui, &mut local, range, &readout, default) {
             *value = local;
             *changed = true;
         }
@@ -351,6 +377,50 @@ fn ocean_slider(
         let readout = format!("{local:.3}");
         if theme::slider(ui, &mut local, range, &readout) {
             *value = local;
+            *changed = true;
+        }
+    });
+}
+
+/// [`ocean_slider`] for rows with no archived reset tag: double-clicking the
+/// slider restores `default`.
+fn ocean_slider_d(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    value: &mut f32,
+    default: f32,
+    range: std::ops::RangeInclusive<f32>,
+    changed: &mut bool,
+) {
+    theme::row(ui, label, tip, theme::Reset::None, |ui| {
+        let mut local = *value;
+        let readout = format!("{local:.3}");
+        if theme::slider_default(ui, &mut local, range, &readout, default) {
+            *value = local;
+            *changed = true;
+        }
+    });
+}
+
+/// Like [`ocean_slider_d`], but `value` is stored in JKA units while the slider
+/// shows and edits metres (`units_per_metre` units each).
+fn ocean_slider_metres_d(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    value: &mut f32,
+    default: f32,
+    max_metres: f32,
+    min_metres: f32,
+    changed: &mut bool,
+) {
+    let scale = crate::ocean::OCEAN_UNITS_PER_METER;
+    theme::row(ui, label, tip, theme::Reset::None, |ui| {
+        let mut metres = (*value / scale).clamp(min_metres, max_metres);
+        let readout = format!("{metres:.1} m");
+        if theme::slider_default(ui, &mut metres, min_metres..=max_metres, &readout, default / scale) {
+            *value = metres * scale;
             *changed = true;
         }
     });

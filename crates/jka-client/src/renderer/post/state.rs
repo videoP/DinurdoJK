@@ -22,7 +22,7 @@ impl Renderer {
     /// instead. Returns [plane Y, square half-extent (0 = off), centre X, Z].
     fn ocean_void_fog_params(&self, eye_y: f32) -> [f32; 4] {
         let off = [NO_WATER_SURFACE, 0.0, 0.0, 0.0];
-        if !self.ocean_enabled || !self.ocean_sky_extend {
+        if !self.ocean_render_ready() || !self.ocean_sky_extend {
             return off;
         }
         let (Some(world), Some(ocean)) = (self.world.as_ref(), self.ocean.as_ref()) else {
@@ -210,6 +210,7 @@ impl Renderer {
             0.0,
             [0.0; 4],
             false,
+            false,
         );
     }
 
@@ -224,6 +225,7 @@ impl Renderer {
         motion_blur_scale: f32,
         camera_pos_time: [f32; 4],
         history_valid: bool,
+        dof_frame_active: bool,
     ) {
         let (cloud_blades, cloud_blade_count) = self.cloud_foreground_uniform(
             view_proj,
@@ -239,11 +241,12 @@ impl Renderer {
             color: PostColorSettings {
                 gamma: self.output_gamma(),
                 // The floating-point scene format and display tone mapping are
-                // independent. 0 disables ACES, 1 enables SDR ACES, and 3
-                // preserves highlights for the native display-output stage. HDR rendering is
-                // selected separately by scene_format().
-                tone_mapping: if self.hdr_output.is_some() { 3.0 } else {
-                    self.tone_mapping_strength.max(if self.native_atmosphere_active() && self.blue_water_environment.filmic { 1.0 } else { 0.0 })
+                // independent: 0 off, 0..1 SDR ACES, 3 HDR output, 4 upstream
+                // Blue Water SDR display grade + AgX.
+                tone_mapping: if self.hdr_output.is_some() { 3.0 } else if self.native_display_mapping_active() {
+                    4.0
+                } else {
+                    self.tone_mapping_strength
                 },
                 bloom: if self.glow_mode.enabled() { 1.0 } else { 0.0 },
                 ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
@@ -300,10 +303,11 @@ impl Renderer {
                 time: self.started.elapsed().as_secs_f32(),
                 exposure: self.color_grade.exposure_ev,
             },
-            exposure_controls: [self.auto_exposure_strength, 0.0, 0.0, 0.0],
+            exposure_controls: [self.effective_auto_exposure_strength(),
+                if self.native_display_mapping_active() { 1.0 } else { 0.0 }, 0.0, 0.0],
             camera_fx: PostCameraFxSettings {
                 motion_blur_scale,
-                depth_of_field: self.depth_of_field_strength,
+                depth_of_field: if dof_frame_active { self.depth_of_field_strength } else { 0.0 },
                 dof_focus_distance: self.dof_focus_distance,
                 dof_quality: self.dof_quality.shader_value(),
             },
@@ -492,10 +496,10 @@ impl Renderer {
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
             underwater: [
-                if self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE {
+                if self.ocean_render_ready() && self.camera_water_surface > NO_WATER_SURFACE {
                     // Depth below the REAL surface over the eye (0 offset = flat plane).
                     self.camera_water_surface + self.eye_wave_offset
-                } else if self.ocean_enabled {
+                } else if self.ocean_render_ready() {
                     self.camera_water_surface
                 } else {
                     NO_WATER_SURFACE
@@ -504,7 +508,12 @@ impl Renderer {
                 ocean_void_fog[0],
                 ocean_void_fog[1],
             ],
-            cloud_foreground: [cloud_blade_count, ocean_void_fog[2], ocean_void_fog[3], 0.0],
+            cloud_foreground: [
+                cloud_blade_count,
+                ocean_void_fog[2],
+                ocean_void_fog[3],
+                self.portal_depth.inverse_scale,
+            ],
             cloud_blades,
             camera_pos_time,
             prev_camera_pos_time: if self.cloud_history_valid || (self.rt_taa_active() && history_valid) {
@@ -738,6 +747,7 @@ impl Renderer {
                                 .ssr_visibility_view
                                 .as_ref()
                                 .unwrap_or(&self.white.view),
+                            self.portal_depth.view(),
                         )
                     })
                 })
@@ -775,6 +785,7 @@ impl Renderer {
             &self.targets.reflection_mask_view,
             &self.auto_exposure_state_buffer,
             self.targets.ssr_visibility_view.as_ref().unwrap_or(&self.white.view),
+            self.portal_depth.view(),
         );
         self.gamma_post_bind_group = create_gamma_post_bind_group(
             &self.device,

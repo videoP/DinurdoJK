@@ -1,6 +1,7 @@
 //! Sabers state.
 use crate::cgame::player_presenter::{
     Arc, Matrix3x4, PlayerAngleState, PlayerAnimationState, PlayerModelAsset,
+    move_lean::MoveLeanState,
 };
 
 /// OpenJK stores current/desired blade length in clientInfo_t::saber[].blade[].
@@ -118,6 +119,13 @@ pub(in crate::cgame::player_presenter) struct EntityPlayerState {
     pub(in crate::cgame::player_presenter) last_angle_time: i32,
     /// Optional filtered world-space look yaw for cg_headLook 2.
     pub(in crate::cgame::player_presenter) head_look_yaw: Option<f32>,
+    /// Smoothed [pitch, roll] visual swim orientation in degrees.
+    pub(in crate::cgame::player_presenter) swim_angles: [f32; 2],
+    pub(in crate::cgame::player_presenter) swim_bank_angle: f32,
+    pub(in crate::cgame::player_presenter) swim_angle_time: i32,
+    pub(in crate::cgame::player_presenter) swim_turn_motion: super::super::swim_tilt::SwimTurnMotion,
+    /// Per-entity filtered ground movement visual pitch.
+    pub(in crate::cgame::player_presenter) move_lean: MoveLeanState,
     pub(in crate::cgame::player_presenter) last_e_flags: i32,
     pub(in crate::cgame::player_presenter) last_client_num: i32,
     /// `cent->ghoul2weapon`: which g2WeaponInstances entry was last copied.
@@ -146,4 +154,7 @@ pub(in crate::cgame::player_presenter) struct EntityPlayerState {
     /// is checked by elapsed time rather than relying on every early return to
     /// invalidate it.
     pub(in crate::cgame::player_presenter) bone_smooth_time: i32,
+    /// One Source jigglebone simulation per live entity; never shared between
+    /// players using the same immutable cached model.
+    pub(in crate::cgame::player_presenter) source_jiggle_sim: Option<jka_assets::source1_jiggle::SourceJiggleAnimator>,
 }

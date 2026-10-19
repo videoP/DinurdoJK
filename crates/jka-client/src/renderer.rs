@@ -1,4 +1,9 @@
 //! renderer module facade. Implementations are grouped by responsibility.
+
+// Narrow trace flag bridge for ocean startup instrumentation.
+pub(crate) fn first_world_frame_trace() -> bool {
+    diagnostics::perf_capture::first_world_frame_trace()
+}
 use api::{FrameInfo, RenderError};
 use crate::ui::GlowMode;
 use frame::plan::FramePlan;
@@ -8,6 +13,7 @@ use visibility::face_plane::{
     merged_face_plane, merged_face_runs, packed_face_plane, selection_stats, FacePlaneSelection, RunCull,
 };
 use overlay::ScreenFxBatch;
+use frametime_graph::FrameTimeGraph;
 use world::deferred_bundles::{DeferredCommand, DeferredResources, DeferredWorldBundles};
 use world::videos::{WorldVideoPlayer, WORLD_VIDEO_MAX_CATCH_UP};
 mod api;
@@ -18,6 +24,7 @@ mod context;
 mod diagnostics;
 mod environment;
 mod frame;
+mod frametime_graph;
 mod glass;
 mod initialize;
 pub(crate) mod gpu_adapter;
@@ -31,6 +38,7 @@ pub(crate) fn input_diag_win32_message(message: *const std::ffi::c_void) {
 mod lighting;
 mod models;
 mod overlay;
+mod portal_depth;
 mod post;
 mod reflections;
 mod render_thread;
@@ -170,7 +178,7 @@ use post::pipelines::{
     create_cloud_shadow_opaque_pipeline,
     create_ssao_temporal_pipeline,
     create_ssr_temporal_pipeline, create_ssr_visibility_resources, create_taa_post_pipeline,
-    create_wireframe_pipeline,
+    create_wireframe_pipeline, wireframe_cull_slot,
 };
 use post::targets::{
     create_bloom_pyramid, create_dof_target, create_temporal_ssao_history,
@@ -325,7 +333,7 @@ use crate::{
     },
     ui::{
         self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
-        DofQuality, DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode,
+        DofMode, DofQuality, DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode,
         EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode,
         PlanarReflectionDebugMode, PlanarReflectionMode, PuddleQuality, PvsMode, RainIntensity,
         ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex,
@@ -679,6 +687,7 @@ struct Renderer {
     eye_wave_offset: f32,
     /// Offset the optics shader adds to its two-cascade lookup near the eye.
     eye_wave_correction: Option<f32>,
+    eye_wave_log: crate::ocean::eye_wave::EyeWaveLog,
     ocean_enabled: bool,
     ocean_sky_extend: bool,
     /// Mesh-free far-plane continuation, live only in r_oceanSkyExtend 2.
@@ -689,6 +698,7 @@ struct Renderer {
     coastal_enabled: bool,
     coastal_pool: u8,
     coastal_atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,
+    upstream_shore_source: Option<Arc<crate::ocean::upstream_coast::Source>>,
     /// GPU occlusion query: how many ocean samples actually survived depth.
     ocean_visibility: OceanVisibility,
     /// Seconds since an ocean surface was last drawn (or the camera was last
@@ -721,7 +731,8 @@ struct Renderer {
     face_plane_cull: bool,
     wireframe_pipeline_layout: wgpu::PipelineLayout,
     wireframe_shader: wgpu::ShaderModule,
-    wireframe_pipeline: Option<wgpu::RenderPipeline>,
+    /// World x-ray overlay, one per shader cull mode (`wireframe_cull_slot`).
+    wireframe_pipeline: [Option<wgpu::RenderPipeline>; 3],
     world_wireframe_pipelines: BTreeMap<WorldShaderVariantKey, wgpu::RenderPipeline>,
     fast_world_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     surface_inspector_shader: wgpu::ShaderModule,
@@ -775,6 +786,7 @@ struct Renderer {
     ui_pending_levelshot: Option<PendingUiLevelshot>,
     ui_small_font_metrics: Option<ui::ProportionalFont>,
     _ui_font_sampler: wgpu::Sampler,
+    frame_time_graph: FrameTimeGraph,
     ui_vertex_buffer: wgpu::Buffer,
     ui_vertex_count: u32,
     ui_dynamic_vertex_buffer: wgpu::Buffer,
@@ -868,14 +880,30 @@ struct Renderer {
     sun_yaw: f32,
     sun_pitch: f32,
     sun_intensity: f32,
+    sun_shadow_strength: f32,
+    sun_lighting: bool,
     sun_color: [f32; 3],
     sun_visibility: SunVisibilityMode,
     entity_sun_lighting: bool,
     baked_sun_removal: f32,
+    baked_sun_cache: bool,
+    /// 0 off, 1 removal amount, 2 authored-sun visibility.
+    baked_sun_debug_mode: u32,
+    baked_sun_shadow_map: bool,
+    baked_sun_edge_softness: f32,
+    baked_sun_direct_limit: f32,
+    baked_indirect_scale: f32,
+    baked_indirect_saturation: f32,
+    baked_indirect_power: f32,
+    baked_indirect_highlight_preserve: f32,
     sky_fractal_override: bool,
     sky_backend: u8,
     blue_water_environment: crate::blue_water_environment::Settings,
     cloud_backend: u8,
+    /// `r_cloudPortalDepth`: 0 off, 1 redraw portal depth, 2 reuse portal pass depth.
+    cloud_portal_depth: u8,
+    /// Portal-camera depth the cloud passes clip against; see `portal_depth.rs`.
+    portal_depth: portal_depth::PortalDepth,
     blue_water_sky: Option<environment::blue_water_sky::AtmosphereRenderer>,
     clouds_enabled: bool,
     cloud_type: CloudType,
@@ -921,6 +949,7 @@ struct Renderer {
     film_grain_strength: f32,
     motion_blur_strength: f32,
     depth_of_field_strength: f32,
+    dof_mode: DofMode,
     crt_scope: ui::CrtScope,
     crt_style: ui::CrtStyle,
     crt_quality: ui::CrtQuality,

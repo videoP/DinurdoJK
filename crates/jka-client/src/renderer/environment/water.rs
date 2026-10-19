@@ -18,10 +18,16 @@ impl Renderer {
         self.grass_front_to_back_enabled = enabled;
     }
 
-    /// The index range promoted water draws instead of its authored face, or
-    /// `None` when the ocean is off or this world carries no clipmap.
+    /// Desired promotion becomes effective only with compatible world and
+    /// surface resources. Presentation uniforms use the same decision.
+    pub(in crate::renderer) fn ocean_render_ready(&self) -> bool {
+        self.ocean_enabled && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ocean)
+            && self.ocean.as_ref().is_some_and(|ocean| ocean.original_surface_ready(
+                (self.config.width, self.config.height, self.msaa_samples, self.scene_format())))
+    }
+
     pub(in crate::renderer) fn ocean_clipmap_quality(&self) -> Option<usize> {
-        self.ocean_enabled
+        self.ocean_render_ready()
             .then(|| usize::from(self.ocean_settings.mesh_quality.min(1)))
     }
 
@@ -42,7 +48,7 @@ impl Renderer {
     /// Whether the sky-extension ocean (mesh, analytic far plane, optics, fog,
     /// submerged classification) is active for `slot` from the current camera.
     pub(in crate::renderer) fn ocean_extension_active(&self, slot: usize) -> bool {
-        self.ocean_sky_extend && slot < 8 && self.ocean_extension_mask >> slot & 1 != 0
+        self.ocean_settings.backend != 3 && self.ocean_sky_extend && slot < 8 && self.ocean_extension_mask >> slot & 1 != 0
     }
 
     /// The extension only exists where the camera's PVS can see the pool's
@@ -288,7 +294,8 @@ impl Renderer {
             .ocean
             .as_ref()
             .is_some_and(|ocean| ocean.map_size() != settings.map_size
-                || (ocean.backend() == 0) != (settings.backend == 0));
+                || (ocean.backend() == 0) != (settings.backend == 0)
+                || (ocean.backend() == 3) != (settings.backend == 3));
         self.ocean_settings = settings;
         self.ocean_interaction.set_falloff(settings);
         self.ocean_interaction.configure(&self.device, &self.queue,
@@ -339,7 +346,8 @@ impl Renderer {
             let mut gpu = if let Some(index) = previous
                 .iter()
                 .position(|(a, g)| a.index == descriptor.index && g.map_size() == settings.map_size
-                    && (g.backend() == 0) == (settings.backend == 0))
+                    && (g.backend() == 0) == (settings.backend == 0)
+                    && (g.backend() == 3) == (settings.backend == 3))
             {
                 previous.swap_remove(index).1
             } else {
@@ -367,6 +375,9 @@ impl Renderer {
         ocean: &'a Option<crate::ocean::OceanGpu>,
         inert: &'a wgpu::BindGroup,
     ) -> &'a wgpu::BindGroup {
+        if ocean.as_ref().is_some_and(|gpu| !gpu.native_surface_available()) {
+            return inert;
+        }
         if batch.source.water_primary {
             let centre = std::array::from_fn(|i| (batch.bounds_min[i] + batch.bounds_max[i]) * 0.5);
             if let Some((_, gpu)) = authored_oceans.iter().find(|(a, _)| {
@@ -411,6 +422,7 @@ impl Renderer {
             }
         } else {
             // Release the large FFT textures/buffers when stock JKA water is selected.
+            self.pipeline_jobs.cancel_slot("native-ocean-surface", 0);
             self.ocean = None;
             self.ocean_optics = crate::ocean::optics::Resources::new(
                 &self.device,

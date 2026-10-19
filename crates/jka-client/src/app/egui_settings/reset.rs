@@ -451,6 +451,7 @@ impl App {
             ui::VIDEO_ROW_MOTION_BLUR => {
                 self.set_motion_blur_strength(defaults.motion_blur_strength)
             }
+            ui::VIDEO_ROW_DOF_MODE => self.set_dof_mode(defaults.dof_mode),
             ui::VIDEO_ROW_DEPTH_OF_FIELD => {
                 self.set_depth_of_field_strength(defaults.depth_of_field_strength)
             }
@@ -861,6 +862,8 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_GRASS => {
+                self.video.surface_sprites = defaults.surface_sprites;
+                self.render_command(RenderCommand::SetSurfaceSprites(self.video.surface_sprites));
                 self.video.grass = defaults.grass;
                 if !self.video.grass || self.applied_grass {
                     self.render_command(RenderCommand::SetGrassEnabled(self.video.grass));

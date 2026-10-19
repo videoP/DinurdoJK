@@ -103,6 +103,35 @@ pub(in crate::renderer) fn fx_runs<'a>(
     })
 }
 
+/// Depth-only passes: merge contiguous index ranges of one alpha mode. Opaque
+/// depth never samples the texture (`by_texture` false), so material, glow and
+/// wireframe boundaries do not split it; alpha-tested depth keeps texture runs.
+pub(in crate::renderer) fn depth_runs<'a>(
+    draws: impl Iterator<Item = &'a DynamicPreparedDraw>,
+    merge: bool,
+    by_texture: bool,
+) -> impl Iterator<Item = (&'a DynamicPreparedDraw, Range<u32>)> {
+    let mut draws = draws.peekable();
+    std::iter::from_fn(move || {
+        let first = draws.next()?;
+        let mut range = first.first_index..first.first_index.saturating_add(first.index_count);
+        if merge && first.index_count % 3 == 0 {
+            while let Some(&next) = draws.peek() {
+                if next.first_index != range.end
+                    || next.index_count % 3 != 0
+                    || next.base_vertex != first.base_vertex
+                    || (by_texture && next.texture_key != first.texture_key)
+                {
+                    break;
+                }
+                range.end = next.first_index.saturating_add(next.index_count);
+                draws.next();
+            }
+        }
+        Some((first, range))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +160,20 @@ mod tests {
             wireframe_class: DynamicWireframeClass::Entity,
             authored_glow: false,
         }
+    }
+
+    #[test]
+    fn depth_runs_ignore_material_only_for_opaque() {
+        let mut draws = [model(1, 0, 3), model(2, 3, 3), model(3, 9, 3), model(4, 12, 3)];
+        draws[1].texture_key = Some("other".into());
+        draws[1].authored_glow = true;
+        let ranges = |by_texture| depth_runs(draws.iter(), true, by_texture)
+            .map(|(_, r)| r).collect::<Vec<_>>();
+        assert_eq!(ranges(false), vec![0..6, 9..15]);
+        assert_eq!(ranges(true), vec![0..3, 3..6, 9..15]);
+        assert_eq!(depth_runs(draws.iter(), false, false).count(), 4);
+        draws[3].base_vertex = 3;
+        assert_eq!(depth_runs(draws.iter(), true, false).count(), 3);
     }
 
     #[test]

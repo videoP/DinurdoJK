@@ -25,6 +25,11 @@ fn original_atmosphere_precomputes_and_draws_finite_day_and_twilight() {
                 depth: None,
             },
         );
+        let sky_mean = blue_water_sky::SkyMeanSampler::new(&device);
+        let mean_read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("original sky mean readback"), size: 16, mapped_at_creation: false,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        });
         let extent = wgpu::Extent3d {
             width: 32,
             height: 16,
@@ -54,10 +59,13 @@ fn original_atmosphere_precomputes_and_draws_finite_day_and_twilight() {
             [32, 16],
         );
         let mut means = Vec::new();
+        let mut sky_references = Vec::new();
         for elevation in [35.0, -8.0] {
             sky.apply(&SkyScene::north_atlantic(elevation, 135.0).cloudless());
             let mut encoder = device.create_command_encoder(&Default::default());
             sky.update(&queue, &mut encoder, &view, 1.0 / 60.0);
+            sky_mean.encode(&mut encoder, sky.environment());
+            encoder.copy_buffer_to_buffer(&sky_mean.buffer, 0, &mean_read, 0, 16);
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Original atmosphere dome fixture"),
@@ -113,6 +121,7 @@ fn original_atmosphere_precomputes_and_draws_finite_day_and_twilight() {
                 .map_async(wgpu::MapMode::Read, |result| result.unwrap());
             read.slice(..)
                 .map_async(wgpu::MapMode::Read, |result| result.unwrap());
+            mean_read.slice(..).map_async(wgpu::MapMode::Read, |result| result.unwrap());
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
@@ -144,6 +153,13 @@ fn original_atmosphere_precomputes_and_draws_finite_day_and_twilight() {
             }
             read.unmap();
             {
+                let bytes = mean_read.slice(..).get_mapped_range().unwrap();
+                let reference = bytemuck::cast_slice::<u8, f32>(&bytes);
+                assert!(reference.iter().all(|v| v.is_finite() && *v > 0.0), "sky reference and clear luminance: {reference:?}");
+                sky_references.push(reference[3]);
+            }
+            mean_read.unmap();
+            {
                 let atlas_bytes = atlas_read.slice(..).get_mapped_range().unwrap();
                 for bytes in atlas_bytes.chunks_exact(2) {
                     let half = u16::from_le_bytes(bytes.try_into().unwrap());
@@ -165,6 +181,7 @@ fn original_atmosphere_precomputes_and_draws_finite_day_and_twilight() {
             means[0] > means[1] * 2.0 && means[1] > 0.0,
             "day/twilight radiance: {means:?}"
         );
+        assert!(sky_references[0] > sky_references[1] * 2.0, "actual sky reference follows dusk: {sky_references:?}");
         assert!(scope.pop().await.is_none(), "atmosphere GPU validation");
     });
 }

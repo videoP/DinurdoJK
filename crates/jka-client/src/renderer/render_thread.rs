@@ -115,6 +115,139 @@ fn print_r_speeds(
     }
 }
 
+// Diagnostic-only command names. Do not derive Debug on RenderCommand: many
+// command payloads own WGPU resources that intentionally are not Debug.
+#[allow(unreachable_patterns)]
+fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
+    match command {
+        RenderCommand::StartPerfCapture { .. } => "StartPerfCapture",
+        RenderCommand::StartSkyPerfSweep { .. } => "StartSkyPerfSweep",
+        RenderCommand::BatchBegin(..) => "BatchBegin",
+        RenderCommand::BatchLabel(..) => "BatchLabel",
+        RenderCommand::BatchEnd => "BatchEnd",
+        RenderCommand::Resize(..) => "Resize",
+        RenderCommand::SetVsync(..) => "SetVsync",
+        RenderCommand::SetMaxFrameLatency(..) => "SetMaxFrameLatency",
+        RenderCommand::SetEarlySubmit(..) => "SetEarlySubmit",
+        RenderCommand::SetPresentCopy(..) => "SetPresentCopy",
+        RenderCommand::SetInputLateLatch(..) => "SetInputLateLatch",
+        RenderCommand::SetMsaa(..) => "SetMsaa",
+        RenderCommand::SetTextureFilter(..) => "SetTextureFilter",
+        RenderCommand::SetPicmip(..) => "SetPicmip",
+        RenderCommand::SetTextureCompression(..) => "SetTextureCompression",
+        RenderCommand::SetDetailTextures(..) => "SetDetailTextures",
+        RenderCommand::SetDetailTexture { .. } => "SetDetailTexture",
+        RenderCommand::SetDetailTextureFade { .. } => "SetDetailTextureFade",
+        RenderCommand::SetWireframeMask(..) => "SetWireframeMask",
+        RenderCommand::SetShaderComplexity(..) => "SetShaderComplexity",
+        RenderCommand::SetDebugVolumes { .. } => "SetDebugVolumes",
+        RenderCommand::SetEntityMarkers(..) => "SetEntityMarkers",
+        RenderCommand::SetCoastalDebugMesh(..) => "SetCoastalDebugMesh",
+        RenderCommand::SetCoastalWater { .. } => "SetCoastalWater",
+        RenderCommand::SetSunRayPreview { .. } => "SetSunRayPreview",
+        RenderCommand::SetPvsMode(..) => "SetPvsMode",
+        RenderCommand::SetFacePlaneCull(..) => "SetFacePlaneCull",
+        RenderCommand::SetDrawInlineModels(..) => "SetDrawInlineModels",
+        RenderCommand::SetFragmentShaderMode(..) => "SetFragmentShaderMode",
+        RenderCommand::SetWorldSortMode(..) => "SetWorldSortMode",
+        RenderCommand::SetColorClearMode(..) => "SetColorClearMode",
+        RenderCommand::SetWorldStageDebug { .. } => "SetWorldStageDebug",
+        RenderCommand::SetFastSky(..) => "SetFastSky",
+        RenderCommand::SetWorldFlares(..) => "SetWorldFlares",
+        RenderCommand::SetFpsCap(..) => "SetFpsCap",
+        RenderCommand::SetGamma(..) => "SetGamma",
+        RenderCommand::SetGammaMethod(..) => "SetGammaMethod",
+        RenderCommand::PrepareGammaMethod(..) => "PrepareGammaMethod",
+        RenderCommand::SetModelBrightness(..) => "SetModelBrightness",
+        RenderCommand::SetDynamicLightBrightness(..) => "SetDynamicLightBrightness",
+        RenderCommand::SetPostEffects(..) => "SetPostEffects",
+        RenderCommand::SetFootprintMode(..) => "SetFootprintMode",
+        RenderCommand::SetGrassEnabled(..) => "SetGrassEnabled",
+        RenderCommand::SetGrassPrecompute(..) => "SetGrassPrecompute",
+        RenderCommand::SetGrassMidLod(..) => "SetGrassMidLod",
+        RenderCommand::SetGrassFrontToBack(..) => "SetGrassFrontToBack",
+        RenderCommand::SetRainOptimizations { .. } => "SetRainOptimizations",
+        RenderCommand::SetContactShadowDebug(..) => "SetContactShadowDebug",
+        RenderCommand::SetSsrDebug(..) => "SetSsrDebug",
+        RenderCommand::SetOceanEnabled(..) => "SetOceanEnabled",
+        RenderCommand::SetOceanSkyExtend(..) => "SetOceanSkyExtend",
+        RenderCommand::SetOceanSettings(..) => "SetOceanSettings",
+        RenderCommand::OceanWake(..) => "OceanWake",
+        RenderCommand::SetPromotedOceanSettings(..) => "SetPromotedOceanSettings",
+        RenderCommand::SetAuthoredOceans(..) => "SetAuthoredOceans",
+        RenderCommand::SetOceanTime(..) => "SetOceanTime",
+        RenderCommand::SetPerfTrace(..) => "SetPerfTrace",
+        RenderCommand::SetGpuTimings(..) => "SetGpuTimings",
+        RenderCommand::SetFrameTimeGraph(..) => "SetFrameTimeGraph",
+        RenderCommand::SetFxZeroAlphaDiscard(..) => "SetFxZeroAlphaDiscard",
+        RenderCommand::SetDebugWorldVertexAlphaOne(..) => "SetDebugWorldVertexAlphaOne",
+        RenderCommand::SetGhoul2BatchDraws(..) => "SetGhoul2BatchDraws",
+        RenderCommand::SetModelStateCache(..) => "SetModelStateCache",
+        RenderCommand::SetDynamicBatchDraws(..) => "SetDynamicBatchDraws",
+        RenderCommand::SetBspModelLod { .. } => "SetBspModelLod",
+        RenderCommand::SetPatchLod { .. } => "SetPatchLod",
+        RenderCommand::SetWorldCompactMinDraws(..) => "SetWorldCompactMinDraws",
+        RenderCommand::SetModelPrepareThreads(..) => "SetModelPrepareThreads",
+        RenderCommand::SetEncoderFinishThreads(..) => "SetEncoderFinishThreads",
+        RenderCommand::SetModelRenderBundles(..) => "SetModelRenderBundles",
+        RenderCommand::SetSurfaceSpritesGpu(..) => "SetSurfaceSpritesGpu",
+        RenderCommand::SetSurfaceSprites(..) => "SetSurfaceSprites",
+        RenderCommand::SetMd3GeometryCache(..) => "SetMd3GeometryCache",
+        RenderCommand::SetModelIndexUploadCache(..) => "SetModelIndexUploadCache",
+        RenderCommand::SetGhoul2BatchKeyCache(..) => "SetGhoul2BatchKeyCache",
+        RenderCommand::SetGpuVisibility { .. } => "SetGpuVisibility",
+        RenderCommand::SetDynamicLighting(..) => "SetDynamicLighting",
+        RenderCommand::SetDynamicLightDebug(..) => "SetDynamicLightDebug",
+        RenderCommand::SetRtSamples(..) => "SetRtSamples",
+        RenderCommand::SetDynamicLightFalloff(..) => "SetDynamicLightFalloff",
+        RenderCommand::SetRtHalfResolution(..) => "SetRtHalfResolution",
+        RenderCommand::SetMapLightSimulation(..) => "SetMapLightSimulation",
+        RenderCommand::SetClassicWorldLighting { .. } => "SetClassicWorldLighting",
+        RenderCommand::SetEmissiveAreaLights(..) => "SetEmissiveAreaLights",
+        RenderCommand::SetShaderLightPromotion { .. } => "SetShaderLightPromotion",
+        RenderCommand::SetEntityAmbientLighting(..) => "SetEntityAmbientLighting",
+        RenderCommand::SetVoxelProbeGi(..) => "SetVoxelProbeGi",
+        RenderCommand::SetLocalLightShadows(..) => "SetLocalLightShadows",
+        RenderCommand::SetTintedGlass(..) => "SetTintedGlass",
+        RenderCommand::SetTintedGlassDebug(..) => "SetTintedGlassDebug",
+        RenderCommand::SetEntityShadowLight(..) => "SetEntityShadowLight",
+        RenderCommand::SetPbrSettings { .. } => "SetPbrSettings",
+        RenderCommand::SetCascadedShadows(..) => "SetCascadedShadows",
+        RenderCommand::SetCullDebug(..) => "SetCullDebug",
+        RenderCommand::SetForceUnifiedWorld(..) => "SetForceUnifiedWorld",
+        RenderCommand::SetPom(..) => "SetPom",
+        RenderCommand::SetPlanarReflectionDebug(..) => "SetPlanarReflectionDebug",
+        RenderCommand::SetPuddleDebug(..) => "SetPuddleDebug",
+        RenderCommand::SetPuddleSkyBlend { .. } => "SetPuddleSkyBlend",
+        RenderCommand::DumpMaterials { .. } => "DumpMaterials",
+        RenderCommand::InspectSurface { .. } => "InspectSurface",
+        RenderCommand::HybridWaveDump { .. } => "HybridWaveDump",
+        RenderCommand::ClearSurfaceInspection => "ClearSurfaceInspection",
+        RenderCommand::AddSurfaceDeformation(..) => "AddSurfaceDeformation",
+        RenderCommand::Screenshot { .. } => "Screenshot",
+        RenderCommand::CopyFrameToClipboard => "CopyFrameToClipboard",
+        RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
+        RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
+        RenderCommand::SetUi(..) => "SetUi",
+        RenderCommand::SetExtensionHud(..) => "SetExtensionHud",
+        RenderCommand::SetTransientUi { .. } => "SetTransientUi",
+        RenderCommand::SetUiTelemetry { .. } => "SetUiTelemetry",
+        RenderCommand::SetEgui(..) => "SetEgui",
+        RenderCommand::CreateCompanion { .. } => "CreateCompanion",
+        RenderCommand::DestroyCompanion { .. } => "DestroyCompanion",
+        RenderCommand::ResizeCompanion { .. } => "ResizeCompanion",
+        RenderCommand::SetCompanionEgui { .. } => "SetCompanionEgui",
+        RenderCommand::SetAssetPreviewMode(..) => "SetAssetPreviewMode",
+        RenderCommand::SetAssetPreviewViewport(..) => "SetAssetPreviewViewport",
+        RenderCommand::UnloadMap => "UnloadMap",
+        RenderCommand::GrowInlineInstances { .. } => "GrowInlineInstances",
+        RenderCommand::LoadMap { .. } => "LoadMap",
+        RenderCommand::RemapMap { .. } => "RemapMap",
+        RenderCommand::Shutdown => "Shutdown",
+        _ => "unknown command",
+    }
+}
+
 pub struct RenderThread {
     pub(in crate::renderer) command_tx: Sender<RenderCommand>,
     /// Kept on the Winit/app side so auxiliary surfaces are created on the
@@ -187,6 +320,9 @@ impl RenderThread {
             .map(|dir| dir.join("dxcompiler.dll"))
             .filter(|path| path.is_file() && path.with_file_name("dxil.dll").is_file());
         if backend == RendererBackend::Dx12 {
+            // wgpu has no DX12 pipeline cache and DXC takes ~120 ms per large
+            // shader, so the patched wgpu-hal keeps compiled bytecode here.
+            std::env::set_var("DINURDOJK_DX12_SHADER_CACHE", base.join("cache").join("dx12_shaders"));
             instance_desc.backend_options.dx12.shader_compiler = match &dxc_path {
                 Some(path) => wgpu::Dx12Compiler::DynamicDxc {
                     dxc_path: path.to_string_lossy().into_owned(),
@@ -538,14 +674,25 @@ pub(in crate::renderer) fn render_thread_main(
         sun_yaw: initial_ui.video.sun_yaw,
         sun_pitch: initial_ui.video.sun_pitch,
         sun_intensity: initial_ui.video.sun_intensity,
+        sun_shadow_strength: initial_ui.video.sun_shadow_strength,
+        sun_lighting: initial_ui.video.sun_lighting,
         sun_color: initial_ui.video.sun_color,
         sun_visibility: initial_ui.video.sun_visibility,
         entity_sun_lighting: initial_ui.video.entity_sun_lighting,
         baked_sun_removal: initial_ui.video.baked_sun_removal,
+        baked_sun_cache: initial_ui.video.baked_sun_cache,
+        baked_sun_shadow_map: initial_ui.video.baked_sun_shadow_map,
+        baked_sun_edge_softness: initial_ui.video.baked_sun_edge_softness,
+        baked_sun_direct_limit: initial_ui.video.baked_sun_direct_limit,
+        baked_indirect_scale: initial_ui.video.baked_indirect_scale,
+        baked_indirect_saturation: initial_ui.video.baked_indirect_saturation,
+        baked_indirect_power: initial_ui.video.baked_indirect_power,
+        baked_indirect_highlight_preserve: initial_ui.video.baked_indirect_highlight_preserve,
         sky_fractal_override: initial_ui.video.sky_fractal_override,
         sky_backend: initial_ui.video.sky_backend,
         blue_water_environment: initial_ui.video.blue_water_environment,
         cloud_backend: initial_ui.video.cloud_backend,
+        cloud_portal_depth: initial_ui.video.cloud_portal_depth,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
         cloud_quality: initial_ui.video.cloud_quality,
@@ -593,6 +740,7 @@ pub(in crate::renderer) fn render_thread_main(
         film_grain_strength: initial_ui.video.film_grain_strength,
         motion_blur_strength: initial_ui.video.motion_blur_strength,
         depth_of_field_strength: initial_ui.video.depth_of_field_strength,
+        dof_mode: initial_ui.video.dof_mode,
         crt_scope: initial_ui.video.crt_scope,
         crt_style: initial_ui.video.crt_style,
         crt_quality: initial_ui.video.crt_quality,
@@ -644,6 +792,8 @@ pub(in crate::renderer) fn render_thread_main(
     }
     renderer.dynamic_model_renderer.set_md3_geometry_cache(initial_ui.video.md3_geometry_cache);
     renderer.dynamic_model_renderer.set_model_render_bundles(initial_ui.video.model_render_bundles);
+    renderer.surface_sprite_effect_renderer.resident_enabled = initial_ui.video.surface_sprites_gpu;
+    renderer.surface_sprite_effect_renderer.enabled = initial_ui.video.surface_sprites;
     if let Err(error) = renderer.set_encoder_finish_threads(initial_ui.video.encoder_finish_threads) {
         eprintln!("Encoder finish worker: {error}");
     }
@@ -733,7 +883,10 @@ pub(in crate::renderer) fn render_thread_main(
     let mut frame_pace_anchor = Instant::now();
     let mut stats_frames = 0_u64;
     let mut last_info = FrameInfo::default();
+    // Graph stage attribution is only taken from a completed render frame.
+    let mut previous_graph_frame_complete = false;
     let mut last_r_speeds = Instant::now();
+    let mut last_ocean_mesh_diag = Instant::now();
     let mut last_measured_input_sequence = 0_u64;
     let mut input_latency_samples = 0_u64;
     let mut input_latch_samples = 0_u64;
@@ -781,6 +934,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut trace_present_ms = 0.0_f64;
     let mut trace_dynamic_model_ms = 0.0_f64;
     let mut trace_grass_cpu_ms = 0.0_f64;
+    let mut trace_surface_sprite_cpu_ms = 0.0_f64;
     let mut trace_ocean_topology_ms=0.0_f64;
     let mut trace_ocean_topology_max_ms=0.0_f64;
     // The per-pass GPU numbers printed below come from `gpu_profiler.latest`,
@@ -814,6 +968,10 @@ pub(in crate::renderer) fn render_thread_main(
     let mut batch_timing: Option<RenderBatchTiming> = None;
 
     let mut deferred_load_map = None;
+    // Separate queue/deferred-upload/first-render intervals. The old
+    // first-frame residual lumped all of these together as "unaccounted".
+    let mut load_map_received_at: Option<Instant> = None;
+    let mut pending_first_world_phases: Option<(Instant, Instant, Instant, Instant)> = None;
     // Explicit type is needed: the first read (`take`) precedes the branch
     // that assigns a `RemapMap`, so inference cannot discover the tuple's
     // `PreparedRemapPlan` type from its field accesses alone.
@@ -857,6 +1015,11 @@ pub(in crate::renderer) fn render_thread_main(
         }
         let mut diag_command_drain_count = 0_u32;
         let diag_command_drain_ms: f64;
+        // Only measured while presenting the first frame of a just-uploaded map.
+        let first_world_command_drain_ms: f64;
+        let mut first_world_command_count = 0_u32;
+        let mut first_world_slowest_command_ms = 0.0_f64;
+        let mut first_world_slowest_command_name = "none";
         // Checked before the command batch as well as before the frame: map and
         // texture uploads run from here, and on a dead device those fail the same
         // silent way, panicking somewhere inside wgpu instead of reporting.
@@ -876,8 +1039,11 @@ pub(in crate::renderer) fn render_thread_main(
                 let timings = map.load_timings;
                 let bsp_stats = map.bsp_stats.clone();
                 let upload_started = Instant::now();
+                let received_at = load_map_received_at.take().unwrap_or(upload_started);
                 let upload_timings = renderer.load_map(*map);
-                let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                let upload_ended_at = Instant::now();
+                let upload_ms = upload_ended_at.duration_since(upload_started).as_secs_f64() * 1000.0;
+                pending_first_world_phases = Some((started, received_at, upload_started, upload_ended_at));
                 pending_world_uploaded = Some((
                     request_id, started, name, triangles, batches, upload_ms,
                     upload_timings, timings, bsp_stats,
@@ -897,11 +1063,21 @@ pub(in crate::renderer) fn render_thread_main(
                 ));
             }
             let diag_command_drain_started = input_diagnostic.is_recording().then(Instant::now);
+            let first_world_command_drain_started =
+                pending_world_uploaded.is_some().then(Instant::now);
             loop {
                 let received = command_rx.try_recv();
                 if diag_command_drain_started.is_some() && received.is_ok() {
                     diag_command_drain_count = diag_command_drain_count.saturating_add(1);
                 }
+                if first_world_command_drain_started.is_some() && received.is_ok() {
+                    first_world_command_count = first_world_command_count.saturating_add(1);
+                }
+                let command_name = if first_world_command_drain_started.is_some() {
+                    received.as_ref().map(menu_trace_command_name).unwrap_or("queue empty")
+                } else {
+                    ""
+                };
                 let command_started = Instant::now();
                 match received {
                     Ok(RenderCommand::StartPerfCapture { stem, frames }) => {
@@ -992,13 +1168,23 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetCoastalDebugMesh(mesh)) => {
                         renderer.set_coastal_debug_mesh(mesh);
                     }
-                    Ok(RenderCommand::SetCoastalWater { enabled, pool, atlas }) => {
+                    Ok(RenderCommand::SetCoastalWater { enabled, pool, atlas, upstream_source }) => {
                         renderer.coastal_enabled = enabled;
                         renderer.coastal_pool = pool;
                         renderer.coastal_atlas = atlas;
+                        renderer.upstream_shore_source = upstream_source;
                     }
-                    Ok(RenderCommand::SetSunRayPreview(enabled)) => {
+                    Ok(RenderCommand::SetSunRayPreview { enabled, debug_mode }) => {
                         renderer.debug_volumes.sun_ray_enabled = enabled;
+                        renderer.debug_volumes.sun_ray_authored = debug_mode != 0;
+                        renderer.baked_sun_debug_mode = if enabled && matches!(debug_mode, 1 | 2) {
+                            u32::from(debug_mode)
+                        } else {
+                            0
+                        };
+                        renderer.update_lighting_settings();
+                        renderer.rebuild_frame_plan();
+                        renderer.sync_runtime_variant_flags();
                     }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
                     Ok(RenderCommand::SetFacePlaneCull(enabled)) => renderer.set_face_plane_cull(enabled),
@@ -1091,6 +1277,11 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetOceanSettings(settings)) => {
                         renderer.set_ocean_settings(settings)
                     }
+                    Ok(RenderCommand::OceanWake(command)) => {
+                        if let Some(ocean) = &mut renderer.ocean {
+                            ocean.blue_wake_command(command);
+                        }
+                    }
                     Ok(RenderCommand::SetPromotedOceanSettings(settings)) => {
                         renderer.promoted_ocean_overrides = settings;
                     }
@@ -1116,6 +1307,7 @@ pub(in crate::renderer) fn render_thread_main(
                         trace_submit_ms = 0.0;
                         trace_present_ms = 0.0;
                         trace_grass_cpu_ms = 0.0;
+                        trace_surface_sprite_cpu_ms = 0.0;
                         trace_ocean_topology_ms=0.0;
                         trace_ocean_topology_max_ms=0.0;
                         trace_prep_stage_ms = [0.0; 4];
@@ -1123,6 +1315,9 @@ pub(in crate::renderer) fn render_thread_main(
                             "JKA perf trace {}",
                             if enabled { "enabled" } else { "disabled" }
                         );
+                    }
+                    Ok(RenderCommand::SetFrameTimeGraph(enabled)) => {
+                        renderer.frame_time_graph.set_enabled(enabled);
                     }
                     Ok(RenderCommand::SetGpuTimings(enabled)) => {
                         user_gpu_timings = enabled;
@@ -1175,6 +1370,12 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetModelRenderBundles(enabled)) => {
                         renderer.dynamic_model_renderer.set_model_render_bundles(enabled);
+                    }
+                    Ok(RenderCommand::SetSurfaceSpritesGpu(enabled)) => {
+                        renderer.surface_sprite_effect_renderer.resident_enabled = enabled;
+                    }
+                    Ok(RenderCommand::SetSurfaceSprites(enabled)) => {
+                        renderer.surface_sprite_effect_renderer.enabled = enabled;
                     }
                     Ok(RenderCommand::SetMd3GeometryCache(enabled)) => {
                         renderer.dynamic_model_renderer.set_md3_geometry_cache(enabled);
@@ -1290,6 +1491,9 @@ pub(in crate::renderer) fn render_thread_main(
                             entity_hint,
                         );
                         let _ = proxy.send_event(UserEvent::SurfaceInspected(info));
+                    }
+                    Ok(RenderCommand::HybridWaveDump { path }) => {
+                        renderer.write_hybrid_wave_dump(&path);
                     }
                     Ok(RenderCommand::ClearSurfaceInspection) => {
                         renderer.inspector_vertex_range = None;
@@ -1469,6 +1673,7 @@ pub(in crate::renderer) fn render_thread_main(
                         // stop draining so command order is kept, and let one frame
                         // present the latest loading state ("uploading") first; the
                         // upload itself runs at the top of the next iteration.
+                        load_map_received_at = Some(Instant::now());
                         deferred_load_map = Some((request_id, started, name, map));
                         break;
                     }
@@ -1520,10 +1725,20 @@ pub(in crate::renderer) fn render_thread_main(
                         return;
                     }
                 }
+                if first_world_command_drain_started.is_some() {
+                    let duration_ms = command_started.elapsed().as_secs_f64() * 1000.0;
+                    if duration_ms > first_world_slowest_command_ms {
+                        first_world_slowest_command_ms = duration_ms;
+                        first_world_slowest_command_name = command_name;
+                    }
+                }
                 if let Some(batch) = batch_timing.as_mut() {
                     batch.record(command_started.elapsed());
                 }
             }
+            first_world_command_drain_ms = first_world_command_drain_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
             diag_command_drain_ms = diag_command_drain_started
                 .map(|started| started.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
@@ -1579,9 +1794,17 @@ pub(in crate::renderer) fn render_thread_main(
 
         // Every settings command for this frame has been drained, so a burst that
         // asked for the scene rebuild several times over pays for it once.
+        let first_world_rebuild_started = pending_world_uploaded.is_some().then(Instant::now);
         renderer.apply_pending_scene_rebuild();
+        let first_world_rebuild_ms = first_world_rebuild_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
+        let first_world_inline_started = pending_world_uploaded.is_some().then(Instant::now);
         renderer.update_inline_models(snapshot.inline_models.as_deref().map(Vec::as_slice));
+        let first_world_inline_ms = first_world_inline_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
         if let Some(scene) = snapshot.companion_scene.as_ref() {
             if let Some(worker) = companion_renderers.get(&scene.id) {
@@ -1596,6 +1819,27 @@ pub(in crate::renderer) fn render_thread_main(
         }
 
         let frame_loop_started = Instant::now();
+        renderer.frame_time_graph.sample(
+            frame_loop_started,
+            previous_graph_frame_complete.then_some(&last_info),
+            renderer.gpu_profiler.latest,
+            &renderer.device, &renderer.queue,
+            renderer.size.width, renderer.size.height,
+        );
+        previous_graph_frame_complete = false;
+        if let Some((_, _, _, uploaded_at)) = pending_first_world_phases.as_ref() {
+            let post_upload_ms = frame_loop_started
+                .saturating_duration_since(*uploaded_at).as_secs_f64() * 1000.0;
+            let measured_ms = first_world_command_drain_ms
+                + first_world_rebuild_ms + first_world_inline_ms;
+            rverbose!(2, "[MAP RENDER SETTINGS] sky backend={} | clouds enabled={} backend={} | sun override={} | ocean enabled={} backend={}",
+                renderer.sky_backend, renderer.clouds_enabled, renderer.cloud_backend,
+                renderer.sun_override, renderer.ocean_enabled, renderer.ocean_settings.backend);
+            rverbose!(2, "[MAP PRE-RENDER] post-upload {:.1} ms | command drain {:.1} ms ({} commands, slowest {:.1}: {}) | scene rebuild {:.1} | inline models {:.1} | remaining {:.1} ms (other loop work)",
+                post_upload_ms, first_world_command_drain_ms, first_world_command_count,
+                first_world_slowest_command_ms, first_world_slowest_command_name, first_world_rebuild_ms, first_world_inline_ms,
+                (post_upload_ms - measured_ms).max(0.0));
+        }
         let diag_frame_start_input = input_diagnostic
             .is_recording()
             .then(|| latest_view.load().input)
@@ -1626,6 +1870,13 @@ pub(in crate::renderer) fn render_thread_main(
             .map(|measurement| measurement.input)
             .or(snapshot.input_latency)
             .filter(|sample| sample.sequence != last_measured_input_sequence);
+        // Existing per-pass CPU counters are opt-in. Enable just for this one
+        // first-world frame, so first-use pipeline and ocean costs can be located
+        // without a 2s + 120-frame warmed-up performance capture.
+        let first_world_profile = pending_first_world_phases.is_some();
+        if first_world_profile {
+            crate::renderer::diagnostics::perf_capture::set_first_world_frame_trace(true);
+        }
         let render_result = {
             let mut model_source = snapshot.model_frame_source;
             if let Some(source) = model_source.as_mut() {
@@ -1672,6 +1923,9 @@ pub(in crate::renderer) fn render_thread_main(
                     input_latelatch.then_some(latest_view.as_ref()),
                 )
             }));
+            if first_world_profile {
+                crate::renderer::diagnostics::perf_capture::set_first_world_frame_trace(false);
+            }
             match frame_outcome {
                 Ok(result) => result,
                 Err(payload) => {
@@ -1704,6 +1958,42 @@ pub(in crate::renderer) fn render_thread_main(
                 {
                     print_r_speeds(&renderer, &frame_camera, &snapshot, &info);
                     last_r_speeds = Instant::now();
+                }
+                if renderer.ocean_settings.adaptive_mesh_debug
+                    && last_ocean_mesh_diag.elapsed() >= Duration::from_secs(1)
+                {
+                    last_ocean_mesh_diag = Instant::now();
+                    let stats = &info.ocean;
+                    let baseline = stats.adaptive_mesh_baseline_triangles;
+                    let selected = stats.adaptive_mesh_selected_triangles;
+                    let removed = baseline as i64 - selected as i64;
+                    let percentage = if baseline != 0 {
+                        removed as f64 * 100.0 / baseline as f64
+                    } else { 0.0 };
+                    let details = renderer.ocean.as_ref().map_or_else(
+                        || "no OceanGpu resources".to_owned(),
+                        |gpu| gpu.original_adaptive_mesh_steps(),
+                    );
+                    let reason = if !renderer.ocean_enabled { "ocean disabled" }
+                        else if renderer.ocean_settings.backend == 0 { "Godot backend: native LOD not used" }
+                        else if !renderer.ocean_settings.surface_pixels { "ocean pixel rendering disabled" }
+                        else if stats.original_surfaces == 0 { "no native surface draw in this frame (PVS / Hybrid fallback / sky)" }
+                        else if stats.adaptive_mesh_uncounted_slots != 0 { "baseline pending" }
+                        else if baseline == 0 { "no visible native indices in admitted pools" }
+                        else if baseline == selected { "NO REDUCTION (identical selected index count)" }
+                        else if selected > baseline { "MESH INCREASED (more triangles than reference)" }
+                        else { "native indexed mesh reduction confirmed" };
+                    println!("[OCEAN ADAPTIVE DEBUG] A/B={} backend={} native_draws={} measured_pools={} pending={} full={} submitted={} saved={:+} ({:+.2}%) waves[height={:.3}m wavelength={:.1}m chop={:.2} wind={:.2}m/s blend={:.2}] screenLOD={:.1} status={} {}",
+                        u8::from(renderer.ocean_settings.adaptive_mesh), renderer.ocean_settings.backend,
+                        stats.original_surfaces, stats.adaptive_mesh_counted_slots, stats.adaptive_mesh_uncounted_slots,
+                        baseline, selected, removed, percentage,
+                        renderer.ocean_settings.blue_water_waves.height,
+                        renderer.ocean_settings.blue_water_waves.wavelength,
+                        renderer.ocean_settings.blue_water_waves.choppiness,
+                        renderer.ocean_settings.blue_water_waves.wind_speed,
+                        renderer.ocean_settings.hybrid_fft_blend,
+                        renderer.ocean_settings.screen_lod_pixels,
+                        reason, details);
                 }
                 if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf)) {
                     if let Some(completed) = perf_capture.take() {
@@ -1751,6 +2041,7 @@ pub(in crate::renderer) fn render_thread_main(
                     trace_present_ms += info.cpu_present_ms;
                     trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
                     trace_grass_cpu_ms += info.grass.cpu_ms;
+                    trace_surface_sprite_cpu_ms += info.surface_sprites.cpu_ms;
                     trace_ocean_topology_ms+=info.ocean.topology_ms;
                     trace_ocean_topology_max_ms=trace_ocean_topology_max_ms.max(info.ocean.topology_ms);
                     if let Some(timing) = renderer.gpu_profiler.latest {
@@ -1769,6 +2060,7 @@ pub(in crate::renderer) fn render_thread_main(
                     trace_prep_stage_ms[3] += info.prep_reflection_ms;
                 }
                 last_info = info;
+                previous_graph_frame_complete = true;
                 if input_diagnostic.is_recording() {
                     diag_rendered = true;
                     diag_present_latest_input = latest_view.load().input;
@@ -1845,6 +2137,37 @@ pub(in crate::renderer) fn render_thread_main(
                     bsp_stats,
                 )) = pending_world_uploaded.take()
                 {
+                    if let Some((requested_at, received_at, upload_started_at, upload_ended_at)) = pending_first_world_phases.take() {
+                        let ms = |later: Instant, earlier: Instant| later.saturating_duration_since(earlier).as_secs_f64() * 1000.0;
+                        rverbose!(2, "[MAP FIRST FRAME PHASES] request->render-queue {:.1} ms (includes preparation) | deferred loading-screen frame {:.1} | world upload {:.1} | post-upload->render {:.1} | first render/present {:.1} | total {:.1} ms",
+                            ms(received_at, requested_at), ms(upload_started_at, received_at),
+                            ms(upload_ended_at, upload_started_at), ms(frame_loop_started, upload_ended_at),
+                            frame_loop_started.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
+                        rverbose!(2, "[MAP FIRST RENDER CPU] frame {:.1} | prepare {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | present {:.1} ms (CPU timings; no GPU wait inference)",
+                            last_info.frame_ms, last_info.cpu_prepare_ms, last_info.cpu_acquire_ms,
+                            last_info.cpu_encode_ms, last_info.cpu_submit_ms, last_info.cpu_present_ms);
+                        let known_encode_ms = last_info.perf_encode_setup_ms
+                            + last_info.perf_encode_pre_world_ms
+                            + last_info.perf_encode_scene_ms
+                            + last_info.perf_encode_post_ui_ms
+                            + last_info.perf_encoder_finish_ms
+                            + last_info.perf_profiler_readback_encode_ms;
+                        rverbose!(2, "[MAP FIRST ENCODE STAGES] encoder setup {:.1} | pre-world (ocean/shadow/reflection/etc) {:.1} | scene {:.1} | post/UI {:.1} | encoder finish {:.1} | profiler copy {:.1} | other {:.1} ms",
+                            last_info.perf_encode_setup_ms, last_info.perf_encode_pre_world_ms,
+                            last_info.perf_encode_scene_ms, last_info.perf_encode_post_ui_ms,
+                            last_info.perf_encoder_finish_ms, last_info.perf_profiler_readback_encode_ms,
+                            (last_info.cpu_encode_ms - known_encode_ms).max(0.0));
+                        rverbose!(2, "[MAP FIRST PRE-WORLD] ocean setup/FFT/coast {:.1} | grass+shadows {:.1} | remaining (depth/cull/reflection/etc) {:.1} ms",
+                            last_info.perf_pre_world_ocean_ms,
+                            last_info.perf_pre_world_shadows_ms,
+                            last_info.perf_pre_world_remaining_ms);
+                        rverbose!(2, "[MAP FIRST ENCODE COUNTS] {} render passes | {} compute passes | {} indexed draws | {} deferred bundle builds | {} deferred bundle hits",
+                            last_info.perf_encode_calls.render_passes,
+                            last_info.perf_encode_calls.compute_passes,
+                            last_info.perf_encode_calls.draw_indexed,
+                            last_info.perf_deferred_bundle_build,
+                            last_info.perf_deferred_bundle_hit);
+                    }
                     let _ = proxy.send_event(UserEvent::WorldUploaded {
                         request_id,
                         name,
@@ -2371,6 +2694,19 @@ pub(in crate::renderer) fn render_thread_main(
                 u8::from(renderer.grass_mid_lod_enabled),
                 u8::from(renderer.grass_front_to_back_enabled),
             );
+            let sprites = last_info.surface_sprites;
+            println!(
+                "[JKA SURFACE SPRITES PERF] gpu_path={} cpu={:.4}ms gpu={}ms cpu_sprites={} resident_instances={} draws={} chunks={}/{} upload_bytes={}",
+                u8::from(renderer.surface_sprite_effect_renderer.resident_enabled),
+                trace_surface_sprite_cpu_ms / frames,
+                gpu_ms(GpuPass::SurfaceSprites),
+                sprites.cpu_sprites,
+                sprites.resident_instances,
+                sprites.draws,
+                sprites.chunks_visible,
+                sprites.chunks_total,
+                sprites.upload_bytes,
+            );
             println!(
                 "[JKA PERF PLAN] post={} post_compact={} linear_depth={} hiz={} gpu_cull={} compact={} clustered={} gamma={:.3} grain={:.3} lut={} lut_strength={:.2} fog={:?} hdr={} tonemap={} bloom={} ssao={} static_ao={} fxaa={} smaa={} taa={} contact={} ssr={} motion={:.2} motion_scale={:.2} dof={:.2} dof_quality={} dof_focus={:.0} ca={:.2} vignette={} local_shadows={} pbr={} pom={} cascaded={}",
                 u8::from(renderer.frame_plan.use_post),
@@ -2489,6 +2825,7 @@ pub(in crate::renderer) fn render_thread_main(
             trace_present_ms = 0.0;
             trace_dynamic_model_ms = 0.0;
             trace_grass_cpu_ms = 0.0;
+            trace_surface_sprite_cpu_ms = 0.0;
             trace_ocean_topology_ms=0.0;
             trace_ocean_topology_max_ms=0.0;
             trace_prep_stage_ms = [0.0; 4];

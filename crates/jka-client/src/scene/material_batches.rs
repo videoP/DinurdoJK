@@ -495,6 +495,7 @@ pub(in crate::scene) fn stage_batch(
         water_amplitude: material.water_amplitude,
         water_deformed: material.water_deformed,
         alpha_shadow: material.alpha_shadow,
+        baked_shadow_texture: material.baked_shadow_texture,
         light_filter: material.light_filter,
         water_primary: material.water && first && !water_fades_to_nothing(material),
         water_overlay: material.water && water_fades_to_nothing(material),
@@ -833,13 +834,27 @@ pub(in crate::scene) fn build_material_debug_entry(
 
     if let Some(grass) = material.grass {
         lines.push(format!(
-            "resolved grass emitter: GodotGrass per-blade path height={:.1} JKA-width-hint={:.1} density={:.1} fade={:.1}..{:.1} wind={:.2}; legacy sprite card suppressed",
+            "resolved grass emitter: r_grass 1=GodotGrass, 0=native JKA sprites; height={:.1} JKA-width-hint={:.1} density={:.1} fade={:.1}..{:.1} wind={:.2}",
             grass.height,
             grass.authored_width,
             grass.density,
             grass.fade_dist,
             grass.fade_max,
             grass.wind,
+        ));
+    }
+
+    for sprite in &material.surface_sprite_effects {
+        lines.push(format!(
+            "resolved native surfaceSprite: {:?} texture={} size={:.1}x{:.1} density={:.1} alphaCut={:.3} depthWrite={} GodotCandidate={} (r_grass 0 always uses native)",
+            sprite.sprite.kind,
+            sprite.texture,
+            sprite.sprite.width,
+            sprite.sprite.height,
+            sprite.sprite.density,
+            sprite.alpha_cutoff,
+            sprite.depth_write,
+            sprite.godot_candidate,
         ));
     }
 

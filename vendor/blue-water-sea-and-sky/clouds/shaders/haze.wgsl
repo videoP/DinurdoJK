@@ -3,7 +3,7 @@
 // air, glowing toward a strike. One full-screen pass from the scene's colour copy into the scene.
 
 #import naval_sky::atmosphere::{sky_radiance}
-#import naval_clouds::post::{post, scene_color}
+#import naval_clouds::post::{post, scene_color, scene_depth}
 
 const RAIN_VISIBILITY: f32 = 1800.0;
 const DESATURATE: f32 = 0.35;
@@ -52,7 +52,17 @@ fn haze_fragment(in: HazeVertex) -> @location(0) vec4<f32> {
     var color = textureLoad(scene_color, pixel, 0);
     if post.haze_strength > 0.0 {
         let ray = normalize(in.ray);
-        let rain = min(select(post.haze_ceiling / max(ray.y, 0.02), post.haze_height / max(-ray.y, 1e-4), ray.y < 0.0), LONGEST);
+        var rain = min(select(post.haze_ceiling / max(ray.y, 0.02), post.haze_height / max(-ray.y, 1e-4), ray.y < 0.0), LONGEST);
+        // Upstream's scene is sea and sky, so the veil was the rain's length along the ray whatever stood in it. Here a
+        // wall, a hill or a player in front of the horizon would be veiled as if it were the horizon itself: stop the
+        // rain at the first opaque surface (reversed depth 0 is sky, which keeps the full length).
+        let depth_size = textureDimensions(scene_depth);
+        let depth = textureLoad(scene_depth, min(vec2<u32>(in.position.xy), depth_size - 1u), 0);
+        if depth > 0.0 {
+            let uv = in.position.xy / vec2<f32>(depth_size);
+            let h = post.inverse_projection * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+            rain = min(rain, length(h.xyz / h.w));
+        }
         let veil = (1.0 - exp(rain / -RAIN_VISIBILITY)) * post.haze_strength;
         let grey = mix(color.rgb, vec3<f32>(luminance(color.rgb)), veil * DESATURATE);
         var lit = in.tint;

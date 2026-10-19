@@ -26,6 +26,24 @@ use crate::scene::{
     WorldGeometryChunk, LIGHTMAP_BY_VERTEX, MAX_FILE_BYTES,
 };
 
+/// A shading normal is not a geometric face plane: q3map phong terrain can
+/// have varying heights even when its RBSP surface kind is Planar. Reject by
+/// a plane only when every vertex actually lies on it; otherwise use bounds.
+fn legacy_dlight_cull_plane(points: impl Iterator<Item = Vec3> + Clone) -> [f32; 4] {
+    let Some(origin) = points.clone().next() else { return [0.0; 4]; };
+    let Some(edge) = points.clone().map(|point| point - origin)
+        .find(|edge| edge.length_squared() > 1.0e-10)
+    else { return [0.0; 4]; };
+    let Some(normal) = points.clone().map(|point| edge.cross(point - origin))
+        .find(|normal| normal.length_squared() > 1.0e-10)
+        .map(Vec3::normalize)
+    else { return [0.0; 4]; };
+    if points.clone().any(|point| normal.dot(point - origin).abs() > 0.1) {
+        return [0.0; 4];
+    }
+    [normal.x, normal.y, normal.z, normal.dot(origin)]
+}
+
 pub fn prepare(root: &Path, game: Option<&Path>, name: &str) -> Result<PreparedMap, String> {
     prepare_internal(root, game, name, None, MapPrepareOptions::default(), None)
 }
@@ -549,7 +567,8 @@ pub(in crate::scene) fn prepare_internal(
 
     // Spawns, FX runners, brush entities and the entity graph read only the BSP,
     // so they run here while the workers are still decoding textures.
-    let static_models = Arc::new(bsp.static_models());
+    // Mutable until the geometry exists: the menu scene stands its props on it.
+    let mut static_models = bsp.static_models();
     let mut spawns: Vec<_> = bsp
         .deathmatch_spawns()
         .into_iter()
@@ -575,7 +594,7 @@ pub(in crate::scene) fn prepare_internal(
             ..SpawnPoint::default()
         });
     }
-    let fx_runners = bsp_fx_runners(&bsp, &mut warnings);
+    let mut fx_runners = bsp_fx_runners(&bsp, &mut warnings);
     let world_effect_registrations = bsp_world_effect_registrations(&bsp);
     let brush_entities = bsp_brush_entities(&bsp);
     let entity_graph = Some(Arc::new(crate::entity_graph::EntityGraph::build(&bsp)));
@@ -613,7 +632,15 @@ pub(in crate::scene) fn prepare_internal(
                     ..Default::default()
                 };
             }
-            let shader_name = String::from_utf8_lossy(&shader.name).to_ascii_lowercase();
+            let mut shader_name = String::from_utf8_lossy(&shader.name).to_ascii_lowercase();
+            if options.menu_look {
+                // Swap before describe so the replacement's surfaceSprites and
+                // grass stages become this surface's emitters. Surface flags stay
+                // the BSP's own (footsteps, puddles, collision are unchanged).
+                if let Some(swap) = super::menu_look::material_swap(name, &shader_name) {
+                    shader_name = swap.to_owned();
+                }
+            }
             materials::describe(
                 &shader_name,
                 shader.surface_flags,
@@ -626,6 +653,29 @@ pub(in crate::scene) fn prepare_internal(
             )
         })
         .collect();
+    // Menu scene only: a stock water material for the synthesized water face,
+    // described here so its textures join the map's texture set.
+    let menu_scenery = (options.menu_look && super::menu_look::is_menu_map(name))
+        .then(|| {
+            let mut describe = |shader: &str| {
+                library.get(shader).is_some().then(|| {
+                    materials::describe(
+                        shader,
+                        0,
+                        library.get(shader),
+                        library_debug.origins.get(shader),
+                        &mut assets,
+                        &mut textures,
+                        options.gen_normal_maps,
+                        options.omit_environment_stages,
+                    )
+                })
+            };
+            Some(super::menu_look::MenuScenery {
+                water: describe(super::menu_look::WATER_SHADER)?,
+            })
+        })
+        .flatten();
     let describe_ms = describe_started.elapsed().as_secs_f64() * 1000.0;
     let tints_started = Instant::now();
 
@@ -678,6 +728,13 @@ pub(in crate::scene) fn prepare_internal(
     }
     phase_lap(&mut load_timings, 5, &mut phase_clock);
 
+    // Nothing grows below the synthesized menu water. Render-space height and
+    // JKA z are the same number, so one floor serves both bakers.
+    let plant_floor = if options.menu_look {
+        super::menu_look::planting_floor(name).unwrap_or(f32::NEG_INFINITY)
+    } else {
+        f32::NEG_INFINITY
+    };
     let surface_sprite_effects =
         collect_surface_sprite_effect_emitters(&bsp, &mesh, &surface_materials);
     if !surface_sprite_effects.is_empty() {
@@ -689,6 +746,22 @@ pub(in crate::scene) fn prepare_internal(
             1,
             "{name}: surfaceSprites effect: {} emitter stage(s), {triangle_count} source triangle(s)",
             surface_sprite_effects.len()
+        );
+    }
+    let surface_sprite_stage = Instant::now();
+    let (surface_sprite_bake, surface_sprite_cpu_ms) =
+        super::surface_sprite_bake::bake_surface_sprites(&surface_sprite_effects, jobs, plant_floor)?;
+    load_timings.surface_sprites_ms = surface_sprite_stage.elapsed().as_secs_f64() * 1000.0;
+    load_timings.surface_sprites_cpu_ms = surface_sprite_cpu_ms;
+    if !surface_sprite_bake.instances.is_empty() {
+        devprintln!(
+            1,
+            "{name}: surfaceSprites bake: {} instance(s) in {} chunk(s), {:.1} MiB; wall {:.2} ms, worker CPU {:.2} ms",
+            surface_sprite_bake.instances.len(),
+            surface_sprite_bake.chunks.len(),
+            std::mem::size_of_val(surface_sprite_bake.instances.as_slice()) as f64 / (1024.0 * 1024.0),
+            load_timings.surface_sprites_ms,
+            surface_sprite_cpu_ms,
         );
     }
 
@@ -757,13 +830,13 @@ pub(in crate::scene) fn prepare_internal(
                 let clump_data = Arc::clone(&clump_data);
                 grass_jobs.push(jobs.submit(Task::MapGrass, move || {
                     let started = Instant::now();
-                    let result = generate_grass_chunk(chunk, lightmaps, clump_data);
+                    let result = generate_grass_chunk(chunk, lightmaps, clump_data, plant_floor);
                     (result, started.elapsed().as_secs_f64() * 1000.0)
                 })?);
             }
         } else {
             let started = Instant::now();
-            let result = generate_grass_chunk(grass_emitters, lightmaps, clump_data);
+            let result = generate_grass_chunk(grass_emitters, lightmaps, clump_data, plant_floor);
             load_timings.grass_cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
             grass_sync = Some(result);
         }
@@ -960,20 +1033,9 @@ pub(in crate::scene) fn prepare_internal(
             }
 
             let plane = if matches!(surface.kind, SurfaceKind::Planar) {
-                surface
-                    .vertices
-                    .clone()
-                    .find_map(|index| {
-                        let vertex = bsp.vertices.get(index)?;
-                        let normal =
-                            Vec3::from_array(render_position(vertex.normal)).normalize_or_zero();
-                        if normal.length_squared() <= 1.0e-10 {
-                            return None;
-                        }
-                        let point = Vec3::from_array(render_position(vertex.position));
-                        Some([normal.x, normal.y, normal.z, normal.dot(point)])
-                    })
-                    .unwrap_or([0.0; 4])
+                legacy_dlight_cull_plane(surface.vertices.clone().map(|index| {
+                    Vec3::from_array(render_position(bsp.vertices[index].position))
+                }))
             } else {
                 [0.0; 4]
             };
@@ -1433,6 +1495,19 @@ pub(in crate::scene) fn prepare_internal(
         &mut batches,
         &mut pvs_batches,
     );
+    if options.menu_look {
+        // Props and fx are stood on the terrain, so they read the batches before
+        // the synthesized water joins them.
+        super::menu_look::apply_scene(
+            root, game, name, options.menu_props, &bsp, &mut static_models, &mut fx_runners,
+        );
+        if static_models.visibility.is_none() && !static_models.placements.is_empty() {
+            static_models.visibility = bsp.visibility.clone();
+        }
+    }
+    if let Some(scenery) = menu_scenery.as_ref() {
+        super::menu_look::append_scenery(scenery, &mut vertices, &mut batches, &mut pvs_batches);
+    }
 
     // AUTO 4 is pure CPU map preprocessing. Keep its potentially expensive
     // per-cluster PVS/group search off the renderer thread and expose it as its
@@ -1676,9 +1751,13 @@ pub(in crate::scene) fn prepare_internal(
     let mut steam_audio_bake_request = None;
     if let (Some(acoustic_mesh), Some(cache)) = (&steam_audio_acoustic_mesh, steam_audio_bake_cache)
     {
+        let over_budget = crate::steam_audio::over_budget_skip(&cache);
         match crate::steam_audio::load_cached_bake(&cache) {
             Ok(Some(data)) => {
                 steam_audio_bake = Some(Arc::new(data));
+            }
+            Ok(None) | Err(_) if over_budget.is_some() => {
+                println!("{name}: {}", over_budget.unwrap_or_default());
             }
             Ok(None) => {
                 let num_threads = jobs
@@ -1852,6 +1931,7 @@ pub(in crate::scene) fn prepare_internal(
             map_hash, root, game)
     } else { None };
 
+    let baked_sun_encoding = crate::scene::source::baked_sun_encoding(&bsp, &used_shader_names, &library);
     Ok(PreparedMap {
         patch_draws,
         inline_patch_draws,
@@ -1865,7 +1945,7 @@ pub(in crate::scene) fn prepare_internal(
         movement,
         collision,
         mark_surfaces,
-        static_models,
+        static_models: Arc::new(static_models),
         physics_collision,
         weather_occlusion,
         vertices,
@@ -1897,6 +1977,7 @@ pub(in crate::scene) fn prepare_internal(
         visibility,
         lights,
         source_map_lighting: SourceMapLighting::default(),
+        baked_sun_encoding,
         sun,
         static_light_grid,
         voxel_probe_gi,
@@ -1904,6 +1985,7 @@ pub(in crate::scene) fn prepare_internal(
         grass_patches,
         grass_local_fogs,
         surface_sprite_effects,
+        surface_sprite_bake,
         global_fog,
         warnings,
         spawns,
@@ -1928,4 +2010,36 @@ pub(in crate::scene) fn prepare_internal(
         },
         texture_hashes,
     })
+}
+
+#[cfg(test)]
+mod legacy_dlight_cull_plane_tests {
+    use super::*;
+
+    #[test]
+    fn nonplanar_terrain_keeps_bounds_culling() {
+        // A q3map terrain face can include the high rim and the flat ground
+        // beneath a fire. A plane through the rim incorrectly rejects it.
+        let points = [
+            Vec3::new(736.0, -384.0, 320.0),
+            Vec3::new(-256.0, -384.0, 192.0),
+            Vec3::new(-256.0, -128.0, 192.0),
+            Vec3::new(0.0, -128.0, 192.0),
+        ];
+        assert_eq!(legacy_dlight_cull_plane(points.into_iter()), [0.0; 4]);
+    }
+
+    #[test]
+    fn coplanar_face_uses_geometry_and_tolerates_duplicate_vertices() {
+        let points = [Vec3::new(0.0, 0.0, 192.0), Vec3::new(0.0, 0.0, 192.0),
+            Vec3::new(1.0, 0.0, 192.0), Vec3::new(2.0, 0.0, 192.0),
+            Vec3::new(0.0, 1.0, 192.0)];
+        let plane = legacy_dlight_cull_plane(points.into_iter());
+        assert_eq!(plane, [0.0, 0.0, 1.0, 192.0]);
+    }
+
+    #[test]
+    fn degenerate_face_keeps_bounds_culling() {
+        assert_eq!(legacy_dlight_cull_plane([Vec3::ZERO; 3].into_iter()), [0.0; 4]);
+    }
 }

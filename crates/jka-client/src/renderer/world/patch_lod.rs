@@ -493,11 +493,6 @@ impl WorldPatchLod {
 
     pub fn stats(&self) -> PatchLodStats { self.stats }
 
-    /// Full-detail index buffer contents (static ranges never change).
-    pub fn source_indices(&self) -> Option<&[u32]> {
-        self.source.as_deref().map(Vec::as_slice)
-    }
-
     /// Legacy dlight surface runs of a packed geometry, in FULL-detail index space.
     pub fn original_runs(&self, geometry: usize) -> &[crate::renderer::LegacyDlightRun] {
         &self.geometries[geometry].original_runs

@@ -60,6 +60,7 @@ impl App {
         self.apply_latched_values_to_settings(&mut settings);
 
         let presentation = config::ClientPresentationSettings {
+            game_launch_screen: self.game_launch_screen,
             third_person: self.third_person,
             spectator_camera: self.spectator_camera,
             first_person_lightsaber: self.first_person_lightsaber,
@@ -95,11 +96,15 @@ impl App {
             console_suggest: self.console_suggest,
             chatbox_completion: self.chatbox_completion,
             clean_chatbox: self.clean_chatbox,
+            streamer: self.streamer,
             chat_log: self.chat_log_enabled,
             ui_vgs: self.ui_vgs,
             jump_height_shade: self.jump_height_shade,
             screen_shake: self.screen_shake,
             head_look: self.head_look,
+            swim_tilt: self.swim_tilt,
+            swim_turn_bank: self.swim_turn_bank,
+            move_lean: self.move_lean,
             zoom_fov: self.japro_zoom_fov,
             fk_duration: self.japro_fk_duration,
             fk_first_jump_duration: self.japro_fk_first_jump_duration,

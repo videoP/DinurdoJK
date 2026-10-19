@@ -195,6 +195,8 @@ impl Renderer {
         // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
         // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
         let fast_baseline = self.sky_backend == 0 && !self.blue_water_environment.world_lighting && self.blue_water_environment.weather_backend != 1 && !self.force_unified_world
+            // bsp_fast has no baked-light adjustment or authored-sun cache pass.
+            && !self.baked_lighting_shader_needed()
             // Curved-grid LOD belongs to the Unified packed BSP path.
             && self.world.as_ref().is_none_or(|world| !world.patch_lod.has_patches())
             && !self.dynamic_light_debug

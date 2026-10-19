@@ -32,9 +32,12 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
     assert!(Arc::ptr_eq(&mesh, &animation));
     assert!(plan.is_none());
     let model = PlayerModelAsset {
+        body_shape_available: false,
+        body_shape_binding: None,
         key: "test".into(), glm: Arc::new(glm.clone()), gla: mesh,
         animation_gla: Arc::clone(&animation), retargeter: plan,
-        source_native_pivots: None, humanoid: true, animations: None,
+        source_native_pivots: None, source_jiggles: None,
+        source_jiggles_enabled: false, humanoid: true, animations: None,
         anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,
     };
     let mut animator = Ghoul2Animator::new(&animation);
@@ -1127,6 +1130,7 @@ fn demo_followed_player_holds_non_saber_weapons() {
                             true,
                             false,
                             None,
+                            false, // No playerState pm_type in this demo harness.
                         )
                         .unwrap();
                     let weapon = followed.state.field_i32("weapon").unwrap_or(0);

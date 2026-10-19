@@ -70,7 +70,13 @@ struct LightingSettings {
     map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; unused by compute/fog consumers
     baked_sun_direction_strength: vec4<f32>, // xyz toward old sun, w removal strength
     baked_sun_radiance: vec4<f32>, // RGB old sun intensity / 255
-    runtime_sun_radiance: vec4<f32>, // RGB new sun intensity / 255
+    original_sun_shadow_view_proj: mat4x4<f32>,
+    original_sun_shadow_params: vec4<f32>, // x requested, y shadow texel size, z cache ready
+    baked_indirect_adjust: vec4<f32>, // x residual exposure, y residual saturation, z shadow PCF softness, w removal budget
+    baked_indirect_curve: vec4<f32>, // x gamma-like power in linear light, y highlight retention, zw reserved
+    baked_sun_debug_mode: vec4<u32>, // x: 0 off, 1 removal amount, 2 old-sun visibility
+    runtime_sun_direction: vec4<f32>,
+    runtime_sun_radiance: vec4<f32>, // xyz radiance, w live BSP sunlight enabled
 };
 struct PbrSettings {
     // x: PBR companions enabled, y: parallax enabled, z: height scale * 1000.
@@ -288,6 +294,7 @@ struct VertexOut {
     @location(9) pbr_lightgrid_lighting: vec4<f32>,
     @location(10) vertex_dlight: vec3<f32>,
     @location(11) @interpolate(flat) legacy_dlight_bits: u32,
+    @location(15) @interpolate(flat) baked_sun_fit: vec4<f32>,
 };
 
 // Fused additive stages only. Reuse locations unused by this shader family;
@@ -594,6 +601,16 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
         output.world_normal = surface_deformation_vertex_normal(
             input.position, input.normal, material_flags_w(), instance_index, allow_shell
         );
+    }
+    output.baked_sun_fit = vec4<f32>(0.0);
+    if (ENABLE_BAKED_SUN_RELIGHT && instance_index == 0u) {
+        let surface_count = arrayLength(&legacy_dlight_surface_masks) / 5u;
+        if (legacy_dlight_surface_id < surface_count) {
+            let base = surface_count + legacy_dlight_surface_id * 4u;
+            output.baked_sun_fit = bitcast<vec4<f32>>(vec4<u32>(
+                legacy_dlight_surface_masks[base], legacy_dlight_surface_masks[base + 1u],
+                legacy_dlight_surface_masks[base + 2u], legacy_dlight_surface_masks[base + 3u]));
+        }
     }
     output.vertex_dlight = transient_vertex_dlight(world_position, output.world_normal);
     output.shell_kind = select(0u, 1u, instance_index != 0u);
@@ -2327,34 +2344,240 @@ fn sample_planar_reflection(
     return vec4<f32>(softened.rgb * 0.90, softened.a);
 }
 
-// Approximate separation of q3map2's sunlight from its *combined* baked
-// lightmap. A BSP does NOT contain individual light contributions; this cannot
-// reconstruct the exact original direct/indirect split. Only run when the
-// specialized relight variant is active. Shader authored colors, local lamps,
-// and dark areas are protected by a small per-channel residual floor and by
-// limiting subtraction to the surface's old-sun facing/available intensity.
-fn relight_baked_sun(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
-    if (!ENABLE_BAKED_SUN_RELIGHT) { return lightmap; }
-    let strength = lighting_settings.baked_sun_direction_strength.w;
-    if (strength <= 0.0) { return lightmap; }
-    let n = normalize(input.world_normal);
+// Original sun is a known RGB *direction* from q3map_sun/q3map_sunExt.
+// The sun's authored intensity is not a calibrated linear-lightmap energy value.
+// The decomposition is constrained by local baked-shadow samples rather than
+// independent RGB clamps against an arbitrary (0.10,0.10,0.10) black floor.
+fn baked_luminance(rgb: vec3<f32>) -> f32 {
+    return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn old_sun_texel_visible(pixel: vec2<i32>, receiver_depth: f32, sky_receiver_depth: f32, depth_bias: f32) -> f32 {
+    let sky = textureLoad(sky_admission_texture, pixel, 4i, 0);
+    let caster = textureLoad(shadow_texture, pixel, 4i, 0);
+    let sky_ok = sky > 0.000001 && sky >= sky_receiver_depth - 0.0005;
+    let caster_ok = receiver_depth + depth_bias >= caster;
+    return select(0.0, 1.0, sky_ok && caster_ok);
+}
+
+fn original_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
     let toward_old = normalize(lighting_settings.baked_sun_direction_strength.xyz);
-    let old_facing = max(dot(n, toward_old), 0.0);
-    let old_radiance = lighting_settings.baked_sun_radiance.rgb * old_facing;
-    // A colored lamp can still resemble the sun: this is a conservative
-    // estimate, not a claimed exact decomposition. Preserve a residual floor.
-    let available = max(lightmap - vec3<f32>(0.10), vec3<f32>(0.0));
-    let old_direct = min(old_radiance, available);
-    let remaining = max(lightmap - old_direct * strength, vec3<f32>(0.0));
-    // The runtime sun must be tested against scene shadow/sky admission before
-    // it is added. Without CSM/RT support CPU disables this mode entirely.
-    let toward_new = -normalize(shadow_settings.light_direction_enabled.xyz);
-    let new_facing = max(dot(n, toward_new), 0.0);
-    if (new_facing <= 0.0 || all(lighting_settings.runtime_sun_radiance.rgb <= vec3<f32>(0.0))) {
+    // Offset receiver *toward* the light in WORLD units to prevent large-map
+    // reverse-Z precision and parallel-floor self-shadow stippling.
+    let receiver = input.world_position + toward_old * 1.5;
+    let clip = lighting_settings.original_sun_shadow_view_proj * vec4<f32>(receiver, 1.0);
+    if (clip.w <= 0.0) { return 0.0; }
+    let ndc = clip.xyz / clip.w;
+    if (any(abs(ndc.xy) >= vec2<f32>(0.995)) || ndc.z <= 0.0 || ndc.z >= 1.0) { return 0.0; }
+    let dims = vec2<i32>(textureDimensions(shadow_texture));
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let texel_center = uv * vec2<f32>(dims);
+    let old_layer = 4i;
+    let encoded_receiver_depth = 0.5 + atan(ndc.z) / 3.14159265358979323846;
+    let slope = 1.0 - max(dot(normalize(normal), toward_old), 0.0);
+    let depth_bias = 0.00035 + 0.001 * slope;
+    // Fast path: five visibility taps detect uniform sun/shadow regions.
+    // The 4x4 filter runs only in the penumbra, not over whole floors.
+    let radius = lighting_settings.baked_indirect_adjust.z;
+    let center_pixel = clamp(vec2<i32>(floor(texel_center)), vec2<i32>(0), dims - vec2<i32>(1));
+    var sum = old_sun_texel_visible(center_pixel, ndc.z, encoded_receiver_depth, depth_bias);
+    for (var k = 0i; k < 4i; k += 1i) {
+        let corner = vec2<f32>(select(-1.0, 1.0, (k & 1) != 0),
+            select(-1.0, 1.0, (k & 2) != 0));
+        let loc = clamp(vec2<i32>(floor(texel_center + corner * radius)),
+            vec2<i32>(0), dims - vec2<i32>(1));
+        sum += old_sun_texel_visible(loc, ndc.z, encoded_receiver_depth, depth_bias);
+    }
+    if (sum <= 0.0 || sum >= 5.0 || radius <= 0.001) {
+        return sum * 0.2;
+    }
+    // Deterministic screen-resolution-independent 4x4 PCF, including SKY.
+    var visible = 0.0;
+    for (var y = 0i; y < 4i; y += 1i) {
+        for (var x = 0i; x < 4i; x += 1i) {
+            let step_xy = (vec2<f32>(f32(x), f32(y)) - vec2<f32>(1.5)) / 1.5;
+            let loc = clamp(vec2<i32>(floor(texel_center + step_xy * radius)),
+                vec2<i32>(0), dims - vec2<i32>(1));
+            visible += old_sun_texel_visible(loc, ndc.z, encoded_receiver_depth, depth_bias);
+        }
+    }
+    return visible * 0.0625;
+}
+
+fn baked_indirect_tone(rgb: vec3<f32>) -> vec3<f32> {
+    let intensity = lighting_settings.baked_indirect_adjust.x;
+    let saturation = lighting_settings.baked_indirect_adjust.y;
+    let luminance = max(baked_luminance(rgb), 0.0);
+    var curve_gain = 1.0;
+    let power = lighting_settings.baked_indirect_curve.x;
+    if (power > 1.0001) {
+        // Lightmap textures are sampled in linear light. Power curves must be
+        // applied to luminance as a common RGB gain, not to channels separately.
+        // This is highlight-preserving tone shaping, not true light separation.
+        let low_light_gain = pow(clamp(luminance, 0.0, 1.0), power - 1.0);
+        let highlight_weight = smoothstep(0.35, 0.85, luminance) *
+            lighting_settings.baked_indirect_curve.y;
+        curve_gain = mix(low_light_gain, 1.0, highlight_weight);
+    }
+    let gray = vec3<f32>(luminance);
+    return max(mix(gray, rgb, saturation) * (intensity * curve_gain), vec3<f32>(0.0));
+}
+
+// Q3Map2 applies gamma, then a hue-preserving exponential exposure, then
+// overbright compensation. Undo that transform BEFORE subtracting photon units.
+fn baked_file_to_linear(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb / 12.92, pow((rgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), rgb > vec3<f32>(0.04045));
+}
+fn baked_linear_to_file(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb * 12.92, 1.055 * pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055, rgb > vec3<f32>(0.0031308));
+}
+fn subtract_authored_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
+    let fit = input.baked_sun_fit;
+    let strength = lighting_settings.baked_sun_direction_strength.w;
+    var remaining = lightmap;
+    if (strength > 0.0 && flux > 0.0) {
+        var encoded = lightmap;
+        if (fit.w > 0.0) { encoded = baked_linear_to_file(encoded); }
+        let compensated = encoded * abs(fit.w);
+        let maximum = max(max(compensated.r, compensated.g), compensated.b);
+        // Default compiler output has zero exposure and stores photon values
+        // directly until saturation. Positive exposure uses the exponential curve.
+        var raw_gamma = compensated * 255.0;
+        if (fit.x > 0.0) {
+            let raw_maximum = -fit.x * log(max(1.0 - min(maximum, 254.5 / 255.0), 0.5 / 255.0));
+            raw_gamma = compensated / max(maximum, 0.00001) * raw_maximum;
+        }
+        let raw = pow(max(raw_gamma / 255.0, vec3<f32>(0.0)), vec3<f32>(fit.y)) * 255.0;
+        let direct = lighting_settings.baked_sun_radiance.rgb * (255.0 * flux * strength);
+        let residual = max(raw - direct, vec3<f32>(0.0));
+        let gamma_residual = pow(residual / 255.0, vec3<f32>(1.0 / fit.y)) * 255.0;
+        let peak = max(max(gamma_residual.r, gamma_residual.g), gamma_residual.b);
+        encoded = gamma_residual / max(peak, 255.0) / abs(fit.w);
+        if (fit.x > 0.0) {
+            encoded = gamma_residual / max(peak, 0.00001) * (1.0 - exp(-peak / fit.x)) / abs(fit.w);
+        }
+        if (fit.w > 0.0) { encoded = baked_file_to_linear(encoded); }
+        remaining = min(lightmap, max(encoded, vec3<f32>(0.0)));
+    }
+    let debug_mode = lighting_settings.baked_sun_debug_mode.x;
+    if (debug_mode == 1u) {
+        let fraction = clamp((baked_luminance(lightmap) - baked_luminance(remaining)) / max(baked_luminance(lightmap), 0.001), 0.0, 1.0);
+        return vec3<f32>(fraction, fraction * 0.16, 0.0);
+    }
+    if (debug_mode == 2u) {
+        let facing = max(dot(normalize(input.world_normal), normalize(lighting_settings.baked_sun_direction_strength.xyz)), 0.001);
+        let visibility = clamp(flux / facing, 0.0, 1.0);
+        return mix(vec3<f32>(1.0, 0.03, 0.02), vec3<f32>(0.02, 1.0, 0.03), visibility);
+    }
+    return remaining;
+}
+
+// Filtering exposed samples before inverse lighting loses energy at edges:
+// inverse(mean(exposure(L))) != mean(L). Subtract at each original luxel first.
+fn sample_authored_baked_sun(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
+    if (lighting_settings.baked_sun_direction_strength.w <= 0.0 && lighting_settings.baked_sun_debug_mode.x == 0u) {
+        return baked_indirect_tone(lightmap);
+    }
+    let dimensions = vec2<i32>(textureDimensions(lightmap_texture));
+    let position = input.lightmap_uv * vec2<f32>(dimensions) - vec2<f32>(0.5);
+    let origin = vec2<i32>(floor(position));
+    let fraction = fract(position);
+    let offsets = array<vec2<i32>, 4>(vec2<i32>(0, 0), vec2<i32>(1, 0), vec2<i32>(0, 1), vec2<i32>(1, 1));
+    let weights = vec4<f32>((1.0 - fraction.x) * (1.0 - fraction.y), fraction.x * (1.0 - fraction.y),
+        (1.0 - fraction.x) * fraction.y, fraction.x * fraction.y);
+    var result = vec3<f32>(0.0);
+    for (var i = 0u; i < 4u; i += 1u) {
+        let coordinate = clamp(origin + offsets[i], vec2<i32>(0), dimensions - vec2<i32>(1));
+        let texel = textureLoad(lightmap_texture, coordinate, 0);
+        result += subtract_authored_baked_sun(texel.rgb, texel.a, input) * weights[i];
+    }
+    if (lighting_settings.baked_sun_debug_mode.x == 0u) { return baked_indirect_tone(result); }
+    return result;
+}
+
+fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
+    if (!ENABLE_BAKED_SUN_RELIGHT) { return lightmap; }
+    // A change-triggered compute pass already subtracted each original luxel.
+    if (lighting_settings.baked_sun_debug_mode.y != 0u && input.baked_sun_fit.z == 4.0) { return baked_indirect_tone(lightmap); }
+    if (input.baked_sun_fit.z == 4.0) { return sample_authored_baked_sun(lightmap, input); }
+    let strength = lighting_settings.baked_sun_direction_strength.w;
+    var remaining = lightmap;
+    let toward_old = normalize(lighting_settings.baked_sun_direction_strength.xyz);
+    let old_facing = max(dot(normalize(input.world_normal), toward_old), 0.0);
+    let fit_kind = u32(input.baked_sun_fit.z + 0.5);
+    var visibility = select(1.0, 0.0, fit_kind == 3u);
+    let shadow_map_requested = lighting_settings.original_sun_shadow_params.x > 0.5;
+    let shadow_map_ready = lighting_settings.original_sun_shadow_params.z > 0.5;
+    if (shadow_map_requested && fit_kind == 0u) {
+        // Fail closed while the map-wide visibility cache is being built or
+        // when its projection is invalid. Never treat a missing cache as lit.
+        visibility = 0.0;
+        if (shadow_map_ready) {
+            visibility = original_sun_visibility(input, input.world_normal);
+        }
+    }
+    let sun_rgb = max(lighting_settings.baked_sun_radiance.rgb, vec3<f32>(0.0)) * old_facing;
+    let sun_y = baked_luminance(sun_rgb);
+    let y = baked_luminance(lightmap);
+    var removed_y = 0.0;
+    if (old_facing > 0.0 && sun_y > 0.00001 && visibility > 0.0 && strength > 0.0) {
+        // q3map_sun intensity is not calibrated to the compiled lightmap's
+        // irradiance. Keep the estimate local and monotonic: cap the removal to
+        // a fraction of this texel and to the texel's available RGB channels.
+        // Do not sample neighboring packed lightmap charts to guess a baseline.
+        // Unpaired surfaces retain the conservative cap. Paired surfaces
+        // below use their measured residual and direct upper bound instead.
+        let budget = y * lighting_settings.baked_indirect_adjust.w;
+        let sun_unit = sun_rgb / sun_y;
+        let channel_budget = min(
+            min(lightmap.r / max(sun_unit.r, 0.001), lightmap.g / max(sun_unit.g, 0.001)),
+            lightmap.b / max(sun_unit.b, 0.001));
+        var energy = min(min(sun_y, budget), channel_budget);
+        if (fit_kind == 1u) {
+            // Use the lightmap's own shadow edge at its authored resolution.
+            // Subtraction stops at the measured indirect baseline; dark texels
+            // stay dark without projecting a coarse shadow-map edge onto them.
+            energy = min(channel_budget, min(input.baked_sun_fit.y,
+                max(y - input.baked_sun_fit.x, 0.0)));
+        }
+        removed_y = energy * strength * visibility;
+        remaining = max(lightmap - sun_unit * removed_y, vec3<f32>(0.0));
+    }
+    let debug_mode = lighting_settings.baked_sun_debug_mode.x;
+    if (debug_mode == 1u) {
+        // Black means no estimated subtraction; red gets brighter as a larger
+        // fraction of this lightmap sample is removed.
+        let removed_fraction = clamp(removed_y / max(y, 0.001), 0.0, 1.0);
+        return vec3<f32>(removed_fraction, removed_fraction * 0.16, 0.0);
+    }
+    if (debug_mode == 2u) {
+        if (old_facing <= 0.0) { return vec3<f32>(0.02, 0.03, 0.12); }
+        if (!shadow_map_requested) { return vec3<f32>(1.0, 0.45, 0.02); }
+        if (shadow_map_requested && !shadow_map_ready) { return vec3<f32>(0.1, 0.2, 1.0); }
+        var shown_visibility = visibility;
+        if (fit_kind == 1u) {
+            shown_visibility = clamp((y - input.baked_sun_fit.x) / max(input.baked_sun_fit.y, 0.001), 0.0, 1.0);
+        }
+        if (shown_visibility <= 0.001) { return vec3<f32>(1.0, 0.03, 0.02); }
+        return vec3<f32>(0.02, shown_visibility, 0.03);
+    }
+    // Night-mode controls affect ONLY surviving baked irradiance, not runtime
+    // direct sun, local dynamic lights, textures or display gamma.
+    remaining = baked_indirect_tone(remaining);
+    return remaining;
+}
+
+// Runtime sunlight is evaluated AFTER cached subtraction/filtering and indirect
+// tone controls. Its direction/intensity never modify the original-sun cache.
+fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
+    let remaining = remove_baked_sun(lightmap, flux, input);
+    if (lighting_settings.baked_sun_debug_mode.x != 0u || lighting_settings.runtime_sun_radiance.w < 0.5) {
         return remaining;
     }
-    let admission = sun_shadow_transmission(input, input.world_normal);
-    return remaining + strength * lighting_settings.runtime_sun_radiance.rgb * new_facing * admission;
+    let facing = max(dot(normalize(input.world_normal), normalize(lighting_settings.runtime_sun_direction.xyz)), 0.0);
+    if (facing <= 0.0 || all(lighting_settings.runtime_sun_radiance.rgb <= vec3<f32>(0.0))) { return remaining; }
+    let visibility = sun_shadow_transmission(input, input.world_normal);
+    return remaining + lighting_settings.runtime_sun_radiance.rgb * facing * visibility;
 }
 
 fn shade_surface(input: VertexOut) -> vec4<f32> {
@@ -2536,6 +2759,10 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         return vec4<f32>(0.95, 0.05, 0.75, 1.0);
     }
 
+    // Lightmap alpha carries internal sun visibility. Legacy material blending
+    // must continue to see an opaque lightmap even when removal is disabled.
+    if (explicit_lightmap_stage) { source_sample.a = 1.0; }
+
     // Classic id Tech 3 world-lighting controls. Keep them runtime flags so
     // development toggles do not create shader/pipeline permutations.
     if (explicit_lightmap_stage) {
@@ -2565,15 +2792,22 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // synthesized implicit lightmap multiply below. Preserve blending order.
     if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u && explicit_lightmap_stage
         && input.lightmap_uv.x >= 0.0) {
-        source_sample = vec4<f32>(relight_baked_sun(source_sample.rgb, input), source_sample.a);
+        let baked = light_bsp_surface(source_sample.rgb, source_sample.a, input);
+        if (lighting_settings.baked_sun_debug_mode.x != 0u) {
+            return vec4<f32>(baked, source_sample.a);
+        }
+        source_sample = vec4<f32>(baked, select(source_sample.a, 1.0, input.baked_sun_fit.z == 4.0));
     }
     // q3map vertex-lit faces have no lightmap. Only touch the authored vertex
     // color path, never unrelated animated/non-lightmapped shader stages.
     if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
         && (material_flags() & 131072u) != 0u && (material_flags() & 1u) != 0u
         && !explicit_lightmap_stage) {
-        let restored = relight_baked_sun(input.color.rgb, input);
-        stage_color = vec4<f32>(material.color.rgb * restored, stage_color.a);
+        let baked = light_bsp_surface(input.color.rgb, 0.0, input);
+        if (lighting_settings.baked_sun_debug_mode.x != 0u) {
+            return vec4<f32>(baked, stage_color.a);
+        }
+        stage_color = vec4<f32>(material.color.rgb * baked, stage_color.a);
     }
     var base = source_sample * stage_color;
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
@@ -2638,7 +2872,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // base-texture Ã— lightmap path. Explicit JKA shader scripts render their
     // `$lightmap` as its own ordered blend stage instead.
     if ((material_flags() & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
-        var lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+        let lightmap_sample = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv);
+        var lightmap_color = lightmap_sample.rgb;
         if (classic_fullbright) {
             // Vanilla r_fullbright keeps the diffuse texture but replaces the
             // baked lightmap contribution with white.
@@ -2649,7 +2884,10 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
             lightmap_color = select(input.color.rgb, vec3<f32>(1.0), classic_lightmap_only);
         }
         if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u) {
-            lightmap_color = relight_baked_sun(lightmap_color, input);
+            lightmap_color = light_bsp_surface(lightmap_color, lightmap_sample.a, input);
+            if (lighting_settings.baked_sun_debug_mode.x != 0u) {
+                return vec4<f32>(lightmap_color, base.a);
+            }
         }
         if (classic_lightmap_only) {
             // r_lightmap removes the diffuse texture so the lighting data itself
@@ -2683,13 +2921,14 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         base = vec4<f32>(base.rgb + reflection_probe_specular(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
     }
     if (ENABLE_CASCADED_SHADOWS && (material_flags() & 4u) != 0u) {
-        if (!ENABLE_BAKED_SUN_RELIGHT || classic_flags != 0u
-            || (material_flags() & (2u | 131072u | 16777216u)) == 0u) {
+        // When direct sun is added explicitly, its visibility already casts
+        // shadows. Legacy mode instead darkens the existing baked illumination.
+        if (lighting_settings.runtime_sun_radiance.w < 0.5) {
         let shadow_rgb = sun_shadow_transmission(input, input.world_normal);
         let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);
-            let shadow_strength = shadow_settings.params.z * sun_facing;
-            base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
+        let shadow_strength = shadow_settings.params.z * sun_facing;
+        base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
         }
     }
     if ((material_flags() & 4u) != 0u) {

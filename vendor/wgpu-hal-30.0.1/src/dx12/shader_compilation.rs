@@ -104,6 +104,14 @@ impl CompilerContainer {
         }
     }
 
+    /// Part of the on-disk shader cache key: FXC and DXC bytecode differ.
+    pub(super) fn cache_tag(&self) -> &'static str {
+        match self {
+            CompilerContainer::Fxc(..) => "fxc",
+            CompilerContainer::DynamicDxc(..) | CompilerContainer::StaticDxc(..) => "dxc",
+        }
+    }
+
     pub(super) fn compile(
         &self,
         device: &super::Device,

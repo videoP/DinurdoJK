@@ -398,7 +398,7 @@ impl Renderer {
             params: [
                 SHADOW_MAP_SIZE as f32,
                 0.00035,
-                0.30 * intensity_scale,
+                (self.sun_shadow_strength * intensity_scale).min(1.0),
                 if bevy_mode { 1.0 } else { 0.0 },
             ],
             camera_forward: [

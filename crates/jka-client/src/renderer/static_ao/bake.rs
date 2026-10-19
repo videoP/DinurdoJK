@@ -663,7 +663,7 @@ pub(in crate::renderer) fn static_ao_baked_pixel(
                 (baked.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
             };
         }
-        out[3] = 255;
+        out[3] = base.rgba[index + 3];
         return out;
     }
 
@@ -731,7 +731,7 @@ pub(in crate::renderer) fn static_ao_baked_pixel(
             (baked.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
         };
     }
-    out[3] = 255;
+    out[3] = weights.iter().map(|(weight, index, _)| *weight * f32::from(base.rgba[*index + 3])).sum::<f32>().round().clamp(0.0, 255.0) as u8;
     out
 }
 
@@ -852,6 +852,29 @@ pub(in crate::renderer) fn build_static_ao_baked_lightmaps(
         .collect()
 }
 
+/// AO caches predate the reserved sun-flux alpha. Restore that payload from the
+/// current base lightmap, including when an old cache contains opaque alpha.
+pub(in crate::renderer) fn restore_baked_sun_alpha(
+    base: &StaticAoBaseLightmap, rgba: &mut [u8], width: u32, height: u32,
+) {
+    if width == 0 || height == 0 || base.width == 0 || base.height == 0
+        || !base.rgba.chunks_exact(4).any(|p| p[3] != 255) { return; }
+    for y in 0..height { for x in 0..width {
+        let sx = (x as f32 + 0.5) * base.width as f32 / width as f32 - 0.5;
+        let sy = (y as f32 + 0.5) * base.height as f32 / height as f32 - 0.5;
+        let ix = sx.floor() as i32; let iy = sy.floor() as i32;
+        let fx = sx - sx.floor(); let fy = sy - sy.floor();
+        let sample = |dx: i32, dy: i32| -> f32 {
+            let bx = (ix + dx).clamp(0, base.width as i32 - 1) as usize;
+            let by = (iy + dy).clamp(0, base.height as i32 - 1) as usize;
+            f32::from(base.rgba[(by * base.width as usize + bx) * 4 + 3])
+        };
+        let alpha = (sample(0,0) * (1.0 - fx) + sample(1,0) * fx) * (1.0 - fy)
+            + (sample(0,1) * (1.0 - fx) + sample(1,1) * fx) * fy;
+        rgba[(y as usize * width as usize + x as usize) * 4 + 3] = alpha.round().clamp(0.0, 255.0) as u8;
+    } }
+}
+
 pub(in crate::renderer) fn read_static_ao_cache(
     source: &StaticAoWorldSource,
     key: StaticAoJobKey,
@@ -883,11 +906,13 @@ pub(in crate::renderer) fn read_static_ao_cache(
         if len != expected_len || offset + len > bytes.len() {
             return None;
         }
+        let mut rgba = bytes[offset..offset + len].to_vec();
+        restore_baked_sun_alpha(base, &mut rgba, width, height);
         images.push(StaticAoBakedLightmap {
             label: format!("{} + cached baked AO", base.label),
             width,
             height,
-            rgba: bytes[offset..offset + len].to_vec(),
+            rgba,
             clamp: base.clamp,
             srgb: base.srgb,
         });

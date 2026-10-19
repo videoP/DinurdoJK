@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+#[ignore = "requires BLUE_WATER_TEST_BASE with costadelsol.bsp"]
+fn upstream_coast_real_map_sky_corners_are_open_sea() {
+    let root = std::path::PathBuf::from(std::env::var("BLUE_WATER_TEST_BASE").expect("asset directory"));
+    let mut assets = crate::pk3::AssetSearchPath::open(&root).unwrap();
+    let bytes = assets.read("maps/costadelsol.bsp", super::super::MAX_FILE_BYTES).unwrap().unwrap();
+    let bsp = Bsp::parse(&bytes.bytes).unwrap();
+    let geometry = Geometry::from_bsp(&bsp).unwrap();
+    for origin in [[-14592.,-14592.],[-14592.,14080.],[14080.,-14592.],[14080.,14080.]] {
+        let heights = geometry.upstream_shore_heights(origin,[5,5],128.,3.,&[]).unwrap();
+        println!("Sky corner {origin:?}: {heights:?}");
+        assert!(heights.iter().all(|h| h.is_nan() || *h < -100.),"sky shell is not land/shallow surf: {origin:?}");
+    }
+}
+
+#[test]
+fn upstream_coast_keeps_sky_shell_open_and_real_banks_solid() {
+    let mut sky_wall = box_solid([0.,-100.,-100.],[10.,100.,100.]);
+    sky_wall.sky[0] = true; // Interior face of a caulk-topped vertical sky shell.
+    let geometry = Geometry {
+        solids: vec![sky_wall, box_solid([-100.,-100.,-100.],[-10.,100.,15.])],
+        triangles:vec![], liquids:vec![],
+    };
+    let samples = geometry.upstream_shore_heights([-20.,0.],[31,2],1.,10.,&[]).unwrap();
+    assert_eq!(samples[0],5.,"actual bank stays land");
+    assert!(samples[25].is_nan(),"sky collision shell must not become a surf bank or wind blocker");
+    assert!(geometry.column([5.,0.],10.,&[0],&[]).bed.unwrap()>10.,"existing solver geometry is preserved");
+    let mut floor = box_solid([-100.,-100.,-100.],[100.,100.,5.]);
+    floor.sky[0]=true; // A distant sky side does not erase the actual floor below water.
+    let geometry = Geometry {solids:vec![floor],triangles:vec![],liquids:vec![]};
+    assert_eq!(geometry.upstream_shore_heights([0.,0.],[2,2],1.,10.,&[]).unwrap()[0],-5.);
+}
+
+#[test]
+fn upstream_coast_raster_respects_water_level_roofs_and_unknown_columns() {
+    let geometry=Geometry {
+        solids:vec![box_solid([-100.,-100.,-100.],[100.,100.,5.]),
+            box_solid([0.5,-100.,-100.],[100.,100.,15.]),
+            box_solid([-100.,-100.,12.],[0.,100.,14.])],
+        triangles:vec![],liquids:vec![],
+    };
+    let footprint=rectangle([-100.,-100.],[100.,100.]);
+    let heights=geometry.upstream_shore_heights([-1.,0.],[3,2],1.,10.,&footprint).unwrap();
+    assert_eq!(heights[0],-5.,"an overhead roof must not become the seabed");
+    assert_eq!(heights[2],5.,"solid land crossing the water plane must shelter waves");
+    let upper=geometry.upstream_shore_heights([1.,0.],[2,2],1.,20.,&footprint).unwrap();
+    assert_eq!(upper[0],-5.,"each pool must use its own still-water level");
+    let unknown=geometry.upstream_shore_heights([200.,200.],[2,2],1.,10.,&footprint).unwrap();
+    assert!(unknown.iter().all(|h|h.is_nan()),"missing geometry is unknown, never a guessed bank");
+    let terrain=Geometry {solids:vec![],liquids:vec![],triangles:vec![Triangle {
+        points:[[0.,0.,15.],[10.,0.,15.],[0.,10.,15.]],normal:[0.,0.,1.],bounds:[[0.,0.],[10.,10.]],
+    }]};
+    let bank=terrain.upstream_shore_heights([1.,1.],[2,2],1.,10.,&[]).unwrap();
+    assert_eq!(bank[0],5.,"brush-free triangle terrain above water must provide land shelter");
+}
+
 fn large_pool_tiles() -> Vec<Region> {
     let footprint = rectangle([0.0, 0.0], [2048.0, 2048.0]);
     (0..8)

@@ -86,12 +86,16 @@ impl App {
         session
             .entity_presenter
             .set_static_models(Arc::clone(&self.map_static_models));
+        session.entity_presenter.set_static_md3_instances(self.video.static_md3_instances);
         session
             .player_presenter
             .set_collision_world(self.map_collision.clone());
         session
             .player_presenter
             .set_head_look_mode(self.head_look);
+        session.player_presenter.set_swim_tilt(self.swim_tilt);
+        session.player_presenter.set_swim_turn_bank(self.swim_turn_bank);
+        session.player_presenter.set_move_lean(self.move_lean);
         session
             .player_presenter
             .set_saber_team_colors(self.saber_team_colors);

@@ -53,6 +53,8 @@ pub(in crate::renderer) struct DebugVolumeRenderer {
     /// brush volumes this is rebuilt every frame (it follows the camera), but it
     /// is a dozen vertices and only exists while `sun_ray_enabled`.
     pub(in crate::renderer) sun_ray_enabled: bool,
+    /// True while visualizing the authored BSP sun rather than the active runtime sun.
+    pub(in crate::renderer) sun_ray_authored: bool,
     pub(in crate::renderer) sun_ray_buffer: Option<wgpu::Buffer>,
     pub(in crate::renderer) sun_ray_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) sun_ray_ghost_pipeline: Option<wgpu::RenderPipeline>,
@@ -73,12 +75,20 @@ pub(in crate::renderer) fn sun_ray_vertices(
     toward_sun: Vec3,
     eye: Vec3,
 ) -> [DebugVolumeVertex; SUN_RAY_VERTEX_COUNT] {
-    const COLOR: [u8; 4] = [255, 214, 72, 255];
+    sun_ray_vertices_colored(head, toward_sun, eye, [255, 214, 72, 255])
+}
+
+pub(in crate::renderer) fn sun_ray_vertices_colored(
+    head: Vec3,
+    toward_sun: Vec3,
+    eye: Vec3,
+    color: [u8; 4],
+) -> [DebugVolumeVertex; SUN_RAY_VERTEX_COUNT] {
     let toward_sun = toward_sun.normalize_or_zero();
     let sun = head + toward_sun * SUN_RAY_LENGTH;
     let vertex = |position: Vec3| DebugVolumeVertex {
         position: position.to_array(),
-        color: COLOR,
+        color,
     };
 
     // Keep the beam a roughly constant few pixels wide at any distance.
@@ -142,11 +152,18 @@ impl DebugVolumeRenderer {
         head: Vec3,
         light_direction: Vec3,
         eye: Vec3,
+        sun_color: [f32; 3],
     ) {
         if !self.sun_ray_enabled {
             return;
         }
-        let vertices = sun_ray_vertices(head, -light_direction, eye);
+        let max_channel = sun_color.into_iter().fold(0.0_f32, f32::max);
+        let color = if max_channel > 1.0e-6 {
+            sun_color.map(|channel| ((channel / max_channel).clamp(0.0, 1.0) * 255.0) as u8)
+        } else {
+            [255, 255, 255]
+        };
+        let vertices = sun_ray_vertices_colored(head, -light_direction, eye, [color[0], color[1], color[2], 255]);
         let buffer = self.sun_ray_buffer.get_or_insert_with(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("JKA sun ray preview"),

@@ -718,6 +718,50 @@ impl CrtReferenceResolution {
     }
 }
 
+/// Controls where the existing depth-of-field blur is actually evaluated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DofMode {
+    #[default]
+    Off,
+    UnderwaterOnly,
+    On,
+}
+
+impl DofMode {
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::UnderwaterOnly => "underwater",
+            Self::On => "on",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" => Some(Self::Off),
+            "1" | "underwater" | "underwateronly" | "underwater_only" | "underwater only" | "underwater-only" => Some(Self::UnderwaterOnly),
+            "2" | "on" | "always" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod dof_mode_tests {
+    use super::DofMode;
+
+    #[test]
+    fn modes_accept_named_and_numeric_cvar_values() {
+        assert_eq!(DofMode::from_config("off"), Some(DofMode::Off));
+        assert_eq!(DofMode::from_config("0"), Some(DofMode::Off));
+        assert_eq!(DofMode::from_config("UNDERWATER"), Some(DofMode::UnderwaterOnly));
+        assert_eq!(DofMode::from_config("1"), Some(DofMode::UnderwaterOnly));
+        assert_eq!(DofMode::from_config("on"), Some(DofMode::On));
+        assert_eq!(DofMode::from_config("2"), Some(DofMode::On));
+        assert_eq!(DofMode::from_config("3"), None);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DofQuality {
     Performance,
@@ -930,6 +974,8 @@ pub const VIDEO_ROW_FX_FPS_SCOPE: usize = 84;
 
 pub const VIDEO_ROW_DOF_AUTOFOCUS: usize = 85;
 
+pub const VIDEO_ROW_DOF_MODE: usize = 111;
+
 pub const VIDEO_ROW_CRT_SCOPE: usize = 86;
 pub const VIDEO_ROW_CRT_STYLE: usize = 95;
 pub const VIDEO_ROW_CRT_QUALITY: usize = 87;
@@ -1140,9 +1186,9 @@ impl RendererBackend {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VsyncMode {
-    #[default]
     Off,
     On,
+    #[default]
     Fast,
     Adaptive,
 }

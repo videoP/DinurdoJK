@@ -9,3 +9,13 @@
 /artifacts/
 /target-glass-check/
 /glass-preview-base/
+
+# Keep the Anny v1 authoring tool reproducible; generated data stays local.
+!/tools/
+/tools/*
+!/tools/jiggle-shape-preview/
+/tools/jiggle-shape-preview/*
+!/tools/jiggle-shape-preview/anny/
+/tools/jiggle-shape-preview/anny/*
+!/tools/jiggle-shape-preview/anny/*.py
+!/tools/jiggle-shape-preview/anny/README.md

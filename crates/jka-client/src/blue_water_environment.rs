@@ -32,6 +32,9 @@ pub struct Settings {
     pub visibility: f32,
     pub world_lighting: bool,
     pub filmic: bool,
+    /// The dome's night glow and floor as a share of the authored level (1 upstream, 0 black). Dome only: the
+    /// environment bake and the world's night light keep the authored glow.
+    pub night_sky: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -64,6 +67,7 @@ impl Default for Settings {
             visibility: 17000.0,
             world_lighting: false,
             filmic: true,
+            night_sky: 1.0,
         }
     }
 }
@@ -83,7 +87,7 @@ impl Settings {
         self.genus = self.genus.min(7);
         self.high_genus = self.high_genus.min(3);
         self.weather_backend = self.weather_backend.min(2);
-        limit!(altitude, 20.0, 15000.0);
+        limit!(altitude, -1000.0, 15000.0);
         limit!(thickness, 50.0, 12000.0);
         limit!(horizon, 0.0, 1.0);
         limit!(ambient, 0.0, 3.0);
@@ -103,6 +107,7 @@ impl Settings {
         limit!(lightning, 0.0, 30.0);
         limit!(fog, 0.0, 1.0);
         limit!(visibility, 200.0, 100000.0);
+        limit!(night_sky, 0.0, 1.0);
         self
     }
     pub fn quality(self) -> SkyQuality {

@@ -317,6 +317,40 @@ app_cvars! {
         ]
     }
 
+    APP_R_DOFMODE {
+        runtime: CvarDef::new(
+                "r_dofMode",
+                "",
+                "off|underwater|on (0|1|2)",
+                "Depth of field: off, fixed-distance underwater only, or on with the usual focus behavior.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_dofmode(app)),
+                |app, value| App::cvar_set_r_dofmode(app, APP_R_DOFMODE.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_r_dofmode, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.dof_mode = DofMode::from_config(value).unwrap_or(settings.dof_mode);
+                }),
+                archive: Some((115, |state| state.video.dof_mode.config_value().to_owned())),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dofmode(&self) -> String {
+                    self.video.dof_mode.config_value().to_owned()
+                }
+                fn cvar_set_r_dofmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = DofMode::from_config(value)
+                        .ok_or_else(|| format!("{name}: expected off|underwater|on (0|1|2)"))?;
+                    self.set_dof_mode(mode);
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_DOFAUTOFOCUS {
         runtime: CvarDef::new("r_dofAutoFocus", "", "0..1", "Autofocus depth of field on the surface under the crosshair. Uses the same BSP/entity trace as the crosshair and works in remote play and demos, not only Solo.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dofautofocus(app)), |app, value| App::cvar_set_r_dofautofocus(app, APP_R_DOFAUTOFOCUS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dofautofocus, None),
         config: CvarBinding {

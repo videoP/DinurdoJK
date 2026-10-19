@@ -12,6 +12,7 @@ path = "src/main.rs"
 blue-water-core = { path = "../blue-water-core" }
 blue-water-gpu = { path = "../blue-water-gpu" }
 blue-water-render = { path = "../blue-water-render" }
+blue-water-fx = { path = "../blue-water-fx" }
 blue-water-clouds = { path = "../blue-water-clouds" }
 blue-water-sky = { path = "../blue-water-sky" }
 bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
@@ -53,4 +54,4 @@ naga = { version = "=30.0.0", features = ["wgsl-in"] }
 png = "=0.18.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Security"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Security"] }

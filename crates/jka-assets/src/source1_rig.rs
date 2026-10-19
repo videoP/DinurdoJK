@@ -23,7 +23,7 @@ use crate::ghoul2::{
     GlaAnimation, GlmLod, GlmModel, GlmSurface, GlmSurfaceHierarchy, GlmVertex, GlmWeight,
     Matrix3x4,
 };
-use crate::source1::{SourceMaterialTable, SourceSkeleton};
+use crate::source1::{SourceJiggleParams, SourceMaterialTable, SourceSkeleton};
 use crate::source1_geometry::{
     assemble_source_lod, parse_source_bodyparts, source_lod_vertices, SourceVtx, SourceVvd,
 };
@@ -139,6 +139,9 @@ pub struct SourceRigDiagnostics {
     /// stores at most three influences per vertex and merging can only reduce
     /// that, so this must be 0; a nonzero value means the merge is wrong.
     pub weight_truncations: usize,
+    /// Procedural Source bones retained as independent GPU skin influences.
+    pub source_jiggle_bones: usize,
+    pub source_jiggle_weighted_vertices: usize,
     /// Baked rest-pose bounds in JKA model units.
     pub rest_bounds: ([f32; 3], [f32; 3]),
     /// Largest distance any vertex moved relative to merely scaling and aligning
@@ -149,7 +152,24 @@ pub struct SourceRigDiagnostics {
     pub lods: Vec<SourceLodStats>,
 }
 
+/// One extra skinning bone, following the ordinary GLA palette. The extra
+/// index is `gla.skeleton.len() + index_in_source_jiggles`. Never mutate the
+/// stock JK2/JKA GLA with these optional Source-specific bones.
+#[derive(Clone, Debug)]
+pub struct SourceJiggleBinding {
+    pub name: String,
+    pub parent_gla: usize,
+    /// The closest procedural Source ancestor, if any; always earlier in the list.
+    pub parent_jiggle: Option<usize>,
+    /// Authored Source bone's neutral frame in the baked JKA model space.
+    pub rest_frame: Matrix3x4,
+    pub parameters: SourceJiggleParams,
+    /// Authored +Z jiggle tip length converted from Source units to JKA units.
+    pub length: f32,
+}
+
 pub struct SourceRig {
+    pub source_jiggles: Vec<SourceJiggleBinding>,
     pub glm: GlmModel,
     /// Per-model, anatomical GLA joint anchors in the newly posed Source mesh.
     /// Pass to `rebase_source_ghoul2_pose` AFTER normal Ghoul2 evaluation.
@@ -1323,6 +1343,49 @@ pub fn build_source_rig(
             ));
         }
     }
+    // Reserve appended skin-palette slots for *authored* Source jigglebones.
+    // They retain their own VVD weight rather than being merged into Head.
+    // A static pose for each extra slot is its owning GLA matrix, so models
+    // appear unchanged until the secondary-motion animator runs.
+    let mut jiggle_slot_of_source = vec![None; skeleton.bones.len()];
+    let mut source_jiggles = Vec::new();
+    for (source_index, bone) in skeleton.bones.iter().enumerate() {
+        let Some(parameters) = bone.jiggle else { continue };
+        if parameters.flags & (crate::source1::JIGGLE_IS_FLEXIBLE
+            | crate::source1::JIGGLE_IS_RIGID) == 0 {
+            // Boing-only procedural rules do not have a bending spring.
+            continue;
+        }
+        let parent_gla = gla_for_bone[source_index].expect("mapped Source bone");
+        let mut ancestor = bone.parent;
+        let mut parent_jiggle = None;
+        while let Some(parent) = ancestor {
+            if let Some(slot) = jiggle_slot_of_source[parent] {
+                parent_jiggle = Some(slot);
+                break;
+            }
+            ancestor = skeleton.bones[parent].parent;
+        }
+        let rebind = source_bake.as_ref().map_or_else(
+            || matrix_of_gla[&parent_gla],
+            |matrices| matrices[source_index],
+        );
+        // The fitted rebind includes uniform Source->JKA scale. A rigid bone
+        // frame is needed for correct pivots and inverse bind, not that scale.
+        let baked_world = mul(&rebind, &rest_world[source_index]);
+        let mut rest_frame = baked_world;
+        for row in &mut rest_frame {
+            for value in &mut row[..3] { *value /= scale; }
+        }
+        // `matrix_of_gla` can carry the same fitted scale; the rest frame
+        // translation is already in final baked JKA coordinates.
+        jiggle_slot_of_source[source_index] = Some(source_jiggles.len());
+        source_jiggles.push(SourceJiggleBinding {
+            name: bone.name.clone(), parent_gla, parent_jiggle, rest_frame,
+            parameters, length: (parameters.length.abs() * scale).max(0.001),
+        });
+    }
+
     let rebinds: Vec<BoneRebind> = gla_for_bone.iter().map(|slot| {
         let gla_bone = slot.expect("every bone is mapped above");
         BoneRebind { gla_bone }
@@ -1388,6 +1451,7 @@ pub fn build_source_rig(
     }
 
     let mut weight_truncations = 0usize;
+    let mut source_jiggle_weighted_vertices = 0usize;
     let mut max_rebind_displacement = 0.0f32;
     let mut rest_min = [f32::INFINITY; 3];
     let mut rest_max = [f32::NEG_INFINITY; 3];
@@ -1467,7 +1531,13 @@ pub fn build_source_rig(
                             // bones), and they all placed the vertex through
                             // that joint's single matrix, so merging their
                             // influence here only compacts the weight list.
-                            *merged.entry(rebind.gla_bone).or_default() += weight;
+                            let palette_index = jiggle_slot_of_source[bone]
+                                .map(|slot| gla.skeleton.len() + slot)
+                                .unwrap_or(rebind.gla_bone);
+                            if palette_index >= gla.skeleton.len() {
+                                source_jiggle_weighted_vertices += 1;
+                            }
+                            *merged.entry(palette_index).or_default() += weight;
                             let &(real, dual, part_scale) = if let Some(ref per_source) = dual_quat_of_source {
                                 &per_source[bone]
                             } else {
@@ -1629,6 +1699,8 @@ pub fn build_source_rig(
         rebind: options.rebind,
         direction_corrected,
         weight_truncations,
+        source_jiggle_bones: source_jiggles.len(),
+        source_jiggle_weighted_vertices,
         rest_bounds: (rest_min, rest_max),
         max_rebind_displacement,
         lods: lod_stats,
@@ -1638,11 +1710,16 @@ pub fn build_source_rig(
         glm: GlmModel {
             name: model_qpath.to_owned(),
             anim_name: "models/players/_humanoid/_humanoid".to_owned(),
+            // `num_bones` names the *primary* skeleton for bodyshape, bolts
+            // and retargeting compatibility. Source procedural weights can
+            // address further in-memory skin palette entries supplied by the
+            // presenter; they are not a different Ghoul2 animation skeleton.
             num_bones: gla.skeleton.len(),
             hierarchy,
             lods,
         },
         surfaces,
+        source_jiggles,
         diagnostics,
     })
 }
@@ -1708,6 +1785,11 @@ pub fn attach_humanoid_bolts(
                             vertex.position[2] += floor_offset;
                         }
                     }
+                }
+                for bone in &mut rig.source_jiggles {
+                    for axis in 0..3 { bone.rest_frame[axis][3] *= ratio; }
+                    bone.rest_frame[2][3] += floor_offset;
+                    bone.length *= ratio;
                 }
                 if let Some(pivots) = &mut rig.native_pivots {
                     for pivot in pivots {
@@ -2211,6 +2293,7 @@ mod tests {
 
     fn empty_rig() -> SourceRig {
         SourceRig {
+            source_jiggles: Vec::new(),
             native_pivots: None,
             glm: GlmModel {
                 name: "source".into(),

@@ -535,10 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn quality_presets_do_not_touch_visibility_optimization_controls() {
+    fn quality_presets_do_not_touch_optimization_controls() {
         for preset in QualityPreset::ALL {
             let settings = preset.settings();
-            for cvar in ["r_gpuDriven", "r_hizOcclusion"] {
+            for (cvar, _, _) in super::super::egui_settings::OPTIMIZATION_CVARS {
                 assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case(cvar)),
                     "{} preset must not change {cvar}", preset.label());
             }

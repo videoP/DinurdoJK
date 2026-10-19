@@ -214,14 +214,48 @@ impl Renderer {
             .map(|(slot, _)| slot)
     }
 
+    /// `hybridwave` command: settings summary plus the last ~600 frames of
+    /// classification, written next to the screenshot the command also queues.
+    pub(in crate::renderer) fn write_hybrid_wave_dump(&self, path: &std::path::Path) {
+        use std::fmt::Write as _;
+        let s = &self.ocean_settings;
+        let mut header = String::new();
+        let _ = writeln!(header, "DinurdoJK hybridwave dump");
+        let _ = writeln!(header, "exe: {:?}", std::env::current_exe().ok());
+        let _ = writeln!(header, "backend={} underwater_mode={} adapter={} waterline_debug={} hybrid_active={}",
+            s.backend, s.blue_water_underwater_mode, s.blue_water_adapter, s.hybrid_waterline_debug,
+            self.hybrid_wave_surface_active());
+        let _ = writeln!(header, "waves: {:?}", s.blue_water_waves);
+        let _ = writeln!(header, "underwater_cull_distance={} absorption_distance={} mesh_quality={}",
+            s.underwater_cull_distance(), s.optics.absorption_distance(), s.mesh_quality);
+        let _ = writeln!(header, "sky_extend={} sky_infinite={} extension_mask={:#b}",
+            self.ocean_sky_extend, self.ocean_sky_infinite, self.ocean_extension_mask);
+        let _ = writeln!(header, "now: eye_wave_slot={:?} offset={} correction={:?} camera_water_surface={}",
+            self.eye_wave_slot, self.eye_wave_offset, self.eye_wave_correction, self.camera_water_surface);
+        let _ = writeln!(header, "water_boxes ({}):", self.water_boxes.len());
+        for (i, volume) in self.water_boxes.iter().enumerate() {
+            let _ = writeln!(header, "  [{i}] {volume:?}");
+        }
+        if let Some(world) = &self.world {
+            let _ = writeln!(header, "promoted surfaces ({}):", world.ocean_surfaces.len());
+            for (i, surface) in world.ocean_surfaces.iter().enumerate() {
+                let _ = writeln!(header, "  [{i}] {surface:?} masked={}", world.ocean_masks.is_masked(i));
+            }
+        }
+        match self.eye_wave_log.write(path, &header) {
+            Ok(()) => println!("[HYBRIDWAVE] wrote {}", path.display()),
+            Err(error) => eprintln!("[HYBRIDWAVE] could not write {}: {error}", path.display()),
+        }
+    }
+
     /// Refreshes `eye_wave_slot` / `eye_wave_offset` from the latest probe sample.
     /// Zero (the flat plane) whenever Hybrid is not classifying by waves.
     pub(in crate::renderer) fn refresh_eye_wave_offset(&mut self, eye: Vec3) {
         let slot = self.hybrid_wave_surface_active().then(|| self.promoted_pool_over(eye)).flatten();
         self.eye_wave_slot = slot;
         let sample = slot.and_then(|slot| self.ocean.as_ref()?.eye_wave_sample(slot));
-        self.eye_wave_offset = sample.map_or(0.0, |s| s.offset);
-        self.eye_wave_correction = sample.map(|s| s.correction);
+        self.eye_wave_offset = sample.map_or(0.0, |s| s.offset());
+        self.eye_wave_correction = sample.map(|s| s.correction());
     }
 
     /// Collects this frame's water volumes (authored oceans first, then promoted

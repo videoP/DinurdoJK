@@ -87,6 +87,7 @@ mod device_creation;
 mod instance;
 mod pipeline_desc;
 mod sampler;
+mod shader_disk_cache;
 mod shader_compilation;
 mod suballocation;
 mod types;

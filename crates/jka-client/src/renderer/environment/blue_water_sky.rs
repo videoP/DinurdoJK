@@ -1,13 +1,104 @@
 //! The original atmosphere on JKA's device; BSP sky polygons authorize display.
 use crate::{camera::Camera, scene::GpuVertex};
-use ::blue_water_sky::{Sky, SkyQuality, SkyScene, SkyTargets, SkyView, math};
+use ::blue_water_sky::{Sky, SkyScene, SkyTargets, SkyView, math};
+
+/// Only structural changes require a build. Sun, wind, coverage and weather
+/// intensity remain ordinary per-frame uniforms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AtmosphereConfig {
+    target: (u32, u32, u32, wgpu::TextureFormat),
+    quality: u8,
+    clouds: bool,
+    weather: bool,
+    aerial: bool,
+}
+
+impl crate::renderer::Renderer {
+    /// Poll once before recording a frame. Requested settings stay untouched;
+    /// absence of a compatible result means the authored sky keeps drawing.
+    pub(in crate::renderer) fn ensure_native_atmosphere(&mut self, camera: &Camera) {
+        use crate::pipeline_jobs::{hash_config, PipelineJobKey};
+        let requested = self.sky_backend == 1 || self.blue_water_environment.world_lighting
+            || self.blue_water_environment.weather_backend == 1
+            || (self.cloud_backend == 1 && self.clouds_enabled);
+        if !requested {
+            self.pipeline_jobs.cancel_slot("native-atmosphere", 0);
+            self.blue_water_sky = None;
+            return;
+        }
+        let settings = self.blue_water_environment.sanitize();
+        let config = AtmosphereConfig {
+            target: (self.config.width, self.config.height, self.msaa_samples, self.scene_format()),
+            quality: settings.quality,
+            clouds: self.cloud_backend == 1 && self.clouds_enabled,
+            weather: settings.weather_backend == 1,
+            aerial: self.sky_backend == 1 && self.fast_sky == 0,
+        };
+        if self.blue_water_sky.as_ref().is_some_and(|sky| sky.config == config) {
+            return;
+        }
+        let was_active = self.blue_water_sky.take().is_some();
+        let key = PipelineJobKey::new("native-atmosphere", 0, hash_config(&config));
+        if let Some(atmosphere) = self.pipeline_jobs.take_ready::<AtmosphereRenderer>(key) {
+            self.blue_water_sky = Some(atmosphere);
+            self.history_valid = false;
+            self.ssr_history_valid = false;
+            self.ssao_history_valid = false;
+            self.rebuild_frame_plan();
+            rverbose!(1, "[ENVIRONMENT READY] atmosphere activated at frame boundary {config:?}");
+            return;
+        }
+        if was_active {
+            self.history_valid = false;
+            self.rebuild_frame_plan();
+        }
+        if self.pipeline_jobs.is_compiling(key) {
+            return;
+        }
+        let sun = self.active_sun();
+        let sea_plane = self.world.as_ref().and_then(|world| world.ocean_surfaces.iter().max_by(|a, b| {
+            let area = |s: &crate::ocean::OceanSurface|
+                (s.maximum[0] - s.minimum[0]) * (s.maximum[1] - s.minimum[1]);
+            area(a).total_cmp(&area(b))
+        })).map_or(0.0, |surface| surface.plane_height);
+        let (device, queue, camera, coverage, wind) = (
+            self.device.clone(), self.queue.clone(), *camera, self.cloud_coverage,
+            [self.weather_wind.speed, self.weather_wind.direction],
+        );
+        self.pipeline_jobs.request(key, "native atmosphere", move || {
+            let started = std::time::Instant::now();
+            let mut atmosphere = AtmosphereRenderer::build(&device, &queue, config, settings);
+            // Fill immutable noise and warm size-dependent targets/tables on
+            // the worker too. Queue ordering makes these writes precede every
+            // subsequent frame using the published resource; no render-thread
+            // device wait or empty placeholder draw is necessary.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("native atmosphere preparation"),
+            });
+            atmosphere.prepare(&device, &queue, &mut encoder, config.target, &camera, [0.0; 2],
+                0.0, sun.direction.map(|value| -value), sea_plane, config.aerial, config.clouds, coverage,
+                wind, settings, sun.intensity, 0.0, false);
+            atmosphere.render_image(&device, &mut encoder, None);
+            queue.submit([encoder.finish()]);
+            // The view may have moved while compilation ran. First use must
+            // start fresh temporal histories using the current frame's camera.
+            atmosphere.last_view = None;
+            atmosphere.last_time = 0.0;
+            rverbose!(1, "[ENVIRONMENT PREPARED] atmosphere worker {:.1} ms {config:?}",
+                started.elapsed().as_secs_f64() * 1000.0);
+            atmosphere
+        });
+    }
+}
 
 pub(in crate::renderer) struct AtmosphereRenderer {
+    config: AtmosphereConfig,
     pub sky: Sky,
     pub clouds: ::blue_water_clouds::CloudLayer,
     weather: ::blue_water_clouds::weather::Weather,
-    weather_reactive: ::blue_water_clouds::reactive::WeatherReactive,
+    weather_reactive: Option<::blue_water_clouds::reactive::WeatherReactive>,
     weather_post: ::blue_water_clouds::post::PostProcess,
+    exposure: super::blue_water_exposure::NativeExposure,
     scene: super::blue_water_scene::Scene,
     settings: crate::blue_water_environment::Settings,
     last_time: f32,
@@ -31,65 +122,99 @@ pub(in crate::renderer) struct AtmosphereRenderer {
     pipeline: wgpu::RenderPipeline,
 }
 impl AtmosphereRenderer {
-    pub fn new(
+    fn build(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        key: (u32, u32, u32, wgpu::TextureFormat),
+        config: AtmosphereConfig,
+        settings: crate::blue_water_environment::Settings,
     ) -> Self {
-        let mut sky = Sky::new(
+        let key = config.target;
+        let quality = settings.quality();
+        let cache = crate::pipeline_cache::get();
+        let placeholders = ::blue_water_render::PlaceholderPipelines::new(device, cache.as_ref());
+        let mut sky = Sky::new_deferred(
             device,
             queue,
-            SkyQuality::High,
+            quality,
             SkyTargets {
                 color: wgpu::TextureFormat::Rgba16Float,
                 depth: None,
             },
+            &placeholders,
         );
-        let clouds = ::blue_water_clouds::CloudLayer::new(
+        // The scene/aerial bindings share the cloud shadow interface even in a
+        // clear sky. Deferred construction leaves its expensive pipelines and
+        // noise fills unbuilt until clouds are requested.
+        let mut clouds = ::blue_water_clouds::CloudLayer::new_deferred(
             device,
             queue,
             &sky,
-            SkyQuality::High,
+            quality,
             ::blue_water_clouds::Targets {
                 color: wgpu::TextureFormat::Rgba16Float,
                 depth: None,
             },
+            &placeholders,
         );
-        sky.attach_clouds(device, clouds.hooks());
+        clouds.set_enabled(config.clouds);
+        if config.clouds {
+            sky.attach_clouds(device, clouds.hooks());
+        }
         let aerial = ::blue_water_render::AerialVolume::new(device);
         let air_composite = super::blue_water_air::AirComposite::new(device, key, &aerial);
-        let aerial_pass = ::blue_water_clouds::aerial::AerialPerspective::new(
+        let mut aerial_pass = ::blue_water_clouds::aerial::AerialPerspective::new(
             device,
             &sky,
             clouds.shadow(),
-            ::blue_water_render::MakePipelines::Now,
+            ::blue_water_render::MakePipelines::Deferred(&placeholders),
         );
-        let weather = ::blue_water_clouds::weather::Weather::new(
+        let mut weather = ::blue_water_clouds::weather::Weather::new_deferred(
             device,
             sky.bind_group_layout(),
-            SkyQuality::High,
+            quality,
             ::blue_water_clouds::Targets {
                 color: wgpu::TextureFormat::Rgba16Float,
                 depth: Some(wgpu::TextureFormat::Depth32Float),
             },
+            &placeholders,
         );
-        let weather_post = ::blue_water_clouds::post::PostProcess::new(
+        let mut weather_post = ::blue_water_clouds::post::PostProcess::new_deferred(
             device,
             sky.bind_group_layout(),
             wgpu::TextureFormat::Rgba16Float,
+            &placeholders,
         );
-        let weather_reactive = ::blue_water_clouds::reactive::WeatherReactive::new(device, weather.draw_layouts());
+        let mut registry = ::blue_water_render::PipelineRegistry::default();
+        let mut context = ::blue_water_render::RenderContext::new(device, &mut registry);
+        context.cache = cache.as_ref();
+        ::blue_water_sky::shaders::register(&mut context).expect("native sky shaders");
+        ::blue_water_clouds::shaders::register(&mut context).expect("native cloud shaders");
+        let sky_ids = sky.register_pipelines(&mut context).expect("native sky pipelines");
+        let cloud_ids = config.clouds.then(|| clouds.register_pipelines(&mut context, &sky).expect("native cloud pipelines"));
+        let weather_ids = config.weather.then(|| weather.register_pipelines(&mut context).expect("native weather pipelines"));
+        let post_ids = config.weather.then(|| weather_post.register_pipelines(&mut context).expect("native weather post"));
+        let aerial_ids = config.aerial.then(|| aerial_pass.register_pipelines(&mut context).expect("native aerial pipelines"));
+        drop(context);
+        sky.adopt_pipelines(&registry, &sky_ids);
+        if let Some(ids) = cloud_ids { clouds.adopt_pipelines(&registry, &ids); }
+        if let Some(ids) = weather_ids { weather.adopt_pipelines(&registry, &ids); }
+        if let Some(ids) = post_ids { weather_post.adopt_pipelines(&registry, &ids); }
+        if let Some(ids) = aerial_ids { aerial_pass.adopt_pipelines(&registry, &ids); }
+        let weather_reactive = config.weather.then(||
+            ::blue_water_clouds::reactive::WeatherReactive::new(device, weather.draw_layouts()));
         let scene = super::blue_water_scene::Scene::new(device, key, &sky, &clouds);
         let (image, camera, group, pipeline) = Self::targets(device, key);
         let (portal_camera, portal_group) = Self::portal_binding(device, &image, &pipeline);
         Self {
+            config,
             sky,
             clouds,
             weather,
             weather_reactive,
             weather_post,
+            exposure: super::blue_water_exposure::NativeExposure::new(device),
             scene,
-            settings: crate::blue_water_environment::Settings::default(),
+            settings,
             last_time: 0.0,
             aerial,
             air_composite,
@@ -297,30 +422,16 @@ impl AtmosphereRenderer {
         frame_dt: f32,
         sheltered: bool,
     ) {
-        if self.key != key {
-            let (image, camera, group, pipeline) = Self::targets(device, key);
-            (self.portal_camera, self.portal_group) =
-                Self::portal_binding(device, &image, &pipeline);
-            self.air_composite =
-                super::blue_water_air::AirComposite::new(device, key, &self.aerial);
-            self.scene = super::blue_water_scene::Scene::new(device, key, &self.sky, &self.clouds);
-            self.image = image;
-            self.camera = camera;
-            self.group = group;
-            self.pipeline = pipeline;
-            self.key = key;
-        }
+        // Resize/quality/features use the same worker path as first use. A
+        // half-rebuilt atmosphere must never reach frame recording.
+        debug_assert_eq!(self.key, key);
         let sun = math::Vec3::from_array(toward_sun).normalize_or_zero();
         let elevation = f64::from(sun.y.clamp(-1.0, 1.0).asin().to_degrees());
         let azimuth = f64::from(sun.x.atan2(sun.z).to_degrees());
         self.show_atmosphere = show_atmosphere;
         self.clouds_active = clouds_enabled;
         let settings = settings.sanitize();
-        if self.settings.quality != settings.quality {
-            self.sky.set_quality(device, queue, settings.quality());
-            self.clouds.set_quality(device, settings.quality());
-            self.weather.set_quality(settings.quality());
-        }
+        debug_assert_eq!(self.config.quality, settings.quality);
         self.settings = settings;
         let scene = settings.scene(
             elevation,
@@ -340,6 +451,12 @@ impl AtmosphereRenderer {
             self.clouds.set_enabled(clouds_enabled);
         }
         self.clouds.set_time_stands(frame_dt <= 0.0);
+        // A negative cloud base lowers the whole sky reference (its ground plane
+        // and the cloud deck with it) below the sea plane by that many metres,
+        // so clouds can stand at the level of a map that lies under the sea plane.
+        let reference_drop = (-settings.altitude).max(0.0);
+        let mut settings = settings;
+        settings.altitude = settings.altitude.max(0.0);
         self.clouds.set_still(frame_dt <= 0.0);
         if self.sky.set_weather_haze(::blue_water_sky::haze::Haze::new(
             settings.visibility as f64,
@@ -347,9 +464,11 @@ impl AtmosphereRenderer {
         )) {
             self.clouds.air_changed();
         }
+        self.sky.set_night_sky_brightness(settings.night_sky);
         self.sky.seek(f64::from(time));
-        let position =
-            (camera.position - glam::Vec3::Y * sea_plane) / crate::ocean::OCEAN_UNITS_PER_METER;
+        let position = (camera.position - glam::Vec3::Y * sea_plane)
+            / crate::ocean::OCEAN_UNITS_PER_METER
+            + glam::Vec3::Y * reference_drop;
         let view = glam::Mat4::look_to_rh(position, camera.forward(), glam::Vec3::Y);
         let fov = camera.fov_y_for_viewport(key.0, key.1);
         let projection = glam::Mat4::from_translation(glam::Vec3::new(
@@ -429,18 +548,24 @@ impl AtmosphereRenderer {
         self.sky.update_tables(queue, encoder, &sky_view, 0.0);
         self.weather_post
             .update(&cloud_view, self.weather.haze(), flash);
-        self.clouds.prepare(
-            device,
-            &mut ::blue_water_render::UploadSink::Queue(queue),
-            &cloud_view,
-            &self.sky,
-            cut,
-        );
-        if let Some(group) = self.clouds.take_field_group() {
-            self.sky.set_cloud_bind_group(group);
+        if clouds_enabled {
+            self.clouds.encode_noise_fill(encoder);
+            self.clouds.prepare(
+                device,
+                &mut ::blue_water_render::UploadSink::Queue(queue),
+                &cloud_view,
+                &self.sky,
+                cut,
+            );
+            if let Some(group) = self.clouds.take_field_group() {
+                self.sky.set_cloud_bind_group(group);
+            }
+        } else {
+            self.clouds.write_shadow_interface(
+                &mut ::blue_water_render::UploadSink::Queue(queue), &self.sky, &cloud_view);
         }
         self.sky.update_environment(queue, encoder);
-        self.clouds.encode_shadows(encoder);
+        if clouds_enabled { self.clouds.encode_shadows(encoder); }
         let vp = sky_view.projection * cloud_view.view;
         let camera_uniforms = ::blue_water_render::CameraUniforms {
             view: cloud_view.view.to_cols_array(),
@@ -530,6 +655,10 @@ impl AtmosphereRenderer {
         resolve: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
         shadows: bool,
+        // Sky-portal depth and 1 / portal scale (r_cloudPortalDepth): merged into
+        // the copy the cloud march reads, after lighting so portal terrain is not
+        // lit as if it were world geometry.
+        portal: Option<(&wgpu::TextureView, f32)>,
     ) {
         self.scene.copy.capture(device, encoder, color, depth);
         if let Some(camera) = &self.frame_camera {
@@ -555,6 +684,10 @@ impl AtmosphereRenderer {
             }
         }
         if self.clouds_active {
+            if let (Some(camera), Some((portal_depth, inverse_scale))) = (&self.frame_camera, portal) {
+                self.scene
+                    .merge_portal_depth(device, queue, encoder, camera, portal_depth, inverse_scale);
+            }
             self.clouds.encode_march(
                 device,
                 encoder,
@@ -581,8 +714,16 @@ impl AtmosphereRenderer {
                 .blit(device, encoder, &self.scene.overlay, color, resolve, true);
         }
     }
+    /// Lightning's current flash (a multiple of the sky's light), 0 without native weather.
+    pub fn flash(&self) -> f32 {
+        if self.settings.weather_backend == 1 { self.weather.light().flash } else { 0.0 }
+    }
     pub fn take_thunder(&mut self) -> Vec<::blue_water_clouds::lightning::Thunder> {
         std::mem::take(&mut self.weather.thunder)
+    }
+    pub fn adapt_exposure(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, state: &wgpu::Buffer, settings: &wgpu::Buffer) {
+        self.exposure.encode(device, encoder, self.sky.environment(), scene, state, settings);
     }
     pub fn draw_weather(
         &mut self,
@@ -631,7 +772,8 @@ impl AtmosphereRenderer {
                     depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),
                 ..Default::default()
             });
-            self.weather.draw_reactive(&mut pass, self.sky.bind_group(), &self.weather_reactive.0);
+            self.weather.draw_reactive(&mut pass, self.sky.bind_group(),
+                &self.weather_reactive.as_ref().expect("prepared native weather").0);
         }
         if self.weather_post.encode(
             device,
@@ -639,6 +781,7 @@ impl AtmosphereRenderer {
             encoder,
             self.sky.bind_group(),
             &self.scene.copy.color,
+            &self.scene.copy.depth,
             &self.scene.overlay,
         ) {
             self.scene
@@ -707,8 +850,8 @@ mod native_tests {
                 .expect("GPU device");
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             for samples in [1, 4] {
+              for (clouds, weather, aerial) in [(false, false, true), (true, false, false), (true, true, true)] {
                 let key = (64, 32, samples, wgpu::TextureFormat::Rgba16Float);
-                let mut atmosphere = AtmosphereRenderer::new(&device, &queue, key);
                 let texture = |format, samples| {
                     device
                         .create_texture(&wgpu::TextureDescriptor {
@@ -736,15 +879,19 @@ mod native_tests {
                 let camera = Camera::new([0., 800., 0.], 0.);
                 let settings = crate::blue_water_environment::Settings {
                     quality: 0,
-                    weather_backend: 1,
+                    weather_backend: u8::from(weather),
                     rain: 1.,
                     rain_speed: 2.,
                     world_lighting: true,
                     ..Default::default()
                 };
+                let config = AtmosphereConfig { target: key, quality: settings.quality,
+                    clouds, weather, aerial };
+                let mut atmosphere = AtmosphereRenderer::build(&device, &queue, config, settings);
+                assert_eq!(atmosphere.weather_reactive.is_some(), weather);
                 for frame in 0..2 {
                     let mut encoder = device.create_command_encoder(&Default::default());
-                    if frame == 1 {
+                    if frame == 1 && weather {
                         // Exercise the shaped bolt draw beyond JKA's map far
                         // plane, in addition to the ordinary cloud flash path.
                         let target = camera.position / crate::ocean::OCEAN_UNITS_PER_METER
@@ -767,8 +914,8 @@ mod native_tests {
                         1. + frame as f32 / 60.,
                         [0.3, 0.8, 0.2],
                         0.,
-                        true,
-                        true,
+                        aerial,
+                        clouds,
                         0.5,
                         [100., 45.],
                         settings,
@@ -776,7 +923,7 @@ mod native_tests {
                         1. / 60.,
                         false,
                     );
-                    if frame == 1 {
+                    if frame == 1 && clouds {
                         assert_eq!(
                             atmosphere.clouds.uniforms().frame[3],
                             1.,
@@ -825,6 +972,7 @@ mod native_tests {
                         resolve,
                         &depth,
                         true,
+                        None,
                     );
                     atmosphere.apply_opaque_air(
                         &device,
@@ -843,11 +991,10 @@ mod native_tests {
                         })
                         .unwrap();
                 }
+              }
             }
-            assert!(
-                scope.pop().await.is_none(),
-                "native environment GPU validation"
-            );
+            let error = scope.pop().await;
+            assert!(error.is_none(), "native environment GPU validation: {error:?}");
         });
     }
 }

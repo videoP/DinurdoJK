@@ -2,6 +2,88 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_UI_GAMELAUNCHSCREEN {
+        runtime: CvarDef::new("ui_gameLaunchScreen", "main", "main|play|solo|servers|demo|profile|controls|setup|chatlogs|screenshots|devtools|assets|maps", "Menu to open on the next game launch without a map.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.game_launch_screen.page_name().to_owned()),
+            |app, value| {
+                app.game_launch_screen = crate::config::GameLaunchScreen::parse(&value.to_string())
+                    .ok_or_else(|| "ui_gameLaunchScreen: unknown launch screen".to_owned())?;
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(screen) = crate::config::GameLaunchScreen::parse(value) {
+                    settings.game_launch_screen = screen;
+                }
+            }),
+            archive: Some((27000, |state| state.presentation.game_launch_screen.page_name().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CL_STREAMERMODE {
+        runtime: CvarDef::new("cl_streamerMode", "0", "0|1", "Use a separately filtered stream presentation snapshot; local game is unaffected.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Bool(app.streamer.enabled),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                app.streamer.enabled = enabled;
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(flag) = parse_bool(value) { settings.streamer.enabled = flag; }
+            }),
+            archive: Some((360, |state| format!("{}", u8::from(state.presentation.streamer.enabled)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CL_STREAMERHIDEPRIVATE {
+        runtime: CvarDef::new("cl_streamerHidePrivate", "1", "0|1", "Mask identified private messages on the stream-only chat and console UI.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Bool(app.streamer.hide_private_messages),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                app.streamer.hide_private_messages = enabled;
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(flag) = parse_bool(value) { settings.streamer.hide_private_messages = flag; }
+            }),
+            archive: Some((361, |state| format!("{}", u8::from(state.presentation.streamer.hide_private_messages)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CL_STREAMERHIDECONSOLE {
+        runtime: CvarDef::new("cl_streamerHideConsole", "1", "0|1", "Mask all console text on the stream-only UI, including input and notifications.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Bool(app.streamer.hide_console),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                app.streamer.hide_console = enabled;
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(flag) = parse_bool(value) { settings.streamer.hide_console = flag; }
+            }),
+            archive: Some((362, |state| format!("{}", u8::from(state.presentation.streamer.hide_console)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_CHATBOXCOMPLETION {
         runtime: CvarDef::new("cg_chatboxCompletion", "", "0..1", "JAPP: Tab in the chat input completes a player name (colours ignored); repeated Tab cycles ranked matches, preferring exact and prefix matches.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_chatboxcompletion(app)), |app, value| App::cvar_set_cg_chatboxcompletion(app, APP_CG_CHATBOXCOMPLETION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_chatboxcompletion, None),
         config: CvarBinding {
@@ -735,6 +817,117 @@ app_cvars! {
                     self.head_look = mode;
                     if let Some(session) = self.game_session.as_mut() {
                         session.player_presenter.set_head_look_mode(mode);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_SWIMTILT {
+        runtime: CvarDef::new(
+            "cg_swimTilt", "0.9", "0..1",
+            "Client-only direction-based swim body tilt (0 stock OpenJK, 1 full; fractional strengths allowed). Keeps the stock swim animations and never alters collision, movement, or server state.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.swim_tilt.to_string()),
+            |app, value| App::cvar_set_cg_swimtilt(app, APP_CG_SWIMTILT.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_swimtilt, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(strength) = value.trim().parse::<f32>() {
+                    if strength.is_finite() { settings.swim_tilt = strength.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((27001, |state| state.presentation.swim_tilt.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_swimtilt(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| "cg_swimTilt expects a number between 0 and 1".to_owned())?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err("cg_swimTilt expects a number between 0 and 1".to_owned());
+                    }
+                    self.swim_tilt = strength;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.player_presenter.set_swim_tilt(strength);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_SWIMTURNBANK {
+        runtime: CvarDef::new(
+            "cg_swimTurnBank", "1", "0..1",
+            "Client-only swim banking up to 45 degrees in response to changes in horizontal travel direction (0 off, 1 full). cg_swimTilt 0 disables all swim orientation changes; does not affect physics or camera.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.swim_turn_bank.to_string()),
+            |app, value| App::cvar_set_cg_swimturnbank(app, APP_CG_SWIMTURNBANK.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_swimturnbank, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(strength) = value.trim().parse::<f32>() {
+                    if strength.is_finite() { settings.swim_turn_bank = strength.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((27002, |state| state.presentation.swim_turn_bank.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_swimturnbank(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| "cg_swimTurnBank expects a number between 0 and 1".to_owned())?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err("cg_swimTurnBank expects a number between 0 and 1".to_owned());
+                    }
+                    self.swim_turn_bank = strength;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.player_presenter.set_swim_turn_bank(strength);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_MOVELEAN {
+        runtime: CvarDef::new(
+            "cg_moveLean", "0.75", "0..1",
+            "PM_NORMAL airborne strafejump lean (0..1). No effect through 500 UPS; smoothly full by 800 UPS. No noclip or grounded lean.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.move_lean.to_string()),
+            |app, value| App::cvar_set_cg_movelean(app, APP_CG_MOVELEAN.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_movelean, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(strength) = value.trim().parse::<f32>() {
+                    if strength.is_finite() { settings.move_lean = strength.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((27003, |state| state.presentation.move_lean.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_movelean(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| "cg_moveLean expects a number between 0 and 1".to_owned())?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err("cg_moveLean expects a number between 0 and 1".to_owned());
+                    }
+                    self.move_lean = strength;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.player_presenter.set_move_lean(strength);
                     }
                     self.mark_config_dirty();
                     self.publish_ui();

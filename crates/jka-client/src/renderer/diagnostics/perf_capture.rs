@@ -8,9 +8,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+// Separately trace only the first map frame. Do not arm a performance capture,
+// write any files, or affect the existing capture's ownership of its flag.
+static FIRST_WORLD_FRAME_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub(in crate::renderer) fn set_first_world_frame_trace(enabled: bool) {
+    FIRST_WORLD_FRAME_TRACE.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn first_world_frame_trace() -> bool {
+    FIRST_WORLD_FRAME_TRACE.load(Ordering::Relaxed)
+}
 
 pub(in crate::renderer) fn enabled() -> bool {
     CAPTURE_ENABLED.load(Ordering::Relaxed)
+        || FIRST_WORLD_FRAME_TRACE.load(Ordering::Relaxed)
 }
 
 // Deliberately preserve the original inclusive CPU timing fields next to the

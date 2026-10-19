@@ -80,6 +80,7 @@ mod renderer;
 mod runtime;
 mod scene;
 mod screenshot;
+mod streamer;
 mod server_browser;
 mod speedometer;
 mod surface_deformation;

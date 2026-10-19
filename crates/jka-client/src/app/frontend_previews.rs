@@ -22,6 +22,66 @@ pub(in crate::app) struct AssetPreviewFxState {
     pub(in crate::app) cycle_ms: i32,
 }
 
+
+/// One repeating `fx_runner` of the menu scene (OpenJK fx_runner: play the
+/// effect, then again every `delay` ms).
+struct MenuFxPlayer {
+    effect: crate::fx::system::EffectId,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    delay_ms: i32,
+    next_ms: i32,
+}
+
+/// Menu-scene props that only the frontend needs: the map's synthesized
+/// `misc_model_static` placements and its fx runners (campfire, waterfall).
+/// Separate from CGame's presenters so the menu never perturbs a game session.
+pub(in crate::app) struct MenuProps {
+    presenter: EntityPresenter,
+    fx: crate::fx::system::FxSystem,
+    light_promoter: crate::fx::light_promotion::FxLightPromoter,
+    pub(in crate::app) lights: Arc<Vec<crate::renderer::TransientLight>>,
+    light_trace_level: Option<u8>,
+    players: Vec<MenuFxPlayer>,
+    started: Instant,
+    /// `map_static_models` this state was built for (reload detection).
+    static_source: Arc<jka_assets::bsp::StaticModels>,
+}
+
+/// JKA AngleVectors forward.
+fn angles_forward(angles: [f32; 3]) -> [f32; 3] {
+    let (sp, cp) = angles[0].to_radians().sin_cos();
+    let (sy, cy) = angles[1].to_radians().sin_cos();
+    [cp * cy, cp * sy, -sp]
+}
+
+/// Profile's animation time is in the same unquantized milliseconds as gameplay.
+/// Fractional bone-frame interpolation is handled by Ghoul2Animator itself.
+fn profile_preview_time_ms(elapsed: Duration) -> i32 {
+    elapsed.as_millis().min(i32::MAX as u128) as i32
+}
+
+#[cfg(test)]
+mod profile_animation_clock_tests {
+    use super::profile_preview_time_ms;
+    use std::time::Duration;
+
+    #[test]
+    fn profile_clock_preserves_sub_frame_times() {
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(0)), 0);
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(8)), 8);
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(16)), 16);
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(32)), 32);
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(33)), 33);
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(34)), 34);
+    }
+
+    #[test]
+    fn profile_clock_saturates_at_ghoul2_time_limit() {
+        assert_eq!(profile_preview_time_ms(Duration::from_millis(i32::MAX as u64 + 100)), i32::MAX);
+    }
+}
+
 impl App {
     pub(in crate::app) fn ensure_local_player_presenter(&mut self) -> Result<(), String> {
         if self.local_player_presenter.is_some() {
@@ -176,27 +236,28 @@ impl App {
             entry.name.eq_ignore_ascii_case(&self.network.saber1)
                 && entry.saber_type.eq_ignore_ascii_case("SABER_STAFF")
         });
-        let saber_stance = if secondary_saber {
-            "BOTH_SABERDUAL_STANCE"
+        // Stock JKA full-body walking clips (also used by OpenJK's character
+        // preview). The model stays in place; only the Ghoul2 pose animates.
+        // Match saber configuration so staff / dual hilts follow the proper
+        // hands instead of forcing a single-saber or stand idle pose.
+        let walk_animation = if !studio_saber {
+            "BOTH_WALK1"
+        } else if secondary_saber {
+            "BOTH_WALK_DUAL"
         } else if primary_staff {
-            "BOTH_SABERSTAFF_STANCE"
+            "BOTH_WALK_STAFF"
         } else {
-            "BOTH_STAND2"
+            "BOTH_WALK2"
         };
-        // Periodic stock Ghoul2 fidgets, not an invented procedural animation.
-        // Keep a stable stance whenever Force is performing its 1-shot action.
-        let idle_ms = self.profile_preview_started.elapsed().as_millis() as i32;
-        let idle_phase = idle_ms.rem_euclid(18000);
-        let in_idle = (13500..=16500).contains(&idle_phase);
-        let animation_name = force_animation.unwrap_or(if studio_saber {
-            if in_idle && !secondary_saber && !primary_staff { "BOTH_STAND2IDLE1" }
-            else { saber_stance }
-        } else if in_idle { "BOTH_STAND1IDLE1" }
-        else { "BOTH_STAND1" });
+        // Force demonstrations temporarily override walking, then return to
+        // the normal looping walk without changing gameplay animations.
+        let animation_name = force_animation.unwrap_or(walk_animation);
         let with_sabers = studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17));
 
-        // 30 Hz is ample for the isolated Profile character and keeps its CPU
-        // skinning/studio-lighting work independent of an uncapped render loop.
+        // The Ghoul2 evaluator already interpolates between authored GLA frames.
+        // Feed it continuous millisecond time: rounding the preview clock to
+        // 33-ms ticks makes *every* rendered frame repeat the same pose for up
+        // to 33 ms, even when the UI and renderer can present at 120+ Hz.
         let animation_elapsed = if force_power.is_some() {
             self.profile_force_preview_started.elapsed()
         } else {
@@ -207,18 +268,12 @@ impl App {
         let preview_model = self.profile_model_staged.as_deref()
             .map(str::to_owned)
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
-        let animation_tick = (animation_elapsed.as_millis() / 33) as i32;
-        // One-shot idle poses must start at frame zero when their 3-second
-        // window opens. Otherwise an animation installed with a start time
-        // of zero instantly freezes at its final frame after 13.5 seconds.
-        let current_time = if in_idle && force_animation.is_none() {
-            (idle_phase - 13500).max(0) / 33 * 33
-        } else {
-            animation_tick.saturating_mul(33)
-        };
+        // Clamp only at i32::MAX to match the Ghoul2 millisecond API; never
+        // quantize to animation.cfg frameLerp (Ghoul2 performs that lerp).
+        let current_time = profile_preview_time_ms(animation_elapsed);
         let key = (
             format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}:{:.2}:{:.2}:{:?}",
                 animation_name,
                 preview_model,
                 self.network.saber1,
@@ -232,10 +287,13 @@ impl App {
                 self.network.cosmetics,
                 self.profile_studio_head_look[0],
                 self.profile_studio_head_look[1],
+                self.video.jiggle_breast_size,
+                self.video.jiggle_glute_size,
+                self.video.body_shape_params(),
             ),
             (self.profile_preview_yaw * 10.0).round() as i32,
             (self.profile_preview_zoom * 1000.0).round() as i32,
-            animation_tick,
+            current_time,
         );
         if self.profile_preview_key.as_ref() == Some(&key) {
             return;
@@ -284,6 +342,50 @@ impl App {
                 presenter.set_early_frustum_cull(false);
                 presenter.set_lod_bias(self.video.ghoul2_lod_bias);
                 presenter.set_lod_scale(self.video.lod_scale);
+                presenter.set_ghoul2_anim_smooth(self.video.ghoul2_anim_smooth);
+                // Profile has its own presenter, but uses the same jiggle solver
+                // and tuning as gameplay. Keep it disabled when physics/jiggle
+                // is disabled globally; never advance the live player's state.
+                presenter.set_jiggle_config(
+                    self.video.client_physics && self.video.jiggle_physics != 0,
+                    self.video.jiggle_physics,
+                    self.video.client_physics_hz,
+                    self.video.client_physics_max_substeps,
+                    crate::cgame::jiggle::JiggleTuning {
+                        solver: crate::cgame::jiggle::JiggleSolver::from_u8(self.video.jiggle_solver),
+                        overall_strength: self.video.jiggle_strength,
+                        breast_strength: self.video.jiggle_breast_strength,
+                        glute_strength: self.video.jiggle_glute_strength,
+                        stiffness_scale: self.video.jiggle_stiffness,
+                        damping_scale: self.video.jiggle_damping,
+                        glute_jiggle_bottom_z: self.video.jiggle_glute_jiggle_bottom_z,
+                        glute_jiggle_top_z: self.video.jiggle_glute_jiggle_top_z,
+                        jp_stiffness: self.video.jiggle_jp_stiffness,
+                        jp_drag: self.video.jiggle_jp_drag,
+                        jp_air_drag: self.video.jiggle_jp_air_drag,
+                        jp_stretch: self.video.jiggle_jp_stretch,
+                        jp_soften: self.video.jiggle_jp_soften,
+                        jp_gravity: self.video.jiggle_jp_gravity,
+                        locomotion: self.video.jiggle_locomotion,
+                        impulse_cap: self.video.jiggle_impulse_cap,
+                        swirl: self.video.jiggle_swirl,
+                        breast_stiffness: self.video.jiggle_breast_stiffness,
+                        breast_damping: self.video.jiggle_breast_damping,
+                        glute_stiffness: self.video.jiggle_glute_stiffness,
+                        glute_damping: self.video.jiggle_glute_damping,
+                        breast_size: self.video.jiggle_breast_size,
+                        glute_size: self.video.jiggle_glute_size,
+                    },
+                    crate::cgame::jiggle::JiggleRemeshTuning {
+                        body_shape: self.video.body_shape_params(),
+                        breast_bottom_z: self.video.jiggle_breast_remesh_bottom_z,
+                        breast_top_z: self.video.jiggle_breast_remesh_top_z,
+                        glute_bottom_z: self.video.jiggle_glute_remesh_bottom_z,
+                        glute_top_z: self.video.jiggle_glute_remesh_top_z,
+                        breast_size: self.video.jiggle_breast_size,
+                        glute_size: self.video.jiggle_glute_size,
+                    },
+                );
                 // No stale requests from a prior Profile frame should leak into
                 // the current isolated saber preview.
                 let _ = presenter.drain_fx_requests();
@@ -350,17 +452,30 @@ impl App {
                                     origin[2]+direction[2]*projection-vertex.position[2],
                                 ];
                                 let dist_sq = to_light.iter().map(|v|v*v).sum::<f32>();
-                                const RADIUS_SQ: f32 = 180.0*180.0;
+                                // Profile-only saber light. Brighten the existing
+                                // diffuse/char_color_* channels rather than adding
+                                // bare saber RGB (which washes out player tint).
+                                // A 48u radius with linear-distance squared fade
+                                // was effectively invisible beyond the saber hand.
+                                const RADIUS: f32 = 112.0;
+                                const INTENSITY: f32 = 1.55;
+                                const MAX_VERTEX_LIGHT: f32 = 1.45;
+                                const RADIUS_SQ: f32 = RADIUS * RADIUS;
                                 if dist_sq >= RADIUS_SQ { continue; }
                                 let distance = dist_sq.sqrt().max(0.5);
-                                let lambert = (vertex.normal[0]*to_light[0]
+                                let facing = (vertex.normal[0]*to_light[0]
                                     +vertex.normal[1]*to_light[1]
-                                    +vertex.normal[2]*to_light[2])/distance;
-                                let attenuation = (1.0-dist_sq/RADIUS_SQ).powi(2);
-                                let bounce = (0.30+0.70*lambert.max(0.0))*attenuation*1.65;
+                                    +vertex.normal[2]*to_light[2]) / distance;
+                                // Soft local bounce lets the near side of a limb
+                                // catch light even if its normal faces sideways;
+                                // quadratic radius attenuation confines the glow.
+                                let radial = 1.0 - dist_sq / RADIUS_SQ;
+                                let strength = radial * radial
+                                    * (0.25 + 0.75 * facing.max(0.0)) * INTENSITY;
                                 for channel in 0..3 {
                                     vertex.color[channel] = (vertex.color[channel]
-                                        +rgb[channel]*bounce).clamp(0.0,1.8);
+                                        * (1.0 + rgb[channel] * strength))
+                                        .clamp(0.0, MAX_VERTEX_LIGHT);
                                 }
                             }
                         }
@@ -796,6 +911,127 @@ impl App {
         self.egui_repaint_requested = true;
     }
 
+    /// Static props and FX of the menu scene, as dynamic model surfaces. Empty
+    /// for maps without a menu look. Built lazily and rebuilt when the prepared
+    /// map's placements change.
+    fn menu_scene_props(&mut self) -> Vec<DynamicModelSurface> {
+        let runners: Vec<scene::MapFxRunner> = self
+            .prepared_map_cache
+            .as_ref()
+            .map(|cache| cache.map.fx_runners.clone())
+            .unwrap_or_default();
+        let statics = Arc::clone(&self.map_static_models);
+        if runners.is_empty() && statics.placements.is_empty() {
+            self.menu_props = None;
+            return Vec::new();
+        }
+        let stale = self
+            .menu_props
+            .as_ref()
+            .is_none_or(|props| !Arc::ptr_eq(&props.static_source, &statics));
+        if stale {
+            let mut assets =
+                match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+                    Ok(assets) => assets,
+                    Err(error) => {
+                        eprintln!("MENU PROPS VFS ERROR: {error}");
+                        return Vec::new();
+                    }
+                };
+            assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+            let mut presenter = match EntityPresenter::new(assets, self.video.pbr) {
+                Ok(presenter) => presenter,
+                Err(error) => {
+                    eprintln!("MENU PROPS MD3 ERROR: {error}");
+                    return Vec::new();
+                }
+            };
+            presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
+            presenter.set_static_md3_instances(self.video.static_md3_instances);
+            presenter.set_static_models(Arc::clone(&statics));
+
+            let mut fx_assets =
+                match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+                    Ok(assets) => assets,
+                    Err(error) => {
+                        eprintln!("MENU PROPS FX VFS ERROR: {error}");
+                        return Vec::new();
+                    }
+                };
+            fx_assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+            let mut fx = crate::fx::system::FxSystem::new();
+            fx.set_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
+            let mut light_promoter = crate::fx::light_promotion::FxLightPromoter::default();
+            light_promoter.set_catalog(Arc::clone(&self.fx_light_promotion_catalog));
+            let mut players = Vec::new();
+            for runner in &runners {
+                let effect = fx.register(&runner.effect, &mut |qpath| {
+                    fx_assets
+                        .read(qpath, 32 * 1024 * 1024)
+                        .ok()
+                        .flatten()
+                        .map(|asset| asset.bytes)
+                });
+                if effect == 0 {
+                    eprintln!("MENU PROPS: could not register effect {}", runner.effect);
+                    continue;
+                }
+                players.push(MenuFxPlayer {
+                    effect,
+                    origin: runner.origin,
+                    direction: angles_forward(runner.angles),
+                    delay_ms: runner.delay_ms.max(50),
+                    next_ms: 0,
+                });
+            }
+            fx.reset_time(0);
+            self.menu_props = Some(MenuProps {
+                presenter,
+                fx,
+                light_promoter,
+                lights: Arc::new(Vec::new()),
+                light_trace_level: None,
+                players,
+                started: Instant::now(),
+                static_source: statics,
+            });
+        }
+        let Some(props) = self.menu_props.as_mut() else { return Vec::new() };
+        let mut surfaces = props.presenter.present_static_models(None);
+        if !props.players.is_empty() {
+            let now_ms = (props.started.elapsed().as_millis().min(i32::MAX as u128) as i32).max(1);
+            props.fx.adjust_time(now_ms);
+            for player in &mut props.players {
+                if now_ms >= player.next_ms {
+                    props.fx.play_effect_dir(player.effect, player.origin, player.direction);
+                    player.next_ms = now_ms.saturating_add(player.delay_ms);
+                }
+            }
+            let mut frame = props.fx.frame();
+            let promoted = props.light_promoter.promote(
+                &frame.auto_light_candidates,
+                &mut |shader| props.presenter.fx_material_stages(shader),
+                now_ms,
+                self.video.promote_fx_lights,
+            );
+            if props.light_trace_level != Some(self.video.promote_fx_lights) {
+                rverbose!(2, "[MENU FX LIGHTS] promotion={} | candidates={} | authored={} | promoted={}",
+                    self.video.promote_fx_lights, frame.auto_light_candidates.len(),
+                    frame.lights.len(), promoted.len());
+                props.light_trace_level = Some(self.video.promote_fx_lights);
+            }
+            frame.lights.extend(promoted);
+            props.lights = Arc::new(frame.lights.iter()
+                .filter_map(crate::renderer::TransientLight::from_fx).collect());
+            let view = crate::fx::draw::FxView::from_camera(&self.camera);
+            let presenter = &mut props.presenter;
+            surfaces.extend(crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| {
+                presenter.fx_material_stages(shader)
+            }));
+        }
+        surfaces
+    }
+
     pub(in crate::app) fn update_frontend_foreground_player(&mut self) {
         let Some(cinematic) = self.frontend_cinematic else {
             self.solo_dynamic_models = Arc::new(Vec::new());
@@ -810,9 +1046,11 @@ impl App {
             return;
         }
 
-        let Some(idle_anim) =
-            jka_assets::animation::animation_index("BOTH_STAND1").map(|index| index as i32)
-        else {
+        let stage = scene::menu_stage(super::constants::FRONTEND_BACKGROUND_MAP);
+        let Some(idle_anim) = jka_assets::animation::animation_index(
+            stage.map_or("BOTH_STAND1", |stage| stage.player_anim),
+        )
+        .map(|index| index as i32) else {
             self.solo_dynamic_models = Arc::new(Vec::new());
             return;
         };
@@ -827,11 +1065,17 @@ impl App {
             model_origin.y - FRONTEND_FOREGROUND_MODEL_HEAD_HEIGHT,
             model_origin.z,
         ];
-        let model_feet_jka = scene::jka_position(model_feet_render);
+        let mut model_feet_jka = scene::jka_position(model_feet_render);
         let camera_jka = scene::jka_position(self.camera.position.to_array());
         let to_camera_x = camera_jka[0] - model_feet_jka[0];
         let to_camera_y = camera_jka[1] - model_feet_jka[1];
-        let face_camera_yaw = to_camera_y.atan2(to_camera_x).to_degrees();
+        let mut face_camera_yaw = to_camera_y.atan2(to_camera_x).to_degrees();
+        if let Some(stage) = stage {
+            // Authored staging: the player sits where the scene put them, not
+            // beside the camera.
+            model_feet_jka = stage.player_feet;
+            face_camera_yaw = stage.player_yaw;
+        }
 
         let mut entity_view = jka_movement::PlayerEntityView::default();
         entity_view.number = 0;
@@ -887,11 +1131,14 @@ impl App {
             true,
             false,
             None,
+            false, // Menu mannequin: no authoritative movement mode.
         );
         let settled = presenter.player_model_settled(entity.number);
         match result {
             Ok(draws) => {
                 let model_ready = settled && !draws.is_empty();
+                let mut draws = draws;
+                draws.extend(self.menu_scene_props());
                 self.solo_dynamic_models = Arc::new(draws);
                 self.advance_frontend_scene_readiness(model_ready, current_time);
             }
@@ -1037,6 +1284,7 @@ impl App {
                     render_third_person || first_person_saber,
                     first_person_saber,
                     ghoul2_view,
+                    player_view.pm_type == 0, // PM_NORMAL; noclip is 3.
                 );
                 match result {
                     Ok(draws) => self.solo_dynamic_models = Arc::new(draws),

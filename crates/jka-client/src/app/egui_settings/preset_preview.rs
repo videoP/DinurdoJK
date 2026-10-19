@@ -49,6 +49,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
         "r_lodbias" => Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
         "r_reflectionQuality" => Reset::Video(ui::VIDEO_ROW_SSR),
         "r_motionBlur" => Reset::Video(ui::VIDEO_ROW_MOTION_BLUR),
+        "r_dofMode" => Reset::Video(ui::VIDEO_ROW_DOF_MODE),
         "r_depthOfField" => Reset::Video(ui::VIDEO_ROW_DEPTH_OF_FIELD),
         "r_dofQuality" => Reset::Video(ui::VIDEO_ROW_DOF_QUALITY),
         "r_chromaticAberration" => Reset::Video(ui::VIDEO_ROW_CHROMATIC_ABERRATION),
@@ -96,7 +97,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
         "fx_physics" | "r_reflectionQuality" => S::Effects,
         "r_hdr" | "r_floatLightmap" | "r_tonemap" | "r_autoExposure"
         | "r_colorLut" | "r_colorLutStrength" => S::Color,
-        "r_glow" | "r_halation" | "r_motionBlur" | "r_depthOfField"
+        "r_glow" | "r_halation" | "r_motionBlur" | "r_dofMode" | "r_depthOfField"
         | "r_dofQuality" | "r_chromaticAberration" | "r_vignette" | "r_filmGrain" => S::PostProcessing,
         "r_sunVisibility" => S::Sun,
         "r_clouds" | "r_cloudShadows" => S::Clouds,

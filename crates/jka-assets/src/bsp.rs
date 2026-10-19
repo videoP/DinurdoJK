@@ -194,6 +194,18 @@ pub struct StaticModel {
     pub scale: [f32; 3],
     /// Added to the cull origin only; the model is drawn at `origin`.
     pub zoffset: f32,
+    /// PVS cluster of the cull origin (`origin + 1 + zoffset` up), the target
+    /// of jaPRO's `R_inPVS` test; `None` in solid (JKA hides those, see
+    /// `Visibility::r_in_pvs`) or without visibility.
+    pub cull_cluster: Option<usize>,
+}
+
+/// The map's `misc_model_static` placements and the PVS that rejects them.
+#[derive(Debug, Clone, Default)]
+pub struct StaticModels {
+    pub placements: Vec<StaticModel>,
+    /// Only kept when there are placements to test.
+    pub visibility: Option<Visibility>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -587,7 +599,7 @@ impl Bsp {
     /// `misc_model_static` entities, as jaPRO's cgame `SP_misc_model_static`
     /// reads them. The game module frees these on the server, so they are never
     /// snapshot entities: the client places each MD3 from the BSP entity string.
-    pub fn static_models(&self) -> Vec<StaticModel> {
+    pub fn static_models(&self) -> StaticModels {
         let vector = |entity: &Entity, key: &[u8]| -> Option<[f32; 3]> {
             let coordinates: Vec<f32> = std::str::from_utf8(entity.get(key)?)
                 .ok()?
@@ -600,7 +612,8 @@ impl Bsp {
         let float = |entity: &Entity, key: &[u8]| -> Option<f32> {
             std::str::from_utf8(entity.get(key)?).ok()?.trim().parse().ok()
         };
-        self.entities
+        let placements: Vec<StaticModel> = self
+            .entities
             .iter()
             .filter(|entity| entity.get(b"classname") == Some(b"misc_model_static".as_slice()))
             .filter_map(|entity| {
@@ -615,9 +628,21 @@ impl Bsp {
                     .unwrap_or_else(|| [float(entity, b"modelscale").unwrap_or(1.0); 3]);
                 let zoffset = float(entity, b"zoffset").unwrap_or(0.0);
                 let finite = origin.iter().chain(&angles).chain(&scale).all(|value| value.is_finite());
-                finite.then(|| StaticModel { model: model.to_owned(), origin, angles, scale, zoffset })
+                let cull_origin = [origin[0], origin[1], origin[2] + 1.0 + zoffset];
+                let cull_cluster =
+                    self.visibility.as_ref().and_then(|vis| vis.cluster_at(cull_origin));
+                finite.then(|| StaticModel {
+                    model: model.to_owned(),
+                    origin,
+                    angles,
+                    scale,
+                    zoffset,
+                    cull_cluster,
+                })
             })
-            .collect()
+            .collect();
+        let visibility = if placements.is_empty() { None } else { self.visibility.clone() };
+        StaticModels { placements, visibility }
     }
 
     /// Fixed geometry for stable map consumers. The historical 1..16 API is

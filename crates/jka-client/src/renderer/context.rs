@@ -39,6 +39,24 @@ fn surface_view_format(
 }
 
 impl Renderer {
+    /// Texture views in bind groups retain the old textures after target replacement.
+    /// Refresh only the inputs; the resolve pipeline and layout remain compatible.
+    fn rebind_scene_depth_resolve(&mut self) {
+        // A pending MSAA change can also replace the single/multisampled layout.
+        // The scene rebuild requested below recreates that pipeline and its binding
+        // together before the next frame, so do not bind it to incompatible targets.
+        if self.scene_pipeline_compat.1 != self.msaa_samples {
+            return;
+        }
+        self.ssr_visibility_bind_group = self._ssr_visibility_layout.as_ref().map(|layout| {
+            super::post::pipelines::create_ssr_visibility_bind_group(
+                &self.device,
+                layout,
+                &self.targets,
+            )
+        });
+    }
+
     /// View of the acquired swapchain image. In the normal SDR path this can
     /// be an sRGB view of a UNORM swapchain (see `presentation_config`). Native
     /// HDR output instead uses the selected native HDR surface format,
@@ -87,6 +105,7 @@ impl Renderer {
         );
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
+        self.rebind_scene_depth_resolve();
         self.rebuild_planar_reflection_resources();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
@@ -143,6 +162,7 @@ impl Renderer {
         );
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
+        self.rebind_scene_depth_resolve();
         self.rebuild_planar_reflection_resources();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();

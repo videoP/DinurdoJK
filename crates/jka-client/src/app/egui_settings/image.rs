@@ -123,28 +123,8 @@ impl App {
         theme::section(
             ui,
             "WORLD VISIBILITY",
-            "Portal visibility, distance culling and GPU draw submission.",
+            "How far away world geometry is still drawn.",
         );
-        const PVS: [(PvsMode, &str); 4] = [
-            (PvsMode::Off, "Off"),
-            (PvsMode::Minimal, "Minimal"),
-            (PvsMode::Full, "Full"),
-            (PvsMode::Auto, "Auto"),
-        ];
-        if let Some(target) = segmented_row(
-            ui,
-            "PVS portal culling",
-            "Uses the map's precomputed visibility set to skip rooms the camera cannot see. Off draws everything. Minimal draws the fewest batches; Full keeps every triangle of each visible batch. Auto precomputes merged batches per camera cluster at map load: the minimal draw count with the exact visible triangles. If a map shows missing geometry, try Full.",
-            theme::Reset::Video(ui::VIDEO_ROW_PVS),
-            self.video.pvs_mode,
-            &PVS,
-        ) {
-            let current = index_of(&PVS, self.video.pvs_mode, 3);
-            let next = index_of(&PVS, target, current);
-            self.video_selected = ui::VIDEO_ROW_PVS;
-            self.change_video_setting(next as i32 - current as i32);
-        }
-
         theme::row(
             ui,
             "Distance cull",
@@ -163,23 +143,5 @@ impl App {
                 }
             },
         );
-        self.egui_toggle_row(
-            ui,
-            "GPU-driven draws",
-            "Builds the draw list on the GPU with a compute pass instead of on \
-             the CPU. Helps on maps with many batches.",
-            ui::VIDEO_ROW_GPU_DRIVEN,
-            self.video.gpu_driven,
-        );
-        ui.add_enabled_ui(self.video.gpu_driven, |ui| {
-            self.egui_toggle_row(
-                ui,
-                "Hi-Z occlusion",
-                "Tests batches against a hierarchical depth pyramid so geometry \
-             hidden behind walls is never submitted. Needs GPU-driven draws.",
-                ui::VIDEO_ROW_HIZ,
-                self.video.hiz_occlusion,
-            );
-        });
     }
 }

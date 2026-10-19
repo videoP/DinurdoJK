@@ -281,6 +281,25 @@ impl Visibility {
             })
     }
 
+    /// rd-vanilla `R_inPVS` for a target point whose leaf cluster is `to`.
+    /// A target in solid (cluster -1) reads `mask[-1 >> 3] & (1 << 7)`: bit 7
+    /// of the byte before the view's PVS row, i.e. the previous row's padding,
+    /// so JKA hides it in practice. Row 0 would read outside the vis data;
+    /// that is treated as hidden. A view with no cluster sees everything.
+    pub fn r_in_pvs(&self, from: Option<usize>, to: Option<usize>) -> bool {
+        let Some(from) = from.filter(|&v| v < self.clusters) else {
+            return true;
+        };
+        match to {
+            Some(to) => self.visible(Some(from), &[to]),
+            None => from
+                .checked_mul(self.stride)
+                .and_then(|row| row.checked_sub(1))
+                .and_then(|byte| self.bits.get(byte))
+                .is_some_and(|byte| byte & 0x80 != 0),
+        }
+    }
+
     /// `visible(Some(from), targets)` for every source cluster at once: bit
     /// `from % 64` of word `from / 64` is set when `from` sees any target.
     /// Identical to testing each source separately, but costs one row OR per

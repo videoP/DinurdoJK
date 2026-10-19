@@ -6,26 +6,18 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_clouds(&mut self, ui: &mut egui::Ui) {
-        if ui.checkbox(&mut self.video.sky_fractal_override, "Experimental Star Nest sky override")
-            .on_hover_text("Replaces BSP skybox and sky cloud stages with a procedural fractal nebula. Optional A/B test; real-world parallax, 12 x 10 shader loops. Does not replace volumetric clouds. Off by default.")
-            .changed()
-        {
-            self.sync_post_effects();
-            self.mark_config_dirty();
-            self.publish_ui();
-        }
-        theme::section(ui, "ATMOSPHERE BACKENDS", "Sky and volumetric clouds can be selected independently of the ocean.");
-        theme::row(ui, "Sky", "Author-authored BSP sky or original Blue Water atmosphere.", theme::Reset::None, |ui| {
-            for (backend, name) in [(0, "JKA sky"), (1, "Blue Water sky")] {
-                if theme::chip(ui, name, self.video.sky_backend == backend).clicked() && self.video.sky_backend != backend {
-                    self.video.sky_backend = backend; self.sync_post_effects(); self.publish_ui();
-                }
-            }
-        });
+        theme::section(ui, "CLOUD RENDERER", "Volumetric clouds can be selected independently of the ocean. Sky controls are on the Sky page.");
         theme::row(ui, "Volumetric clouds", "Select original JKA volumetrics or imported Blue Water cloud reconstruction.", theme::Reset::None, |ui| {
             for (backend, name) in [(0, "JKA clouds"), (1, "Blue Water clouds")] {
                 if theme::chip(ui, name, self.video.cloud_backend == backend).clicked() && self.video.cloud_backend != backend {
                     self.video.cloud_backend = backend; self.sync_post_effects(); self.publish_ui();
+                }
+            }
+        });
+        theme::row(ui, "Sky portal depth", "How clouds treat misc_skyportal geometry (distant terrain). Off draws clouds over it. Redraw re-renders the portal view depth-only. Reuse has the portal pass write the depth itself (no extra draw; needs MSAA off, otherwise acts as Redraw).", theme::Reset::None, |ui| {
+            for (mode, name) in [(0u8, "Off"), (1, "Redraw"), (2, "Reuse")] {
+                if theme::chip(ui, name, self.video.cloud_portal_depth == mode).clicked() && self.video.cloud_portal_depth != mode {
+                    self.video.cloud_portal_depth = mode; self.sync_post_effects(); self.publish_ui();
                 }
             }
         });
@@ -249,19 +241,6 @@ impl App {
             |ui| {
                 if theme::switch(ui, self.video.cloud_terrain_interaction).is_some() {
                     self.apply_cloud_tuning(ui::CLOUD_ROW_TERRAIN_INTERACTION, true, None);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Empty-space skip",
-            "A/B optimization: takes larger primary-ray steps only when the macro \
-             cloud field is safely below the coverage threshold, then falls back \
-             to fine stepping near potential cloud.",
-            theme::Reset::CloudTuning(ui::CLOUD_ROW_EMPTY_SKIP),
-            |ui| {
-                if theme::switch(ui, self.video.cloud_empty_skip).is_some() {
-                    self.apply_cloud_tuning(ui::CLOUD_ROW_EMPTY_SKIP, true, None);
                 }
             },
         );

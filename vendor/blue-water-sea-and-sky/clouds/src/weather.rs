@@ -365,6 +365,7 @@ impl Draw {
         module: &wgpu::ShaderModule,
         [sky_layout, layout]: &[wgpu::BindGroupLayout; 2],
         targets: Targets,
+        cache: Option<&wgpu::PipelineCache>,
     ) -> wgpu::RenderPipeline {
         let layouts = [None, Some(sky_layout), Some(layout)];
         let (vertex, fragment, buffers, blend) = match self {
@@ -397,6 +398,7 @@ impl Draw {
             &buffers,
             Some(blend),
             targets,
+            cache,
         )
     }
 }
@@ -443,7 +445,7 @@ impl Weather {
                 draw.shader().1,
                 Vec::new(),
                 Box::new(move |build| {
-                    Pipeline::Render(draw.pipeline(build.device, build.module, &layouts, targets))
+                    Pipeline::Render(draw.pipeline(build.device, build.module, &layouts, targets, build.cache))
                 }),
             )?);
         }
@@ -575,7 +577,7 @@ impl Weather {
             make.render(|| {
                 let (source, path) = draw.shader();
                 let module = shaders::shader_module(device, source, path, &[]);
-                draw.pipeline(device, &module, &layouts, targets)
+                draw.pipeline(device, &module, &layouts, targets, None)
             })
         });
         let mut weather = Self {

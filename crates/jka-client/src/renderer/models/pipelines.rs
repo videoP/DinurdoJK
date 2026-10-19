@@ -1785,7 +1785,8 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             None => Default::default(),
         }
     };
-    let legacy_dlight_vertex_stream = shader_variant.is_some_and(|variant| variant.legacy_dlights);
+    let legacy_dlight_vertex_stream = shader_variant.is_some_and(|variant|
+        variant.legacy_dlights || variant.baked_sun_relight);
     // Select the fused UV vertex interface only when paired with a fused
     // fragment entry point. Legacy projected light and separate fog passes
     // consume the ordinary VertexOut interface, even for fused source batches.

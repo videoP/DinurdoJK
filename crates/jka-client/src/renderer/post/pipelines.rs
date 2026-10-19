@@ -1,7 +1,12 @@
 //! Post pipelines.
+use crate::materials::CullMode;
 use crate::renderer::{
     depth_texture_entry, GpuVertex, RenderTargets, DEPTH_FORMAT, VERTEX_ATTRIBUTES,
 };
+
+#[cfg(test)]
+#[path = "depth_resolve_tests.rs"]
+mod depth_resolve_tests;
 
 pub(in crate::renderer) fn create_planar_debug_pipeline(
     device: &wgpu::Device,
@@ -226,9 +231,19 @@ pub(in crate::renderer) fn create_ssr_visibility_resources(
         multiview_mask: None,
         cache: crate::pipeline_cache::get().as_ref(),
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind_group = create_ssr_visibility_bind_group(device, &layout, targets);
+    Some((layout, pipeline, bind_group))
+}
+
+/// Rebind recreated depth targets without recompiling the resolve pipeline.
+pub(in crate::renderer) fn create_ssr_visibility_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    targets: &RenderTargets,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA SSR frontmost visibility bind group"),
-        layout: &layout,
+        layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -239,8 +254,7 @@ pub(in crate::renderer) fn create_ssr_visibility_resources(
                 resource: wgpu::BindingResource::TextureView(&targets.ao_depth_view),
             },
         ],
-    });
-    Some((layout, pipeline, bind_group))
+    })
 }
 
 pub(in crate::renderer) fn create_ssr_temporal_pipeline(
@@ -495,12 +509,22 @@ pub(in crate::renderer) fn create_cull_debug_pipeline(
     })
 }
 
+/// Slot in `Renderer::wireframe_pipeline` for a shader cull mode.
+pub(in crate::renderer) fn wireframe_cull_slot(cull: CullMode) -> usize {
+    match cull {
+        CullMode::None => 0,
+        CullMode::Front => 1,
+        CullMode::Back => 2,
+    }
+}
+
 pub(in crate::renderer) fn create_wireframe_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
+    cull: CullMode,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA wireframe overlay pipeline"),
@@ -519,7 +543,13 @@ pub(in crate::renderer) fn create_wireframe_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            // DrawTris inherits the shader's GL_Cull, so JKA's r_showtris hides
+            // back faces exactly as the world pass does.
+            cull_mode: match cull {
+                CullMode::None => None,
+                CullMode::Front => Some(wgpu::Face::Front),
+                CullMode::Back => Some(wgpu::Face::Back),
+            },
             polygon_mode: wgpu::PolygonMode::Line,
             unclipped_depth: false,
             conservative: false,

@@ -87,9 +87,37 @@ pub fn derive_from_amplitude(amplitude: f32) -> DerivedWaves {
     let speed = 180.0 * (wavelength / 1400.0).sqrt();
     let steepness = (0.65 * r.max(1.0e-3).powf(0.25)).clamp(0.2, 1.0);
     let wind_chop = r.max(1.0e-3).powf(0.25).clamp(0.3, 2.0);
-    let foam = (0.05 + 0.95 * (amplitude / 64.0).min(1.0)).clamp(0.0, 4.0);
+    let foam = foam_for_amplitude(amplitude);
+    // Preserve spray's existing response; changing foam must not silently
+    // retune a different visual effect.
+    let spray = (0.05 + 0.95 * (amplitude / 64.0).min(1.0)).clamp(0.0, 4.0);
     let roughness = 0.05 + 0.15 * r.clamp(0.0, 1.0) + 0.1 * ((r - 1.0) / 3.0).clamp(0.0, 1.0);
-    DerivedWaves { wavelength, speed, steepness, wind_chop, foam, spray: foam, roughness }
+    DerivedWaves { wavelength, speed, steepness, wind_chop, foam, spray, roughness }
+}
+
+/// Continuous foam-amplitude response in JKA units: 0 is strictly foam-free,
+/// even 0.001u remains positive, and the authored 128u sea remains at 1.0.
+/// This is a source/visibility multiplier, not a substitute for wave breaking.
+pub fn foam_for_amplitude(amplitude: f32) -> f32 {
+    let amplitude = if amplitude.is_finite() { amplitude.max(0.0) } else { 0.0 };
+    (1.25 * amplitude / (amplitude + 32.0)).clamp(0.0, 1.25)
+}
+
+#[cfg(test)]
+mod foam_curve_tests {
+    use super::foam_for_amplitude;
+
+    #[test]
+    fn no_minimum_threshold_and_original_default() {
+        assert_eq!(foam_for_amplitude(0.0), 0.0);
+        assert_eq!(foam_for_amplitude(-10.0), 0.0);
+        assert_eq!(foam_for_amplitude(128.0), 1.0);
+        assert!(foam_for_amplitude(0.001) > 0.0);
+        assert!(foam_for_amplitude(0.001) < foam_for_amplitude(1.0));
+        assert!(foam_for_amplitude(1.0) < foam_for_amplitude(32.0));
+        assert!(foam_for_amplitude(32.0) < foam_for_amplitude(128.0));
+        assert!(foam_for_amplitude(256.0) > foam_for_amplitude(128.0));
+    }
 }
 
 impl OceanAuthoring {

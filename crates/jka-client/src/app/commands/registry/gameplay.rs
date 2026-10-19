@@ -139,6 +139,8 @@ commands! {
                                 self.solo_dynamic_models = Arc::new(Vec::new());
                             }
                             self.enter_local_game_dir();
+                            // Only `menudevmap` keeps the main-menu look for the next load.
+                            self.menu_look_play = std::mem::take(&mut self.menu_look_oneshot);
                             self.request_map(source);
                             self.console_map_barrier = !self.console_command_buffer.is_empty();
                         }

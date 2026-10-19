@@ -6,10 +6,10 @@ use crate::cgame::player_presenter::{
     ghoul2_render_origin, ghoul2_render_transform, model_bolt_matrix_timed,
     model_bolt_origin_timed, multiply_3x4, openjk_look_target_origin,
     openjk_player_entity_needs_reset, openjk_vectoangles, player_angle_entity, player_entity_rgb,
-    record_motion_pose_eval, record_pose_eval, reset_remote_player_saber_attachment,
+    record_motion_pose_eval, record_pose_eval, presented_entity_velocity, reset_remote_player_saber_attachment,
     smooth_ghoul2_pose, smooth_head_look_yaw, source_dismember_surface_set, suppressed_during_intermission,
     transform_jka_model_point, update_weapon_attachment, viewer_style_from, weapon_world_model,
-    Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
+    swim_tilt, move_lean::MoveLeanState, Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
     DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator,
     Ghoul2PresentationView, HashMap, HashSet, Instant, ModelResolution, PlayerAngleState,
     PlayerAnimationState, PlayerPresenter, PresentedEntity, RagdollMode, SaberBladeLengthKey,
@@ -314,6 +314,7 @@ impl PlayerPresenter {
                 hidden_first_person_entity != Some(entity.number),
                 false,
                 view,
+                false, // Snapshot entityState does not contain authoritative pm_type.
             ) {
                 Ok(mut player_draws) => draws.append(&mut player_draws),
                 Err(error) => {
@@ -424,6 +425,7 @@ impl PlayerPresenter {
         submit_geometry: bool,
         first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
+        normal_pm_movement: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         // The outer session dispatches ET_INVISIBLE away from CG_Player,
         // matching TaystJK CG_AddCEntity. Keep the presenter itself safe from
@@ -482,6 +484,7 @@ impl PlayerPresenter {
             submit_geometry,
             first_person_saber,
             view,
+            normal_pm_movement,
         );
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
             let surfaces = result.as_ref().map_or(0, |draws| draws.len() as u32);
@@ -528,6 +531,7 @@ impl PlayerPresenter {
             true,
             false,
             view,
+            false, // Race-ghost entityState does not carry authoritative pm_type.
         );
         self.look = previous_look;
         // The ghost is deliberately silent and visual-only. Do not even run
@@ -556,6 +560,7 @@ impl PlayerPresenter {
         submit_geometry: bool,
         first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
+        normal_pm_movement: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         // CG_Player adjusts the rider's lerpOrigin and yaw from the vehicle
         // before CG_G2PlayerAngles and before any attachment/skin submissions.
@@ -666,6 +671,7 @@ impl PlayerPresenter {
             {
                 if !runtime.model.shares_mesh_pose_binding(&model) {
                     runtime.bone_smooth_history = None;
+                    runtime.source_jiggle_sim = None;
                 }
                 runtime.model_key.clone_from(&model.key);
                 runtime.model = Arc::clone(&model);
@@ -682,6 +688,7 @@ impl PlayerPresenter {
             {
                 if !runtime.model.shares_mesh_pose_binding(&model) {
                     runtime.bone_smooth_history = None;
+                    runtime.source_jiggle_sim = None;
                 }
                 runtime.model = Arc::clone(&model);
             }
@@ -700,6 +707,11 @@ impl PlayerPresenter {
                     player_angles: PlayerAngleState::reset_from_angles(entity.angles),
                     last_angle_time: current_time,
                     head_look_yaw: None,
+                    swim_angles: [0.0; 2],
+                    swim_bank_angle: 0.0,
+                    swim_angle_time: current_time,
+                    swim_turn_motion: swim_tilt::SwimTurnMotion::default(),
+                    move_lean: MoveLeanState::default(),
                     last_e_flags: entity.state.field_i32("eFlags").unwrap_or(0),
                     last_client_num: entity
                         .state
@@ -713,6 +725,7 @@ impl PlayerPresenter {
                     saber_names: [info.saber_name.clone(), info.saber2_name.clone()],
                     bone_smooth_history: None,
                     bone_smooth_time: current_time,
+                    source_jiggle_sim: None,
                 },
             );
         }
@@ -732,6 +745,9 @@ impl PlayerPresenter {
             .field_i32("clientNum")
             .unwrap_or(i32::from(entity.number));
         let head_look_mode = self.head_look_mode;
+        let swim_tilt_strength = self.swim_tilt;
+        let swim_bank_strength = self.swim_turn_bank;
+        let move_lean_strength = self.move_lean;
         let runtime = self
             .entities
             .get_mut(&entity.number)
@@ -780,6 +796,11 @@ impl PlayerPresenter {
                 runtime.last_angle_time = current_time;
             }
             runtime.head_look_yaw = None;
+            runtime.swim_angles = [0.0; 2];
+            runtime.swim_bank_angle = 0.0;
+            runtime.swim_angle_time = current_time;
+            runtime.swim_turn_motion.reset();
+            runtime.move_lean.reset(current_time);
         }
         runtime.last_e_flags = e_flags;
         runtime.last_client_num = client_num;
@@ -955,7 +976,7 @@ impl PlayerPresenter {
         // Force-grip handoff must instead sample the exact normal player pose on
         // its first frame, then Rapier freezes that skinning pose internally.
         let rapier_corpse = corpse_ragdoll_requested && self.ragdolls.active();
-        let (axis, torso_angles) = if rapier_corpse {
+        let (mut axis, torso_angles) = if rapier_corpse {
             runtime.last_angle_time = current_time;
             (angles_to_axis([0.0, entity.angles[1], 0.0]), [0.0; 3])
         } else if !model.humanoid {
@@ -1084,6 +1105,67 @@ impl PlayerPresenter {
             }
             (angle_result.axis(), torso_angles)
         };
+
+        // Presentation-only: preserve BG_G2PlayerAngles, the original GLA swim
+        // animations, networked orientation and movement. Remote entityState
+        // has no reliable waterlevel; matching BOTH_SWIM legs animations is
+        // the authoritative common gate for local, demo and remote players.
+        if model.humanoid && entity.entity_type == ET_PLAYER && !ragdoll_requested
+            && entity.state.field_i32("m_iVehicleNum").unwrap_or(0) == 0
+        {
+            if swim_tilt_strength > 0.0 || runtime.swim_angles != [0.0; 2]
+                || runtime.swim_bank_angle.abs() > 0.01
+            {
+                let legs_anim = entity.state.field_i32("legsAnim").unwrap_or(0);
+                let yaw = entity.angles[1];
+                let velocity = presented_entity_velocity(entity);
+                let dt = current_time.saturating_sub(runtime.swim_angle_time);
+                let target = swim_tilt::swim_target_angles(
+                    legs_anim, yaw, velocity, swim_tilt_strength,
+                );
+                // The stock strafe roll stays at its full original strength.
+                // Turn banking is a separate local head-to-feet (axis 2)
+                // rotation driven by the curved path of actual swim velocity.
+                let turning = runtime.swim_turn_motion.update(
+                    current_time, legs_anim, velocity, swim_tilt_strength, swim_bank_strength,
+                );
+                runtime.swim_angles = swim_tilt::swim_smooth(runtime.swim_angles, target, dt);
+                runtime.swim_bank_angle = swim_tilt::swim_smooth(
+                    [runtime.swim_bank_angle, 0.0], [turning, 0.0], dt,
+                )[0];
+                axis = swim_tilt::swim_rotate_axis(axis, runtime.swim_angles);
+                axis = swim_tilt::rotate_local_bank(axis, runtime.swim_bank_angle);
+            }
+            runtime.swim_angle_time = current_time;
+        } else {
+            runtime.swim_angles = [0.0; 2];
+            runtime.swim_bank_angle = 0.0;
+            runtime.swim_angle_time = current_time;
+            runtime.swim_turn_motion.reset();
+        }
+
+        // Airborne strafejump/bunnyhop lean ONLY; grounded run/walk is untouched.
+        // The movement pose is cosmetic: only the rendered Ghoul2 axis changes.
+        // No collision, aim, prediction, GLA or server entity angles are altered.
+        if model.humanoid && entity.entity_type == ET_PLAYER && !ragdoll_requested
+            && e_flags & (EF_DEAD | EF_RAG | EF_JETPACK) == 0
+            && entity.state.field_i32("m_iVehicleNum").unwrap_or(0) == 0
+            && (move_lean_strength > 0.0 || runtime.move_lean.pitch.abs() > 0.01
+                || runtime.move_lean.roll.abs() > 0.01)
+        {
+            let legs_anim = entity.state.field_i32("legsAnim").unwrap_or(0);
+            let on_ground = entity.state.field_i32("groundEntityNum").unwrap_or(1023) != 1023;
+            let velocity = presented_entity_velocity(entity);
+            let tilt = runtime.move_lean.update(
+                current_time, legs_anim, on_ground, normal_pm_movement, entity.angles[1], velocity,
+                move_lean_strength,
+            );
+            if tilt[0].abs() > 0.01 || tilt[1].abs() > 0.01 {
+                axis = swim_tilt::swim_rotate_axis(axis, tilt);
+            }
+        } else {
+            runtime.move_lean.reset(current_time);
+        }
 
         // CG_G2SkelForModel: creature NPCs use the animation.cfg beside
         // their loaded GLA. Humanoids keep the global multiplayer table.
@@ -1254,12 +1336,46 @@ impl PlayerPresenter {
                     && current_time.saturating_sub(runtime.bone_smooth_time)
                         <= BONE_SMOOTH_MAX_GAP_MS
             }) {
-                pose = smooth_ghoul2_pose(&model.gla, history, &pose, self.ghoul2_anim_smooth);
+                let base_count = model.gla.skeleton.len();
+                // Smoothing is defined on GLA joints only. Extra Source
+                // jigglebones have no GLA base_pose and are replaced later by
+                // their own physical transforms; never index gla.skeleton
+                // with their appended palette slots.
+                let mut smoothed = smooth_ghoul2_pose(
+                    &model.gla, &history[..base_count], &pose[..base_count],
+                    self.ghoul2_anim_smooth,
+                );
+                if let Some(bindings) = model.source_jiggles.as_deref() {
+                    for binding in bindings {
+                        smoothed.push(smoothed[binding.parent_gla]);
+                    }
+                }
+                pose = smoothed;
             }
             runtime.bone_smooth_history = Some(pose.clone());
             runtime.bone_smooth_time = current_time;
         } else {
             runtime.bone_smooth_history = None;
+        }
+
+        // Source 1 native procedural bones are appended to the skin palette,
+        // *after* animation, ragdoll and jaPRO smoothing. The original GLA
+        // pose and attachments stay untouched; only weighted Source jiggle
+        // vertices receive secondary motion. Simulate in world space so
+        // footsteps and character turns transfer inertia naturally.
+        if model.source_jiggles_enabled {
+            if let Some(bindings) = model.source_jiggles.as_deref() {
+                runtime.source_jiggle_sim.get_or_insert_with(Default::default).update(
+                    bindings,
+                    model.gla.skeleton.len(),
+                    &mut pose,
+                    render_axis,
+                    render_origin,
+                    current_time,
+                );
+            }
+        } else {
+            runtime.source_jiggle_sim = None;
         }
 
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {

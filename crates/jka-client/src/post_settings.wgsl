@@ -2,13 +2,13 @@
 // binds the post buffer (post.wgsl and rain_haze_mask.wgsl); it must match the
 // field order of `PostUniform` in renderer.rs, which a unit test checks.
 struct PostSettings {
-    color: vec4<f32>, // gamma, tone mapping (0..1 SDR ACES strength / 3 display-output stage), bloom, ssao
+    color: vec4<f32>, // gamma, tone mapping (0..1 SDR ACES / 3 HDR output / 4 native AgX), bloom, ssao
     aa: vec4<f32>, // fxaa, viewport width, viewport height, taa
     taa_params: vec4<f32>, // x HDR scene, y reflection debug, z reflection quality, w reserved
     scene: vec4<f32>, // contact shadows, volumetric fog, ssr, history valid
     film: vec4<f32>, // halation, chromatic aberration, vignette, LUT strength
     grain: vec4<f32>, // strength, size, time, manual exposure
-    exposure_controls: vec4<f32>, // x auto exposure strength; yzw reserved
+    exposure_controls: vec4<f32>, // x auto exposure strength; y native night readability; zw reserved
     camera_fx: vec4<f32>, // motion shutter scale, DOF strength, focus distance, DOF quality
     legacy_fog: vec4<f32>, // authored display-space RGB, depthForOpaque; taa_params.w = scale/enabled
     clouds: vec4<f32>, // enabled, type, quality, coverage
@@ -32,7 +32,7 @@ struct PostSettings {
     legacy_weather: vec4<f32>, // sand haze, spacedust haze, acid-rain haze, 2D-precipitation-haze flag
     snow_haze: vec4<f32>, // x 2D snow haze density/cloud count (zero in froxel mode)
     underwater: vec4<f32>, // water surface Y above a submerged camera (-1e30 when not submerged), absorption distance, promoted ocean plane Y (no-receiver volumetric fog), its square half-extent (0 = off)
-    cloud_foreground: vec4<f32>, // lit saber blade count, promoted ocean fog centre X/Z, reserved
+    cloud_foreground: vec4<f32>, // lit saber blade count, promoted ocean fog centre X/Z, 1 / sky-portal scale (0 = no portal depth bound, negative = unscaled portal that just hides clouds)
     cloud_blades: array<vec4<f32>, 16>, // per blade: ax, ay, bx, by (pixels); glow radius px, nearest distance
     camera_pos_time: vec4<f32>,
     prev_camera_pos_time: vec4<f32>,

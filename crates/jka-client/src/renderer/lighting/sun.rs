@@ -20,13 +20,22 @@ impl Renderer {
         let head = player_position
             .map(|origin| origin + Vec3::Y * STANDING_VIEW_HEIGHT)
             .unwrap_or(camera.position);
-        let light_direction = Vec3::from_array(self.active_sun().direction);
+        let sun = if self.debug_volumes.sun_ray_authored {
+            self.world
+                .as_ref()
+                .and_then(|world| world.sun)
+                .unwrap_or_else(|| self.active_sun())
+        } else {
+            self.active_sun()
+        };
+        let light_direction = Vec3::from_array(sun.direction);
         self.debug_volumes.update_sun_ray(
             &self.device,
             &self.queue,
             head,
             light_direction,
             camera.position,
+            sun.color,
         );
     }
 

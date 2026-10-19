@@ -23,7 +23,7 @@ impl BlueWaterWaves {
         let bounded = |v: f32, fallback: f32, low: f32, high: f32| {
             if v.is_finite() { v.clamp(low, high) } else { fallback }
         };
-        self.height = bounded(self.height, defaults.height, 0.0, 20.0);
+        self.height = bounded(self.height, defaults.height, 0.0, 60.0);
         self.direction = bounded(self.direction, defaults.direction, -180.0, 180.0);
         self.wavelength = bounded(self.wavelength, defaults.wavelength, 2.0, 512.0);
         self.choppiness = bounded(self.choppiness, defaults.choppiness, 0.0, 4.0);

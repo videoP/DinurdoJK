@@ -42,7 +42,7 @@ let CvarValue::Bool(enabled) = value else { unreachable!() };
 
 Ok(())
 }),
-CvarDef::new("cg_eventWorkers", "0", "0|1", "A/B test event semantic preparation: 0 CGame thread, 1 dedicated worker pool; ordered side effects remain on CGame.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |app| CvarValue::Bool(app.cg_event_workers), |app, value| {
+CvarDef::new("cg_eventWorkers", "1", "0|1", "Event semantic preparation: 0 CGame thread, 1 dedicated worker pool (default); ordered side effects remain on CGame.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |app| CvarValue::Bool(app.cg_event_workers), |app, value| {
 let CvarValue::Bool(enabled) = value else { unreachable!() };
 
 

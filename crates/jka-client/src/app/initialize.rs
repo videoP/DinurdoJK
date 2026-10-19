@@ -131,6 +131,7 @@ impl App {
             map_editor: None,
             entity_graph: None,
             entity_marker_cache: None,
+            entity_marker_placement_sig: 0,
             entity_graph_ui: EntityGraphUi::default(),
             source_map_edit_on_load: false,
             map_edit_preview_request_id: None,
@@ -140,6 +141,8 @@ impl App {
             initial_source,
             front_end,
             frontend_page: FrontendPage::Main,
+            game_launch_screen: presentation.game_launch_screen,
+            frontend_skip_chrome_fade: presentation.game_launch_screen != config::GameLaunchScreen::Main,
             solo_maps: Vec::new(),
             solo_map_selected: 0,
             solo_catalog_loaded: false,
@@ -202,6 +205,9 @@ impl App {
             asset_preview_model_key: None,
             asset_preview_shader_key: None,
             asset_preview_fx: None,
+            menu_props: None,
+            menu_look_play: false,
+            menu_look_oneshot: false,
             asset_preview_viewport_key: None,
             profile_models: Vec::new(),
             profile_sabers: Vec::new(),
@@ -212,7 +218,7 @@ impl App {
             profile_studio_last_frame: Instant::now(),
             profile_studio_spin_velocity: 0.0,
             profile_studio_head_look: [0.0, 0.0],
-            profile_studio_world_anchors: [None; 5],
+            profile_studio_world_anchors: [None; 7],
             profile_studio_cosmetic_group: 0,
             profile_studio_show_saber: true,
             profile_studio_skin_visible: [true; 4],
@@ -485,6 +491,8 @@ impl App {
             console_suggest: presentation.console_suggest,
             chatbox_completion: presentation.chatbox_completion,
             clean_chatbox: presentation.clean_chatbox,
+            streamer: presentation.streamer,
+            streamer_preview_local: false,
             last_clean_chat_message: None,
             chat_log_enabled: presentation.chat_log,
             chat_log: crate::chat_log::ChatLog::spawn(),
@@ -500,6 +508,9 @@ impl App {
             jump_height_shade: presentation.jump_height_shade,
             screen_shake: presentation.screen_shake,
             head_look: presentation.head_look,
+            swim_tilt: presentation.swim_tilt,
+            swim_turn_bank: presentation.swim_turn_bank,
+            move_lean: presentation.move_lean,
             force_model: presentation.force_model.clone(),
             forced_player_models,
             japro_zoom_fov: presentation.zoom_fov,
@@ -542,6 +553,9 @@ impl App {
             environment_selected: 0,
             sun_ray_until: None,
             sun_ray_sent: false,
+            sun_ray_preview_mode: 0,
+            sun_ray_sent_mode: 0,
+            baked_sun_debug_view: 0,
             ocean_settings_open: false,
             authored_oceans: Vec::new(),
             map_authored_oceans: Vec::new(),
@@ -560,6 +574,7 @@ impl App {
             cloud_tuning_open: false,
             cloud_tuning_selected: 0,
             video,
+            frame_time_graph: false,
             world_effects: {
                 let mut effects = crate::world_effects::LegacyWorldEffects::default();
                 let _ = effects.set_weather_type(video.weather_type);
@@ -625,6 +640,8 @@ impl App {
                 pbr_materials: video.pbr,
                 allow_asset_overrides: video.allow_asset_overrides,
                 steam_audio: audio.steam_audio,
+                menu_look: false,
+                menu_props: false,
             },
             prepared_map_cache: None,
             fx_light_promotion_catalog: Arc::new(
@@ -676,6 +693,9 @@ impl App {
         // modest hardware instead of at the engine's uncurated field defaults.
         if fresh_install {
             app.apply_quality_preset(quality::QualityPreset::Low);
+        }
+        if app.front_end {
+            app.open_ui_page(&[app.game_launch_screen.page_name()]);
         }
         Ok(app)
     }

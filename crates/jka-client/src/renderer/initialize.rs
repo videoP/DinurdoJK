@@ -24,10 +24,10 @@ use crate::renderer::{
     unfilterable_texture_entry_stages, uniform_entry, upload_texture, weather, ui, Arc,
     AutoExposureState, AutoExposureUniform, BTreeMap, CameraUniform, CloudLayerSettings,
     CloudRenderResolution, CloudRenderSettings, CloudSunSettings, CloudType, ColorLutPreset,
-    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DeferredWorldBundles, DofQuality,
+    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DeferredWorldBundles, DofMode, DofQuality,
     OceanVisibility,
     DofUniform, DynamicLightsMode, DynamicModelRenderer, DynamicShadowsMode, EntityShadowLight,
-    EntityShadowState, FramePlan, GammaPostUniform, GpuCullSettings, GpuProfiler, GrassRenderer,
+    EntityShadowState, FramePlan, FrameTimeGraph, GammaPostUniform, GpuCullSettings, GpuProfiler, GrassRenderer,
     HashMap, InlineDrawScratch, Instant, JumpShadeState, LightingSettings, Mat4, Path, PbrSettings,
     PipelineJobManager, PlanarReflectionDebugMode, PlanarReflectionMode,
     PostAaSettings, PostCameraFxSettings, PostCloudShadowSettings, PostCloudShapingSettings,
@@ -376,6 +376,7 @@ impl Renderer {
                 texture_entry(23),
                 storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
                 unfilterable_texture_entry(25),
+                depth_texture_entry(26),
             ],
         });
         let post_shader = create_shader_module_timed(
@@ -915,6 +916,12 @@ impl Renderer {
                     map_minlight: [0.0; 4],
                     baked_sun_direction_strength: [0.0; 4],
                     baked_sun_radiance: [0.0; 4],
+                    original_sun_shadow_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                    original_sun_shadow_params: [0.0; 4],
+                    baked_indirect_adjust: [1.0, 1.0, 2.5, 0.48],
+                    baked_indirect_curve: [1.0, 1.0, 0.0, 0.0],
+                    baked_sun_debug_mode: [0; 4],
+                    runtime_sun_direction: [0.0, 1.0, 0.0, 0.0],
                     runtime_sun_radiance: [0.0; 4],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -1055,7 +1062,7 @@ impl Renderer {
         // Debug line pipelines are intentionally cold/lazy. Normal gameplay never
         // creates them, and changing the category mask only compiles a family the
         // first frame that family is actually requested.
-        let wireframe_pipeline = None;
+        let wireframe_pipeline = Default::default();
         let debug_volume_shader = create_shader_module_timed(
             &device,
             wgpu::ShaderModuleDescriptor {
@@ -1894,6 +1901,7 @@ impl Renderer {
             targets.ssr_visibility_view.as_ref(),
         );
 
+        let portal_depth = crate::renderer::portal_depth::PortalDepth::new(&device);
         let post_bind_groups = std::array::from_fn(|history_index| {
             std::array::from_fn(|ssao_index| {
                 std::array::from_fn(|ssr_index| {
@@ -1939,6 +1947,7 @@ impl Renderer {
                             &targets.reflection_mask_view,
                             &auto_exposure_state_buffer,
                             targets.ssr_visibility_view.as_ref().unwrap_or(&white.view),
+                            portal_depth.view(),
                         )
                     })
                 })
@@ -2000,6 +2009,7 @@ impl Renderer {
             &targets.reflection_mask_view,
             &auto_exposure_state_buffer,
             targets.ssr_visibility_view.as_ref().unwrap_or(&white.view),
+            portal_depth.view(),
         );
         let gamma_post_bind_group = create_gamma_post_bind_group(
             &device,
@@ -2385,6 +2395,7 @@ impl Renderer {
             eye_wave_slot: None,
             eye_wave_offset: 0.0,
             eye_wave_correction: None,
+            eye_wave_log: Default::default(),
             ocean_enabled: false,
             ocean_sky_extend: true,
             ocean_sky_infinite: true,
@@ -2392,6 +2403,7 @@ impl Renderer {
             coastal_enabled: false,
             coastal_pool: 0,
             coastal_atlas: None,
+            upstream_shore_source: None,
             ocean_visibility,
             ocean_hidden_time: 0.0,
             ocean_settings: crate::ocean::OceanSettings::default(),
@@ -2459,6 +2471,7 @@ impl Renderer {
             ui_pending_levelshot: None,
             ui_small_font_metrics,
             _ui_font_sampler: ui_font_sampler,
+            frame_time_graph: FrameTimeGraph::default(),
             ui_vertex_buffer,
             ui_vertex_count: 0,
             ui_dynamic_vertex_buffer,
@@ -2535,14 +2548,27 @@ impl Renderer {
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,
+            sun_shadow_strength: 0.3,
+            sun_lighting: false,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
+            baked_sun_cache: true,
+            baked_sun_debug_mode: 0,
+            baked_sun_shadow_map: true,
+            baked_sun_edge_softness: 2.5,
+            baked_sun_direct_limit: 0.48,
+            baked_indirect_scale: 1.0,
+            baked_indirect_saturation: 1.0,
+            baked_indirect_power: 1.0,
+            baked_indirect_highlight_preserve: 1.0,
             sky_fractal_override: false,
             sky_backend: 0,
         blue_water_environment: crate::blue_water_environment::Settings::default(),
             cloud_backend: 0,
+            cloud_portal_depth: 0,
+            portal_depth,
             blue_water_sky: None,
             clouds_enabled: true,
             cloud_type: CloudType::Storm,
@@ -2591,6 +2617,7 @@ impl Renderer {
             film_grain_strength: 0.0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
+            dof_mode: DofMode::Off,
             crt_scope: ui::CrtScope::Off,
             crt_style: ui::CrtStyle::LottesFast,
             crt_quality: ui::CrtQuality::Fast,

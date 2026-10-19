@@ -219,6 +219,8 @@ pub(crate) struct JiggleTuning {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct JiggleRemeshTuning {
+    /// Anny v1 shape recipe, applied once before anatomical fitting/promotion.
+    pub body_shape: jka_assets::body_shape::BodyShapeParams,
     /// Signed model-space Z offsets in JKA units from the auto-fitted remesh bounds.
     pub breast_bottom_z: f32,
     pub breast_top_z: f32,
@@ -233,6 +235,7 @@ pub(crate) struct JiggleRemeshTuning {
 impl Default for JiggleRemeshTuning {
     fn default() -> Self {
         Self {
+            body_shape: Default::default(),
             breast_bottom_z: 0.0,
             breast_top_z: 0.0,
             glute_bottom_z: 0.0,
@@ -246,6 +249,7 @@ impl Default for JiggleRemeshTuning {
 impl JiggleRemeshTuning {
     pub(crate) fn clamped(self) -> Self {
         Self {
+            body_shape: self.body_shape.clamped(),
             breast_bottom_z: self.breast_bottom_z.clamp(-8.0, 8.0),
             breast_top_z: self.breast_top_z.clamp(-8.0, 8.0),
             glute_bottom_z: self.glute_bottom_z.clamp(-8.0, 8.0),
@@ -1183,6 +1187,30 @@ impl JiggleProfile {
         // destroy hard/smoothed normal choices authored into the GLM.
     }
 
+    /// Animated chest/glute callout, derived from the *fitted* soft-tissue regions,
+    /// not from guessed proportions or fixed screen coordinates. Average both
+    /// sides to give each slider one stable anchor as the character turns.
+    pub(crate) fn studio_body_anchor(
+        &self,
+        glute: bool,
+        pose: &[Matrix3x4],
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+    ) -> Option<[f32; 3]> {
+        let name = if glute { "glute" } else { "breast" };
+        let mut total = [0.0f32; 3];
+        let mut count = 0u32;
+        for region in self.regions.iter().filter(|region| region.name.contains(name)) {
+            if let Some((point, _root)) = region_anchor_root(region, pose, axis, origin) {
+                for i in 0..3 {
+                    total[i] += point[i] + origin[i];
+                }
+                count += 1;
+            }
+        }
+        (count != 0).then(|| total.map(|v| v / count as f32))
+    }
+
     pub(crate) fn region_count(&self) -> usize {
         self.regions.len()
     }
@@ -1885,6 +1913,12 @@ fn compile_region_anchor(
                     ));
                 };
                 if bone_index >= gla.skeleton.len() {
+                    // Source-only native procedural jigglebones are appended
+                    // after the GLA skin palette. They are not anatomical
+                    // anchor candidates for breast/glute auto-detection.
+                    if glm.name.to_ascii_lowercase().ends_with(".mdl") {
+                        continue;
+                    }
                     return Err(format!(
                         "region `{}` references GLM bone {} but GLA has only {} bones",
                         region.name,

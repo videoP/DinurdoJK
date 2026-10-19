@@ -13,7 +13,7 @@ if (-not $Executable) { $Executable = Join-Path $repoRoot 'target\release\Dinurd
 if (Get-Process -Name DinurdoJK -ErrorAction SilentlyContinue) {
     throw 'Close the running DinurdoJK before starting an isolation run.'
 }
-if ($Build) { & (Join-Path $repoRoot 'build.ps1') -Faster; if ($LASTEXITCODE) { throw 'Build failed.' } }
+if ($Build) { & (Join-Path $repoRoot 'build.ps1') -Fast; if ($LASTEXITCODE) { throw 'Build failed.' } }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $exeDirectory = Split-Path -Parent $Executable
 $runDirectory = Join-Path $repoRoot ('target\rt-isolation\runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $Mode)

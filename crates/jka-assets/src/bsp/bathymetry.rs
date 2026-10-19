@@ -10,6 +10,7 @@ use std::time::Instant;
 
 mod cache;
 mod bands;
+mod upstream_shore;
 mod promotion;
 mod report;
 pub use cache::fingerprint;
@@ -923,9 +924,22 @@ impl Geometry {
     }
 
     fn column(&self, p: [f32; 2], level: f32, solids: &[usize], triangles: &[usize]) -> Column {
+        self.column_with_sky(p, level, solids, triangles, false)
+    }
+
+    fn column_with_sky(&self, p: [f32; 2], level: f32, solids: &[usize], triangles: &[usize], open_sky: bool) -> Column {
         let mut spans: Vec<_> = solids
             .iter()
-            .filter_map(|&s| self.solids[s].column(p))
+            .filter_map(|&s| {
+                let solid = &self.solids[s];
+                let span = solid.column(p)?;
+                // The BSP's sky shell closes collision/visibility. Its vertical sky face
+                // at the water level is an opening to the extended sea, not a coastal bank.
+                // Retain real seabed below the water and the existing solver's geometry.
+                let sky_boundary = open_sky && span.0 <= f64::from(level) && span.1 >= f64::from(level)
+                    && solid.sky.iter().zip(&solid.planes).any(|(sky,plane)| *sky && f64::from(plane.normal[2]).abs() < EPS);
+                (!sky_boundary).then_some(span)
+            })
             .collect();
         spans.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut merged: Vec<(f64, f64, bool)> = Vec::new();

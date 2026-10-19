@@ -1073,6 +1073,13 @@ pub(in crate::cgame::player_presenter) fn build_gpu_mesh_source(
         surface.surface_index,
         if two_sided { "#twosided" } else { "" },
     ));
+    let base_key = if jiggle_remesh.body_shape.is_neutral() {
+        base_key
+    } else {
+        let shape = jiggle_remesh.body_shape.clamped();
+        Arc::<str>::from(format!("{base_key}#body_v1_{:08x}_{:08x}_{:08x}_{:08x}",
+            shape.muscle.to_bits(), shape.weight.to_bits(), shape.proportions.to_bits(), shape.age.to_bits()))
+    };
     let key = if promote {
         Arc::<str>::from(format!(
             "{base_key}#jiggle_source_skin_guard_v1{}#rb{:08x}#rt{:08x}#gb{:08x}#gt{:08x}#bs{:08x}#gs{:08x}",

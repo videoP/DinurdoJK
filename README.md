@@ -36,3 +36,23 @@ Place your own game assets in `GameData/base` beside the executable, or pass a b
 See [the client source layout](docs/source-layout.md) for module responsibilities and frame-time constraints.
 
 The Video -> Color menu groups film/external LUTs, split toning and brightness controls. See [color grading](docs/color-grading.md) for the saved settings and rendering cost.
+
+`r_bakedSunCache 1` caches projected baked-sun subtraction in GPU lightmaps when
+`r_bakedSunRemoval` changes. It defaults to `0` (per-pixel evaluation). The cache
+uses half-float lightmaps and rebuilds when its source lightmaps change; warm
+frames use normal filtered sampling. Heatmap and visibility previews stay live.
+Turning removal off restores the original lightmaps, and turning the cache off
+releases its extra textures. Unsupported bake formats and vertex-lit surfaces
+retain their existing shader path. This changes rendering cost, not the sunlight
+reconstruction or its current visual limitations.
+
+`r_sunLighting 1` adds the live sun to BSP lighting after baked-sun subtraction,
+using the current direction, color and intensity independently of removal strength
+and its cache. Enable `r_dynamicShadows csm` (or RT) for occlusion. It defaults to
+`0`, which preserves legacy baked lighting. This light is evaluated during rendering.
+
+`r_sunShadowStrength` controls legacy CSM/RT shadow darkening from `0` to `1`
+when `r_sunLighting` is off.
+Its default `0.3` preserves the previous strength. Sun intensity and surface
+orientation still affect the result. Live sun shadows also work while baked-sun
+removal, its cache, or other baked-light adjustments are enabled.

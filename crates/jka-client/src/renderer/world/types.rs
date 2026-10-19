@@ -562,8 +562,14 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) raster_glass_static: Vec<crate::renderer::lighting::glass_transmission::RasterGlassTriangle>,
     pub(in crate::renderer) raster_glass_dynamic: Vec<crate::renderer::lighting::glass_transmission::RasterGlassTriangle>,
     pub(in crate::renderer) sun: Option<DirectionalSun>,
+    /// Direct irradiance measured from paired sunlit/shadowed BSP surfaces.
+    pub(in crate::renderer) baked_sun_radiance: Option<[f32; 3]>,
+    pub(in crate::renderer) baked_sun_encoding: Option<scene::BakedSunEncoding>,
+    pub(in crate::renderer) baked_sun_cache: Option<crate::renderer::lighting::baked_sun_cache::LightmapCache>,
     pub(in crate::renderer) grass: Option<GrassMapGpu>,
     pub(in crate::renderer) surface_sprite_effects: Vec<SurfaceSpriteEffectGpu>,
+    /// Map-load instances for vegetation surfaceSprites (r_surfaceSpritesGpu).
+    pub(in crate::renderer) surface_sprite_resident: Option<crate::renderer::environment::surface_sprites::ResidentSurfaceSprites>,
     pub(in crate::renderer) active_pipeline_variant: WorldShaderVariantKey,
     pub(in crate::renderer) pipeline_variants:
         BTreeMap<WorldShaderVariantKey, WorldPipelineVariant>,

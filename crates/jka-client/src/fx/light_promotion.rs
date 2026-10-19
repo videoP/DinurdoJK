@@ -259,6 +259,16 @@ fn effect_relative_key(path: &str) -> String {
         .to_owned()
 }
 
+/// Resolve map fx_runner names using the same namespace as EFX registration.
+pub fn runner_effect_asset_names(runners: &[scene::MapFxRunner]) -> Vec<String> {
+    let mut names: Vec<_> = runners.iter()
+        .map(|runner| format!("effects/{}.efx", effect_relative_key(&runner.effect)))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 fn effect_key(path: &str) -> String {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     normalized

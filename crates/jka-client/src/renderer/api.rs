@@ -1,7 +1,7 @@
 //! Api.
 use crate::renderer::{
     scene, ui, Arc, Camera, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
-    DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
+    DofMode, DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode,
     Ghoul2SkinningMode, Hash, InputLatencySample, Instant, JumpShadeState, PathBuf, PhysicalSize,
     PlanarReflectionDebugMode, Pod, PreparedMap, PuddleQuality, PvsMode, RainIntensity,
@@ -631,6 +631,44 @@ pub struct TransientLight {
     pub blade_segments: Option<Arc<[crate::fx::system::FxLightSegment]>>,
 }
 
+impl TransientLight {
+    /// Shared FX-to-renderer conversion for gameplay and menu scenes.
+    pub(crate) fn from_fx(light: &crate::fx::system::FxLight) -> Option<Self> {
+        if !light.radius.is_finite() || light.radius <= 0.0
+            || !light.origin.iter().all(|value| value.is_finite())
+            || !light.rgb.iter().all(|value| value.is_finite())
+        {
+            return None;
+        }
+        Some(Self {
+            kind: light.kind,
+            position: scene::render_position(light.origin),
+            color: light.rgb.map(|value| value.max(0.0)),
+            radius: light.radius,
+            source_radius: light.source_radius.max(0.0),
+            // OpenJK's FX primitive passes RGB plus radius to
+            // RE_AddLightToScene; the renderer's point-light intensity
+            // scale of 1.0 is the matching neutral source strength.
+            intensity: 1.0,
+            spot: light.spot.map(|spot| crate::fx::system::FxSpotLight {
+                direction: scene::render_position(spot.direction),
+                ..spot
+            }),
+            segment: light.segment.map(|ends| ends.map(scene::render_position)),
+            blade_segments: light.blade_segments.as_ref().map(|blades| {
+                blades
+                    .iter()
+                    .map(|blade| crate::fx::system::FxLightSegment {
+                        endpoints: blade.endpoints.map(scene::render_position),
+                        ..*blade
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            }),
+        })
+    }
+}
+
 /// A lit saber blade in renderer space. The blade is additive FX light that no
 /// depth buffer knows about, so the cloud composite is told where it is and
 /// keeps its own transmittance and radiance off those pixels.
@@ -744,15 +782,28 @@ pub struct PostEffects {
     pub sun_yaw: f32,
     pub sun_pitch: f32,
     pub sun_intensity: f32,
+    pub sun_shadow_strength: f32,
+    pub sun_lighting: bool,
     pub sun_color: [f32; 3],
     pub sun_visibility: SunVisibilityMode,
     pub entity_sun_lighting: bool,
-    /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
+    /// 0..1: estimated subtraction of authored direct sunlight from BSP baked lighting.
     pub baked_sun_removal: f32,
+    pub baked_sun_cache: bool,
+    pub baked_sun_shadow_map: bool,
+    pub baked_sun_edge_softness: f32,
+    pub baked_sun_direct_limit: f32,
+    pub baked_indirect_scale: f32,
+    pub baked_indirect_saturation: f32,
+    /// Nonlinear dimming of low irradiance: 1.0 = disabled.
+    pub baked_indirect_power: f32,
+    /// Keep high-luminance baked pools bright (heuristic; no light-source separation).
+    pub baked_indirect_highlight_preserve: f32,
     pub sky_fractal_override: bool,
     pub sky_backend: u8,
     pub blue_water_environment: crate::blue_water_environment::Settings,
     pub cloud_backend: u8,
+    pub cloud_portal_depth: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
@@ -808,6 +859,7 @@ pub struct PostEffects {
     pub film_grain_strength: f32,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
+    pub dof_mode: DofMode,
     pub crt_scope: ui::CrtScope,
     pub crt_style: ui::CrtStyle,
     pub crt_quality: ui::CrtQuality,
@@ -983,9 +1035,11 @@ pub enum RenderCommand {
         enabled: bool,
         pool: u8,
         atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,
+        upstream_source: Option<Arc<crate::ocean::upstream_coast::Source>>,
     },
-    /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
-    SetSunRayPreview(bool),
+    /// Preview a sun ray; debug modes also colorize BSP baked-sun inputs.
+    /// 0 = active sun ray only, 1 = baked removal amount, 2 = authored-sun visibility.
+    SetSunRayPreview { enabled: bool, debug_mode: u8 },
     SetPvsMode(PvsMode),
     SetFacePlaneCull(bool),
     SetWorldFlares(bool),
@@ -1029,6 +1083,8 @@ pub enum RenderCommand {
     /// Phase-1 render-only clipmap continuation at qualifying BSP sky walls.
     SetOceanSkyExtend(u8),
     SetOceanSettings(crate::ocean::OceanSettings),
+    /// Blue Water ship wake input (hulls, strikes, demo ships); ignored unless `r_oceanWake` is on.
+    OceanWake(crate::ocean::WakeCommand),
     SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
     SetOceanTime(f32),
@@ -1036,6 +1092,8 @@ pub enum RenderCommand {
     SetForceUnifiedWorld(bool),
     SetPom(bool),
     SetGpuTimings(bool),
+    /// Native top-of-screen frame-interval graph, updated at 30Hz.
+    SetFrameTimeGraph(bool),
     SetFxZeroAlphaDiscard(bool),
     /// A/B diagnostic for BSP `alphaGen vertex`, no WGSL runtime branch.
     SetDebugWorldVertexAlphaOne(bool),
@@ -1049,6 +1107,8 @@ pub enum RenderCommand {
     SetModelPrepareThreads(u32),
     SetMd3GeometryCache(bool),
     SetModelRenderBundles(bool),
+    SetSurfaceSpritesGpu(bool),
+    SetSurfaceSprites(bool),
     SetEncoderFinishThreads(u32),
     SetModelIndexUploadCache(bool),
     SetGhoul2BatchKeyCache(bool),
@@ -1107,6 +1167,8 @@ pub enum RenderCommand {
         format: ScreenshotFormat,
     },
     CopyFrameToClipboard,
+    /// Write the Hybrid wave-classification log and a settings summary to `path`.
+    HybridWaveDump { path: PathBuf },
     /// One-shot scene-only readback, before egui/HUD layers.
     CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
     CaptureVideoFrame { frame_index: u64, depth: bool },
@@ -1247,6 +1309,10 @@ pub(in crate::renderer) struct FrameInfo {
     /// reflections, and environment work on the unified path.
     pub(in crate::renderer) perf_encode_setup_ms: f64,
     pub(in crate::renderer) perf_encode_pre_world_ms: f64,
+    /// First-use profiling subdivisions within pre-world command encoding.
+    pub(in crate::renderer) perf_pre_world_ocean_ms: f64,
+    pub(in crate::renderer) perf_pre_world_shadows_ms: f64,
+    pub(in crate::renderer) perf_pre_world_remaining_ms: f64,
     pub(in crate::renderer) perf_encode_scene_ms: f64,
     pub(in crate::renderer) perf_encode_post_ui_ms: f64,
     pub(in crate::renderer) perf_encoder_finish_ms: f64,
@@ -1354,6 +1420,7 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_world_cpu_visibility: bool,
     pub(in crate::renderer) perf_world_material_stages: Vec<WorldStagePerf>,
     pub(in crate::renderer) grass: GrassDrawStats,
+    pub(in crate::renderer) surface_sprites: crate::renderer::environment::surface_sprites::SurfaceSpriteStats,
     pub(in crate::renderer) ocean: crate::ocean::OceanDrawStats,
 }
 

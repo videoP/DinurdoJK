@@ -1,8 +1,9 @@
 //! Lighting state.
 use crate::renderer::{
     legacy_dlight_surface_mask, scene, transient_light_gpu, transient_light_samples,
-    DirectionalSun, DynamicLightsMode, DynamicShadowsMode, EntityDlight, GpuPointLight, LegacyDlightPerfStats, LightingSettings,
-    Renderer, TransientLight, Vec3, LOCAL_SHADOW_MAP_SIZE, MAX_DYNAMIC_LIGHTS,
+    DirectionalSun, DynamicLightsMode, EntityDlight, GpuPointLight, LegacyDlightPerfStats,
+    LightingSettings,
+    Mat4, Renderer, TransientLight, Vec3, LOCAL_SHADOW_MAP_SIZE, MAX_DYNAMIC_LIGHTS,
     MAX_ENTITY_DLIGHTS,
 };
 use bytemuck::Zeroable;
@@ -408,25 +409,25 @@ impl Renderer {
                 world.source_map_lighting
             });
         // A BSP lightmap is one combined image, not a per-light decomposition.
-        // Use conservative facing/brightness estimates only for maps whose
-        // authored sun is known; zero on source maps and sunless BSPs.
-        // Without sun shadows, adding a directional light would illuminate
-        // interiors through walls, so replacement requires RT or cascades.
+        // Use a conservative estimate only for maps whose authored sun is known;
+        // this path only subtracts its estimated direct contribution.
         let authored_sun = self.world.as_ref()
             .filter(|world| !world.source_map)
             .and_then(|world| world.sun);
-        let can_relight = (self.cascaded_shadows_enabled
-            || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-                && self.ray_tracing_supported))
-            && authored_sun.is_some();
-        let replacement = self.active_sun();
-        let old = authored_sun.unwrap_or(replacement);
-        let strength = if can_relight { self.baked_sun_removal } else { 0.0 };
+        let has_authored_sun = authored_sun.is_some();
+        let old = authored_sun.unwrap_or_else(|| self.active_sun());
+        let strength = if has_authored_sun { self.baked_sun_removal } else { 0.0 };
         let old_toward = -Vec3::from_array(old.direction).normalize_or_zero();
         let radiance = |sun: DirectionalSun| {
             let rgb = Vec3::from_array(sun.color) * (sun.intensity.max(0.0) / 255.0);
             [rgb.x, rgb.y, rgb.z, 0.0]
         };
+        let old_map = self.shadow_resources.original_sun_cache.filter(|cache| {
+            self.baked_sun_shadow_map && self.world.as_ref().is_some_and(|world| {
+                !world.source_map && world.remap_asset_hash == cache.map_identity
+                    && world.sun.is_some_and(|sun| sun.direction == cache.direction)
+            })
+        });
         let settings = LightingSettings {
             values: [
                 u32::from(direct_local_lighting_enabled && light_count != 0),
@@ -474,8 +475,39 @@ impl Renderer {
                 self.rt_samples as f32,
             ],
             baked_sun_direction_strength: [old_toward.x, old_toward.y, old_toward.z, strength],
-            baked_sun_radiance: radiance(old),
-            runtime_sun_radiance: radiance(replacement),
+            baked_sun_radiance: self.world.as_ref()
+                .and_then(|world| world.baked_sun_radiance)
+                .map_or_else(|| radiance(old), |rgb| [rgb[0], rgb[1], rgb[2], 1.0]),
+            original_sun_shadow_view_proj: old_map.map_or(
+                Mat4::IDENTITY.to_cols_array_2d(),
+                |cache| cache.view_proj.to_cols_array_2d(),
+            ),
+            original_sun_shadow_params: [
+                if self.baked_sun_shadow_map { 1.0 } else { 0.0 },
+                old_map.map_or(0.0, |cache| cache.texel_size),
+                if old_map.is_some() { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            baked_indirect_adjust: [
+                self.baked_indirect_scale,
+                self.baked_indirect_saturation,
+                self.baked_sun_edge_softness,
+                self.baked_sun_direct_limit,
+            ],
+            baked_indirect_curve: [
+                self.baked_indirect_power,
+                self.baked_indirect_highlight_preserve,
+                0.0, 0.0,
+            ],
+            baked_sun_debug_mode: [self.baked_sun_debug_mode, u32::from(self.baked_sun_cache_active()), 0, 0],
+            runtime_sun_direction: {
+                let toward = -Vec3::from_array(self.active_sun().direction);
+                [toward.x, toward.y, toward.z, 0.0]
+            },
+            runtime_sun_radiance: {
+                let rgb = radiance(self.active_sun());
+                [rgb[0], rgb[1], rgb[2], if self.sun_lighting && self.world.as_ref().is_some_and(|w| !w.source_map) { 1.0 } else { 0.0 }]
+            },
             map_minlight: [
                 source_map_lighting.minlight[0],
                 source_map_lighting.minlight[1],
@@ -485,8 +517,8 @@ impl Renderer {
         };
         let settings_bytes = bytemuck::bytes_of(&settings);
         // RT reads its sample count and every consumer the dlight falloff mode from
-        // existing padding; the uniform buffer ABI is unchanged. Always upload the
-        // whole struct so a mode change back to 0 cannot leave a stale value.
+        // existing padding. The appended live-sun fields share this upload. Always
+        // upload the whole struct so changes back to 0 cannot leave stale values.
         let upload_bytes = settings_bytes;
         self.queue
             .write_buffer(&self.lighting_settings_buffer, 0, upload_bytes);

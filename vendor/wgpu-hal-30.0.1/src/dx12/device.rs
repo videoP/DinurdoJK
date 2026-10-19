@@ -424,14 +424,28 @@ impl super::Device {
             key.shader_model.to_str()
         );
 
-        let compiled_shader = self.compiler_container.compile(
-            self,
-            &key.source,
-            source_name,
-            &key.entry_point,
-            stage_bit,
-            &full_stage,
-        )?;
+        let tag = self.compiler_container.cache_tag();
+        let from_disk = super::shader_disk_cache::load(tag, &full_stage, &key.entry_point, &key.source);
+        let compiled_shader = match from_disk {
+            Some(bytes) => super::CompiledShader::Precompiled(bytes),
+            None => {
+                let compiled = self.compiler_container.compile(
+                    self,
+                    &key.source,
+                    source_name,
+                    &key.entry_point,
+                    stage_bit,
+                    &full_stage,
+                )?;
+                let native = compiled.create_native_shader();
+                // SAFETY: the blob owns `BytecodeLength` bytes at `pShaderBytecode`.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(native.pShaderBytecode.cast::<u8>(), native.BytecodeLength)
+                };
+                super::shader_disk_cache::store(tag, &full_stage, &key.entry_point, &key.source, bytes);
+                compiled
+            }
+        };
 
         {
             let mut shader_cache = self.shader_cache.lock();

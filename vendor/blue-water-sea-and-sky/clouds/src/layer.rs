@@ -897,6 +897,7 @@ impl CloudLayer {
                 &module,
                 &[&composite_layout, &uniforms_layout, &composite_depth_layout],
                 targets,
+                None,
             )
         });
 
@@ -1130,6 +1131,7 @@ impl CloudLayer {
                 build.module,
                 &[&layouts[0], &layouts[1], &layouts[2]],
                 targets,
+                build.cache,
             ))
         });
         let composite = ctx.add_pipeline(
@@ -1848,7 +1850,10 @@ impl CloudLayer {
         self.previous_view_projection = view_projection;
     }
 
-    fn write_shadow_interface(
+    /// Refresh just the shared shadow uniforms. Hosts with clouds disabled can
+    /// keep a valid clear-sky interface without allocating screen targets or
+    /// compiling/dispatching the cloud pipelines.
+    pub fn write_shadow_interface(
         &self,
         queue: &mut naval_render::UploadSink<'_>,
         sky: &Sky,
@@ -2299,6 +2304,7 @@ fn composite_pipeline(
     module: &wgpu::ShaderModule,
     layouts: &[&wgpu::BindGroupLayout; 3],
     targets: Targets,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cloud composite"),
@@ -2345,7 +2351,7 @@ fn composite_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 

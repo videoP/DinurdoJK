@@ -72,13 +72,16 @@ impl App {
             dynamic_models
         };
         let dynamic_models = if !self.model_placement.placed_draws.is_empty()
-            || !self.model_placement.preview_draws.is_empty() {
+            || !self.model_placement.preview_draws.is_empty()
+            || !self.model_placement.fx_draws.is_empty() {
             let mut merged = Vec::with_capacity(dynamic_models.len()
                 + self.model_placement.placed_draws.len()
-                + self.model_placement.preview_draws.len());
+                + self.model_placement.preview_draws.len()
+                + self.model_placement.fx_draws.len());
             merged.extend(dynamic_models.iter().cloned());
             merged.extend(self.model_placement.placed_draws.iter().cloned());
             merged.extend(self.model_placement.preview_draws.iter().cloned());
+            merged.extend(self.model_placement.fx_draws.iter().cloned());
             Arc::new(merged)
         } else {
             dynamic_models
@@ -263,6 +266,9 @@ impl App {
             spectator_highlights,
             transient_lights: if self.profile_preview_active {
                 Arc::new(Vec::new())
+            } else if self.front_end && self.frontend_cinematic.is_some() {
+                self.menu_props.as_ref().map_or_else(
+                    || Arc::new(Vec::new()), |props| Arc::clone(&props.lights))
             } else {
                 self.game_session.as_ref().map_or_else(
                     || Arc::new(Vec::new()),
@@ -437,7 +443,7 @@ impl App {
 
     pub(in crate::app) fn publish_transient_ui(&self) {
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
-        let console_notify_lines = self.console_notify_ui_snapshot();
+        let mut console_notify_lines = self.console_notify_ui_snapshot();
         let demo_timeline = self.demo_timeline_ui(Instant::now());
         let prediction_debug = self.prediction_debug_ui();
         let mut crosshair_target = self.crosshair_target.clone();
@@ -462,6 +468,9 @@ impl App {
                 &mut race_timer,
                 &mut speedometer,
             );
+        }
+        if self.streamer_preview_local {
+            crate::streamer::redact_stream_transients(&mut chat_lines, &mut console_notify_lines, self.streamer);
         }
         self.render_command(RenderCommand::SetTransientUi {
             chat_lines,

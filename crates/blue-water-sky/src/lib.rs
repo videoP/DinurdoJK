@@ -1,5 +1,7 @@
 //! Original Blue Water atmosphere and celestial renderer, on JKA host services.
 pub use glam as math;
+mod sky_mean;
+pub use sky_mean::SkyMeanSampler;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/aerial.rs"]
 pub mod aerial;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/cover.rs"]

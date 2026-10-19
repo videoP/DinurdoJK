@@ -3,6 +3,126 @@ use crate::cvar_compatibility::{assert_snapshot, digest, Fixture, INPUTS};
 use std::fs;
 
 #[test]
+fn upstream_coast_is_saved_separately_and_preserves_jka_solver_choice() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop=winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture=Fixture::new();let path=fixture.0.join("DinurdoJK.cfg");fs::write(&path,"").unwrap();
+    let mut app=App::new(fixture.0.clone(),None,crate::scene::MapSource::Bsp("mp/ffa3".into()),false,event_loop.create_proxy()).unwrap();
+    app.set_console_cvar("r_oceanType","3").unwrap();
+    app.set_console_cvar("r_coastal","1").unwrap();
+    app.set_console_cvar("r_coastalPool","2").unwrap();
+    let waves=app.video.ocean_settings.blue_water_waves;
+    app.set_console_cvar("r_blueWaterCoast","1").unwrap();
+    assert!(!app.video.ocean_settings.blue_water_coast_shelter);
+    app.set_console_cvar("r_blueWaterCoastShelter","1").unwrap();
+    app.set_console_cvar("r_blueWaterCoastShelter","0").unwrap();
+    assert!(app.video.ocean_settings.blue_water_coast && app.coastal_enabled);
+    assert_eq!(app.coastal_pool,2);
+    app.flush_config();
+    assert!(crate::config::load_video_settings(&path).ocean_settings.blue_water_coast);
+    assert!(!crate::config::load_video_settings(&path).ocean_settings.blue_water_coast_shelter);
+    app.set_console_cvar("r_blueWaterCoast","0").unwrap();
+    assert!(app.coastal_enabled);
+    assert_eq!(app.video.ocean_settings.blue_water_waves,waves);
+    assert_eq!(app.video.ocean_settings.backend,2);
+    app.flush_config();
+    assert!(!crate::config::load_video_settings(&path).ocean_settings.blue_water_coast);
+}
+
+#[test]
+fn lake_promotion_switches_live_and_round_trips_without_overwriting_ocean() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop=winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture=Fixture::new();
+    let path=fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app=App::new(fixture.0.clone(),None,crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false,event_loop.create_proxy()).unwrap();
+    app.set_console_cvar("r_oceanType","3").unwrap();
+    let ocean=app.video.ocean_settings;
+    app.set_console_cvar("r_oceanType","4").unwrap();
+    app.set_console_cvar("r_lakeWindSpeed","7.5").unwrap();
+    app.set_console_cvar("r_lakeDirection","-35").unwrap();
+    app.set_console_cvar("r_lakeTransparency","2").unwrap();
+    app.set_console_cvar("r_lakeSalt","1").unwrap();
+    assert!(app.video.ocean);
+    assert_eq!(app.video.ocean_settings.backend,3);
+    let resolved=app.video.ocean_settings.resolved_for_gpu();
+    assert!(!resolved.blue_water_adapter && !resolved.interaction);
+    assert_eq!(resolved.blue_water_caustics_mode,2);
+    app.flush_config();
+    let saved=crate::config::load_video_settings(&path);
+    assert!(saved.ocean);
+    assert_eq!(saved.ocean_settings.backend,3);
+    assert_eq!(saved.ocean_settings.lake,app.video.ocean_settings.lake);
+    app.set_console_cvar("r_oceanType","3").unwrap();
+    assert_eq!(app.video.ocean_settings.blue_water_waves,ocean.blue_water_waves);
+    assert_eq!(app.video.ocean_settings.hybrid_transparency,ocean.hybrid_transparency);
+    assert_eq!(app.video.ocean_settings.hybrid_underwater_mode,ocean.hybrid_underwater_mode);
+    app.set_console_cvar("r_oceanType","0").unwrap();
+    assert!(!app.video.ocean);
+}
+
+#[test]
+fn game_launch_screen_opens_preferred_page_without_waiting_for_scene() {
+    use crate::app::{FrontendPage, OverlayMode};
+    use crate::config::GameLaunchScreen;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    for &(screen, name, _) in GameLaunchScreen::OPTIONS {
+        fs::write(&path, format!("seta ui_gameLaunchScreen \"{name}\"\n")).unwrap();
+        let mut app = App::new(fixture.0.clone(), None,
+            crate::scene::MapSource::Bsp("mp/ffa3".into()), false,
+            event_loop.create_proxy()).unwrap();
+        assert_eq!(app.game_launch_screen, screen);
+        assert_eq!(app.frontend_skip_chrome_fade, screen != GameLaunchScreen::Main);
+        assert!(app.render.is_none(), "navigation is ready before renderer/scene initialization");
+        assert!(app.loading.is_none(), "frontend scene must not block the preferred page");
+        if screen == GameLaunchScreen::Settings {
+            assert_eq!(app.overlay, OverlayMode::Video);
+        } else {
+            assert_eq!(app.overlay, OverlayMode::Game);
+            let expected = match screen {
+                GameLaunchScreen::Main => FrontendPage::Main,
+                GameLaunchScreen::Play => FrontendPage::Play,
+                GameLaunchScreen::Solo => FrontendPage::SoloGame,
+                GameLaunchScreen::Servers => FrontendPage::ServerBrowser,
+                GameLaunchScreen::Demo => FrontendPage::PlayDemo,
+                GameLaunchScreen::Profile => FrontendPage::Profile,
+                GameLaunchScreen::Controls => FrontendPage::Controls,
+                GameLaunchScreen::ChatLogs => FrontendPage::ChatLogs,
+                GameLaunchScreen::Screenshots => FrontendPage::Screenshots,
+                GameLaunchScreen::DeveloperTools => FrontendPage::DeveloperTools,
+                GameLaunchScreen::Assets => FrontendPage::AssetViewer,
+                GameLaunchScreen::Maps => FrontendPage::MapViewer,
+                GameLaunchScreen::Settings => unreachable!(),
+            };
+            assert_eq!(app.frontend_page, expected);
+        }
+        if screen != GameLaunchScreen::Main {
+            app.open_ui_page(&["main"]);
+            assert_eq!(app.frontend_page, FrontendPage::Main);
+            assert!(app.frontend_skip_chrome_fade, "returning to Main must not wait for its scene");
+        }
+        app.set_console_cvar("ui_gameLaunchScreen", "solo").unwrap();
+        assert!(app.set_console_cvar("ui_gameLaunchScreen", "missing-page").is_err());
+        assert_eq!(app.game_launch_screen, GameLaunchScreen::Solo);
+    }
+    fs::write(&path, "seta ui_gameLaunchScreen \"setup\"\n").unwrap();
+    let app = App::new(fixture.0.clone(), None,
+        crate::scene::MapSource::Bsp("mp/ffa3".into()), true,
+        event_loop.create_proxy()).unwrap();
+    assert!(!app.front_end);
+    assert!(app.loading.is_some(), "explicit map launch takes priority");
+    assert_eq!(app.overlay, OverlayMode::Game);
+}
+
+#[test]
 fn cvar_runtime_setters_and_latches_match_baseline() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
@@ -160,6 +280,7 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         ("r_worldCompactMinDraws", "1", "2"),
         ("r_modelPrepareThreads", "2", "0"),
         ("r_md3GeometryCache", "1", "0"),
+        ("r_staticMd3Instances", "0", "1"),
         ("r_modelRenderBundles", "0", "1"),
         ("r_encoderFinishThreads", "2", "0"),
         ("r_modelIndexUploadCache", "0", "1"),

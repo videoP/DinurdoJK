@@ -1430,6 +1430,7 @@ impl App {
                     glute_size: self.video.jiggle_glute_size,
                 },
                 crate::cgame::jiggle::JiggleRemeshTuning {
+                    body_shape: self.video.body_shape_params(),
                     breast_bottom_z: self.video.jiggle_breast_remesh_bottom_z,
                     breast_top_z: self.video.jiggle_breast_remesh_top_z,
                     glute_bottom_z: self.video.jiggle_glute_remesh_bottom_z,

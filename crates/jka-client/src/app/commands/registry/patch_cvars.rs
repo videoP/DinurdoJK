@@ -75,6 +75,21 @@ app_cvars! {
             }
         ]
     }
+    APP_R_FRAMETIMEGRAPH {
+        runtime: CvarDef::new("r_frameTimeGraph", "0", "0|1", "Transparent 1-pixel/frame CPU phase graph (prepare/acquire/encode/submit/present/other), percentile-colored tips, and optional async GPU readout with r_gpuTimings 1. Updates at 30 Hz; session-only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.frame_time_graph),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { return Err("r_frameTimeGraph expects 0 or 1".into()); };
+                app.frame_time_graph = enabled;
+                app.render_command(RenderCommand::SetFrameTimeGraph(enabled));
+                Ok(())
+            }),
+        config: CvarBinding {
+            default: Some(|_| "0".to_string()),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_R_SPEEDS {
         runtime: CvarDef::new("r_speeds", "", "0..8", "TaystJK-style renderer stats: 1 world geometry, 2 culling, 3 viewcluster, 4 dynamic lights, 5 zFar, 6 flares, 7 memory; 8 extended patch LOD diagnostics.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app: &App| CvarValue::String(app.video.speeds.to_string()), |app, value| App::cvar_set_r_speeds(app, APP_R_SPEEDS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_speeds, None),
         config: CvarBinding {

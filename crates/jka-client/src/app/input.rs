@@ -75,7 +75,7 @@ impl App {
         self.profile_studio_last_frame = Instant::now();
         self.profile_studio_spin_velocity = 0.0;
         self.profile_studio_head_look = [0.0; 2];
-        self.profile_studio_world_anchors = [None; 5];
+        self.profile_studio_world_anchors = [None; 7];
         self.profile_studio_cosmetic_group = 0;
         self.profile_preview_key = None;
     }
@@ -127,14 +127,19 @@ impl App {
             self.last_console_notify_refresh = Instant::now();
         }
         self.overlay = overlay;
-        self.sync_profile_preview_mode(
-            self.overlay == OverlayMode::Game
-                && if self.front_end {
-                    self.frontend_page == FrontendPage::Profile
-                } else {
-                    self.menu_selected == 2
-                },
-        );
+        // Console is a temporary input/paint layer over its originating menu.
+        // It must not close Profile (which clears the isolated character stage
+        // and commits staged model changes), only the menu's actual exit does.
+        if overlay != OverlayMode::Console {
+            self.sync_profile_preview_mode(
+                self.overlay == OverlayMode::Game
+                    && if self.front_end {
+                        self.frontend_page == FrontendPage::Profile
+                    } else {
+                        self.menu_selected == 2
+                    },
+            );
+        }
         self.egui_repaint_requested = true;
         if leaving_console {
             self.console_input.clear();

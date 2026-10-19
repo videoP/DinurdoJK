@@ -760,6 +760,7 @@ impl GameSession {
                         // Without a view the presenter cannot pick a Ghoul2 LOD,
                         // so the local player's own model would stay at LOD 0.
                         ghoul2_view,
+                        sample.policy.pm_type == 0, // PM_NORMAL, never PM_NOCLIP (3).
                     )?);
                     // Snapshot players already submit their thrown sabers in
                     // present_snapshot_players. The local/followed player can
@@ -1003,38 +1004,7 @@ impl GameSession {
             fx_frame
                 .lights
                 .iter()
-                .filter(|light| {
-                    light.radius.is_finite()
-                        && light.radius > 0.0
-                        && light.origin.iter().all(|value| value.is_finite())
-                        && light.rgb.iter().all(|value| value.is_finite())
-                })
-                .map(|light| TransientLight {
-                    kind: light.kind,
-                    position: scene::render_position(light.origin),
-                    color: light.rgb.map(|value| value.max(0.0)),
-                    radius: light.radius,
-                    source_radius: light.source_radius.max(0.0),
-                    // OpenJK's FX primitive passes RGB plus radius to
-                    // RE_AddLightToScene; the renderer's point-light intensity
-                    // scale of 1.0 is the matching neutral source strength.
-                    intensity: 1.0,
-                    spot: light.spot.map(|spot| crate::fx::system::FxSpotLight {
-                        direction: scene::render_position(spot.direction),
-                        ..spot
-                    }),
-                    segment: light.segment.map(|ends| ends.map(scene::render_position)),
-                    blade_segments: light.blade_segments.as_ref().map(|blades| {
-                        blades
-                            .iter()
-                            .map(|blade| crate::fx::system::FxLightSegment {
-                                endpoints: blade.endpoints.map(scene::render_position),
-                                ..*blade
-                            })
-                            .collect::<Vec<_>>()
-                            .into()
-                    }),
-                })
+                .filter_map(TransientLight::from_fx)
                 .collect(),
         );
         if !self.suppress_audio {

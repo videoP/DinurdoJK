@@ -228,6 +228,7 @@ pub(in crate::renderer) fn create_post_bind_group(
     reflection_mask_view: &wgpu::TextureView,
     auto_exposure_state_buffer: &wgpu::Buffer,
     ssr_visibility_view: &wgpu::TextureView,
+    portal_depth_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let bloom_half = bloom.map_or(scene_view, |pyramid| &pyramid.views[0]);
     let bloom_quarter = bloom.map_or(scene_view, |pyramid| &pyramid.views[1]);
@@ -340,6 +341,10 @@ pub(in crate::renderer) fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 25,
                 resource: wgpu::BindingResource::TextureView(ssr_visibility_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 26,
+                resource: wgpu::BindingResource::TextureView(portal_depth_view),
             },
         ],
     })

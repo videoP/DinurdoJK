@@ -3,8 +3,7 @@ param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [switch]$Check,
     [switch]$Fetch,
-    [switch]$Fast,
-    [switch]$Faster
+    [switch]$Fast
 )
 $ErrorActionPreference = 'Stop'
 $stableCargoPath = Join-Path $env:USERPROFILE '.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe'
@@ -65,25 +64,17 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 #            numbers and shipping. A one-line change costs ~6.5 min (the LTO step).
 # -Fast      Cargo 'fast' profile: ThinLTO + incremental. ~1 min per change and
 #            about 2% below release FPS; fine for day-to-day FPS checks.
-# -Faster    Cargo 'faster' profile: LTO off + incremental. ~20 s per change but
-#            about 23% below release FPS on CPU-bound spots; never bench with it.
-# Each profile keeps its own target\<profile> cache (see Cargo.toml), so switching
-# modes never recompiles every dependency. -Fast/-Faster copy the exe, .pdb and
+# The fast profile keeps its own target\fast cache (see Cargo.toml), so switching
+# modes never recompiles every dependency. -Fast copies the exe, .pdb and
 # runtime DLLs into target\release, where the base folder lives, so the game is
 # always run from target\release\DinurdoJK.exe. DinurdoJK.exe.mode records which
 # mode produced the exe currently there.
-if ($Fast -and $Faster) {
-    throw 'Use either -Fast or -Faster, not both.'
-}
-if (($Fast -or $Faster) -and $Configuration -eq 'Debug') {
-    throw '-Fast and -Faster are optimized profiles; omit -Configuration Debug.'
+if ($Fast -and $Configuration -eq 'Debug') {
+    throw '-Fast is an optimized profile; omit -Configuration Debug.'
 }
 if ($Fast) {
     $buildMode = 'fast'
     $profileArguments = @('--profile', 'fast')
-} elseif ($Faster) {
-    $buildMode = 'faster'
-    $profileArguments = @('--profile', 'faster')
 } elseif ($Configuration -eq 'Release') {
     $buildMode = 'release'
     $profileArguments = @('--release')
@@ -148,7 +139,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
     }
     # Release/Debug link straight into the runtime folder, so make room first.
-    # -Fast/-Faster build elsewhere and replace the exe only after a successful build.
+    # -Fast builds elsewhere and replaces the exe only after a successful build.
     $buildsInPlace = $buildDirectory -eq $runtimeDirectory
     if ($buildsInPlace) { Preserve-RunningExecutable }
     $cargoArguments = @('build', '--workspace', '--offline', '--locked') + $profileArguments
@@ -184,7 +175,6 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg') -Destination (Join-Path $runtimeBase 'shader_modes_ab.cfg') -Force
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }
-    if ($Faster) { Write-Host '(-Faster: LTO off; quickest rebuilds but about 23% below release FPS - do not benchmark with it)' }
     Write-Host 'Place a GameData-style base folder beside the executable. Assets may be loose files or live in any .pk3.'
     Write-Host 'Launch the client for mp/ffa3. Choose Join Game or Join Spectate; Escape opens the menu.'
     Write-Host 'WASD moves; Space jumps; hold Space for Force jump; Ctrl crouches/rolls; Shift walks.'

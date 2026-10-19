@@ -5,6 +5,8 @@ param(
     [switch]$Environment,
     [switch]$CloudsOff,
     [switch]$Hybrid,
+    [switch]$Lakes,
+    [switch]$Coast,
     [string]$Executable = '',
     [ValidateRange(640, 7680)]
     [int]$Width = 1920,
@@ -13,11 +15,17 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
-$executable = if ($Executable) { $Executable } elseif ($Environment) { Join-Path $workspaceRoot 'target\blue-water-environment\DinurdoJK.exe' } else { Join-Path $workspaceRoot 'target\release\DinurdoJK.exe' }
+if ($Lakes -and $Coast) { throw 'Choose either -Lakes or -Coast.' }
+$executable = if ($Executable) { $Executable } elseif ($Lakes) { Join-Path $workspaceRoot 'target\blue-water-lakes\DinurdoJK.exe' } elseif ($Coast) { Join-Path $workspaceRoot 'target\blue-water-coast\DinurdoJK.exe' } elseif ($Environment) { Join-Path $workspaceRoot 'target\blue-water-environment\DinurdoJK.exe' } else { Join-Path $workspaceRoot 'target\release\DinurdoJK.exe' }
 if (-not (Test-Path -LiteralPath $executable)) { throw 'Build the release client first.' }
-$playRoot = Join-Path $workspaceRoot $(if ($Environment) { 'target\blue-water-environment-play' } else { 'target\blue-water-play' })
+$playRoot = Join-Path $workspaceRoot $(if ($Lakes) { 'target\blue-water-lakes-play' } elseif ($Coast) { 'target\blue-water-coast-play' } elseif ($Environment) { 'target\blue-water-environment-play' } else { 'target\blue-water-play' })
 $playBase = Join-Path $playRoot 'base'
 New-Item -ItemType Directory -Force -Path $playBase | Out-Null
+# Promotion must be enabled before the initial BSP load, not just by the later play commands.
+$coastConfig = Join-Path $playBase 'DinurdoJK.cfg'
+if ($Coast -and -not (Test-Path -LiteralPath $coastConfig)) {
+    [System.IO.File]::WriteAllLines($coastConfig, @('seta r_ocean "1"', 'seta r_oceanType "3"'))
+}
 foreach ($package in Get-ChildItem -LiteralPath $SourceBase -File -Filter '*.pk3') {
     $destination = Join-Path $playBase $package.Name
     if (-not (Test-Path -LiteralPath $destination)) {
@@ -56,10 +64,13 @@ $commands = @(
 if ($Environment) {
     $commands += @('set r_clouds "1"', 'set r_cloudBackend "1"', 'set r_skyBackend "1"',
         'set r_blueSkyWeatherBackend "1"', 'set r_blueSkyRain "0.3"',
-        'set r_blueSkyLightning "2"', 'set r_blueSkyWorldLighting "0"')
+        'set r_blueSkyLightning "2"', 'set r_blueSkyWorldLighting "0"',
+        'set r_blueSkyFilmic "1"')
 }
 if ($CloudsOff) { $commands += 'set r_clouds "0"' }
 if ($Hybrid) { $commands += 'set r_oceanType "3"' }
+if ($Lakes) { $commands += 'set r_oceanType "4"' }
+if ($Coast) { $commands += @('set r_oceanType "3"','set r_blueWaterCoast "1"','set r_blueWaterCoastShelter "0"') }
 [System.IO.File]::WriteAllLines((Join-Path $playBase 'blue_water_play.cfg'), $commands)
 $process = Start-Process -FilePath $executable -ArgumentList @(
     '--base', ('"' + $playBase + '"'), '--map', $Map, '+exec', 'blue_water_play.cfg'

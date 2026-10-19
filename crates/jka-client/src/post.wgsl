@@ -26,10 +26,13 @@ struct AutoExposureState {
     exposure_ev: f32,
     average_luminance: f32,
     target_ev: f32,
-    reserved: f32,
+    reserved: f32, // native night factor (zero for the host scene meter)
 };
 @group(0) @binding(24) var<storage, read> auto_exposure_state: AutoExposureState;
 @group(0) @binding(25) var ssr_visibility_texture: texture_2d<f32>;
+// misc_skyportal camera depth (reversed-Z). Only read while
+// settings.cloud_foreground.w > 0; see portal_radial_depth.
+@group(0) @binding(26) var portal_depth_texture: texture_depth_2d;
 // Sparse march output, read only by fs_cloud_resolve. It lives in its own bind
 // group because the march pipeline renders into this texture and so must not
 // have it bound; per-entry-point reachability keeps group 1 out of that
@@ -108,11 +111,43 @@ fn scene(uv: vec2<f32>) -> vec3<f32> {
         clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))
     ).rgb;
 }
-fn display_scene(uv: vec2<f32>) -> vec3<f32> {
-    var color = scene(uv) * exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
-    if (settings.color.y > 0.0 && settings.color.y < 2.0) {
-        color = mix(color, aces_fitted(color), settings.color.y);
+// BLUE_WATER_DISPLAY_LIBRARY
+
+fn display_mapping(color: vec3<f32>) -> vec3<f32> {
+    if (settings.color.y > 3.5) {
+        return bw_agx(bw_display_grade(color, 1.0));
     }
+    if (settings.color.y > 0.0 && settings.color.y < 2.0) {
+        return mix(color, aces_fitted(color), settings.color.y);
+    }
+    return color;
+}
+
+// Published upstream display policy (docs/lighting.md, "Night readability").
+// The clear-sky reference drives dusk; camera direction and cloud cover do not.
+fn native_night_readability(color: vec3<f32>, depth: f32) -> vec3<f32> {
+    let night = auto_exposure_state.reserved * settings.exposure_controls.y;
+    if night <= 0.0 { return color; }
+    var world = select(0.0,
+        1.0 - smoothstep(1500.0, 12000.0, depth / 40.0), valid_depth(depth));
+    // Open deep water and the underside must take the same near-world grade.
+    if settings.underwater.x > -1e20 { world = 1.0; }
+    let shadows = 1.0 - smoothstep(0.02, 0.2, luminance(color));
+    return color * exp2(mix(-0.25, 1.25, world) * night * shadows);
+}
+
+fn native_night_scene(color: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if auto_exposure_state.reserved * settings.exposure_controls.y <= 0.0 { return color; }
+    // Use completed depth: promoted water draws after the linear prepass.
+    let dims = textureDimensions(ssr_visibility_texture);
+    let pixel = vec2<i32>(uv * vec2<f32>(dims));
+    return native_night_readability(color, resolved_scene_radial_depth(pixel));
+}
+
+fn display_scene(uv: vec2<f32>) -> vec3<f32> {
+    var color = native_night_scene(scene(uv), uv)
+        * exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
+    color = display_mapping(color);
     return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / max(settings.color.x, 0.05)));
 }
 
@@ -659,6 +694,12 @@ fn taa_resolve_bevy(uv: vec2<f32>) -> TaaResolve {
     }
 
     var out: TaaResolve;
+
+    // Native weather has no persistent surface motion. Honor its marker at the
+    // actual pixel before the closest-depth search can select adjacent terrain.
+    if any(abs(taa_motion_nearest(uv)) > vec2<f32>(1.0)) {
+        return TaaResolve(current_color, 1.0);
+    }
 
     // Bevy's RESET specialization: current frame becomes history immediately,
     // with maximum stationary confidence for the next frame.
@@ -2154,8 +2195,45 @@ fn projected_cloud_shadow_factor(
     return 1.0 - strength * (1.0 - visibility);
 }
 
+// Radial distance to sky-portal geometry along this pixel's ray, in main-world
+// units, or 1e30 where the portal view shows none. The portal view is the main
+// view shifted by a translation, so the portal depth unprojects through the main
+// inverse view-projection to a point whose offset from the camera is the offset
+// from the portal camera. Dividing by the portal scale (cloud_foreground.w holds
+// 1 / scale, 0 when no portal depth is live) converts it to main-world distance.
+fn portal_radial_depth(uv: vec2<f32>) -> f32 {
+    let inverse_scale = settings.cloud_foreground.w;
+    if (inverse_scale == 0.0) {
+        return 1.0e30;
+    }
+    let dims = vec2<i32>(textureDimensions(portal_depth_texture));
+    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+    let depth = textureLoad(portal_depth_texture, pixel, 0);
+    if (depth <= 0.0) {
+        return 1.0e30;
+    }
+    if (inverse_scale < 0.0) {
+        // Unscaled portal: infinitely far in the map's frame, so it hides clouds.
+        return 1.0;
+    }
+    let point = settings.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    return distance(point.xyz / point.w, settings.camera_pos_time.xyz) * inverse_scale;
+}
+
+// Nearest solid along the pixel's ray as the clouds see it: the main view's
+// linear depth, or sky-portal geometry when that is closer. Not valid_depth()
+// when neither is present.
+fn cloud_occluder_depth(uv: vec2<f32>) -> f32 {
+    let main_depth = depth_at_uv(uv);
+    let portal_depth = portal_radial_depth(uv);
+    if (valid_depth(main_depth)) {
+        return min(main_depth, portal_depth);
+    }
+    return portal_depth;
+}
+
 fn cloud_scene_limit(uv: vec2<f32>, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
-    let depth = depth_at_uv(uv);
+    let depth = cloud_occluder_depth(uv);
     if (!valid_depth(depth)) {
         return 1.0e30;
     }
@@ -2560,14 +2638,14 @@ fn cloud_sample_lattice(
         // averaged together, or cloud from open sky bleeds across every
         // silhouette. Where they disagree, take the nearest-depth one whole.
         let inv = 1.0 / vec2<f32>(size);
-        let centre = depth_at_uv((vec2<f32>(texel) + 0.5) * inv);
+        let centre = cloud_occluder_depth((vec2<f32>(texel) + 0.5) * inv);
         let texels = array<vec2<i32>, 4>(t00, t10, t01, t11);
         let colors = array<vec4<f32>, 4>(c00, c10, c01, c11);
         var worst = 0.0;
         var nearest = c00;
         var nearest_delta = 1.0e30;
         for (var i = 0; i < 4; i = i + 1) {
-            let d = depth_at_uv((vec2<f32>(texels[i]) + 0.5) * inv);
+            let d = cloud_occluder_depth((vec2<f32>(texels[i]) + 0.5) * inv);
             let delta = abs(d - centre);
             worst = max(worst, delta);
             if (delta < nearest_delta) {
@@ -2809,7 +2887,7 @@ fn render_clouds(background: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     // point is in front of the cloud volume, no neighboring cloud texel is
     // allowed to wash over that pixel.
     let scene_depth = depth_at_uv(uv);
-    if (valid_depth(scene_depth)) {
+    if (valid_depth(cloud_occluder_depth(uv))) {
         let ro = settings.camera_pos_time.xyz;
         let rd = cloud_world_ray(uv);
         let interval = cloud_shell_interval(ro, rd);
@@ -3029,7 +3107,6 @@ fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> v
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3102,10 +3179,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         color = apply_film_halation(color, red_return);
     }
 
+    color = native_night_scene(color, input.uv);
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
-    if (tonemap_enabled) {
-        color = mix(color, aces_fitted(color), settings.color.y);
-    }
+    color = display_mapping(color);
 
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
@@ -3129,7 +3205,6 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let dims = textureDimensions(linear_depth_texture);
     let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
     let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
@@ -3155,10 +3230,9 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     }
     color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
+    color = native_night_scene(color, input.uv);
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
-    if (tonemap_enabled) {
-        color = mix(color, aces_fitted(color), settings.color.y);
-    }
+    color = display_mapping(color);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
@@ -3180,7 +3254,6 @@ struct TaaFragmentOut {
 @fragment
 fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3259,10 +3332,9 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
         color = apply_film_halation(color, red_return);
     }
 
+    color = native_night_scene(color, input.uv);
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
-    if (tonemap_enabled) {
-        color = mix(color, aces_fitted(color), settings.color.y);
-    }
+    color = display_mapping(color);
 
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));

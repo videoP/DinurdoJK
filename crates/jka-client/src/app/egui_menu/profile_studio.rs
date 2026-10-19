@@ -86,9 +86,9 @@ impl App {
             );
         });
         self.update_profile_preview();
-        // Studio motion and real Ghoul2 animation are capped to 30Hz. The
-        // renderer remains completely free to render gameplay at uncapped FPS.
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        // No Profile-specific animation/repaint timer: tick_egui_menu already
+        // rebuilds the frontend at its active render cap (display refresh or
+        // lower com_maxfps). The Ghoul2 preview clock samples continuous time.
     }
 
     fn studio_control_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
@@ -144,6 +144,8 @@ impl App {
         // Skin variants remain in the model icon hover chooser. No duplicated
         // active-variant grid above the model catalog.
         self.studio_multipart_skin(ui, &current_model, &current);
+        ui.add_space(8.0);
+        self.studio_body_shape_controls(ui, &current);
         ui.add_space(11.0);
         cap(ui, "SHOW SKINS", "");
         ui.horizontal_wrapped(|ui| {
@@ -478,6 +480,10 @@ impl App {
             None
         } else { Some(value.to_owned()) };
         self.profile_preview_key = None;
+        // A new model may have no fitted anatomy. Do not show the old model's
+        // sliders while its async Ghoul2 profile is loading.
+        self.profile_studio_world_anchors[5] = None;
+        self.profile_studio_world_anchors[6] = None;
     }
 
     /// Tint is a CHARACTER setting, not a model-library filter. These are the
@@ -505,6 +511,73 @@ impl App {
                 self.profile_preview_key = None;
             }
         });
+    }
+
+    /// Body-shape controls belong to the character they change. The cvars are
+    /// shared with gameplay and config persistence; there are no Profile-only
+    /// copies or additional background remesh loops.
+    fn studio_body_size_slider(&mut self, ui: &mut egui::Ui, glute: bool) {
+        let (title, cvar, max, current, help) = if glute {
+            ("GLUTE SIZE", "r_jiggleGluteSize", 4.0,
+             self.video.jiggle_glute_size,
+             "Peak glute mass in JKA units; negative reduces. Middle-click to reset.")
+        } else {
+            ("BREAST SIZE", "r_jiggleBreastSize", 3.0,
+             self.video.jiggle_breast_size,
+             "Peak chest mass in JKA units; negative reduces. Middle-click to reset.")
+        };
+        label(ui, title, 10.0, SKY_SOFT);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let mut size = current;
+            let response = ui.add(egui::Slider::new(&mut size, -2.0..=max)
+                .step_by(0.10).show_value(false))
+                .on_hover_text(help);
+            if response.clicked_by(egui::PointerButton::Middle) {
+                size = 0.0;
+            }
+            label(ui, format!("{size:+.1} u"), 10.0, theme::TEXT);
+            if size != current {
+                if let Err(error) = self.set_console_cvar(cvar, &size.to_string()) {
+                    self.console_status = error;
+                } else {
+                    self.profile_preview_key = None;
+                }
+            }
+        });
+    }
+
+    fn studio_body_shape_controls(&mut self, ui: &mut egui::Ui, current: &str) {
+        let info = crate::cgame::ClientInfo::solo_model(current);
+        let available = self.asset_preview_player_presenter.as_ref()
+            .is_some_and(|presenter| presenter.profile_body_shape_available(&info));
+        cap(ui, "BODY", "");
+        ui.add_enabled_ui(available, |ui| {
+            for (title, cvar, current, default) in [
+                ("Muscle", "r_bodyMuscle", self.video.body_muscle, 0.5),
+                ("Weight", "r_bodyWeight", self.video.body_weight, 0.5),
+                ("Proportions", "r_bodyProportions", self.video.body_proportions, 0.5),
+                ("Age", "r_bodyAge", self.video.body_age, 0.5),
+            ] {
+                let id = ui.id().with(cvar);
+                let mut value = ui.ctx().data_mut(|data| data.get_temp::<f32>(id)).unwrap_or(current);
+                let response = ui.add(egui::Slider::new(&mut value, 0.0..=1.0)
+                    .step_by(0.01).text(title).show_value(false))
+                    .on_hover_text("Release to update the character. Middle-click to reset.");
+                if response.clicked_by(egui::PointerButton::Middle) { value = default; }
+                if response.dragged() {
+                    ui.ctx().data_mut(|data| data.insert_temp(id, value));
+                } else {
+                    ui.ctx().data_mut(|data| data.remove::<f32>(id));
+                    if available && value != current {
+                        if let Err(error) = self.set_console_cvar(cvar, &value.to_string()) {
+                            self.console_status = error;
+                        } else { self.profile_preview_key = None; }
+                    }
+                }
+            }
+        });
+        if !available { label(ui, "Body shaping is unavailable for this character.", 10.0, MUTED); }
     }
 
     /// All saber selection takes place on the character stage. Source of truth:
@@ -775,6 +848,37 @@ impl App {
                 self.profile_studio_cosmetic_group =
                     if self.profile_studio_cosmetic_group == group { 0 } else { group };
             }
+        }
+
+        // Anatomy sliders use the same animated-profile anchor projection as
+        // saber/cosmetic callouts, with endpoints fitted to the actual model's
+        // soft-tissue regions (including Source 1 imports) rather than guessing
+        // fixed body heights. No marker is shown when a model has no region.
+        for (glute, joint, relative_y) in [(false, 5usize, 0.35f32), (true, 6, 0.57)] {
+            // Missing region means this model has nothing for the slider to
+            // deform. Keep both the slider and its line completely absent.
+            let Some(anchor) = self.studio_project_anchor(rect, joint) else {
+                continue;
+            };
+            let panel = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - 202.0,
+                    rect.top() + rect.height() * relative_y),
+                egui::vec2(188.0, 68.0));
+            p.line_segment([panel.left_center(), anchor],
+                egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
+            p.circle_filled(anchor, 3.0, SKY);
+            ui.scope_builder(egui::UiBuilder::new()
+                .id_salt(("studio_body_size", glute)).max_rect(panel), |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
+                    .corner_radius(egui::CornerRadius::same(5))
+                    .stroke(egui::Stroke::new(1.0, EDGE))
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        ui.set_width(174.0);
+                        self.studio_body_size_slider(ui, glute);
+                    });
+            });
         }
 
         // Both floating saber controls are full editors. Their connector

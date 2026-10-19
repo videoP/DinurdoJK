@@ -201,6 +201,7 @@ pub fn scene_pipeline(
     buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     blend: Option<wgpu::BlendState>,
     targets: crate::Targets,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -236,7 +237,7 @@ pub fn scene_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 
@@ -251,6 +252,7 @@ pub fn screen_pipeline(
     layouts: &[Option<&wgpu::BindGroupLayout>],
     format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -280,7 +282,7 @@ pub fn screen_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 

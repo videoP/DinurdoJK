@@ -59,6 +59,7 @@ fn veil_pipeline(
     module: &wgpu::ShaderModule,
     [uniform_layout, sky_layout, texture_layout]: &[wgpu::BindGroupLayout; 3],
     format: wgpu::TextureFormat,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     gpu::screen_pipeline(
         device,
@@ -69,6 +70,7 @@ fn veil_pipeline(
         &[Some(uniform_layout), Some(sky_layout), Some(texture_layout)],
         format,
         None,
+        cache,
     )
 }
 
@@ -114,7 +116,7 @@ impl PostProcess {
             shaders::HAZE_PATH,
             Vec::new(),
             Box::new(move |build| {
-                Pipeline::Render(veil_pipeline(build.device, build.module, &layouts, format))
+                Pipeline::Render(veil_pipeline(build.device, build.module, &layouts, format, build.cache))
             }),
         )?;
         Ok(PostPipelines { composite })
@@ -152,7 +154,10 @@ impl PostProcess {
         let texture_layout = gpu::layout(
             device,
             "sky post textures",
-            &[gpu::texture_entry(0, wgpu::TextureViewDimension::D2, false)],
+            &[
+                gpu::texture_entry(0, wgpu::TextureViewDimension::D2, false),
+                gpu::depth_entry(1),
+            ],
         );
         let layouts = [
             uniform_layout.clone(),
@@ -162,7 +167,7 @@ impl PostProcess {
         let pipeline = make.render(|| {
             let module =
                 shaders::shader_module(device, shaders::HAZE_WGSL, shaders::HAZE_PATH, &[]);
-            veil_pipeline(device, &module, &layouts, format)
+            veil_pipeline(device, &module, &layouts, format, None)
         });
         Self {
             uniforms: PostUniforms::default(),
@@ -209,6 +214,7 @@ impl PostProcess {
         encoder: &mut wgpu::CommandEncoder,
         sky_group: &wgpu::BindGroup,
         color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) -> bool {
         if !self.active() {
@@ -219,7 +225,10 @@ impl PostProcess {
             device,
             "sky post textures",
             &self.texture_layout,
-            &[(0, wgpu::BindingResource::TextureView(color))],
+            &[
+                (0, wgpu::BindingResource::TextureView(color)),
+                (1, wgpu::BindingResource::TextureView(depth)),
+            ],
         );
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sky post"),

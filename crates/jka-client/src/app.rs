@@ -61,7 +61,7 @@ use display::{
     ConsoleCvarSetResult, FrontendCinematic, MapLoadPurpose, PendingRendererRestart,
     VideoConfirmation,
 };
-use frontend_previews::AssetPreviewFxState;
+use frontend_previews::{AssetPreviewFxState, MenuProps};
 use hud::generic_timer_bar;
 use map_loading::{
     prepared_map_has_ocean_surface, spawn_map_loader, MapLoadRequest, MapLoadingState, PerfSample,
@@ -151,7 +151,7 @@ use crate::{
     ui::{
         self, ChatMode, CloudRenderResolution, CloudType, ColorLutPreset, ConsolePathLinkUi,
         ConsoleSearchMatch, ConsoleSelection, ConsoleSize, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode, DemoKillMarkerUi,
-        DemoTimelineUi, DofQuality, DynamicLightsMode, DynamicShadowsMode,
+        DemoTimelineUi, DofMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
         EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FullscreenMode,
         FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, HudElementId, HudElementLayout,
         HudLayout, HudState,
@@ -232,6 +232,9 @@ pub struct App {
     initial_source: scene::MapSource,
     front_end: bool,
     frontend_page: FrontendPage,
+    game_launch_screen: config::GameLaunchScreen,
+    /// Non-main launches reveal navigation independently of background-scene readiness.
+    frontend_skip_chrome_fade: bool,
     solo_maps: Vec<SoloMapEntry>,
     solo_map_selected: usize,
     solo_catalog_loaded: bool,
@@ -301,6 +304,12 @@ pub struct App {
     asset_preview_model_key: Option<(String, i32, i32, i32)>,
     asset_preview_shader_key: Option<(String, String, i32)>,
     asset_preview_fx: Option<AssetPreviewFxState>,
+    /// Frontend-only menu scene props (static models + fx runners).
+    menu_props: Option<MenuProps>,
+    /// The loaded gameplay map was prepared with the menu look (`menudevmap`).
+    menu_look_play: bool,
+    /// The next `devmap` keeps the menu look (set by `menudevmap`).
+    menu_look_oneshot: bool,
     asset_preview_viewport_key: Option<[u32; 4]>,
     profile_models: Vec<ProfileModelEntry>,
     profile_sabers: Vec<ProfileSaberEntry>,
@@ -313,8 +322,8 @@ pub struct App {
     profile_studio_spin_velocity: f32,
     /// Head-look control from cursor position on the Studio stage (-1..1).
     profile_studio_head_look: [f32; 2],
-    /// Animated JKA-space bolt anchors: head, face, back, right hand, left hand.
-    profile_studio_world_anchors: [Option<[f32; 3]>; 5],
+    /// Animated JKA-space anchors: head, face, back, hands, fitted breast/glute centers.
+    profile_studio_world_anchors: [Option<[f32; 3]>; 7],
     /// Stage-anchored cosmetic chooser (0 closed, jaPRO groups 1..=3).
     profile_studio_cosmetic_group: u8,
     profile_studio_show_saber: bool,
@@ -559,7 +568,7 @@ pub struct App {
     /// Drawn/markable world surfaces for OpenJK-style R_MarkFragments marks.
     map_mark_surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>,
     /// The map's `misc_model_static` props (client-placed MD3s, jaPRO cgame).
-    map_static_models: Arc<Vec<jka_assets::bsp::StaticModel>>,
+    map_static_models: Arc<jka_assets::bsp::StaticModels>,
     map_visibility: Option<jka_assets::bsp::Visibility>,
     steam_audio_acoustic_mesh: Option<Arc<jka_assets::bsp::AcousticMesh>>,
     steam_audio_bake: Option<Arc<crate::steam_audio::SteamAudioBakeData>>,
@@ -703,6 +712,9 @@ pub struct App {
     /// `cg_chatboxCompletion`: Tab in the chat input completes player names.
     chatbox_completion: bool,
     clean_chatbox: u8,
+    streamer: crate::streamer::StreamerSettings,
+    /// Explicit local diagnostic preview; OBS capture must use a separate source.
+    streamer_preview_local: bool,
     last_clean_chat_message: Option<String>,
     /// `cl_chatLog`: session-based HTML logging for live server chat.
     chat_log_enabled: bool,
@@ -731,6 +743,12 @@ pub struct App {
     screen_shake: u8,
     /// cg_headLook: head target visuals only; authoritative targets unchanged.
     head_look: u8,
+    /// Archived, client-side directional swim pose strength.
+    swim_tilt: f32,
+    /// Archived, client-side swim banking driven by the rate of yaw change.
+    swim_turn_bank: f32,
+    /// Archived speed + acceleration/braking player body pitch.
+    move_lean: f32,
     /// DinurdoJK compact player-model visibility override. `0` disables; one
     /// model applies to all other players; `ally,enemy` splits team relations.
     force_model: String,
@@ -786,10 +804,15 @@ pub struct App {
     /// Which section of Setup -> Video the left rail is showing.
     video_section: VideoSection,
     environment_selected: usize,
-    /// While the sun yaw/pitch is being edited the renderer draws a beam from the
-    /// sun to the player's head; this is when that beam should be hidden again.
+    /// While a sun or baked-sun control is edited, the renderer previews the
+    /// corresponding direction/diagnostic until this deadline.
     sun_ray_until: Option<Instant>,
     sun_ray_sent: bool,
+    /// 0 = preview current runtime sun; 1 = baked-sun removal; 2 = old-sun visibility.
+    sun_ray_preview_mode: u8,
+    sun_ray_sent_mode: u8,
+    /// Session-only live baked-sun visualization: 0 auto on drag, 1 removal, 2 visibility.
+    baked_sun_debug_view: u8,
     ocean_settings_open: bool,
     authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     map_authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
@@ -811,6 +834,8 @@ pub struct App {
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
+    /// Session-only opt-in, keeps inactive rendering at its original cost.
+    frame_time_graph: bool,
     /// OpenJK/TaystJK renderer world-effect state shared by `/r_we` and
     /// CS_EFFECTS strings beginning with `*`. User weather cvars remain
     /// untouched; this is a presentation override layered on top.
@@ -880,6 +905,8 @@ pub struct App {
     /// Entity blueprint of the loaded map, for the `entities` overlay.
     entity_graph: Option<std::sync::Arc<crate::entity_graph::EntityGraph>>,
     entity_marker_cache: Option<(usize, Vec<Option<[f32; 3]>>)>,
+    /// Signature of the staged model/effect placements drawn in the markers.
+    entity_marker_placement_sig: u64,
     entity_graph_ui: EntityGraphUi,
     /// Set by Developer Tools -> Map Viewer when EDIT SOURCE MAP launches a map.
     source_map_edit_on_load: bool,

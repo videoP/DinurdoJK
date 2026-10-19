@@ -1,6 +1,6 @@
 ﻿[workspace]
 members = ["crates/blue-water-core", "crates/blue-water-gpu", "crates/blue-water-render", "crates/blue-water-sim", "crates/blue-water-sky",
-    "crates/blue-water-clouds", "crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-cloth-core", "crates/jka-movement", "crates/jka-water"]
+    "crates/blue-water-clouds", "crates/blue-water-fx", "crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-cloth-core", "crates/jka-movement", "crates/jka-water"]
 resolver = "2"
 
 [workspace.package]
@@ -14,21 +14,14 @@ strip = true
 lto = true
 codegen-units = 1
 
-# Iteration profiles (build.ps1 -Fast / -Faster). Each custom profile builds into its
+# Iteration profile (build.ps1 -Fast). The custom profile builds into its
 # own target/<name> folder, so switching modes never discards another mode's cache.
 # Measured 2026-10-11 on AMJH3TE (one-line change rebuild / FPS vs release):
 #   fast   ~60 s rebuild, about -2% FPS: fine for day-to-day FPS checks.
-#   faster ~20 s rebuild, about -23% FPS: never use it for FPS numbers.
 [profile.fast]
 inherits = "release"
 lto = "thin"
 codegen-units = 16
-incremental = true
-
-[profile.faster]
-inherits = "release"
-lto = "off"
-codegen-units = 256
 incremental = true
 
 # wgpu-core 30.0.1 with one fix: Queue::present re-transitions the surface

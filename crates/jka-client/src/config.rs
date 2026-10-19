@@ -14,8 +14,59 @@ pub(crate) const GAMMA_MAX: f32 = 3.0;
 const FPS_CAP_MIN: u32 = 1;
 pub const FPS_CAP_MAX: u32 = 10_000;
 
+/// Saved frontend destination, applied only when starting without a map.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GameLaunchScreen {
+    #[default]
+    Main,
+    Play,
+    Solo,
+    Servers,
+    Demo,
+    Profile,
+    Controls,
+    Settings,
+    ChatLogs,
+    Screenshots,
+    DeveloperTools,
+    Assets,
+    Maps,
+}
+
+impl GameLaunchScreen {
+    pub const OPTIONS: &[(Self, &str, &str)] = &[
+        (Self::Main, "main", "Main menu"),
+        (Self::Play, "play", "Play"),
+        (Self::Solo, "solo", "Solo game"),
+        (Self::Servers, "servers", "Join server"),
+        (Self::Demo, "demo", "Play demo"),
+        (Self::Profile, "profile", "Profile"),
+        (Self::Controls, "controls", "Controls"),
+        (Self::Settings, "setup", "Settings"),
+        (Self::ChatLogs, "chatlogs", "Chat logs"),
+        (Self::Screenshots, "screenshots", "Screenshots"),
+        (Self::DeveloperTools, "devtools", "Developer tools"),
+        (Self::Assets, "assets", "Asset viewer"),
+        (Self::Maps, "maps", "Map viewer"),
+    ];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::OPTIONS.iter().find(|(_, name, _)| name.eq_ignore_ascii_case(value.trim()))
+            .map(|(screen, _, _)| *screen)
+    }
+
+    pub fn page_name(self) -> &'static str {
+        Self::OPTIONS.iter().find(|(screen, _, _)| *screen == self).unwrap().1
+    }
+
+    pub fn label(self) -> &'static str {
+        Self::OPTIONS.iter().find(|(screen, _, _)| *screen == self).unwrap().2
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientPresentationSettings {
+    pub game_launch_screen: GameLaunchScreen,
     pub third_person: ThirdPersonSettings,
     pub spectator_camera: SpectatorCameraSettings,
     pub first_person_lightsaber: bool,
@@ -83,6 +134,7 @@ pub struct ClientPresentationSettings {
     pub chatbox_completion: bool,
     /// cg_cleanChatbox: 0 off, 1 strip body colors and filter spam, 2 recolor initial body color and filter spam.
     pub clean_chatbox: u8,
+    pub streamer: crate::streamer::StreamerSettings,
     /// cl_chatLog: persist live server chat sessions as self-contained HTML.
     pub chat_log: bool,
     /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
@@ -93,6 +145,12 @@ pub struct ClientPresentationSettings {
     pub screen_shake: u8,
     /// cg_headLook: 0 no automatic head tracking, 1 OpenJK, 2 gradual tracking.
     pub head_look: u8,
+    /// cg_swimTilt: 0 = original swim presentation, 1 = full directional body tilt.
+    pub swim_tilt: f32,
+    /// cg_swimTurnBank: head-to-feet bank from actual velocity curvature (0..1).
+    pub swim_turn_bank: f32,
+    /// cg_moveLean: airborne acceleration/braking lean (0..1).
+    pub move_lean: f32,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
     /// jaPRO cgame options: `cg_stylePlayer`, the race timer, spectator aids.
@@ -263,6 +321,7 @@ pub fn load_audio_settings(primary: &Path) -> AudioSettings {
 impl Default for ClientPresentationSettings {
     fn default() -> Self {
         Self {
+            game_launch_screen: GameLaunchScreen::default(),
             third_person: ThirdPersonSettings::default(),
             spectator_camera: SpectatorCameraSettings::default(),
             first_person_lightsaber: true,
@@ -302,11 +361,15 @@ impl Default for ClientPresentationSettings {
             console_suggest: true,
             chatbox_completion: true,
             clean_chatbox: 0,
+            streamer: crate::streamer::StreamerSettings::default(),
             chat_log: true,
             ui_vgs: 1,
             jump_height_shade: true,
             screen_shake: 1,
             head_look: 1,
+            swim_tilt: 0.9,
+            swim_turn_bank: 1.0,
+            move_lean: 0.75,
             network: crate::net::NetworkSettings::default(),
             japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
@@ -814,6 +877,30 @@ fn split_cfg_words(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_launch_screen_round_trips_and_invalid_config_keeps_main_menu() {
+        let path = std::env::temp_dir().join(format!(
+            "jka-launch-screen-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        let mut presentation = ClientPresentationSettings::default();
+        assert_eq!(presentation.game_launch_screen, GameLaunchScreen::Main);
+        for &(screen, _, _) in GameLaunchScreen::OPTIONS {
+            presentation.game_launch_screen = screen;
+            save_video_settings(
+                &path, VideoSettings::default(), &crate::keybinds::Bindings::default(),
+                &presentation, &AudioSettings::default(),
+            ).expect("save launch screen");
+            assert_eq!(load_client_presentation_settings(&path).game_launch_screen, screen);
+        }
+        fs::write(&path, "seta ui_gameLaunchScreen \"obsolete-page\"\n").expect("write invalid screen");
+        assert_eq!(load_client_presentation_settings(&path).game_launch_screen, GameLaunchScreen::Main);
+        fs::write(&path, "seta ui_gameLaunchScreen \"SOLO\"\n").expect("write uppercase screen");
+        assert_eq!(load_client_presentation_settings(&path).game_launch_screen, GameLaunchScreen::Solo);
+        fs::write(&path, "// config from before launch-screen preference\n").expect("write old config");
+        assert_eq!(load_client_presentation_settings(&path).game_launch_screen, GameLaunchScreen::Main);
+        fs::remove_file(&path).expect("remove launch-screen test config");
+    }
 
     #[test]
     fn config_comments_preserve_quoted_slashes_and_multiline_block_comments() {

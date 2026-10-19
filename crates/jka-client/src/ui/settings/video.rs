@@ -1,6 +1,6 @@
 //! Settings video.
 use crate::ui::{
-    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofQuality,
+    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofMode, DofQuality,
     DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode,
     FootprintMode, FullscreenMode, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode,
     CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, PlanarReflectionDebugMode,
@@ -142,6 +142,13 @@ pub struct VideoSettings {
     pub world_compact_min_draws: u32,
     pub model_prepare_threads: u32,
     pub md3_geometry_cache: bool,
+    /// A/B GPU-resident instancing for repeated client-only static MD3 props.
+    pub static_md3_instances: bool,
+    /// Resident GPU instances for native vegetation surfaceSprites; false is
+    /// the original per-frame CPU generation.
+    pub surface_sprites_gpu: bool,
+    /// r_surfaceSprites: draw the map's native JKA surfaceSprites at all.
+    pub surface_sprites: bool,
     /// Use authored MD3 variants (always); optionally generate missing LODs in background.
     pub md3_auto_lod: bool,
     /// Developer A/B override for baked models. The shared r_md3AutoLod gate
@@ -204,6 +211,10 @@ pub struct VideoSettings {
     /// Baked into the promoted jiggle mesh (rebuilds player models).
     pub jiggle_breast_size: f32,
     pub jiggle_glute_size: f32,
+    pub body_muscle: f32,
+    pub body_weight: f32,
+    pub body_proportions: f32,
+    pub body_age: f32,
     /// Origin-acceleration kick multiplier; steady travel never contributes.
     pub jiggle_locomotion: f32,
     /// Locomotion impulse ceiling per 60 Hz step; scaled for r_physicsHz.
@@ -296,6 +307,8 @@ pub struct VideoSettings {
     /// q3map elevation in degrees above the horizon.
     pub sun_pitch: f32,
     pub sun_intensity: f32,
+    pub sun_shadow_strength: f32,
+    pub sun_lighting: bool,
     /// Unnormalized RGB chosen by the user; renderer normalizes it like q3map.
     pub sun_color: [f32; 3],
     /// Controls whether direct shader-sun light requires an authored sky portal.
@@ -306,6 +319,16 @@ pub struct VideoSettings {
     pub entity_sun_lighting: bool,
     /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
     pub baked_sun_removal: f32,
+    pub baked_sun_cache: bool,
+    pub baked_sun_shadow_map: bool,
+    pub baked_sun_edge_softness: f32,
+    pub baked_sun_direct_limit: f32,
+    pub baked_indirect_scale: f32,
+    pub baked_indirect_saturation: f32,
+    /// Nonlinear dimming of low irradiance: 1.0 = disabled.
+    pub baked_indirect_power: f32,
+    /// Keep high-luminance baked pools bright (heuristic; no light-source separation).
+    pub baked_indirect_highlight_preserve: f32,
     /// 0 = map/default distanceCull; otherwise multiplier applied to that base.
     pub distance_cull_scale: f32,
     /// Experimental Star Nest procedural override of map-authored sky faces.
@@ -313,6 +336,9 @@ pub struct VideoSettings {
     pub sky_backend: u8,
     pub blue_water_environment: crate::blue_water_environment::Settings,
     pub cloud_backend: u8,
+    /// Sky-portal geometry vs volumetric clouds: 0 off (clouds draw over portal
+    /// geometry), 1 redraw portal depth, 2 reuse the portal pass depth.
+    pub cloud_portal_depth: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
@@ -394,6 +420,7 @@ pub struct VideoSettings {
     pub film_grain_strength: f32,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
+    pub dof_mode: DofMode,
     /// Native WGPU port of Timothy Lottes' crt-lottes-fast filter.
     pub crt_scope: CrtScope,
     pub crt_style: CrtStyle,
@@ -485,6 +512,15 @@ pub struct VideoSettings {
 }
 
 impl VideoSettings {
+    pub(crate) fn body_shape_params(&self) -> jka_assets::body_shape::BodyShapeParams {
+        jka_assets::body_shape::BodyShapeParams {
+            muscle: self.body_muscle,
+            weight: self.body_weight,
+            proportions: self.body_proportions,
+            age: self.body_age,
+        }
+    }
+
     /// r_jigglePhysics: 0 off, 1 female, 2 male, 3 both. Textual on/off
     /// remain accepted for older config scripts.
     pub(crate) fn parse_jiggle_mode(value: &str) -> Option<u8> {
@@ -581,7 +617,7 @@ impl Default for VideoSettings {
             fullscreen: FullscreenMode::Windowed,
             renderer_backend: RendererBackend::Vulkan,
             gpu_adapter: 0,
-            vsync: VsyncMode::Off,
+            vsync: VsyncMode::Fast,
             max_frame_latency: 3,
             early_submit: false,
             present_copy: false,
@@ -645,6 +681,9 @@ impl Default for VideoSettings {
             world_compact_min_draws: 1,
             model_prepare_threads: 0,
             md3_geometry_cache: true,
+            static_md3_instances: false,
+            surface_sprites_gpu: true,
+            surface_sprites: true,
             md3_auto_lod: true,
             bsp_model_lod: true,
             md3_lod_debug: false,
@@ -681,6 +720,10 @@ impl Default for VideoSettings {
             jiggle_glute_jiggle_top_z: 0.0,
             jiggle_breast_size: 0.0,
             jiggle_glute_size: 0.0,
+            body_muscle: 0.5,
+            body_weight: 0.5,
+            body_proportions: 0.5,
+            body_age: 0.5,
             jiggle_locomotion: 1.0,
             jiggle_impulse_cap: 0.5,
             jiggle_swirl: 0.35,
@@ -754,15 +797,26 @@ impl Default for VideoSettings {
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,
+            sun_shadow_strength: 0.3,
+            sun_lighting: false,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
+            baked_sun_cache: true,
+            baked_sun_shadow_map: true,
+            baked_sun_edge_softness: 2.5,
+            baked_sun_direct_limit: 0.48,
+            baked_indirect_scale: 1.0,
+            baked_indirect_saturation: 1.0,
+            baked_indirect_power: 1.0,
+            baked_indirect_highlight_preserve: 1.0,
             distance_cull_scale: 0.0,
             sky_fractal_override: false,
             sky_backend: 0,
             blue_water_environment: crate::blue_water_environment::Settings::default(),
             cloud_backend: 0,
+            cloud_portal_depth: 0,
             clouds: true,
             cloud_type: CloudType::Storm,
             cloud_quality: 1.0,
@@ -824,6 +878,7 @@ impl Default for VideoSettings {
             film_grain_strength: 0.0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
+            dof_mode: DofMode::Off,
             crt_scope: CrtScope::Off,
             crt_style: CrtStyle::LottesFast,
             crt_quality: CrtQuality::Fast,

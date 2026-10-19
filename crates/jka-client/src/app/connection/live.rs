@@ -651,6 +651,9 @@ impl App {
             session
                 .player_presenter
                 .set_head_look_mode(self.head_look);
+            session.player_presenter.set_swim_tilt(self.swim_tilt);
+            session.player_presenter.set_swim_turn_bank(self.swim_turn_bank);
+            session.player_presenter.set_move_lean(self.move_lean);
             session
                 .player_presenter
                 .set_saber_team_colors(self.saber_team_colors);

@@ -1,5 +1,6 @@
 //! Frame draw.
 use crate::renderer::{
+    wireframe_cull_slot,
     world_stage_probe_excludes, aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
     advance_world_animations,
     aabb_screen_rect,
@@ -11,7 +12,7 @@ use crate::renderer::{
     sample_view_rotation, scene, select_planar_reflection_views, snow_shell_draw_near_center,
     temporal_jitter, ui, update_active_cull_indices, update_visibility, weather, Arc,
     AutoExposureUniform, BlendMode, Camera, CameraUniform, CompanionSceneView, CullDebugMode,
-    DeferredCommand, DeferredResources, DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
+    DeferredCommand, DeferredResources, DofMode, DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
     DynamicShadowsMode, FootprintMode, FrameInfo, GlowMode, GpuPass, Instant, LatestViewState, Mat4,
     WorldPipelineBinding, is_sky_cloud_stage,
     PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PvsMode, RenderError,
@@ -79,6 +80,8 @@ impl Renderer {
             return Ok(FrameInfo::default());
         }
 
+        self.sync_baked_sun_lightmap_cache();
+
         if self.baked_brightness.busy {
             self.tick_baked_brightness();
         }
@@ -95,6 +98,7 @@ impl Renderer {
             let _ = self.ensure_fast_world_pipelines();
         }
         self.build_blob_shadow_marks(dynamic_models);
+        self.ensure_native_atmosphere(camera);
 
         // Resolved before any pass borrows the renderer mutably.
         let update_weather_surface = self.weather.rain.enabled
@@ -139,21 +143,47 @@ impl Renderer {
         if sky_box_allowed {
             self.ensure_sky_box_pipelines(enhanced_world_shader);
         }
-        // Ocean resources are created/released immediately by SetOceanEnabled.
+        let ocean_target = (self.config.width, self.config.height, self.msaa_samples, self.scene_format());
+        let ocean_sky_faces = self.world.as_ref().and_then(|world| world.primary_skybox.and_then(|indices| {
+            let [Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)] =
+                indices.map(|index| world.textures.get(index).map(|image| &image.view)) else { return None; };
+            Some([a, b, c, d, e, f])
+        }));
+        let native_ocean_ready = if self.ocean_enabled && self.world.as_ref().is_some_and(|world| !world.ocean_surfaces.is_empty()) {
+            if let Some(ocean) = &mut self.ocean {
+                let was_ready = ocean.original_surface_ready(ocean_target);
+                let ready = ocean.ensure_original_surface(&mut self.pipeline_jobs, &self.device, &self.queue, ocean_target, ocean_sky_faces);
+                if ready && !was_ready {
+                    self.history_valid = false;
+                    self.ssr_history_valid = false;
+                    self.ocean_visibility.primed = false;
+                }
+                ready
+            } else { false }
+        } else {
+            self.pipeline_jobs.cancel_slot("native-ocean-surface", 0);
+            self.ocean.as_ref().is_some_and(|ocean| !matches!(ocean.backend(), 1 | 2))
+        };
         // Promote authored water only once both the setting and active compiled
-        // PSO agree that ocean support is live; until then stock water remains.
-        let render_ocean = self.ocean_enabled && active_world_variant.is_some_and(|key| key.ocean);
+        // PSO and native surface agree that ocean support is live; until then
+        // authored water remains, including its normal geometry and optics.
+        let render_ocean = self.ocean_enabled && native_ocean_ready && active_world_variant.is_some_and(|key| key.ocean);
         if render_ocean && self.ocean_sky_infinite {
             self.ensure_ocean_far_pipeline();
         }
         let ocean_clipmap =
             render_ocean.then(|| usize::from(self.ocean_settings.mesh_quality.min(1)));
-        self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean);
+        self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean && self.ocean_settings.backend != 3);
         let topology_started=render_ocean.then(Instant::now);
         self.refresh_eye_wave_offset(camera.position);
-        if render_ocean {
-            // Classification must be fresh for submerged Hybrid/caustics choices.
+        // BSP water volumes are valid even with the promoted ocean renderer
+        // disabled. DOF underwater-only still needs to recognize stock water.
+        if render_ocean || (self.dof_mode == DofMode::UnderwaterOnly
+            && self.depth_of_field_strength > 0.001)
+        {
             self.refresh_water_boxes(camera.position);
+        }
+        if render_ocean {
             let prepare_godot_geometry = self.ocean_settings.backend == 0
                 || self.ocean_settings.blue_water_prepare_godot_mesh
                 || (self.ocean_settings.backend == 2
@@ -240,15 +270,31 @@ impl Renderer {
         // Keep glow pipeline polling entirely outside the maximum-FPS path.
         self.ensure_bloom_pipelines();
 
+        // Underwater mode uses the existing per-frame, wave-aware camera/water
+        // classification. The resources stay resident across the waterline, but
+        // its expensive separable blur is skipped whenever we are above water.
+        let dof_frame_active = self.depth_of_field_strength > 0.001
+            && match self.dof_mode {
+                DofMode::Off => false,
+                DofMode::On => true,
+                DofMode::UnderwaterOnly =>
+                    self.camera_water_surface > crate::renderer::NO_WATER_SURFACE,
+            };
         let frame_time = self.started.elapsed().as_secs_f32();
         let frame_delta = if self.previous_frame_time > 0.0 {
             (frame_time - self.previous_frame_time).clamp(0.0, 0.25)
         } else {
             0.0
         };
-        if self.depth_of_field_strength > 0.001 {
-            let target = dof_focus_target.clamp(32.0, 16384.0);
-            if !self.dof_focus_valid || frame_delta <= 0.0 {
+        if dof_frame_active {
+            // Fixed focal plane several feet ahead, never trace-based autofocus.
+            const UNDERWATER_FOCUS_UNITS: f32 = 48.0;
+            let target = if self.dof_mode == DofMode::UnderwaterOnly {
+                UNDERWATER_FOCUS_UNITS
+            } else {
+                dof_focus_target.clamp(32.0, 16_384.0)
+            };
+            if self.dof_mode == DofMode::UnderwaterOnly || !self.dof_focus_valid || frame_delta <= 0.0 {
                 self.dof_focus_distance = target;
                 self.dof_focus_valid = true;
             } else {
@@ -258,7 +304,7 @@ impl Renderer {
                 self.dof_focus_distance += (target - self.dof_focus_distance) * alpha;
             }
         }
-        if self.depth_of_field_strength > 0.001 {
+        if dof_frame_active {
             self.queue.write_buffer(
                 &self.dof_buffer,
                 0,
@@ -326,6 +372,10 @@ impl Renderer {
         };
         self.refresh_water_boxes(camera.position);
         let mut optical_volumes = None;
+        // Godot receiver caustics only exist within `caustic_max_distance_m` of
+        // a water volume. Out of range the receiver target, its capture pass
+        // and the surface's read of it are all dead weight: false there.
+        let mut godot_receiver_live = false;
         if render_ocean
             && self
                 .world
@@ -400,6 +450,28 @@ impl Renderer {
                 uniform.maximum[i] = [x, y, z, 0.0];
             }
             uniform.params[3] = self.water_boxes.len() as f32;
+            godot_receiver_live = self.ocean_settings.backend != 0
+                && matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4)
+                && self.ocean_settings.godot_capture_caustics_strength() > 0.0
+                && {
+                    let limit = uniform.caustic_tuning[3];
+                    // Receivers sit under the (animated) surface of a volume, so
+                    // lift each box top by a generous crest bound. The 0.75 unit
+                    // margin matches the shader's receiver margin.
+                    let crest = (self.ocean_settings.blue_water_waves.height * 4.0 + 1.0)
+                        * crate::ocean::OCEAN_UNITS_PER_METER;
+                    limit <= 0.0 || self.water_boxes.iter().any(|volume| {
+                        let eye = camera.position.to_array();
+                        let mut squared = 0.0f32;
+                        for axis in 0..3 {
+                            let lo = volume.minimum[axis] - 0.75;
+                            let hi = volume.maximum[axis] + 0.75 + if axis == 1 { crest } else { 0.0 };
+                            let gap = (lo - eye[axis]).max(eye[axis] - hi).max(0.0);
+                            squared += gap * gap;
+                        }
+                        squared < limit * limit
+                    })
+                };
             if self.ocean_sky_extend {
                 if let Some(world) = self.world.as_ref() {
                     for (slot, region) in world.ocean_sky_regions.iter().enumerate().take(8) {
@@ -545,6 +617,51 @@ impl Renderer {
                     );
                     (position, portal_view_proj)
                 });
+        // r_cloudPortalDepth: let the cloud passes treat sky-portal geometry as
+        // solid. 1 redraws the portal batches depth-only; 2 has the portal pass
+        // itself write the shared texture, which needs it single-sampled (the
+        // depth is sampled afterwards), so MSAA falls back to the redraw.
+        // A portal with no scale (no misc_skyportal_orient) keeps its camera
+        // fixed, i.e. it is infinitely far: its geometry has no distance to
+        // convert, so it simply hides the clouds (inverse_scale -1 = mask).
+        let portal_scale = self
+            .world
+            .as_ref()
+            .filter(|_| sky_portal_view.is_some())
+            .and_then(|world| world.sky_portal)
+            .map_or(0.0, |portal| portal.scale);
+        let portal_depth_mode = if self.clouds_enabled
+            && sky_portal_view.is_some()
+            && (self.cloud_backend == 1 || plan.use_post)
+        {
+            match self.cloud_portal_depth {
+                0 => 0,
+                2 if self.msaa_samples <= 1 => 2,
+                _ => 1,
+            }
+        } else {
+            0
+        };
+        let portal_depth_rebuilt = self.portal_depth.ensure(
+            &self.device,
+            (self.config.width, self.config.height),
+            portal_depth_mode != 0,
+        );
+        if portal_depth_rebuilt {
+            self.rebuild_color_lut_bind_groups();
+        }
+        self.portal_depth.inverse_scale = match portal_depth_mode {
+            0 => 0.0,
+            _ if portal_scale > 1.0e-4 => 1.0 / portal_scale,
+            _ => -1.0,
+        };
+        // The sky flares bind whichever depth the portal pass wrote; rebind when
+        // that choice (or the texture) changes.
+        let portal_pass_uses_target = portal_depth_mode == 2;
+        if portal_depth_rebuilt || self.portal_depth.pass_uses_target != portal_pass_uses_target {
+            self.portal_depth.pass_uses_target = portal_pass_uses_target;
+            self.world_flares_sky.invalidate_depth_binding();
+        }
         self.ensure_wireframe_pipelines();
         self.ensure_shader_complexity_target();
         self.ensure_shader_complexity_pipelines();
@@ -589,6 +706,7 @@ impl Renderer {
                 camera_pos_time,
                 self.temporal_resolve_active() && self.history_valid
                     && (!self.rt_taa_active() || camera.position.distance(self.previous_camera_position) <= 96.0),
+                dof_frame_active,
             );
         }
         if self.ssao_enabled {
@@ -767,10 +885,16 @@ impl Renderer {
                         &self.device,
                         &self.queue,
                         &world.surface_sprite_effects,
+                        world.surface_sprite_resident.as_ref(),
                         camera,
+                        view_proj,
                         pvs_cluster,
                         frame_time * 1000.0,
+                        self.grass_enabled && world.grass.is_some(),
+                        self.weather_wind,
                     ));
+                info.surface_sprites = prepared_surface_sprite_effects
+                    .as_ref().map(|prepared| prepared.stats).unwrap_or_default();
             }
         }
         if active_selection_changed {
@@ -1230,6 +1354,12 @@ impl Renderer {
                 ocean.configure_coastal(&self.device, &self.queue, self.coastal_enabled,
                     self.coastal_pool, self.coastal_atlas.as_ref(), &promoted, &self.promoted_ocean_overrides);
                 ocean.set_promoted_surfaces(&self.device, &self.queue, &promoted, &self.promoted_ocean_overrides);
+                if matches!(self.ocean_settings.backend,1|2) {
+                    let maps=if self.ocean_settings.blue_water_coast {
+                        self.upstream_shore_source.as_ref().and_then(|s|s.request(self.ocean_settings.blue_water_waves.direction.to_radians()))
+                    } else {None};
+                    ocean.set_blue_water_shore(&self.device,&self.queue,maps);
+                }
             }
             // Re-centre the clipmap before the wave step so the geometry the
             // frame draws and the field it samples come from the same tick.
@@ -1299,6 +1429,10 @@ impl Renderer {
         info.ocean.sim_hidden = ocean_sim_hidden;
         info.ocean.visible_samples = self.ocean_visibility.latest_samples;
         info.ocean.visibility_primed = self.ocean_visibility.primed;
+        if let Some(started) = perf_pre_world_started {
+            info.perf_pre_world_ocean_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_shadows_started = perf_timing.then(Instant::now);
 
         // Grass preparation has to precede the first sun-shadow cascade because
         // nearby blades reuse the prepared wind/trample transform as a cheap
@@ -1332,6 +1466,9 @@ impl Renderer {
             self.write_entity_shadow_uniforms(frame, camera, casters);
             self.encode_entity_shadow_pass(&mut encoder, frame);
         }
+        // Build the authored-sun static visibility once per BSP, independently
+        // of the user's current sun angle and of the four runtime cascades.
+        self.encode_original_sun_shadow(&mut encoder, camera_pos_time);
         let csm_entity_casters = match shadow_matrices.as_ref() {
             Some(matrices) => self.prepare_entity_cascade_casters(matrices),
             None => false,
@@ -1516,6 +1653,10 @@ impl Renderer {
             }
         }
 
+        if let Some(started) = perf_shadows_started {
+            info.perf_pre_world_shadows_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_remaining_pre_world_started = perf_timing.then(Instant::now);
         if self.weather.rain.enabled && !self.weather.rain.frozen {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::RainSim, false);
@@ -2164,6 +2305,7 @@ impl Renderer {
                     let ocean_bind_group = self
                         .ocean
                         .as_ref()
+                        .filter(|ocean| ocean.native_surface_available())
                         .map(|ocean| &ocean.render_bind_group)
                         .unwrap_or(&self.ocean_inert_bind_group);
                     if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -2513,6 +2655,8 @@ impl Renderer {
         let precipitation_haze_mask_active = plan.use_post
             && !plan.gamma_only_post
             && self.precipitation_haze_mask_needed();
+        let native_eye_adaptation = self.native_display_mapping_active();
+        let auto_exposure_effective = self.effective_auto_exposure_strength() > 0.0;
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
                 .as_mut()
@@ -2541,7 +2685,12 @@ impl Renderer {
         if let Some(started) = perf_pre_world_started {
             info.perf_encode_pre_world_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
+        if let Some(started) = perf_remaining_pre_world_started {
+            info.perf_pre_world_remaining_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
         let perf_scene_started = perf_timing.then(Instant::now);
+        let menu_scene_trace = crate::renderer::diagnostics::perf_capture::first_world_frame_trace();
+        let mut menu_scene_checkpoint = menu_scene_trace.then(Instant::now);
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
         if let Some(world) = &self.world {
@@ -2635,11 +2784,10 @@ impl Renderer {
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             // A water reflection or aerial receiver can remain visible when this PVS has no sky polygons.
             // Keep the physical sky's camera/time current; the draw below still uses exact BSP sky admission.
-            if self.sky_backend == 1 || self.blue_water_environment.world_lighting || self.blue_water_environment.weather_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled) {
+            if let Some(atmosphere) = self.blue_water_sky.as_mut() {
+                let first_sky_prepare_started = menu_scene_trace.then(Instant::now);
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSkyPrepare, false);
                 let key = (self.config.width, self.config.height, self.msaa_samples, flare_scene_format);
-                let atmosphere = self.blue_water_sky.get_or_insert_with(||
-                    crate::renderer::environment::blue_water_sky::AtmosphereRenderer::new(&self.device, &self.queue, key));
                 let sea_plane = world.ocean_surfaces.iter().max_by(|a, b| {
                     let area = |s: &crate::ocean::OceanSurface| (s.maximum[0] - s.minimum[0]) * (s.maximum[1] - s.minimum[1]);
                     area(a).total_cmp(&area(b))
@@ -2651,20 +2799,36 @@ impl Renderer {
                 info.native_thunder.extend(atmosphere.take_thunder());
                 if let Some((_, matrix)) = sky_portal_view { atmosphere.write_portal_camera(&self.queue, matrix); }
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSkyPrepare, true);
+                if let Some(started) = first_sky_prepare_started {
+                    rverbose!(2, "[MAP FIRST SCENE SKY] atmosphere prepare {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+                }
             }
             if optical_volumes.is_some() {
                 if let Some(ocean) = self.ocean.as_mut().filter(|gpu| gpu.backend() != 0) {
-                    let visible = if self.pvs_mode == PvsMode::Off { None } else {
-                        world.visibility.as_ref()
-                            .and_then(|visibility| visibility.cluster_at(scene::jka_position(camera.position.to_array())))
-                            .and_then(|cluster| world.full_visible_batches_by_cluster.get(cluster))
+                    // Share Godot's *exact* PVS tile admission with the native
+                    // Blue Water mesh. An absent cluster means outside the BSP,
+                    // NOT "PVS disabled": that case must receive empty tiles.
+                    // None is reserved for PVS Off / maps with no vis data.
+                    let pvs = if self.pvs_mode == PvsMode::Off || world.visibility.is_none() {
+                        [None; crate::ocean::OCEAN_MAX_SURFACES]
+                    } else {
+                        match world.visibility.as_ref().and_then(|visibility|
+                            visibility.cluster_at(scene::jka_position(camera.position.to_array()))) {
+                            Some(cluster) => {
+                                let visible = world.full_visible_batches_by_cluster.get(cluster)
+                                    .map_or(&[][..], |batches| batches.as_slice());
+                                world.ocean_pvs_footprints.visible_tiles(visible)
+                            }
+                            // Outside BSP: unlike an unknown *piece*, an invalid
+                            // cluster is definitively not in any water PVS.
+                            None => [Some([0; crate::ocean::OCEAN_PRUNE_TILE_AXIS]); crate::ocean::OCEAN_MAX_SURFACES],
+                        }
                     };
-                    let pvs = visible.map(|batches| world.ocean_pvs_footprints.visible_tiles(batches))
-                        .unwrap_or([None; crate::ocean::OCEAN_MAX_SURFACES]);
                     let sky_faces = world.primary_skybox.and_then(|indices| {
                         let views: Option<Vec<_>> = indices.iter().map(|&index| world.textures.get(index).map(|image| &image.view)).collect();
                         views.and_then(|views| views.try_into().ok())
                     });
+                    let first_native_surface_started = menu_scene_trace.then(Instant::now);
                     ocean.prepare_original_surface(&self.device, &self.queue, &mut encoder, camera,
                         (self.config.width, self.config.height, self.msaa_samples, flare_scene_format),
                         jitter, frame_delta, self.taa_frame_index,
@@ -2672,14 +2836,17 @@ impl Renderer {
                         self.ocean_settings.backend == 2
                             && self.ocean_settings.blue_water_underwater_mode == 4
                             && self.ocean_settings.hybrid_waterline_debug == 3,
-                        &pvs, sky_faces,
+                        &pvs, self.ocean_extension_mask, sky_faces,
                         &self.ocean_optics.water_distance, self.camera_water_surface,
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.environment()),
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.light()),
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| &sky.aerial),
                         self.blue_water_sky.as_ref().filter(|_| self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled).map(|sky| sky.clouds.shadow()), optical_volumes.as_ref().expect("active water volumes"),
-                        &self.ocean_optics.receiver_color, self.weather.fog.legacy_self_fog(),
+                        godot_receiver_live.then_some(&self.ocean_optics.receiver_color), self.weather.fog.legacy_self_fog(),
                         if self.blue_water_environment.weather_backend == 1 { self.blue_water_environment.rain } else { 0.0 });
+                    if let Some(started) = first_native_surface_started {
+                        rverbose!(2, "[MAP FIRST SCENE OCEAN] prepare_original_surface {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+                    }
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsCompute, false);
                     ocean.prepare_original_caustics(&mut encoder);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsCompute, true);
@@ -2688,7 +2855,15 @@ impl Renderer {
             }
             if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1 || self.blue_water_environment.world_lighting || self.blue_water_environment.weather_backend==1 || (self.cloud_backend == 1 && self.clouds_enabled)) {
                 let probe = self.ocean.as_ref().filter(|ocean|ocean.backend()!=0).and_then(|ocean| ocean.original_underwater_probe());
+                let first_atmosphere_render_started = menu_scene_trace.then(Instant::now);
                 atmosphere.render_image(&self.device, &mut encoder, probe);
+                if let Some(started) = first_atmosphere_render_started {
+                    rverbose!(2, "[MAP FIRST SCENE SKY] atmosphere render_image {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            if let Some(started) = menu_scene_checkpoint.take() {
+                rverbose!(2, "[MAP FIRST SCENE CHECKPOINT] scene entry -> sky/native ocean {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+                menu_scene_checkpoint = Some(Instant::now());
             }
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
             if capture_api_calls {
@@ -2738,7 +2913,7 @@ impl Renderer {
                     let Some(group_index) = batch.compact_group.map(|value| value as usize) else {
                         continue;
                     };
-                    if face_cull_cpu && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
+                    if face_cull_cpu && run_cull.water.is_some() && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
                         // This member will be drawn as filtered subranges below.
                         // Do not also upload it into its group's multi-draw.
                         continue;
@@ -2864,6 +3039,13 @@ impl Renderer {
                         (&world.coarse_batches, indices)
                     };
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
+                // r_cloudPortalDepth 2: the portal pass writes the texture the
+                // cloud passes read, instead of the depth the main pass clears.
+                let portal_pass_depth_view = if portal_pass_uses_target {
+                    self.portal_depth.target_view().unwrap_or(&self.targets.depth_view)
+                } else {
+                    &self.targets.depth_view
+                };
                 let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("JKA sky portal"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2880,7 +3062,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.targets.depth_view,
+                        view: portal_pass_depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(camera_depth_clear()),
                             store: wgpu::StoreOp::Store,
@@ -2911,6 +3093,7 @@ impl Renderer {
                     let ocean_bind_group = self
                         .ocean
                         .as_ref()
+                        .filter(|ocean| ocean.native_surface_available())
                         .map(|ocean| &ocean.render_bind_group)
                         .unwrap_or(&self.ocean_inert_bind_group);
                     if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -2948,6 +3131,9 @@ impl Renderer {
                     // per-instance isPortalEnt selection below.
                     .filter(|&i| !portal_batches[i].is_inline_entity)
                     .chain(portal_inline_indices);
+                // Mode 1 replays the survivors depth-only below; no allocation
+                // otherwise.
+                let mut portal_depth_candidates: Vec<usize> = Vec::new();
                 for batch_index in portal_candidates {
                     let batch = &portal_batches[batch_index];
                     if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
@@ -2966,7 +3152,10 @@ impl Renderer {
                     {
                         continue;
                     }
-                    if self.sky_backend == 1 && batch.source.pipeline.class == DrawClass::Sky && !batch.is_inline_entity {
+                    if portal_depth_mode == 1 {
+                        portal_depth_candidates.push(batch_index);
+                    }
+                    if self.sky_backend == 1 && self.blue_water_sky.is_some() && batch.source.pipeline.class == DrawClass::Sky && !batch.is_inline_entity {
                         continue;
                     }
                     if current_pipeline != Some(batch.source.pipeline) {
@@ -3016,7 +3205,7 @@ impl Renderer {
                         &self.queue,
                         &mut encoder,
                         color_view,
-                        &self.targets.depth_view,
+                        portal_pass_depth_view,
                         flare_format,
                         self.msaa_samples,
                         portal_position,
@@ -3028,6 +3217,61 @@ impl Renderer {
                         self.pvs_mode != PvsMode::Off,
                         self.weather.fog.legacy_drawfog_value(),
                     );
+                }
+                // r_cloudPortalDepth 1: depth-only replay of the portal batches
+                // into the texture the cloud passes read. Opaque and alpha-tested
+                // depth writers only, matching the main linear-depth prepass.
+                if portal_depth_mode == 1 {
+                    if let Some(portal_depth_view) = self.portal_depth.target_view() {
+                        if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
+                        let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("JKA sky portal cloud depth"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: portal_depth_view,
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        depth_pass.set_bind_group(0, &self.sky_portal_camera_bind_group, &[]);
+                        depth_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        depth_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        depth_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        let mut current_is_mask: Option<bool> = None;
+                        for &batch_index in &portal_depth_candidates {
+                            let batch = &portal_batches[batch_index];
+                            if batch.source.pipeline.class == DrawClass::Sky
+                                || !batch.source.pipeline.depth_write
+                                || batch.source.pipeline.depth_equal
+                            {
+                                continue;
+                            }
+                            let is_mask = match batch.source.pipeline.class {
+                                DrawClass::Opaque => false,
+                                DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => true,
+                                _ => continue,
+                            };
+                            if current_is_mask != Some(is_mask) {
+                                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                                depth_pass.set_pipeline(if is_mask {
+                                    &self.hiz_prepass_mask_pipeline
+                                } else {
+                                    &self.hiz_prepass_pipeline
+                                });
+                                current_is_mask = Some(is_mask);
+                            }
+                            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                            depth_pass.set_bind_group(1, &batch.bind_group, &[]);
+                            if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
+                            draw_world_batch_secondary(&mut depth_pass, batch, 0..1, None);
+                        }
+                    }
                 }
                 true
             } else {
@@ -3091,7 +3335,8 @@ impl Renderer {
                 let ocean_bind_group = self
                     .ocean
                     .as_ref()
-                    .map(|ocean| &ocean.render_bind_group)
+                    .filter(|ocean| ocean.native_surface_available())
+                        .map(|ocean| &ocean.render_bind_group)
                     .unwrap_or(&self.ocean_inert_bind_group);
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
@@ -3412,7 +3657,7 @@ impl Renderer {
                                     same_world_surface(batch, &active.batches[next_index])
                                 });
                         let cpu_compactable = !batch.is_inline_entity
-                            && !(face_cull_cpu && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial)
+                            && !(face_cull_cpu && run_cull.water.is_some() && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial)
                             && !previous_same
                             && !next_is_same_surface
                             && self
@@ -3585,7 +3830,7 @@ impl Renderer {
                 } else {
                     // Only partially rejected batches use finer indexed ranges;
                     // unaffected groups retain their existing compact/indirect path.
-                    if face_cull_cpu && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
+                    if face_cull_cpu && run_cull.water.is_some() && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
                         let (draws, triangles) = draw_partial_face_batch(&mut pass, batch, &run_cull);
                         info.world_face_plane_partial_batches += 1;
                         info.world_face_plane_rejected_triangles += triangles;
@@ -3660,7 +3905,7 @@ impl Renderer {
                             if capture_api_calls { info.perf_encode_calls.draw_indexed_indirect = info.perf_encode_calls.draw_indexed_indirect.saturating_add(1); }
                             pass.draw_indexed_indirect(&world.indirect_buffer, offset);
                         } else {
-                            if face_cull_cpu && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
+                            if face_cull_cpu && run_cull.water.is_some() && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
                                 let (draws, _) = draw_partial_face_batch(&mut pass, batch, &run_cull);
                                 if capture_api_calls {
                                     info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(draws);
@@ -3732,7 +3977,8 @@ impl Renderer {
                         let ocean_bind_group = self
                             .ocean
                             .as_ref()
-                            .map(|ocean| &ocean.render_bind_group)
+                            .filter(|ocean| ocean.native_surface_available())
+                        .map(|ocean| &ocean.render_bind_group)
                             .unwrap_or(&self.ocean_inert_bind_group);
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
@@ -4093,12 +4339,15 @@ impl Renderer {
 
             };
             if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
+                self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, false);
                 self.surface_sprite_effect_renderer.draw(
                     &mut pass,
                     &self.camera_bind_group,
                     &world.surface_sprite_effects,
+                    world.surface_sprite_resident.as_ref(),
                     prepared,
                 );
+                self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, true);
             }
             if super::finish::eligible(
                 self.encoder_finish_threads, self.msaa_samples, self.ocean_enabled,
@@ -4323,9 +4572,10 @@ impl Renderer {
 
             if optical_volumes.is_some() {
                 drop(pass);
+                let bw_portal_depth = self.portal_depth.target_view().filter(|_| self.portal_depth.inverse_scale != 0.0).map(|view| (view, self.portal_depth.inverse_scale));
                 if let Some(atmosphere)=self.blue_water_sky.as_mut().filter(|_|self.sky_backend==1 || self.blue_water_environment.world_lighting || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                 }
                 // Light submerged receivers before atmospheric scattering is added.
@@ -4376,15 +4626,48 @@ impl Renderer {
                 // (`refresh_water_boxes` ran this frame for the same camera).
                 let submerged = optical_volumes.is_some()
                     && self.camera_water_surface > crate::renderer::NO_WATER_SURFACE;
+                // The wave-aware capture + full-screen composite only matter
+                // while the eye is under the rasterized surface (`submerged`
+                // already includes the solved wave height at the eye). Above
+                // water the Blue Water surface draws its own transmission;
+                // running the optics too costs a full-screen pass and tints
+                // shoreline pixels that the approximate wave height calls wet.
                 let hybrid_wave_optics = self.ocean_settings.backend == 2
                     && self.ocean_settings.blue_water_underwater_mode == 4
                     && self.ocean_settings.blue_water_adapter
+                    && submerged
                     && self.ocean.as_ref().is_some_and(|gpu| gpu.backend() != 0);
                 // Preserve existing CPU-controlled Godot mesh selection.
                 // Only the optical capture/composite becomes wave-aware.
                 let hybrid_godot_surface = submerged
                     && self.ocean_settings.backend == 2
                     && self.ocean_settings.blue_water_underwater_mode == 4;
+                if self.ocean_settings.backend == 2 {
+                    static LOG_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let slot = self.eye_wave_slot;
+                    let sample = slot.and_then(|slot| self.ocean.as_ref()?.eye_wave_sample(slot));
+                    self.eye_wave_log.push(crate::ocean::eye_wave::EyeWaveRecord {
+                        adapter_offset: sample.map_or(0.0, |s| s.adapter),
+                        native_valid: sample.is_some_and(|s| s.native.is_some()),
+                        seconds: LOG_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64(),
+                        eye: camera.position.to_array(),
+                        yaw_pitch: [camera.yaw, camera.pitch],
+                        slot,
+                        plane: slot
+                            .and_then(|slot| world.ocean_surfaces.get(slot))
+                            .map_or(f32::NAN, |surface| surface.plane_height),
+                        probe_valid: self.eye_wave_correction.is_some(),
+                        probe_offset: self.eye_wave_offset,
+                        probe_correction: self.eye_wave_correction.unwrap_or(0.0),
+                        camera_water_surface: self.camera_water_surface,
+                        submerged,
+                        godot_mesh: hybrid_godot_surface,
+                        cull_radius: crate::ocean::optics::submerged_cull_radius(
+                            camera.position.to_array(), &self.water_boxes, world.ocean_masks.as_ref(),
+                            self.ocean_settings.underwater_cull_distance(), self.eye_wave_offset,
+                        ),
+                    });
+                }
                 if self.ocean_settings.hybrid_waterline_debug > 0
                     && self.ocean_settings.backend == 2
                     && self.ocean_settings.blue_water_underwater_mode == 4
@@ -4496,8 +4779,7 @@ impl Renderer {
                 // diagnostic eliminates one potential full-screen color/depth
                 // capture without leaving any known legacy consumer unbound.
                 let native_only = self.ocean_settings.backend != 0
-                    && self.ocean_settings.blue_water_dedup_capture
-                    && !matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4)
+                    && !godot_receiver_live
                     && !submerged
                     && !hybrid_wave_optics
                     && self.authored_oceans.is_empty();
@@ -4542,7 +4824,7 @@ impl Renderer {
                         &self.targets.depth_view,
                         optical_ocean,
                         scissor,
-                        self.ocean_settings.backend != 0 && matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4),
+                        godot_receiver_live,
                         hybrid_wave_optics,
                     );
                 }
@@ -4574,6 +4856,27 @@ impl Renderer {
                 }
                 self.gpu_profiler
                     .write_encoder_timestamp(&mut encoder, GpuPass::OceanOptics, true);
+                // The native surface's expensive material is shaded on a true
+                // 1/2 or 1/4 resolution attachment before the full-resolution
+                // water geometry/depth pass. Match its admitted surface mask
+                // to the main ocean pass rather than shading every hidden pool.
+                if self.ocean_settings.surface_pixels && !hybrid_godot_surface
+                    && self.ocean_settings.pixel_detail_mode != 0
+                {
+                    let mut admitted_native = 0u8;
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            || batch.ocean_clipmap.is_none()
+                            || !batch_area_visible(batch, effective_area_mask)
+                            || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                        { continue; }
+                        claim_ocean_clipmap(&mut admitted_native, batch);
+                    }
+                    if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0) {
+                        ocean.encode_reduced_original_surface(&mut encoder, admitted_native);
+                    }
+                }
                 // Only run the query when something consumes it. An occlusion
                 // query can suppress early-Z on a depth-writing, discarding
                 // pass like this one, so turning both consumers off has to turn
@@ -4685,8 +4988,11 @@ impl Renderer {
                         info.ocean.half_cells =
                             info.ocean.half_cells.max(runtime.current_half_cells);
                     }
+                    // Blue Water owns all native pool draws once prepared.
+                    // A PVS-rejected (not-ready) native slot must not resurrect
+                    // a stale Godot fallback clipmap through the None case.
                     if !hybrid_godot_surface && self.ocean.as_ref().is_some_and(|gpu|
-                        gpu.original_surface_triangles(batch.ocean_clipmap_id as usize).is_some()) {
+                        gpu.original_surface_prepared()) {
                         continue;
                     }
                     if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -4745,7 +5051,8 @@ impl Renderer {
                             info.ocean.minimum_level = info.ocean.minimum_level.max(runtime.current_minimum_level);
                             info.ocean.half_cells = info.ocean.half_cells.max(runtime.current_half_cells);
                         }
-                        if original.is_some() { continue; }
+                        if !hybrid_godot_surface && self.ocean.as_ref().is_some_and(|gpu|
+                            gpu.original_surface_prepared()) { continue; }
                         if capture_api_calls {
                             info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(2);
                             info.perf_encode_calls.world_helper_draw_indexed =
@@ -4766,7 +5073,7 @@ impl Renderer {
                         pass.set_pipeline(far_pipeline);
                         for (slot, region) in world.ocean_sky_regions.iter().enumerate() {
                             if region.is_none() || slot >= 8 || self.ocean_extension_mask >> slot & 1 == 0 { continue; }
-                            if !hybrid_godot_surface && self.ocean.as_ref().is_some_and(|gpu| gpu.original_surface_triangles(slot).is_some()) {
+                            if !hybrid_godot_surface && self.ocean.as_ref().is_some_and(|gpu| gpu.original_surface_prepared()) {
                                 continue;
                             }
                             let Some(batch) = world.ocean_sky_representatives[slot]
@@ -4786,7 +5093,18 @@ impl Renderer {
                 if let Some(ocean) = self.ocean.as_ref().filter(|gpu| self.ocean_settings.surface_pixels
                     && gpu.backend() != 0 && !hybrid_godot_surface) {
                     let (drawn, horizon_only, horizon_triangles) = ocean.draw_original_surfaces(&mut pass, ocean_drawn);
+                    // Distance modes run the expensive original fragment only
+                    // nearby, feathered over the genuine reduced far image.
+                    ocean.draw_original_near_detail(&mut pass, ocean_drawn);
                     info.ocean.original_surfaces = drawn;
+                    if self.ocean_settings.adaptive_mesh_debug {
+                        let (baseline, selected, counted, missing) =
+                            ocean.original_adaptive_mesh_counts(ocean_drawn);
+                        info.ocean.adaptive_mesh_baseline_triangles = baseline;
+                        info.ocean.adaptive_mesh_selected_triangles = selected;
+                        info.ocean.adaptive_mesh_counted_slots = counted;
+                        info.ocean.adaptive_mesh_uncounted_slots = missing;
+                    }
                     info.ocean.clipmaps_drawn = info.ocean.clipmaps_drawn.saturating_add(horizon_only);
                     info.ocean.triangles = info.ocean.triangles.saturating_add(horizon_triangles);
                     if capture_api_calls {
@@ -4827,9 +5145,10 @@ impl Renderer {
 
             if optical_volumes.is_none() && (self.sky_backend==1 || self.blue_water_environment.world_lighting || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
                 drop(pass);
+                let bw_portal_depth = self.portal_depth.target_view().filter(|_| self.portal_depth.inverse_scale != 0.0).map(|view| (view, self.portal_depth.inverse_scale));
                 if let Some(atmosphere)=self.blue_water_sky.as_mut() {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                     atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view);
                 }
@@ -5219,6 +5538,19 @@ impl Renderer {
                 .wind_visuals
                 .render(&mut pass, &self.camera_bind_group);
 
+            // Native Blue Water spindrift: its own pass over the finished scene, then back to the shared pass.
+            if self.ocean_enabled && self.ocean.as_ref().is_some_and(|gpu| gpu.original_spindrift_active()) {
+                drop(pass);
+                let flash = self.blue_water_sky.as_ref().map_or(0.0, |sky| sky.flash());
+                if let Some(ocean) = self.ocean.as_mut() {
+                    ocean.draw_original_spindrift(&self.device, &self.queue, &mut encoder, color_view, resolve_target, &self.targets.depth_view, flash);
+                }
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene after native spindrift"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
+                });
+            }
             if self.blue_water_environment.weather_backend==1 {
                 drop(pass);
                 let rain_eye = self.blue_water_sky.as_ref().and_then(|sky| sky.weather_eye());
@@ -5230,7 +5562,7 @@ impl Renderer {
                     atmosphere.set_sea_heights(&self.device, &self.queue, heights);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::RainDraw,false);
                     atmosphere.draw_weather(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,
-                        self.taa_enabled.then_some(&self.targets.motion_vector_view));
+                        (self.taa_enabled || rt_taa_active).then_some(&self.targets.motion_vector_view));
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::RainDraw,true);
                 }
                 pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -5301,9 +5633,8 @@ impl Renderer {
             if self.wireframe_mask != 0 {
                 let mask = self.wireframe_mask;
                 if mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0 {
-                    if let Some(pipeline) = &self.wireframe_pipeline {
-                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
-                        pass.set_pipeline(pipeline);
+                    if self.wireframe_pipeline.iter().all(Option::is_some) {
+                        let mut bound_cull = None;
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(0, &self.camera_bind_group, &[]);
                         for &batch_index in active.indices {
@@ -5320,19 +5651,28 @@ impl Renderer {
                                 && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                                 && (!render_ocean || batch.ocean_clipmap.is_none())
                                 && batch.source.pipeline.class != DrawClass::Sky
+                                && batch_area_visible(batch, effective_area_mask)
                                 && aabb_intersects_clip_frustum(
                                     batch.bounds_min,
                                     batch.bounds_max,
                                     view_proj,
                                 )
                             {
+                                let slot = wireframe_cull_slot(batch.source.pipeline.cull);
+                                if bound_cull != Some(slot) {
+                                    if let Some(pipeline) = &self.wireframe_pipeline[slot] {
+                                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                                        pass.set_pipeline(pipeline);
+                                    }
+                                    bound_cull = Some(slot);
+                                }
                                 // Show what is actually drawn: the same water culls as the main pass
                                 // (whole batches here too, since the GPU-driven path filters late).
                                 if water_cull.as_ref().is_some_and(|water| water.culls(batch.bounds_min, batch.bounds_max))
                                 {
                                     continue;
                                 }
-                                if face_cull_cpu && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
+                                if face_cull_cpu && run_cull.water.is_some() && face_plane_selection(batch, &run_cull) == FacePlaneSelection::Partial {
                                     let (draws, _) = draw_partial_face_batch(&mut pass, batch, &run_cull);
                                     if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(draws); }
                                     continue;
@@ -5521,6 +5861,7 @@ impl Renderer {
                             &mut pass,
                             &self.camera_bind_group,
                             &world.surface_sprite_effects,
+                            world.surface_sprite_resident.as_ref(),
                             prepared,
                         );
                     }
@@ -5653,7 +5994,8 @@ impl Renderer {
                         let ocean_bind_group = self
                             .ocean
                             .as_ref()
-                            .map(|ocean| &ocean.render_bind_group)
+                            .filter(|ocean| ocean.native_surface_available())
+                        .map(|ocean| &ocean.render_bind_group)
                             .unwrap_or(&self.ocean_inert_bind_group);
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         glow_pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
@@ -6046,6 +6388,9 @@ impl Renderer {
         }
         self.compact_group_scratch = compact_group_drawn;
         self.face_plane_cull_scratch = face_plane_cull_scratch;
+        if let Some(started) = menu_scene_checkpoint {
+            rverbose!(2, "[MAP FIRST SCENE CHECKPOINT] remaining world scene {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
         if let Some(started) = perf_scene_started {
             // The serial split's prefix finish is reported in finish, rather
             // than double-counted in this mutually exclusive scene interval.
@@ -6060,7 +6405,7 @@ impl Renderer {
         // Legacy 1 also needs completed depth: promoted water is drawn after
         // the linear/policy prepass and can cover its receiver or the sky.
         let needs_resolved_scene_depth = self.ssr_enabled || self.reflection_debug_enabled
-            || self.weather.fog.legacy1_global_post_active();
+            || self.weather.fog.legacy1_global_post_active() || native_eye_adaptation;
         if needs_resolved_scene_depth {
             // Resolve the final opaque device depth after players, vehicles and
             // promoted ocean have rendered. SSR compares its reconstructed
@@ -6190,35 +6535,50 @@ impl Renderer {
             }
         }
 
-        if self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled {
+        if auto_exposure_effective {
             // Inlined rather than called via &self methods: a live borrow of
             // self.smaa_target (through smaa_frame) is in scope here, and a
             // method call would reborrow all of *self.
             let uniform = AutoExposureUniform {
-                params: [1.0, frame_delta.clamp(0.0, 0.25), -2.0, 2.0],
+                params: [1.0, frame_delta.clamp(0.0, 0.25), if native_eye_adaptation { -1.0 } else { -2.0 }, 2.0],
                 // 18% middle gray, with slower opening into darkness than closing
                 // down on a suddenly bright scene. These are intentionally fixed
                 // policy constants for r_autoExposure rather than extra user knobs.
-                adaptation: [0.18, 1.5, 3.0, 0.0],
+                adaptation: [0.18, 1.5, 3.0,
+                    if self.ocean_enabled && self.camera_water_surface > crate::renderer::NO_WATER_SURFACE { 1.0 } else { 0.0 }],
             };
             self.queue.write_buffer(
                 &self.auto_exposure_settings_buffer,
                 0,
                 bytemuck::bytes_of(&uniform),
             );
-            if capture_api_calls { info.perf_encode_calls.compute_passes = info.perf_encode_calls.compute_passes.saturating_add(1); }
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("JKA auto-exposure luminance/adaptation"),
-                timestamp_writes: None,
-            });
-            if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
-            pass.set_pipeline(&self.auto_exposure_pipeline);
-            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-            pass.set_bind_group(0, &self.auto_exposure_bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            let native_exposure = if native_eye_adaptation {
+                if let Some(atmosphere) = self.blue_water_sky.as_mut() {
+                    atmosphere.adapt_exposure(&self.device, &mut encoder, &self.targets.scene_view,
+                        &self.auto_exposure_state_buffer, &self.auto_exposure_settings_buffer);
+                    if capture_api_calls {
+                        info.perf_encode_calls.compute_passes = info.perf_encode_calls.compute_passes.saturating_add(2);
+                        info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(2);
+                        info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(4);
+                    }
+                    true
+                } else { false }
+            } else { false };
+            if !native_exposure {
+                if capture_api_calls { info.perf_encode_calls.compute_passes = info.perf_encode_calls.compute_passes.saturating_add(1); }
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("JKA auto-exposure luminance/adaptation"),
+                    timestamp_writes: None,
+                });
+                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                pass.set_pipeline(&self.auto_exposure_pipeline);
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                pass.set_bind_group(0, &self.auto_exposure_bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
         }
 
-        if self.depth_of_field_strength > 0.001 {
+        if dof_frame_active {
             if let (Some(target), Some(bind_group)) = (&self.targets.dof, &self.dof_bind_group) {
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -6678,7 +7038,8 @@ impl Renderer {
             && (self.screen_fx_vertex_count != 0
                 || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
-                || self.ui_transient_vertex_count != 0)
+                || self.ui_transient_vertex_count != 0
+                || (self.frame_time_graph.draw_ready() && !self.egui_active))
         {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, false);
@@ -6719,6 +7080,9 @@ impl Renderer {
                 &self.ui_vertex_buffer,
                 self.ui_vertex_count,
             );
+            if !self.egui_active {
+                self.frame_time_graph.draw(&mut pass, &self.ui_pipeline, &self.ui_bind_group);
+            }
             drop(pass);
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, true);

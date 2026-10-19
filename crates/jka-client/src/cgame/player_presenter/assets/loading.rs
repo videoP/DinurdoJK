@@ -761,6 +761,31 @@ fn build_character_model(
     };
     let animation_gla = source.load_gla(&gla_qpath)?;
     let (gla, retargeter) = mesh_skeleton_binding(&glm, &animation_gla)?;
+    let shape_qpath = model_qpath.strip_suffix(".glm").map(|p| format!("{p}.bodyshape"));
+    let shape_bytes = if let Some(path) = &shape_qpath {
+        source.read_optional(path, 64 * 1024 * 1024)?
+    } else { None };
+    let mut glm = glm;
+    let mut body_shape_available = false;
+    let mut body_shape_pivots = None;
+    if let Some(bytes) = shape_bytes {
+        match jka_assets::body_shape::BodyShapeGrid::parse(
+            &bytes, &glm, jka_assets::body_shape::model_fingerprint(&model_bytes),
+        ) {
+            Ok(grid) => {
+                body_shape_available = true;
+                if !jiggle_remesh.body_shape.is_neutral() {
+                    body_shape_pivots = grid.apply(Arc::make_mut(&mut glm), &gla, jiggle_remesh.body_shape, None)?
+                        .map(Arc::new);
+                }
+            }
+            Err(error) => rverbose!(1, "PLAYER BODY SHAPE WARNING: {model_qpath}: {error}"),
+        }
+    }
+    let body_shape_binding = body_shape_pivots.as_deref().map(|p| {
+        jka_assets::body_shape::BodyShapeBinding::new(&gla, None, p)
+            .map(Arc::new)
+    }).transpose()?;
     if glm.num_bones > gla.skeleton.len() {
         return Err(format!(
             "GLM references {} bones but GLA only provides {}",
@@ -940,12 +965,16 @@ fn build_character_model(
     );
 
     Ok(PlayerModelAsset {
+        body_shape_available,
+        body_shape_binding,
         key,
         glm,
         gla,
         animation_gla,
         retargeter,
-        source_native_pivots: None,
+        source_native_pivots: body_shape_pivots,
+        source_jiggles: None,
+        source_jiggles_enabled: false,
         humanoid,
         animations,
         anim_events,

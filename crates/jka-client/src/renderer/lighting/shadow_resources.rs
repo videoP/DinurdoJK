@@ -7,10 +7,20 @@ use crate::renderer::{
 };
 use wgpu::util::DeviceExt;
 
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct OriginalSunShadowCache {
+    pub(in crate::renderer) map_identity: u64,
+    pub(in crate::renderer) direction: [f32; 3],
+    pub(in crate::renderer) view_proj: Mat4,
+    pub(in crate::renderer) texel_size: f32,
+}
+
 pub(in crate::renderer) struct ShadowResources {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) _array_view: wgpu::TextureView,
     pub(in crate::renderer) layer_views: Vec<wgpu::TextureView>,
+    /// Last array slice: original BSP sun, never sampled by runtime CSM.
+    pub(in crate::renderer) original_sun_cache: Option<OriginalSunShadowCache>,
     pub(in crate::renderer) _sky_texture: wgpu::Texture,
     pub(in crate::renderer) sky_array_view: wgpu::TextureView,
     pub(in crate::renderer) sky_layer_views: Vec<wgpu::TextureView>,
@@ -292,7 +302,7 @@ pub(in crate::renderer) fn create_shadow_resources(
         size: wgpu::Extent3d {
             width: SHADOW_MAP_SIZE,
             height: SHADOW_MAP_SIZE,
-            depth_or_array_layers: SHADOW_CASCADES as u32,
+            depth_or_array_layers: (SHADOW_CASCADES + 1) as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -308,11 +318,11 @@ pub(in crate::renderer) fn create_shadow_resources(
         base_mip_level: 0,
         mip_level_count: Some(1),
         base_array_layer: 0,
-        array_layer_count: Some(SHADOW_CASCADES as u32),
+        array_layer_count: Some((SHADOW_CASCADES + 1) as u32),
         aspect: wgpu::TextureAspect::DepthOnly,
         usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
     });
-    let layer_views = (0..SHADOW_CASCADES)
+    let layer_views = (0..=SHADOW_CASCADES)
         .map(|cascade| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA cascaded sun shadow layer"),
@@ -332,7 +342,7 @@ pub(in crate::renderer) fn create_shadow_resources(
         size: wgpu::Extent3d {
             width: SHADOW_MAP_SIZE,
             height: SHADOW_MAP_SIZE,
-            depth_or_array_layers: SHADOW_CASCADES as u32,
+            depth_or_array_layers: (SHADOW_CASCADES + 1) as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -348,11 +358,11 @@ pub(in crate::renderer) fn create_shadow_resources(
         base_mip_level: 0,
         mip_level_count: Some(1),
         base_array_layer: 0,
-        array_layer_count: Some(SHADOW_CASCADES as u32),
+        array_layer_count: Some((SHADOW_CASCADES + 1) as u32),
         aspect: wgpu::TextureAspect::DepthOnly,
         usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
     });
-    let sky_layer_views = (0..SHADOW_CASCADES)
+    let sky_layer_views = (0..=SHADOW_CASCADES)
         .map(|cascade| {
             sky_texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA cascaded shader-sun sky admission layer"),
@@ -498,9 +508,9 @@ pub(in crate::renderer) fn create_shadow_resources(
             },
         ],
     });*/
-    let mut caster_buffers = Vec::with_capacity(SHADOW_CASCADES);
-    let mut caster_bind_groups = Vec::with_capacity(SHADOW_CASCADES);
-    for _ in 0..SHADOW_CASCADES {
+    let mut caster_buffers = Vec::with_capacity(SHADOW_CASCADES + 1);
+    let mut caster_bind_groups = Vec::with_capacity(SHADOW_CASCADES + 1);
+    for _ in 0..=SHADOW_CASCADES {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA cascaded sun shadow caster uniform"),
             contents: bytemuck::bytes_of(&ShadowCasterUniform {
@@ -524,6 +534,7 @@ pub(in crate::renderer) fn create_shadow_resources(
         _texture: texture,
         _array_view: array_view,
         layer_views,
+        original_sun_cache: None,
         _sky_texture: sky_texture,
         sky_array_view,
         sky_layer_views,

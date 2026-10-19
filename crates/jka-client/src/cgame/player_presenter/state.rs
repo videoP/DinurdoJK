@@ -62,12 +62,14 @@ impl PlayerPresenter {
         self.footsteps.clear();
         self.entities.clear();
         self.jiggle.clear();
+        self.preview_source_jiggles.clear();
         self.team_power.clear();
         self.body_fade.clear();
         self.gore.clear();
         self.last_gpu.clear();
         self.vehicle_snaps.clear();
         self.vehicle_animations.clear();
+        self.profile_bone_smooth_history = None;
         self.force_grip_targets.clear();
         self.force_gripped_entities.clear();
         self.pending_impulse_ragdolls.clear();
@@ -202,6 +204,9 @@ impl PlayerPresenter {
             look: crate::japro_cg::Appearance::NORMAL,
             japro_cinfo2: 0,
             head_look_mode: 1,
+            swim_tilt: 0.9,
+            swim_turn_bank: 1.0,
+            move_lean: 0.75,
             saber_team_colors: true,
             saber_staff_multi_color: false,
             duel_shell_gray: None,
@@ -223,6 +228,7 @@ impl PlayerPresenter {
             entities: HashMap::new(),
             external_live_entities: HashSet::new(),
             jiggle: super::AsyncJiggleSystem::default(),
+            preview_source_jiggles: HashMap::new(),
             jiggle_sex_filter: 0,
             jiggle_remesh: JiggleRemeshTuning::default(),
             cloth: super::AsyncClothSystem::default(),
@@ -250,6 +256,7 @@ impl PlayerPresenter {
             reported_vehicle_fallbacks: HashSet::new(),
             logged_first_draw: false,
             skinning_mode: Ghoul2SkinningMode::Gpu,
+            preview_cpu_remesh: false,
             early_frustum_cull: true,
             rt_shadow_casters_enabled: false,
             collision_world: None,
@@ -262,6 +269,7 @@ impl PlayerPresenter {
             lod_bias: 0,
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             ghoul2_anim_smooth: 0.3,
+            profile_bone_smooth_history: None,
             view_weapon_frame: 0,
             view_weapon_frame_time: 0,
             skinning_pool,
@@ -274,6 +282,39 @@ impl PlayerPresenter {
     /// Only the visual look vector is changed, not entityState or Pmove.
     pub fn set_head_look_mode(&mut self, mode: u8) {
         self.head_look_mode = mode.min(2);
+    }
+
+    /// Visual-only, including remote players; 0 returns to exact stock orientation.
+    pub fn set_swim_tilt(&mut self, strength: f32) {
+        self.swim_tilt = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
+        if self.swim_tilt == 0.0 {
+            for runtime in self.entities.values_mut() {
+                runtime.swim_angles = [0.0; 2];
+                runtime.swim_bank_angle = 0.0;
+                runtime.swim_angle_time = 0;
+                runtime.swim_turn_motion.reset();
+            }
+        }
+    }
+
+    /// Cosmetic banking into actual swim velocity curves. The master
+    /// cg_swimTilt still controls whether any presentation tilt is applied.
+    pub fn set_swim_turn_bank(&mut self, strength: f32) {
+        self.swim_turn_bank = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Cosmetic air-only strafejump/bunnyhop lean (ground run/walk remains unchanged).
+    pub fn set_move_lean(&mut self, strength: f32) {
+        self.move_lean = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
+        if self.move_lean == 0.0 {
+            for runtime in self.entities.values_mut() {
+                runtime.move_lean.reset(self.stage_time_ms);
+            }
+        }
     }
 
     /// TaystJK `CG_MapTorsoToWeaponFrame`: sample the already-advanced local

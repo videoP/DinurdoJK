@@ -227,7 +227,10 @@ fn sky_radiance_along(camera: vec3<f32>, direction: vec3<f32>, shadow_length_km:
 fn dome_sky(direction: vec3<f32>, from_sea: bool, shadow_length: f32) -> vec3<f32> {
     let origin = select(camera_km(), sea_km(), from_sea);
     let along = held(direction, origin.y);
-    return grade(scattered_along(origin, along, direction, shadow_length), direction);
+    // The host's night sky brightness (`sky.haze.z`) dims the dome's own night floor; the environment bake (from the
+    // sea) keeps the full floor so the world's night light is unchanged.
+    let night = select(sky.haze.z, 1.0, from_sea);
+    return shoulder(scattered_along(origin, along, direction, shadow_length)) + night_floor(direction.y) * night;
 }
 
 // Sky radiance along a world direction, sun and moon discs excluded; below the horizon, the horizon's colour.

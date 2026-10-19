@@ -649,12 +649,23 @@ fn minimal_key() -> WorldShaderVariantKey {
 
 #[test]
 fn baked_sun_relight_variant_validates() {
-    let variant = WorldShaderVariantKey {
-        baked_sun_relight: true,
-        cascaded_shadows: true,
-        ..minimal_key()
-    };
-    let _ = specialized_lean_module(variant);
+    for cascaded_shadows in [false, true] {
+        let variant = WorldShaderVariantKey {
+            baked_sun_relight: true,
+            cascaded_shadows,
+            ..minimal_key()
+        };
+        assert!(!WorldShaderVariantKey {
+            minimal_entries: true,
+            material_specialization: true,
+            ..variant
+        }.minimal_entry_compatible());
+        let module = specialized_lean_module(variant);
+        let report = audit_entry(&module, ShaderStage::Fragment, "fs_main");
+        assert!(report.live_functions.contains("remove_baked_sun"));
+        assert!(report.live_functions.contains("original_sun_visibility"),
+            "Authored-sun visibility must survive even with runtime CSM disabled");
+    }
 }
 
 fn specialized_lean_module(key: WorldShaderVariantKey) -> Module {
@@ -1004,4 +1015,142 @@ fn material_fragment_key_narrows_only_compiled_out_bits() {
     assert_eq!((wall_ao.flags, wall_ao.tc_gen), (2 | 131072, 1));
     assert_eq!(MaterialFragmentKey::from_material([0; 4], -0.5).alpha_func, 3);
     assert_eq!(MaterialFragmentKey::from_material([0; 4], 0.0).alpha_func, 1);
+}
+
+/// Exercise the actual WGSL inverse/subtraction on a GPU, with known compiler
+/// photon values. This catches encoded-space subtraction and color-normalization
+/// mistakes that shader parsing alone cannot detect.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn authored_baked_sun_removes_known_photons_on_gpu() {
+    let full = include_str!("../../bsp.wgsl");
+    let start = full.find("fn baked_file_to_linear(").unwrap();
+    let end = full.find("fn remove_baked_sun(").unwrap();
+    let helpers = &full[start..end];
+    let encode = |raw: [f32; 3], gamma: f32, compensate: f32, srgb: bool| -> [f32; 3] {
+        let g = raw.map(|v| (v / 255.0).powf(1.0 / gamma) * 255.0);
+        let peak = g.into_iter().fold(0.0_f32, f32::max);
+        g.map(|v| {
+            let v = v / peak * (1.0 - (-peak / 260.0).exp()) / compensate;
+            if !srgb { v } else if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        })
+    };
+    let flux = 48.0_f32.to_radians().sin();
+    let direct = 900.0 * flux;
+    let mut expected = Vec::new();
+    let mut cases = String::new();
+    for (index, (baseline, strength, visibility, gamma, compensate, srgb)) in [
+        ([100.0; 3], 0.0, flux, 1.0, 1.0, true),
+        ([100.0; 3], 1.0, flux, 1.0, 1.0, true),
+        ([100.0; 3], 1.0, 0.0, 1.0, 1.0, true),
+        ([100.0; 3], 0.5, flux, 1.0, 1.0, true),
+        ([120.0, 180.0, 90.0], 1.0, flux, 1.0, 1.0, true),
+        ([120.0, 180.0, 90.0], 1.0, flux, 2.2, 1.0, true),
+        ([100.0; 3], 1.0, flux, 1.0, 2.0, true),
+        ([100.0; 3], 1.0, flux, 1.0, 1.0, false),
+    ].into_iter().enumerate() {
+        let sunlight = if visibility > 0.0 { direct } else { 0.0 };
+        let input = encode(baseline.map(|v| v + sunlight), gamma, compensate, srgb);
+        expected.push(encode(baseline.map(|v| v + sunlight * (1.0 - strength)), gamma, compensate, srgb));
+        let signed_compensate = if srgb { compensate } else { -compensate };
+        cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_direction_strength.w = {strength:?}; input.baked_sun_fit = vec4<f32>(260.0, {gamma:?}, 4.0, {signed_compensate:?}); output[{index}] = vec4<f32>(subtract_authored_baked_sun(vec3<f32>({:?}, {:?}, {:?}), {visibility:?}, input), 1.0); }}\n", input[0], input[1], input[2]));
+    }
+    let boundary = encode([100.0; 3], 1.0, 1.0, true);
+    expected.push(boundary);
+    cases.push_str("if (id.x == 8u) { lighting_settings.baked_sun_direction_strength.w = 1.0; input.baked_sun_fit = vec4<f32>(260.0, 1.0, 4.0, 1.0); input.lightmap_uv = vec2<f32>(0.5); output[8] = vec4<f32>(sample_authored_baked_sun(vec3<f32>(0.0), input), 1.0); }\n");
+    // Retail maps such as ffa3 omit compiler metadata. Exercise the standard
+    // zero-exposure transform using its authored colored sun, without clipping.
+    let default_sun = [0.874291 * 175.0, 175.0, 0.819403 * 175.0];
+    for (strength, visibility, gamma, compensate, srgb) in [
+        (0.0, flux, 1.0, 1.0, true),
+        (1.0, flux, 1.0, 1.0, true),
+        (0.5, flux, 1.0, 1.0, true),
+        (1.0, 0.0, 1.0, 1.0, true),
+        (1.0, flux, 2.2, 2.0, true),
+        (1.0, flux, 1.0, 1.0, false),
+    ] {
+        let encode_default = |raw: [f32; 3]| {
+            let corrected = raw.map(|v| (v / 255.0).powf(1.0 / gamma));
+            let peak = corrected.into_iter().fold(1.0_f32, f32::max);
+            corrected.map(|v| {
+                let v = v / peak / compensate;
+                if !srgb { v } else if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            })
+        };
+        let baseline = [40.0, 60.0, 30.0];
+        let input = encode_default(std::array::from_fn(|c| baseline[c] + default_sun[c] * visibility));
+        let index = expected.len();
+        expected.push(encode_default(std::array::from_fn(|c| baseline[c] + default_sun[c] * visibility * (1.0 - strength))));
+        let signed_compensate = if srgb { compensate } else { -compensate };
+        cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_radiance = vec4<f32>({:?}, {:?}, {:?}, 0.0); lighting_settings.baked_sun_direction_strength.w = {strength:?}; input.baked_sun_fit = vec4<f32>(0.0, {gamma:?}, 4.0, {signed_compensate:?}); output[{index}] = vec4<f32>(subtract_authored_baked_sun(vec3<f32>({:?}, {:?}, {:?}), {visibility:?}, input), 1.0); }}\n", default_sun[0] / 255.0, default_sun[1] / 255.0, default_sun[2] / 255.0, input[0], input[1], input[2]));
+    }
+    let live_start = full.find("fn light_bsp_surface(").unwrap();
+    let live_end = full[live_start..].find("fn shade_surface(").unwrap() + live_start;
+    let live_helper = &full[live_start..live_end];
+    for (strength, visibility, facing, enabled, gain) in [
+        (0.0, 1.0, true, true, 1.0),
+        (1.0, 1.0, true, true, 1.0),
+        (1.0, 0.0, true, true, 1.0),
+        (1.0, 1.0, false, true, 1.0),
+        (1.0, 1.0, true, true, 2.0),
+        (1.0, 1.0, true, false, 1.0),
+    ] {
+        let index = expected.len();
+        let baseline = [0.1, 0.15, 0.05];
+        let radiance = [0.4, 0.2, 0.1];
+        expected.push(std::array::from_fn(|c| baseline[c] + if enabled && facing { radiance[c] * gain * visibility } else { 0.0 }));
+        let direction = if facing { "0.0, 1.0, 0.0" } else { "1.0, 0.0, 0.0" };
+        let enabled = if enabled { 1.0 } else { 0.0 };
+        cases.push_str(&format!("if (id.x == {index}u) {{ input.world_normal = vec3<f32>(0.0, 1.0, 0.0); lighting_settings.baked_sun_direction_strength.w = {strength:?}; lighting_settings.runtime_sun_direction = vec4<f32>({direction}, 0.0); lighting_settings.runtime_sun_radiance = vec4<f32>({:?}, {:?}, {:?}, {enabled:?}); test_visibility = {visibility:?}; output[{index}] = vec4<f32>(light_bsp_surface(vec3<f32>(0.1, 0.15, 0.05), 0.0, input), 1.0); }}\n", radiance[0] * gain, radiance[1] * gain, radiance[2] * gain));
+    }
+    let source = format!("{}\n{}\n{}\n{}", r#"
+struct Settings { baked_sun_direction_strength: vec4<f32>, baked_sun_radiance: vec4<f32>, baked_sun_debug_mode: vec4<u32>, runtime_sun_direction: vec4<f32>, runtime_sun_radiance: vec4<f32> }
+var<private> lighting_settings: Settings;
+var<private> test_visibility: f32;
+struct VertexOut { baked_sun_fit: vec4<f32>, world_normal: vec3<f32>, lightmap_uv: vec2<f32> }
+@group(0) @binding(0) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(1) var lightmap_texture: texture_2d<f32>;
+fn baked_luminance(rgb: vec3<f32>) -> f32 { return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+fn baked_indirect_tone(rgb: vec3<f32>) -> vec3<f32> { return rgb; }
+fn remove_baked_sun(rgb: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> { return rgb; }
+fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(test_visibility); }
+"#, helpers, live_helper, format!("@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ var input: VertexOut; lighting_settings.baked_sun_radiance = vec4<f32>(900.0 / 255.0, 900.0 / 255.0, 900.0 / 255.0, 0.0); {cases} }}"));
+    crate::renderer::block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = instance.request_adapter(&Default::default()).await.expect("sun subtraction GPU adapter");
+        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("actual authored-sun subtraction"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let bytes = expected.len() as u64 * 16;
+        let output = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("baked shadow boundary fixture"), size: wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        let to_byte = |raw: f32| ((1.0 - (-raw / 260.0).exp()) * 255.0).round() as u8;
+        let lit = to_byte(100.0 + direct); let shadow = to_byte(100.0);
+        let flux_byte = (flux * 255.0).round() as u8;
+        let texels = [lit, lit, lit, flux_byte, shadow, shadow, shadow, 0, lit, lit, lit, flux_byte, shadow, shadow, shadow, 0];
+        queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &texels, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(2) }, wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 });
+        let view = texture.create_view(&Default::default());
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+        ] });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        { let mut pass = encoder.begin_compute_pass(&Default::default()); pass.set_pipeline(&pipeline); pass.set_bind_group(0, &group, &[]); pass.dispatch_workgroups(expected.len() as u32, 1, 1); }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, bytes);
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |result| result.unwrap());
+        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        let data = readback.slice(..).get_mapped_range().unwrap();
+        let values: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        for (index, (actual, expected)) in values.iter().zip(expected).enumerate() {
+            let tolerance = if index == 8 { 0.01 } else { 0.0001 };
+            for channel in 0..3 { assert!((actual[channel] - expected[channel]).abs() < tolerance, "sun case {index} channel {channel}: {} != {}", actual[channel], expected[channel]); }
+        }
+    });
 }

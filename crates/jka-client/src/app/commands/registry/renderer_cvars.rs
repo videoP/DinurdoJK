@@ -635,7 +635,12 @@ app_cvars! {
                             .ok()
                             .filter(|strength| strength.is_finite())
                             .map(|strength| strength.clamp(0.0, 1.0))
-                            .unwrap_or(settings.depth_of_field_strength)
+                            .unwrap_or(settings.depth_of_field_strength);
+                        // Legacy configs predate r_dofMode. A nonzero strength
+                        // was equivalent to On, so maintain that behavior.
+                        if settings.depth_of_field_strength > 0.001 && settings.dof_mode == DofMode::Off {
+                            settings.dof_mode = DofMode::On;
+                        }
                     }
                 }),
                 archive: Some((112, |state| {
@@ -1538,7 +1543,7 @@ app_cvars! {
     }
 
     APP_R_BAKEDSUNREMOVAL {
-        runtime: CvarDef::new("r_bakedSunRemoval", "", "0..1", "Approximate removal of baked map sunlight and replacement with the runtime sun on BSP lightmapped surfaces (requires sun visibility for relighting). 0 preserves vanilla lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_bakedsunremoval(app)), |app, value| App::cvar_set_r_bakedsunremoval(app, APP_R_BAKEDSUNREMOVAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremoval, None),
+        runtime: CvarDef::new("r_bakedSunRemoval", "", "0..1", "Subtract authored direct sun in BSP lightmap UVs and compiler lighting units when bake settings are known; use measured fits or conservative estimates otherwise. 0 preserves baked lighting; 1 applies the full estimate. Does not add a replacement light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_bakedsunremoval(app)), |app, value| App::cvar_set_r_bakedsunremoval(app, APP_R_BAKEDSUNREMOVAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremoval, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(v) = value.parse::<f32>() {
@@ -1555,6 +1560,264 @@ app_cvars! {
                 }
                 fn cvar_set_r_bakedsunremoval(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.baked_sun_removal = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SUNLIGHTING {
+        runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM or RT sun shadows for occlusion. Default 0 preserves legacy baked lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.sun_lighting = v; }
+            }),
+            archive: Some((26046, |state| if state.video.sun_lighting { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_sunlighting(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.sun_lighting = parse_bool(value).ok_or_else(|| format!("{name}: expected 0|1"))?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SUNSHADOWSTRENGTH {
+        runtime: CvarDef::new("r_sunShadowStrength", "", "0..1", "Live sun shadow contrast before surface-facing attenuation. Default 0.3 preserves the existing response; 1 strengthens CSM/RT sun shadows. Intensity scaling still applies, with final strength capped at 1. Does not change baked-sun removal.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(format!("{:.3}", app.video.sun_shadow_strength)), |app, value| App::cvar_set_r_sunshadowstrength(app, APP_R_SUNSHADOWSTRENGTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunshadowstrength, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.sun_shadow_strength = v.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((26045, |state| format!("{:.3}", state.video.sun_shadow_strength))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_sunshadowstrength(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.sun_shadow_strength = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDSUNCACHE {
+        runtime: CvarDef::new("r_bakedSunCache", "", "0|1", "Cache projected BSP sunlight subtraction in GPU lightmaps when the removal amount or source changes. 0 evaluates per pixel; 1 uses cached filtered lightmaps. Preview remains live. Unsupported bake formats use the shader path. Default 1.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.baked_sun_cache { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_bakedsuncache(app, APP_R_BAKEDSUNCACHE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsuncache, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.baked_sun_cache = v; }
+            }),
+            archive: Some((26044, |state| if state.video.baked_sun_cache { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_bakedsuncache(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_sun_cache = parse_bool(value)
+                        .ok_or_else(|| format!("{name}: expected 0|1"))?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDSUNSHADOWMAP {
+        runtime: CvarDef::new("r_bakedSunShadowMap", "", "0|1", "Fallback visibility for surfaces without a measured baked-sun fit: 1 = cached original-sun shadow map; 0 = unshadowed approximation. Static BSP-only map, rebuilt on map or authored-sun change.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_bakedsunshadowmap(app)), |app, value| App::cvar_set_r_bakedsunshadowmap(app, APP_R_BAKEDSUNSHADOWMAP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunshadowmap, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.baked_sun_shadow_map = v; }
+            }),
+            archive: Some((60, |state| if state.video.baked_sun_shadow_map { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_bakedsunshadowmap(&self) -> String {
+                    if self.video.baked_sun_shadow_map { "1".into() } else { "0".into() }
+                }
+                fn cvar_set_r_bakedsunshadowmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_sun_shadow_map = parse_bool(value)
+                        .ok_or_else(|| format!("{name}: expected 0|1"))?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDSUNEDGESOFTNESS {
+        runtime: CvarDef::new("r_bakedSunEdgeSoftness", "", "0..24", "Fallback original-sun shadow edge softness in depth-map texels. Paired surface fits retain authored lightmap edges.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedsunedgesoftness_get(app)), |app, value| App::cvar_r_bakedsunedgesoftness_set(app, APP_R_BAKEDSUNEDGESOFTNESS.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedsunedgesoftness_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_sun_edge_softness = v.clamp(0.0, 24.0); }
+                }
+            }),
+            archive: Some((26036, |state| format!("{:.3}", state.video.baked_sun_edge_softness))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedsunedgesoftness_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_sun_edge_softness)
+                }
+                fn cvar_r_bakedsunedgesoftness_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_sun_edge_softness = Self::parse_cvar_finite(name, value)?.clamp(0.0, 24.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDSUNDIRECTLIMIT {
+        runtime: CvarDef::new("r_bakedSunDirectLimit", "", "0..0.9", "Safety cap on the fraction removed from unpaired BSP lightmap samples. Paired surface fits use their measured shadow baseline and direct-light bound.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedsundirectlimit_get(app)), |app, value| App::cvar_r_bakedsundirectlimit_set(app, APP_R_BAKEDSUNDIRECTLIMIT.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedsundirectlimit_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_sun_direct_limit = v.clamp(0.0, 0.9); }
+                }
+            }),
+            archive: Some((26037, |state| format!("{:.3}", state.video.baked_sun_direct_limit))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedsundirectlimit_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_sun_direct_limit)
+                }
+                fn cvar_r_bakedsundirectlimit_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_sun_direct_limit = Self::parse_cvar_finite(name, value)?.clamp(0.0, 0.9);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDINDIRECTSCALE {
+        runtime: CvarDef::new("r_bakedIndirectScale", "", "0..2", "Brightness multiplier for residual baked illumination only, separate from gamma and runtime sun.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedindirectscale_get(app)), |app, value| App::cvar_r_bakedindirectscale_set(app, APP_R_BAKEDINDIRECTSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedindirectscale_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_indirect_scale = v.clamp(0.0, 2.0); }
+                }
+            }),
+            archive: Some((26038, |state| format!("{:.3}", state.video.baked_indirect_scale))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedindirectscale_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_indirect_scale)
+                }
+                fn cvar_r_bakedindirectscale_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_indirect_scale = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDINDIRECTSATURATION {
+        runtime: CvarDef::new("r_bakedIndirectSaturation", "", "0..2", "Saturation multiplier for residual baked illumination only, not textures or dynamic sunlight.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedindirectsaturation_get(app)), |app, value| App::cvar_r_bakedindirectsaturation_set(app, APP_R_BAKEDINDIRECTSATURATION.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedindirectsaturation_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_indirect_saturation = v.clamp(0.0, 2.0); }
+                }
+            }),
+            archive: Some((26039, |state| format!("{:.3}", state.video.baked_indirect_saturation))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedindirectsaturation_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_indirect_saturation)
+                }
+                fn cvar_r_bakedindirectsaturation_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_indirect_saturation = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+
+    APP_R_BAKEDINDIRECTPOWER {
+        runtime: CvarDef::new("r_bakedIndirectPower", "", "1..4", "Power curve for baked indirect linear luminance. 1 = unchanged; higher values darken dim baked illumination while preserving hue.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedindirectpower_get(app)), |app, value| App::cvar_r_bakedindirectpower_set(app, APP_R_BAKEDINDIRECTPOWER.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedindirectpower_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_indirect_power = v.clamp(1.0, 4.0); }
+                }
+            }),
+            archive: Some((26040, |state| format!("{:.3}", state.video.baked_indirect_power))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedindirectpower_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_indirect_power)
+                }
+                fn cvar_r_bakedindirectpower_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_indirect_power = Self::parse_cvar_finite(name, value)?.clamp(1.0, 4.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BAKEDINDIRECTHIGHLIGHTPRESERVE {
+        runtime: CvarDef::new("r_bakedIndirectHighlightPreserve", "", "0..1", "Restore high-luminance baked lighting after the night power curve. 0 = none; 1 = full highlight retention.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_r_bakedindirecthighlightpreserve_get(app)), |app, value| App::cvar_r_bakedindirecthighlightpreserve_set(app, APP_R_BAKEDINDIRECTHIGHLIGHTPRESERVE.entry.name, &value.to_string())).with_text_setter(App::cvar_r_bakedindirecthighlightpreserve_set, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_indirect_highlight_preserve = v.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((26041, |state| format!("{:.3}", state.video.baked_indirect_highlight_preserve))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_r_bakedindirecthighlightpreserve_get(&self) -> String {
+                    format!("{:.3}", self.video.baked_indirect_highlight_preserve)
+                }
+                fn cvar_r_bakedindirecthighlightpreserve_set(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_indirect_highlight_preserve = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
                     self.sync_post_effects();
                     self.mark_config_dirty();
                     self.publish_ui();
@@ -2429,6 +2692,70 @@ app_cvars! {
                     scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias, debug: self.video.md3_lod_debug,
                     enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
                 });
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_SURFACESPRITES {
+        runtime: CvarDef::new("r_surfaceSprites", "", "0..1", "Draw the map's native JKA surfaceSprites (ground grass/vegetation cards and splash effects). 0 hides them; Godot procedural grass (r_grass) is separate. Applied live.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.surface_sprites)),
+            |app, value| App::cvar_set_r_surfacesprites(app, APP_R_SURFACESPRITES.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_surfacesprites, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.surface_sprites = parse_bool(value).unwrap_or(settings.surface_sprites);
+            }),
+            archive: Some((93, |state| bool_value(state.video.surface_sprites))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_surfacesprites(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.surface_sprites = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetSurfaceSprites(self.video.surface_sprites));
+                self.console_status = format!("JKA SURFACE SPRITES: {}",
+                    if self.video.surface_sprites { "ON" } else { "OFF" });
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_SURFACESPRITESGPU {
+        runtime: CvarDef::new("r_surfaceSpritesGpu", "", "0..1", "A/B: 1 (default) bakes native vertical/flattened/oriented surfaceSprites into GPU-resident instances at map load and only culls 512-unit chunks per frame; 0 regenerates and uploads every sprite on the CPU each frame (original path). Effect-kind sprites always use the CPU path. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.surface_sprites_gpu)),
+            |app, value| App::cvar_set_r_surfacespritesgpu(app, APP_R_SURFACESPRITESGPU.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_surfacespritesgpu, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.surface_sprites_gpu)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_surfacespritesgpu(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.surface_sprites_gpu = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetSurfaceSpritesGpu(self.video.surface_sprites_gpu));
+                self.console_status = format!("SURFACE SPRITES: {}",
+                    if self.video.surface_sprites_gpu { "GPU RESIDENT" } else { "CPU PER FRAME" });
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_STATICMD3INSTANCES {
+        runtime: CvarDef::new("r_staticMd3Instances", "", "0..1", "A/B: 0 original misc_model_static CPU MD3 path; 1 GPU-resident model-space geometry and per-placement transforms for repeated opaque/masked props. Existing CPU PVS/frustum/LOD culling remains; unusual stages and RT fall back. Session only, default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.static_md3_instances)),
+            |app, value| App::cvar_set_r_staticmd3instances(app, APP_R_STATICMD3INSTANCES.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_staticmd3instances, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.static_md3_instances)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_staticmd3instances(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.static_md3_instances = enabled;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.entity_presenter.set_static_md3_instances(enabled);
+                }
+                self.console_status = format!("STATIC MD3 GPU INSTANCES: {} (CPU VISIBILITY + LOD)",
+                    if enabled { "ON" } else { "BASELINE" });
                 self.publish_ui();
                 Ok(())
             }
@@ -4550,39 +4877,6 @@ app_cvars! {
                         self.publish_ui();
                     }
                     Ok(())
-                }
-            }
-        ]
-    }
-
-    APP_R_TERRAINLOD {
-        runtime: CvarDef::new(
-                "r_terrainLod",
-                "",
-                "0..1",
-                "Distance-based geometry LOD aggressiveness for q3map indexed terrain; 0 disables it.",
-                CvarType::String,
-                CvarFlags::NONE,
-                LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_r_terrainlod(app)),
-                |app, value| {
-                    App::cvar_set_r_terrainlod(app, APP_R_TERRAINLOD.entry.name, &value.to_string())
-                },
-            )
-            .with_text_setter(App::cvar_set_r_terrainlod, None),
-        config: CvarBinding {
-                default: Some(|_state| {
-                    "0.000".to_owned()
-                 }),
-                ..CvarBinding::NONE
-            },
-        implementations: [
-            impl App {
-                fn cvar_get_r_terrainlod(&self) -> String {
-                    "0.000".to_owned()
-                }
-                fn cvar_set_r_terrainlod(&mut self, name: &str, _value: &str) -> Result<(), String> {
-                    Err(format!("{name}: cvar is registered but has no setter yet"))
                 }
             }
         ]

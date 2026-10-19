@@ -47,6 +47,7 @@ struct SourceDescriptor {
     scale: Option<f32>,
     max_lods: usize,
     female: bool,
+    jigglebones: bool,
     /// `"rebind"`: how Source geometry is re-placed onto its GLA bone. An authoring
     /// aid for comparing the constructions; the default is the correct one.
     rebind: SourceRebindMode,
@@ -126,6 +127,10 @@ fn parse_descriptor(qpath: &str, bytes: &[u8]) -> Result<SourceDescriptor, Strin
             .get("female")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // Optional per-model A/B switch. Does not discard extra skin weights:
+        // a disabled rig simply animates all its extra bones with their parent.
+        jigglebones: metadata.get("jigglebones")
+            .and_then(|v| v.as_bool()).unwrap_or(true),
         bolt_donor: match metadata.get("bolt_donor").and_then(|v| v.as_str()) {
             None => DEFAULT_BOLT_DONOR.to_owned(),
             Some(path) => {
@@ -323,6 +328,36 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
             rebind: descriptor.rebind,
         },
     )?;
+    let mut body_shape_available = false;
+    let mut body_shape_binding = None;
+    let shape_qpath = format!("models/players/{model_name}/model.bodyshape");
+    if let Some(bytes) = source.read_optional(&shape_qpath, 64 * 1024 * 1024)? {
+        match jka_assets::body_shape::BodyShapeGrid::parse(
+            &bytes, &rig.glm, jka_assets::body_shape::model_fingerprint(&mdl),
+        ) {
+            Ok(grid) => {
+                body_shape_available = true;
+                if let Some(pivots) = grid.apply(&mut rig.glm, &gla, jiggle_remesh.body_shape, rig.native_pivots.as_deref())? {
+                    body_shape_binding = Some(Arc::new(jka_assets::body_shape::BodyShapeBinding::new(
+                        &gla, rig.native_pivots.as_deref(), &pivots,
+                    )?));
+                    // Match the procedural hair pivots to the shaped native
+                    // cranium/parent pivot, just as the ordinary GLA bone
+                    // matrices are rebound by BodyShapeBinding.
+                    if let Some(original) = rig.native_pivots.as_deref() {
+                        for jiggle_bone in &mut rig.source_jiggles {
+                            let parent = jiggle_bone.parent_gla;
+                            for k in 0..3 {
+                                jiggle_bone.rest_frame[k][3] += pivots[parent][k] - original[parent][k];
+                            }
+                        }
+                    }
+                    rig.native_pivots = Some(pivots);
+                }
+            }
+            Err(error) => rverbose!(1, "SOURCE BODY SHAPE WARNING: {model_name}: {error}"),
+        }
+    }
     // A Source `.mdl` has no Ghoul2 tag surfaces, so without these the character
     // has no bolts at all and the saber, weapon flash and jetpack silently vanish.
     let bolts = match source.read_optional(&descriptor.bolt_donor, MAX_GLM_BYTES)? {
@@ -347,6 +382,7 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         }
     };
     let source_native_pivots = rig.native_pivots.map(Arc::new);
+    let source_jiggles = (!rig.source_jiggles.is_empty()).then(|| Arc::new(rig.source_jiggles));
     let glm = Arc::new(rig.glm);
     // Source geometry is already rebound and weighted to _humanoid. The
     // stock GLM auto detector requires Raven helper surfaces, which Source
@@ -402,14 +438,24 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
     }
 
     log_source_diagnostics(model_name, &descriptor, &rig.diagnostics, bolts);
+    if rig.diagnostics.source_jiggle_bones > 0 {
+        println!("SOURCE JIGGLEBONES: {model_name}: {} procedural bones, {} weighted influences, simulation={} (source_model.json jigglebones)",
+            rig.diagnostics.source_jiggle_bones,
+            rig.diagnostics.source_jiggle_weighted_vertices,
+            descriptor.jigglebones);
+    }
 
     Ok(PlayerModelAsset {
+        body_shape_available,
+        body_shape_binding,
         key,
         glm,
         gla,
         animation_gla,
         retargeter,
         source_native_pivots,
+        source_jiggles,
+        source_jiggles_enabled: descriptor.jigglebones,
         // A Source player is driven by `players/_humanoid/`, so it takes the
         // ordinary multiplayer animation and BG_G2PlayerAngles path.
         humanoid: true,

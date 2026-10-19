@@ -3,6 +3,36 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_baked_sun_debug ["baked_sun_debug"] ("baked_sun_debug <0|1|2>", "Baked sunlight diagnostic: 0 normal, 1 removed amount, 2 sun visibility.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let mode = match words.as_slice() {
+            [_, "0"] => 0,
+            [_, "1"] => 1,
+            [_, "2"] => 2,
+            _ => {
+                self.push_console_line("usage: baked_sun_debug <0|1|2>".to_owned());
+                return CommandResult::Handled;
+            }
+        };
+        self.baked_sun_debug_view = mode;
+        self.sun_ray_until = None;
+        self.sync_sun_ray();
+        CommandResult::Handled
+    }
+    cmd_bluewater_coast_debug ["bluewater_coast_debug"] ("bluewater_coast_debug", "Inspect upstream coastal depth, fetch and wave attenuation at the view position.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("usage: bluewater_coast_debug".to_owned());
+            return CommandResult::Handled;
+        }
+        let at = [self.camera.position.x as f64 / crate::ocean::OCEAN_UNITS_PER_METER as f64,
+                  self.camera.position.z as f64 / crate::ocean::OCEAN_UNITS_PER_METER as f64];
+        let lines = self.prepared_map_cache.as_ref()
+            .and_then(|cache| cache.map.coastal_bathymetry.as_ref())
+            .map(|job| job.upstream_shore.report(at, &self.video.ocean_settings))
+            .unwrap_or_else(|| vec!["No upstream shore source: load a BSP with water promotion enabled.".into()]);
+        for line in lines { self.push_console_line(line); }
+        CommandResult::Handled
+    }
     cmd_gpu_info ["gpu_info"] ("gpu_info", "Show the active graphics adapter and staged GPU preference.", CommandScope::Always) |self, line| {
         if line.split_whitespace().count() != 1 { self.push_console_line("usage: gpu_info".to_owned()); return CommandResult::Handled; }
         self.push_console_line(format!("GPU ACTIVE: {} ({}) | backend {}", self.active_gpu_name,
@@ -110,6 +140,21 @@ commands! {
                 for line in self.predictor.regime_report(&command_rate) {
                     self.push_console_line(line);
                 }
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_hybridwave ["hybridwave", ] ("hybridwave", "Write the Hybrid ocean wave-classification log (last ~600 frames + settings) to <game>/hybridwave/*.txt and queue a PNG screenshot at the same moment. Send both files.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                let path = self.game_write_path(std::path::PathBuf::from("hybridwave")
+                    .join(format!("hybridwave-{}.txt", demo_recording_timestamp())));
+                self.push_console_line(format!("hybridwave: {}", path.display()));
+                self.render_command(RenderCommand::HybridWaveDump { path });
+                self.request_screenshot_png();
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,
@@ -313,6 +358,43 @@ commands! {
         }
     }
 
+    cmd_menudevmap ["menudevmap", ] ("menudevmap", "devmap mp/duel9 with the main-menu look (Yavin retextures, water, campfire and waterfall fx) but without the props. Then run `menuent` to stage the props as editable Map Mods placements.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                self.menu_look_oneshot = true;
+                self.execute_command_line("devmap mp/duel9");
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_placeedit ["placeedit", ] ("placeedit", "Edit the staged model placements: aim at one and click to pick it up (move, wheel to scale, right-drag to rotate, click to drop), Ctrl+click copies, Delete/X removes, Ctrl+Z undoes, E toggles back to placing, Esc exits.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                self.enter_placement_edit();
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_menuent ["menuent", ] ("menuent [overwrite]", "In a menudevmap session: load the menu props from mapmods/mp/duel9.ent as editable Map Mods placements (writing it from the built-in layout first if it does not exist; `menuent overwrite` rewrites it from the built-in layout). Edit them with the placement tool, then Map Mods > EXPORT to mapmods/mp/duel9.ent: the main menu reads that file.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let overwrite = match words.as_slice() {
+            [_verb] => false,
+            [_verb, arg] if arg.eq_ignore_ascii_case("overwrite") => true,
+            _ => return CommandResult::Unhandled,
+        };
+        match self.write_default_menu_ent(overwrite) {
+            Ok(message) => self.push_console_line(format!("^5MENUENT:^7 {message}")),
+            Err(error) => self.push_console_line(format!("^1menuent:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
     cmd_oceanpool ["oceanpool", ] ("oceanpool [pool] [reset | amp wavelength direction speed steepness slosh windchop foam spray]", "Script the Water settings page's local pool override (1-based pool number as in the pool label). No arguments lists pools; 'reset' is RESET OCEAN DEFAULTS.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -353,6 +435,42 @@ commands! {
             }
             _ => return CommandResult::Unhandled,
         }
+    }
+
+    cmd_oceanwake ["oceanwake", ] ("oceanwake ship [boat|destroyer|battleship] [m/s] [circle radius m] | strike [round|charge|aircraft] [size] | clear | reset", "Drive Blue Water's ship wake (r_oceanWake 1, native / Hybrid ocean). 'ship' sails a proxy hull ahead of the camera (radius 0: a straight run across the view); 'strike' drops an impact 60 m ahead (round: calibre m; charge: kg TNT; aircraft: m/s).", CommandScope::Always) |self, command| {
+        use crate::ocean::{ShipClass, StrikeKind, WakeCommand};
+        let words: Vec<_> = command.split_whitespace().collect();
+        let number = |word: Option<&&str>, default: f32| word.and_then(|w| w.parse::<f32>().ok()).unwrap_or(default);
+        let wake = match words.as_slice() {
+            [_verb, "ship", rest @ ..] => {
+                let class = rest.first().and_then(|w| ShipClass::parse(w));
+                let offset = usize::from(class.is_some());
+                let class = class.unwrap_or(ShipClass::Destroyer);
+                let default_speed = match class { ShipClass::Boat => 9.0, ShipClass::Destroyer => 14.0, ShipClass::Battleship => 12.0 };
+                let default_radius = match class { ShipClass::Boat => 60.0, ShipClass::Destroyer => 250.0, ShipClass::Battleship => 450.0 };
+                WakeCommand::Demo { class, speed: number(rest.get(offset), default_speed), radius: number(rest.get(offset + 1), default_radius) }
+            }
+            [_verb, "strike", rest @ ..] => {
+                let size = rest.get(1);
+                let kind = match rest.first().copied().unwrap_or("round") {
+                    "charge" => StrikeKind::Charge { kg: number(size, 500.0), depth: 0.0 },
+                    "aircraft" => StrikeKind::Aircraft { speed: number(size, 60.0) },
+                    _ => StrikeKind::Round { caliber_m: number(size, 0.38), speed: 700.0 },
+                };
+                WakeCommand::StrikeAhead { distance_m: 60.0, kind }
+            }
+            [_verb, "clear"] => { self.render_command(RenderCommand::OceanWake(WakeCommand::ClearShips)); WakeCommand::ClearDemos }
+            [_verb, "reset"] => WakeCommand::Reset,
+            _ => {
+                self.push_console_line(format!("r_oceanWake {} (set 1 to enable). usage: oceanwake ship [boat|destroyer|battleship] [m/s] [circle radius m] | strike [round|charge|aircraft] [size] | clear | reset", self.video.ocean_settings.blue_wake));
+                return CommandResult::Handled;
+            }
+        };
+        if self.video.ocean_settings.blue_wake == 0 {
+            self.push_console_line("^3oceanwake: r_oceanWake is 0, so Blue Water's wake is off; set it to 1 (native or Hybrid ocean).".to_owned());
+        }
+        self.render_command(RenderCommand::OceanWake(wake));
+        CommandResult::Handled
     }
 
     cmd_perfsample ["perfsample", ] ("perfsample [arguments]", "perfsample <seconds> [label]: hold the command buffer, then print the average render FPS.", CommandScope::Always) |self, command| {

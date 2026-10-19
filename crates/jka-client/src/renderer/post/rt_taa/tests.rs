@@ -314,8 +314,10 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         assert!(affected > 0 && untouched > 0);
         // No lights, removed light, revealed surface, invalid history and camera
-        // reset must all return the current MSAA color, without temporal trails.
-        for case in 0..5 {
+        // reset and native-weather motion markers must all return the current
+        // MSAA color, without temporal trails.
+        for case in 0..6 {
+            write(&motion, bytemuck::cast_slice(&[if case == 5 { 0x4000u16 } else { 0 }; 64]), 4);
             lighting.values[1] = if case == 0 { 0 } else { 1 };
             light.shadow[3] = if case == 1 { 0.0 } else { 1.0 };
             post.scene.history_valid = if case == 4 { 0.0 } else { 1.0 };
@@ -338,6 +340,6 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
                 assert_eq!(&p[..3], &raw[i][..3], "case {case} pixel {i}");
             }
         }
-        println!("regional TAA: {affected} filtered pixels, {untouched} unchanged; 5 history rejection cases passed");
+        println!("regional TAA: {affected} filtered pixels, {untouched} unchanged; 6 history rejection cases passed");
     });
 }

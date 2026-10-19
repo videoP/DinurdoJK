@@ -11,7 +11,7 @@ impl App {
     pub(in crate::app::egui_menu) fn build_egui_frontend_menu(&mut self, ui: &mut egui::Ui) {
         self.egui_frontend_scene_fade(ui);
         self.egui_frontend_header(ui);
-        if self.overlay == OverlayMode::Video {
+        if self.egui_display_overlay() == OverlayMode::Video {
             self.egui_setup_tabs(ui);
             self.egui_footer(ui);
             self.egui_body(ui);
@@ -28,6 +28,12 @@ impl App {
     /// hit-testable Area or blocking loading overlay. Until the renderer has
     /// presented the first dark frame the scrim is fully opaque.
     fn egui_frontend_2d_fade(&self, ui: &egui::Ui) {
+        // Background decoding/preparation stays asynchronous. A preferred-page
+        // launch must never wait behind the scene's presentation clock, even
+        // when navigating back to Main before the scene is ready.
+        if self.frontend_skip_chrome_fade || self.frontend_page == FrontendPage::Main {
+            return;
+        }
         let ctx = ui.ctx();
         let now = std::time::Instant::now();
         let shown = self.frontend_stage.brightness(now, FRONTEND_CHROME_FADE_IN_SECS);
@@ -105,7 +111,11 @@ impl App {
             });
         let image_expected =
             self.frontend_scene_texture.is_some() || self.frontend_stage.cache_pending;
-        let darkness = if image_expected {
+        // Main displays the art-directed scene without artificial darkening.
+        // Retain the cached still -> live-3D handoff, not the old black scrim.
+        let darkness = if self.frontend_page == FrontendPage::Main {
+            0.0
+        } else if image_expected {
             1.0 - self.frontend_stage.brightness(now, FRONTEND_STAGE_FADE_IN_SECS)
         } else {
             1.0 - handoff
@@ -156,7 +166,7 @@ impl App {
                         theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
                         ui.add_space(14.0);
                     }
-                    let page = if self.overlay == OverlayMode::Video {
+                    let page = if self.egui_display_overlay() == OverlayMode::Video {
                         "SETTINGS"
                     } else {
                         match self.frontend_page {
@@ -175,7 +185,7 @@ impl App {
                         }
                     };
                     theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
-                    if self.overlay == OverlayMode::Video
+                    if self.egui_display_overlay() == OverlayMode::Video
                         || self.frontend_page != FrontendPage::Main
                     {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

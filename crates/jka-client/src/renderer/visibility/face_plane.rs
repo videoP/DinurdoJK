@@ -224,6 +224,27 @@ pub(in crate::renderer) fn selection_stats(batch: &WorldBatch, cull: &RunCull) -
     }
     let Some(range) = run_range(batch) else { return (FacePlaneSelection::Keep, 0); };
     let count = range.end - range.start;
+    if cull.water.is_none() {
+        // Face planes alone never split a batch: the rasterizer already drops
+        // back faces, so a partial cull would only trade them for extra draws
+        // and break the batch out of its compact multi-draw. Like JKA's
+        // R_CullSurface, only a batch whose every surface faces away is skipped,
+        // and the first surviving run ends the scan.
+        if !cull.face_planes {
+            return (FacePlaneSelection::Keep, 0);
+        }
+        let mut cursor = 0u32;
+        for run in batch.face_cull_runs.iter() {
+            if run.offsets.start != cursor || run.offsets.end > count || run.offsets.start >= run.offsets.end
+                || !face_plane_rejected(run.plane, cull.camera)
+            {
+                return (FacePlaneSelection::Keep, 0);
+            }
+            cursor = run.offsets.end;
+        }
+        let selection = if cursor == count { FacePlaneSelection::Reject } else { FacePlaneSelection::Keep };
+        return (selection, 0);
+    }
     let mut removed = 0u32;
     let mut by_water = 0u32;
     let mut cursor = 0u32;
@@ -241,9 +262,10 @@ pub(in crate::renderer) fn selection_stats(batch: &WorldBatch, cull: &RunCull) -
         }
     }
     if cursor != count { return (FacePlaneSelection::Keep, 0); }
-    if removed == 0 { (FacePlaneSelection::Keep, 0) }
-    else if removed == count { (FacePlaneSelection::Reject, by_water) }
-    else { (FacePlaneSelection::Partial, by_water) }
+    if removed == count { (FacePlaneSelection::Reject, by_water) }
+    // Only water absorption justifies split draws; see the face-plane-only path.
+    else if by_water > 0 { (FacePlaneSelection::Partial, by_water) }
+    else { (FacePlaneSelection::Keep, 0) }
 }
 
 /// Main-camera CPU draw for partial batches. Adjacent surviving BSP face-runs

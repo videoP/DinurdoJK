@@ -23,6 +23,11 @@ pub mod rain_heights;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/environment.rs"]
 pub mod sky_environment;
 pub mod surface_waves;
+#[path = "../../../vendor/blue-water-sea-and-sky/ocean/src/shore.rs"]
+pub mod shore;
+#[path = "../../../vendor/blue-water-sea-and-sky/ocean/src/hull_sea.rs"]
+pub mod hull_sea;
+pub mod lakes;
 use blue_water_core::{sea_state, spectrum, whitecaps, CascadeInfo, QualityTier, WaveParameters};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -515,6 +520,7 @@ impl WaveField {
         self.cascades = sea_state::sea_state_cascades(&self.tier, self.sea.peak_wavelength);
         let wave = spectrum::build_spectrum(&self.cascades, &self.sea);
         self.surface_stats = surface_waves::SpectrumStats::from_spectrum(&wave);
+        self.surface_stats.set_shore_tables(&wave, self.sea.wind_speed);
         let n = self.n as usize;
         let count = self.count as usize;
         let mut atlas = vec![0f32; n * n * count * 4];

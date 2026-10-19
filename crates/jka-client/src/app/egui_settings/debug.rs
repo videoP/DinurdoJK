@@ -271,17 +271,6 @@ impl App {
             );
         }
 
-        theme::row(
-            ui,
-            "Event worker queue",
-            "A/B test for client event processing. Off performs the same semantic preparation on the CGame thread. On prepares multi-event receive batches on a dedicated worker pool, then applies all player/audio/FX/presentation side effects in original queue order. Single-event batches intentionally stay inline.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(value) = theme::switch(ui, self.cg_event_workers) {
-                    let _ = self.set_console_cvar("cg_eventWorkers", if value { "1" } else { "0" });
-                }
-            },
-        );
         self.egui_toggle_row(
             ui,
             "GPU timestamps",

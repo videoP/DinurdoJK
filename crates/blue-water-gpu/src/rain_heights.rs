@@ -312,15 +312,15 @@ impl RainHeights {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: surface.calm_wake.as_entire_binding(),
+                    resource: surface.wake_resources().uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&surface.calm_view),
+                    resource: wgpu::BindingResource::TextureView(&surface.wake_resources().displays[0]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&surface.calm_view),
+                    resource: wgpu::BindingResource::TextureView(&surface.wake_resources().displays[1]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,

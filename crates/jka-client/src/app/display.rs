@@ -84,6 +84,8 @@ pub(in crate::app) enum MapLoadPurpose {
 pub(in crate::app) struct FrontendCinematic {
     pub(in crate::app) position: [f32; 3],
     pub(in crate::app) yaw: f32,
+    /// Camera pitch in radians (App::camera convention).
+    pub(in crate::app) pitch: f32,
     /// The Ghoul2 clock is independent of camera animation and GPU upload.
     pub(in crate::app) anim_started: Instant,
     /// Actual first frame containing this uploaded BSP, not model readiness.

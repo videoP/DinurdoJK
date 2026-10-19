@@ -19,13 +19,15 @@ impl App {
         theme::row(
             ui,
             "Wind speed",
-            "Base atmospheric wind speed in JKA map units per second.",
+            "Base atmospheric wind speed in knots.",
             theme::Reset::Environment(ui::ENV_ROW_WEATHER_WIND_SPEED),
             |ui| {
-                let mut value = wind.speed;
-                let readout = format!("{value:.0} u/s");
-                if theme::slider(ui, &mut value, 0.0..=8192.0, &readout) {
-                    self.set_weather_wind_speed(value);
+                // Stored in map units/s; the ocean scale is 40 units per metre.
+                let units_per_knot = 0.514_444 * crate::ocean::OCEAN_UNITS_PER_METER;
+                let mut value = (wind.speed / units_per_knot).clamp(0.0, 250.0);
+                let readout = format!("{value:.0} kt");
+                if theme::slider(ui, &mut value, 0.0..=250.0, &readout) {
+                    self.set_weather_wind_speed(value * units_per_knot);
                 }
             },
         );
@@ -65,19 +67,6 @@ impl App {
                 let readout = format!("{value:.0}°");
                 if theme::slider(ui, &mut value, 0.0..=180.0, &readout) {
                     self.set_weather_direction_variation(value);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Wind visuals",
-            "Camera-centred airborne dust and sparse gust wisps driven by the same atmospheric wind as rain, grass and ocean. Sheltered areas are suppressed by the weather heightfield.",
-            theme::Reset::Environment(ui::ENV_ROW_WIND_VISUALS),
-            |ui| {
-                let mut value = self.video.wind_visuals;
-                let readout = percent(value);
-                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
-                    self.set_wind_visuals(value);
                 }
             },
         );
@@ -129,6 +118,19 @@ impl App {
             self.set_weather_type(selected_weather);
         }
 
+        theme::row(
+            ui,
+            "Wind visuals",
+            "Camera-centred airborne dust specks and sparse gust wisps. Off by default, independent of Weather type and r_we clear (console: r_windVisuals). Driven by the atmospheric wind; sheltered areas are suppressed by the weather heightfield.",
+            theme::Reset::Environment(ui::ENV_ROW_WIND_VISUALS),
+            |ui| {
+                let mut value = self.video.wind_visuals;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_wind_visuals(value);
+                }
+            },
+        );
         let weather = self.effective_weather_type();
         if weather.is_rain() {
             self.egui_environment_toggle(

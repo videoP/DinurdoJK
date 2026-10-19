@@ -1,7 +1,7 @@
 //! Post.
 use crate::app::egui_settings::{
     index_of, percent, quality_table_row, segmented_row, theme, ui, App, CrtMask, CrtQuality,
-    CrtReferenceResolution, CrtScope, CrtStyle, DofQuality, GlowMode,
+    CrtReferenceResolution, CrtScope, CrtStyle, DofMode, DofQuality, GlowMode,
 };
 
 impl App {
@@ -203,6 +203,22 @@ impl App {
                 }
             },
         );
+        const DOF_MODES: [(DofMode, &str); 3] = [
+            (DofMode::Off, "Off"),
+            (DofMode::UnderwaterOnly, "Underwater only"),
+            (DofMode::On, "On"),
+        ];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Depth of field mode",
+            "r_dofMode: Off disables blur; Underwater only focuses at a fixed 48 game units (no autofocus); On uses the normal focus behavior.",
+            theme::Reset::Video(ui::VIDEO_ROW_DOF_MODE),
+            self.video.dof_mode,
+            &DOF_MODES,
+        ) {
+            self.set_dof_mode(mode);
+        }
+
         theme::row(
             ui,
             "Depth of field",
@@ -218,17 +234,19 @@ impl App {
             },
         );
 
-        theme::row(
-            ui,
-            "Autofocus",
-            "r_dofAutoFocus. When depth of field is enabled, continuously focuses on the surface under the crosshair. Off holds the current focus distance.",
-            theme::Reset::Video(ui::VIDEO_ROW_DOF_AUTOFOCUS),
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.video.dof_autofocus) {
-                    let _ = self.set_console_cvar("r_dofAutoFocus", if enabled { "1" } else { "0" });
-                }
-            },
-        );
+        if self.video.dof_mode == DofMode::On {
+            theme::row(
+                ui,
+                "Autofocus",
+                "r_dofAutoFocus. When depth of field is enabled, continuously focuses on the surface under the crosshair. Off holds the current focus distance.",
+                theme::Reset::Video(ui::VIDEO_ROW_DOF_AUTOFOCUS),
+                |ui| {
+                    if let Some(enabled) = theme::switch(ui, self.video.dof_autofocus) {
+                        let _ = self.set_console_cvar("r_dofAutoFocus", if enabled { "1" } else { "0" });
+                    }
+                },
+            );
+        }
 
         const DOF: [(DofQuality, &str); 3] = [
             (DofQuality::Performance, "Performance"),

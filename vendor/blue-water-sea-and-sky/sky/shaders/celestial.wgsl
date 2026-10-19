@@ -288,7 +288,9 @@ fn celestial_radiance(direction: vec3<f32>) -> vec3<f32> {
     if sky.night > 0.0 && direction.y > sky.star_horizon {
         let galactic = to_galactic(direction);
         let s = stars(galactic, direction, pixel);
-        result += (s + (milky_way(galactic, 0.0) + NIGHT_GLOW) * sky.milky_way) * (1.0 - moon_cover(direction, sky.moon_direction, pixel));
+        // `sky.haze.z` is the host's night sky brightness: it dims the dome's flat glow only, not the Milky Way, the
+        // stars, or the environment bake's glow (`celestial_diffuse_radiance`).
+        result += (s + (milky_way(galactic, 0.0) + NIGHT_GLOW * sky.haze.z) * sky.milky_way) * (1.0 - moon_cover(direction, sky.moon_direction, pixel));
     }
     return result;
 }

@@ -127,12 +127,16 @@ impl App {
             let origin = self.live_entity_origin(entity);
             origins.push(Some(origin));
         }
+        let placement_signature = self.placement_marker_signature();
         if self.entity_marker_cache.as_ref().is_some_and(|(id, old)| {
             *id == graph_id && *old == origins
-        }) {
+        }) && self.entity_marker_placement_sig == placement_signature {
             return;
         }
         let mut mesh = jka_assets::bsp::DebugVolumeMesh::default();
+        // Staged models and effects (Map Mods / the placement tool) belong in the
+        // same view: green boxes for models, magenta ring-and-arrow for effects.
+        self.push_placement_markers(&mut mesh);
         for (entity, origin) in graph.entities.iter().zip(origins.iter()) {
             if let Some(origin) = origin {
                 let (mins, maxs) = entity_marker_box(entity, *origin);
@@ -146,6 +150,7 @@ impl App {
         }
         self.render_command(RenderCommand::SetEntityMarkers(Some(mesh)));
         self.entity_marker_cache = Some((graph_id, origins));
+        self.entity_marker_placement_sig = placement_signature;
     }
 
     /// Nearest `r_drawEntities` marker box under the center crosshair, as an
@@ -351,7 +356,7 @@ impl App {
                 && (settings.dynamic != 0
                     || settings.identify_target
                     || settings.names != 0.0
-                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus))
+                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus))
                 && matches!(
                     self.overlay,
                     OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs
@@ -366,7 +371,7 @@ impl App {
             }
             return;
         }
-        let dof_autofocus = self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus;
+        let dof_autofocus = self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus;
         let scan_interval = if force_chat_scan || settings.dynamic != 0 || dof_autofocus {
             Duration::ZERO
         } else {

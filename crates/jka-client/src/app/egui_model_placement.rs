@@ -45,7 +45,50 @@ impl BmodelPlacement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PlacementKind { Md3, Bmodel }
+pub(super) enum PlacementKind { Md3, Bmodel, Fx }
+
+/// A placed effect, exported as an `fx_runner` entity: `effect` is the
+/// `fxFile` value (`env/small_fire`), `angles` aim it (JKA pitch/yaw/roll;
+/// `-90 0 0` is straight up) and it replays every `delay_ms` like OpenJK's runner.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct FxPlacement {
+    pub effect: String,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    pub delay_ms: i32,
+}
+
+/// Live playback of the placed effects while editing (the placement tool's
+/// own FX scheduler, separate from CGame's).
+pub(super) struct PlacementFx {
+    system: crate::fx::system::FxSystem,
+    started: Instant,
+    ids: HashMap<String, crate::fx::system::EffectId>,
+    /// Next replay time per placed effect, and for the one in hand.
+    next: Vec<i32>,
+    ghost_next: i32,
+}
+
+/// Effect path as a runner's `fxFile` wants it: no `effects/` prefix or `.efx`.
+fn fx_runner_name(qpath: &str) -> String {
+    let lower = qpath.replace('\\', "/");
+    let trimmed = lower.strip_prefix("effects/").unwrap_or(&lower);
+    trimmed.strip_suffix(".efx").unwrap_or(trimmed).to_owned()
+}
+
+/// Distance along a ray to a sphere (used to pick effect gizmos).
+fn ray_hits_sphere(start: [f32; 3], direction: [f32; 3], center: [f32; 3], radius: f32) -> Option<f32> {
+    let offset: [f32; 3] = std::array::from_fn(|j| start[j] - center[j]);
+    let b = offset[0] * direction[0] + offset[1] * direction[1] + offset[2] * direction[2];
+    let c = offset.iter().map(|v| v * v).sum::<f32>() - radius * radius;
+    let discriminant = b * b - c;
+    if discriminant < 0.0 { return None; }
+    let distance = -b - discriminant.sqrt();
+    (distance > 0.0 || c < 0.0).then_some(distance.max(0.0))
+}
+
+/// Radius of the pick sphere around a placed effect.
+const FX_PICK_RADIUS: f32 = 28.0;
 
 pub(super) struct ModelPlacementUi {
     pub kind: PlacementKind,
@@ -61,6 +104,26 @@ pub(super) struct ModelPlacementUi {
     pub ent_filename: String,
     pub ent_overwrite: bool,
     pub ent_status: String,
+    /// Edit mode: with no model in hand the crosshair picks existing
+    /// placements up (move / copy / delete) instead of stamping a new one.
+    pub edit_mode: bool,
+    /// Placement under the crosshair in edit mode.
+    pub hover: Option<usize>,
+    /// The original of a picked-up placement, restored by Esc.
+    pub held: Option<ModelPlacement>,
+    /// Whole-list snapshots (models, effects) taken before each edit-mode
+    /// pickup or delete.
+    pub edit_undo: Vec<(Vec<ModelPlacement>, Vec<FxPlacement>)>,
+    pub fx_placed: Vec<FxPlacement>,
+    /// Effect in hand (placing a new one, or a picked-up one) and its delay.
+    pub fx_selection: Option<String>,
+    pub fx_delay: f32,
+    pub fx_held: Option<FxPlacement>,
+    pub fx_hover: Option<usize>,
+    pub fx_runtime: Option<PlacementFx>,
+    pub fx_draws: Arc<Vec<DynamicModelSurface>>,
+    /// The browser lists effects instead of models.
+    pub picker_effects: bool,
     pub search: String,
     pub sort: usize,
     pub active: bool,
@@ -92,6 +155,10 @@ impl Default for ModelPlacementUi {
             bmodel_placed: Vec::new(),
             bmodel_collision_dirty: true, bmodel_collision_local: false,
             ent_filename: String::new(), ent_overwrite: false, ent_status: String::new(),
+            edit_mode: false, hover: None, held: None, edit_undo: Vec::new(),
+            fx_placed: Vec::new(), fx_selection: None, fx_delay: 200.0, fx_held: None,
+            fx_hover: None, fx_runtime: None, fx_draws: Arc::new(Vec::new()),
+            picker_effects: false,
             search: String::new(), sort: 0, active: false, rotating: false,
             hit_valid: false, selection: None, scale: 1.0, angles: [0.0; 3],
             origin: [0.0; 3], bounds: None, placed: Vec::new(),
@@ -112,6 +179,31 @@ pub(super) fn model_axis(angles: [f32; 3], scale: f32) -> [[f32; 3]; 3] {
     let right = [-sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp];
     let up = [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp];
     [forward, [-right[0], -right[1], -right[2]], up].map(|v| v.map(|c| c * scale))
+}
+
+/// Distance along a world ray to its first entry into a placement's oriented
+/// bounds (the ray is carried into model space, where the bounds are an AABB).
+fn ray_hits_placement(start: [f32; 3], direction: [f32; 3], placement: &ModelPlacement) -> Option<f32> {
+    let scale_sq = placement.scale * placement.scale;
+    if !(scale_sq > 1.0e-12) { return None; }
+    let axis = model_axis(placement.angles, placement.scale);
+    let relative: [f32; 3] = std::array::from_fn(|j| start[j] - placement.origin[j]);
+    let dot = |k: usize, v: [f32; 3]| (axis[k][0] * v[0] + axis[k][1] * v[1] + axis[k][2] * v[2]) / scale_sq;
+    let origin: [f32; 3] = std::array::from_fn(|k| dot(k, relative));
+    let delta: [f32; 3] = std::array::from_fn(|k| dot(k, direction));
+    let (mins, maxs) = placement.bounds;
+    let (mut near, mut far) = (0.0_f32, f32::INFINITY);
+    for k in 0..3 {
+        if delta[k].abs() < 1.0e-9 {
+            if origin[k] < mins[k] || origin[k] > maxs[k] { return None; }
+        } else {
+            let (a, b) = ((mins[k] - origin[k]) / delta[k], (maxs[k] - origin[k]) / delta[k]);
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+            if near > far { return None; }
+        }
+    }
+    Some(near)
 }
 
 fn placement_corners(placement: &ModelPlacement) -> [[f32; 3]; 8] {
@@ -261,6 +353,11 @@ impl App {
             }
         };
         self.model_placement.kind = PlacementKind::Md3;
+        // Choosing a model from the browser is "place new", not "edit".
+        self.model_placement.edit_mode = false;
+        self.model_placement.held = None;
+        self.model_placement.fx_selection = None;
+        self.model_placement.fx_held = None;
         self.model_placement.selection = Some(qpath);
         self.model_placement.scale = 1.0;
         self.model_placement.angles = [0.0; 3];
@@ -272,7 +369,141 @@ impl App {
         self.set_overlay(OverlayMode::None);
     }
 
+    /// Edit mode: move / copy / delete the placements already in the list
+    /// (staged by the placement tool, `menuent`, or a Map Mods import).
+    pub(in crate::app) fn enter_placement_edit(&mut self) {
+        if self.prepared_map_cache.is_none() || self.map_collision.is_none() {
+            self.console_status = "PLACEMENT EDIT: LOAD A MAP FIRST".into();
+            self.publish_ui();
+            return;
+        }
+        let state = &mut self.model_placement;
+        state.map_label = self.prepared_map_cache.as_ref()
+            .map(|map| map.label.clone()).unwrap_or_default();
+        state.kind = PlacementKind::Md3;
+        state.edit_mode = true;
+        state.active = true;
+        state.rotating = false;
+        state.selection = None;
+        state.bounds = None;
+        state.held = None;
+        state.hover = None;
+        state.fx_selection = None;
+        state.fx_held = None;
+        state.fx_hover = None;
+        state.hit_valid = false;
+        state.preview_key = None;
+        state.preview_draws = Arc::new(Vec::new());
+        state.status = format!("Edit mode: {} model(s), {} fx", state.placed.len(), state.fx_placed.len());
+        self.set_overlay(OverlayMode::None);
+        self.egui_repaint_requested = true;
+    }
+
+    /// Primary click. In edit mode with nothing in hand it picks up the
+    /// placement under the crosshair (`copy` keeps the original); otherwise it
+    /// stamps the model in hand.
+    pub(in crate::app) fn placement_click(&mut self, copy: bool) {
+        let state = &mut self.model_placement;
+        if !(state.edit_mode && state.selection.is_none() && state.fx_selection.is_none()
+            && state.kind == PlacementKind::Md3) {
+            self.stamp_placement();
+            return;
+        }
+        // An effect under the crosshair: pick it up the same way.
+        if let Some(index) = state.fx_hover.filter(|&index| index < state.fx_placed.len()) {
+            state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
+            let picked = if copy { state.fx_placed[index].clone() } else { state.fx_placed.remove(index) };
+            state.fx_held = (!copy).then(|| picked.clone());
+            state.fx_selection = Some(picked.effect);
+            state.fx_delay = picked.delay_ms as f32;
+            state.angles = picked.angles;
+            state.origin = picked.origin;
+            state.kind = PlacementKind::Fx;
+            state.fx_hover = None;
+            state.hit_valid = false;
+            state.status = if copy { "Effect copy picked up: click to place".into() }
+                else { "Effect picked up: click to drop (Esc puts it back)".into() };
+            return;
+        }
+        let Some(index) = state.hover.filter(|&index| index < state.placed.len()) else { return; };
+        state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
+        let picked = if copy { state.placed[index].clone() } else { state.placed.remove(index) };
+        state.held = (!copy).then(|| picked.clone());
+        state.selection = Some(picked.qpath);
+        state.bounds = Some(picked.bounds);
+        state.scale = picked.scale;
+        state.angles = picked.angles;
+        state.origin = picked.origin;
+        state.hover = None;
+        state.hit_valid = false;
+        state.preview_key = None;
+        state.placed_dirty = true;
+        state.status = if copy { "Copy picked up: click to place".into() }
+            else { "Picked up: click to drop (Esc puts it back)".into() };
+    }
+
+    /// Delete the placement under the crosshair (edit mode, nothing in hand).
+    pub(in crate::app) fn delete_hovered_placement(&mut self) {
+        let state = &mut self.model_placement;
+        if !(state.edit_mode && state.selection.is_none() && state.fx_selection.is_none()) { return; }
+        if let Some(index) = state.fx_hover.filter(|&index| index < state.fx_placed.len()) {
+            state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
+            let removed = state.fx_placed.remove(index);
+            state.fx_hover = None;
+            state.status = format!("Deleted effect {} ({} left; Ctrl+Z undoes)", removed.effect, state.fx_placed.len());
+            return;
+        }
+        let Some(index) = state.hover.filter(|&index| index < state.placed.len()) else { return; };
+        state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
+        let removed = state.placed.remove(index);
+        state.hover = None;
+        state.placed_dirty = true;
+        state.status = format!("Deleted {} ({} left; Ctrl+Z undoes)", removed.qpath, state.placed.len());
+    }
+
+    /// `E` toggles between placing a model and editing placed ones.
+    pub(in crate::app) fn toggle_placement_edit(&mut self) {
+        if self.model_placement.edit_mode {
+            self.model_placement.edit_mode = false;
+            self.cancel_placement();
+        } else {
+            self.enter_placement_edit();
+        }
+    }
+
     pub(in crate::app) fn cancel_placement(&mut self) {
+        // Edit mode with a picked-up model or effect: Esc puts it back and stays
+        // in edit mode.
+        if self.model_placement.edit_mode
+            && (self.model_placement.selection.is_some() || self.model_placement.fx_selection.is_some()) {
+            let state = &mut self.model_placement;
+            if let Some(original) = state.held.take() {
+                state.placed.push(original);
+            }
+            if let Some(original) = state.fx_held.take() {
+                state.fx_placed.push(original);
+            }
+            state.kind = PlacementKind::Md3;
+            state.fx_selection = None;
+            state.selection = None;
+            state.bounds = None;
+            state.hit_valid = false;
+            state.preview_key = None;
+            state.preview_draws = Arc::new(Vec::new());
+            state.placed_dirty = true;
+            state.status = "Edit mode".into();
+            self.egui_repaint_requested = true;
+            return;
+        }
+        self.model_placement.edit_mode = false;
+        self.model_placement.held = None;
+        self.model_placement.hover = None;
+        self.model_placement.fx_held = None;
+        self.model_placement.fx_hover = None;
+        self.model_placement.fx_selection = None;
+        if self.model_placement.kind == PlacementKind::Fx {
+            self.model_placement.kind = PlacementKind::Md3;
+        }
         self.model_placement.active = false;
         self.model_placement.rotating = false;
         self.model_placement.hit_valid = false;
@@ -281,8 +512,48 @@ impl App {
         self.egui_repaint_requested = true;
     }
 
+    /// Choose an effect from the browser: it follows the crosshair as a live
+    /// preview until placed.
+    pub(in crate::app) fn choose_placement_effect(&mut self, qpath: String) {
+        let state = &mut self.model_placement;
+        state.kind = PlacementKind::Fx;
+        state.edit_mode = false;
+        state.held = None;
+        state.fx_held = None;
+        state.selection = None;
+        state.bounds = None;
+        state.fx_selection = Some(fx_runner_name(&qpath));
+        state.fx_delay = 200.0;
+        // Straight up, like an unaimed fx_runner.
+        state.angles = [270.0, 0.0, 0.0];
+        state.active = true;
+        state.rotating = false;
+        state.hit_valid = false;
+        state.preview_key = None;
+        state.preview_draws = Arc::new(Vec::new());
+        state.status.clear();
+        self.set_overlay(OverlayMode::None);
+    }
+
     pub(in crate::app) fn stamp_placement(&mut self) {
         if !self.model_placement.active || !self.model_placement.hit_valid { return; }
+        if self.model_placement.kind == PlacementKind::Fx {
+            let state = &mut self.model_placement;
+            let Some(effect) = state.fx_selection.clone() else { return; };
+            state.fx_placed.push(FxPlacement {
+                effect, origin: state.origin, angles: state.angles,
+                delay_ms: state.fx_delay.round() as i32,
+            });
+            state.status = format!("{} effect(s) placed", state.fx_placed.len());
+            if state.edit_mode {
+                // Dropped: back to picking things up.
+                state.kind = PlacementKind::Md3;
+                state.fx_selection = None;
+                state.fx_held = None;
+                state.hit_valid = false;
+            }
+            return;
+        }
         if self.model_placement.kind == PlacementKind::Bmodel {
             if let (Some(model), Some(bounds)) = (self.model_placement.bmodel_selection,
                 self.model_placement.bmodel_bounds) {
@@ -306,9 +577,40 @@ impl App {
         });
         self.model_placement.placed_dirty = true;
         self.model_placement.status = format!("{} model(s) placed", self.model_placement.placed.len());
+        if self.model_placement.edit_mode {
+            // Dropped: back to picking things up.
+            let state = &mut self.model_placement;
+            state.selection = None;
+            state.bounds = None;
+            state.held = None;
+            state.hit_valid = false;
+            state.preview_key = None;
+            state.preview_draws = Arc::new(Vec::new());
+        }
     }
 
     pub(in crate::app) fn undo_model_placement(&mut self) {
+        if self.model_placement.edit_mode {
+            let state = &mut self.model_placement;
+            if let Some((models, effects)) = state.edit_undo.pop() {
+                state.placed = models;
+                state.fx_placed = effects;
+                state.fx_selection = None;
+                state.fx_held = None;
+                state.fx_hover = None;
+                if state.kind == PlacementKind::Fx { state.kind = PlacementKind::Md3; }
+                state.selection = None;
+                state.bounds = None;
+                state.held = None;
+                state.hover = None;
+                state.hit_valid = false;
+                state.preview_key = None;
+                state.preview_draws = Arc::new(Vec::new());
+                state.placed_dirty = true;
+                state.status = "Edit undone".into();
+            }
+            return;
+        }
         if self.model_placement.kind == PlacementKind::Bmodel {
             if self.model_placement.bmodel_placed.pop().is_some() {
                 self.model_placement.bmodel_collision_dirty = true;
@@ -346,6 +648,166 @@ impl App {
         self.model_placement.bmodel_collision_dirty = false;
     }
 
+    /// Changes whenever a staged model or effect is added, moved or removed, so
+    /// the `r_drawEntities` markers rebuild exactly then.
+    pub(in crate::app) fn placement_marker_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let state = &self.model_placement;
+        for placement in &state.placed {
+            placement.qpath.hash(&mut hasher);
+            for value in placement.origin.iter().chain(&placement.angles) {
+                value.to_bits().hash(&mut hasher);
+            }
+            placement.scale.to_bits().hash(&mut hasher);
+        }
+        for placement in &state.fx_placed {
+            placement.effect.hash(&mut hasher);
+            for value in placement.origin.iter().chain(&placement.angles) {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Adds the staged models (green oriented-bounds boxes) and effects
+    /// (magenta box with an arrow along their direction) to the
+    /// `r_drawEntities` marker mesh.
+    pub(in crate::app) fn push_placement_markers(&self, mesh: &mut jka_assets::bsp::DebugVolumeMesh) {
+        const MODEL_COLOR: [u8; 4] = [0x6C, 0xE0, 0x7A, 0xFF];
+        const FX_COLOR: [u8; 4] = [0xFF, 0x7A, 0xD8, 0xFF];
+        for placement in &self.model_placement.placed {
+            let corners = placement_corners(placement);
+            let mut mins = [f32::INFINITY; 3];
+            let mut maxs = [f32::NEG_INFINITY; 3];
+            for corner in corners {
+                for axis in 0..3 {
+                    mins[axis] = mins[axis].min(corner[axis]);
+                    maxs[axis] = maxs[axis].max(corner[axis]);
+                }
+            }
+            mesh.push_box(mins, maxs, MODEL_COLOR);
+        }
+        for placement in &self.model_placement.fx_placed {
+            let origin = placement.origin;
+            let half = 10.0;
+            mesh.push_box(
+                std::array::from_fn(|j| origin[j] - half),
+                std::array::from_fn(|j| origin[j] + half),
+                FX_COLOR,
+            );
+            let forward = model_axis(placement.angles, 1.0)[0];
+            mesh.push_line(origin, std::array::from_fn(|j| origin[j] + forward[j] * 72.0), FX_COLOR);
+        }
+    }
+
+    /// Labels for the staged placements in the `r_drawEntities` view.
+    pub(in crate::app) fn placement_marker_labels(&self) -> Vec<([f32; 3], String, [u8; 3])> {
+        let mut labels = Vec::new();
+        for placement in &self.model_placement.placed {
+            let leaf = placement.qpath.rsplit('/').next().unwrap_or(&placement.qpath);
+            let leaf = leaf.strip_suffix(".md3").unwrap_or(leaf);
+            labels.push((placement.origin, leaf.to_owned(), [0x6C, 0xE0, 0x7A]));
+        }
+        for placement in &self.model_placement.fx_placed {
+            labels.push((placement.origin, format!("fx: {}", placement.effect), [0xFF, 0x7A, 0xD8]));
+        }
+        labels
+    }
+
+    /// Runs the placed effects (and the one in hand) through the placement
+    /// tool's own FX scheduler and tessellates this frame's particles. Cheap
+    /// when nothing is placed.
+    fn update_placement_fx(&mut self) {
+        let want_ghost = self.model_placement.kind == PlacementKind::Fx
+            && self.model_placement.active && self.model_placement.hit_valid
+            && self.model_placement.fx_selection.is_some();
+        if self.model_placement.fx_placed.is_empty() && !want_ghost {
+            if !self.model_placement.fx_draws.is_empty() {
+                self.model_placement.fx_draws = Arc::new(Vec::new());
+            }
+            return;
+        }
+        if let Err(error) = self.ensure_asset_preview_entity_presenter() {
+            self.model_placement.status = error;
+            return;
+        }
+        if self.model_placement.fx_runtime.is_none() {
+            self.model_placement.fx_runtime = Some(PlacementFx {
+                system: crate::fx::system::FxSystem::new(),
+                started: Instant::now(),
+                ids: HashMap::new(),
+                next: Vec::new(),
+                ghost_next: 0,
+            });
+            if let Some(runtime) = self.model_placement.fx_runtime.as_mut() {
+                runtime.system.reset_time(0);
+            }
+        }
+        // Effects not yet known to the scheduler are registered from the VFS.
+        let mut wanted: Vec<String> = self.model_placement.fx_placed.iter()
+            .map(|fx| fx.effect.clone()).collect();
+        if let Some(effect) = self.model_placement.fx_selection.clone() {
+            wanted.push(effect);
+        }
+        let mut assets = None;
+        for effect in wanted {
+            let known = self.model_placement.fx_runtime.as_ref()
+                .is_some_and(|runtime| runtime.ids.contains_key(&effect));
+            if known { continue; }
+            if assets.is_none() {
+                match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+                    Ok(mut opened) => {
+                        opened.set_allow_asset_overrides(self.video.allow_asset_overrides);
+                        assets = Some(opened);
+                    }
+                    Err(error) => {
+                        self.model_placement.status = format!("FX VFS ERROR: {error}");
+                        return;
+                    }
+                }
+            }
+            let reader = assets.as_mut().expect("opened above");
+            let runtime = self.model_placement.fx_runtime.as_mut().expect("created above");
+            let id = runtime.system.register(&effect, &mut |qpath| {
+                reader.read(qpath, 32 * 1024 * 1024).ok().flatten().map(|asset| asset.bytes)
+            });
+            if id == 0 {
+                self.model_placement.status = format!("Could not load effect {effect}");
+            }
+            runtime.ids.insert(effect, id);
+        }
+        let state = &mut self.model_placement;
+        let Some(runtime) = state.fx_runtime.as_mut() else { return; };
+        let now_ms = (runtime.started.elapsed().as_millis().min(i32::MAX as u128) as i32).max(1);
+        runtime.system.adjust_time(now_ms);
+        runtime.next.resize(state.fx_placed.len(), 0);
+        let forward = |angles: [f32; 3]| model_axis(angles, 1.0)[0];
+        for (index, placement) in state.fx_placed.iter().enumerate() {
+            let id = runtime.ids.get(&placement.effect).copied().unwrap_or(0);
+            if id != 0 && now_ms >= runtime.next[index] {
+                runtime.system.play_effect_dir(id, placement.origin, forward(placement.angles));
+                runtime.next[index] = now_ms.saturating_add(placement.delay_ms.max(50));
+            }
+        }
+        if want_ghost {
+            if let Some(effect) = state.fx_selection.as_ref() {
+                let id = runtime.ids.get(effect).copied().unwrap_or(0);
+                if id != 0 && now_ms >= runtime.ghost_next {
+                    runtime.system.play_effect_dir(id, state.origin, forward(state.angles));
+                    runtime.ghost_next = now_ms.saturating_add((state.fx_delay as i32).max(50));
+                }
+            }
+        }
+        let frame = runtime.system.frame();
+        let view = crate::fx::draw::FxView::from_camera(&self.camera);
+        let Some(presenter) = self.asset_preview_entity_presenter.as_mut() else { return; };
+        let surfaces = crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| {
+            presenter.fx_material_stages(shader)
+        });
+        self.model_placement.fx_draws = Arc::new(surfaces);
+    }
+
     /// Called before the RenderSnapshot is published. Model vertices for fixed
     /// placements are built only on a stamp/undo, not once per game frame.
     pub(in crate::app) fn update_model_placement(&mut self) {
@@ -375,6 +837,35 @@ impl App {
                 }
             }
         }
+        if self.model_placement.edit_mode
+            && self.model_placement.selection.is_none() && self.model_placement.fx_selection.is_none() {
+            // Nothing in hand: find the model or effect under the crosshair
+            // (whichever the ray meets first).
+            let start = scene::jka_position(self.camera.position.to_array());
+            let direction = scene::jka_position(self.camera.forward().to_array());
+            let state = &mut self.model_placement;
+            let model = state.placed.iter().enumerate()
+                .filter_map(|(index, placement)| {
+                    ray_hits_placement(start, direction, placement).map(|distance| (index, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let effect = state.fx_placed.iter().enumerate()
+                .filter_map(|(index, placement)| {
+                    ray_hits_sphere(start, direction, placement.origin, FX_PICK_RADIUS)
+                        .map(|distance| (index, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            // Effect gizmos are small and often sit inside a model's bounds, so
+            // an effect wins unless a model is clearly nearer.
+            let effect_wins = match (model, effect) {
+                (Some(m), Some(e)) => e.1 <= m.1 + 64.0,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            state.fx_hover = effect.filter(|_| effect_wins).map(|(index, _)| index);
+            state.hover = model.filter(|_| !effect_wins).map(|(index, _)| index);
+        }
+        self.update_placement_fx();
         if self.model_placement.kind == PlacementKind::Bmodel {
             self.model_placement.preview_draws = Arc::new(Vec::new());
             self.model_placement.preview_key = None;
@@ -413,7 +904,8 @@ impl App {
             self.model_placement.placed_dirty = false;
         }
         if self.model_placement.kind == PlacementKind::Md3
-            && self.model_placement.active && self.model_placement.hit_valid {
+            && self.model_placement.active && self.model_placement.hit_valid
+            && self.model_placement.selection.is_some() && self.model_placement.bounds.is_some() {
             let placement = ModelPlacement {
                 qpath: self.model_placement.selection.as_ref().unwrap().clone(),
                 origin: self.model_placement.origin,
@@ -439,6 +931,7 @@ impl App {
     pub(super) fn egui_model_picker(&mut self, root: &mut egui::Ui) {
         self.ensure_asset_viewer_catalog();
         let mut selected = None;
+        let mut selected_effect = None;
         let mut close = false;
         let mut image_requests = Vec::new();
         let state = &mut self.model_placement;
@@ -453,7 +946,15 @@ impl App {
                         if ui.button("CLOSE").clicked() { close = true; }
                     });
                 });
-                ui.label("Choose any loaded MD3. Thumbnails show actual model geometry; the live world preview shows its authored materials.");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut state.picker_effects, false, "MD3 MODELS");
+                    ui.selectable_value(&mut state.picker_effects, true, "EFFECTS (.efx)");
+                });
+                if state.picker_effects {
+                    ui.label("Choose an effect: it plays live at the crosshair. Place it as an fx_runner; aim with right-drag (Shift pitch, Alt roll), wheel sets its repeat delay.");
+                } else {
+                    ui.label("Choose any loaded MD3. Thumbnails show actual model geometry; the live world preview shows its authored materials.");
+                }
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut state.search)
                         .hint_text("Filter by filename or folder...").desired_width(420.0));
@@ -474,8 +975,9 @@ impl App {
                     return;
                 }
                 let query = state.search.trim().to_ascii_lowercase();
+                let wanted_kind = if state.picker_effects { AssetKind::Efx } else { AssetKind::Md3 };
                 let mut models: Vec<_> = self.asset_viewer_entries.iter()
-                    .filter(|entry| entry.kind == AssetKind::Md3)
+                    .filter(|entry| entry.kind == wanted_kind)
                     .filter(|entry| query.is_empty() || entry.qpath.to_ascii_lowercase().contains(&query))
                     .collect();
                 match state.sort {
@@ -483,14 +985,24 @@ impl App {
                     2 => models.sort_unstable_by(|a,b| a.folder.cmp(&b.folder).then(a.leaf.cmp(&b.leaf))),
                     _ => models.sort_unstable_by(|a,b| a.qpath.cmp(&b.qpath)),
                 }
-                ui.label(format!("{} matching MD3s   •   {} already placed", models.len(), state.placed.len()));
+                if state.picker_effects {
+                    ui.label(format!("{} matching effects   •   {} already placed", models.len(), state.fx_placed.len()));
+                } else {
+                    ui.label(format!("{} matching MD3s   •   {} already placed", models.len(), state.placed.len()));
+                }
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("model_placement_results")
                     .auto_shrink([false, false]).show_rows(ui, 46.0, models.len(), |ui, rows| {
                         for i in rows {
                             let entry = models[i];
                             ui.horizontal(|ui| {
-                                if let Some(texture) = state.thumbnails.get(&entry.qpath) {
+                                if state.picker_effects {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(34.0, 34.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 3.0, theme::CONTROL);
+                                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                                        "EFX", egui::FontId::monospace(10.0), theme::TEXT_DIM);
+                                } else if let Some(texture) = state.thumbnails.get(&entry.qpath) {
                                     ui.add(egui::Image::new(texture)
                                         .fit_to_exact_size(egui::vec2(34.0, 34.0)));
                                 } else {
@@ -505,7 +1017,11 @@ impl App {
                                         "MD3", egui::FontId::monospace(10.0), theme::TEXT_DIM);
                                 }
                                 if ui.button(&entry.qpath).clicked() {
-                                    selected = Some(entry.qpath.clone());
+                                    if state.picker_effects {
+                                        selected_effect = Some(entry.qpath.clone());
+                                    } else {
+                                        selected = Some(entry.qpath.clone());
+                                    }
                                 }
                             });
                         }
@@ -520,6 +1036,7 @@ impl App {
         }
         if close { self.set_overlay(OverlayMode::None); }
         if let Some(qpath) = selected { self.choose_placement_model(qpath); }
+        if let Some(qpath) = selected_effect { self.choose_placement_effect(qpath); }
     }
 
     /// Screen-space projected oriented bounds; coordinates originate in JKA
@@ -531,66 +1048,155 @@ impl App {
         if size.width == 0 || size.height == 0 { return; }
         let state = &self.model_placement;
         let painter = root.painter();
-        if state.hit_valid {
-            let corners = match state.kind {
-                PlacementKind::Md3 => match (&state.selection, state.bounds) {
-                    (Some(qpath), Some(bounds)) => Some(placement_corners(&ModelPlacement {
-                        qpath: qpath.clone(), origin: state.origin,
-                        scale: state.scale, angles: state.angles, bounds,
-                    })),
-                    _ => None,
-                },
-                PlacementKind::Bmodel => match (state.bmodel_selection, state.bmodel_bounds) {
-                    (Some(model), Some(bounds)) => Some(bmodel_corners(&BmodelPlacement {
-                        model, pivot: state.bmodel_pivot, hit: state.origin,
-                        angles: state.angles, bounds,
-                    })),
-                    _ => None,
-                },
-            };
-            if let Some(corners) = corners {
-                let pixels_per_point = root.ctx().pixels_per_point().max(0.001);
-                let projected: [Option<egui::Pos2>; 8] = std::array::from_fn(|i| {
-                    self.camera.project_to_screen(size.width, size.height,
-                        glam::Vec3::from_array(scene::render_position(corners[i])))
-                        .map(|point| egui::pos2(point.x / pixels_per_point, point.y / pixels_per_point))
-                });
-                let color = if state.rotating { egui::Color32::from_rgb(255, 179, 73) }
-                    else { egui::Color32::from_rgb(76, 220, 191) };
-                for i in 0..8 {
-                    for bit in [1,2,4] {
-                        if i & bit != 0 { continue; }
-                        if let (Some(a), Some(b)) = (projected[i], projected[i | bit]) {
-                            painter.line_segment([a,b], egui::Stroke::new(1.7, color));
-                        }
+        let pixels_per_point = root.ctx().pixels_per_point().max(0.001);
+        let project = |point: [f32; 3]| {
+            self.camera.project_to_screen(size.width, size.height,
+                glam::Vec3::from_array(scene::render_position(point)))
+                .map(|p| egui::pos2(p.x / pixels_per_point, p.y / pixels_per_point))
+        };
+        let draw_box = |corners: [[f32; 3]; 8], color: egui::Color32| {
+            let projected: [Option<egui::Pos2>; 8] = std::array::from_fn(|i| project(corners[i]));
+            for i in 0..8 {
+                for bit in [1, 2, 4] {
+                    if i & bit != 0 { continue; }
+                    if let (Some(a), Some(b)) = (projected[i], projected[i | bit]) {
+                        painter.line_segment([a, b], egui::Stroke::new(1.7, color));
                     }
                 }
-                if let Some(center) = self.camera.project_to_screen(size.width, size.height,
-                    glam::Vec3::from_array(scene::render_position(state.origin))) {
-                    painter.circle_filled(egui::pos2(center.x / pixels_per_point,
-                        center.y / pixels_per_point), 3.0, color);
+            }
+        };
+        // An effect: a ring at its origin and a line along the way it plays.
+        let draw_fx = |origin: [f32; 3], angles: [f32; 3], color: egui::Color32| {
+            let Some(a) = project(origin) else { return; };
+            painter.circle_stroke(a, 7.0, egui::Stroke::new(1.7, color));
+            let forward = model_axis(angles, 1.0)[0];
+            let tip = std::array::from_fn(|j| origin[j] + forward[j] * 72.0);
+            if let Some(b) = project(tip) {
+                painter.line_segment([a, b], egui::Stroke::new(1.7, color));
+                painter.circle_filled(b, 3.0, color);
+            }
+        };
+        // Picking and placing use the exact screen-centre ray. In third person the
+        // game's own crosshair follows the weapon aim and sits elsewhere, so mark
+        // the real centre: aim with this reticle, not the game crosshair.
+        {
+            let center = egui::pos2(
+                size.width as f32 / pixels_per_point * 0.5,
+                size.height as f32 / pixels_per_point * 0.5,
+            );
+            let color = if state.hover.is_some() || state.fx_hover.is_some() {
+                egui::Color32::from_rgb(255, 214, 90)
+            } else {
+                egui::Color32::from_rgb(255, 255, 255)
+            };
+            painter.circle_stroke(center, 10.0, egui::Stroke::new(1.5, color));
+            for (dx, dy) in [(-16.0, 0.0), (16.0, 0.0), (0.0, -16.0), (0.0, 16.0)] {
+                let near = center + egui::vec2(dx * 0.62, dy * 0.62);
+                painter.line_segment([near, center + egui::vec2(dx, dy)], egui::Stroke::new(1.5, color));
+            }
+        }
+        if state.hit_valid {
+            let color = if state.rotating { egui::Color32::from_rgb(255, 179, 73) }
+                else { egui::Color32::from_rgb(76, 220, 191) };
+            match state.kind {
+                PlacementKind::Md3 => {
+                    if let (Some(qpath), Some(bounds)) = (&state.selection, state.bounds) {
+                        draw_box(placement_corners(&ModelPlacement {
+                            qpath: qpath.clone(), origin: state.origin,
+                            scale: state.scale, angles: state.angles, bounds,
+                        }), color);
+                    }
+                }
+                PlacementKind::Bmodel => {
+                    if let (Some(model), Some(bounds)) = (state.bmodel_selection, state.bmodel_bounds) {
+                        draw_box(bmodel_corners(&BmodelPlacement {
+                            model, pivot: state.bmodel_pivot, hit: state.origin,
+                            angles: state.angles, bounds,
+                        }), color);
+                    }
+                }
+                PlacementKind::Fx => {
+                    if state.fx_selection.is_some() { draw_fx(state.origin, state.angles, color); }
+                }
+            }
+            if state.kind != PlacementKind::Fx {
+                if let Some(center) = project(state.origin) {
+                    painter.circle_filled(center, 3.0, color);
                 }
             }
         }
+        // Edit mode, nothing in hand: show every effect, and outline the model or
+        // effect under the crosshair.
+        let edit_idle = state.edit_mode && state.selection.is_none()
+            && state.fx_selection.is_none() && state.kind == PlacementKind::Md3;
+        if edit_idle {
+            for placement in &state.fx_placed {
+                draw_fx(placement.origin, placement.angles,
+                    egui::Color32::from_rgba_unmultiplied(255, 122, 216, 150));
+            }
+        }
+        let hovered = state.hover.filter(|_| edit_idle)
+            .and_then(|index| state.placed.get(index).map(|p| (index, p)));
+        let hovered_fx = state.fx_hover.filter(|_| edit_idle)
+            .and_then(|index| state.fx_placed.get(index).map(|p| (index, p)));
+        let gold = egui::Color32::from_rgb(255, 214, 90);
+        if let Some((_, placement)) = hovered { draw_box(placement_corners(placement), gold); }
+        if let Some((_, placement)) = hovered_fx { draw_fx(placement.origin, placement.angles, gold); }
         let bounds = root.max_rect();
         let top = bounds.min + egui::vec2(20.0, 20.0);
         painter.rect_filled(egui::Rect::from_min_size(top, egui::vec2(690.0, 78.0)),
             5.0, egui::Color32::from_black_alpha(188));
         painter.text(top + egui::vec2(12.0, 11.0), egui::Align2::LEFT_TOP,
             match state.kind {
+                _ if edit_idle => match (hovered, hovered_fx) {
+                    (_, Some((index, placement))) => format!("EDIT   FX #{index}   {}", placement.effect),
+                    (Some((index, placement)), _) => format!("EDIT   MD3 #{index}   {}", placement.qpath),
+                    _ => "EDIT   (aim at a model or effect)".to_owned(),
+                },
+                PlacementKind::Md3 if state.edit_mode => format!("MD3 EDIT   holding   {}", state.selection.as_deref().unwrap_or("")),
                 PlacementKind::Md3 => format!("MD3 PLACEMENT   {}", state.selection.as_deref().unwrap_or("")),
                 PlacementKind::Bmodel => format!("BMODEL PLACEMENT   *{}", state.bmodel_selection.unwrap_or(0)),
+                PlacementKind::Fx if state.edit_mode => format!("FX EDIT   holding   {}", state.fx_selection.as_deref().unwrap_or("")),
+                PlacementKind::Fx => format!("FX PLACEMENT   {}", state.fx_selection.as_deref().unwrap_or("")),
             },
             egui::FontId::monospace(12.0), theme::TEXT);
         painter.text(top + egui::vec2(12.0, 34.0), egui::Align2::LEFT_TOP,
-            format!("{}   Pitch {:.1}°   Yaw {:.1}°   Roll {:.1}°  {}",
-                if state.kind == PlacementKind::Md3 { format!("Scale {:.3}×", state.scale) } else { "BMODEL 1:1 (scale locked)".into() },
-                state.angles[0], state.angles[1], state.angles[2],
-                if !state.hit_valid { "NO SURFACE" } else if state.rotating { "ROTATE" } else { "READY" }),
+            if let Some((_, placement)) = hovered_fx {
+                format!("Origin {:.0} {:.0} {:.0}   Pitch {:.0}°  Yaw {:.0}°  Roll {:.0}°   Delay {} ms   {} fx",
+                    placement.origin[0], placement.origin[1], placement.origin[2],
+                    placement.angles[0], placement.angles[1], placement.angles[2],
+                    placement.delay_ms, state.fx_placed.len())
+            } else if let Some((_, placement)) = hovered {
+                format!("Origin {:.0} {:.0} {:.0}   Scale {:.3}×   Pitch {:.0}°  Yaw {:.0}°  Roll {:.0}°   {} placed",
+                    placement.origin[0], placement.origin[1], placement.origin[2], placement.scale,
+                    placement.angles[0], placement.angles[1], placement.angles[2], state.placed.len())
+            } else if edit_idle {
+                format!("{} models · {} fx · {} fx surfaces drawn · {} effects loaded   {}",
+                    state.placed.len(), state.fx_placed.len(), state.fx_draws.len(),
+                    state.fx_runtime.as_ref().map_or(0, |runtime| runtime.ids.values().filter(|&&id| id != 0).count()),
+                    state.status)
+            } else if state.kind == PlacementKind::Fx {
+                format!("Delay {:.0} ms   Pitch {:.1}°   Yaw {:.1}°   Roll {:.1}°  {}",
+                    state.fx_delay, state.angles[0], state.angles[1], state.angles[2],
+                    if !state.hit_valid { "NO SURFACE" } else if state.rotating { "ROTATE" } else { "READY" })
+            } else {
+                format!("{}   Pitch {:.1}°   Yaw {:.1}°   Roll {:.1}°  {}",
+                    if state.kind == PlacementKind::Md3 { format!("Scale {:.3}×", state.scale) } else { "BMODEL 1:1 (scale locked)".into() },
+                    state.angles[0], state.angles[1], state.angles[2],
+                    if !state.hit_valid { "NO SURFACE" } else if state.rotating { "ROTATE" } else { "READY" })
+            },
             egui::FontId::monospace(11.0), theme::ACCENT);
         painter.text(top + egui::vec2(12.0, 56.0), egui::Align2::LEFT_TOP,
-            if state.kind == PlacementKind::Md3 {
-                "LMB Place · Wheel Size · RMB Hold Pivot + Rotate · Shift Pitch · Alt Roll · Tab Browser · Ctrl+Z Undo · Esc Exit"
+            if edit_idle {
+                "LMB Pick up · Ctrl+LMB Copy · Del/X Delete · Ctrl+Z Undo · Tab Place new · E Place mode · Esc Exit"
+            } else if state.kind == PlacementKind::Fx && state.edit_mode {
+                "LMB Drop · Wheel Delay · RMB Aim · Shift Pitch · Alt Roll · Esc Put back · Ctrl+Z Undo edit"
+            } else if state.kind == PlacementKind::Fx {
+                "LMB Place · Wheel Repeat delay · RMB Aim (Shift pitch, Alt roll) · Tab Browser · E Edit placed · Ctrl+Z Undo · Esc Exit"
+            } else if state.kind == PlacementKind::Md3 && state.edit_mode {
+                "LMB Drop · Wheel Size · RMB Rotate · Shift Pitch · Alt Roll · Esc Put back · Ctrl+Z Undo edit"
+            } else if state.kind == PlacementKind::Md3 {
+                "LMB Place · Wheel Size · RMB Hold Pivot + Rotate · Shift Pitch · Alt Roll · Tab Browser · E Edit placed · Ctrl+Z Undo · Esc Exit"
             } else {
                 "LMB Place · RMB Rotate · Shift Pitch · Alt Roll · Tab Browser · Ctrl+Z Undo · Esc Exit (scale locked)"
             },

@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
+/// The driver blob is opaque and append-only (stale entries from old builds are
+/// never evicted, and it reached 840 MiB), so it cannot be trimmed oldest-first.
+/// Past this size it is dropped and rebuilt instead.
+const MAX_BLOB_BYTES: usize = 256 << 20;
+
 struct Slot {
     cache: wgpu::PipelineCache,
     path: PathBuf,
@@ -55,7 +60,11 @@ pub(crate) fn install(device: &wgpu::Device, info: &wgpu::AdapterInfo, base: &Pa
     let Some(key) = wgpu::util::pipeline_cache_key(info) else { return; };
     let path = base.join("cache").join(format!("{key}.bin"));
     let started = std::time::Instant::now();
-    let loaded = read_blob(&path);
+    let mut loaded = read_blob(&path);
+    if loaded.as_ref().is_some_and(|(bytes, _)| bytes.len() > MAX_BLOB_BYTES) {
+        rverbose!(1, "[PIPELINE CACHE] {} is over {} MiB; starting empty", path.display(), MAX_BLOB_BYTES >> 20);
+        loaded = None;
+    }
     let size = loaded.as_ref().map_or(0, |(bytes, _)| bytes.len());
     // SAFETY: `data` is either None or bytes previously returned by
     // `PipelineCache::get_data` that passed the checksum above; wgpu itself
@@ -102,6 +111,15 @@ pub(crate) fn save() {
         (slot.cache.clone(), slot.path.clone(), slot.on_disk)
     };
     let Some(mut data) = cache.get_data() else { return; };
+    if data.len() > MAX_BLOB_BYTES {
+        // Reset: the next launch rebuilds a fresh, small cache.
+        let _ = std::fs::remove_file(&path);
+        rverbose!(1, "[PIPELINE CACHE] {} KiB exceeds the cap; removed {}", data.len() / 1024, path.display());
+        if let Some(slot) = SLOT.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            slot.on_disk = None;
+        }
+        return;
+    }
     let sum = checksum(&data);
     if on_disk == Some(sum) {
         return;

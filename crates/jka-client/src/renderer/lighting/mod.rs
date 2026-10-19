@@ -5,6 +5,8 @@ pub(in crate::renderer) mod glass_transmission;
 pub(in crate::renderer) mod legacy_dlight_lists;
 pub(in crate::renderer) mod legacy_dlights;
 pub(in crate::renderer) mod local_shadows;
+pub(in crate::renderer) mod original_sun;
+pub(in crate::renderer) mod baked_sun_cache;
 pub(in crate::renderer) mod ray_tracing;
 pub(in crate::renderer) mod rt_diagnostics;
 pub(in crate::renderer) mod settings;

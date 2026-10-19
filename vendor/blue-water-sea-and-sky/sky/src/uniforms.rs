@@ -68,7 +68,7 @@ pub struct SkyUniforms {
     /// The lightning channel lighting the clouds (world m) and its radiant intensity (0 dark).
     pub lightning_position: [f32; 3],
     pub lightning_intensity: f32,
-    /// How the air under a closed deck greys (x, 0–1) and dims (y) the clear sky's haze (`overcast`); z, w unused.
+    /// How the air under a closed deck greys (x, 0–1) and dims (y) the clear sky's haze (`overcast`); z is the dome's night sky brightness (1 authored, `Sky::set_night_sky_brightness`); w unused.
     pub haze: [f32; 4],
 }
 

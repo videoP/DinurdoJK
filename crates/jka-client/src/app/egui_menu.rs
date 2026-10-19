@@ -35,8 +35,8 @@ use super::ui_catalog::CatalogPayload;
 use super::*;
 
 const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
-const SETUP_TABS: [&str; 8] = [
-    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS",
+const SETUP_TABS: [&str; 9] = [
+    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE",
 ];
 
 const TOP_RESUME: usize = 0;
@@ -53,7 +53,8 @@ const SETUP_TAB_AUDIO: usize = 4;
 const SETUP_TAB_NETWORK: usize = 5;
 const SETUP_TAB_INTERFACE: usize = 6;
 const SETUP_TAB_EXTENSIONS: usize = 7;
-const SETUP_TAB_MOD: usize = 8;
+const SETUP_TAB_STREAMER: usize = 8;
+const SETUP_TAB_MOD: usize = 9;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
 /// label, a full-width meter and its readout: on the Video page the world
@@ -326,6 +327,7 @@ pub(super) enum VideoSection {
     Surface,
     Water,
     Glass,
+    Optimizations,
 }
 
 impl VideoSection {
@@ -340,14 +342,15 @@ impl VideoSection {
         (Self::Physics, "Physics"),
     ];
     const ENVIRONMENT: [(Self, &'static str); 6] = [
-        (Self::Sun, "Sun"),
+        (Self::Sun, "Sky"),
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),
         (Self::Water, "Ocean"),
         (Self::Glass, "Glass"),
     ];
-    const TOOLS: [(Self, &'static str); 1] = [(Self::DebugTools, "Debug & tools")];
+    const OPTIMIZATIONS: [(Self, &'static str); 1] = [(Self::Optimizations, "Optimizations")];
+    const DEBUG: [(Self, &'static str); 1] = [(Self::DebugTools, "Debug & tools")];
 }
 
 // ------------------------------------------------------------- free widgets --

@@ -6,6 +6,7 @@ use naga_oil::compose::{
 use std::collections::HashMap;
 #[path = "../../../vendor/blue-water-sea-and-sky/shared/render/src/aerial.rs"]
 pub mod aerial;
+pub mod relay;
 pub use aerial::*;
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -51,6 +52,8 @@ pub type PipelineId = usize;
 pub struct PipelineBuild<'a> {
     pub device: &'a wgpu::Device,
     pub module: &'a wgpu::ShaderModule,
+    /// The host's device-specific pipeline cache, when the backend supports it.
+    pub cache: Option<&'a wgpu::PipelineCache>,
 }
 pub type PipelineRecipe = Box<dyn for<'a> Fn(PipelineBuild<'a>) -> Pipeline + Send + Sync>;
 #[derive(Default)]
@@ -89,7 +92,7 @@ pub fn compute_recipe(layouts: Vec<wgpu::BindGroupLayout>, entry: &'static str) 
                     module: build.module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache: build.cache,
                 }),
         )
     })
@@ -99,6 +102,7 @@ pub struct RenderContext<'a> {
     pub device: &'a wgpu::Device,
     registry: &'a mut PipelineRegistry,
     pub library: ShaderLibrary,
+    pub cache: Option<&'a wgpu::PipelineCache>,
 }
 #[derive(Default)]
 pub struct ShaderLibrary {
@@ -114,6 +118,7 @@ impl<'a> RenderContext<'a> {
         Self {
             device,
             registry,
+            cache: None,
             library: ShaderLibrary {
                 files: vec![shaders::builtin::AERIAL_VOLUME, shaders::builtin::MOTION],
             },
@@ -181,6 +186,7 @@ impl<'a> RenderContext<'a> {
         self.registry.pipelines.push(recipe(PipelineBuild {
             device: self.device,
             module: &module,
+            cache: self.cache,
         }));
         Ok(id)
     }
@@ -189,6 +195,44 @@ impl<'a> RenderContext<'a> {
 pub struct PlaceholderPipelines {
     pub compute: wgpu::ComputePipeline,
     pub render: wgpu::RenderPipeline,
+}
+impl PlaceholderPipelines {
+    /// Sentinels for deferred constructors. Never encode work with these;
+    /// adopt the registered pipelines before exposing a resource to the host.
+    pub fn new(device: &wgpu::Device, cache: Option<&wgpu::PipelineCache>) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deferred pipeline sentinels"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                "@compute @workgroup_size(1) fn compute() {}\n\
+                 @vertex fn vertex() -> @builtin(position) vec4f { return vec4f(0.0); }\n\
+                 @fragment fn fragment() -> @location(0) vec4f { return vec4f(0.0); }",
+            )),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deferred pipeline sentinels"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        Self {
+            compute: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("deferred compute sentinel"), layout: Some(&layout),
+                module: &module, entry_point: Some("compute"),
+                compilation_options: Default::default(), cache,
+            }),
+            render: device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("deferred render sentinel"), layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vertex"),
+                    compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(), depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fragment"),
+                    compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL,
+                    })] }),
+                multiview_mask: None, cache,
+            }),
+        }
+    }
 }
 #[derive(Clone, Copy)]
 pub enum MakePipelines<'a> {

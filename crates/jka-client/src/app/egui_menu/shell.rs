@@ -4,7 +4,7 @@ use crate::app::egui_menu::{
     EguiRenderData, ElementState, FrontendPage, Instant, KeyCode, KeyEvent, MapEditor, MouseButton,
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
     GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
-    SETUP_TAB_MOD, SETUP_TAB_EXTENSIONS, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
+    SETUP_TAB_MOD, SETUP_TAB_EXTENSIONS, SETUP_TAB_STREAMER, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
     TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
 
@@ -34,17 +34,23 @@ impl App {
         self.shader_remap_ui.thumbnails_pending.clear();
     }
 
+    /// Console steals input, not the menu's visual layer or 3D preview.
+    /// Do not substitute the frontend Main page when a nested menu is behind it.
+    pub(in crate::app) fn egui_display_overlay(&self) -> OverlayMode {
+        if self.overlay == OverlayMode::Console {
+            self.overlay_before_console
+        } else {
+            self.overlay
+        }
+    }
+
     /// egui owns every menu overlay, not just the Video page.
     pub(in crate::app) fn egui_menu_active(&self) -> bool {
         let blocking_download_ui = self.connection_modal_active();
-        let asset_viewer_behind_console = self.front_end
-            && self.frontend_page == FrontendPage::AssetViewer
-            && self.overlay == OverlayMode::Console;
         (blocking_download_ui
             || self.siege_dialog.is_some()
-            || asset_viewer_behind_console
             || matches!(
-                self.overlay,
+                self.egui_display_overlay(),
                 OverlayMode::Game
                     | OverlayMode::Video
                     | OverlayMode::Vgs
@@ -292,11 +298,17 @@ impl App {
             return;
         }
 
-        // The render thread reuses the most recent tessellated UI every frame.
-        // Rebuilding egui at ~120 Hz keeps interaction fluid without coupling
-        // the main/event thread to a 300-1000 FPS uncapped renderer.
-        if !self.egui_repaint_requested && self.egui_last_frame.elapsed() < Duration::from_millis(8)
-        {
+        // The render thread reuses the latest tessellated UI between updates.
+        // On the frontend, rebuild at the *same* cap as the renderer: the
+        // monitor refresh or com_maxfps, whichever is lower. In particular the
+        // animated Profile page must not impose its own 30/60/120 Hz cadence.
+        // Gameplay overlays keep the original lightweight ~120 Hz UI throttle.
+        let ui_interval = if self.front_end {
+            Duration::from_secs_f64(1.0 / f64::from(self.active_render_fps_cap().max(1)))
+        } else {
+            Duration::from_millis(8)
+        };
+        if !self.egui_repaint_requested && self.egui_last_frame.elapsed() < ui_interval {
             return;
         }
         self.run_egui_menu_frame();
@@ -395,11 +407,12 @@ impl App {
             // Noninteractive developer HUDs must not enter egui's input
             // catcher: mouse look, wheel and attacks are handled explicitly
             // by the placement mode's raw input dispatcher.
-            if self.model_placement.active && self.overlay == OverlayMode::None {
+            if self.model_placement.active && self.egui_display_overlay() == OverlayMode::None {
                 self.egui_model_placement_hud(ui);
             }
             return;
         }
+        let painted_overlay = self.egui_display_overlay();
         if self.server_password_prompt.is_some() {
             self.egui_server_password_dialog(ui);
             return;
@@ -424,59 +437,59 @@ impl App {
             self.egui_download_dialog(ui);
             return;
         }
-        if self.overlay == OverlayMode::Vgs {
+        if painted_overlay == OverlayMode::Vgs {
             self.egui_vgs_menu(ui);
             return;
         }
-        if self.overlay == OverlayMode::HudEdit {
+        if painted_overlay == OverlayMode::HudEdit {
             self.egui_hud_editor(ui);
             return;
         }
-        if self.overlay == OverlayMode::CameraEdit {
+        if painted_overlay == OverlayMode::CameraEdit {
             self.egui_camera_editor(ui);
             return;
         }
-        if self.overlay == OverlayMode::MapEdit {
+        if painted_overlay == OverlayMode::MapEdit {
             self.egui_map_editor(ui);
             return;
         }
-        if self.overlay == OverlayMode::DevRadial {
+        if painted_overlay == OverlayMode::DevRadial {
             self.egui_dev_radial(ui);
             return;
         }
-        if self.overlay == OverlayMode::ModelPicker {
+        if painted_overlay == OverlayMode::ModelPicker {
             self.egui_model_picker(ui);
             return;
         }
-        if self.overlay == OverlayMode::BmodelPicker {
+        if painted_overlay == OverlayMode::BmodelPicker {
             self.egui_bmodel_picker(ui);
             return;
         }
-        if self.overlay == OverlayMode::MapMods {
+        if painted_overlay == OverlayMode::MapMods {
             self.egui_map_mods(ui);
             return;
         }
-        if self.overlay == OverlayMode::EmoteRadial {
+        if painted_overlay == OverlayMode::EmoteRadial {
             self.egui_emote_radial(ui);
             return;
         }
-        if self.overlay == OverlayMode::ShaderRemap {
+        if painted_overlay == OverlayMode::ShaderRemap {
             self.egui_shader_remap(ui);
             return;
         }
-        if self.overlay == OverlayMode::EntityGraph {
+        if painted_overlay == OverlayMode::EntityGraph {
             self.egui_entity_graph(ui);
             return;
         }
-        if self.overlay == OverlayMode::Trace {
+        if painted_overlay == OverlayMode::Trace {
             self.egui_trace_menu(ui);
             return;
         }
-        if self.overlay == OverlayMode::StrafeTrails {
+        if painted_overlay == OverlayMode::StrafeTrails {
             self.egui_strafe_trails(ui);
             return;
         }
-        if self.overlay == OverlayMode::RaceGhosts {
+        if painted_overlay == OverlayMode::RaceGhosts {
             self.egui_race_ghosts(ui);
             return;
         }
@@ -485,7 +498,7 @@ impl App {
             return;
         }
         self.egui_top_bar(ui);
-        if self.overlay == OverlayMode::Video {
+        if painted_overlay == OverlayMode::Video {
             self.egui_setup_tabs(ui);
         }
         self.egui_footer(ui);
@@ -543,7 +556,7 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_top_bar(&mut self, root: &mut egui::Ui) {
-        let selected = if self.overlay == OverlayMode::Video {
+        let selected = if self.egui_display_overlay() == OverlayMode::Video {
             TOP_SETUP
         } else {
             self.menu_selected
@@ -635,7 +648,8 @@ impl App {
         if name.as_deref() == Some("setup") && tab.as_deref() == Some("video") {
             if let Some(section_name) = args.get(2) {
                 if let Some(&(section, _)) = VideoSection::RENDERING.iter()
-                    .chain(VideoSection::ENVIRONMENT.iter()).chain(VideoSection::TOOLS.iter())
+                    .chain(VideoSection::ENVIRONMENT.iter()).chain(VideoSection::OPTIMIZATIONS.iter())
+                    .chain(VideoSection::DEBUG.iter())
                     .find(|(section, label)| label.eq_ignore_ascii_case(section_name)
                         || format!("{section:?}").eq_ignore_ascii_case(section_name)) {
                     self.video_section = section;
@@ -715,7 +729,7 @@ impl App {
             }
             _ => {
                 self.console_status =
-                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|extensions|mod]".into();
+                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|extensions|streamer|mod]".into();
             }
         }
     }
@@ -731,6 +745,7 @@ impl App {
         {
             return SETUP_TAB_MOD;
         }
+        if tab.eq_ignore_ascii_case("streamer") { return SETUP_TAB_STREAMER; }
         SETUP_TABS
             .iter()
             .position(|name| name.eq_ignore_ascii_case(tab))
@@ -811,7 +826,7 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_footer(&mut self, root: &mut egui::Ui) {
-        let on_video = self.overlay == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
+        let on_video = self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
         let restart = on_video && self.video_restart_required();
         let pending_video_changes = if restart {
             self.pending_video_changes()
@@ -900,7 +915,7 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_body(&mut self, root: &mut egui::Ui) {
-        let on_video = self.overlay == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
+        let on_video = self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
         if on_video {
             self.egui_video_rail(root);
         }
@@ -915,9 +930,9 @@ impl App {
                 // the front-end browser so the two versions have identical
                 // column geometry and interaction positions. Profile remains a
                 // full-width special case for its renderer-owned preview.
-                let server_page = self.overlay == OverlayMode::Game && self.menu_selected == 1;
+                let server_page = self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == 1;
                 let profile_page =
-                    self.overlay == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
+                    self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let content_w = if server_page {
                     ui.available_width().min(1120.0)
                 } else if profile_page {
@@ -939,7 +954,7 @@ impl App {
                 // Every other page sits on the renderer's blurred backdrop,
                 // where a solid panel reads better.
                 let profile_preview_page =
-                    self.overlay == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
+                    self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let frame = if on_video {
                     egui::Frame::new().fill(theme::VIDEO_SCRIM)
                 } else if profile_preview_page {
@@ -971,7 +986,7 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_page(&mut self, ui: &mut egui::Ui) {
-        if self.overlay == OverlayMode::Video {
+        if self.egui_display_overlay() == OverlayMode::Video {
             match self.setup_selected {
                 SETUP_TAB_GAME => self.egui_game_settings(ui),
                 SETUP_TAB_MOVEMENT => self.egui_movement_page(ui),
@@ -981,6 +996,7 @@ impl App {
                 SETUP_TAB_NETWORK => self.egui_network_page(ui),
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
                 SETUP_TAB_EXTENSIONS => self.egui_extensions_page(ui),
+                SETUP_TAB_STREAMER => self.egui_streamer_settings(ui),
                 SETUP_TAB_MOD => self.egui_mod_setup_settings(ui),
                 _ => unreachable!("setup tab index is bounded by the visible setup tabs"),
             }
@@ -1028,7 +1044,8 @@ impl App {
                 for (title, entries) in [
                     ("RENDERING", &VideoSection::RENDERING[..]),
                     ("ENVIRONMENT", &VideoSection::ENVIRONMENT[..]),
-                    ("TOOLS", &VideoSection::TOOLS[..]),
+                    ("OPTIMIZATIONS", &VideoSection::OPTIMIZATIONS[..]),
+                    ("DEBUG", &VideoSection::DEBUG[..]),
                 ] {
                     rail_group(ui, title);
                     for (section, label) in entries.iter().copied() {

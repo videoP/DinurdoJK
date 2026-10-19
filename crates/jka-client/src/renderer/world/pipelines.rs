@@ -14,6 +14,21 @@ impl Renderer {
     pub(in crate::renderer) fn native_atmosphere_active(&self) -> bool {
         self.sky_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled)
     }
+
+    pub(in crate::renderer) fn native_display_mapping_active(&self) -> bool {
+        self.native_atmosphere_active() && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
+    }
+
+    pub(in crate::renderer) fn effective_auto_exposure_strength(&self) -> f32 {
+        if self.native_display_mapping_active() {
+            // Native display mode owns sky-referenced eye adaptation and AgX.
+            1.0
+        } else if self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled {
+            self.auto_exposure_strength
+        } else {
+            0.0
+        }
+    }
     /// Format the gameplay scene renders into, ignoring the asset viewer.
     pub(in crate::renderer) fn gameplay_scene_format(&self) -> wgpu::TextureFormat {
         // Legacy OpenGL starts with GL_DITHER enabled, and the OpenJK/TaystJK
@@ -393,7 +408,7 @@ impl Renderer {
             self.rebuild_world_pipelines();
             self.cloud_shadow_opaque_pipeline = None;
             self.cull_debug_pipeline = None;
-            self.wireframe_pipeline = None;
+            self.wireframe_pipeline = Default::default();
             self.world_wireframe_pipelines.clear();
             self.fast_world_wireframe_pipeline = None;
             self.debug_volumes.clear_pipelines();

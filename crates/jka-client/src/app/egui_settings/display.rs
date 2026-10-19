@@ -25,13 +25,14 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::PostProcessing => "Post processing",
         VideoSection::DebugTools => "Debug & tools",
         VideoSection::Physics => "Physics",
-        VideoSection::Sun => "Sun",
+        VideoSection::Sun => "Sky",
         VideoSection::BlueWater => "Ocean",
         VideoSection::Clouds => "Clouds",
         VideoSection::Weather => "Weather",
         VideoSection::Surface => "Surface interaction",
         VideoSection::Water => "Ocean",
         VideoSection::Glass => "Glass",
+        VideoSection::Optimizations => "Optimizations",
     }
 }
 
@@ -79,8 +80,8 @@ impl App {
                 "Client-side visual simulation for ragdolls, dynamic props and debris.",
             ),
             VideoSection::Sun => (
-                "SUN",
-                "Runtime q3 shader-sun direction, intensity and chromaticity.",
+                "SKY",
+                "Sky renderer, sun, baked lighting, moon and atmosphere.",
             ),
             VideoSection::BlueWater => (
                 "OCEAN",
@@ -97,6 +98,10 @@ impl App {
             ),
             VideoSection::Water => ("OCEAN", "Stock JKA, Godot, Blue Water or Hybrid promoted water."),
             VideoSection::Glass => ("GLASS", "Glass promotion, transmission, frosting and refractive edges."),
+            VideoSection::Optimizations => (
+                "OPTIMIZATIONS",
+                "Speed-ups and A/B switches. No quality preset changes these.",
+            ),
         };
         // The preset toolbar is global to Video, not part of any individual
         // page title or scrollable setting group.
@@ -138,6 +143,7 @@ impl App {
                 VideoSection::Surface => self.egui_surface(ui),
                 VideoSection::Water => self.egui_water(ui),
                 VideoSection::Glass => self.egui_glass(ui),
+                VideoSection::Optimizations => self.egui_optimizations(ui),
             });
 
         // Drained after the page is built: a label click posts its tag while

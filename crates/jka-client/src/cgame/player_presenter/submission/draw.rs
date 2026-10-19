@@ -5,9 +5,94 @@ use crate::cgame::player_presenter::{
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
     JiggleProfile, Matrix3x4, PlayerPresenter, PlayerSurfaceAsset, ResolvedStage, StageFrame,
+    Ghoul2GpuMeshSource,
     TextureData,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
+/// CPU preview of exactly the promoted bind-pose mesh used by GPU Ghoul2.
+/// Reuses OpenJK's first-bone normal and two-weight position convention;
+/// only the isolated Profile takes this path (no in-game CPU skin overhead).
+fn skin_profile_promoted_mesh(
+    surface_index: usize,
+    mesh: &Ghoul2GpuMeshSource,
+    pose: &[Matrix3x4],
+) -> Result<jka_assets::ghoul2::Ghoul2SkinnedSurface, String> {
+    use jka_assets::ghoul2::{transform_normal, transform_point, Ghoul2SkinnedVertex};
+    let mut vertices = Vec::with_capacity(mesh.vertices.len());
+    for v in mesh.vertices.iter() {
+        let count = v.weight_count as usize;
+        if !(1..=4).contains(&count) {
+            return Err(format!("profile surface {surface_index}: invalid weight count {count}"));
+        }
+        let matrix = |i: usize| -> Result<&Matrix3x4, String> {
+            pose.get(v.bone_indices[i] as usize).ok_or_else(||
+                format!("profile surface {surface_index}: missing Ghoul2 bone {}", v.bone_indices[i]))
+        };
+        let normal = transform_normal(matrix(0)?, v.normal);
+        let position = if count == 1 {
+            transform_point(matrix(0)?, v.position)
+        } else if count == 2 {
+            let a = transform_point(matrix(0)?, v.position);
+            let b = transform_point(matrix(1)?, v.position);
+            std::array::from_fn(|i| v.weights[0] * (a[i] - b[i]) + b[i])
+        } else {
+            let mut point = [0.0f32; 3];
+            let mut sum = 0.0;
+            for i in 0..count {
+                let weight = if i + 1 == count { 1.0 - sum } else {
+                    sum += v.weights[i];
+                    v.weights[i]
+                };
+                let p = transform_point(matrix(i)?, v.position);
+                for component in 0..3 { point[component] += weight * p[component]; }
+            }
+            point
+        };
+        vertices.push(Ghoul2SkinnedVertex { position, normal, uv: v.uv });
+    }
+    Ok(jka_assets::ghoul2::Ghoul2SkinnedSurface {
+        surface_index,
+        vertices,
+        indices: mesh.indices.as_ref().clone(),
+    })
+}
+
+/// Apply the same per-vertex jiggle displacement as ghoul2_skin.wgsl to
+/// Profile's CPU-skinned *promoted* mesh. The promoted mesh contains newly
+/// subdivided vertices; indexing the original GLM profile mask by their indices
+/// would leave those new vertices undeformed (and misassign other weights).
+fn deform_profile_promoted_jiggle(
+    mesh: &Ghoul2GpuMeshSource,
+    offsets: &[[f32; 4]; 4],
+    skinned: &mut Ghoul2SkinnedSurface,
+) {
+    fn smoothstep(lo: f32, hi: f32, value: f32) -> f32 {
+        let t = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+    for (vertex, binding) in skinned.vertices.iter_mut().zip(mesh.vertices.iter()) {
+        let region = binding.jiggle_region as usize;
+        if region >= offsets.len() || binding.jiggle_weight <= 0.0 {
+            continue;
+        }
+        let mut weight = binding.jiggle_weight;
+        if binding.jiggle_coord.abs() < 2.0 {
+            let bottom = offsets[0][3];
+            let top = offsets[1][3];
+            let lower = smoothstep(-0.70 + bottom, -0.15 + bottom, binding.jiggle_coord);
+            let upper = if top < 0.0 {
+                1.0 - smoothstep(0.65 + top, 1.0 + top, binding.jiggle_coord)
+            } else {
+                1.0
+            };
+            weight *= lower * upper;
+        }
+        for component in 0..3 {
+            vertex.position[component] += offsets[region][component] * weight;
+        }
+    }
+}
 
 impl PlayerPresenter {
     #[allow(clippy::too_many_arguments)]
@@ -354,7 +439,8 @@ impl PlayerPresenter {
             return Ok(draws);
         }
 
-        let used_workers = self.skinning_mode == Ghoul2SkinningMode::CpuWorkers && jobs.len() > 1;
+        let preview_remesh = self.preview_cpu_remesh && self.jiggle_remesh != Default::default();
+        let used_workers = !preview_remesh && self.skinning_mode == Ghoul2SkinningMode::CpuWorkers && jobs.len() > 1;
         let mut skinned = if used_workers {
             let started = Instant::now();
             let results = self.skinning_pool.install(|| {
@@ -366,23 +452,35 @@ impl PlayerPresenter {
             results
         } else {
             jobs.iter()
-                .map(|(_, surface, _)| skin_surface_timed(&mut self.perf, surface, pose))
+                .map(|(_, surface, mesh)| {
+                    if preview_remesh && mesh.key != mesh.base_key {
+                        skin_profile_promoted_mesh(surface.surface_index, mesh, pose)
+                    } else {
+                        skin_surface_timed(&mut self.perf, surface, pose)
+                    }
+                })
                 .collect::<Vec<_>>()
         };
 
         if let (Some(profile), Some(offsets)) = (jiggle_profile, jiggle_offsets.as_deref()) {
-            for ((_, surface, _), result) in jobs.iter().zip(skinned.iter_mut()) {
+            for ((_, surface, mesh), result) in jobs.iter().zip(skinned.iter_mut()) {
                 if !profile.affects_surface(lod_index, surface.surface_index) {
                     continue;
                 }
                 if let Ok(skinned_surface) = result {
-                    profile.deform_surface(
-                        lod_index,
-                        surface.surface_index,
-                        offsets,
-                        self.jiggle.tuning(),
-                        skinned_surface,
-                    );
+                    if preview_remesh && mesh.key != mesh.base_key {
+                        // Promoted topology: use the bindings interpolated for
+                        // *each* new vertex, just like the gameplay GPU path.
+                        deform_profile_promoted_jiggle(mesh, &gpu_jiggle_offsets, skinned_surface);
+                    } else {
+                        profile.deform_surface(
+                            lod_index,
+                            surface.surface_index,
+                            offsets,
+                            self.jiggle.tuning(),
+                            skinned_surface,
+                        );
+                    }
                 }
             }
         }
@@ -435,7 +533,12 @@ impl PlayerPresenter {
                 origin,
                 surface_rgba,
             );
-            if vertices.is_empty() || gpu_mesh.cpu_indices.is_empty() {
+            let draw_indices = if preview_remesh && gpu_mesh.key != gpu_mesh.base_key {
+                &gpu_mesh.indices
+            } else {
+                &gpu_mesh.cpu_indices
+            };
+            if vertices.is_empty() || draw_indices.is_empty() {
                 continue;
             }
             let (texture, base_alpha_mode, authored_glow) = custom_material
@@ -455,7 +558,7 @@ impl PlayerPresenter {
                 wireframe_class: DynamicWireframeClass::Player,
                 raster_visible: true,
                 vertices: Arc::new(vertices),
-                indices: Arc::clone(&gpu_mesh.cpu_indices),
+                indices: Arc::clone(draw_indices),
                 lighting_origin: Some(origin),
                 rt_rigid: None,
                 rt_skinned_key: self

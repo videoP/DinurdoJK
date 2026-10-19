@@ -9,6 +9,7 @@ dependencies = [
  "audionimbus",
  "blue-water-clouds",
  "blue-water-core",
+ "blue-water-fx",
  "blue-water-gpu",
  "blue-water-render",
  "blue-water-sky",
@@ -399,6 +400,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blue-water-fx"
+version = "0.1.0"
+dependencies = [
+ "blue-water-core",
+ "blue-water-gpu",
+ "blue-water-render",
+ "bytemuck",
+ "futures-lite",
+ "glam 0.33.9",
+ "naga_oil",
+ "wgpu",
+]
+
+[[package]]
 name = "blue-water-gpu"
 version = "0.1.0"
 dependencies = [
@@ -406,6 +421,7 @@ dependencies = [
  "bytemuck",
  "futures-lite",
  "glam 0.32.1",
+ "half",
  "naga_oil",
  "wgpu",
 ]

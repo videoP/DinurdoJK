@@ -5,7 +5,7 @@ use std::{collections::HashMap, fs, hash::{Hash, Hasher}, io::{Read, Write}, pat
     sync::{mpsc::{self, Receiver, SyncSender}, Arc}, thread};
 
 pub(super) const LODS: usize = 3; // TaystJK / Quake 3 MD3_MAX_LODS
-const MAGIC: &[u8; 8] = b"DJMD3L02"; // invalidate old caches when algorithm changes
+const MAGIC: &[u8; 8] = b"DJMD3L03"; // invalidate old caches when algorithm changes
 const CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) struct Job {
@@ -98,9 +98,21 @@ fn write_cache(path: &PathBuf, indices: &[Vec<u32>]) {
         let _ = fs::rename(&tmp, path);
     } else { let _ = fs::remove_file(tmp); }
 }
-fn reduced_indices(surface: &Surface, lod: usize) -> Vec<u32> {
+/// meshoptimizer's own extent: the largest axis span of the positions.
+fn extent(positions: impl Iterator<Item = [f32; 3]>) -> f32 {
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for p in positions {
+        for axis in 0..3 { min[axis] = min[axis].min(p[axis]); max[axis] = max[axis].max(p[axis]); }
+    }
+    (0..3).map(|axis| max[axis] - min[axis]).fold(0.0_f32, f32::max)
+}
+/// `model_extent` makes the error budget model-relative: prop MD3s are many
+/// tiny surfaces (2-tri foliage cards, vine strips), and an error relative to
+/// each surface's own extent never lets a far LOD drop or collapse them.
+fn reduced_indices(surface: &Surface, lod: usize, model_extent: f32) -> Vec<u32> {
     let original = &surface.indices;
-    if original.len() < 96 || surface.frames.is_empty() { return original.clone(); }
+    if original.len() < 6 || surface.frames.is_empty() { return original.clone(); }
     // Do not guess animated shape changes from frame 0. Authored animated MD3
     // variants continue to work; generated fallback is conservative here.
     if surface.frames.len() > 1 && surface.frames.iter().skip(1).any(|frame| {
@@ -113,9 +125,20 @@ fn reduced_indices(surface: &Surface, lod: usize) -> Vec<u32> {
     let attributes: Vec<[f32; 5]> = surface.vertices.iter().map(|v| [
         v.normal[0], v.normal[1], v.normal[2], v.uv[0], v.uv[1],
     ]).collect();
-    let weights = [0.5_f32, 0.5, 0.5, 1.0, 1.0];
-    let ratio = if lod == 1 { 0.55 } else { 0.25 };
-    let error = if lod == 1 { 0.01 } else { 0.035 };
+    // LOD2 is only seen far away: light seam weights let hard-edged props
+    // (split normals/UVs on every face) collapse at all.
+    let weights = if lod == 1 { [0.5_f32, 0.5, 0.5, 1.0, 1.0] } else { [0.05, 0.05, 0.05, 0.2, 0.2] };
+    let ratio = if lod == 1 { 0.5 } else { 0.2 };
+    // Fraction of the whole model's extent, converted to meshoptimizer's
+    // surface-relative error (attributes keep their usual relative weighting).
+    let model_error = if lod == 1 { 0.02 } else { 0.05 };
+    let surface_extent = extent(positions.iter().copied());
+    if surface_extent <= 0.0 { return original.clone(); }
+    let error = model_error * model_extent.max(surface_extent) / surface_extent;
+    // Prune drops disconnected pieces smaller than the error (far foliage
+    // cards); Permissive lets LOD2 collapse across attribute seams.
+    let options = meshopt::SimplifyOptions::Prune.bits()
+        | if lod == 1 { 0 } else { meshopt::SimplifyOptions::Permissive.bits() };
     // meshoptimizer respects topology, borders and seams; never use 'sloppy'.
     // Packing [f32;3] guarantees the FFI stride and alignment.
     let mut output = vec![0u32; original.len()];
@@ -126,11 +149,12 @@ fn reduced_indices(surface: &Surface, lod: usize) -> Vec<u32> {
             attributes.as_ptr().cast::<f32>(), 20,
             weights.as_ptr(), weights.len(), std::ptr::null(),
             ((original.len() as f32 * ratio) as usize / 3 * 3).max(3),
-            error, 0, std::ptr::null_mut(),
+            error, options, std::ptr::null_mut(),
         )
     };
     output.truncate(count);
-    if output.len() < original.len() && output.len() >= 3 && output.len() % 3 == 0 {
+    // Zero is valid: a far LOD may prune a whole small surface.
+    if output.len() < original.len() && output.len() % 3 == 0 {
         output
     } else { original.clone() }
 }
@@ -152,8 +176,18 @@ fn build_model(base: &Model, index_sets: Vec<Vec<u32>>) -> Model {
         .map(|(src, indices)| compact_surface(src, indices)).collect();
     Model { frames: base.frames.clone(), tags: base.tags.clone(), surfaces }
 }
+/// Below this many triangles in the whole model a fallback LOD is not worth
+/// a second copy.
+const MIN_MODEL_TRIS: usize = 32;
 fn run(job: &Job) -> ([Option<Model>; 2], &'static str) {
     let mut output: [Option<Model>; 2] = [None, None];
+    let model_tris: usize = job.model.surfaces.iter().map(|s| s.indices.len() / 3).sum();
+    if model_tris < MIN_MODEL_TRIS { return (output, "too small"); }
+    let model_extent = job.model.frames.first()
+        .map(|frame| (0..3).map(|axis| frame.maxs[axis] - frame.mins[axis]).fold(0.0_f32, f32::max))
+        .filter(|extent| *extent > 0.0)
+        .unwrap_or_else(|| extent(job.model.surfaces.iter()
+            .flat_map(|s| s.vertices.iter().map(|v| v.position))));
     let mut all_cache = true;
     for lod in 1..LODS {
         if !job.missing[lod - 1] { continue; }
@@ -162,7 +196,7 @@ fn run(job: &Job) -> ([Option<Model>; 2], &'static str) {
         else {
             all_cache = false;
             let indices: Vec<Vec<u32>> = job.model.surfaces.iter()
-                .map(|surface| reduced_indices(surface, lod)).collect();
+                .map(|surface| reduced_indices(surface, lod, model_extent)).collect();
             write_cache(&path, &indices);
             indices
         };
@@ -179,6 +213,26 @@ mod tests {
     use super::*;
     #[test]
     fn content_hash_changes() { assert_ne!(content_hash(b"a"), content_hash(b"b")); }
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock PK3s"]
+    fn prop_foliage_reduces_at_far_lods() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut assets = jka_assets::pk3::AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        for path in ["models/map_objects/yavin/tree09_b.md3", "models/map_objects/imperial/imp_light.md3"] {
+            let data = assets.read(path, 16 * 1024 * 1024).unwrap().unwrap().bytes;
+            let model = Arc::new(jka_assets::md3::parse(&data).unwrap());
+            let tris = |lod: usize| -> usize {
+                let frame = &model.frames[0];
+                let extent = (0..3).map(|a| frame.maxs[a] - frame.mins[a]).fold(0.0_f32, f32::max);
+                if lod == 0 { return model.surfaces.iter().map(|s| s.indices.len() / 3).sum(); }
+                model.surfaces.iter().map(|s| reduced_indices(s, lod, extent).len() / 3).sum()
+            };
+            let counts = [tris(0), tris(1), tris(2)];
+            println!("{path}: tris LOD0/1/2 = {counts:?}");
+            assert!(counts[1] <= counts[0] && counts[2] < counts[1], "{path}: {counts:?}");
+        }
+    }
+
     #[test]
     fn compact_keeps_all_animation_frames() {
         use jka_assets::md3::Vertex;

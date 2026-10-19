@@ -10,7 +10,7 @@ use crate::app::egui_settings::{
     PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z,
     PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG, PHYS_JIGGLE_JP_GRAVITY,
     PHYS_JIGGLE_JP_SOFTEN, PHYS_JIGGLE_JP_STIFFNESS, PHYS_JIGGLE_JP_STRETCH, PHYS_JIGGLE_SOLVER,
-    PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH, PHYS_JIGGLE_BREAST_SIZE, PHYS_JIGGLE_GLUTE_SIZE,
+    PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH,
     PHYS_JIGGLE_LOCOMOTION, PHYS_JIGGLE_SWIRL, PHYS_JIGGLE_BREAST_STIFFNESS,
     PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS, PHYS_JIGGLE_GLUTE_DAMPING,
     PHYS_MAX_SUBSTEPS, PHYS_PLAYER_PUSH, PHYS_PROPS,
@@ -213,20 +213,6 @@ impl App {
                 let mut value = current;
                 let readout = format!("{value:.2}");
                 if theme::slider(ui, &mut value, min..=max, &readout) {
-                    let _ = self.set_console_cvar(cvar, &value.to_string());
-                }
-            });
-        }
-
-        theme::section(ui, "BODY SHAPE", "Bind-pose mass baked into the promoted jiggle mesh (GPU skinning). Changing a value rebuilds player models in the background; 0.00 is the stock mesh.");
-        for (label, tip, field, current, max, cvar) in [
-            ("Breast size", "Peak mass added at the breast center in JKA units, fading to zero at the soft-region edge. Negative reduces.", PHYS_JIGGLE_BREAST_SIZE, self.video.jiggle_breast_size, 3.0, "r_jiggleBreastSize"),
-            ("Glute size", "Peak mass added at the glute center in JKA units, fading to zero at the soft-region edge and above the upper thigh. Negative reduces.", PHYS_JIGGLE_GLUTE_SIZE, self.video.jiggle_glute_size, 4.0, "r_jiggleGluteSize"),
-        ] {
-            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
-                let mut value = current;
-                let readout = format!("{value:+.2} u");
-                if theme::slider(ui, &mut value, -2.0..=max, &readout) {
                     let _ = self.set_console_cvar(cvar, &value.to_string());
                 }
             });

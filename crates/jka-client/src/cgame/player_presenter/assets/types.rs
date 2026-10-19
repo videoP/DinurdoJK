@@ -154,6 +154,8 @@ pub(in crate::cgame::player_presenter) fn fpls_mode3_surface_hidden(
 }
 
 pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
+    pub(in crate::cgame::player_presenter) body_shape_available: bool,
+    pub(in crate::cgame::player_presenter) body_shape_binding: Option<Arc<jka_assets::body_shape::BodyShapeBinding>>,
     pub(in crate::cgame::player_presenter) key: String,
     pub(in crate::cgame::player_presenter) glm: Arc<GlmModel>,
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
@@ -161,8 +163,11 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     /// `gla` above binds the mesh, bolts, ragdolls and GPU skin matrices.
     pub(in crate::cgame::player_presenter) animation_gla: Arc<GlaAnimation>,
     pub(in crate::cgame::player_presenter) retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
-    /// Per-Source-model anatomical Ghoul2 pivots. None for stock GLM players.
+    /// Anatomical pivots for Source models or shaped native GLM players.
     pub(in crate::cgame::player_presenter) source_native_pivots: Option<Arc<Vec<[f32; 3]>>>,
+    /// Extra procedural bones appended after GLA matrices for Source players.
+    pub(in crate::cgame::player_presenter) source_jiggles: Option<Arc<Vec<jka_assets::source1_rig::SourceJiggleBinding>>>,
+    pub(in crate::cgame::player_presenter) source_jiggles_enabled: bool,
     /// `players/_humanoid/` skeletons use the normal multiplayer animation/angle
     /// path.  Creature skeletons use the model-local tables cached below.
     pub(in crate::cgame::player_presenter) humanoid: bool,
@@ -183,11 +188,18 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
 
 impl PlayerModelAsset {
     pub(in crate::cgame::player_presenter) fn shares_mesh_pose_binding(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.gla, &other.gla) && match (&self.source_native_pivots, &other.source_native_pivots) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
+        Arc::ptr_eq(&self.gla, &other.gla)
+            && self.source_jiggles_enabled == other.source_jiggles_enabled
+            && match (&self.source_jiggles, &other.source_jiggles) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+            && match (&self.source_native_pivots, &other.source_native_pivots) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 
     /// Convert once before every consumer of the final mesh pose. The stock
@@ -198,8 +210,33 @@ impl PlayerModelAsset {
         if let Some(plan) = &self.retargeter {
             pose = plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose))?;
         }
-        if let Some(pivots) = &self.source_native_pivots {
-            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(&self.gla, &pose, pivots)?;
+        self.bind_mesh_pose(pose)
+    }
+
+    pub(in crate::cgame::player_presenter) fn bind_mesh_pose(
+        &self, pose: Vec<crate::cgame::player_presenter::Matrix3x4>,
+    ) -> Result<Vec<crate::cgame::player_presenter::Matrix3x4>, String> {
+        let mut pose = if let Some(binding) = &self.body_shape_binding {
+            binding.retarget(&self.gla, &pose)?
+        } else if let Some(pivots) = &self.source_native_pivots {
+            jka_assets::source1_rig::rebase_source_ghoul2_pose(&self.gla, &pose, pivots)?
+        } else {
+            pose
+        };
+        // An ordinary Source/GLM animation never has its own jiggle palette.
+        // Copy each extra bone's mapped-parent skin matrix as the neutral
+        // fallback for previews, offscreen models, and physics-disabled mode.
+        // The per-entity animator later replaces these entries in place.
+        if let Some(bindings) = &self.source_jiggles {
+            let gla_bones = self.gla.skeleton.len();
+            if pose.len() != gla_bones {
+                return Err(format!("Source pose has {} bones, expected {gla_bones}", pose.len()));
+            }
+            for binding in bindings.iter() {
+                let matrix = *pose.get(binding.parent_gla)
+                    .ok_or("Source jiggle parent outside GLA")?;
+                pose.push(matrix);
+            }
         }
         Ok(pose)
     }

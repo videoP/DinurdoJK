@@ -69,9 +69,16 @@ pub(in crate::renderer) fn rasterize_static_ao_texels(
     source: &StaticAoWorldSource,
     scale: u32,
 ) -> Vec<Vec<Option<StaticAoTexelSample>>> {
+    rasterize_lightmap_texels(&source.lightmap_triangles, &source.lightmap_sizes, scale)
+}
+
+pub(in crate::renderer) fn rasterize_lightmap_texels(
+    triangles: &[crate::renderer::StaticAoLightmapTriangle],
+    lightmap_sizes: &[[u32; 2]],
+    scale: u32,
+) -> Vec<Vec<Option<StaticAoTexelSample>>> {
     let scale = scale.max(1);
-    let mut texels = source
-        .lightmap_sizes
+    let mut texels = lightmap_sizes
         .iter()
         .map(|&[width, height]| {
             let width = width.saturating_mul(scale);
@@ -80,8 +87,8 @@ pub(in crate::renderer) fn rasterize_static_ao_texels(
         })
         .collect::<Vec<_>>();
 
-    for triangle in source.lightmap_triangles.iter() {
-        let Some(&[base_width, base_height]) = source.lightmap_sizes.get(triangle.texture) else {
+    for triangle in triangles.iter() {
+        let Some(&[base_width, base_height]) = lightmap_sizes.get(triangle.texture) else {
             continue;
         };
         let width = base_width.saturating_mul(scale);
@@ -140,9 +147,16 @@ pub(in crate::renderer) fn rasterize_static_ao_owners(
     source: &StaticAoWorldSource,
     scale: u32,
 ) -> Vec<Vec<u32>> {
+    rasterize_lightmap_owners(&source.lightmap_triangles, &source.lightmap_sizes, scale)
+}
+
+pub(in crate::renderer) fn rasterize_lightmap_owners(
+    triangles: &[crate::renderer::StaticAoLightmapTriangle],
+    lightmap_sizes: &[[u32; 2]],
+    scale: u32,
+) -> Vec<Vec<u32>> {
     let scale = scale.max(1);
-    let mut owners = source
-        .lightmap_sizes
+    let mut owners = lightmap_sizes
         .iter()
         .map(|&[width, height]| {
             let width = width.saturating_mul(scale);
@@ -151,8 +165,8 @@ pub(in crate::renderer) fn rasterize_static_ao_owners(
         })
         .collect::<Vec<_>>();
 
-    for triangle in source.lightmap_triangles.iter() {
-        let Some(&[base_width, base_height]) = source.lightmap_sizes.get(triangle.texture) else {
+    for triangle in triangles.iter() {
+        let Some(&[base_width, base_height]) = lightmap_sizes.get(triangle.texture) else {
             continue;
         };
         let width = base_width.saturating_mul(scale);
@@ -481,6 +495,15 @@ impl StaticAoBvh {
         direction: Vec3,
         triangle: StaticAoTraceTriangle,
     ) -> Option<f32> {
+        Self::ray_triangle_hit(origin, direction, triangle).map(|hit| hit.0)
+    }
+
+    #[inline]
+    fn ray_triangle_hit(
+        origin: Vec3,
+        direction: Vec3,
+        triangle: StaticAoTraceTriangle,
+    ) -> Option<(f32, [f32; 3])> {
         let p = direction.cross(triangle.edge2);
         let determinant = triangle.edge1.dot(p);
         if determinant.abs() < 1.0e-7 {
@@ -498,7 +521,7 @@ impl StaticAoBvh {
             return None;
         }
         let distance = triangle.edge2.dot(q) * inverse;
-        (distance > 0.001 && distance.is_finite()).then_some(distance)
+        (distance > 0.001 && distance.is_finite()).then_some((distance, [1.0 - u - v, u, v]))
     }
 
     pub(in crate::renderer) fn trace(
@@ -506,6 +529,18 @@ impl StaticAoBvh {
         origin: Vec3,
         direction: Vec3,
         max_distance: f32,
+    ) -> Option<f32> {
+        self.trace_filtered(origin, direction, max_distance, |_, _| true)
+    }
+
+    /// Rejected intersections do not hide more distant geometry. The callback
+    /// can accumulate transmission through cutouts before accepting an opaque hit.
+    pub(in crate::renderer) fn trace_filtered(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max_distance: f32,
+        mut accept: impl FnMut(usize, [f32; 3]) -> bool,
     ) -> Option<f32> {
         let inverse_direction = Vec3::new(
             if direction.x.abs() >= 1.0e-8 {
@@ -553,9 +588,9 @@ impl StaticAoBvh {
                 let end = start + node.count as usize;
                 for &triangle_index in &self.indices[start..end] {
                     let triangle = self.triangles[triangle_index as usize];
-                    if let Some(distance) = Self::ray_triangle_distance(origin, direction, triangle)
+                    if let Some((distance, barycentric)) = Self::ray_triangle_hit(origin, direction, triangle)
                     {
-                        if distance < closest {
+                        if distance < closest && accept(triangle_index as usize, barycentric) {
                             closest = distance;
                             hit = true;
                         }

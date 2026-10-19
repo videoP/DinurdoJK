@@ -33,26 +33,37 @@ pub(in crate::cgame::player_presenter) fn model_bolt_matrix_timed(
     result
 }
 
-/// Profile is intentionally studio-lit rather than map-lightgrid-lit. This bakes
-/// a key + soft fill from vertex normals into preview-only shaderRGBA. Gameplay
-/// models continue through the configured lighting.
+/// Profile is intentionally studio-lit rather than map-lightgrid-lit. Bake
+/// an ambient bounce + front key/fill + restrained back rim into preview-only
+/// vertex lighting. All terms multiply the *existing* material/tint color:
+/// they must never add white or saber RGB over the chosen `char_color_*`.
+/// Gameplay models continue through the configured lighting.
 pub fn apply_profile_studio_light(draws: &mut [DynamicModelSurface], cinematic: bool) {
+    let key_direction = Vec3::new(-0.35, 0.72, 0.60).normalize();
+    let fill_direction = Vec3::new(0.55, 0.20, -0.35).normalize();
+    // Opposite the front key, slightly elevated to pick out silhouette edges.
+    let back_direction = Vec3::new(0.25, -0.90, 0.38).normalize();
     for surface in draws {
         let vertices = Arc::make_mut(&mut surface.vertices);
         for vertex in vertices.iter_mut() {
             let normal = Vec3::from_array(vertex.normal).normalize_or_zero();
-            let key = normal
-                .dot(Vec3::new(-0.35, 0.72, 0.60).normalize())
-                .max(0.0);
-            let fill = normal
-                .dot(Vec3::new(0.55, 0.20, -0.35).normalize())
-                .max(0.0);
-            let light = if cinematic {
-                (0.18 + 0.53 * key + 0.12 * fill).min(0.83)
+            let key = normal.dot(key_direction).max(0.0);
+            let fill = normal.dot(fill_direction).max(0.0);
+            let (base_light, back_rim) = if cinematic {
+                // Former 0.18 ambient / 0.83 ceiling left even white skin
+                // visibly dark. Keep the key directional, but lift shadows.
+                let base = 0.43 + 0.46 * key + 0.18 * fill;
+                let rim = 0.20 * normal.dot(back_direction).max(0.0).powi(2);
+                (base, rim)
             } else {
-                (0.38 + 0.72 * key + 0.20 * fill).min(1.18)
+                (0.38 + 0.72 * key + 0.20 * fill, 0.0)
             };
             for channel in 0..3 {
+                // A very subtle cool rim adds shape without washing out the
+                // model's chosen RGB. Cap highlights; never add naked light RGB.
+                let rim_tint = [0.86, 0.94, 1.0][channel];
+                let light = (base_light + back_rim * rim_tint)
+                    .min(if cinematic { 1.10 } else { 1.18 });
                 vertex.color[channel] *= light;
             }
         }

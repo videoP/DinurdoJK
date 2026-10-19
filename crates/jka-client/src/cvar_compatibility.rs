@@ -38,6 +38,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", model_state_cache: false, dynamic_batch_draws: false, world_compact_min_draws: 1", "")
         .replace(", md3_geometry_cache: false", "")
         .replace(", md3_geometry_cache: true", "")
+        .replace(", static_md3_instances: false", "")
+        .replace(", surface_sprites_gpu: true, surface_sprites: true", "")
         .replace(", md3_auto_lod: false, md3_lod_debug: false", "")
         .replace(", md3_auto_lod: true, bsp_model_lod: true, md3_lod_debug: false", "")
         .replace(", model_render_bundles: false", "")
@@ -76,7 +78,24 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", world_flares: false", "")
         .replace(", saber_flares: true", "")
         .replace(", rt_taa: 0", "")
-        .replace(", baked_sun_removal: 0.0", "");
+        .replace(", baked_sun_removal: 0.0", "")
+        .replace(", baked_sun_cache: false", "")
+        .replace(", sun_shadow_strength: 0.3", "")
+        .replace(", sun_lighting: false", "")
+        .replace(", baked_sun_shadow_map: true", "")
+        .replace(", baked_sun_edge_softness: 2.5", "")
+        .replace(", baked_sun_direct_limit: 0.48", "")
+        .replace(", baked_indirect_scale: 1.0", "")
+        .replace(", baked_indirect_saturation: 1.0", "")
+        .replace(", baked_indirect_power: 1.0", "")
+        .replace(", baked_indirect_highlight_preserve: 1.0", "")
+        .replace(", swim_tilt: 0.9", "")
+        .replace(", swim_strafe_roll: 0.0", "")
+        .replace(", swim_bank_axis: 2", "")
+        .replace(", swim_bank_probe: 0.0", "")
+        .replace(", swim_turn_bank: 0.7", "")
+        .replace(", swim_turn_bank: 1.0", "")
+        .replace(", move_lean: 0.75", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -112,7 +131,12 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
         projected_archive = actual
             .lines()
             .filter(|line| {
-                !line.starts_with("seta r_bakedSunRemoval ")
+                !line.starts_with("seta cg_swimTilt ")
+                    && !line.starts_with("seta r_bakedSunRemoval ")
+                    && !line.starts_with("seta r_bakedSunCache ")
+                    && !line.starts_with("seta r_sunShadowStrength ")
+                    && !line.starts_with("seta r_sunLighting ")
+                    && !line.starts_with("seta r_bakedSunShadowMap ")
                     && !line.starts_with("seta r_rtTaa ") &&
                 !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
@@ -565,9 +589,12 @@ fn shared_auto_lod_default_and_archive_round_trip() {
 fn baked_sun_removal_loads_and_archives_without_changing_legacy_fixtures() {
     let fixture = Fixture::new();
     let path = fixture.0.join("sun.cfg");
-    fs::write(&path, "seta r_bakedSunRemoval \"0.750\"\n").unwrap();
+    fs::write(&path, "seta r_bakedSunRemoval \"0.750\"\nseta r_bakedSunCache \"1\"\nseta r_sunShadowStrength \"0.85\"\nseta r_sunLighting \"1\"\n").unwrap();
     let video = config::load_video_settings(&path);
     assert_eq!(video.baked_sun_removal, 0.75);
+    assert!(video.baked_sun_cache);
+    assert_eq!(video.sun_shadow_strength, 0.85);
+    assert!(video.sun_lighting);
     config::save_video_settings(
         &path, video,
         &crate::keybinds::Bindings::default(),
@@ -576,4 +603,7 @@ fn baked_sun_removal_loads_and_archives_without_changing_legacy_fixtures() {
     ).unwrap();
     let saved = fs::read_to_string(&path).unwrap();
     assert!(saved.contains("seta r_bakedSunRemoval \"0.750\""));
+    assert!(saved.contains("seta r_bakedSunCache \"1\""));
+    assert!(saved.contains("seta r_sunShadowStrength \"0.850\""));
+    assert!(saved.contains("seta r_sunLighting \"1\""));
 }

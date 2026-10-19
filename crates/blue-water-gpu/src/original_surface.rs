@@ -6,7 +6,7 @@ use crate::{geometry, shader_composer, surface_waves::SurfaceWaves};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-fn uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -19,7 +19,7 @@ fn uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayou
     }
 }
 
-fn storage(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -32,7 +32,7 @@ fn storage(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayou
     }
 }
 
-fn sampled(
+pub(crate) fn sampled(
     binding: u32,
     visibility: wgpu::ShaderStages,
     dimension: wgpu::TextureViewDimension,
@@ -54,7 +54,7 @@ fn sampled(
     }
 }
 
-fn sampler(
+pub(crate) fn sampler(
     binding: u32,
     visibility: wgpu::ShaderStages,
     comparison: bool,
@@ -76,6 +76,10 @@ pub struct OriginalSurfacePipeline {
     pub surface_layout: wgpu::BindGroupLayout,
     pub environment_layout: wgpu::BindGroupLayout,
     pub pipeline: wgpu::RenderPipeline,
+    pub reduced_pipeline: Option<wgpu::RenderPipeline>,
+    pub near_pipeline: Option<wgpu::RenderPipeline>,
+    pub reconstruct_pipeline: Option<wgpu::RenderPipeline>,
+    pub reconstruct_layout: Option<wgpu::BindGroupLayout>,
     pub wireframe: Option<wgpu::RenderPipeline>,
     pub waterline_marker: Option<wgpu::RenderPipeline>,
     // Keep the existing compiled vertex entry to compile the debug overlay
@@ -95,6 +99,17 @@ pub struct OriginalClipmap {
     rings: Vec<u32>,
     horizon_start: u32,
     index_count: u32,
+    // Ring index variants for stride 1, 2, 4, 8, 16; all preserve both
+    // original inner/outer edge vertices to stitch without T-junctions.
+    ring_lods: Vec<[std::ops::Range<u32>; 5]>,
+    // Independent centre-fill LODs; without these the nearest flat-water
+    // rectangle would remain fully tessellated even as its rings simplify.
+    fill_lods: Vec<[std::ops::Range<u32>; 5]>,
+    // CPU copy of upstream lattice/index variants for footprint/PVS pruning.
+    // The GPU vertex buffer and its wave displacement shader stay unchanged.
+    source_vertices: Vec<geometry::OceanVertex>,
+    source_indices: Vec<u32>,
+    prune_capacity: usize,
 }
 
 /// Material values in the original surface uniform. Colors are linear RGB.
@@ -137,12 +152,155 @@ impl Default for SurfaceAppearance {
     }
 }
 
+/// Reindex the *existing* upstream grid, without moving vertices or changing
+/// the shader's clipmap frame/morph logic. The annulus is four non-overlapping
+/// rectangles from upstream geometry::build: north/south, east/west.
+///
+/// Each interior block gets a coarse centre fan. At the annulus borders (both
+/// the hole and the exterior) ALL original grid-edge vertices are included,
+/// avoiding T-junctions against the independently snapped neighbouring ring.
+/// This is built once per mesh quality, not uploaded per frame.
+fn append_stitched_ring(indices: &mut Vec<u32>, segments: u32, level: usize, stride: u32) {
+    let half = (segments / 2) as i32;
+    let hole = (segments / 4) as i32;
+    let step = stride as i32;
+    debug_assert!(stride.is_power_of_two() && stride <= segments / 4);
+    let per_level = (segments + 1) * (segments + 1);
+    let at = |x: i32, y: i32| -> u32 {
+        level as u32 * per_level + ((y + half) * (segments as i32 + 1) + x + half) as u32
+    };
+    // Squares completely in the ring, with the hole excluded exactly as in
+    // geometry::build. Rectangle boundaries coincide on the same lattice.
+    let rects = [
+        (-half, half, -half, -hole),
+        (-half, half, hole, half),
+        (-half, -hole, -hole, hole),
+        (hole, half, -hole, hole),
+    ];
+    for (left, right, bottom, top) in rects {
+        for y0 in (bottom..top).step_by(stride as usize) {
+            for x0 in (left..right).step_by(stride as usize) {
+                let x1 = x0 + step;
+                let y1 = y0 + step;
+                // An edge touching the true hole or exterior must include
+                // every source grid vertex. Adjacent rectangles use identical
+                // strides at their internal borders.
+                let fine_left = x0 == -half || (x0 == hole && y0 >= -hole && y1 <= hole);
+                let fine_right = x1 == half || (x1 == -hole && y0 >= -hole && y1 <= hole);
+                let fine_bottom = y0 == -half || (y0 == hole && x0 >= -hole && x1 <= hole);
+                let fine_top = y1 == half || (y1 == -hole && x0 >= -hole && x1 <= hole);
+                // Traverse clockwise viewed from above, matching the upstream
+                // OceanVertex winding (geometry::build's triangle closure).
+                // At stride 16 the perimeter has at most 64 samples.
+                // No per-block heap allocation during clipmap construction.
+                let mut edge = [0u32; 64];
+                let mut count = 0usize;
+                let mut push = |vertex| { edge[count] = vertex; count += 1; };
+                push(at(x0, y0));
+                let delta = if fine_left { 1 } else { step };
+                for y in (y0 + delta..=y1).step_by(delta as usize) { push(at(x0, y)); }
+                let delta = if fine_top { 1 } else { step };
+                for x in (x0 + delta..=x1).step_by(delta as usize) { push(at(x, y1)); }
+                let delta = if fine_right { 1 } else { step };
+                for y in (y0..y1).rev() {
+                    // start at y1 - delta, not one below y1 when decimated
+                    if (y1 - y) % delta == 0 { push(at(x1, y)); }
+                }
+                let delta = if fine_bottom { 1 } else { step };
+                for x in (x0..x1).rev() {
+                    if (x1 - x) % delta == 0 && x > x0 { push(at(x, y0)); }
+                }
+                // The fan apex is an EXISTING interior lattice vertex;
+                // no extra vertex attributes or GPU pipeline changes.
+                drop(push);
+                let centre = at(x0 + step / 2, y0 + step / 2);
+                for i in 0..count {
+                    indices.extend_from_slice(&[centre, edge[i], edge[(i + 1) % count]]);
+                }
+            }
+        }
+    }
+}
+
+/// A decimated centre fill with every boundary lattice vertex retained.
+/// The fan/edge winding matches append_stitched_ring. As with the rings,
+/// this retains the *original* vertices and only substitutes indices.
+fn append_stitched_fill(indices: &mut Vec<u32>, segments: u32, level: usize, stride: u32) {
+    let half = (segments / 4) as i32;
+    let step = stride as i32;
+    debug_assert!(stride.is_power_of_two() && stride >= 2 && stride <= segments / 4);
+    let per_level = (segments + 1) * (segments + 1);
+    let at = |x: i32, y: i32| -> u32 {
+        level as u32 * per_level + ((y + segments as i32 / 2) * (segments as i32 + 1)
+            + x + segments as i32 / 2) as u32
+    };
+    for y0 in (-half..half).step_by(stride as usize) {
+        for x0 in (-half..half).step_by(stride as usize) {
+            let x1 = x0 + step;
+            let y1 = y0 + step;
+            let mut edge = [0u32; 64];
+            let mut count = 0;
+            let mut push = |v| { edge[count] = v; count += 1; };
+            push(at(x0, y0));
+            let delta = if x0 == -half { 1 } else { step };
+            for y in (y0 + delta..=y1).step_by(delta as usize) { push(at(x0, y)); }
+            let delta = if y1 == half { 1 } else { step };
+            for x in (x0 + delta..=x1).step_by(delta as usize) { push(at(x, y1)); }
+            let delta = if x1 == half { 1 } else { step };
+            for y in (y0..y1).rev() {
+                if (y1 - y) % delta == 0 { push(at(x1, y)); }
+            }
+            let delta = if y0 == -half { 1 } else { step };
+            for x in (x0..x1).rev() {
+                if (x1 - x) % delta == 0 && x > x0 { push(at(x, y0)); }
+            }
+            drop(push);
+            let centre = at(x0 + step / 2, y0 + step / 2);
+            for i in 0..count {
+                indices.extend_from_slice(&[centre, edge[i], edge[(i + 1) % count]]);
+            }
+        }
+    }
+}
+
 impl OriginalClipmap {
     pub fn new(device: &wgpu::Device, segments: u32, levels: usize) -> Self {
         let clipmap = geometry::Clipmap::new(segments, levels);
         let mesh = geometry::build(clipmap, 512.0);
         let outer_ring_cells = clipmap.segments * clipmap.segments * 3 / 4;
         let horizon_start = mesh.rings[clipmap.levels - 1] + outer_ring_cells * 6;
+        let index_count = mesh.indices.len() as u32;
+        let mut indices = mesh.indices.clone();
+        let ring_lods: Vec<[std::ops::Range<u32>; 5]> = (0..clipmap.levels).map(|level| {
+            let base_start = mesh.rings[level];
+            let base_end = mesh.rings.get(level + 1).copied().unwrap_or(horizon_start);
+            let mut ranges: [std::ops::Range<u32>; 5] = std::array::from_fn(|_| base_start..base_end);
+            for (variant, range) in ranges.iter_mut().enumerate().skip(1) {
+                let start = indices.len() as u32;
+                append_stitched_ring(&mut indices, clipmap.segments, level,
+                    (1u32 << variant).min(clipmap.segments / 4));
+                *range = start..indices.len() as u32;
+            }
+            ranges
+        }).collect();
+        let fill_lods: Vec<[std::ops::Range<u32>; 5]> = (0..clipmap.levels).map(|level| {
+            let base = mesh.fills[level].clone();
+            let mut variants: [std::ops::Range<u32>; 5] = std::array::from_fn(|_| base.clone());
+            for (variant, range) in variants.iter_mut().enumerate().skip(1) {
+                let start = indices.len() as u32;
+                append_stitched_fill(&mut indices, clipmap.segments, level,
+                    (1u32 << variant).min(clipmap.segments / 4));
+                *range = start..indices.len() as u32;
+            }
+            variants
+        }).collect();
+        let prune_capacity = (0..clipmap.levels).map(|level| {
+            ring_lods[level].iter().map(|r| (r.end - r.start) as usize).max().unwrap_or(0)
+        }).sum::<usize>() + fill_lods.iter().flat_map(|variants| variants.iter())
+            .map(|r| (r.end - r.start) as usize).max().unwrap_or(0)
+            + (index_count - horizon_start) as usize;
+        let source_indices = indices.clone();
+        let source_vertices = mesh.vertices.clone();
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Blue Water original clipmap vertices"),
             contents: bytemuck::cast_slice(&mesh.vertices),
@@ -150,7 +308,7 @@ impl OriginalClipmap {
         });
         let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Blue Water original clipmap indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
+            contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
         Self {
@@ -160,8 +318,100 @@ impl OriginalClipmap {
             fills: mesh.fills,
             rings: mesh.rings,
             horizon_start,
-            index_count: mesh.indices.len() as u32,
+            index_count,
+            ring_lods,
+            fill_lods,
+            source_indices,
+            source_vertices,
+            prune_capacity,
         }
+    }
+
+    /// Maximum indices across the active fill, per-ring LOD variants and sky horizon.
+    pub fn pruned_index_capacity(&self) -> usize { self.prune_capacity }
+
+    /// Prune the original Blue Water indices with the SAME conservative cell
+    /// admission callback used by Godot. The submitted triangles are genuinely
+    /// removed; fragment masking remains solely for shoreline precision.
+    ///
+    /// CPU positions match the upstream snapped frame and inner-edge shift.
+    /// `extra_pad` (metres) widens every test for callers that pass frames
+    /// quantized coarser than the real snap, so one prune stays valid over a
+    /// longer camera move.
+    /// Pad by the maximum one-cell geomorph to avoid losing triangles when
+    /// `detail.morph` changes between lattice crossings (no per-frame rebuild).
+    pub fn pruned_indices(
+        &self,
+        first: usize, outer: usize, steps: &[u8; 10], horizon: bool,
+        frames: &[[f32; 4]; 10],
+        extra_pad: f32,
+        admit: impl FnMut([f32; 2], [f32; 2]) -> bool,
+    ) -> Vec<u32> {
+        self.pruned_indices_with_fill(first, outer, steps, 1, horizon, frames, extra_pad, admit)
+    }
+
+    /// Curvature-aware geometry option: individually decimate the centre fill
+    /// as well as the annular rings, without changing the upstream vertex shader.
+    pub fn pruned_indices_with_fill(
+        &self,
+        first: usize, outer: usize, steps: &[u8; 10], fill_step: u8,
+        horizon: bool, frames: &[[f32; 4]; 10], extra_pad: f32,
+        mut admit: impl FnMut([f32; 2], [f32; 2]) -> bool,
+    ) -> Vec<u32> {
+        let first = first.min(self.clipmap.levels - 1);
+        let last = if horizon { self.clipmap.levels - 1 }
+            else { outer.max(first).min(self.clipmap.levels - 1) };
+        let mut out = Vec::with_capacity((self.prune_capacity / 8).max(4096));
+        // Reconstruct the upstream vertex shader's snapped grid once per
+        // lattice crossing, not three times for every triangle. The shader's
+        // continuous 0..1 geomorph moves vertices by at most one cell, which
+        // is covered by the conservative bounds expansion below.
+        let positions: Vec<[f32; 2]> = self.source_vertices.iter().map(|vertex| {
+            let level = (vertex.level[0] as usize).min(self.clipmap.levels - 1);
+            let frame = frames[level];
+            let inner = level > 0 && vertex.position.iter().all(|&v|
+                v.abs() <= self.clipmap.segments as f32 * frame[2] / 4.0 + 1.0e-3);
+            let centre = if inner { frames[level - 1] } else { frame };
+            [centre[0] + vertex.position[0], centre[1] + vertex.position[1]]
+        }).collect();
+        let mut prune_range = |range: &std::ops::Range<u32>, original_quads: bool| {
+            // The upstream fill and stride-1 rings are six indices per cell.
+            // Godot admits the entire cell conservatively; test once per
+            // quad, instead of separately discarding half of a wet quad.
+            // Stitched outer LOD variants contain triangle fans, so their
+            // groups must instead be examined triangle-by-triangle.
+            let stride = if original_quads { 6 } else { 3 };
+            for indices in self.source_indices[range.start as usize..range.end as usize]
+                .chunks_exact(stride)
+            {
+                let mut lo = [f32::INFINITY; 2];
+                let mut hi = [f32::NEG_INFINITY; 2];
+                for &vertex_index in indices {
+                    let point = positions[vertex_index as usize];
+                    for axis in 0..2 {
+                        lo[axis] = lo[axis].min(point[axis]);
+                        hi[axis] = hi[axis].max(point[axis]);
+                    }
+                }
+                let level = (self.source_vertices[indices[0] as usize].level[0] as usize)
+                    .min(self.clipmap.levels - 1);
+                let pad = frames[level][2] * 1.05 + extra_pad;
+                for axis in 0..2 { lo[axis] -= pad; hi[axis] += pad; }
+                if admit(lo, hi) { out.extend_from_slice(indices); }
+            }
+        };
+        let fill_variant = fill_step.clamp(1, 16).ilog2().min(4) as usize;
+        prune_range(&self.fill_lods[first][fill_variant], fill_variant == 0);
+        for level in first..=last {
+            let variant = steps[level].clamp(1, 16).ilog2().min(4) as usize;
+            prune_range(&self.ring_lods[level][variant], variant == 0);
+        }
+        // Horizon/skirt is valid only under the sky-contact gate; the finite
+        // footprint callback cannot bound its far-plane vertices conservatively.
+        if horizon {
+            out.extend_from_slice(&self.source_indices[self.horizon_start as usize..self.index_count as usize]);
+        }
+        out
     }
 
     pub fn clipmap(&self) -> geometry::Clipmap {
@@ -182,6 +432,61 @@ impl OriginalClipmap {
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(self.fills[first].clone(), 0, 0..1);
         pass.draw_indexed(self.rings[first]..end, 0, 0..1);
+    }
+
+    /// Use the original vertex shader and frames verbatim; only ring *interior*
+    /// indices become sparse. Both ring borders retain every original vertex,
+    /// so separate LOD levels meet exactly as before, including odd-vertex
+    /// morphing at the outer edge. The already allocated variants are immutable.
+    pub fn draw_lod<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>, first: usize,
+        outer_level: usize, ring_steps: &[u8; 10], horizon: bool,
+    ) {
+        let first = first.min(self.clipmap.levels - 1);
+        let last = if horizon { self.clipmap.levels - 1 }
+            else { outer_level.max(first).min(self.clipmap.levels - 1) };
+        if (first..=last).all(|level| ring_steps[level] == 1) {
+            if horizon { self.draw_horizon(pass, first); }
+            else { self.draw(pass, first, last); }
+            return;
+        }
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(self.fills[first].clone(), 0, 0..1);
+        for level in first..=last {
+            let variant = ring_steps[level].clamp(1, 16).ilog2().min(4) as usize;
+            pass.draw_indexed(self.ring_lods[level][variant].clone(), 0, 0..1);
+        }
+        if horizon {
+            pass.draw_indexed(self.horizon_start..self.index_count, 0, 0..1);
+        }
+    }
+
+    /// Draw the exact selected pool indices for all Blue Water passes.
+    pub fn draw_pruned<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>,
+        index_buffer: &'a wgpu::Buffer, index_count: u32,
+    ) {
+        if index_count == 0 { return; }
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..index_count, 0, 0..1);
+    }
+
+    pub fn triangle_count_lod(
+        &self, first: usize, outer_level: usize, ring_steps: &[u8; 10], horizon: bool,
+    ) -> u64 {
+        let first = first.min(self.clipmap.levels - 1);
+        let last = if horizon { self.clipmap.levels - 1 }
+            else { outer_level.max(first).min(self.clipmap.levels - 1) };
+        let mut indices = self.fills[first].end - self.fills[first].start;
+        for level in first..=last {
+            let variant = ring_steps[level].clamp(1, 16).ilog2().min(4) as usize;
+            let range = &self.ring_lods[level][variant];
+            indices += range.end - range.start;
+        }
+        if horizon { indices += self.index_count - self.horizon_start; }
+        u64::from(indices) / 3
     }
 
     pub fn triangle_count(&self, first: usize, outer_level: usize) -> u64 {
@@ -336,7 +641,7 @@ impl SurfaceBoundary {
     }
 }
 
-fn buffer(device: &wgpu::Device, label: &'static str, size: u64, storage: bool) -> wgpu::Buffer {
+pub(crate) fn buffer(device: &wgpu::Device, label: &'static str, size: u64, storage: bool) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size.max(16),
@@ -349,7 +654,7 @@ fn buffer(device: &wgpu::Device, label: &'static str, size: u64, storage: bool) 
     })
 }
 
-fn placeholder(
+pub(crate) fn placeholder(
     device: &wgpu::Device,
     label: &'static str,
     format: wgpu::TextureFormat,
@@ -380,7 +685,7 @@ fn placeholder(
     })
 }
 
-fn size_of_binding(module: &wgpu::naga::Module, group: u32, binding: u32) -> u64 {
+pub(crate) fn size_of_binding(module: &wgpu::naga::Module, group: u32, binding: u32) -> u64 {
     let (_, global) = module
         .global_variables
         .iter()
@@ -397,25 +702,35 @@ fn size_of_binding(module: &wgpu::naga::Module, group: u32, binding: u32) -> u64
     }
 }
 
-fn entry_buffer(binding: u32, value: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry_buffer(binding: u32, value: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: value.as_entire_binding(),
     }
 }
 
-fn entry_texture(binding: u32, value: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry_texture(binding: u32, value: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::TextureView(value),
     }
 }
 
-fn entry_sampler(binding: u32, value: &wgpu::Sampler) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry_sampler(binding: u32, value: &wgpu::Sampler) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::Sampler(value),
     }
+}
+
+/// The wake sampler's inputs (`naval_ocean::wake`): the `Wake` uniform, the field's two display textures, the trail atlas
+/// and the torpedo field. Cheap to clone (handles).
+#[derive(Clone)]
+pub struct WakeResources {
+    pub uniform: wgpu::Buffer,
+    pub displays: [wgpu::TextureView; 2],
+    pub trail_atlas: wgpu::TextureView,
+    pub torpedo_field: wgpu::TextureView,
 }
 
 /// Live bindings for the original material. Neutral shadow, wake, cloud and
@@ -432,6 +747,7 @@ pub struct OriginalSurfaceBindings {
     current_scene: Option<(wgpu::TextureView, wgpu::TextureView)>,
     neutral_cloud: (wgpu::TextureView, wgpu::Sampler, wgpu::Buffer),
     surface: wgpu::Buffer,
+    hybrid_swell: wgpu::Buffer,
     environment: wgpu::Buffer,
     ambient_atlas: wgpu::Texture,
     ambient: [f32; 3],
@@ -439,6 +755,9 @@ pub struct OriginalSurfaceBindings {
     pub(crate) calm_wake: wgpu::Buffer,
     pub(crate) calm_view: wgpu::TextureView,
     pub(crate) wake_sampler: wgpu::Sampler,
+    /// Live ship-wake resources (group 1, bindings 5-10); calm until `set_wake` supplies the effects crate's.
+    wake: WakeResources,
+    wake_generation: u64,
     cloud_view: wgpu::TextureView,
     cloud_sampler: wgpu::Sampler,
     cloud_uniform: wgpu::Buffer,
@@ -559,6 +878,9 @@ impl OriginalSurfaceBindings {
             surface_bytes as u64,
             false,
         );
+        let hybrid_swell = buffer(device, "JKA Hybrid Gerstner", 32, false);
+        let pure_fft: [[f32; 4]; 2] = [[0.0; 4], [0.0, 0.0, 1.0, 0.0]];
+        queue.write_buffer(&hybrid_swell, 0, bytemuck::bytes_of(&pure_fft));
         let calm_wake = buffer(
             device,
             "Blue Water calm wake",
@@ -639,8 +961,12 @@ impl OriginalSurfaceBindings {
             &pipeline.surface_layout,
             &surface,
             &foam,
-            &calm_wake,
-            &calm_view,
+            &WakeResources {
+                uniform: calm_wake.clone(),
+                displays: [calm_view.clone(), calm_view.clone()],
+                trail_atlas: calm_view.clone(),
+                torpedo_field: calm_view.clone(),
+            },
             &wake_sampler,
             &cloud_view,
             &cloud_sampler,
@@ -648,6 +974,7 @@ impl OriginalSurfaceBindings {
             &probe_view,
             &reflection_table,
             &boundary,
+            &hybrid_swell,
             &color,
             &depth,
         );
@@ -736,10 +1063,18 @@ impl OriginalSurfaceBindings {
                 cloud_uniform.clone(),
             ),
             surface,
+            hybrid_swell,
             environment,
             ambient_atlas: atlas,
             ambient: [117.0 / 255.0, 154.0 / 255.0, 186.0 / 255.0],
             foam,
+            wake: WakeResources {
+                uniform: calm_wake.clone(),
+                displays: [calm_view.clone(), calm_view.clone()],
+                trail_atlas: calm_view.clone(),
+                torpedo_field: calm_view.clone(),
+            },
+            wake_generation: 0,
             calm_wake,
             calm_view,
             wake_sampler,
@@ -759,8 +1094,7 @@ impl OriginalSurfaceBindings {
         layout: &wgpu::BindGroupLayout,
         surface: &wgpu::Buffer,
         foam: &crate::foam_texture::FoamMap,
-        calm_wake: &wgpu::Buffer,
-        calm_view: &wgpu::TextureView,
+        wake: &WakeResources,
         wake_sampler: &wgpu::Sampler,
         cloud_view: &wgpu::TextureView,
         cloud_sampler: &wgpu::Sampler,
@@ -768,6 +1102,7 @@ impl OriginalSurfaceBindings {
         probe_view: &wgpu::TextureView,
         reflection_table: &wgpu::Buffer,
         boundary: &wgpu::Buffer,
+        hybrid_swell: &wgpu::Buffer,
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
@@ -780,18 +1115,19 @@ impl OriginalSurfaceBindings {
                 entry_sampler(2, &foam.sampler),
                 entry_texture(3, color),
                 entry_texture(4, depth),
-                entry_buffer(5, calm_wake),
-                entry_texture(6, calm_view),
-                entry_texture(7, calm_view),
+                entry_buffer(5, &wake.uniform),
+                entry_texture(6, &wake.displays[0]),
+                entry_texture(7, &wake.displays[1]),
                 entry_sampler(8, wake_sampler),
-                entry_texture(9, calm_view),
-                entry_texture(10, calm_view),
+                entry_texture(9, &wake.trail_atlas),
+                entry_texture(10, &wake.torpedo_field),
                 entry_texture(11, cloud_view),
                 entry_sampler(12, cloud_sampler),
                 entry_buffer(13, cloud_uniform),
                 entry_texture(14, probe_view),
                 entry_buffer(15, reflection_table),
                 entry_buffer(16, boundary),
+                entry_buffer(17, hybrid_swell),
             ],
         })
     }
@@ -810,8 +1146,7 @@ impl OriginalSurfaceBindings {
             &pipeline.surface_layout,
             &self.surface,
             &self.foam,
-            &self.calm_wake,
-            &self.calm_view,
+            &self.wake,
             &self.wake_sampler,
             &self.cloud_view,
             &self.cloud_sampler,
@@ -819,11 +1154,47 @@ impl OriginalSurfaceBindings {
             &self.probe_view,
             &self.reflection_table,
             &self.boundary,
+            &self.hybrid_swell,
             color,
             depth,
         );
         self.current_scene = Some(next);
     }
+
+    /// Bind live ship-wake resources (or calm ones again for `None`). Rebuilds the material group against the scene
+    /// copies already bound; `wake_generation` moves so dependent bind groups (underwater, rain heights) can follow.
+    pub fn set_wake(
+        &mut self,
+        device: &wgpu::Device,
+        pipeline: &OriginalSurfacePipeline,
+        wake: Option<WakeResources>,
+    ) {
+        let next = wake.unwrap_or_else(|| WakeResources {
+            uniform: self.calm_wake.clone(),
+            displays: [self.calm_view.clone(), self.calm_view.clone()],
+            trail_atlas: self.calm_view.clone(),
+            torpedo_field: self.calm_view.clone(),
+        });
+        let same = self.wake.uniform == next.uniform
+            && self.wake.displays == next.displays
+            && self.wake.trail_atlas == next.trail_atlas
+            && self.wake.torpedo_field == next.torpedo_field;
+        if same { return; }
+        self.wake = next;
+        self.wake_generation += 1;
+        if let Some((color, depth)) = self.current_scene.take() {
+            self.set_scene(device, pipeline, &color, &depth);
+        }
+    }
+
+    pub fn wake_resources(&self) -> &WakeResources { &self.wake }
+    /// The pool's `JkaWaterBoundary` uniform, for effects that must stay inside its footprint.
+    pub fn boundary(&self) -> &wgpu::Buffer { &self.boundary }
+    /// The cloud-shadow resources currently bound (neutral when clouds are off).
+    pub fn cloud_resources(&self) -> (&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer) {
+        (&self.cloud_view, &self.cloud_sampler, &self.cloud_uniform)
+    }
+    pub fn wake_generation(&self) -> u64 { self.wake_generation }
 
     /// Bind the original atmosphere's froxels and cloud shadow resources, restoring clear air when absent.
     pub fn set_atmosphere_resources(
@@ -969,6 +1340,10 @@ impl OriginalSurfaceBindings {
         );
     }
 
+    pub fn write_hybrid_swell(&self, queue: &wgpu::Queue, two_vec4: &[[f32; 4]; 2]) {
+        queue.write_buffer(&self.hybrid_swell, 0, bytemuck::bytes_of(two_vec4));
+    }
+
     pub fn write_surface_prefix(&self, queue: &wgpu::Queue, first_25_vec4: &[[f32; 4]; 25]) {
         assert!(self.surface_bytes >= 25 * 16);
         queue.write_buffer(&self.surface, 0, bytemuck::bytes_of(first_25_vec4));
@@ -1017,6 +1392,19 @@ impl OriginalSurfacePipeline {
         reflection_steps: u32,
         pixel_detail_mode: u8,
     ) -> Self {
+        Self::new_with_wave_layout(device, waves.layout(), color_format, samples, reflection_steps, pixel_detail_mode)
+    }
+
+    /// Pipeline construction needs only the immutable wave layout. Hosts can
+    /// clone that handle into their build queue without sharing wave state.
+    pub fn new_with_wave_layout(
+        device: &wgpu::Device,
+        wave_layout: &wgpu::BindGroupLayout,
+        color_format: wgpu::TextureFormat,
+        samples: u32,
+        reflection_steps: u32,
+        pixel_detail_mode: u8,
+    ) -> Self {
         let vertex = wgpu::ShaderStages::VERTEX;
         let fragment = wgpu::ShaderStages::FRAGMENT;
         let both = vertex | fragment;
@@ -1024,16 +1412,17 @@ impl OriginalSurfacePipeline {
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Blue Water original camera layout"),
             entries: &[
+                // Vertex visibility too: native spindrift lights and hazes each wisp in its vertex stage.
                 uniform(0, both),
-                uniform(1, fragment),
-                sampled(2, fragment, wgpu::TextureViewDimension::D2Array, true),
-                sampled(3, fragment, t2, true),
-                sampler(4, fragment, true),
+                uniform(1, both),
+                sampled(2, both, wgpu::TextureViewDimension::D2Array, true),
+                sampled(3, both, t2, true),
+                sampler(4, both, true),
                 uniform(5, both),
-                sampled(6, fragment, wgpu::TextureViewDimension::D3, false),
-                sampler(7, fragment, false),
-                storage(8, fragment),
-                uniform(9, fragment),
+                sampled(6, both, wgpu::TextureViewDimension::D3, false),
+                sampler(7, both, false),
+                storage(8, both),
+                uniform(9, both),
             ],
         });
         let surface_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1056,15 +1445,16 @@ impl OriginalSurfacePipeline {
                 sampled(14, fragment, t2, false),
                 storage(15, fragment),
                 uniform(16, fragment),
+                uniform(17, both),
             ],
         });
         let environment_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Blue Water original environment layout"),
                 entries: &[
-                    sampled(0, fragment, t2, false),
-                    sampler(1, fragment, false),
-                    uniform(2, fragment),
+                    sampled(0, both, t2, false),
+                    sampler(1, both, false),
+                    uniform(2, both),
                 ],
             });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1072,7 +1462,7 @@ impl OriginalSurfacePipeline {
             bind_group_layouts: &[
                 Some(&camera_layout),
                 Some(&surface_layout),
-                Some(waves.layout()),
+                Some(wave_layout),
                 Some(&environment_layout),
             ],
             immediate_size: 0,
@@ -1119,11 +1509,147 @@ impl OriginalSurfacePipeline {
             multiview_mask: None,
             cache: None,
         });
+        let (reduced_pipeline, near_pipeline, reconstruct_pipeline, reconstruct_layout) = if pixel_detail_mode == 0 {
+            (None, None, None, None)
+        } else {
+            // Render the complete surface graph at true reduced raster resolution.
+            // The expensive shader does not execute at intermediate pixels.
+            let reduced = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blue Water true reduced-resolution material"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader, entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader, entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::TextureFormat::Rgba16Float.into())],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw, cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(), bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: 1, ..Default::default() },
+                multiview_mask: None, cache: None,
+            });
+            let reduced_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blue Water reduced shaded color/depth"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        }, count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        }, count: None,
+                    },
+                ],
+            });
+            let reconstruction_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Blue Water reduced reconstruction layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout), Some(&surface_layout), Some(wave_layout),
+                    Some(&environment_layout), Some(&reduced_layout),
+                ], immediate_size: 0,
+            });
+            let mut composer = shader_composer::composer().expect("Blue Water composer");
+            let reconstruction = shader_composer::jka_reconstruct_module(&mut composer)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+            let reconstruction_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blue Water full-resolution depth-aware upscaler"),
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(reconstruction)),
+            });
+            let reconstructed = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blue Water full-resolution geometry, depth and color reconstruction"),
+                layout: Some(&reconstruction_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &reconstruction_shader, entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &reconstruction_shader, entry_point: Some("fragment"),
+                    compilation_options: Default::default(), targets: &[Some(color_format.into())],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw, cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(), bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                multiview_mask: None, cache: None,
+            });
+            let near = if matches!(pixel_detail_mode, 3 | 4) {
+                let mut composer = shader_composer::composer().expect("Blue Water composer");
+                let near_module = shader_composer::jka_near_surface_module(&mut composer, reflection_steps)
+                    .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+                let near_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Blue Water distance-aware near detail"),
+                    source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(near_module)),
+                });
+                Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Blue Water full-resolution near detail / feathered overlay"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &near_shader, entry_point: Some("vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &near_shader, entry_point: Some("fragment"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: wgpu::FrontFace::Ccw, cull_mode: None, ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(), bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                    multiview_mask: None, cache: None,
+                }))
+            } else { None };
+            (Some(reduced), near, Some(reconstructed), Some(reduced_layout))
+        };
         Self {
             camera_layout,
             surface_layout,
             environment_layout,
             pipeline,
+            reduced_pipeline,
+            near_pipeline,
+            reconstruct_pipeline,
+            reconstruct_layout,
             wireframe: None,
             waterline_marker: None,
             vertex_shader: shader,
@@ -1170,11 +1696,12 @@ impl OriginalSurfacePipeline {
         if self.wireframe.is_some() || !device.features().contains(wgpu::Features::POLYGON_MODE_LINE) {
             return;
         }
+        let mut composer = shader_composer::composer().expect("Blue Water wireframe composer");
+        let module = shader_composer::jka_wireframe_module(&mut composer)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blue Water native wireframe color"),
-            source: wgpu::ShaderSource::Wgsl(
-                "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.9, 0.1, 1.0); }".into(),
-            ),
+            label: Some("Blue Water PVS/footprint-masked native wireframe"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
         });
         self.wireframe = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Blue Water original native wireframe"),
@@ -1187,7 +1714,7 @@ impl OriginalSurfacePipeline {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &line_shader,
-                entry_point: Some("main"),
+                entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(color_format.into())],
             }),
@@ -1215,6 +1742,87 @@ impl OriginalSurfacePipeline {
 mod tests {
     use super::*;
     use blue_water_core::QualityTier;
+
+    #[test]
+    fn decimated_rings_keep_exact_dense_boundaries_and_watertight_indices() {
+        use std::collections::HashMap;
+        for segments in [32u32, 64, 128] {
+            let half = (segments / 2) as i32;
+            let hole = (segments / 4) as i32;
+            for stride in [2, 4, 8, 16] {
+                let mut indices = Vec::new();
+                append_stitched_ring(&mut indices, segments, 0, stride.min(segments / 4));
+                assert_eq!(indices.len() % 3, 0);
+                assert!(indices.len() < (segments * segments * 3 / 4 * 6) as usize);
+                let point = |id: u32| {
+                    let span = segments + 1;
+                    ((id % span) as i32 - half, (id / span) as i32 - half)
+                };
+                let mut edges: HashMap<((i32, i32), (i32, i32)), u32> = HashMap::new();
+                let mut doubled_area = 0i64;
+                for triangle in indices.chunks_exact(3) {
+                    let [a, b, c] = [point(triangle[0]), point(triangle[1]), point(triangle[2])];
+                    let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                    assert!(cross < 0, "zero/inverted triangle, stride={stride}");
+                    doubled_area += i64::from(-cross);
+                    for (a, b) in [(a, b), (b, c), (c, a)] {
+                        *edges.entry(if a < b { (a, b) } else { (b, a) }).or_default() += 1;
+                    }
+                }
+                assert_eq!(doubled_area, i64::from(segments * segments * 3 / 2));
+                let boundary: Vec<_> = edges.iter().filter(|edge| *edge.1 == 1).collect();
+                assert_eq!(boundary.len(), (6 * segments) as usize);
+                for (edge, _) in boundary {
+                    let (a, b) = *edge;
+                    // Every seam segment is exactly one ORIGINAL grid cell.
+                    assert_eq!((a.0 - b.0).abs() + (a.1 - b.1).abs(), 1);
+                    assert!(a.0.abs() == half || b.0.abs() == half
+                        || a.1.abs() == half || b.1.abs() == half
+                        || a.0.abs() == hole || b.0.abs() == hole
+                        || a.1.abs() == hole || b.1.abs() == hole);
+                }
+                assert!(edges.values().all(|&n| n == 1 || n == 2), "nonmanifold index edges");
+            }
+        }
+    }
+
+    #[test]
+    fn decimated_fill_keeps_dense_ring_join_without_nonmanifold_edges() {
+        use std::collections::HashMap;
+        for segments in [64u32, 128, 256] {
+            let half = (segments / 2) as i32;
+            let hole = (segments / 4) as i32;
+            for stride in [2, 4, 8, 16] {
+                let mut indices = Vec::new();
+                append_stitched_fill(&mut indices, segments, 0, stride);
+                let point = |id: u32| {
+                    let span = segments + 1;
+                    ((id % span) as i32 - half, (id / span) as i32 - half)
+                };
+                let mut edges: HashMap<((i32, i32), (i32, i32)), u32> = HashMap::new();
+                let mut doubled_area = 0i64;
+                for tri in indices.chunks_exact(3) {
+                    let [a, b, c] = [point(tri[0]), point(tri[1]), point(tri[2])];
+                    let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                    assert!(cross < 0, "inverted/degenerate fill triangle: stride={stride}");
+                    doubled_area += i64::from(-cross);
+                    for (a, b) in [(a, b), (b, c), (c, a)] {
+                        *edges.entry(if a < b { (a, b) } else { (b, a) }).or_default() += 1;
+                    }
+                }
+                assert_eq!(doubled_area, i64::from(segments * segments / 2));
+                let boundary: Vec<_> = edges.iter().filter(|edge| *edge.1 == 1).collect();
+                assert_eq!(boundary.len(), (2 * segments) as usize);
+                for (edge, _) in boundary {
+                    let (a, b) = *edge;
+                    assert_eq!((a.0 - b.0).abs() + (a.1 - b.1).abs(), 1);
+                    assert!(a.0.abs() == hole || b.0.abs() == hole
+                        || a.1.abs() == hole || b.1.abs() == hole);
+                }
+                assert!(edges.values().all(|&n| n == 1 || n == 2));
+            }
+        }
+    }
 
     #[test]
     fn jka_fragment_boundary_preserves_outline_pvs_and_sky_contacts() {
@@ -1352,6 +1960,89 @@ mod tests {
                 read.unmap();
             }
             assert!(scope.pop().await.is_none(), "JKA boundary GPU validation");
+        });
+    }
+
+    #[test]
+    fn pruned_indices_keep_the_selected_lod_draw_when_everything_is_admitted() {
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .expect("GPU adapter");
+            let (device, _queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .expect("GPU device");
+            for (segments, levels) in [(64, 6), (256, 9)] {
+                let clipmap = OriginalClipmap::new(&device, segments, levels);
+                let frames = clipmap.clipmap().frames(123.4, -56.7);
+                for steps in [[1u8; 10], [1, 1, 2, 4, 8, 16, 1, 2, 4, 8]] {
+                    for (first, outer, horizon) in [(0, levels - 1, false), (2, levels - 2, false), (1, levels - 1, true)] {
+                        let kept = clipmap.pruned_indices(first, outer, &steps, horizon, &frames, 0.0, |_, _| true);
+                        assert_eq!(
+                            kept.len() as u64 / 3,
+                            clipmap.triangle_count_lod(first, outer, &steps, horizon),
+                            "segments {segments} levels {levels} first {first} outer {outer} horizon {horizon}"
+                        );
+                        assert!(kept.len() <= clipmap.pruned_index_capacity());
+                    }
+                }
+                let started = std::time::Instant::now();
+                let mut kept = 0;
+                for _ in 0..10 {
+                    kept = clipmap.pruned_indices(0, levels - 1, &[1; 10], false, &frames, 0.0,
+                        |lo, hi| hi[0] > 0.0 && lo[0] < 3000.0 && hi[1] > 0.0 && lo[1] < 3000.0).len();
+                }
+                eprintln!("prune {segments}x{levels}: {:.2} ms per full rebuild, {kept} indices kept",
+                    started.elapsed().as_secs_f64() * 100.0);
+            }
+        });
+    }
+
+    #[test]
+    fn pruned_indices_keep_every_triangle_the_shader_places_over_the_region() {
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.expect("GPU adapter");
+            let (device, _queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("GPU device");
+            let (segments, levels) = (64u32, 6usize);
+            let clipmap = OriginalClipmap::new(&device, segments, levels);
+            // A 90 m x 40 m pool 300 m from the origin; camera inside it.
+            let (lo_r, hi_r) = ([300.0f32, -120.0], [390.0f32, -80.0]);
+            let frames = clipmap.clipmap().frames(331.3, -97.9);
+            let steps = [1u8; 10];
+            let kept = clipmap.pruned_indices(0, levels - 1, &steps, false, &frames, 0.0, |lo, hi| {
+                hi[0] >= lo_r[0] && lo[0] <= hi_r[0] && hi[1] >= lo_r[1] && lo[1] <= hi_r[1]
+            });
+            let kept: std::collections::HashSet<[u32; 3]> = kept.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+            // The vertex shader's snapped lattice position, written independently.
+            let shader_position = |vertex: &geometry::OceanVertex| -> [f32; 2] {
+                let level = vertex.level[0] as usize;
+                let frame = frames[level];
+                let lattice = [vertex.position[0] * frame[3], vertex.position[1] * frame[3]];
+                let inner = lattice[0].abs().max(lattice[1].abs()) <= segments as f32 / 4.0 && level > 0;
+                let finer = frames[level.saturating_sub(1)];
+                let shift = if inner { [(finer[0] - frame[0]) * frame[3], (finer[1] - frame[1]) * frame[3]] } else { [0.0; 2] };
+                [frame[0] + (lattice[0] + shift[0]) * frame[2], frame[1] + (lattice[1] + shift[1]) * frame[2]]
+            };
+            let mut ranges = vec![clipmap.fills[0].clone()];
+            for level in 0..levels { ranges.push(clipmap.ring_lods[level][0].clone()); }
+            let (mut over, mut missing) = (0, 0);
+            for range in ranges {
+                for tri in clipmap.source_indices[range.start as usize..range.end as usize].chunks_exact(3) {
+                    let points: Vec<[f32; 2]> = tri.iter().map(|&i| shader_position(&clipmap.source_vertices[i as usize])).collect();
+                    let lo = [points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min), points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min)];
+                    let hi = [points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max), points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max)];
+                    if hi[0] >= lo_r[0] && lo[0] <= hi_r[0] && hi[1] >= lo_r[1] && lo[1] <= hi_r[1] {
+                        over += 1;
+                        if !kept.contains(&[tri[0], tri[1], tri[2]]) { missing += 1; }
+                    }
+                }
+            }
+            eprintln!("triangles over the pool: {over}, missing from the pruned set: {missing}");
+            assert!(over > 100 && missing == 0);
         });
     }
 

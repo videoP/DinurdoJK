@@ -20,6 +20,8 @@ pub(crate) use sub_bsp::{prepare_source_with_sub_bsps, server_bsp_names, sub_bsp
 mod coordinates;
 mod entities;
 mod environment;
+mod menu_look;
+pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage, MenuFx, MenuProp};
 mod geometry;
 mod lighting;
 mod lightmaps;
@@ -30,6 +32,7 @@ mod shader_remap;
 mod source;
 mod source_map;
 mod vegetation;
+pub mod surface_sprite_bake;
 mod visibility;
 pub(crate) use cache::FoldHasher;
 pub(crate) use shader_remap::{
@@ -411,6 +414,8 @@ pub struct DrawBatch {
     /// work; runtime sun visibility does not consume these authored compile flags yet.
     #[allow(dead_code)]
     pub alpha_shadow: bool,
+    /// Compiler image for authored sunlight transmission, independent of stages.
+    pub baked_shadow_texture: Option<usize>,
     #[allow(dead_code)]
     pub light_filter: bool,
     /// First authored stage used as the promoted-water replacement draw.
@@ -802,6 +807,9 @@ pub struct MapLoadTimings {
     pub geometry_ms: f64,
     pub grass_ms: f64,
     pub grass_cpu_ms: f64,
+    /// Native surfaceSprites bake: wall time on the loader, summed worker CPU.
+    pub surface_sprites_ms: f64,
+    pub surface_sprites_cpu_ms: f64,
     pub gi_ms: f64,
     pub ocean_ms: f64,
     pub steam_audio_ms: f64,
@@ -903,6 +911,14 @@ pub struct MapPrepareOptions {
     /// offline probe/reflection/pathing bake. When false there is no acoustic
     /// geometry work during map preparation.
     pub steam_audio: bool,
+    /// Apply the built-in main-menu presentation edits (see `scene::menu_look`):
+    /// prepare-time material substitution and synthesized water. Only the
+    /// frontend background sets this; gameplay loads of the same map stay stock.
+    pub menu_look: bool,
+    /// With `menu_look`: also add the menu scene's props (static models). The
+    /// menu itself sets this; `menudevmap` leaves it off so the props can be
+    /// loaded as editable Map Mods placements instead.
+    pub menu_props: bool,
 }
 
 impl Default for MapPrepareOptions {
@@ -925,6 +941,8 @@ impl Default for MapPrepareOptions {
             pbr_materials: true,
             allow_asset_overrides: true,
             steam_audio: false,
+            menu_look: false,
+            menu_props: false,
         }
     }
 }
@@ -1414,6 +1432,17 @@ pub struct SourceMapLighting {
     pub minlight: [f32; 3],
 }
 
+/// q3map2 output transform and authored sun sampling retained for inverse lighting.
+#[derive(Debug, Clone, Copy)]
+pub struct BakedSunEncoding {
+    pub exposure: f32,
+    pub gamma: f32,
+    pub compensate: f32,
+    pub brightness: f32,
+    pub deviance: f32,
+    pub samples: u32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LegacyDlightSurface {
     /// 0 = reject, 1 = bounds + planar face test, 2 = bounds-only test.
@@ -1507,7 +1536,7 @@ pub struct PreparedMap {
     pub mark_surfaces: Option<Arc<jka_assets::bsp::MarkSurfaces>>,
     /// `misc_model_static` props the client places from the BSP entity string
     /// (the game module frees them, so they never arrive in a snapshot).
-    pub static_models: Arc<Vec<jka_assets::bsp::StaticModel>>,
+    pub static_models: Arc<jka_assets::bsp::StaticModels>,
     /// Compact static world surface used only by client-side Rapier visuals.
     /// It stays in JKA coordinates; the Rapier layer owns unit conversion.
     pub physics_collision: crate::cgame::ragdoll::PhysicsMapMesh,
@@ -1572,6 +1601,7 @@ pub struct PreparedMap {
     /// Global q3map2 source-.map lighting controls. Compiled BSPs keep zeroes.
     pub source_map_lighting: SourceMapLighting,
     pub sun: Option<DirectionalSun>,
+    pub baked_sun_encoding: Option<BakedSunEncoding>,
     /// Static directional lighting derived from the JKA RBSP lightgrid.
     pub static_light_grid: Option<StaticLightGrid>,
     /// Runtime voxel/probe indirect-light field generated from world geometry
@@ -1588,6 +1618,9 @@ pub struct PreparedMap {
     /// is expanded into transient QuickSprite quads every frame instead of being
     /// mapped across the BSP surface.
     pub surface_sprite_effects: Vec<SurfaceSpriteEffectEmitter>,
+    /// Static instances for the vegetation kinds of `surface_sprite_effects`,
+    /// baked on the map job pool (renderer uploads them; r_surfaceSpritesGpu).
+    pub surface_sprite_bake: surface_sprite_bake::SurfaceSpriteBake,
     /// OpenJK-style global fog encoded by a BSP fog record whose brush number is -1.
     /// The color is also the scene clear color even when the optional fog effect is disabled.
     pub global_fog: Option<[f32; 4]>,

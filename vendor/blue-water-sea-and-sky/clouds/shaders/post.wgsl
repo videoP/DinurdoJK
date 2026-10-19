@@ -26,3 +26,5 @@ struct PostUniforms {
 
 @group(0) @binding(0) var<uniform> post: PostUniforms;
 @group(2) @binding(0) var scene_color: texture_2d<f32>;
+// The opaque scene's reversed depth (0 where there is none: sky). Host fix: the veil must stop at the first surface.
+@group(2) @binding(1) var scene_depth: texture_depth_2d;

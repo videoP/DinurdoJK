@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 39;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 40;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -84,6 +84,8 @@ pub(in crate::renderer) enum GpuPass {
     BlueWaterCausticsCompute = 36,
     BlueWaterCausticsReceiver = 37,
     BlueWaterSceneCapture = 38,
+    // Sub-timing inside World: native surfaceSprites (CPU or resident path).
+    SurfaceSprites = 39,
 }
 
 impl GpuPass {
@@ -133,6 +135,7 @@ impl GpuPass {
         Self::BlueWaterCausticsCompute,
         Self::BlueWaterCausticsReceiver,
         Self::BlueWaterSceneCapture,
+        Self::SurfaceSprites,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -176,6 +179,7 @@ impl GpuPass {
             Self::BlueWaterCausticsCompute => "blue_water_caustics_compute",
             Self::BlueWaterCausticsReceiver => "blue_water_caustics_receiver",
             Self::BlueWaterSceneCapture => "blue_water_scene_capture",
+            Self::SurfaceSprites => "surface_sprites",
         }
     }
 }

@@ -152,7 +152,8 @@ impl App {
         let prediction_debug = self.prediction_debug_ui();
         let force_select = self.force_select_ui(Instant::now());
 
-        UiSnapshot {
+        let mut snapshot = UiSnapshot {
+            frontend_main_scene: self.front_end && self.frontend_page == crate::app::FrontendPage::Main,
             mode: self.overlay,
             setup_selected: self.setup_selected,
             console_input: self.console_input.clone(),
@@ -224,7 +225,20 @@ impl App {
                     total,
                     skipped: false,
                 }),
+        };
+        if self.streamer_preview_local {
+            crate::streamer::redact_stream_snapshot(&mut snapshot, self.streamer);
         }
+        snapshot
+    }
+
+    /// Owned, independently filtered presentation for the eventual OBS output.
+    /// Consumers must never draw the unfiltered local snapshot into that output.
+    #[allow(dead_code)] // OBS surface integration will consume this snapshot.
+    pub(in crate::app) fn streamer_ui_snapshot(&self) -> UiSnapshot {
+        let mut stream = self.ui_snapshot();
+        crate::streamer::redact_stream_snapshot(&mut stream, self.streamer);
+        stream
     }
 
     /// HUD Edit Mode: fill the normally empty transient readouts with sample

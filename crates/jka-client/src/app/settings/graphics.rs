@@ -1,7 +1,7 @@
 //! Settings graphics.
 use crate::app::{
     scene, ui, App, CloudRenderResolution, CloudType, ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
-    DofQuality, DynamicLightsMode, DynamicShadowsMode,
+    DofMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FxGeometryMode,
     Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, Instant, PlanarReflectionDebugMode, PostEffects,
     PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RenderCommand, VsyncMode,
@@ -187,6 +187,24 @@ impl App {
 
     pub(in crate::app) fn set_depth_of_field_strength(&mut self, strength: f32) {
         self.video.depth_of_field_strength = strength.clamp(0.0, 1.0);
+        // Preserve legacy r_depthOfField and slider behavior for users who
+        // adjust intensity without first choosing a mode.
+        if self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == DofMode::Off {
+            self.video.dof_mode = DofMode::On;
+        }
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_dof_mode(&mut self, mode: DofMode) {
+        self.video.dof_mode = mode;
+        // A fresh installation starts with zero intensity. Selecting a visible
+        // mode should immediately produce visible DOF without a second step.
+        if mode != DofMode::Off && self.video.depth_of_field_strength <= 0.001 {
+            self.video.depth_of_field_strength = 0.45;
+        }
+        self.crosshair_scan_at = Instant::now() - std::time::Duration::from_secs(1);
         self.sync_post_effects();
         self.mark_config_dirty();
         self.publish_ui();
@@ -330,21 +348,47 @@ impl App {
     /// Shows the sun-to-head beam for a moment; called on every yaw/pitch edit and
     /// kept alive by `egui_sun` while a slider is still held.
     pub(in crate::app) fn touch_sun_ray(&mut self) {
+        self.sun_ray_preview_mode = 0;
         self.sun_ray_until = Some(Instant::now() + std::time::Duration::from_millis(1200));
         self.sync_sun_ray();
     }
 
-    /// Sends the beam's visibility to the renderer when it changes or expires.
+    /// Shows the authored map sun and extraction diagnostic while its slider is
+    /// being dragged. A nonzero selected view stays pinned in the menu.
+    pub(in crate::app) fn touch_baked_sun_debug(&mut self) {
+        self.sun_ray_preview_mode = if self.baked_sun_debug_view == 0 {
+            1
+        } else {
+            self.baked_sun_debug_view
+        };
+        self.sun_ray_until = Some(Instant::now() + std::time::Duration::from_millis(1200));
+        self.sync_sun_ray();
+    }
+
+    /// Sends the selected sun/debug view when it changes or expires.
     pub(in crate::app) fn sync_sun_ray(&mut self) {
-        let want = self
+        let timed = self
             .sun_ray_until
             .is_some_and(|until| Instant::now() < until);
-        if !want {
+        if !timed {
             self.sun_ray_until = None;
         }
-        if want != self.sun_ray_sent {
+        let debug_mode = if timed {
+            Some(self.sun_ray_preview_mode)
+        } else if self.baked_sun_debug_view != 0 {
+            Some(self.baked_sun_debug_view)
+        } else {
+            None
+        };
+        let want = debug_mode.is_some();
+        let mode = debug_mode.unwrap_or(0);
+        if want != self.sun_ray_sent || (want && mode != self.sun_ray_sent_mode) {
             self.sun_ray_sent = want;
-            self.render_command(RenderCommand::SetSunRayPreview(want));
+            self.sun_ray_sent_mode = mode;
+            self.render_command(RenderCommand::SetSunRayPreview {
+                enabled: want,
+                debug_mode: mode,
+            });
         }
     }
 
@@ -572,7 +616,11 @@ impl App {
             .world_effects
             .wind_override()
             .unwrap_or(self.video.weather_wind);
-        self.render_command(RenderCommand::SetPostEffects(PostEffects {
+        // Sun source "Map shader" leaves the runtime sun authored by the map.
+        // Baked-light controls are independent and operate on BSP baked data.
+        let sun_defaults = crate::app::VideoSettings::default();
+        let custom_sun = self.video.sun_override;
+        let effects = PostEffects {
             hdr: self.video.hdr,
             hdr_paper_white: self.video.hdr_paper_white,
             hdr_peak: self.video.hdr_peak,
@@ -599,14 +647,25 @@ impl App {
             sun_yaw: self.video.sun_yaw,
             sun_pitch: self.video.sun_pitch,
             sun_intensity: self.video.sun_intensity,
+            sun_shadow_strength: self.video.sun_shadow_strength,
+            sun_lighting: self.video.sun_lighting,
             sun_color: self.video.sun_color,
             sun_visibility: self.video.sun_visibility,
-            entity_sun_lighting: self.video.entity_sun_lighting,
+            entity_sun_lighting: if custom_sun { self.video.entity_sun_lighting } else { sun_defaults.entity_sun_lighting },
             baked_sun_removal: self.video.baked_sun_removal,
+            baked_sun_cache: self.video.baked_sun_cache,
+            baked_sun_shadow_map: self.video.baked_sun_shadow_map,
+            baked_sun_edge_softness: self.video.baked_sun_edge_softness,
+            baked_sun_direct_limit: self.video.baked_sun_direct_limit,
+            baked_indirect_scale: self.video.baked_indirect_scale,
+            baked_indirect_saturation: self.video.baked_indirect_saturation,
+            baked_indirect_power: self.video.baked_indirect_power,
+            baked_indirect_highlight_preserve: self.video.baked_indirect_highlight_preserve,
             sky_fractal_override: self.video.sky_fractal_override,
             sky_backend: self.video.sky_backend,
         blue_water_environment: self.video.blue_water_environment,
             cloud_backend: self.video.cloud_backend,
+            cloud_portal_depth: self.video.cloud_portal_depth,
             clouds: self.video.clouds,
             cloud_type: self.video.cloud_type,
             cloud_quality: self.video.cloud_quality,
@@ -656,6 +715,7 @@ impl App {
             film_grain_strength: self.video.film_grain_strength,
             motion_blur_strength: self.video.motion_blur_strength,
             depth_of_field_strength: self.video.depth_of_field_strength,
+            dof_mode: self.video.dof_mode,
             crt_scope: self.video.crt_scope,
             crt_style: self.video.crt_style,
             crt_quality: self.video.crt_quality,
@@ -671,7 +731,8 @@ impl App {
             color_lut_strength: self.video.color_lut_strength,
             color_grade: self.video.color_grade,
             split_toning: self.video.split_toning,
-        }));
+        };
+        self.render_command(RenderCommand::SetPostEffects(effects));
     }
 
     /// Synchronize the effective world-flare enable to the render thread.
@@ -1628,7 +1689,7 @@ impl App {
     /// Single ocean selector. No promotion uses the existing resource-off path,
     /// so stock BSP/JKA water returns rather than an invisible promoted mesh.
     pub(in crate::app) fn set_ocean_type(&mut self, ocean_type: u8) {
-        let ocean_type = ocean_type.min(3);
+        let ocean_type = ocean_type.min(4);
         let enabled = ocean_type != 0;
         let backend = ocean_type.saturating_sub(1);
         if enabled {
@@ -1780,7 +1841,7 @@ impl App {
                 self.set_cloud_thickness(self.video.cloud_thickness + direction as f32 * 128.0)
             }
             ui::ENV_ROW_WEATHER_WIND_SPEED => {
-                self.set_weather_wind_speed(self.video.weather_wind.speed + direction as f32 * 20.0)
+                self.set_weather_wind_speed(self.video.weather_wind.speed + direction as f32 * 5.0 * 0.514_444 * crate::ocean::OCEAN_UNITS_PER_METER)
             }
             ui::ENV_ROW_WEATHER_WIND_DIRECTION => self.set_weather_wind_direction(
                 self.video.weather_wind.direction + direction as f32 * 15.0,

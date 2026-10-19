@@ -3,10 +3,10 @@ use super::cvar_prelude::*;
 
 app_cvars! {
     APP_R_BLUESKYALTITUDE {
-        runtime:CvarDef::new("r_blueSkyAltitude","","20.0..15000.0","Cloud base (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+        runtime:CvarDef::new("r_blueSkyAltitude","","-1000.0..15000.0","Cloud base (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.altitude.to_string()),|app,value|App::cvar_set_bluesky_altitude(app,APP_R_BLUESKYALTITUDE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_altitude,None),
-        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.altitude=v.clamp(20.0, 15000.0) as f32;}}}),archive:Some((27300,|state|state.video.blue_water_environment.altitude.to_string())),..CvarBinding::NONE},
-        implementations:[impl App {fn cvar_set_bluesky_altitude(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.altitude=App::parse_cvar_finite(name,value)?.clamp(20.0,15000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.altitude=v.clamp(-1000.0, 15000.0) as f32;}}}),archive:Some((27300,|state|state.video.blue_water_environment.altitude.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_altitude(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.altitude=App::parse_cvar_finite(name,value)?.clamp(-1000.0,15000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYTHICKNESS {
         runtime:CvarDef::new("r_blueSkyThickness","","50.0..12000.0","Cloud thickness (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
@@ -170,6 +170,12 @@ app_cvars! {
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.filmic=parse_bool(value).unwrap_or(settings.blue_water_environment.filmic);}),archive:Some((27326,|state|state.video.blue_water_environment.filmic.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_filmic(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.filmic=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
+    APP_R_BLUESKYNIGHTSKY {
+        runtime:CvarDef::new("r_blueSkyNightSky","1","0.0..1.0","Native night sky brightness (dome glow and floor)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.night_sky.to_string()),|app,value|App::cvar_set_bluesky_night_sky(app,APP_R_BLUESKYNIGHTSKY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_night_sky,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.night_sky=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27327,|state|state.video.blue_water_environment.night_sky.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_night_sky(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.night_sky=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
 
     APP_R_SKYBACKEND {
         runtime: CvarDef::new("r_skyBackend", "0", "0|1",
@@ -194,6 +200,19 @@ app_cvars! {
             |app, value| {
                 let CvarValue::Int(backend) = value else { unreachable!() };
                 app.video.cloud_backend = backend as u8;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_CLOUDPORTALDEPTH {
+        runtime: CvarDef::new("r_cloudPortalDepth", "0", "0|1|2",
+            "Sky-portal geometry vs volumetric clouds. 0 clouds draw over portal geometry; 1 depth-only redraw of the portal view; 2 reuse the portal pass depth (no extra draw, needs MSAA off).",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.cloud_portal_depth as i32),
+            |app, value| {
+                let CvarValue::Int(mode) = value else { unreachable!() };
+                app.video.cloud_portal_depth = mode as u8;
                 app.sync_post_effects(); app.publish_ui(); Ok(())
             }),
         config: CvarBinding::NONE,

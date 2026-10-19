@@ -1,5 +1,6 @@
 //! Native import of JKA assets, independent of protocol and rendering backends.
 pub mod animation;
+pub mod body_shape;
 pub mod animevents;
 pub mod bsp;
 pub mod ghoul2;
@@ -16,5 +17,6 @@ pub mod skin;
 pub mod vehicle;
 
 pub mod source1;
+pub mod source1_jiggle;
 pub mod source1_geometry;
 pub mod source1_rig;

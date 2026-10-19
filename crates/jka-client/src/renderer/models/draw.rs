@@ -1277,11 +1277,12 @@ impl DynamicModelRenderer {
             pass.set_bind_group(0, camera, &[]);
             for (alpha_mode, pipeline, _) in prepass_modes {
                 let mut bound = false;
-                for draw in self
-                    .draws
-                    .iter()
-                    .filter(|draw| draw.alpha_mode == alpha_mode)
-                {
+                let masked = alpha_mode == DynamicModelAlphaMode::Mask;
+                for (draw, indices) in super::submission::depth_runs(
+                    self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode),
+                    self.dynamic_batch_draws,
+                    masked,
+                ) {
                     if !bound {
                         pass.set_pipeline(pipeline);
                         // Opaque depth never samples the texture; one bind keeps
@@ -1289,7 +1290,7 @@ impl DynamicModelRenderer {
                         pass.set_bind_group(1, &self.fallback_bind_group, &[]);
                         bound = true;
                     }
-                    if alpha_mode == DynamicModelAlphaMode::Mask {
+                    if masked {
                         let bind_group = draw
                             .texture_key
                             .as_ref()
@@ -1297,11 +1298,7 @@ impl DynamicModelRenderer {
                             .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
                         pass.set_bind_group(1, bind_group, &[]);
                     }
-                    pass.draw_indexed(
-                        draw.first_index..draw.first_index.saturating_add(draw.index_count),
-                        draw.base_vertex,
-                        0..1,
-                    );
+                    pass.draw_indexed(indices, draw.base_vertex, 0..1);
                 }
             }
         }

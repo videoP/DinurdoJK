@@ -133,41 +133,6 @@ impl App {
         );
         });
 
-        const FX_GEOMETRY: [(FxGeometryMode, &str); 3] = [
-            (FxGeometryMode::Cpu, "CPU"),
-            (FxGeometryMode::CpuWorkers, "CPU workers"),
-            (FxGeometryMode::Gpu, "GPU"),
-        ];
-        if let Some(target) = segmented_row(
-            ui,
-            "FX geometry",
-            "View-dependent EFX geometry. CPU is the exact current reference path. CPU workers uses the same authored particles/materials and exact same CPU geometry, but parallelizes tessellation over Rayon. GPU keeps FX simulation on the dedicated jka-fx CPU thread and packs Particle, OrientedParticle, Line, Tail and legacy SaberGlow geometry into compact WGPU instances (including under RT lighting/shadows). Animated tcMod stages and complex primitives remain on CPU. This is geometry acceleration, not GPU-resident particle simulation.",
-            theme::Reset::Video(ui::VIDEO_ROW_FX_GEOMETRY),
-            self.video.fx_geometry,
-            &FX_GEOMETRY,
-        ) {
-            let current = FxGeometryMode::ALL
-                .iter()
-                .position(|mode| *mode == self.video.fx_geometry)
-                .unwrap_or(0);
-            let next = FxGeometryMode::ALL
-                .iter()
-                .position(|mode| *mode == target)
-                .unwrap_or(current);
-            self.video_selected = ui::VIDEO_ROW_FX_GEOMETRY;
-            self.change_video_setting(next as i32 - current as i32);
-        }
-
-        ui.add_enabled_ui(self.video.fx_geometry == FxGeometryMode::Gpu, |ui| {
-        self.egui_toggle_row(
-            ui,
-            "FX zero-alpha discard",
-            "A/B diagnostic for r_fxGeometry GPU. Discards only fragments whose final source alpha is exactly zero on source-alpha EFX sprite blend modes, before fog/blending. Non-zero-alpha edges are unchanged; GL_ONE/additive-one and modulation modes are intentionally untouched.",
-            ui::VIDEO_ROW_FX_ZERO_ALPHA_DISCARD,
-            self.video.fx_zero_alpha_discard,
-        );
-        });
-
         self.egui_toggle_row(
             ui,
             "Modern saber rendering",

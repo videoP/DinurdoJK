@@ -630,7 +630,12 @@ impl ApplicationHandler<UserEvent> for App {
                 map_name,
                 progress,
             } => {
-                if request_id != self.latest_request_id || !self.audio.steam_audio {
+                if request_id != self.latest_request_id {
+                    // Its result would be discarded; stop burning cores on it.
+                    crate::steam_audio::cancel_background_bake();
+                    return;
+                }
+                if !self.audio.steam_audio {
                     return;
                 }
                 let progress = progress.clamp(0.0, 1.0);
@@ -752,6 +757,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 let map_edit_preview = self.map_edit_preview_request_id == Some(request_id);
+                if frontend_background {
+                    self.fx_light_promotion_catalog = Arc::clone(&fx_light_promotion);
+                    self.menu_props = None;
+                }
                 if !frontend_background && !map_edit_preview {
                     self.fx_light_promotion_catalog = Arc::clone(&fx_light_promotion);
                     // Live-map preparation can overlap the previous CGame. Only
@@ -1110,18 +1119,28 @@ impl ApplicationHandler<UserEvent> for App {
                     self.local_server = None;
                     self.spawns = map.spawns.clone();
                     self.spawn_index = 0;
+                    let stage = scene::menu_stage(&name);
                     if let Some(spawn) = self.spawns.first().copied() {
                         let mut position = spawn.position;
                         position[1] += FRONTEND_CAMERA_EYE_HEIGHT;
+                        let mut yaw = spawn.yaw;
+                        let mut pitch = (-2.0_f32).to_radians();
+                        if let Some(stage) = stage {
+                            // Authored staging replaces the spawn-point camera.
+                            position = scene::render_position(stage.camera);
+                            yaw = stage.camera_yaw.to_radians();
+                            pitch = (-stage.camera_pitch).to_radians();
+                        }
                         // Preserve the configured gameplay FOV in App::camera;
                         // render_snapshot gives this scene its own fixed FOV.
                         // Replacing the stored value here would overwrite the
                         // console/UI cg_fov getter and the archived setting.
                         self.camera =
-                            Camera::new_with_fov(position, spawn.yaw, self.camera.cg_fov());
+                            Camera::new_with_fov(position, yaw, self.camera.cg_fov());
                         self.frontend_cinematic = Some(FrontendCinematic {
                             position,
-                            yaw: spawn.yaw,
+                            yaw,
+                            pitch,
                             anim_started: Instant::now(),
                             world_ready_at: None,
                             model_visible_since: None,
@@ -1283,15 +1302,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.normalize_ocean_settings();
                 self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
                 self.render_command(RenderCommand::SetOceanEnabled(self.video.ocean));
+                // Apply the configured effects before upload so the world is
+                // compiled for their scene format on its first upload.
+                self.sync_post_effects();
                 self.render_command(RenderCommand::LoadMap {
                     request_id,
                     started,
                     name,
                     map,
                 });
-                // The quality the renderer runs depends on how this map was
-                // prepared, which the settings menu may have changed mid-load.
-                self.sync_post_effects();
                 self.publish_snapshot();
             }
             UserEvent::PhysicsMeshReady { label, result } => {
@@ -1590,9 +1609,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if crate::logging::renderer_verbose_enabled(2) {
                     self.push_console_line(format!(
-                        "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms | PVS plans {:.1} ms",
+                        "^6[MAP PREP DETAIL]^7 grass wall {:.1} ms | grass worker CPU {:.1} ms | surface sprites wall {:.1} ms (worker CPU {:.1}) | gi {:.1} ms | ocean mesh {:.1} ms | acoustics {:.1} ms | PVS plans {:.1} ms",
                         timings.grass_ms,
                         timings.grass_cpu_ms,
+                        timings.surface_sprites_ms,
+                        timings.surface_sprites_cpu_ms,
                         timings.gi_ms,
                         timings.ocean_ms,
                         timings.steam_audio_ms,
@@ -1969,7 +1990,8 @@ impl ApplicationHandler<UserEvent> for App {
                 match button {
                     MouseButton::Left => {
                         if *state == ElementState::Pressed && !self.model_placement.rotating {
-                            self.stamp_placement();
+                            // Edit mode: pick up (Ctrl = copy); otherwise stamp.
+                            self.placement_click(self.modifiers.control_key());
                         }
                         return;
                     }
@@ -2094,6 +2116,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if amount.is_finite() && self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Md3 {
                     self.model_placement.scale = (self.model_placement.scale
                         * (amount * 0.085).exp()).clamp(0.01, 100.0);
+                    self.egui_repaint_requested = true;
+                } else if amount.is_finite() && self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Fx {
+                    // An effect has no size: the wheel sets how often it replays.
+                    self.model_placement.fx_delay = (self.model_placement.fx_delay
+                        * (amount * 0.085).exp()).clamp(50.0, 5000.0);
                     self.egui_repaint_requested = true;
                 }
             }
@@ -2470,11 +2497,18 @@ impl ApplicationHandler<UserEvent> for App {
                             KeyCode::KeyZ if self.modifiers.control_key() => {
                                 self.undo_model_placement(); return;
                             }
+                            KeyCode::KeyE if !self.modifiers.control_key() => {
+                                self.toggle_placement_edit(); return;
+                            }
+                            KeyCode::Delete | KeyCode::KeyX if self.model_placement.edit_mode => {
+                                self.delete_hovered_placement(); return;
+                            }
                             _ => {}
                         }
                     }
-                    if matches!(code, KeyCode::Escape | KeyCode::Tab)
-                        || (code == KeyCode::KeyZ && self.modifiers.control_key()) {
+                    if matches!(code, KeyCode::Escape | KeyCode::Tab | KeyCode::KeyE)
+                        || (code == KeyCode::KeyZ && self.modifiers.control_key())
+                        || (self.model_placement.edit_mode && matches!(code, KeyCode::Delete | KeyCode::KeyX)) {
                         return;
                     }
                 }
@@ -2916,7 +2950,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Keep the crosshair endpoint coherent with this exact raw-input
                 // view sample before publishing the pair to the render seqlock.
                 if self.crosshair.dynamic != 0
-                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus)
+                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus)
                 {
                     self.update_crosshair_target(event_at);
                 }
@@ -2956,7 +2990,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // prevents the renderer from late-latching a new angle while
                     // still drawing the previous mouse sample's dynamic crosshair.
                     if self.crosshair.dynamic != 0
-                        || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus)
+                        || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus)
                     {
                         self.update_crosshair_target(event_at);
                     }
@@ -2976,6 +3010,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.update_solo_player_view_and_presentation();
                         if self.crosshair.dynamic != 0
                             || (self.video.depth_of_field_strength > 0.001
+                                && self.video.dof_mode == ui::DofMode::On
                                 && self.video.dof_autofocus)
                         {
                             self.update_crosshair_target(event_at);

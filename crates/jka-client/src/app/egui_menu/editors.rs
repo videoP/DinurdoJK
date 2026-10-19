@@ -615,9 +615,6 @@ impl App {
     /// draws afterward on the same layer covers them.
     pub(in crate::app::egui_menu) fn egui_entity_labels(&mut self, ui: &mut egui::Ui) {
         const MAX_LABEL_DISTANCE: f32 = 4096.0;
-        let Some(graph) = self.entity_graph.as_deref() else {
-            return;
-        };
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -629,6 +626,22 @@ impl App {
         let painter = ui.painter().clone();
         let eye = self.camera.position;
         let font = egui::FontId::proportional(12.0);
+        // Staged models and effects (Map Mods / the placement tool).
+        for (origin, text, [r, g, b]) in self.placement_marker_labels() {
+            let render_point = glam::Vec3::from_array(scene::render_position(origin));
+            if eye.distance(render_point) > MAX_LABEL_DISTANCE {
+                continue;
+            }
+            let Some(screen) = self.camera.project_to_screen(size.width, size.height, render_point) else {
+                continue;
+            };
+            let point = egui::pos2(screen.x / pixels_per_point, screen.y / pixels_per_point);
+            theme::glow_text(&painter, point, egui::Align2::CENTER_BOTTOM, &text,
+                font.clone(), egui::Color32::from_rgb(r, g, b));
+        }
+        let Some(graph) = self.entity_graph.as_deref() else {
+            return;
+        };
         for entity in &graph.entities {
             if !entity.positioned || entity.classname.is_empty() {
                 continue;

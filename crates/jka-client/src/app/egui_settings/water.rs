@@ -1,6 +1,6 @@
 //! Water.
 use crate::app::egui_settings::{
-    color_row, linked_ocean_slider, ocean_slider, percent, quality_table_row, theme, ui, App, FootprintMode,
+    color_row, linked_ocean_slider, ocean_slider, ocean_slider_dd, percent, quality_table_row, theme, ui, App, FootprintMode,
     OCEAN_FOAM_COLOR, OCEAN_MAP_SIZE, OCEAN_MESH_QUALITY, OCEAN_NORMAL_STRENGTH, OCEAN_ROUGHNESS,
     OCEAN_SEA_SPRAY, OCEAN_UPDATES, OCEAN_WATER_COLOR, OCEAN_WIND_FOAM,
 };
@@ -24,14 +24,31 @@ impl App {
         ) {
             self.set_environment_quality_segment(ui::ENV_ROW_FOOTPRINTS, target);
         }
-        self.egui_environment_toggle(
+        // Off / native JKA surfaceSprites / promoted to Godot procedural grass
+        // (r_surfaceSprites + r_grass). Godot replaces the sprite emitters it
+        // can promote; anything it cannot keeps its JKA sprites.
+        const GRASS: [(u8, &str); 3] = [(0, "Off"), (1, "JKA sprites"), (2, "Godot grass")];
+        let grass_mode = if self.video.grass { 2 } else { u8::from(self.video.surface_sprites) };
+        if let Some(target) = quality_table_row(
             ui,
-            "Procedural grass",
-            "Scatters GPU-generated grass over surfaces the map marks as \
-             ground. Reacts to wind and to players moving through it.",
-            ui::ENV_ROW_GRASS,
-            self.video.grass,
-        );
+            "Grass",
+            "Ground vegetation the map marks with surfaceSprites. JKA sprites are the \
+             original flat cards; Godot grass promotes them to GPU-generated blades that \
+             react to wind and to players moving through them.",
+            theme::Reset::Environment(ui::ENV_ROW_GRASS),
+            grass_mode,
+            &GRASS,
+            1,
+        ) {
+            let sprites = target != 0;
+            if sprites != self.video.surface_sprites {
+                let _ = self.set_console_cvar("r_surfaceSprites", if sprites { "1" } else { "0" });
+            }
+            if (target == 2) != self.video.grass {
+                self.environment_selected = ui::ENV_ROW_GRASS;
+                self.change_environment_setting(1);
+            }
+        }
         if self.video.grass && !self.applied_grass {
             theme::banner(
                 ui,
@@ -43,9 +60,9 @@ impl App {
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
         let current = if self.video.ocean { self.video.ocean_settings.backend + 1 } else { 0 };
-        theme::section(ui, "OCEAN TYPE", "One switch controls water promotion. Off keeps stock JKA map water.");
-        theme::row(ui, "Ocean renderer", "Hybrid = Blue Water above the surface, JKA/Godot optics and surface when submerged. Sky and clouds are independent under Clouds.", theme::Reset::None, |ui| {
-            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid")] {
+        theme::section(ui, "WATER PROMOTION", "Choose how map water is promoted. Off keeps stock JKA water.");
+        theme::row(ui, "Water renderer", "Lakes / ponds uses flat water with wind ripples and freshwater optics, without ocean FFT or an infinite horizon. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
+            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (4, "Lakes / ponds")] {
                 if theme::chip(ui, label, mode == current).clicked() && mode != current {
                     self.set_ocean_type(mode);
                 }
@@ -56,21 +73,14 @@ impl App {
             theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM);
             return;
         }
-        let mut surface_pixels = self.video.ocean_settings.surface_pixels;
-        if ui.checkbox(&mut surface_pixels, "Render ocean surface pixels")
-            .on_hover_text("Diagnostic A/B (r_oceanSurfacePixels): turn off ALL promoted ocean surface draws, including native Blue Water and infinite water. FFT, wind foam, water interaction and CPU mesh updates keep running; no ocean surface is visible or writes depth. Other ocean optics/caustics remain enabled.")
-            .changed()
-        {
-            self.video.ocean_settings.surface_pixels = surface_pixels;
-            self.commit_ocean_settings();
-        }
-        if !surface_pixels {
-            theme::banner(ui, "Surface draw disabled for benchmarking. FFT and mesh updates continue; GPU vertex displacement is skipped because there are no surface draw calls.", theme::TEXT_DIM);
-        }
         if self.video.ocean && !self.applied_ocean {
             theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING);
         }
 
+        if self.video.ocean_settings.backend == 3 {
+            self.egui_lakes(ui);
+            return;
+        }
         let mut wake_mode = self.video.water_wake;
         ui.horizontal(|ui| {
             ui.label("Water Wake");
@@ -223,6 +233,8 @@ impl App {
         // Locks live on the shared settings; a lock toggle edits this copy and
         // is written back with the rest of the change below.
         let mut links = self.video.ocean_settings.links;
+        let da = crate::ocean::OceanSettings::default().authored;
+        let dopt = crate::ocean::OceanSettings::default().optics;
         let mut changed = false;
 
         theme::section(
@@ -234,12 +246,12 @@ impl App {
             promoted_index.is_some() || (self.ocean_settings_target <= -2 && self.authored_ocean_preview),
             |ui| {
                 let a = &mut settings.authored;
-                ocean_slider(
+                ocean_slider_dd(
                     ui,
                     "Swell amplitude",
                     "Master sea state, in map units. Wavelength, speed, choppiness, wind chop, foam, spray and roughness follow it while their padlocks are closed. Promoted pools retain a small nonzero ripple.",
                     theme::Reset::None,
-                    &mut a.amplitude,
+                    &mut a.amplitude, da.amplitude,
                     if promoted_index.is_some() { crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE..=5000.0 } else { 0.0..=5000.0 },
                     &mut changed,
                 );
@@ -247,18 +259,18 @@ impl App {
                     ui,
                     "Swell wavelength",
                     "Distance between authored swell crests, in map units. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.wavelength,
+                    &mut a.wavelength, da.wavelength,
                     64.0..=32768.0,
                     crate::ocean::links::WAVELENGTH,
                     &mut links,
                     &mut changed,
                 );
-                ocean_slider(
+                ocean_slider_dd(
                     ui,
                     "Swell travel direction",
                     "Heading of the authored swell in degrees.",
                     theme::Reset::None,
-                    &mut a.direction,
+                    &mut a.direction, da.direction,
                     -180.0..=180.0,
                     &mut changed,
                 );
@@ -266,7 +278,7 @@ impl App {
                     ui,
                     "Primary wave speed",
                     "Travel speed of the authored swell in map units per second. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.speed,
+                    &mut a.speed, da.speed,
                     -4096.0..=4096.0,
                     crate::ocean::links::SPEED,
                     &mut links,
@@ -276,18 +288,18 @@ impl App {
                     ui,
                     "Base choppiness",
                     "Horizontal steepness of the authored swell. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.steepness,
+                    &mut a.steepness, da.steepness,
                     0.0..=1.0,
                     crate::ocean::links::STEEPNESS,
                     &mut links,
                     &mut changed,
                 );
-                ocean_slider(
+                ocean_slider_dd(
                     ui,
                     "Cross-sea / FFT blend",
                     "How strongly the first two FFT cascades roughen and cross the authored swell.",
                     theme::Reset::None,
-                    &mut a.slosh,
+                    &mut a.slosh, da.slosh,
                     0.0..=1.0,
                     &mut changed,
                 );
@@ -295,7 +307,7 @@ impl App {
                     ui,
                     "Wind chop",
                     "Scales the weather-driven fine chop cascade. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.wind_chop,
+                    &mut a.wind_chop, da.wind_chop,
                     0.0..=4.0,
                     crate::ocean::links::WIND_CHOP,
                     &mut links,
@@ -305,7 +317,7 @@ impl App {
                     ui,
                     "Foam amount",
                     "Foam strength for the selected ocean. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.foam,
+                    &mut a.foam, da.foam,
                     0.0..=4.0,
                     crate::ocean::links::FOAM,
                     &mut links,
@@ -315,7 +327,7 @@ impl App {
                     ui,
                     "Spray amount",
                     "Spray strength for the selected ocean. Follows the swell amplitude while locked; unlock to set it yourself.",
-                    &mut a.spray,
+                    &mut a.spray, da.spray,
                     0.0..=4.0,
                     crate::ocean::links::SPRAY,
                     &mut links,
@@ -326,12 +338,12 @@ impl App {
         );
 
         ui.add_enabled_ui(promoted_index.is_none(), |ui| {
-            ocean_slider(
+            ocean_slider_dd(
                 ui,
                 "Foam lifetime",
                 "How long accumulated crest foam persists before decaying.",
                 theme::Reset::None,
-                &mut settings.authored.foam_lifetime,
+                &mut settings.authored.foam_lifetime, da.foam_lifetime,
                 0.1..=30.0,
                 &mut changed,
             );
@@ -412,19 +424,6 @@ impl App {
                 }
             },
         );
-        theme::row(
-            ui,
-            "Dynamic mesh LOD rates",
-            "r_oceanDynamicUpdates: 0 original; 1 nearest two mesh rings use live FFT (48 Hz), third uses a 32 Hz displacement snapshot, outer rings a 24 Hz snapshot. Wind foam streak appearance follows these mesh rates. All FFT cascades remain synchronized; this reduces cached texture bandwidth, not FFT dispatch count.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(value) = theme::switch(ui, settings.dynamic_update_rates) {
-                    settings.dynamic_update_rates = value;
-                    changed = true;
-                }
-            },
-        );
-
         });
         theme::row(
             ui,
@@ -449,19 +448,6 @@ impl App {
                 let preview = theme::preview_toggle_value(ui.ctx(), reset(theme::Reset::Ocean(OCEAN_WIND_FOAM)), settings.wind_foam_streaks);
                 if let Some(value) = theme::switch(ui, preview) {
                     settings.wind_foam_streaks = value;
-                    changed = true;
-                }
-            },
-        );
-
-        theme::row(
-            ui,
-            "Sync wind foam to waves",
-            "r_oceanWindFoamSync: wind-streak transport runs only when the fine FFT layer finishes updating, rather than every rendered frame. The mesh still renders each frame.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(value) = theme::switch(ui, settings.wind_foam_sync) {
-                    settings.wind_foam_sync = value;
                     changed = true;
                 }
             },
@@ -568,7 +554,7 @@ impl App {
             0.0..=4.0,
             &mut changed,
         );
-        ocean_slider(ui, "Caustic view distance", "Camera-to-terrain receiver range in metres. Caustics fade over the final 25%; 0 disables distance culling. Does not change fog/refraction.", theme::Reset::None, &mut settings.optics.caustic_max_distance_m, 0.0..=500.0, &mut changed);
+        ocean_slider_dd(ui, "Caustic view distance", "Camera-to-terrain receiver range in metres. Caustics fade over the final 25%; 0 disables distance culling. Does not change fog/refraction.", theme::Reset::None, &mut settings.optics.caustic_max_distance_m, dopt.caustic_max_distance_m, 0.0..=500.0, &mut changed);
         ocean_slider(ui, "Underwater cull", "Skips geometry the water already hides, as a multiple of the absorption distance (the transparency distance; never below 2, where 0.2% of the light is left). Underwater: everything beyond it (never closer than 256), plus the far ocean sheet. From above: anything lying under that much water. Murkier water culls more. Zero disables.", reset(theme::Reset::Ocean(15)), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
 
         });

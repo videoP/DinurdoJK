@@ -427,6 +427,28 @@ fn collect_draws(
     if state.light_boxes.is_empty() {
         return;
     }
+    // One-shot receiver diagnostics at the highest renderer verbosity. This
+    // distinguishes material eligibility from coarse surface rejection.
+    static TRACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if crate::logging::renderer_verbose_enabled(3)
+        && !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        for (id, batch) in world.coarse_batches.iter().enumerate() {
+            if !state.light_boxes.iter().any(|(minimum, maximum)| {
+                (0..3).all(|axis| batch.bounds_min[axis] <= maximum[axis]
+                    && batch.bounds_max[axis] >= minimum[axis])
+            }) { continue; }
+            let name = world.material_debug.entries.get(batch.source.material_debug_index as usize)
+                .map_or("unknown", |entry| entry.name.as_str());
+            let lit = batch.legacy_dlight_runs.iter().filter(|run| {
+                state.masks.get(run.surface_id as usize).is_some_and(|mask| *mask != 0)
+            }).count();
+            println!("[DLIGHT RECEIVER] batch={id} shader={name} eligible={} blend={:?} lightmap={} folded={} rgb={:?} lit_runs={lit}/{} depth_write={}",
+                legacy_dlight_receives(&batch.source), batch.source.pipeline.blend,
+                batch.source.texture_is_lightmap, batch.source.modulate_lightmap,
+                batch.source.rgb_gen, batch.legacy_dlight_runs.len(), batch.source.pipeline.depth_write);
+        }
+    }
     let index = index_for(world);
     visible.clear();
     visible.resize(world.coarse_batches.len(), false);
@@ -467,7 +489,10 @@ fn collect_draws(
     }
     drop(state);
     keys.sort_unstable();
-    let source = world.patch_lod.source_indices().unwrap_or(&[]);
+    // Static runs exist even on maps without curved patches. Patch LOD
+    // deliberately retains no index source there; the resident world's
+    // immutable source is shared by all geometry consumers.
+    let source = world.remap_index_source.as_slice();
     let mut current = u32::MAX;
     for &(rank, entry) in keys.iter() {
         if rank != current {

@@ -28,6 +28,7 @@ pub enum Status {
 }
 
 pub struct Job {
+    pub upstream_shore: Arc<super::upstream_coast::Source>,
     pub status: Mutex<Status>,
     /// CPU selection/descriptor work on the loader; geometry and IO are excluded.
     pub selection_ms: f64,
@@ -146,6 +147,7 @@ pub fn start(
         key[1]
     ));
     let job = Arc::new(Job {
+        upstream_shore: super::upstream_coast::Source::new(Arc::clone(&bsp),debug_footprints.clone()),
         status: Mutex::new(Status::Pending),
         selection_ms: selection_started.elapsed().as_secs_f64() * 1000.0,
         footprints: debug_footprints,

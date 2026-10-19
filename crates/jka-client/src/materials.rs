@@ -232,15 +232,18 @@ pub struct GrassMaterial {
     pub any_angle: bool,
 }
 
-/// One JKA `surfaceSprites effect` stage. Unlike an ordinary material pass,
-/// Raven's backend expands this stage into camera-facing QuickSprite quads at
-/// runtime; the source surface UVs are never used for the splash texture.
+/// Native JKA surfaceSprites stage, including vertical/flattened vegetation.
+/// The source UVs are never stretched over the BSP as an ordinary stage.
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceSpriteEffectMaterial {
     pub texture: usize,
     pub clamp: bool,
     pub blend: Option<BlendFunc>,
     pub sprite: shader::SurfaceSprite,
+    pub alpha_cutoff: f32,
+    pub depth_write: bool,
+    /// Render through Godot only while r_grass is enabled; otherwise native JKA.
+    pub godot_candidate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +278,8 @@ pub struct SurfaceMaterial {
     pub water_deformed: bool,
     /// q3map2 `surfaceparm alphashadow`.
     pub alpha_shadow: bool,
+    /// Compiler shadow image (q3map_lightimage, otherwise the base image).
+    pub baked_shadow_texture: Option<usize>,
     /// q3map2 `surfaceparm lightfilter`.
     pub light_filter: bool,
     /// q3map_nofog or runtime noglfog exemption from local/global BSP fog.
@@ -300,8 +305,8 @@ pub struct SurfaceMaterial {
     /// Grass-compatible vertical stages, retained independently instead of
     /// treating the first vertical sprite (possibly a billboard tree) as grass.
     pub grass_stages: Vec<GrassMaterial>,
-    /// Raven QuickSprite effect stages retained separately from ordinary BSP
-    /// material passes so they can be distributed over triangles at runtime.
+    /// Raven QuickSprite stages (effects and native vegetation), kept off the
+    /// ordinary BSP material path and distributed over triangles at runtime.
     pub surface_sprite_effects: Vec<SurfaceSpriteEffectMaterial>,
     /// Retail JKA's quick-sprite path finishes by re-enabling face culling even
     /// when the parent shader authored `cull twosided`. wgpu has no mutable GL
@@ -339,6 +344,7 @@ impl Default for SurfaceMaterial {
             water_amplitude: crate::ocean::appearance::DEFAULT_PROMOTED_AMPLITUDE,
             water_deformed: false,
             alpha_shadow: false,
+            baked_shadow_texture: None,
             light_filter: false,
             no_fog: false,
             sky: false,
@@ -2358,9 +2364,7 @@ pub fn primary_texture_requests(
                     {
                         continue;
                     }
-                    if stage.surface_sprite.is_some_and(|sprite| {
-                        matches!(sprite.kind, shader::SurfaceSpriteType::Vertical)
-                    }) {
+                    if stage.surface_sprite.is_some() {
                         continue;
                     }
                     push(&stage.image, stage.clamp, true);
@@ -2571,7 +2575,10 @@ pub fn describe(
                 let procedural_sprite_only = source.surface_sprite.is_some_and(|sprite| {
                     matches!(
                         sprite.kind,
-                        shader::SurfaceSpriteType::Vertical | shader::SurfaceSpriteType::Effect
+                        shader::SurfaceSpriteType::Vertical
+                            | shader::SurfaceSpriteType::Flattened
+                            | shader::SurfaceSpriteType::Oriented
+                            | shader::SurfaceSpriteType::Effect
                     )
                 });
                 let authored_ordinary_stage = !source.image.is_empty() && !procedural_sprite_only;
@@ -2584,7 +2591,12 @@ pub fn describe(
                     continue;
                 }
                 if let Some(sprite) = source.surface_sprite {
-                    if matches!(sprite.kind, shader::SurfaceSpriteType::Vertical) {
+                    let vegetation = matches!(
+                        sprite.kind,
+                        shader::SurfaceSpriteType::Vertical | shader::SurfaceSpriteType::Flattened
+                    );
+                    let mut godot_candidate = false;
+                    if vegetation {
                         // Native JKA surfaceSprites can describe grass, shrubs,
                         // and huge billboard trees in the *same* material.
                         // The Godot blade renderer is suitable for short cards,
@@ -2599,6 +2611,7 @@ pub fn describe(
                             && sprite.width <= MAX_GRASS_SPRITE_SIZE
                             && sprite.height <= MAX_GRASS_SPRITE_SIZE;
                         if grass_sized {
+                            godot_candidate = true;
                             let candidate = GrassMaterial {
                                 authored_width: sprite.width,
                                 height: sprite.height,
@@ -2615,24 +2628,27 @@ pub fn describe(
                             grass_stages.push(candidate);
                         } else {
                             textures.warnings.push(format!(
-                                "{name}: surfaceSprites vertical {} {:.1}x{:.1} is not Godot grass; keeping it out of blade generation",
+                                "{name}: surfaceSprites {:?} {} {:.1}x{:.1} uses native QuickSprites (too large for Godot grass)", sprite.kind,
                                 source.image, sprite.width, sprite.height
                             ));
                         }
-                        // Never interpret vertical surfaceSprites as ordinary
-                        // material passes stretched across the BSP polygon.
-                        continue;
                     }
-                    if matches!(sprite.kind, shader::SurfaceSpriteType::Effect) {
+                    if matches!(
+                        sprite.kind,
+                        shader::SurfaceSpriteType::Vertical
+                            | shader::SurfaceSpriteType::Flattened
+                            | shader::SurfaceSpriteType::Oriented
+                            | shader::SurfaceSpriteType::Effect
+                    ) {
                         if source.image.is_empty() || source.image.starts_with('$') {
                             textures.warnings.push(format!(
-                                "{name}: surfaceSprites effect has no ordinary image; skipping emitter"
+                                "{name}: surfaceSprites {:?} has no ordinary image; skipping emitter", sprite.kind
                             ));
                             continue;
                         }
                         let Some(texture) = textures.load(assets, &source.image, source.clamp) else {
                             textures.warnings.push(format!(
-                                "{name}: surfaceSprites effect texture {} could not be loaded",
+                                "{name}: surfaceSprites texture {} could not be loaded",
                                 source.image
                             ));
                             continue;
@@ -2640,7 +2656,7 @@ pub fn describe(
                         let blend = stage_blend(source);
                         if !source.blend.is_empty() && blend.is_none() {
                             textures.warnings.push(format!(
-                                "{name}: unsupported surfaceSprites effect blendFunc {}; using opaque blend",
+                                "{name}: unsupported surfaceSprites blendFunc {}; using opaque blend",
                                 source.blend
                             ));
                         }
@@ -2649,16 +2665,19 @@ pub fn describe(
                             clamp: source.clamp,
                             blend,
                             sprite,
+                            alpha_cutoff: alpha_cutoff(source),
+                            depth_write: source.depth_write
+                                || blend.is_none()
+                                || blend == Some(BlendFunc {
+                                    src: BlendFactor::One,
+                                    dst: BlendFactor::Zero,
+                                }),
+                            godot_candidate,
                         });
-                        // Effect surfaceSprites are procedural QuickSprite quads. Rendering
-                        // the clampmap as a normal BSP stage stretches one splash over the
-                        // entire parent polygon, which is exactly the bug this path avoids.
+                        // A surfaceSprites stage is *always* a QuickSprite emitter.
+                        // Never paint its image over the parent BSP polygon.
                         continue;
                     }
-                    textures.warnings.push(format!(
-                        "{name}: surfaceSprites {:?} is not handled procedurally; preserving the existing material-stage fallback",
-                        sprite.kind
-                    ));
                 }
                 if source.image.is_empty() {
                     continue;
@@ -2937,6 +2956,12 @@ pub fn describe(
         .map(glass_reflectance_from_texture)
         .unwrap_or(0.04);
 
+    let baked_shadow_texture = if definition.alpha_shadow || definition.light_filter {
+        definition.light_image.as_deref().or_else(|| definition.stages.iter()
+            .map(|stage| stage.image.as_str())
+            .find(|image| !image.is_empty() && !image.starts_with('$')))
+            .and_then(|path| textures.load(assets, path, false))
+    } else { None };
     SurfaceMaterial {
         // A model shader (and an uncompiled source-map preview) has no BSP
         // material bits. Prefer its explicit Glass declaration when present.
@@ -2968,6 +2993,7 @@ pub fn describe(
         water_amplitude: crate::ocean::appearance::amplitude_from_shader(definition),
         water_deformed: crate::ocean::appearance::deformation_amplitude(definition).is_some(),
         alpha_shadow: definition.alpha_shadow,
+        baked_shadow_texture,
         light_filter: definition.light_filter,
         no_fog: definition.no_fog || definition.no_gl_fog,
         clamp_time: definition.clamp_time,

@@ -10,10 +10,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Steam Audio works in meters. JKA does not define a canonical physical meter,
@@ -27,6 +27,34 @@ const PROBE_SPACING_M: f32 = 3.0;
 const PROBE_HEIGHT_M: f32 = 1.5;
 const PROBE_BOUNDS_PADDING_M: f32 = 1.0;
 const MAX_PROBES: usize = 65_536;
+/// Process private-memory growth allowed while a bake runs. Huge race maps
+/// (racepack4: 32k probes) grew the process to 17 GB, mostly after the
+/// reflections stage. Past this the bake is cancelled and the map is marked so
+/// later loads skip it; direct acoustics stay active either way.
+/// `JKA_STEAM_AUDIO_BAKE_BUDGET_MIB` overrides it (testing, big-RAM machines).
+const DEFAULT_BAKE_MEMORY_BUDGET_MIB: u64 = 2048;
+const BAKE_MEMORY_POLL: Duration = Duration::from_millis(100);
+/// The bake is queued while the map's own upload is still allocating (racepack4:
+/// 1.2 -> 5.4 GB in the same seconds), so growth is measured from the first
+/// second-long window that grows less than this, or from the timeout below.
+const BAKE_MEMORY_SETTLE_WINDOW: Duration = Duration::from_secs(1);
+const BAKE_MEMORY_SETTLE_BYTES: u64 = 32 * 1024 * 1024;
+const BAKE_MEMORY_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bumped when the map that queued a bake is no longer current; its result is
+/// discarded anyway, so the running bake is cancelled without a marker.
+static BAKE_CANCEL_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn cancel_background_bake() {
+    BAKE_CANCEL_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+const OVER_BUDGET_MARKER: &str = "over_budget.json";
+
+fn bake_memory_budget_mib() -> u64 {
+    std::env::var("JKA_STEAM_AUDIO_BAKE_BUDGET_MIB")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_BAKE_MEMORY_BUDGET_MIB)
+}
 
 // Initial offline-quality profile. The expensive work is cached per BSP hash.
 const REFLECTION_RAYS: u32 = 4_096;
@@ -151,9 +179,13 @@ pub fn load_or_bake(
             eprintln!("{}: Steam Audio cache ignored: {error}", cache.map_name);
         }
     }
+    if let Some(reason) = over_budget_skip(cache) {
+        return Err(reason);
+    }
 
     let threads = num_threads.clamp(1, 8) as u32;
     let started = Instant::now();
+    let cancel_generation = BAKE_CANCEL_GENERATION.load(Ordering::Acquire);
     let context = Context::default();
     let scene = build_scene_from_acoustic_mesh(&context, mesh)?;
     let vertices = mesh
@@ -195,66 +227,101 @@ pub fn load_or_bake(
         cache.map_name, probe_count, PROBE_SPACING_M, PROBE_HEIGHT_M, threads,
     );
 
-    let reverb_id = reverb_identifier();
-    devprintln!(
-        1,
-        "{}: Steam Audio reflections bake starting ({} rays, {} diffuse samples, {} bounces)",
-        cache.map_name, REFLECTION_RAYS, REFLECTION_DIFFUSE_SAMPLES, REFLECTION_BOUNCES
-    );
-    ReflectionsBaker::<DefaultRayTracer>::new()
-        .bake_with_progress_callback(
-            &context,
-            &mut probe_batch,
-            &scene,
-            ReflectionsBakeParams {
-                identifier: reverb_id,
-                bake_flags: ReflectionsBakeFlags::BAKE_CONVOLUTION
-                    | ReflectionsBakeFlags::BAKE_PARAMETRIC,
-                num_rays: REFLECTION_RAYS,
-                num_diffuse_samples: REFLECTION_DIFFUSE_SAMPLES,
-                num_bounces: REFLECTION_BOUNCES,
-                simulated_duration: REFLECTION_SIMULATED_DURATION_S,
-                saved_duration: REFLECTION_SAVED_DURATION_S,
-                order: REFLECTION_AMBISONIC_ORDER,
-                num_threads: threads,
-                irradiance_min_distance: REFLECTION_IRRADIANCE_MIN_DISTANCE_M,
-                bake_batch_size: REFLECTION_BAKE_BATCH_SIZE,
-            },
-            bake_progress_callback(
-                cache.map_name.clone(),
-                "reflections",
-                0.0,
-                0.85,
-                progress.clone(),
-            ),
-        )
-        .map_err(|error| format!("Steam Audio reflections bake failed: {error}"))?;
+    // A cancelled Steam Audio bake returns normally, so the watchdog's flag is
+    // what tells a budget cancel apart from a finished stage.
+    let watchdog = BakeMemoryWatchdog::default();
+    let bake_result = std::thread::scope(|scope| {
+        let (watch_context, watchdog) = (context.clone(), &watchdog);
+        let spawned = std::thread::Builder::new()
+            .name("jka-steam-audio-memory".into())
+            .spawn_scoped(scope, move || watchdog.run(&watch_context, cancel_generation));
+        if let Err(error) = spawned {
+            eprintln!("{}: Steam Audio bake memory watchdog unavailable: {error}", cache.map_name);
+        }
+        let result = (|| -> Result<(), String> {
+            let reverb_id = reverb_identifier();
+            devprintln!(
+                1,
+                "{}: Steam Audio reflections bake starting ({} rays, {} diffuse samples, {} bounces)",
+                cache.map_name, REFLECTION_RAYS, REFLECTION_DIFFUSE_SAMPLES, REFLECTION_BOUNCES
+            );
+            ReflectionsBaker::<DefaultRayTracer>::new()
+                .bake_with_progress_callback(
+                    &context,
+                    &mut probe_batch,
+                    &scene,
+                    ReflectionsBakeParams {
+                        identifier: reverb_id,
+                        bake_flags: ReflectionsBakeFlags::BAKE_CONVOLUTION
+                            | ReflectionsBakeFlags::BAKE_PARAMETRIC,
+                        num_rays: REFLECTION_RAYS,
+                        num_diffuse_samples: REFLECTION_DIFFUSE_SAMPLES,
+                        num_bounces: REFLECTION_BOUNCES,
+                        simulated_duration: REFLECTION_SIMULATED_DURATION_S,
+                        saved_duration: REFLECTION_SAVED_DURATION_S,
+                        order: REFLECTION_AMBISONIC_ORDER,
+                        num_threads: threads,
+                        irradiance_min_distance: REFLECTION_IRRADIANCE_MIN_DISTANCE_M,
+                        bake_batch_size: REFLECTION_BAKE_BATCH_SIZE,
+                    },
+                    bake_progress_callback(
+                        cache.map_name.clone(),
+                        "reflections",
+                        0.0,
+                        0.85,
+                        progress.clone(),
+                    ),
+                )
+                .map_err(|error| format!("Steam Audio reflections bake failed: {error}"))?;
+            if watchdog.cancelled() {
+                return Ok(());
+            }
 
-    let path_id = path_identifier();
-    devprintln!(1, "{}: Steam Audio pathing bake starting", cache.map_name);
-    PathBaker::<DefaultRayTracer>::new()
-        .bake_with_progress_callback(
-            &context,
-            &mut probe_batch,
-            &scene,
-            PathBakeParams {
-                identifier: path_id,
-                num_samples: PATH_NUM_SAMPLES,
-                radius: PATH_RADIUS_M,
-                threshold: PATH_VISIBILITY_THRESHOLD,
-                visibility_range: PATH_VISIBILITY_RANGE_M,
-                path_range: PATH_RANGE_M,
-                num_threads: threads,
-            },
-            bake_progress_callback(
-                cache.map_name.clone(),
-                "pathing",
-                0.85,
-                0.15,
-                progress.clone(),
-            ),
-        )
-        .map_err(|error| format!("Steam Audio pathing bake failed: {error}"))?;
+            let path_id = path_identifier();
+            devprintln!(1, "{}: Steam Audio pathing bake starting", cache.map_name);
+            PathBaker::<DefaultRayTracer>::new()
+                .bake_with_progress_callback(
+                    &context,
+                    &mut probe_batch,
+                    &scene,
+                    PathBakeParams {
+                        identifier: path_id,
+                        num_samples: PATH_NUM_SAMPLES,
+                        radius: PATH_RADIUS_M,
+                        threshold: PATH_VISIBILITY_THRESHOLD,
+                        visibility_range: PATH_VISIBILITY_RANGE_M,
+                        path_range: PATH_RANGE_M,
+                        num_threads: threads,
+                    },
+                    bake_progress_callback(
+                        cache.map_name.clone(),
+                        "pathing",
+                        0.85,
+                        0.15,
+                        progress.clone(),
+                    ),
+                )
+                .map_err(|error| format!("Steam Audio pathing bake failed: {error}"))?;
+            Ok(())
+        })();
+        watchdog.done.store(true, Ordering::Release);
+        result
+    });
+    if watchdog.stale.load(Ordering::Acquire) {
+        return Err("Steam Audio bake cancelled: its map is no longer current".into());
+    }
+    if watchdog.exceeded.load(Ordering::Acquire) {
+        let growth_mib = watchdog.peak_growth_bytes.load(Ordering::Relaxed) / (1024 * 1024);
+        let reason = format!(
+            "Steam Audio bake cancelled: process memory grew {growth_mib} MiB, over the {} MiB bake budget ({probe_count} probes); this map will skip the bake",
+            bake_memory_budget_mib(),
+        );
+        if let Err(error) = write_over_budget_marker(cache, probe_count, growth_mib) {
+            eprintln!("{}: {error}", cache.map_name);
+        }
+        return Err(reason);
+    }
+    bake_result?;
 
     let reflection_data_bytes = probe_batch.data_size(reverb_identifier());
     let pathing_data_bytes = probe_batch.data_size(path_identifier());
@@ -397,6 +464,123 @@ fn bake_progress_callback(
             );
         }
     })
+}
+
+#[derive(Default)]
+struct BakeMemoryWatchdog {
+    done: AtomicBool,
+    exceeded: AtomicBool,
+    stale: AtomicBool,
+    peak_growth_bytes: AtomicU64,
+}
+
+impl BakeMemoryWatchdog {
+    fn cancelled(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire) || self.stale.load(Ordering::Acquire)
+    }
+
+    fn run(&self, context: &Context, cancel_generation: u64) {
+        let budget = bake_memory_budget_mib() * 1024 * 1024;
+        let started = Instant::now();
+        let mut baseline = None;
+        let mut window = (Instant::now(), process_private_bytes().unwrap_or(0));
+        while !self.done.load(Ordering::Acquire) {
+            if BAKE_CANCEL_GENERATION.load(Ordering::Acquire) != cancel_generation {
+                self.stale.store(true, Ordering::Release);
+            }
+            if let Some(now_bytes) = process_private_bytes() {
+                match baseline {
+                    Some(baseline) => {
+                        let growth = now_bytes.saturating_sub(baseline);
+                        self.peak_growth_bytes.fetch_max(growth, Ordering::Relaxed);
+                        if growth > budget {
+                            self.exceeded.store(true, Ordering::Release);
+                        }
+                    }
+                    None if window.0.elapsed() >= BAKE_MEMORY_SETTLE_WINDOW => {
+                        let settled = now_bytes.saturating_sub(window.1) < BAKE_MEMORY_SETTLE_BYTES;
+                        if settled || started.elapsed() >= BAKE_MEMORY_SETTLE_TIMEOUT {
+                            baseline = Some(now_bytes);
+                        }
+                        window = (Instant::now(), now_bytes);
+                    }
+                    None => {}
+                }
+            }
+            // Re-sent every poll: a cancel that lands between the two stages
+            // must still stop whichever baker starts next.
+            if self.cancelled() {
+                ReflectionsBaker::<DefaultRayTracer>::new().cancel_bake(context);
+                PathBaker::<DefaultRayTracer>::new().cancel_bake(context);
+            }
+            std::thread::sleep(BAKE_MEMORY_POLL);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_private_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX},
+        Threading::GetCurrentProcess,
+    };
+    // SAFETY: plain-old-data out struct sized by `cb`; the pseudo-handle needs no close.
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        )
+    };
+    (ok != 0).then_some(counters.PrivateUsage as u64)
+}
+
+#[cfg(not(windows))]
+fn process_private_bytes() -> Option<u64> {
+    None
+}
+
+/// `Some(reason)` when an earlier bake of this exact map/profile was cancelled
+/// for exceeding a budget at least as large as the current one.
+pub fn over_budget_skip(cache: &SteamAudioBakeCacheInfo) -> Option<String> {
+    let path = cache.directory.join(OVER_BUDGET_MARKER);
+    let marker: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    if marker.get("bake_signature").and_then(Value::as_str) != Some(bake_signature()) {
+        return None;
+    }
+    let budget = marker.get("budget_mib").and_then(Value::as_u64)?;
+    if budget < bake_memory_budget_mib() {
+        return None;
+    }
+    Some(format!(
+        "Steam Audio bake skipped: an earlier bake of this map grew {} MiB with {} probes, over the {budget} MiB budget; delete {} to retry",
+        marker.get("growth_mib").and_then(Value::as_u64).unwrap_or(0),
+        marker.get("probe_count").and_then(Value::as_u64).unwrap_or(0),
+        path.display(),
+    ))
+}
+
+fn write_over_budget_marker(
+    cache: &SteamAudioBakeCacheInfo,
+    probe_count: usize,
+    growth_mib: u64,
+) -> Result<(), String> {
+    fs::create_dir_all(&cache.directory).map_err(|error| {
+        format!("could not create Steam Audio cache {}: {error}", cache.directory.display())
+    })?;
+    let marker = json!({
+        "map_name": &cache.map_name,
+        "map_hash": format!("{:016x}", cache.map_hash),
+        "bake_signature": bake_signature(),
+        "budget_mib": bake_memory_budget_mib(),
+        "growth_mib": growth_mib,
+        "probe_count": probe_count,
+    });
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|error| format!("could not serialize Steam Audio over-budget marker: {error}"))?;
+    atomic_write(&cache.directory.join(OVER_BUDGET_MARKER), &bytes)
 }
 
 /// Builds the runtime Steam Audio scene directly from the already-prepared BSP

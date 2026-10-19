@@ -7,8 +7,7 @@ use crate::renderer::{
 impl Renderer {
     pub(in crate::renderer) fn set_post_effects(&mut self, effects: PostEffects) {
         let old_scene_format = self.scene_format();
-        let old_auto_exposure_effective =
-            self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
+        let old_auto_exposure_effective = self.effective_auto_exposure_strength() > 0.0;
         let old_bloom_pyramid = self.glow_mode.enabled() || self.halation_enabled;
         let old_authored_glow = self.glow_mode.authored();
         let old_ssao_enabled = self.ssao_enabled;
@@ -69,20 +68,6 @@ impl Renderer {
         }
         self.auto_exposure_strength = effects.auto_exposure.clamp(0.0, 1.0);
         self.auto_exposure_enabled = self.auto_exposure_strength > 0.0;
-        let auto_exposure_effective =
-            self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
-        if old_auto_exposure_effective != auto_exposure_effective || !auto_exposure_effective {
-            self.queue.write_buffer(
-                &self.auto_exposure_state_buffer,
-                0,
-                bytemuck::bytes_of(&AutoExposureState {
-                    exposure_ev: 0.0,
-                    average_luminance: 1.0,
-                    target_ev: 0.0,
-                    reserved: 0.0,
-                }),
-            );
-        }
         self.glow_mode = effects.glow;
         self.halation_enabled = effects.halation;
         self.ssao_enabled = effects.ssao;
@@ -132,15 +117,35 @@ impl Renderer {
         self.sun_yaw = effects.sun_yaw.rem_euclid(360.0);
         self.sun_pitch = effects.sun_pitch.clamp(-90.0, 90.0);
         self.sun_intensity = effects.sun_intensity.max(0.0);
+        self.sun_shadow_strength = effects.sun_shadow_strength.clamp(0.0, 1.0);
+        let old_sun_lighting = self.sun_lighting;
+        self.sun_lighting = effects.sun_lighting;
         self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
         self.sun_visibility = effects.sun_visibility;
         self.entity_sun_lighting = effects.entity_sun_lighting;
         let old_baked_sun_removal = self.baked_sun_removal;
         self.baked_sun_removal = effects.baked_sun_removal.clamp(0.0, 1.0);
+        self.baked_sun_cache = effects.baked_sun_cache;
+        let old_baked_sun_shadow_map = self.baked_sun_shadow_map;
+        self.baked_sun_shadow_map = effects.baked_sun_shadow_map;
+        let old_indirect = (self.baked_indirect_scale, self.baked_indirect_saturation,
+            self.baked_indirect_power, self.baked_indirect_highlight_preserve,
+            self.baked_sun_edge_softness, self.baked_sun_direct_limit);
+        self.baked_indirect_scale = effects.baked_indirect_scale.clamp(0.0, 2.0);
+        self.baked_indirect_saturation = effects.baked_indirect_saturation.clamp(0.0, 2.0);
+        self.baked_indirect_power = effects.baked_indirect_power.clamp(1.0, 4.0);
+        self.baked_indirect_highlight_preserve = effects.baked_indirect_highlight_preserve.clamp(0.0, 1.0);
+        self.baked_sun_edge_softness = effects.baked_sun_edge_softness.clamp(0.0, 24.0);
+        self.baked_sun_direct_limit = effects.baked_sun_direct_limit.clamp(0.0, 0.9);
         let current_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
                            self.sun_intensity, self.sun_color);
         if old_baked_sun_removal != self.baked_sun_removal
-            || (self.baked_sun_removal > 0.0 && previous_sun != current_sun)
+            || old_baked_sun_shadow_map != self.baked_sun_shadow_map
+            || old_indirect != (self.baked_indirect_scale, self.baked_indirect_saturation,
+                self.baked_indirect_power, self.baked_indirect_highlight_preserve,
+                self.baked_sun_edge_softness, self.baked_sun_direct_limit)
+            || previous_sun != current_sun
+            || old_sun_lighting != self.sun_lighting
         {
             self.update_lighting_settings();
         }
@@ -151,7 +156,26 @@ impl Renderer {
         self.sky_backend = effects.sky_backend.min(1);
         self.blue_water_environment = effects.blue_water_environment.sanitize();
         self.cloud_backend = effects.cloud_backend.min(1);
+        let cloud_portal_depth = effects.cloud_portal_depth.min(2);
+        if self.cloud_portal_depth != cloud_portal_depth {
+            self.cloud_history_valid = false;
+        }
+        self.cloud_portal_depth = cloud_portal_depth;
         self.clouds_enabled = effects.clouds;
+        let auto_exposure_effective =
+            self.effective_auto_exposure_strength() > 0.0;
+        if old_auto_exposure_effective != auto_exposure_effective || !auto_exposure_effective {
+            self.queue.write_buffer(
+                &self.auto_exposure_state_buffer,
+                0,
+                bytemuck::bytes_of(&AutoExposureState {
+                    exposure_ev: 0.0,
+                    average_luminance: 1.0,
+                    target_ev: 0.0,
+                    reserved: 0.0,
+                }),
+            );
+        }
         self.cloud_type = effects.cloud_type;
         self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);
         self.cloud_coverage = effects.cloud_coverage.clamp(0.0, 1.0);
@@ -240,7 +264,11 @@ impl Renderer {
             self.cloud_history_read_index = 0;
             self.cloud_temporal_frame_index = 0;
         }
-        let cloud_resources_changed = self.clouds_enabled && self.ensure_cloud_noise_resources();
+        // Blue Water owns its cloud noise. The legacy CPU bake is only consumed
+        // by backend 0; doing it for the native menu blocks the render thread.
+        let cloud_resources_changed = self.clouds_enabled
+            && self.cloud_backend == 0
+            && self.ensure_cloud_noise_resources();
         let new_legacy_fog_effective = self.weather.fog.legacy_effective();
         let legacy_fog_pipeline_changed = old_legacy_fog_effective != new_legacy_fog_effective;
         self.weather.fog.write_legacy_control(&self.queue);
@@ -259,7 +287,12 @@ impl Renderer {
         self.vignette_enabled = effects.vignette;
         self.film_grain_strength = effects.film_grain_strength.clamp(0.0, 1.0);
         self.motion_blur_strength = effects.motion_blur_strength.clamp(0.0, 1.0);
-        self.depth_of_field_strength = effects.depth_of_field_strength.clamp(0.0, 1.0);
+        self.dof_mode = effects.dof_mode;
+        self.depth_of_field_strength = if effects.dof_mode == ui::DofMode::Off {
+            0.0
+        } else {
+            effects.depth_of_field_strength.clamp(0.0, 1.0)
+        };
         let old_crt_scope = self.crt_scope;
         self.crt_scope = effects.crt_scope;
         self.crt_style = effects.crt_style;

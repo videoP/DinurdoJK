@@ -31,6 +31,20 @@ const POST_SETTINGS_WGSL: &str = include_str!("post_settings.wgsl");
 
 /// `base` plus the post-process uniform block, for shaders that bind the post buffer.
 pub(crate) fn with_post_settings(base: &str) -> String {
+    // Reuse the upstream display math without its standalone capture bindings.
+    const DISPLAY_MARKER: &str = "// BLUE_WATER_DISPLAY_LIBRARY";
+    let base = if base.contains(DISPLAY_MARKER) {
+        let upstream = include_str!("../../../vendor/blue-water-sea-and-sky/sky/shaders/display.wgsl");
+        let library = upstream.split_once("const LOOK_EXPOSURE").unwrap().1;
+        let library = format!("const LOOK_EXPOSURE{}", library.split_once("@vertex").unwrap().0)
+            .replace("luminance(", "bw_display_luminance(")
+            .replace("display_grade(", "bw_display_grade(")
+            .replace("agx_contrast(", "bw_agx_contrast(")
+            .replace("agx(", "bw_agx(");
+        base.replace(DISPLAY_MARKER, &library)
+    } else {
+        base.to_owned()
+    };
     format!("{POST_SETTINGS_WGSL}
 {base}")
 }
