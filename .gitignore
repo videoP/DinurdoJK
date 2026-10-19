@@ -24,3 +24,6 @@
 /base/emotes/*.djk_fnemote
 /base/emotes-*/
 /base/fnemote*.pk3
+# C# exporter build output
+/exporter/*/bin/
+/exporter/*/obj/

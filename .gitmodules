@@ -1,0 +1,3 @@
+[submodule "exporter/CUE4Parse"]
+	path = exporter/CUE4Parse
+	url = https://github.com/FabianFG/CUE4Parse.git

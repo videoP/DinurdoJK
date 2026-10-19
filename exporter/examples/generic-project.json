@@ -1,0 +1,12 @@
+{
+  "project": {
+    "pak_directory": "D:/MyGame/Content/Paks",
+    "game_version": "GAME_UE5_4",
+    "mappings": "D:/MyGame/MyGame.usmap",
+    "aes_file": "D:/keys/mygame-aes.json"
+  },
+  "seeds": [
+    { "asset": "/Game/Props/SM_Chair.SM_Chair" },
+    { "asset": "/Game/Characters/SK_Hero.SK_Hero" }
+  ]
+}

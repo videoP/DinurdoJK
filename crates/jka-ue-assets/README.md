@@ -8,9 +8,10 @@ for materials, all in one PK3.
 The crate never reads `.uasset`/`.pak`/`.ucas` files and links no Epic code.
 It consumes a plain **export directory** (JSON + PNG) that any exporter can
 produce; see [EXPORT-FORMAT.md](EXPORT-FORMAT.md) for the exact layout. The
-exporter itself is deliberately not part of this repository: how you obtain
-the data (CUE4Parse, UModel, your own editor tooling) is up to you and your
-game's licence.
+[`exporter/`](../../exporter/README.md) is a CUE4Parse-based tool that
+writes it (Fortnite defaults, any UE game via a `project` config); you can also
+produce it with UModel or your own editor tooling. How you obtain the data is
+up to you and your game's licence.
 
 ```
  your exporter ──▶ export directory ──▶ djk-ue-import ──▶ models/<ns>/*.md3, textures, shaders (PK3)
