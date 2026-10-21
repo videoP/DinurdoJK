@@ -77,6 +77,7 @@ impl App {
         self.profile_studio_spin_velocity = 0.0;
         self.profile_studio_head_look = [0.0; 2];
         self.profile_studio_world_anchors = [None; 7];
+        self.profile_body_highlight = None;
         self.profile_studio_cosmetic_group = 0;
         self.profile_preview_key = None;
     }
@@ -429,6 +430,7 @@ impl App {
                 self.live_buttons.insert(plus_verb.clone());
                 // IN_KeyDown wasPressed: a tap shorter than a frame still fires.
                 self.live_input.note_pressed(&plus_verb);
+                self.live_input.note_movement_button_press(&plus_verb);
                 if let Some(player) = &mut self.local_server {
                     if let Some(key) = keybinds::canonical_movement_key(&plus_verb) {
                         player.note_movement_key_press(key);

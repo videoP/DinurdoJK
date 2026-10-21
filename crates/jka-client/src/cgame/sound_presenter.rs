@@ -771,19 +771,32 @@ impl SoundPresenter {
         for command in commands {
             match command {
                 crate::emotes::AudioCommand::StopAll => {
-                    self.stop_emote_sound(None, None);
+                    self.stop_emote_sound(Some(1023), None);
                     if let Some((entity, _)) = owner {
                         self.stop_emote_sound(Some(entity), None);
                     }
                 }
                 crate::emotes::AudioCommand::StopLane(lane) => {
-                    self.stop_emote_sound(None, Some(lane));
+                    self.stop_emote_sound(Some(1023), Some(lane));
                     if let Some((entity, _)) = owner {
                         self.stop_emote_sound(Some(entity), Some(lane));
                     }
                 }
                 crate::emotes::AudioCommand::Play { wav, lane, mode, loop_start_sample } => {
                     self.play_emote_sound(&wav, lane, mode, owner, loop_start_sample);
+                }
+            }
+        }
+        let (decoded, commands) = crate::emotes::network::poll_audio();
+        for result in decoded { let _ = self.assets.cache_emote_decode(result); }
+        for (entity, command) in commands {
+            let source = entities.iter().chain(followed_entity).find(|e| e.number == entity)
+                .map(|e| (entity, e.origin));
+            match command {
+                crate::emotes::AudioCommand::StopAll => self.stop_emote_sound(Some(entity), None),
+                crate::emotes::AudioCommand::StopLane(lane) => self.stop_emote_sound(Some(entity), Some(lane)),
+                crate::emotes::AudioCommand::Play { wav, lane, mode, loop_start_sample } => {
+                    self.play_emote_sound(&wav, lane, mode, source, loop_start_sample);
                 }
             }
         }
@@ -981,6 +994,12 @@ impl SoundPresenter {
         self.ambient.reset();
         if let Some(b) = &mut self.backend { b.clear(); }
     }
+    pub(crate) fn update_variometer(&mut self, sample: Option<crate::audio::variometer::MotionSample>, volume: f32, style: u8) {
+        if let Some(backend) = &mut self.backend {
+            backend.update_variometer(sample, volume, style);
+        }
+    }
+
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
         if let Some(backend) = &mut self.backend {
             backend.set_mix(effects_volume, voice_volume, separation);

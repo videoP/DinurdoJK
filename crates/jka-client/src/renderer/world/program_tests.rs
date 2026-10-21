@@ -303,8 +303,12 @@ fn generated_stage_matrix_validates_and_specializes() {
         surface_deformation: true,
         ..low
     };
+    let baked = WorldShaderVariantKey {
+        baked_sun_relight: true,
+        ..low
+    };
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
-    for variant in [minimal, low, medium] {
+    for variant in [minimal, low, medium, baked] {
         for flags in [
             0,
             2,
@@ -312,6 +316,8 @@ fn generated_stage_matrix_validates_and_specializes() {
             134217728 | 268435456,
             2 | 8 | 16 | 32 | 128,
             4096,
+            8388608,
+            131072 | 1,
         ] {
             for tc_gen in 0..4 {
                 let mut uniform = MaterialUniform::default();
@@ -614,6 +620,9 @@ fn world_program_modes_gpu_images_match() {
             (2 | 8 | 134217728, 0.5, 0, 1, 2, 2),
             (2, 0.0, 0, 0, 2, 14 << 8),
             (4096, 0.0, 3, 0, 2, 0),
+            // Explicit $lightmap stage: source alpha is forced opaque.
+            (8388608, 0.0, 1, 0, 0, 0),
+            (8388608 | 1048576, 0.0, 1, 0, 1, 0),
         ] {
             let mut material = MaterialUniform::default();
             material.header = [tc_gen, 3, flags, material_word];
@@ -660,7 +669,7 @@ fn world_program_modes_gpu_images_match() {
                     MaterialFragmentKey::from_uniform(&material),
                 );
                 let effective = program_variant(variant, key);
-                let program = modules.shader(&device, &shader, effective, key);
+                let program = modules.shader(&device, &shader, &shader, effective, key);
                 let generated = matches!(
                     key.program,
                     StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced
@@ -892,4 +901,116 @@ fn deferred_world_bundle_fp16_and_program_counts_gpu() {
         let error = scope.pop().await;
         assert!(error.is_none(), "FP16 bundle validation: {error:?}");
     });
+}
+
+#[test]
+fn trace_stage_eligibility_matches_program_selection() {
+    // The trace's reasons must never say ELIGIBLE while the program selector
+    // actually chooses a specialized fallback (or vice versa) for common cases.
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Opaque;
+    let plain = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    for mode in 2..=4 {
+        let variant = WorldShaderVariantKey {
+            material_specialization: true,
+            minimal_entries: mode == 2,
+            program_mode: WorldProgramMode::from_console(mode),
+            ..Default::default()
+        };
+        assert!(stage_rejection_reasons(variant, pipeline, plain, mode).is_empty());
+        assert_ne!(program_key(variant, pipeline, plain).program, StageProgram::Specialized);
+        // Hybrid Ocean alone no longer blocks dry stages (see dry_variant).
+        let ocean = WorldShaderVariantKey { ocean: true, ..variant };
+        assert!(stage_rejection_reasons(ocean, pipeline, plain, mode).is_empty());
+        assert_ne!(program_key(ocean, pipeline, plain).program, StageProgram::Specialized);
+        let lit = WorldShaderVariantKey { point_lights: true, ..ocean };
+        assert!(stage_rejection_reasons(lit, pipeline, plain, mode)
+            .iter().any(|why| why.contains("world shader family")));
+        assert_eq!(program_key(lit, pipeline, plain).program, StageProgram::Specialized);
+        let mut autosprite = pipeline;
+        autosprite.auto_sprite2 = true;
+        assert!(stage_rejection_reasons(variant, autosprite, plain, mode)
+            .iter().any(|why| why.contains("autosprite2")));
+        assert_eq!(program_key(variant, autosprite, plain).program, StageProgram::Specialized);
+        let glass = MaterialFragmentKey::from_material([0, 0, 2, 1 << 17], 0.0);
+        assert!(stage_rejection_reasons(variant, pipeline, glass, mode)
+            .iter().any(|why| why.contains("glass")));
+        assert_eq!(program_key(variant, pipeline, glass).program, StageProgram::Specialized);
+    }
+    let generated = WorldShaderVariantKey {
+        material_specialization: true,
+        program_mode: WorldProgramMode::Generated,
+        ..Default::default()
+    };
+    let special_tcgen = MaterialFragmentKey::from_material([7, 0, 2, 0], 0.0);
+    assert!(stage_rejection_reasons(generated, pipeline, special_tcgen, 4)
+        .iter().any(|why| why.contains("tcGen")));
+    assert_eq!(program_key(generated, pipeline, special_tcgen).program, StageProgram::Specialized);
+}
+
+#[test]
+fn hybrid_ocean_dry_stages_use_lean_programs() {
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Opaque;
+    let wall = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let mode1 = WorldShaderVariantKey { material_specialization: true, ocean: true, ..Default::default() };
+    assert_eq!(mode1.family(), WorldShaderFamily::Enhanced);
+    let key = program_key(mode1, pipeline, wall);
+    assert_eq!(key.program, StageProgram::SpecializedLean);
+    let effective = program_variant(mode1, key);
+    assert!(!effective.ocean && effective.family() == WorldShaderFamily::Lean);
+    // The Enhanced-module specialization keeps the real variant.
+    assert!(program_variant(mode1, MaterialFragmentKey { program: StageProgram::Specialized, ..key }).ocean);
+    // Mode 1 on a dry variant is unchanged.
+    assert_eq!(program_key(WorldShaderVariantKey { ocean: false, ..mode1 }, pipeline, wall).program, StageProgram::Specialized);
+    // Another Enhanced feature or RT keeps the Enhanced program.
+    for blocked in [
+        WorldShaderVariantKey { voxel_gi: true, ..mode1 },
+        WorldShaderVariantKey { ray_traced_shadows: true, ..mode1 },
+    ] {
+        assert!(dry_variant(blocked).is_none());
+        assert_eq!(program_key(blocked, pipeline, wall).program, StageProgram::Specialized);
+    }
+    let generated = WorldShaderVariantKey { program_mode: WorldProgramMode::Generated, ..mode1 };
+    let key = program_key(generated, pipeline, wall);
+    assert_eq!(key.program, StageProgram::GeneratedBasic);
+    assert!(!program_variant(generated, key).ocean);
+}
+
+#[test]
+fn baked_relight_specializes_only_lightmap_stages() {
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Opaque;
+    let variant = WorldShaderVariantKey {
+        material_specialization: true,
+        program_mode: WorldProgramMode::Generated,
+        baked_sun_relight: true,
+        ..Default::default()
+    };
+    // A plain texture stage never reaches light_bsp_surface.
+    let texture = MaterialFragmentKey::from_material([0, 0, 0, 0], 0.0);
+    let key = program_key(variant, pipeline, texture);
+    assert_eq!(key.program, StageProgram::GeneratedBasic);
+    assert!(!program_variant(variant, key).baked_sun_relight);
+    for flags in [2, 8388608, 131072 | 1] {
+        let lit = MaterialFragmentKey::from_material([0, 0, flags, 0], 0.0);
+        let key = program_key(variant, pipeline, lit);
+        assert_eq!(key.program, StageProgram::GeneratedEnhanced, "flags {flags}");
+        let effective = program_variant(variant, key);
+        assert!(effective.baked_sun_relight);
+        let source = generated_source(effective, key);
+        let vs = function_body(&source, "vs_generated");
+        assert!(vs.contains("world_vertex(input, instance_index, legacy_dlight_surface_id)"));
+        assert!(source.contains("@interpolate(flat) baked_sun_fit"));
+    }
+    // Vertex colour alone (no vertex-lit flag) is not baked lighting.
+    let vertex_color = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.0);
+    assert!(!program_variant(variant, program_key(variant, pipeline, vertex_color)).baked_sun_relight);
+    // Mode 3 keeps lightmapped relight specialized; plain stages stay shared.
+    let shared = WorldShaderVariantKey { program_mode: WorldProgramMode::Shared, ..variant };
+    let lightmapped = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    assert_eq!(program_key(shared, pipeline, lightmapped).program, StageProgram::Specialized);
+    assert!(stage_rejection_reasons(shared, pipeline, lightmapped, 3).iter().any(|why| why.contains("baked")));
+    assert_eq!(program_key(shared, pipeline, texture).program, StageProgram::SharedBasic);
+    assert!(stage_rejection_reasons(shared, pipeline, texture, 3).is_empty());
 }

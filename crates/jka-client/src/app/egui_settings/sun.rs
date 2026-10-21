@@ -32,8 +32,7 @@ impl App {
             differs(v.baked_indirect_saturation, d.baked_indirect_saturation),
             differs(v.baked_indirect_power, d.baked_indirect_power),
             differs(v.baked_indirect_highlight_preserve, d.baked_indirect_highlight_preserve),
-            s.world_lighting != e.world_lighting,
-            s.filmic != e.filmic,
+            differs(s.world_lighting, e.world_lighting),
             s.moon_custom != e.moon_custom,
             differs(s.moon_phase, e.moon_phase),
             differs(s.moon_elevation, e.moon_elevation),
@@ -81,7 +80,6 @@ impl App {
         v.baked_indirect_highlight_preserve = d.baked_indirect_highlight_preserve;
         let s = &mut v.blue_water_environment;
         s.world_lighting = e.world_lighting;
-        s.filmic = e.filmic;
         s.moon_phase = e.moon_phase;
         s.moon_custom = e.moon_custom;
         s.moon_elevation = e.moon_elevation;
@@ -163,7 +161,7 @@ impl App {
 
         // ------------------------------------------------------------ sky --
         theme::section(ui, "SKY", "Which sky is drawn behind the map.");
-        theme::row(ui, "Sky renderer", "The map's authored BSP sky, or the Blue Water atmosphere. Blue Water also enables native exposure/highlight mapping by default, which changes ground colors. Sky world lighting is a separate opt-in.", theme::Reset::None, |ui| {
+        theme::row(ui, "Sky renderer", "The map's authored BSP sky, or the Blue Water atmosphere. Blue Water also unlocks sky-referenced auto exposure (Color page, on by default) and the World lighting slider below (off by default).", theme::Reset::None, |ui| {
             for (backend, name) in [(0, "JKA sky"), (1, "Blue Water sky")] {
                 if theme::chip(ui, name, self.video.sky_backend == backend).clicked()
                     && self.video.sky_backend != backend

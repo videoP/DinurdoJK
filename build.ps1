@@ -171,7 +171,14 @@ try {
     }
     $runtimeBase = Join-Path $runtimeDirectory 'base'
     New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
-    Copy-Item -LiteralPath $rainGlassPackagePath -Destination (Join-Path $runtimeBase 'dinurdo-assets.pk3') -Force
+    $runtimeRainGlassPackagePath = Join-Path $runtimeBase 'dinurdo-assets.pk3'
+    # As with runtime DLLs, an identical package needs no write (and may be
+    # held open by the running game or shared with other installs via hardlink).
+    if (-not (Test-Path -LiteralPath $runtimeRainGlassPackagePath) -or
+        (Get-FileHash -LiteralPath $rainGlassPackagePath).Hash -ne
+        (Get-FileHash -LiteralPath $runtimeRainGlassPackagePath).Hash) {
+        Copy-Item -LiteralPath $rainGlassPackagePath -Destination $runtimeRainGlassPackagePath -Force
+    }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg') -Destination (Join-Path $runtimeBase 'shader_modes_ab.cfg') -Force
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }

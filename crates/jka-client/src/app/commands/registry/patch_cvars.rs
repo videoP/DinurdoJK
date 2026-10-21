@@ -76,7 +76,7 @@ app_cvars! {
         ]
     }
     APP_R_FRAMETIMEGRAPH {
-        runtime: CvarDef::new("r_frameTimeGraph", "0", "0|1", "Transparent 1-pixel/frame CPU phase graph (prepare/acquire/encode/submit/present/other), percentile-colored tips, and optional async GPU readout with r_gpuTimings 1. Updates at 30 Hz; session-only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_frameTimeGraph", "0", "0|1", "Transparent FPS graph + cg_drawFPS 2 essentials, real asynchronous WGPU 30 primary BSP vertex/fragment counts when supported, shader-mode bind counts, and optional GPU timestamps with r_gpuTimings 1. Updates at 30 Hz; opt-in/session-only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::Bool(app.frame_time_graph),
             |app, value| {
                 let CvarValue::Bool(enabled) = value else { return Err("r_frameTimeGraph expects 0 or 1".into()); };

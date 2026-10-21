@@ -30,7 +30,10 @@ pub struct Settings {
     pub strike_preview: bool,
     pub fog: f32,
     pub visibility: f32,
-    pub world_lighting: bool,
+    /// Blend of the sky's ambient and celestial light over the baked world, 0 baked only.
+    /// The renderer zeroes it while the JKA sky is selected.
+    pub world_lighting: f32,
+    /// Sky-referenced eye adaptation with AgX and night readability; only active under the Blue Water sky.
     pub filmic: bool,
     /// The dome's night glow and floor as a share of the authored level (1 upstream, 0 black). Dome only: the
     /// environment bake and the world's night light keep the authored glow.
@@ -65,7 +68,7 @@ impl Default for Settings {
             strike_preview: false,
             fog: 0.0,
             visibility: 17000.0,
-            world_lighting: false,
+            world_lighting: 0.0,
             filmic: true,
             night_sky: 1.0,
         }
@@ -108,6 +111,7 @@ impl Settings {
         limit!(fog, 0.0, 1.0);
         limit!(visibility, 200.0, 100000.0);
         limit!(night_sky, 0.0, 1.0);
+        limit!(world_lighting, 0.0, 1.0);
         self
     }
     pub fn quality(self) -> SkyQuality {

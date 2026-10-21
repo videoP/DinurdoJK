@@ -2,7 +2,7 @@
 use crate::renderer::{
     cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
     create_cloud_resolve_bind_group, create_dof_bind_group, create_fast_post_bind_group,
-    create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline,
+    create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline, create_post_pipeline_for,
     create_cloud_shadow_opaque_pipeline,
     create_rain_post_pipeline,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups, pipeline_hash,
@@ -147,6 +147,30 @@ impl Renderer {
         });
     }
 
+    /// r_postSpecialize: the full-post pipeline compiled for `mask`, or None
+    /// while it compiles on the pipeline workers (the caller then draws with the
+    /// general pipeline, which renders the same image).
+    pub(in crate::renderer) fn ensure_post_specialized(&mut self, mask: u32) -> bool {
+        if !self.post_specialize || self.post_specialized.contains_key(&(self.config.format, mask)) {
+            return self.post_specialize;
+        }
+        let key = PipelineJobKey::new("post-specialized", mask, pipeline_hash(&(self.config.format, mask)));
+        if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+            self.post_specialized.insert((self.config.format, mask), pipeline);
+            return true;
+        }
+        let (device, layout, shader, format) = (
+            self.device.clone(),
+            self.post_pipeline_layout.clone(),
+            self.post_shader.clone(),
+            self.config.format,
+        );
+        self.pipeline_jobs.request(key, "specialized full post", move || {
+            create_post_pipeline_for(&device, &layout, &shader, format, Some(mask))
+        });
+        true
+    }
+
     /// Polls/queues the specialized rain-only fullscreen post pipeline.
     pub(in crate::renderer) fn ensure_rain_post_pipeline(&mut self, needed_now: bool) {
         if !needed_now || self.rain_post_pipeline.is_some() {
@@ -200,7 +224,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn update_post_uniform(&self) {
-        self.write_post_uniform(
+        let _ = self.write_post_uniform(
             Mat4::IDENTITY,
             Mat4::IDENTITY,
             Mat4::IDENTITY,
@@ -226,7 +250,7 @@ impl Renderer {
         camera_pos_time: [f32; 4],
         history_valid: bool,
         dof_frame_active: bool,
-    ) {
+    ) -> u32 {
         let (cloud_blades, cloud_blade_count) = self.cloud_foreground_uniform(
             view_proj,
             Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]),
@@ -535,6 +559,7 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.post_buffer, 0, bytemuck::bytes_of(&uniform));
+        post_feature_mask(&uniform)
     }
 
     pub(in crate::renderer) fn write_ssao_temporal_uniform(
@@ -815,4 +840,27 @@ impl Renderer {
     pub(in crate::renderer) fn flush_staged_queue_writes(&self) {
         self.queue.submit([]);
     }
+}
+
+/// `POST_FEATURES` bits (post.wgsl `fs_main`) for a uniform. A bit is set when
+/// any input of its branch is non-zero (NaN included), a superset of the
+/// shader's own `> 0.5` / `> 0.001` tests, so a cleared bit only removes a
+/// branch that would have returned its input unchanged.
+pub(in crate::renderer) fn post_feature_mask(uniform: &PostUniform) -> u32 {
+    let on = |value: f32| value != 0.0;
+    let mut mask = 0u32;
+    let mut set = |bit: u32, enabled: bool| if enabled { mask |= bit };
+    set(1, on(uniform.aa.fxaa));
+    set(2, on(uniform.camera_fx.motion_blur_scale));
+    set(4, on(uniform.camera_fx.depth_of_field));
+    set(8, on(uniform.rain[3]) || on(uniform.scene.ssr) || on(uniform.scene.contact_shadows)
+        || on(uniform.color.ssao) || on(uniform.scene.volumetric_fog) || on(uniform.legacy_weather[3]));
+    set(16, on(uniform.clouds.values[0]));
+    set(32, uniform.legacy_weather[..3].iter().any(|&value| on(value)));
+    set(64, on(uniform.color.bloom));
+    set(128, on(uniform.film.halation));
+    set(256, on(uniform.exposure_controls[1]));
+    set(512, on(uniform.taa_params[3]));
+    set(1024, on(uniform.taa_params[1]));
+    mask
 }

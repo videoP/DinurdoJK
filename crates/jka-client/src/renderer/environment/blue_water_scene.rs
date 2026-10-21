@@ -316,6 +316,7 @@ impl Scene {
             }),
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         pass.set_pipeline(&self.merge);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
@@ -350,6 +351,7 @@ impl Scene {
             })],
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         pass.set_pipeline(if over { &self.over } else { &self.replace });
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
@@ -364,7 +366,7 @@ impl Scene {
         clouds: &CloudLayer,
         color: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
-        world: bool,
+        world: f32,
         shadows: bool,
         flash: f32,
     ) {
@@ -372,7 +374,7 @@ impl Scene {
         values[..16].copy_from_slice(&camera.inverse_view_projection);
         values[16..19].copy_from_slice(&camera.position);
         values[20..24].copy_from_slice(&camera.viewport);
-        values[24] = u8::from(world) as f32;
+        values[24] = world.clamp(0.0, 1.0);
         values[25] = u8::from(shadows) as f32;
         values[26] = flash;
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&values));
@@ -407,6 +409,7 @@ impl Scene {
             })],
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         pass.set_pipeline(&self.light);
         pass.set_bind_group(0, &group, &[]);
         pass.set_bind_group(1, &clouds.shadow().bind_group, &[]);

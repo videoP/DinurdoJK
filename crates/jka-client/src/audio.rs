@@ -1,4 +1,5 @@
 //! Native audio device/mixer and registered SFX cache. No CGame event IDs here.
+pub(crate) mod variometer;
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
@@ -1711,6 +1712,7 @@ impl Source for MasterTap {
 }
 
 pub struct AudioBackend {
+    variometer: Option<variometer::Variometer>,
     voices: Vec<Voice>,
     loops: Vec<LoopRequest>,
     loop_voices: HashMap<String, LoopVoice>,
@@ -1816,6 +1818,7 @@ impl AudioBackend {
         };
 
         Ok(Self {
+            variometer: None,
             voices: Vec::new(),
             loops: Vec::new(),
             loop_voices: HashMap::new(),
@@ -1868,6 +1871,7 @@ impl AudioBackend {
 
     fn from_mixer(mixer: Mixer) -> Self {
         Self {
+            variometer: None,
             voices: Vec::new(),
             loops: Vec::new(),
             loop_voices: HashMap::new(),
@@ -2351,6 +2355,16 @@ impl AudioBackend {
         }
     }
 
+    pub(crate) fn update_variometer(&mut self, sample: Option<variometer::MotionSample>, volume: f32, style: u8) {
+        if let Some(sample) = sample.filter(|_| volume > 0.0 && self.rate > 0.0) {
+            self.variometer.get_or_insert_with(|| {
+                variometer::Variometer::new(&self.mixer, self.output_sample_rate)
+            }).update(sample, volume, style);
+        } else if let Some(tone) = self.variometer.take() {
+            tone.stop();
+        }
+    }
+
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
         self.effects_volume = effects_volume.clamp(0.0, 1.0);
         self.voice_volume = voice_volume.clamp(0.0, 1.0);
@@ -2589,6 +2603,9 @@ impl AudioBackend {
 
     pub fn set_rate(&mut self, rate: f32) {
         self.rate = rate;
+        if rate == 0.0 {
+            if let Some(tone) = self.variometer.take() { tone.stop(); }
+        }
         for voice in &self.voices {
             if rate == 0.0 { voice.player.pause(); }
             else { voice.player.set_speed(rate); voice.player.play(); }
@@ -2752,6 +2769,7 @@ impl AudioBackend {
     }
 
     pub fn clear(&mut self) {
+        if let Some(tone) = self.variometer.take() { tone.stop(); }
         for voice in std::mem::take(&mut self.voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
         for (_, voice) in std::mem::take(&mut self.loop_voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
         self.loops.clear();

@@ -83,3 +83,76 @@ tests; none was in the renderer test group. Their log is
 
 The requested `DinurdoJK_TextureCompression_UI_export_compile_fix.patch` was also
 applied: `VIDEO_ROW_TEXTURE_COMPRESSION` is exported by `ui.rs`.
+
+### Shader fallback diagnostics
+
+With `r_frameTimeGraph 1`, modes 2–4 show **MAP BSP MODE N ELIGIBILITY**:
+these are coarse BSP batches in the loaded map (including ones not visible),
+**not** GPU fragment counts or the number of draw submissions this frame.
+A batch is assigned a single primary fallback category. Global variant
+features, special sky/fused/ocean pipelines, autosprite2, three-stage sRGB,
+special tcGen and glass are distinguished. These counters are diagnostic only.
+
+`/trace` on a BSP surface adds **FRAGMENT SHADER / PSO ELIGIBILITY**. It shows:
+- Requested vs installed active shader mode (background compilation may lag).
+- The material's actual installed base-pass program from the active PSO set.
+- What modes 2, 3 and 4 would select with the current active global features.
+- Every relevant exclusion reason for the traced stage, not just the first.
+
+Prediction of another mode's program does not compile or activate that mode.
+A surface that is eligible but lacks the expected installed program in the
+active mode is flagged for investigation. Shader diagnosis does not modify
+rendering, pipeline selection, stage fusion, or ocean promotion.
+
+## Hybrid Ocean, baked relight and benchmarking (2026-10-20)
+
+**Dry stages under Hybrid Ocean.** `r_ocean 1` puts the whole variant in the
+Enhanced family (bsp.wgsl + its layout). Only the reserved ocean pipeline shades
+ocean geometry (bsp.wgsl detects it per vertex; world batches never contain
+clipmap vertices), so `dry_variant()` judges every other stage with the ocean
+compiled out. Those programs are built from bsp_lean.wgsl against the Enhanced
+pipeline layout (identical groups 0/1/3/4; Lean group 2 is a subset), so they
+draw with the frame's existing bind groups. Mode 1 installs `SpecializedLean`;
+modes 2-4 select their Minimal/Shared/Generated programs instead of falling
+back. Point/area lights, irradiance volume, voxel GI and RT keep Enhanced.
+
+**Baked relight.** `baked_sun_relight` no longer disqualifies modes 3/4. Stages
+that cannot reach `light_bsp_surface` (no implicit/explicit lightmap, no
+vertex-lit vertex colour) compile it out; lightmapped stages use
+GeneratedEnhanced (fs_main equations) with the surface-id stream and a flat
+`baked_sun_fit` varying, exactly like vs_main_legacy. Mode 3 keeps lightmapped
+stages specialized under relight: its uniform-driven SharedEnhanced measured
+4-13% slower (RTX 3060). Mode 2 still requires relight off.
+
+**Explicit `$lightmap` alpha.** `fs_world_minimal` (mode 2, SharedBasic,
+GeneratedBasic) now forces the source alpha of explicit lightmap stages to 1 as
+fs_main does; lightmap alpha carries sun flux on sun-baked maps. The flag is a
+compile-time key bit in every specialized mode.
+
+**Per-batch CPU cost.** `base_pipeline()` looks up the specialized PSO for every
+world batch every frame; the map now uses the fold hasher instead of SipHash.
+
+### Benchmark workflow
+
+`python scripts/bench_shader_modes.py` launches the client per (spot, trial,
+exe, case), measures every requested mode twice in mirrored order (A B C C B A,
+odd trials C B A A B C), waits with `waitshadermode` until the requested mode
+is active and nothing compiles, settles, then records `render_perf_capture 10s`.
+It writes `bench/results/shader-modes-<tag>-<scenario>-<time>/` (summary
+JSON/CSV, report.txt, gzip per-frame columns, logs) and restores the cfg.
+`--exe name=path` (repeatable) interleaves builds; `--case name=cvar:v;...`
+interleaves settings. Captures whose view is not the requested camera (input
+during a run) are dropped from the report. `--report <dirs>` re-reports and
+merges; `--exclude-launch` drops a disturbed launch. Spots use
+`setviewpos_exact` (no teleport push) and are given as `viewpos` cameras.
+
+`--shots-only --freeze-time 100` takes one PNG per mode with
+`JKA_FIXED_SHADER_TIME` freezing the renderer clock; compare with
+`python scripts/diff_mode_shots.py <dir> --ref 0`. Ocean simulation, spray and
+cgame entities are not on that clock: measure the same-mode floor in the same
+launch (e.g. `--modes 0,1,0,1`) before reading a difference.
+
+`render_perf_capture <N>s` records for N seconds (cap 200k frames). New columns:
+`frame_interval_ms` (present-to-present), `world_variant_pending`, active PSO
+counts and the latest primary-BSP pipeline statistics (vertex/clipped/fragment
+invocations; first world pass only, ~10 Hz, asynchronous).

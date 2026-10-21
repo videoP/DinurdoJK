@@ -32,6 +32,45 @@ pub(in crate::renderer) fn posed_inline_vertices(
     (vertices, minimum, maximum)
 }
 
+/// Same vertex math as the scalar reference, split into chunks so one large
+/// mover can use several workers. Scratch storage survives between frames.
+pub(in crate::renderer) fn posed_inline_vertices_workers(
+    base: &[GpuVertex],
+    pose: InlineModelInstance,
+    vertices: &mut Vec<GpuVertex>,
+    pool: &rayon::ThreadPool,
+) -> ([f32; 3], [f32; 3]) {
+    use rayon::prelude::*;
+    const CHUNK_VERTICES: usize = 4096;
+    let Some(first) = base.first() else {
+        vertices.clear();
+        return ([0.0; 3], [0.0; 3]);
+    };
+    vertices.resize(base.len(), *first);
+    pool.install(|| {
+        base.par_chunks(CHUNK_VERTICES)
+            .zip(vertices.par_chunks_mut(CHUNK_VERTICES))
+            .map(|(source, destination)| {
+                let mut minimum = [f32::INFINITY; 3];
+                let mut maximum = [f32::NEG_INFINITY; 3];
+                for (vertex, out) in source.iter().zip(destination) {
+                    *out = *vertex;
+                    out.position = pose.transform_point(vertex.position);
+                    out.normal = pose.transform_normal(vertex.normal);
+                    for axis in 0..3 {
+                        minimum[axis] = minimum[axis].min(out.position[axis]);
+                        maximum[axis] = maximum[axis].max(out.position[axis]);
+                    }
+                }
+                (minimum, maximum)
+            })
+            .reduce(|| ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |a, b| {
+                (std::array::from_fn(|axis| a.0[axis].min(b.0[axis])),
+                 std::array::from_fn(|axis| a.1[axis].max(b.1[axis])))
+            })
+    })
+}
+
 pub(in crate::renderer) fn make_cull_record(
     source: &DrawBatch,
     vertices: &[GpuVertex],

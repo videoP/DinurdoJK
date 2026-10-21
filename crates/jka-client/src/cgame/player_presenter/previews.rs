@@ -7,7 +7,54 @@ use crate::cgame::player_presenter::{
     BONE_ANIM_OVERRIDE_FREEZE, BONE_ANIM_OVERRIDE_LOOP,
 };
 
+pub(super) struct BodyPick {
+    pub(super) model: Arc<super::assets::types::PlayerModelAsset>,
+    pose: Vec<jka_assets::ghoul2::Matrix3x4>,
+    axis: [[f32;3];3],
+    origin: [f32;3],
+}
+
 impl PlayerPresenter {
+    /// Intersect the animated visible body mesh. Sabers, cosmetics and hidden
+    /// skin surfaces do not participate. Only clicks perform CPU intersection.
+    pub(crate) fn pick_profile_body(&self, info: &crate::cgame::ClientInfo,
+        ray_origin: [f32;3], ray_direction: [f32;3]) -> Option<&'static str> {
+        let pick = self.profile_body_pick.as_ref()?;
+        let key = super::player_model_key(info);
+        // A model selection/loading transition must not pick the previous body.
+        let super::assets::loading::ModelLookup::Ready(current) = self.lookup_model(&key) else {return None;};
+        if !Arc::ptr_eq(&current, &pick.model) || !pick.model.body_shape_available {return None;}
+        let local_origin = std::array::from_fn(|i| (0..3).map(|k|
+            (ray_origin[k]-pick.origin[k])*pick.axis[i][k]).sum::<f32>());
+        let local_direction = std::array::from_fn(|i| (0..3).map(|k|
+            ray_direction[k]*pick.axis[i][k]).sum::<f32>());
+        let ray_origin = glam::Vec3::from_array(local_origin);
+        let direction = glam::Vec3::from_array(local_direction);
+        let mut nearest = f32::INFINITY;
+        let mut bind_point = None;
+        let lod = pick.model.glm.lods.first()?;
+        for surface in &lod.surfaces {
+            if !pick.model.surfaces.iter().any(|s| s.surface_index==surface.surface_index && s.default_visible) {continue;}
+            let skinned = jka_assets::ghoul2::skin_glm_surface(surface, &pick.pose).ok()?;
+            for face in &surface.triangles {
+                let ids = face.map(|i|i as usize);
+                let [a,b,c] = ids.map(|i|glam::Vec3::from_array(skinned.vertices[i].position));
+                let ab=b-a; let ac=c-a; let h=direction.cross(ac); let det=ab.dot(h);
+                if det.abs()<1e-7 {continue;}
+                let s=ray_origin-a;let u=s.dot(h)/det;
+                if !(0.0..=1.0).contains(&u) {continue;}
+                let q=s.cross(ab);let v=direction.dot(q)/det;
+                if v<0.0 || u+v>1.0 {continue;}
+                let distance=ac.dot(q)/det;
+                if distance<=0.0 || distance>=nearest {continue;}
+                nearest=distance;
+                let weights=[1.0-u-v,u,v];
+                bind_point=Some(std::array::from_fn(|k|(0..3).map(|j|surface.vertices[ids[j]].position[k]*weights[j]).sum::<f32>()));
+            }
+        }
+        jka_assets::body_shape::anny::region(&pick.model.glm,&pick.model.gla,
+            pick.model.source_native_pivots.as_deref().map(|p|p.as_slice()),bind_point?)
+    }
     pub(crate) fn profile_body_shape_available(&self, info: &crate::cgame::ClientInfo) -> bool {
         let key = super::player_model_key(info);
         matches!(self.lookup_model(&key), super::assets::loading::ModelLookup::Ready(model) if model.body_shape_available)
@@ -386,6 +433,7 @@ impl PlayerPresenter {
         record_pose_eval(&mut self.perf, pose_started);
         // The studio is CPU-skinned for cinematic lighting. Use the same
         // promoted bind-pose mesh as gameplay when drawing its body shape.
+        self.profile_body_pick = Some(BodyPick { model: Arc::clone(&model), pose: pose.clone(), axis, origin });
         self.preview_cpu_remesh = true;
         let body_result = self.render_glm_surfaces_tinted(
             0,

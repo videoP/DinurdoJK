@@ -1808,6 +1808,8 @@ version = "0.1.0"
 dependencies = [
  "image",
  "log",
+ "serde",
+ "serde_json",
  "zip 8.6.0",
 ]
 

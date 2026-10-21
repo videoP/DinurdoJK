@@ -1,4 +1,4 @@
-//! Hold `/emote` to open a nonmodal, relative-mouse, two-tier emote wheel.
+//! Hold `/emote` to open a nonmodal, relative-mouse emote wheel with a categorized library.
 //! Unlike release-to-commit wheels, it mirrors `/dev`: left-click commits a
 //! selection, release of the bound key/button only cancels. Right-click goes
 //! back to categories. The outer tier never paginates or steals gameplay input.
@@ -9,9 +9,11 @@ use crate::net::mod_support::ServerMod;
 use std::borrow::Cow;
 use std::f32::consts::{FRAC_PI_2, PI};
 
-const CATEGORY_INNER: f32 = 0.13;
-const CATEGORY_OUTER: f32 = 0.48;
-const EMOTE_INNER: f32 = 0.505;
+const CATEGORY_INNER: f32 = 0.09;
+const CATEGORY_OUTER: f32 = 0.29;
+const EMOTE_INNER: f32 = 0.315;
+const LIBRARY_CATEGORY_OUTER: f32 = 0.55;
+const LIBRARY_EMOTE_INNER: f32 = 0.575;
 const SECTOR_GAP: f32 = 0.016;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,13 +21,24 @@ pub(in crate::app) enum EmoteCategory {
     Taunts,
     Standard,
     Library,
+    LibraryCategory(usize),
+    Favorites,
+}
+
+impl EmoteCategory {
+    fn parent(self) -> Option<Self> {
+        match self {
+            Self::LibraryCategory(_) => Some(Self::Library),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     Category(EmoteCategory),
     Command(&'static str),
-    /// A starred emote from the installed library, by catalog ID.
+    /// An installed emote, by catalog ID.
     Emote(String),
     Disabled,
 }
@@ -136,13 +149,13 @@ fn categories() -> [Entry; 4] {
     [
         Entry::new("TAUNTS", "SABER + GESTURES", Action::Category(EmoteCategory::Taunts)),
         Entry::new("STANDARD", "SERVER MOD", Action::Category(EmoteCategory::Standard)),
-        Entry::new("LIBRARY", "STARRED EMOTES", Action::Category(EmoteCategory::Library)),
-        Entry::new("FAVORITES", "COMING SOON", Action::Disabled),
+        Entry::new("LIBRARY", "BROWSE CATEGORIES", Action::Category(EmoteCategory::Library)),
+        Entry::new("FAVORITES", "STARRED EMOTES", Action::Category(EmoteCategory::Favorites)),
     ]
 }
 
 /// Every emote in one uninterrupted ring: no Back, Prev, Next, or page slots.
-/// `library` is the user's starred library emotes (see `library_entries`).
+/// Dynamic tiers contain library categories, installed emotes, or favorites.
 fn entries<'a>(category: EmoteCategory, server_mod: ServerMod, library: &'a [Entry]) -> &'a [Entry] {
     match category {
         EmoteCategory::Taunts => const { &[
@@ -153,12 +166,11 @@ fn entries<'a>(category: EmoteCategory, server_mod: ServerMod, library: &'a [Ent
             Entry::cmd("MEDITATE", "meditate"),
         ] },
         EmoteCategory::Standard => standard_catalog(server_mod),
-        EmoteCategory::Library => library,
+        EmoteCategory::Library | EmoteCategory::LibraryCategory(_) | EmoteCategory::Favorites => library,
     }
 }
 
-/// Starred emotes in Profile order, or one disabled entry saying why the
-/// tier is empty. Never the whole library: the ring does not paginate.
+/// Installed emotes or favorites, or a disabled entry explaining an empty tier.
 fn library_entries(favorites: Result<Vec<crate::emotes::Emote>, &'static str>) -> Vec<Entry> {
     match favorites {
         Ok(emotes) => emotes
@@ -226,7 +238,7 @@ fn emote_font_size(painter: &egui::Painter, label: &str, radial_space: f32) -> f
 impl App {
     pub(in crate::app) fn emote_radial_back(&mut self) {
         if self.emote_radial_category.is_some() {
-            self.emote_radial_category = None;
+            self.emote_radial_category = self.emote_radial_category.and_then(EmoteCategory::parent);
             self.dev_radial_offset = [0.0, -0.28];
             self.egui_repaint_requested = true;
         } else {
@@ -253,7 +265,7 @@ impl App {
                 self.emote_radial_category = Some(category);
                 self.dev_radial_offset = [0.0, -0.28];
                 self.egui_repaint_requested = true;
-                if category == EmoteCategory::Library {
+                if category == EmoteCategory::Favorites {
                     self.warm_favorite_emote_audio();
                 }
             }
@@ -263,18 +275,33 @@ impl App {
             }
             Action::Emote(id) => {
                 self.close_emote_radial();
-                self.play_favorite_emote(&id);
+                self.play_wheel_emote(&id);
             }
             Action::Disabled => {}
         }
     }
 
-    /// Only the LIBRARY tier reads the library; other tiers are static.
     fn radial_library_entries(&self, category: EmoteCategory) -> Vec<Entry> {
-        if category == EmoteCategory::Library {
-            library_entries(self.wheel_favorite_emotes())
-        } else {
-            Vec::new()
+        match category {
+            EmoteCategory::Library => self.emote_wheel.categories.iter().enumerate()
+                .map(|(index, category)| Entry {
+                    label: Cow::Owned(category.name.to_uppercase()),
+                    sub: Cow::Borrowed("BROWSE EMOTES"),
+                    action: Action::Category(EmoteCategory::LibraryCategory(index)),
+                }).collect(),
+            EmoteCategory::LibraryCategory(index) => {
+                let Some(category) = self.emote_wheel.categories.get(index) else {
+                    return library_entries(Err("CATEGORY UNAVAILABLE"));
+                };
+                library_entries(crate::emotes::catalog(&self.base)
+                    .map_err(|_| "EMOTE LIBRARY LOADING OR UNAVAILABLE")
+                    .and_then(|catalog| {
+                        let emotes = self.emote_wheel.catalog_emotes(&catalog, Some(&category.id));
+                        if emotes.is_empty() { Err("NO EMOTES IN THIS CATEGORY") } else { Ok(emotes) }
+                    }))
+            }
+            EmoteCategory::Favorites => library_entries(self.wheel_favorite_emotes()),
+            _ => Vec::new(),
         }
     }
 
@@ -302,11 +329,35 @@ impl App {
 
         // Paint the entire outer catalog, with radial text so every narrow
         // slice has an individually visible full label even with 30+ emotes.
-        if let Some(items) = catalog {
+        // Keep the Library categories in their own middle band when the
+        // selected category's emotes open in a third, separate outer band.
+        let library_categories = if matches!(chosen_category, Some(EmoteCategory::LibraryCategory(_))) {
+            self.radial_library_entries(EmoteCategory::Library)
+        } else { Vec::new() };
+        let mut rings = Vec::with_capacity(2);
+        match chosen_category {
+            Some(EmoteCategory::Library) => {
+                if let Some(items) = catalog {
+                    rings.push((items, outer * EMOTE_INNER, outer * LIBRARY_CATEGORY_OUTER, selected_outer));
+                }
+            }
+            Some(EmoteCategory::LibraryCategory(index)) => {
+                rings.push((library_categories.as_slice(), outer * EMOTE_INNER,
+                    outer * LIBRARY_CATEGORY_OUTER, Some(index)));
+                if let Some(items) = catalog {
+                    rings.push((items, outer * LIBRARY_EMOTE_INNER, outer, selected_outer));
+                }
+            }
+            _ => {
+                if let Some(items) = catalog {
+                    rings.push((items, outer * EMOTE_INNER, outer, selected_outer));
+                }
+            }
+        }
+        for (items, inner, ring_outer, selected_ring) in rings {
             if !items.is_empty() {
                 let step = 2.0 * PI / items.len() as f32;
-                let inner = outer * EMOTE_INNER;
-                let width = outer - inner;
+                let width = ring_outer - inner;
                 // Aim the label toward the middle of the band, leaving room
                 // around both ends to avoid touching the inner ring.
                 let label_radius = inner + width * 0.5;
@@ -315,7 +366,7 @@ impl App {
                     let visual_gap = SECTOR_GAP.min(step * 0.16);
                     let start = angle - step * 0.5 + visual_gap;
                     let end = angle + step * 0.5 - visual_gap;
-                    let highlighted = selected_outer == Some(i) && choice.enabled();
+                    let highlighted = selected_ring == Some(i) && choice.enabled();
                     let fill = if highlighted {
                         egui::Color32::from_rgba_unmultiplied(38, 94, 151, 242)
                     } else if choice.enabled() {
@@ -323,8 +374,8 @@ impl App {
                     } else {
                         egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
                     };
-                    paint_annular_sector(painter, center, inner, outer, start, end, fill);
-                    paint_arc(painter, center, outer, start, end,
+                    paint_annular_sector(painter, center, inner, ring_outer, start, end, fill);
+                    paint_arc(painter, center, ring_outer, start, end,
                         egui::Stroke::new(1.5, if highlighted { theme::ACCENT } else { theme::LINE_STRONG }));
                     paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE));
                     let color = if highlighted { egui::Color32::WHITE }
@@ -364,15 +415,25 @@ impl App {
             let fg = if highlighted { egui::Color32::WHITE }
                 else if dimmed || !choice.enabled() { theme::TEXT_DISABLED }
                 else { theme::TEXT };
-            let anchor = center + egui::vec2(angle.cos(), angle.sin()) * (ring_inner + ring_outer) * 0.5;
-            painter.text(anchor, egui::Align2::CENTER_CENTER, &*choice.label,
-                egui::FontId::proportional(if outer < 220.0 { 9.0 } else { 11.0 }), fg);
+            let label_radius = (ring_inner + ring_outer) * 0.5;
+            let size = emote_font_size(painter, &choice.label, (ring_outer - ring_inner - 12.0).max(12.0));
+            paint_radial_label(painter, center, angle, label_radius, &choice.label, size, fg);
         }
 
         painter.circle_filled(center, ring_inner - 3.0, theme::CHROME);
         painter.circle_stroke(center, ring_inner - 2.0, egui::Stroke::new(1.0, theme::LINE_STRONG));
         painter.text(center, egui::Align2::CENTER_CENTER, "EMOTE",
             egui::FontId::proportional(if outer > 300.0 { 15.0 } else { 10.0 }), theme::TEXT);
+
+        let heading = match chosen_category {
+            Some(EmoteCategory::Library) => "LIBRARY / CATEGORIES".to_owned(),
+            Some(EmoteCategory::LibraryCategory(index)) => self.emote_wheel.categories.get(index)
+                .map(|c| format!("LIBRARY / {}", c.name.to_uppercase())).unwrap_or_default(),
+            Some(EmoteCategory::Favorites) => "FAVORITES".to_owned(),
+            _ => String::new(),
+        };
+        painter.text(center - egui::vec2(0.0, outer + 18.0), egui::Align2::CENTER_CENTER,
+            heading, egui::FontId::proportional(12.0), theme::TEXT);
 
         // Full selected command below the rings assists reading tiny slices.
         let footer = if let (Some(_category), Some(items), Some(index)) =
@@ -405,7 +466,7 @@ mod tests {
     #[test]
     fn no_navigation_sectors_and_complete_standard_catalogs() {
         assert_eq!(categories().len(), 4);
-        assert_eq!(categories()[3].action, Action::Disabled);
+        assert_eq!(categories()[3].action, Action::Category(EmoteCategory::Favorites));
         assert_eq!(standard_catalog(ServerMod::Japlus).len(), 29);
         assert_eq!(standard_catalog(ServerMod::Japro).len(), 32);
         assert!(standard_catalog(ServerMod::Base).is_empty());
@@ -428,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn library_tier_lists_starred_emotes_or_says_why_it_is_empty() {
+    fn favorites_tier_lists_starred_emotes_or_says_why_it_is_empty() {
         let empty = library_entries(Err("STAR EMOTES IN PROFILE"));
         assert_eq!(empty.len(), 1);
         assert!(!empty[0].enabled());
@@ -437,7 +498,16 @@ mod tests {
         let tier = library_entries(Ok(emotes));
         assert_eq!(tier[0].label, "FLOSS");
         assert_eq!(tier[0].action, Action::Emote("EID_Floss".into()));
-        assert_eq!(entries(EmoteCategory::Library, ServerMod::Base, &tier).len(), 1);
+        assert_eq!(entries(EmoteCategory::Favorites, ServerMod::Base, &tier).len(), 1);
+    }
+
+    #[test]
+    fn library_back_returns_through_each_layer() {
+        assert_eq!(EmoteCategory::LibraryCategory(2).parent(), Some(EmoteCategory::Library));
+        assert_eq!(EmoteCategory::Library.parent(), None);
+        assert_eq!(EmoteCategory::Favorites.parent(), None);
+        assert_eq!(EmoteCategory::Taunts.parent(), None);
+        assert_eq!(EmoteCategory::Standard.parent(), None);
     }
 
     #[test]

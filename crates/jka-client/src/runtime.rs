@@ -55,6 +55,8 @@ pub struct WorldShaderPrograms {
     pub active: u8,
     /// General, specialized, mode-2 minimal, shared, generated.
     pub binds: [u32; 5],
+    /// A requested world variant is still compiling in the background.
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone)]

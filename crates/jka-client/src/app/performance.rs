@@ -26,10 +26,64 @@ impl App {
             gpu_ms: Vec::new(),
             world_program_binds: (0, 0),
             world_shader_programs: Default::default(),
+            ready_mode: None,
         });
     }
 
+    /// `waitshadermode <mode> [timeout=120]`: hold the command buffer until the
+    /// renderer reports `mode` both requested and active with no world variant
+    /// still compiling, so scripted measurements never sample a compile.
+    pub(in crate::app) fn begin_shader_mode_wait(&mut self, arguments: &[&str]) {
+        let mode = arguments.first().and_then(|text| text.parse::<u8>().ok()).filter(|mode| *mode <= 4);
+        let timeout = arguments.get(1).map_or(Some(120.0), |text| text.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+        let (Some(mode), Some(timeout)) = (mode, timeout) else {
+            self.push_console_line("usage: waitshadermode <0-4> [timeout_seconds]".to_owned());
+            return;
+        };
+        self.perf_sample = Some(PerfSample {
+            label: format!("mode{mode}"),
+            started: Instant::now(),
+            duration: Duration::from_secs_f64(timeout),
+            skipped_first: false,
+            fps: Vec::new(),
+            frame_ms: Vec::new(),
+            gpu_ms: Vec::new(),
+            world_program_binds: (0, 0),
+            world_shader_programs: Default::default(),
+            ready_mode: Some(mode),
+        });
+    }
+
+    fn finish_shader_mode_wait(&mut self, stats: &RenderStats) {
+        let Some(sample) = self.perf_sample.as_mut() else { return; };
+        let Some(mode) = sample.ready_mode else { return; };
+        // The first stats window can predate the cvar reaching the renderer.
+        if !sample.skipped_first {
+            sample.skipped_first = true;
+            return;
+        }
+        let programs = stats.world_shader_programs;
+        let ready = programs.requested == mode && programs.active == mode && !programs.pending;
+        let elapsed = sample.started.elapsed();
+        if !ready && elapsed < sample.duration {
+            return;
+        }
+        self.perf_sample = None;
+        self.push_console_line(format!(
+            "[JKA SHADER MODE {}] mode={mode} requested={} active={} pending={} waited_ms={:.0} binds[general={} specialized={} minimal={} shared={} generated={}]",
+            if ready { "READY" } else { "TIMEOUT" },
+            programs.requested, programs.active, programs.pending,
+            elapsed.as_secs_f64() * 1000.0,
+            programs.binds[0], programs.binds[1], programs.binds[2], programs.binds[3], programs.binds[4],
+        ));
+    }
+
     pub(in crate::app) fn accumulate_perf_sample(&mut self, stats: &RenderStats) {
+        if self.perf_sample.as_ref().is_some_and(|sample| sample.ready_mode.is_some()) {
+            self.finish_shader_mode_wait(stats);
+            return;
+        }
         let Some(sample) = self.perf_sample.as_mut() else {
             return;
         };

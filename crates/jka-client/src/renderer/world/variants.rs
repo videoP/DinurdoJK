@@ -192,8 +192,10 @@ impl MaterialFragmentKey {
     /// reads in shade_surface and its helpers (bsp_lean.wgsl / bsp.wgsl).
     fn relevant_bits(variant: WorldShaderVariantKey, alpha_test: bool) -> (u32, u32, bool) {
         // Always live: implicit lightmap multiply, rgbGen/alphaGen vertex and
-        // one-minus-vertex, rgbGen/alphaGen wave, legacy sRGB additive output.
+        // one-minus-vertex, rgbGen/alphaGen wave, legacy sRGB additive output,
+        // and the explicit $lightmap stage's opaque-alpha override.
         let mut keep = MATERIAL_FLAG_IMPLICIT_LIGHTMAP
+            | MATERIAL_FLAG_EXPLICIT_LIGHTMAP
             | MATERIAL_FLAGS_VERTEX_COLOR
             | MATERIAL_FLAGS_WAVES
             | MATERIAL_FLAG_LEGACY_SRGB;

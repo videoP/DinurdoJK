@@ -329,6 +329,7 @@ pub struct App {
     profile_studio_head_look: [f32; 2],
     /// Animated JKA-space anchors: head, face, back, hands, fitted breast/glute centers.
     profile_studio_world_anchors: [Option<[f32; 3]>; 7],
+    profile_body_highlight: Option<String>,
     /// Stage-anchored cosmetic chooser (0 closed, jaPRO groups 1..=3).
     profile_studio_cosmetic_group: u8,
     profile_studio_show_saber: bool,
@@ -504,9 +505,6 @@ pub struct App {
     vote_menu: egui_pages::VoteMenuState,
     live_input: crate::net::LiveInput,
     emote_net_rx: crate::emote_net::Receiver,
-    /// Candidate remote starts, for the separate Fortnite animation runtime.
-    /// A caller must validate the ID against the installed catalog first.
-    pub(crate) remote_emote_starts: VecDeque<crate::emote_net::RemoteEmoteStart>,
     /// Lowercased `+command` kbuttons currently held (IN_KeyDown state).
     live_buttons: HashSet<String>,
     /// Per-button input sources, mirroring OpenJK/TaystJK kbutton_t::down[].

@@ -46,7 +46,16 @@ fn rt_local_sample_count(light: PointLight) -> u32 {
     return select(1u, rt_sample_count(), finite_transient);
 }
 
+fn rt_emitter_seed(input: VertexOut) -> u32 {
+    let pixel = vec2<u32>(max(input.clip_position.xy, vec2<f32>(0.0)));
+    return (pixel.x + pixel.y * max(lighting_settings.values.z, 1u)) ^ (camera.render_flags.w * 3266489917u);
+}
+
 fn rt_sample_local_emitter(light: PointLight, input: VertexOut, light_index: u32, sample_index: u32, sample_count: u32) -> PointLight {
+    return rt_sample_local_emitter_seed(light, input, light_index, sample_index, sample_count, rt_emitter_seed(input));
+}
+
+fn rt_sample_local_emitter_seed(light: PointLight, input: VertexOut, light_index: u32, sample_index: u32, sample_count: u32, seed: u32) -> PointLight {
     // Negative emitter.w also encodes authored q3map angle attenuation, while
     // shadow.z is q3map extra_distance for static lights. shadow.w distinguishes
     // runtime transients, for which emitter.w<0 is a line and shadow.z is the
@@ -63,9 +72,7 @@ fn rt_sample_local_emitter(light: PointLight, input: VertexOut, light_index: u32
     // so distance, BRDF and visibility agree. With one sample this changes every
     // frame and converges through the existing temporal RT path; 2/4 samples
     // reduce noise at proportionally higher shadow-ray cost.
-    let pixel = vec2<u32>(max(input.clip_position.xy, vec2<f32>(0.0)));
-    let width = max(lighting_settings.values.z, 1u);
-    var rng = (pixel.x + pixel.y * width) ^ (light_index * 2246822519u) ^ (camera.render_flags.w * 3266489917u);
+    var rng = seed ^ (light_index * 2246822519u);
     rng ^= sample_index * 668265263u;
 
     var sampled = light;

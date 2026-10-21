@@ -114,9 +114,32 @@ no bundle has to exist on disk before it is played.
 djk-fnemote pack-library base/emotes my-native-assets.pk3 out/library.pk3
 # rewrite a directory of bundles smaller, without resampling poses or re-encoding audio
 djk-fnemote compact-library base/emotes out/emotes-compact
+# losslessly rebase shipping body poses into a local-transform pool, preserving
+# other members and choosing the original bundle whenever it is smaller
+djk-fnemote pool-poses fnemotes-v12.pk3 fnemotes-v13-posepool.pk3
 ```
 
 Personal files such as `favorites.json` are never packed.
+
+### Opaque color texture conversion
+
+The texture audit uses Pillow to inspect actual alpha pixels and material roles.
+Its optional overlay converts only opaque 8-bit color PNGs that become smaller
+at JPEG quality 85, with 4:4:4 chroma sampling. Transparent PNGs, normal/data maps
+and effects textures retain their original bytes. JPEG RGB values are lossy;
+decoded alpha remains exactly 255. Updated shader/index paths explicitly select
+the new JPEGs, including when the original PK3 remains mounted.
+
+```powershell
+python scripts/audit-emote-textures.py source.pk3 audit.json --quality 85 --overlay textures.partial.zip
+cargo run -p jka-emotes --example repack_textures --profile fast -- source.pk3 textures.partial.zip audit.json fresh-output.pk3
+python scripts/verify-emote-textures.py source.pk3 fresh-output.pk3 audit.json
+```
+
+The merger copies all untouched ZIP payloads without recompression. Verification
+compares those compressed bytes, decodes every JPEG to check dimensions and exact
+alpha, and checks standalone asset references for obsolete PNG paths. Both output
+archives must be fresh paths; the source is never overwritten.
 
 ## Scope
 

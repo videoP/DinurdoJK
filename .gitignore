@@ -4,6 +4,7 @@
 /.ocean-work/
 /.codex/
 *.zip
+!/crates/jka-assets/src/body_shape/anny/anny_targets.zip
 /tools/
 /docs/
 /artifacts/

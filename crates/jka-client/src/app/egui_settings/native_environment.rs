@@ -56,16 +56,6 @@ fn sky_slider(ui: &mut egui::Ui, label: &str, tip: &str, value: &mut f32, defaul
     });
     changed
 }
-fn sky_switch(ui: &mut egui::Ui, label: &str, tip: &str, value: &mut bool) -> bool {
-    let mut changed = false;
-    theme::row(ui, label, tip, theme::Reset::None, |ui| {
-        if let Some(on) = theme::switch(ui, *value) {
-            *value = on;
-            changed = true;
-        }
-    });
-    changed
-}
 /// A slider that stays locked (padlock closed, slider greyed) until unlocked, like
 /// the linked ocean controls. `unlocked` is shared by every row using one padlock state.
 #[allow(clippy::too_many_arguments)]
@@ -221,8 +211,7 @@ impl App {
         changed |= sky_slider(ui, "Mie directionality", "How tightly the aureole hugs the sun. Higher is a smaller, brighter halo.", &mut s.mie_g, d.mie_g, 0.0, 0.95);
         changed |= sky_slider(ui, "Multiple scattering", "Light scattered more than once; brightens the sky away from the sun.", &mut s.multiple, d.multiple, 0.0, 3.0);
         changed |= sky_slider(ui, "Night sky brightness", "Dims the dome's flat night glow only (1 is upstream). Stars, the Milky Way and the world's night light are unchanged.", &mut s.night_sky, d.night_sky, 0.0, 1.0);
-        changed |= sky_switch(ui, "Sky world lighting (approximate)", "Use the native sky's ambient and celestial light on opaque terrain/models. Baked lighting cannot be separated exactly; dark regions are preserved but this is not a replacement for baked indoor/GI lighting.", &mut s.world_lighting);
-        changed |= sky_switch(ui, "Native highlight mapping", "Use upstream AgX, sky-referenced eye adaptation and night readability. Limits daylight glare, preserves dusk/night exposure, and gently lifts nearby world shadows at night. Applies while native sky or clouds are selected.", &mut s.filmic);
+        changed |= sky_slider(ui, "World lighting", "How much of the Blue Water sky's ambient and sun/moon light is applied over the map's baked lighting. 0 leaves the baked lighting alone. The baked light cannot be separated exactly, so this scales it rather than relighting it; dark regions are preserved but it is no replacement for baked indoor/GI lighting. Cloud shadows are a separate toggle on the Clouds page.", &mut s.world_lighting, d.world_lighting, 0.0, 1.0);
         if changed {
             self.commit_sky_environment(s);
         }

@@ -56,6 +56,33 @@ fn upstream_coast_raster_respects_water_level_roofs_and_unknown_columns() {
     assert_eq!(bank[0],5.,"brush-free triangle terrain above water must provide land shelter");
 }
 
+/// The Gerstner ocean's contact field: what upstream's two depth cameras see within 10 units of the water at z = 0.
+#[test]
+fn contact_band_keeps_solids_crossing_the_water_and_ignores_decks_and_seabeds() {
+    let geometry = Geometry {
+        solids: vec![
+            // A wall through the water, a pier deck clear above it, a seabed well below it.
+            box_solid([0., -100., -50.], [4., 100., 50.]),
+            box_solid([10., -100., 4.], [14., 100., 6.]),
+            box_solid([20., -100., -100.], [24., 100., -30.]),
+        ],
+        triangles: vec![Triangle {
+            points: [[30., -100., 2.], [40., -100., 2.], [30., 100., 2.]],
+            normal: [0., 0., 1.],
+            bounds: [[30., -100.], [40., 100.]],
+        }],
+        liquids: vec![],
+    };
+    let spans = geometry.contact_band([-1., 0.], [42, 1], 1., 0., 10.).unwrap();
+    let at = |x: f32| spans[(x + 1.) as usize];
+    assert_eq!(at(-1.), [-10., 10.], "open water has no contact");
+    assert_eq!(at(2.), [10., -10.], "a wall through the water is clipped to the band");
+    assert_eq!(at(12.), [6., 4.], "a deck above the water keeps its own underside");
+    assert_eq!(at(22.), [-10., 10.], "a seabed below the band is not contact");
+    assert_eq!(at(31.), [2., 2.], "triangle terrain inside the band is a surface");
+    assert!(geometry.contact_band([0., 0.], [0, 1], 1., 0., 10.).is_err());
+}
+
 fn large_pool_tiles() -> Vec<Region> {
     let footprint = rectangle([0.0, 0.0], [2048.0, 2048.0]);
     (0..8)

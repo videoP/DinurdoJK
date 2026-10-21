@@ -16,7 +16,9 @@ mod compose;
 mod console;
 mod demo;
 mod frametime_graph;
-pub(crate) use frametime_graph::build_frame_time_graph_vertices;
+pub(crate) use frametime_graph::{build_frame_time_graph_vertices, FrameGraphSummary};
+mod tile_cost;
+pub(crate) use tile_cost::{build_tile_cost_vertices, TileCostView};
 mod diagnostics;
 mod geometry;
 mod hud;
@@ -95,7 +97,7 @@ pub use settings::rendering::{
     ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
     DofMode, DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
-    FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode,
+    FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, InlineTransformMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
     TextureFilter, VsyncMode, ENV_ROW_BAKED_SUN_REMOVAL, ENV_ROW_ENTITY_SUN_LIGHTING, ENV_ROW_GRASS, ENV_ROW_OCEAN,
     ENV_ROW_OCEAN_SETTINGS, ENV_ROW_SUN_COLOR, ENV_ROW_SUN_INTENSITY, ENV_ROW_SUN_PITCH,

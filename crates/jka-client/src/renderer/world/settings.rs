@@ -836,6 +836,7 @@ impl Renderer {
             if let Some(world) = &mut self.world {
                 world.pipeline_variants.insert(key, variant);
                 world.active_pipeline_variant = key;
+                world.refresh_pso_slots();
                 self.world_variant_pending = None;
                 rverbose!(1, "World lighting shaders active (compiled): {}", key.short_label());
                 rverbose!(
@@ -867,6 +868,7 @@ impl Renderer {
             )
         }).unwrap_or_default();
         let device = self.device.clone();
+        let lean_shader = self.world_shader_lean.clone();
         let queued =
             self.pipeline_jobs
                 .request_with_cancel(job_key, "specialized BSP world variant", move |cancel| {
@@ -874,6 +876,7 @@ impl Renderer {
                         &device,
                         &layout,
                         &shader,
+                        &lean_shader,
                         scene_format,
                         samples,
                         key,

@@ -79,7 +79,7 @@ impl App {
                 self.emote_wheel.categories.push(Category{id:format!("category-{n}"),name:format!("Category {n}")});changed=true;
             }
             if changed{self.save_emote_favorites();}
-            ui.small("Hold the wheel key and click a category. Release over an emote to play; right-click to go back.");
+            ui.small("Hold the wheel key and click a category. Click an emote to play; right-click to go back. Releasing the key cancels.");
         });
     }
 

@@ -51,6 +51,7 @@ struct SkinDraw {
     jiggle1: vec4<f32>,
     jiggle2: vec4<f32>,
     jiggle3: vec4<f32>,
+    jiggle4: vec4<f32>,
     // Source 1 $phong: boost, exponent, $rimlightboost, $rimlightexponent.
     // A zero boost means the term is off.
     source_phong: vec4<f32>,
@@ -180,6 +181,7 @@ fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
         case 1u: { return draw.jiggle1.xyz; }
         case 2u: { return draw.jiggle2.xyz; }
         case 3u: { return draw.jiggle3.xyz; }
+        case 4u: { return draw.jiggle4.xyz; }
         default: { return vec3<f32>(0.0); }
     }
 }
@@ -221,7 +223,7 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         input.weight_count,
         draw.params.x,
     );
-    if (input.jiggle_weight > 0.0 && input.jiggle_region < 4u) {
+    if (input.jiggle_weight > 0.0 && input.jiggle_region < 5u) {
         let jiggle_weight = jiggle_effective_weight(draw, input.jiggle_weight, input.jiggle_coord);
         model_position += jiggle_offset(draw, input.jiggle_region) * jiggle_weight;
     }

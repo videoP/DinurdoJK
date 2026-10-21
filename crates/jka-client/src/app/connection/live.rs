@@ -7,7 +7,8 @@ use crate::app::{
 impl App {
     pub(in crate::app) fn reset_remote_emotes(&mut self) {
         self.emote_net_rx.reset();
-        self.remote_emote_starts.clear();
+        crate::emotes::network::reset();
+        crate::emotes::stop_world();
     }
 
     pub(in crate::app) fn connect_to_server(&mut self, target: &str) {
@@ -176,6 +177,7 @@ impl App {
             let buttons = crate::net::CommandButtons {
                 active: if playing { &self.live_buttons } else { &empty },
                 forced_moveup: playing && self.japro_flipkick_moveup,
+                idrive: self.network.idrive,
                 any_key: playing && (!self.keys.is_empty() || !self.mouse_buttons_down.is_empty()),
                 // jaPRO CL_CmdButtons: `Key_GetCatcher() || (unfocused &&
                 // cl_chatBubbleUnfocused)`, then `cl_chatBubbleSelf`.
@@ -194,6 +196,10 @@ impl App {
                 .expect("checked above")
                 .session()
                 .server_time();
+            let emote_anims = self.predictor.committed()
+                .or_else(|| self.game_session.as_ref()?.current_snapshot.as_ref().map(|s| &s.player_state))
+                .map(|ps| (ps.field_i32("torsoAnim").unwrap_or(-1), ps.field_i32("legsAnim").unwrap_or(-1)))
+                .unwrap_or((-1, -1));
             if self.network.command_pacing {
                 // Race physics steps by the gap between usercmds, so stamp them on an exact
                 // cl.serverTime cadence (a stock client at com_maxfps 125 sends 8 ms gaps).
@@ -231,6 +237,9 @@ impl App {
                     }
                     self.next_command_time = Some(next);
                     let cmd = self.live_input.create_cmd(&buttons);
+                    if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
+                        self.live_input.queue_emote_stop();
+                    }
                     net.session_mut().create_command_at(cmd, stamp);
                 }
             } else {
@@ -247,6 +256,9 @@ impl App {
                         _ => now,
                     });
                     let cmd = self.live_input.create_cmd(&buttons);
+                    if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
+                        self.live_input.queue_emote_stop();
+                    }
                     let net = self.net.as_mut().expect("checked above");
                     net.session_mut().create_command(cmd);
                 }
@@ -369,18 +381,12 @@ impl App {
             SessionEvent::Snapshot(snapshot) => {
                 if self.game_session.as_ref().is_some_and(|session| session.live) {
                     if self.emote_net_rx.needs_reset(&snapshot) {
-                        self.remote_emote_starts.clear();
+                        crate::emotes::network::reset();
                     }
                     let own_client = self.net.as_ref().map(|net| net.session().client_num()).unwrap_or(-1);
-                    for found in self.emote_net_rx.on_snapshot(&snapshot, own_client) {
-                        devprintln!(1,
-                            "[DJK EMOTE NET] client={} id={} serverTime={} candidate (catalog validation required)",
-                            found.client_num, found.emote_id, found.server_time);
-                        if self.remote_emote_starts.len() >= 64 {
-                            self.remote_emote_starts.pop_front();
-                        }
-                        self.remote_emote_starts.push_back(found);
-                    }
+                    let starts = self.emote_net_rx.on_snapshot(&snapshot, own_client);
+                    let catalog = crate::emotes::catalog(&self.base).unwrap_or_default();
+                    crate::emotes::network::on_snapshot(&snapshot, own_client, &starts, &catalog);
                 }
                 if let Some(session) = self.game_session.as_mut().filter(|session| session.live) {
                     if session.live_snapshots.len() >= 128 {

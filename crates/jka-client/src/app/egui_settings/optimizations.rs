@@ -20,6 +20,7 @@ pub(in crate::app) const OPTIMIZATION_CVARS: &[(&str, &str, &str)] = &[
     ("r_gpuDriven", "0", "0"),
     ("r_hizOcclusion", "0", "0"),
     ("r_ghoul2Skinning", "gpu", "cpu"),
+    ("r_inlineTransform", "gpu", "cpu"),
     ("r_ghoul2BatchDraws", "1", "0"),
     ("r_staticMd3Instances", "0", "0"),
     ("r_ghoul2EarlyCull", "1", "0"),
@@ -439,6 +440,22 @@ impl App {
             self.change_video_setting(next as i32 - current as i32);
         }
 
+        const INLINE_TRANSFORMS: [(ui::InlineTransformMode, &str); 3] = [
+            (ui::InlineTransformMode::Cpu, "CPU"),
+            (ui::InlineTransformMode::CpuWorkers, "CPU workers"),
+            (ui::InlineTransformMode::Gpu, "GPU"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Inline mover transforms",
+            "Moves BSP objects such as boats, doors and platforms. GPU, the default, transforms vertices with compute. CPU is the reference. CPU workers splits large meshes across worker threads before uploading them. Applies immediately; collision and gameplay use the same poses in every mode.",
+            theme::Reset::None,
+            self.video.inline_transform_mode,
+            &INLINE_TRANSFORMS,
+        ) {
+            let _ = self.set_console_cvar("r_inlineTransform", target.config_value());
+        }
+
         const GHOUL2_BATCHING: [(Ghoul2BatchMode, &str); 3] = [
             (Ghoul2BatchMode::Off, "Off"),
             (Ghoul2BatchMode::Adaptive, "Adaptive"),
@@ -632,11 +649,21 @@ impl App {
                     }
                 }
             });
-            theme::row(ui, "Curvature-adaptive geometry A/B", "Native/Hybrid experiment. Estimates wave-surface angular bending and simplifies complete clipmap rings plus their central fill on calm, long-wave water. Preserves stitched edges; Off restores original LOD behavior. Per-ring adaptation; no per-patch geomorph.", theme::Reset::None, |ui| {
-                if theme::chip(ui, "Off", !ocean.adaptive_mesh).clicked() { ocean.adaptive_mesh = false; changed = true; }
-                if theme::chip(ui, "On", ocean.adaptive_mesh).clicked() { ocean.adaptive_mesh = true; changed = true; }
+            theme::row(ui, "Adaptive ocean geometry", "0 original mesh; 1 conservative whole-ring curvature LOD; 2 experimental per-tile wave-curvature LOD with GPU vertex geomorph and stitched edges. All modes preserve screen-space LOD.", theme::Reset::None, |ui| {
+                for (mode, title) in [(0, "Off"), (1, "Rings"), (2, "Local")] {
+                    if theme::chip(ui, title, ocean.adaptive_mesh == mode).clicked() {
+                        ocean.adaptive_mesh = mode; changed = true;
+                    }
+                }
             });
-            theme::row(ui, "Screen-space mesh LOD", "Native/Hybrid only. Preserves the nearest three drawn rings at original density; progressively decimates outer-ring interiors at shallow elevation angles. Boundary vertices remain stitched; wireframe and triangle counts show the reduction. Default Off.", theme::Reset::None, |ui| {
+            theme::row(ui, "Local mesh tolerance", "Mode 2 only: scales the allowed projected and normal geometry error. Higher = fewer triangles, potentially more visible geometric error. 1x retains the original thresholds.", theme::Reset::None, |ui| {
+                for (tolerance, title) in [(0.5, "0.5x"), (1.0, "1x"), (2.0, "2x"), (4.0, "4x"), (8.0, "8x"), (16.0, "16x")] {
+                    if theme::chip(ui, title, ocean.adaptive_mesh_tolerance == tolerance).clicked() {
+                        ocean.adaptive_mesh_tolerance = tolerance; changed = true;
+                    }
+                }
+            });
+            theme::row(ui, "Screen-space mesh LOD", "Native/Hybrid only. Decimates outer-ring interiors at shallow elevation angles; the nearest three rings are protected when curvature-adaptive mesh is Off. With adaptive mesh On, combines with curvature LOD instead of being overridden. Boundary vertices stay stitched. Default Off.", theme::Reset::None, |ui| {
                 for (threshold, name) in [(0.0, "Off"), (1.0, "1px"), (2.0, "2px"), (4.0, "4px"), (8.0, "8px")] {
                     if theme::chip(ui, name, ocean.screen_lod_pixels == threshold).clicked() {
                         ocean.screen_lod_pixels = threshold;
@@ -644,8 +671,8 @@ impl App {
                     }
                 }
             });
-            theme::row(ui, "Expensive pixel detail", "Native/Hybrid: render the original material on real 1/2 or 1/4 resolution targets, then depth-aware upscale against full-resolution wave geometry. Far modes blend to full-quality shading near the camera; this is not hardware VRS.", theme::Reset::None, |ui| {
-                for (mode, name) in [(0, "Full"), (1, "2x2"), (2, "4x4"), (3, "Far 2x2"), (4, "Far 4x4")] {
+            theme::row(ui, "Expensive pixel detail", "Native/Hybrid: render the original material on real 1/2 or 1/4 resolution targets, then depth-aware upscale against full-resolution wave geometry. Far modes blend to full-quality shading near the camera. Adaptive 2x2 shades full resolution only where the 2x2 image would visibly differ (edges, crests, glints, foam lace); this is not hardware VRS.", theme::Reset::None, |ui| {
+                for (mode, name) in [(0, "Full"), (1, "2x2"), (2, "4x4"), (3, "Far 2x2"), (4, "Far 4x4"), (5, "Adaptive 2x2")] {
                     if theme::chip(ui, name, ocean.pixel_detail_mode == mode).clicked() {
                         ocean.pixel_detail_mode = mode;
                         changed = true;
@@ -658,6 +685,16 @@ impl App {
                     let readout = format!("{distance:.0} m");
                     if theme::slider_default(ui, &mut distance, 1.0..=1000.0, &readout, d.pixel_detail_distance) {
                         ocean.pixel_detail_distance = distance;
+                        changed = true;
+                    }
+                });
+            }
+            if ocean.pixel_detail_mode == 5 {
+                theme::row(ui, "Adaptive contrast", "How much the coarse image may bend across a 2x2 block before that block gets full shading. Lower = more full-resolution blocks: closer to Full, slower.", theme::Reset::None, |ui| {
+                    let mut contrast = ocean.pixel_detail_contrast;
+                    let readout = format!("{:.1} %", contrast * 100.0);
+                    if theme::slider_default(ui, &mut contrast, 0.001..=0.2, &readout, d.pixel_detail_contrast) {
+                        ocean.pixel_detail_contrast = contrast;
                         changed = true;
                     }
                 });

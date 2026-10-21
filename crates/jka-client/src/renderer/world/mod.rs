@@ -7,6 +7,7 @@ pub(in crate::renderer) mod geometry;
 pub(in crate::renderer) mod patch_lod;
 pub(in crate::renderer) mod bsp_model_lod;
 pub(in crate::renderer) mod inline_models;
+pub(in crate::renderer) mod inline_transform;
 pub(in crate::renderer) mod lifecycle;
 pub(in crate::renderer) mod material_remap;
 pub(in crate::renderer) mod pipelines;

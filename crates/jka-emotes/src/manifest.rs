@@ -3,6 +3,8 @@ use serde_json::Value;
 #[derive(Clone, Debug)]
 pub struct Emote {
     pub id: String,
+    /// Source identity, preserved when the UI groups/renames catalogue rows.
+    pub network_key: String,
     pub label: String,
     pub catalog_parent: Option<String>,
     pub shared_montage_alias: bool,
@@ -322,6 +324,7 @@ pub fn parse_manifest(root: &Value) -> Result<Vec<Emote>, String> {
             }
         }
         out.push(Emote {
+            network_key: format!("{}\t{}", id.to_ascii_lowercase(), row["variant_name"].as_str().unwrap_or("Default").to_ascii_lowercase()),
             id,
             label,
             catalog_parent: row["catalog_parent"].as_str().map(str::to_owned),

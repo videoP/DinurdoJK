@@ -70,6 +70,8 @@ impl PlayerPresenter {
         self.vehicle_snaps.clear();
         self.vehicle_animations.clear();
         self.profile_bone_smooth_history = None;
+        self.profile_body_pick = None;
+        self.profile_selection = Default::default();
         self.force_grip_targets.clear();
         self.force_gripped_entities.clear();
         self.pending_impulse_ragdolls.clear();
@@ -258,6 +260,8 @@ impl PlayerPresenter {
             logged_first_draw: false,
             skinning_mode: Ghoul2SkinningMode::Gpu,
             preview_cpu_remesh: false,
+            profile_body_pick: None,
+            profile_selection: Default::default(),
             early_frustum_cull: true,
             rt_shadow_casters_enabled: false,
             collision_world: None,

@@ -238,6 +238,14 @@ pub struct AudioSettings {
     pub voice_volume: f32,
     pub music_volume: f32,
     pub emote_music_volume: f32,
+    pub variometer: bool,
+    pub variometer_style: u8,
+    pub variometer_input: u8,
+    /// Strafe-angle input: degrees from the optimal angle that stay silent.
+    pub variometer_dead_zone: f32,
+    /// Strafe-angle input: sensitivity multiplier (1 = full range 15 degrees past the dead zone).
+    pub variometer_scale: f32,
+    pub variometer_volume: f32,
     pub separation: f32,
     pub mute_when_unfocused: bool,
     /// Master gate for Valve Steam Audio integration. Off preserves the legacy
@@ -262,6 +270,12 @@ impl Default for AudioSettings {
             voice_volume: 1.0,
             music_volume: 0.25,
             emote_music_volume: 0.5,
+            variometer: false,
+            variometer_style: 0,
+            variometer_input: 0,
+            variometer_dead_zone: 0.5,
+            variometer_scale: 1.0,
+            variometer_volume: 0.35,
             separation: 0.5,
             mute_when_unfocused: true,
             steam_audio: false,
@@ -1232,6 +1246,10 @@ mod tests {
         let path = dir.join("test.cfg");
         let audio = AudioSettings {
             effects_volume: 0.375,
+            variometer: true,
+            variometer_style: 1,
+            variometer_input: 1,
+            variometer_volume: 0.425,
             voice_volume: 0.625,
             music_volume: 0.125,
             separation: 0.75,
@@ -1272,6 +1290,10 @@ mod tests {
 
         assert_eq!(loaded, audio);
         assert!(text.contains("seta s_volume \"0.375\""));
+        assert!(text.contains("seta s_variometer \"1\""));
+        assert!(text.contains("seta s_variometerStyle \"1\""));
+        assert!(text.contains("seta s_variometerInput \"1\""));
+        assert!(text.contains("seta s_variometerVolume \"0.425\""));
         assert!(text.contains("seta s_volumeVoice \"0.625\""));
         assert!(text.contains("seta s_musicvolume \"0.125\""));
         assert!(text.contains("seta s_separation \"0.750\""));
@@ -1340,7 +1362,7 @@ mod tests {
         for samples in [1, 2, 4] {
             let mut settings = VideoSettings::default();
             settings.rt_samples = samples;
-            settings.rt_half_resolution = samples != 1;
+            settings.rt_trace_rate = samples;
             save_video_settings(
                 &path,
                 settings,
@@ -1351,24 +1373,31 @@ mod tests {
             .unwrap();
             assert_eq!(load_video_settings(&path).rt_samples, samples);
             assert_eq!(
-                load_video_settings(&path).rt_half_resolution,
-                samples != 1
+                load_video_settings(&path).rt_trace_rate,
+                samples
             );
         }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("r_rtTraceRate"));
+        assert!(!text.contains("r_rtResolution"));
         for value in ["0", "3", "999", "-1", "NaN"] {
             std::fs::write(&path, format!("seta r_rtSamples \"{value}\"\n")).unwrap();
             assert_eq!(load_video_settings(&path).rt_samples, 1);
         }
-        for (value, half) in [
-            ("full", false),
-            ("half", true),
-            ("1", false),
-            ("0.5", true),
-            ("0.25", false),
-            ("invalid", false),
+        for value in ["0", "3", "-1", "0.5", "NaN"] {
+            std::fs::write(&path, format!("seta r_rtTraceRate \"{value}\"\n")).unwrap();
+            assert_eq!(load_video_settings(&path).rt_trace_rate, 1);
+        }
+        for (value, rate) in [
+            ("full", 1),
+            ("half", 4),
+            ("1", 1),
+            ("0.5", 4),
+            ("0.25", 1),
+            ("invalid", 1),
         ] {
             std::fs::write(&path, format!("seta r_rtResolution \"{value}\"\n")).unwrap();
-            assert_eq!(load_video_settings(&path).rt_half_resolution, half);
+            assert_eq!(load_video_settings(&path).rt_trace_rate, rate);
         }
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();

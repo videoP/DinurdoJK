@@ -1,4 +1,5 @@
 use jka_assets::ghoul2::{multiply_3x4, Matrix3x4, OPENJK_GHOUL2_ROOT_MATRIX};
+pub mod pooled;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Interpolation {
@@ -87,6 +88,9 @@ impl PoseClip {
         &self.matrices
     }
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.starts_with(b"DJKPOSE4") {
+            return pooled::decode(bytes);
+        }
         if bytes.len() < 16 || !matches!(&bytes[..8], b"DJKPOSE1" | b"DJKPOSE2" | b"DJKPOSE3") {
             return Err("invalid baked pose header".into());
         }

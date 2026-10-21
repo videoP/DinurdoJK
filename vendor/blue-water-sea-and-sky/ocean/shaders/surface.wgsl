@@ -243,7 +243,60 @@ fn vertex(input: VertexIn) -> VertexOut {
         spacing = reach * max(surface.fan.y, surface.detail.w * reach);
     }
     let offset = displacement(grid, spacing);
-    let world = vec3<f32>(grid.x + offset.x, offset.y + wake_height(grid), grid.y + offset.z);
+    var world = vec3<f32>(grid.x + offset.x, offset.y + wake_height(grid), grid.y + offset.z);
+    // The JKA local-tile mesh encodes a coarse-parent stride and transition
+    // weight in the otherwise-unused (non-horizon) vertex spacing channel.
+    // Reconstruct the *displaced* coarse triangle on the GPU, then move an
+    // inserted fine vertex onto it before the fine triangles appear. Reverse
+    // the interpolation before collapsing fine indices. Clipmap ring geomorph
+    // above remains unchanged, and tile seams share identical parent samples.
+    if !horizon && !fan && input.level.y >= 1028.0 {
+        let packed = input.level.y - 1024.0;
+        let parent_step = floor(packed * 0.5);
+        let coarse = clamp(packed - parent_step * 2.0, 0.0, 1.0);
+        let base = floor((lattice + segments * 0.5) / parent_step) * parent_step
+            - segments * 0.5;
+        let uv = clamp((lattice - base) / parent_step, vec2<f32>(0.0), vec2<f32>(1.0));
+        var a = vec2<f32>(0.0);
+        var b = vec2<f32>(0.0);
+        var wc = 0.0;
+        var wa = 0.0;
+        var wb = 0.0;
+        if uv.y <= uv.x && uv.y <= 1.0 - uv.x {
+            a = base; b = base + vec2<f32>(parent_step, 0.0);
+            wc = 2.0 * uv.y; wa = 1.0 - uv.x - uv.y; wb = uv.x - uv.y;
+        } else if uv.y >= uv.x && uv.y >= 1.0 - uv.x {
+            a = base + vec2<f32>(parent_step, parent_step);
+            b = base + vec2<f32>(0.0, parent_step);
+            wc = 2.0 * (1.0 - uv.y);
+            wa = uv.x + uv.y - 1.0; wb = uv.y - uv.x;
+        } else if uv.x <= uv.y {
+            a = base + vec2<f32>(0.0, parent_step); b = base;
+            wc = 2.0 * uv.x; wa = uv.y - uv.x; wb = 1.0 - uv.x - uv.y;
+        } else {
+            a = base + vec2<f32>(parent_step, 0.0);
+            b = base + vec2<f32>(parent_step, parent_step);
+            wc = 2.0 * (1.0 - uv.x);
+            wa = uv.x - uv.y; wb = uv.x + uv.y - 1.0;
+        }
+        // Use the same base-grid snap and native ring geomorph for each parent
+        // vertex. Sampling displacement at each *parent* point avoids the
+        // pop from simply sliding an already-displaced fine vertex sideways.
+        let shift = select(vec2<f32>(0.0), (finer.xy - frame.xy) * frame.w, inner);
+        let ia = a + shift;
+        let ib = b + shift;
+        let ic = base + vec2<f32>(parent_step * 0.5) + shift;
+        let pa = frame.xy + ia * cell - glsl_mod(ia, 2.0) * morph * cell;
+        let pb = frame.xy + ib * cell - glsl_mod(ib, 2.0) * morph * cell;
+        let pc = frame.xy + ic * cell - glsl_mod(ic, 2.0) * morph * cell;
+        let da = displacement(pa, spacing);
+        let db = displacement(pb, spacing);
+        let dc = displacement(pc, spacing);
+        let coarse_world = (vec3<f32>(pa.x + da.x, da.y + wake_height(pa), pa.y + da.z) * wa
+            + vec3<f32>(pb.x + db.x, db.y + wake_height(pb), pb.y + db.z) * wb
+            + vec3<f32>(pc.x + dc.x, dc.y + wake_height(pc), pc.y + dc.z) * wc);
+        world = mix(world, coarse_world, coarse);
+    }
     var output: VertexOut;
     output.clip = world_to_clip(world);
     if (horizon || fan) && camera.curvature > 0.0 {

@@ -250,6 +250,8 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         "rt_sample_count",
         "rt_local_sample_count",
         "rt_sample_local_emitter",
+        "rt_emitter_seed",
+        "rt_sample_local_emitter_seed",
         "rt_alpha_repeat_coord",
         "rt_rgba_texel",
         "rt_sample_rgba",
@@ -307,6 +309,10 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         }
         source = source.replace(from, to);
     }
+    source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+    source.push_str(include_str!("../../rt_local_rate_surface.wgsl"));
+    source.push_str(include_str!("../../rt_local_rate_read.wgsl"));
+    source.push_str(declaration(&donor, "fn rt_rate_local_shadow_rgb(")?);
     source.push_str(&rt_sampled_light_loops(
         &include_str!("../../rt_model_lighting.wgsl").replace("\r\n", "\n"),
     )?);
@@ -491,6 +497,8 @@ var<private> lighting_settings: Settings;
             "rt_sample_count",
             "rt_local_sample_count",
             "rt_sample_local_emitter",
+            "rt_emitter_seed",
+            "rt_sample_local_emitter_seed",
         ] {
             source.push_str(declaration(&donor, &format!("fn {name}(")).unwrap());
             source.push('\n');

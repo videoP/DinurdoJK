@@ -214,12 +214,45 @@ impl App {
                 },
             );
         });
+        // Sky-referenced reads the Blue Water sky, so it only exists under that sky.
+        // The filmic flag is kept while the JKA sky is shown (so switching back
+        // restores it), which is why the mode is derived rather than stored.
+        let sky_ok = self.video.sky_backend == 1;
+        let exposure_mode: u8 = if sky_ok && self.video.blue_water_environment.filmic {
+            2
+        } else if self.video.auto_exposure > 0.0 {
+            1
+        } else {
+            0
+        };
+        let mut picked: Option<u8> = None;
+        theme::row(
+            ui,
+            "Auto exposure mode",
+            "Off keeps exposure fixed. Balanced meters the whole image toward 18% grey (needs HDR and tone mapping) and lifts dark scenes toward daylight. Sky-referenced is the Blue Water eye: it meters against the sky's own brightness, closes on glare, stays dark at night, and brings AgX tone mapping and a night-readability lift with it. Sky-referenced needs the Blue Water sky.",
+            theme::Reset::None,
+            |ui| {
+                for (mode, name) in [(0u8, "Off"), (1, "Balanced"), (2, "Sky-referenced")] {
+                    let enabled = mode != 2 || sky_ok;
+                    let clicked = ui
+                        .add_enabled_ui(enabled, |ui| theme::chip(ui, name, exposure_mode == mode).clicked())
+                        .inner;
+                    if clicked && exposure_mode != mode {
+                        picked = Some(mode);
+                    }
+                    ui.add_space(3.0);
+                }
+            },
+        );
+        if let Some(mode) = picked {
+            self.set_auto_exposure_mode(mode);
+        }
         ui.add_enabled_ui(
-            (self.video.hdr_mode() != 0) && self.video.tone_mapping > 0.0,
+            (self.video.hdr_mode() != 0) && self.video.tone_mapping > 0.0 && exposure_mode != 2,
             |ui| {
                 theme::row(
                     ui,
-                    "Auto exposure",
+                    "Balanced strength",
                     "Amount of adaptive exposure correction. 0% disables metering; 100% keeps the original response speed and range.",
                     theme::Reset::Video(ui::VIDEO_ROW_AUTO_EXPOSURE),
                     |ui| {

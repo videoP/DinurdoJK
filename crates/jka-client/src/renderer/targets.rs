@@ -5,7 +5,6 @@ use crate::renderer::{
     CloudRenderResolution, Duration, Instant, DEPTH_FORMAT,
 };
 
-
 pub(in crate::renderer) struct AuthoredGlowTarget {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,
@@ -45,12 +44,71 @@ pub(in crate::renderer) struct MenuBackdropResources {
 }
 
 impl RenderTargets {
+    pub(in crate::renderer) fn memory_categories(&self) -> [(&'static str, u64); 6] {
+        use crate::renderer::diagnostics::memory::texture_bytes as bytes;
+        let scene = bytes(&self._scene_texture)
+            + bytes(&self._depth_texture)
+            + self._msaa_texture.as_ref().map_or(0, bytes);
+        let post = self.authored_glow.as_ref().map_or(0, |target| {
+            bytes(&target._texture) + target._msaa_texture.as_ref().map_or(0, bytes)
+        }) + self
+            .bloom
+            .as_ref()
+            .map_or(0, |target| target._textures.iter().map(bytes).sum())
+            + self
+                .dof
+                .as_ref()
+                .map_or(0, |target| bytes(&target._texture));
+        let temporal = self._history_textures.iter().map(bytes).sum();
+        let clouds = self._cloud_transfer_textures.iter().map(bytes).sum::<u64>()
+            + bytes(&self._cloud_march_texture);
+        let depth = bytes(&self._ao_depth_texture)
+            + bytes(&self._linear_depth_texture)
+            + bytes(&self._motion_vector_texture)
+            + bytes(&self._reflection_mask_texture)
+            + bytes(&self._hiz_texture)
+            + self._ssr_visibility_texture.as_ref().map_or(0, bytes);
+        let effects = self
+            .ssao_history
+            .as_ref()
+            .map_or(0, |target| target._textures.iter().map(bytes).sum::<u64>())
+            + self.ssr_history.as_ref().map_or(0, |target| {
+                target
+                    ._radiance_textures
+                    .iter()
+                    .chain(target._depth_textures.iter())
+                    .map(bytes)
+                    .sum::<u64>()
+            })
+            + bytes(&self._rain_haze_mask_texture);
+        [
+            ("scene/depth/MSAA", scene),
+            ("glow/bloom/DOF", post),
+            ("temporal color", temporal),
+            ("legacy clouds", clouds),
+            ("depth/motion/reflection/Hi-Z", depth),
+            ("AO/SSR/weather", effects),
+        ]
+    }
+
     pub(in crate::renderer) fn cloud_width(&self) -> u32 {
         self._cloud_march_texture.width()
     }
 
     pub(in crate::renderer) fn cloud_height(&self) -> u32 {
         self._cloud_march_texture.height()
+    }
+}
+
+impl crate::renderer::Renderer {
+    pub(in crate::renderer) fn needs_resolved_depth_target(&self) -> bool {
+        // This is also read by legacy global fog and native eye adaptation.
+        // Use settings rather than map/GPU readiness so later world loads do
+        // not need to allocate a target in the middle of a frame.
+        self.ssr_enabled
+            || self.reflection_debug_enabled
+            || self.weather.fog.mode == crate::ui::FogMode::LegacyDrawFog1
+            || (self.sky_backend == 1 && self.blue_water_environment.filmic)
     }
 }
 
@@ -223,6 +281,9 @@ pub(in crate::renderer) fn create_targets(
     enable_dof: bool,
     enable_ssao: bool,
     enable_ssr: bool,
+    enable_resolved_depth: bool,
+    enable_temporal: bool,
+    enable_clouds: bool,
     cloud_render_resolution: CloudRenderResolution,
 ) -> RenderTargets {
     let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -320,12 +381,19 @@ pub(in crate::renderer) fn create_targets(
     let dof = enable_dof.then(|| create_dof_target(device, width, height));
     let ssao_history = enable_ssao.then(|| create_temporal_ssao_history(device, width, height));
     let ssr_history = enable_ssr.then(|| create_temporal_ssr_history(device, width, height));
+    // Inactive effects still need valid sampled bindings, but no viewport-sized
+    // storage. Rebuild at full size before enabling their render passes.
+    let (history_width, history_height) = if enable_temporal {
+        (width.max(1), height.max(1))
+    } else {
+        (1, 1)
+    };
     let history_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA temporal history ping-pong"),
             size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
+                width: history_width,
+                height: history_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -340,8 +408,14 @@ pub(in crate::renderer) fn create_targets(
         history_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
     });
     let cloud_scale = cloud_render_resolution.scale().clamp(0.01, 1.0);
-    let cloud_width = ((width.max(1) as f32 * cloud_scale).round() as u32).max(1);
-    let cloud_height = ((height.max(1) as f32 * cloud_scale).round() as u32).max(1);
+    let (cloud_width, cloud_height) = if enable_clouds {
+        (
+            ((width.max(1) as f32 * cloud_scale).round() as u32).max(1),
+            ((height.max(1) as f32 * cloud_scale).round() as u32).max(1),
+        )
+    } else {
+        (1, 1)
+    };
     let cloud_transfer_textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA volumetric cloud transfer ping-pong"),
@@ -426,24 +500,25 @@ pub(in crate::renderer) fn create_targets(
     });
     let reflection_mask_view =
         reflection_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    // Full-resolution resolved final scene depth used only by SSR. The linear-depth
-    // prepass carries BSP and depth-writing entities; this one-channel float target
-    // additionally captures main-pass-only depth writers (grass, promoted ocean) so
-    // SSR can reject reflections under them. Fog reads linear depth directly.
-    let ssr_visibility_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("JKA resolved final scene depth"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    }));
+    // Resolved final scene depth for SSR, legacy global fog and native metering.
+    // Unlike the linear-depth prepass, it also includes main-pass-only depth
+    // writers (grass, promoted ocean). Other fog modes read linear depth.
+    let ssr_visibility_texture = enable_resolved_depth.then(|| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA resolved final scene depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
     let ssr_visibility_view = ssr_visibility_texture
         .as_ref()
         .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));

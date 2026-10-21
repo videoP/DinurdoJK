@@ -1,6 +1,121 @@
 use super::*;
 use super::submission::mesh::append_surface_indices;
 
+#[test]
+#[ignore = "requires JKA_TEST_BASE stock PK3s"]
+fn short_emote_keeps_replaced_native_taunt_hidden_after_completion() {
+    use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+    let stock = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").unwrap());
+    crate::emotes::stop();
+    crate::emotes::network::reset();
+    let mut presenter = PlayerPresenter::new(AssetSearchPath::open(&stock).unwrap(), false).unwrap();
+    presenter.set_async_loading(false);
+    presenter.skinning_mode = Ghoul2SkinningMode::Cpu;
+    presenter.early_frustum_cull = false;
+    presenter.viewer_client = 0;
+    let info = crate::cgame::ClientInfo::solo_model("kyle/default");
+    let taunt = animation_index("BOTH_DUAL_TAUNT").unwrap() as u32;
+    let mut state = EntityState { number: 0, fields: [0; ENTITY_FIELDS.len()] };
+    for (name, value) in [("eType", ET_PLAYER as u32), ("clientNum", 0), ("weapon", WP_SABER as u32), ("torsoAnim", taunt), ("legsAnim", taunt)] {
+        state.fields[ENTITY_FIELDS.iter().position(|(key, _)| *key == name).unwrap()] = value;
+    }
+    let mut entity = PresentedEntity { number: 0, entity_type: ET_PLAYER, origin: [0.; 3], angles: [0.; 3], state };
+    // Warm the model/rig so the one-second cosmetic clip cannot expire during asset I/O.
+    presenter.present_player_entity(&entity, &info, 1000, 1., None, false, true, false, None, true).unwrap();
+    let rig = "models/players/_humanoid/_humanoid.gla";
+    presenter.load_emote_gla(rig).unwrap();
+    let emote = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[{
+        "id":"short_test", "name":"Short", "gla":rig, "first_frame":0, "end_frame":30, "fps":30
+    }]})).unwrap().remove(0);
+    crate::emotes::play_world(emote);
+    let draws = presenter.present_player_entity(&entity, &info, 1100, 1., None, false, true, false, None, false).unwrap();
+    assert!(!draws.is_empty());
+    assert!(crate::emotes::active_preview().is_some());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    for time in [2300, 2400] {
+        let draws = presenter.present_player_entity(&entity, &info, time, 1., None, false, true, false, None, false).unwrap();
+        assert!(!draws.is_empty());
+        assert!(crate::emotes::active_preview().is_none());
+        let runtime = &presenter.entities[&0];
+        let idle = animation_index("BOTH_SABERDUAL_STANCE").unwrap() as i32;
+        assert_eq!(runtime.animation.torso.animation_number, idle);
+        assert_eq!(runtime.animation.legs.animation_number, idle);
+        assert_eq!(entity.state.field_i32("torsoAnim"), Some(taunt as i32));
+        assert_eq!(entity.state.field_i32("legsAnim"), Some(taunt as i32));
+    }
+    // A fresh native taunt must still render, even with the same animation ID.
+    for name in ["torsoFlip", "legsFlip"] {
+        entity.state.fields[ENTITY_FIELDS.iter().position(|(key, _)| *key == name).unwrap()] = 1;
+    }
+    presenter.present_player_entity(&entity, &info, 2500, 1., None, false, true, false, None, false).unwrap();
+    assert_eq!(presenter.entities[&0].animation.torso.animation_number, taunt as i32);
+    crate::emotes::stop();
+    crate::emotes::network::reset();
+}
+
+#[test]
+#[ignore = "requires JKA_TEST_BASE stock PK3s and DJK_EMOTE_TEST_BASE packed library"]
+fn network_emote_renders_remote_player_without_replacing_local_playback() {
+    use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+    use jka_protocol::server::{PlayerState, Snapshot};
+    let stock = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").unwrap());
+    let base = std::path::PathBuf::from(std::env::var_os("DJK_EMOTE_TEST_BASE").unwrap());
+    crate::emotes::stop();
+    crate::emotes::refresh_catalog();
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let catalog = loop {
+        if let Ok(entries) = crate::emotes::catalog(&base) { break entries; }
+        assert!(Instant::now() < deadline, "catalogue timeout");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let emote = crate::emotes::network::resolve(&catalog, 876).expect("Dance Moves");
+    let mut state = EntityState { number: 1, fields: [0; ENTITY_FIELDS.len()] };
+    let mut set = |name: &str, bits: u32| {
+        state.fields[ENTITY_FIELDS.iter().position(|(key, _)| *key == name).unwrap()] = bits;
+    };
+    let stand = animation_index("BOTH_STAND1").unwrap() as u32;
+    for (name, bits) in [("eType", ET_PLAYER as u32), ("clientNum", 1), ("torsoAnim", stand), ("legsAnim", stand)] { set(name, bits); }
+    let mut snapshot = Snapshot { server_time: 100, message_num: 1, delta_num: 0, snap_flags: 0, ping: 0, server_command_num: 0, area_mask: [0;32], player_state: PlayerState::default(), vehicle_player_state: None, entities: vec![state] };
+    let mut receiver = crate::emote_net::Receiver::default();
+    receiver.on_snapshot(&snapshot, 0);
+    snapshot.server_time = 150;
+    let mut angles = [0;3];
+    assert!(crate::emote_net_codec::encode_cmd_angles(&mut angles, [0;3], 876));
+    for (name, bits) in [
+        ("torsoAnim", animation_index("BOTH_ENGAGETAUNT").unwrap() as u32),
+        ("apos.trBase[0]", ((angles[0] as i16) as f32 * (360. / 65536.)).to_bits()),
+        ("apos.trBase[1]", ((angles[1] as i16) as f32 * (360. / 65536.)).to_bits()),
+    ] {
+        snapshot.entities[0].fields[ENTITY_FIELDS.iter().position(|(key,_)| *key == name).unwrap()] = bits;
+    }
+    let starts = receiver.on_snapshot(&snapshot, 0);
+    assert_eq!(starts.len(), 1);
+    crate::emotes::network::on_snapshot(&snapshot, 0, &starts, &catalog);
+    crate::emotes::network::set_render_time(650);
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    let active = loop {
+        let _ = crate::emotes::network::poll_audio();
+        if let Some(active) = crate::emotes::network::player_preview(1, 0, 650) { break active; }
+        assert!(Instant::now() < deadline, "remote preparation timeout");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(active.emote.network_key, emote.network_key);
+    assert_eq!(active.elapsed_ms, 500);
+    assert!(active.emote.pose.is_some());
+    assert!(crate::emotes::active_preview().is_none());
+    let mut presenter = PlayerPresenter::new(AssetSearchPath::open(&stock).unwrap(), false).unwrap();
+    presenter.set_async_loading(false);
+    presenter.skinning_mode = Ghoul2SkinningMode::Cpu;
+    presenter.early_frustum_cull = false;
+    presenter.viewer_client = 0;
+    let info = crate::cgame::ClientInfo::solo_model("kyle/default");
+    let entity = PresentedEntity { number: 1, entity_type: ET_PLAYER, origin: [0.;3], angles: [0.;3], state: snapshot.entities.remove(0) };
+    let draws = presenter.present_player_entity(&entity, &info, 650, 1., None, false, true, false, None, true).unwrap();
+    assert!(draws.iter().any(|s| !s.vertices.is_empty()));
+    assert!(draws.iter().flat_map(|s| s.vertices.iter()).flat_map(|v| v.position).all(f32::is_finite));
+    crate::emotes::network::reset();
+}
+
 
 /// `Oktiefighter.dm_26`: on mount the local playerState transmits eFlags=264
 /// (EF_NODRAW | EF_TELEPORT_BIT) and m_iVehicleNum=112. It has no packet

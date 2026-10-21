@@ -32,6 +32,8 @@ pub use native_waves::BlueWaterWaves;
 mod original_surface;
 pub mod coastal;
 pub mod upstream_coast;
+pub mod gerstner_contact;
+mod gerstner_patterns;
 mod lakes;
 pub use lakes::LakeSettings;
 pub mod sky_extend;
@@ -78,6 +80,21 @@ const PROMOTED_CLIPMAP_MIN_HALF_CELLS: i32 = 32;
 const PROMOTED_CLIPMAP_CELL_QUANTUM: i32 = 8;
 const PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE: f32 = 64.0;
 
+/// Capture-only CPU timings for native ocean mesh preparation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeMeshCpuStats {
+    /// Entire native surface preparation, inclusive of mesh build/upload.
+    pub prepare_ms: f64,
+    /// CPU geometry generation and admission queries; excludes buffer uploads.
+    pub build_ms: f64,
+    /// CPU buffer growth and write_buffer calls, not GPU transfer completion.
+    pub upload_ms: f64,
+    pub rebuilds: u32,
+    pub vertices: u64,
+    pub indices: u64,
+    pub upload_bytes: u64,
+}
+
 /// Per-frame ocean submission counters.
 ///
 /// These exist because the ocean's cost does not scale with how much water is
@@ -88,6 +105,7 @@ const PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE: f32 = 64.0;
 /// much of the PVS set the per-surface claim collapsed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OceanDrawStats {
+    pub native_cpu: NativeMeshCpuStats,
     /// CPU footprint queries/index regeneration, including work before acquire.
     pub topology_ms: f64,
     /// Promoted surfaces the loaded world carries, visible or not.
@@ -1113,25 +1131,30 @@ fn mask_triangle_contains(t: MaskTriangle, p: [f32; 2]) -> bool {
         || e.iter().all(|&v| v <= MASK_TOLERANCE)
 }
 
-fn tile_inside_triangle(t: MaskTriangle, lo: [f32; 2], hi: [f32; 2]) -> bool {
-    let corners = [lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]];
-    // Require one consistent winding branch for all four corners. Each branch
-    // is an intersection of half-planes, hence contains the complete tile.
-    let edges = corners.map(|p| mask_triangle_edges(t, p));
-    edges.iter().all(|e| e.iter().all(|&v| v >= -MASK_TOLERANCE))
-        || edges.iter().all(|e| e.iter().all(|&v| v <= MASK_TOLERANCE))
-}
-
 fn set_mask_tile(words: &mut [u32], tile: usize, code: u32) {
     let bit = tile * 2;
     words[bit / 32] |= code << (bit % 32);
 }
 
+/// A tile the outline (the triangles' union boundary) does not reach, even
+/// grown by the mask tolerance, lies wholly on one side of it: inside or
+/// outside by its centre. Only tiles the coastline crosses keep the triangle
+/// test. Asking whether one triangle holds the whole tile instead left every
+/// tile across two triangles' shared edge a boundary tile.
 fn build_mask_tiles<const AXIS: usize, const WORDS: usize>(
     triangles: &[MaskTriangle],
     minimum: [f32; 2],
     maximum: [f32; 2],
 ) -> [u32; WORDS] {
+    // An exact duplicate would hide its edges from `outline_boundary`.
+    let key = |p: [f32; 2]| ((p[0] * 8.0).round() as i32, (p[1] * 8.0).round() as i32);
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<MaskTriangle> = triangles.iter().copied().filter(|t| {
+        let mut corners = t.map(key);
+        corners.sort_unstable();
+        seen.insert(corners)
+    }).collect();
+    let outline = outline_boundary(&unique);
     let size = [maximum[0] - minimum[0], maximum[1] - minimum[1]];
     let mut tiles = [0u32; WORDS];
     for y in 0..AXIS {
@@ -1144,20 +1167,15 @@ fn build_mask_tiles<const AXIS: usize, const WORDS: usize>(
                 minimum[0] + size[0] * (x + 1) as f32 / AXIS as f32,
                 minimum[1] + size[1] * (y + 1) as f32 / AXIS as f32,
             ];
-            let overlaps = |t: &MaskTriangle| {
-                (0..2).all(|axis| {
-                    let tri_lo = t.iter().map(|p| p[axis]).fold(f32::INFINITY, f32::min);
-                    let tri_hi = t.iter().map(|p| p[axis]).fold(f32::NEG_INFINITY, f32::max);
-                    tri_hi + MASK_TOLERANCE >= lo[axis]
-                        && tri_lo - MASK_TOLERANCE <= hi[axis]
-                })
-            };
-            let code = if !triangles.iter().any(overlaps) {
-                MASK_TILE_OUTSIDE
-            } else if triangles.iter().any(|&t| tile_inside_triangle(t, lo, hi)) {
+            let grown_lo = [lo[0] - MASK_TOLERANCE, lo[1] - MASK_TOLERANCE];
+            let grown_hi = [hi[0] + MASK_TOLERANCE, hi[1] + MASK_TOLERANCE];
+            let centre = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+            let code = if outline.iter().any(|&edge| segment_touches_rect(edge, grown_lo, grown_hi)) {
+                MASK_TILE_BOUNDARY
+            } else if unique.iter().any(|&t| mask_triangle_contains(t, centre)) {
                 MASK_TILE_INSIDE
             } else {
-                MASK_TILE_BOUNDARY
+                MASK_TILE_OUTSIDE
             };
             set_mask_tile(&mut tiles, y * AXIS + x, code);
         }
@@ -1479,22 +1497,63 @@ pub struct OceanSettings {
     pub screen_lod_pixels: f32,
     /// A/B: simplify the centre and rings according to estimated wave
     /// curvature/projected geometry error. Does not change FFT resolution.
-    pub adaptive_mesh: bool,
+    pub adaptive_mesh: u8,
+    /// Mode 2 only: larger values allow coarser local tessellation (1 = original).
+    pub adaptive_mesh_tolerance: f32,
     /// Debug-only native LOD counters, computed against identical PVS-pruned full mesh.
     pub adaptive_mesh_debug: bool,
     /// Diagnostic native/Hybrid expensive pixel shading rate:
     /// 0 full; 1=2x2; 2=4x4; 3=distance-aware 2x2; 4=distance-aware 4x4;
-    /// 5=cheap approximation at all pixels (all preserve full-res depth).
+    /// 5=adaptive 2x2: full shading only on blocks the 2x2 shading cannot reconstruct
+    /// (all preserve full-res depth).
     pub pixel_detail_mode: u8,
+    /// `r_oceanCostProbe`: Blue Water surface feature stubs (`shader_composer::COST_PROBE_*`) for per-feature GPU
+    /// cost A/B. Not archived; 0 is the real shader.
+    pub surface_cost_probe: u32,
+    /// `r_oceanSkipFadedCascades`: lossless A/B, a pixel skips the field reads of a cascade that has fully faded.
+    pub skip_faded_cascades: bool,
+    /// `r_oceanWaveStatistics`: lossy A/B. 1: where a pixel's long side has averaged a wave cascade, its slopes are
+    /// drawn as their spectral statistics and its derivative reads skipped (Bruneton 2010); 2: also its foam spread.
+    pub wave_statistics: u8,
+    /// `r_blueWaterSSRTiles`: upstream's reflection tile table, so rays whose screen box holds only sky skip the march
+    /// (lossless). Off binds the zeroed table that traces every ray.
+    pub blue_water_ssr_tiles: bool,
+    /// `r_oceanOpticsReceiverOnly`: with Godot receiver caustics the only capture reader, write just the receiver
+    /// output (image-identical). Off runs the full capture (A/B).
+    pub optics_receiver_only: bool,
+    /// `r_oceanFarShader`: 0 off; 1 the default far-water stubs (`FAR_SHADER_DEFAULT`); above 1 an explicit
+    /// `shader_composer` stub mask. Water past the sky walls is drawn with that slimmer shader (A/B, lossy).
+    pub far_shader: u32,
     /// Distance in metres where the distance-aware sparse experiment starts.
     pub pixel_detail_distance: f32,
+    /// `r_oceanPixelContrast`: mode 5's luminance-curvature share above which a 2x2 block gets full shading.
+    pub pixel_detail_contrast: f32,
+    /// `r_oceanPixelDebug`: mode 5 tints its full-shaded blocks by reason (not archived).
+    pub pixel_detail_debug: bool,
     pub blue_water_waves: BlueWaterWaves,
     /// Hybrid-only: 1 = original Blue Water FFT, 0 = authored Gerstner swell.
     /// Independent of Godot's authored.slosh; Native backend ignores this setting.
     pub hybrid_fft_blend: f32,
+    /// A/B: 0 original; 1 compression limit; 2 bounded spilling crests.
+    pub hybrid_breaker: u8,
     /// Separate authored swell for Hybrid; never changes Godot map-authored
     /// waves, their amplitude links, or Blue Water's simulation parameters.
     pub hybrid_swell: OceanAuthoring,
+    /// `r_oceanType 5` (backend 2 + this): Hybrid with godot-water-shader's
+    /// waves, surface colour and persistent foam (vendor/godot-water-shader)
+    /// in place of the FFT displacement, water body and foam. Blue Water lights it.
+    pub gerstner_water: bool,
+    /// `r_gerstnerWaveScale`: the upstream sea this many times larger (Froude-similar).
+    pub gerstner_wave_scale: f32,
+    /// `r_gerstnerFoam` bits: persistent foam cascades 1 near (15 m), 2 far (30 m); 4 distant (per-pixel
+    /// compression foam past the cascades).
+    pub gerstner_foam: u8,
+    /// `r_gerstnerFoamRate`: persistent foam steps per second per cascade (staggered); 0 every frame, as upstream.
+    pub gerstner_foam_rate: f32,
+    /// `r_gerstnerWaterColor`: upstream's water `color` (sRGB 0..1; FoamScene 0, 55, 65).
+    pub gerstner_water_color: [f32; 3],
+    /// `r_gerstnerCrestColor`: the colour crests blend toward (sRGB 0..1; upstream's linear 0, 0.08, 0.02).
+    pub gerstner_crest_color: [f32; 3],
     pub blue_water_optics: BlueWaterOptics,
     /// Blue Water scene-bending refraction; independent of legacy optics.
     pub blue_water_refraction: f32,
@@ -1617,12 +1676,22 @@ impl Default for OceanSettings {
             blue_water_coast_shelter: false,
             surface_pixels: true,
             screen_lod_pixels: 0.0,
-            adaptive_mesh: false,
+            adaptive_mesh: 0,
+            adaptive_mesh_tolerance: 1.0,
             adaptive_mesh_debug: false,
             pixel_detail_mode: 0,
+            surface_cost_probe: 0,
+            skip_faded_cascades: false,
+            wave_statistics: 0,
+            blue_water_ssr_tiles: true,
+            optics_receiver_only: true,
+            far_shader: 0,
             pixel_detail_distance: 100.0,
+            pixel_detail_contrast: 0.1,
+            pixel_detail_debug: false,
             blue_water_waves: BlueWaterWaves::default(),
             hybrid_fft_blend: 1.0,
+            hybrid_breaker: 0,
             hybrid_swell: OceanAuthoring::default(),
             blue_water_optics: BlueWaterOptics::default(),
             blue_water_refraction: 0.1,
@@ -1648,6 +1717,12 @@ impl Default for OceanSettings {
             hybrid_caustics_scale: 3.0,
             hybrid_caustics_gain: 1.5,
             hybrid_caustics_fast: false,
+            gerstner_water: false,
+            gerstner_wave_scale: 1.0,
+            gerstner_foam: 7,
+            gerstner_foam_rate: 60.0,
+            gerstner_water_color: GERSTNER_WATER_COLOR,
+            gerstner_crest_color: GERSTNER_CREST_COLOR,
             blue_water_ssr_steps: 16,
             blue_wake: 0,
             spindrift: 0,
@@ -1754,6 +1829,11 @@ impl OceanSettings {
             self.optics.transparency = optics::Settings::default().transparency * self.lake.transparency;
             self.optics.fog_color = if self.lake.salt { [0.18,0.35,0.34] } else { [0.16,0.25,0.12] };
         } else if self.backend == 2 {
+            if self.gerstner_water {
+                // Its waves have no FFT component and no crest limiter (`hybrid_swell_uniform`).
+                self.hybrid_breaker = 0;
+                self.hybrid_fft_blend = 0.0;
+            }
             self.blue_water_refraction_mode = self.hybrid_refraction_mode;
             self.blue_water_caustics_mode = self.hybrid_caustics_mode;
             self.blue_water_underwater_mode = self.hybrid_underwater_mode;
@@ -1780,14 +1860,27 @@ impl OceanSettings {
         self
     }
 
+    /// `r_oceanType 5`: Hybrid with godot-water-shader's waves and surface.
+    pub fn gerstner_active(&self) -> bool {
+        self.backend == 2 && self.gerstner_water
+    }
+
     pub fn sanitize(mut self) -> Self {
         self.backend = self.backend.min(3);
+        self.hybrid_breaker = self.hybrid_breaker.min(2);
         self.lake = self.lake.sanitize();
         self.blue_water_waves = self.blue_water_waves.sanitize();
         self.hybrid_fft_blend = if self.hybrid_fft_blend.is_finite() {
             self.hybrid_fft_blend.clamp(0.0, 1.0)
         } else { 1.0 };
         self.hybrid_swell = self.hybrid_swell.sanitize();
+        self.gerstner_wave_scale = if self.gerstner_wave_scale.is_finite() {
+            self.gerstner_wave_scale.clamp(0.1, 20.0)
+        } else { 1.0 };
+        self.gerstner_foam = self.gerstner_foam.min(7);
+        self.gerstner_foam_rate = if self.gerstner_foam_rate.is_finite() {
+            self.gerstner_foam_rate.clamp(0.0, 60.0)
+        } else { 60.0 };
         self.blue_water_optics = self.blue_water_optics.sanitize();
         self.blue_water_refraction = if self.blue_water_refraction.is_finite() {
             self.blue_water_refraction.clamp(0.0, 0.15)
@@ -1812,6 +1905,8 @@ impl OceanSettings {
         for (color, fallback) in [
             (&mut self.hybrid_fog_color, optics::Settings::default().fog_color),
             (&mut self.hybrid_water_color, BlueWaterOptics::default().water_color),
+            (&mut self.gerstner_water_color, GERSTNER_WATER_COLOR),
+            (&mut self.gerstner_crest_color, GERSTNER_CREST_COLOR),
         ] {
             for (value, default) in color.iter_mut().zip(fallback) {
                 *value = bounded(*value, default, 0.0, 1.0);
@@ -1956,6 +2051,26 @@ pub struct OceanRenderUniform {
     pub appearance_c: [f32; 4], // x visual fixes, y spatial-LOD ready, z near cell spacing, w analytic far radius
     /// Hybrid: x = vertical lift of the Godot mesh near the camera (metres), y = active.
     pub hybrid_eye: [f32; 4],
+    /// Submerged Hybrid only: Blue Water's clipmap frames for `vs_ocean_native`.
+    pub native_mesh: NativeOceanMesh,
+    /// `OceanMasks::prune_tiles`: the outline's 2-bit 32x32 classification, 16 vec4 per slot.
+    pub mask_fine_tiles: [[u32; 4]; OCEAN_FINE_TILE_VEC4S * OCEAN_MAX_SURFACES],
+}
+
+const OCEAN_FINE_TILE_VEC4S: usize = OCEAN_PRUNE_TILE_WORDS / 4;
+
+/// Submerged Hybrid draws Blue Water's own clipmap mesh with the Godot world
+/// shader (`vs_ocean_native` in bsp.wgsl). This is that pool's upstream
+/// `Surface` prefix the vertex stage needs to place it exactly as Blue Water does.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct NativeOceanMesh {
+    /// Per level: snapped centre x, z (m), cell (m), 1 / cell.
+    pub frames: [[f32; 4]; 10],
+    /// Segments, levels, clipmap centre x, z (m).
+    pub clipmap: [f32; 4],
+    /// Finest level drawn, its morph, plane height (units), mask slot.
+    pub detail: [f32; 4],
 }
 
 struct PromotedRenderSurface {
@@ -1992,11 +2107,15 @@ pub struct OceanGpu {
     lakes: Option<lakes::LakeRenderer>,
     /// Lazily created: only Hybrid classification asks for the real eye-wave height.
     eye_wave: Option<eye_wave::EyeWaveProbe>,
+    /// `r_oceanType 5`'s intersection-foam contact fields, once their worker has built them.
+    gerstner_contact: Option<gerstner_contact::ContactFields>,
     sky_extend_enabled: bool,
     sky_infinite_enabled: bool,
     sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
     promoted_centres: [Option<[f32; 2]>; OCEAN_MAX_SURFACES],
     promoted_far_radii: [Option<f32>; OCEAN_MAX_SURFACES],
+    /// Per pool while its submerged Hybrid surface is the native mesh.
+    native_meshes: [Option<NativeOceanMesh>; OCEAN_MAX_SURFACES],
     pub coastal: Option<coastal::Gpu>,
     coastal_render: std::sync::Arc<coastal::RenderResources>,
     coastal_key: Option<(usize, u8, bool, u32, u32)>,
@@ -2451,12 +2570,12 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, lakes:None, eye_wave:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, lakes:None, eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
             interaction_splash_uniform: interaction.splash_uniform.clone(),
-            coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES], promoted_far_radii: [None;OCEAN_MAX_SURFACES] };
+            coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES], promoted_far_radii: [None;OCEAN_MAX_SURFACES], native_meshes: [None;OCEAN_MAX_SURFACES] };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         if settings.backend == 0 {
@@ -2475,8 +2594,18 @@ impl OceanGpu {
         if let Some(blue)=self.blue_water.as_mut() {blue.set_shore(device,queue,maps,self.settings.blue_water_coast_shelter);}
     }
 
+    /// `r_oceanType 5`'s contact fields (`upstream_coast::Source::request_contact`); `None` until they are built.
+    pub(crate) fn set_gerstner_contact(&mut self, fields: Option<gerstner_contact::ContactFields>) {
+        self.gerstner_contact = fields;
+    }
+
 
     pub fn set_time(&mut self, seconds: f32) {
+        // Screenshot A/Bs already freeze the render clock with this variable.
+        // The render-thread scene clock must not advance the ocean behind it.
+        static FIXED_TIME: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let seconds = FIXED_TIME.get_or_init(|| std::env::var("JKA_FIXED_SHADER_TIME")
+            .ok()?.parse::<f32>().ok().filter(|v| v.is_finite())).unwrap_or(seconds);
         if !seconds.is_finite() { return; }
         if (seconds - self.elapsed).abs() > 0.05 {
             self.elapsed = seconds;
@@ -2510,6 +2639,11 @@ impl OceanGpu {
         uniform.mask_ranges = self.masks.ranges;
         uniform.mask_bounds = self.masks.bounds;
         uniform.mask_tiles = self.masks.tiles;
+        for (slot, words) in self.masks.prune_tiles.iter().enumerate() {
+            for (index, chunk) in words.chunks_exact(4).enumerate() {
+                uniform.mask_fine_tiles[slot * OCEAN_FINE_TILE_VEC4S + index].copy_from_slice(chunk);
+            }
+        }
         uniform.mask_triangles[..self.masks.triangles.len()].copy_from_slice(&self.masks.triangles);
         queue.write_buffer(&self.render_buffer,0,bytemuck::bytes_of(&uniform));
         for surface in &self.promoted_surfaces {
@@ -2517,6 +2651,9 @@ impl OceanGpu {
                 &surface.descriptor, surface.manual, self.promoted_surfaces.len());
             if let Some(centre)=self.promoted_centres[surface.descriptor.index] {
                 local.clipmap[0]=centre[0];local.clipmap[1]=centre[1];
+            }
+            if let Some(mesh)=self.native_meshes[surface.descriptor.index] {
+                local.native_mesh=mesh;
             }
             // Keep clipmap.z as the geometric lattice spacing. Store Phase 2's
             // analytic exterior radius in the reserved appearance_c.w slot.
@@ -3069,6 +3206,8 @@ impl OceanGpu {
         const NATIVE_PROBE_SPACING_METRES: f32 = 0.5;
         let native = probe.has_native().then(|| eye_wave::NativeProbeInput {
             swell: hybrid_swell_uniform(settings, self.elapsed),
+            breaker_mode: if settings.backend == 2 { settings.hybrid_breaker } else { 0 },
+            godot: gerstner_uniform(settings, self.elapsed, [0.0; 4])[0],
             waves_group: blue.waves(slot).group(&blue.field),
             eye_xz_metres: [eye[0] / OCEAN_UNITS_PER_METER, eye[2] / OCEAN_UNITS_PER_METER],
             spacing_metres: NATIVE_PROBE_SPACING_METRES,
@@ -3091,7 +3230,8 @@ impl OceanGpu {
         if let Some(blue) = &mut self.blue_water {
             blue.adapter_enabled = self.settings.blue_water_adapter;
             blue.encode(queue, encoder, delta, self.settings.updates_per_second, self.settings.blue_water_waves,
-                hybrid_swell_uniform(&self.settings,self.elapsed+delta.max(0.0)));
+                hybrid_swell_uniform(&self.settings,self.elapsed+delta.max(0.0)),
+                if self.settings.backend == 2 { self.settings.hybrid_breaker } else { 0 });
             self.elapsed += delta.max(0.0);
             self.write_render_uniform(queue);
             return;
@@ -3269,7 +3409,9 @@ fn linear_color(rgb:[f32;3])->[f32;4] { [srgb_channel_to_linear(rgb[0]),srgb_cha
 /// xy: travel direction, z: radians/metre, w: amplitude in metres.
 /// xyzw motion: radians/s, horizontal displacement ratio, FFT weight, seconds.
 pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[f32; 4]; 2] {
-    let mix = if settings.backend == 2 { settings.hybrid_fft_blend.clamp(0.0, 1.0) } else { 1.0 };
+    // `r_oceanType 5` replaces both the FFT and the authored swell with its own waves.
+    let gerstner = settings.gerstner_active();
+    let mix = if gerstner { 0.0 } else if settings.backend == 2 { settings.hybrid_fft_blend.clamp(0.0, 1.0) } else { 1.0 };
     let authored = settings.hybrid_swell;
     // Travel direction follows the FFT swell direction (same angle convention).
     let angle = settings.blue_water_waves.direction.to_radians();
@@ -3285,14 +3427,55 @@ pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[
     let reference_height = *REFERENCE_WAVE_HEIGHT
         .get_or_init(|| BlueWaterWaves::default().height.max(0.001));
     let wave_height_scale = settings.blue_water_waves.height.max(0.0) / reference_height;
-    let amplitude = authored.amplitude / OCEAN_UNITS_PER_METER
-        * (1.0 - mix) * wave_height_scale;
+    let amplitude = if gerstner { 0.0 } else {
+        authored.amplitude / OCEAN_UNITS_PER_METER * (1.0 - mix) * wave_height_scale
+    };
     let horizontal = 0.9 * authored.steepness
         / (authored.amplitude * std::f32::consts::TAU / authored.wavelength).max(0.00001);
     [
         [angle.cos(), -angle.sin(), frequency, amplitude],
         [std::f32::consts::TAU * authored.speed / authored.wavelength, horizontal, mix, seconds],
     ]
+}
+
+/// godot-water-shader's water `color` as FoamScene sets it (sRGB 0, 55, 65).
+pub const GERSTNER_WATER_COLOR: [f32; 3] = [0.0, 55.0 / 255.0, 65.0 / 255.0];
+/// g_wave's crest colour, linear (0, 0.08, 0.02), as sRGB.
+pub const GERSTNER_CREST_COLOR: [f32; 3] = [0.0, 0.31330, 0.15170];
+
+/// godot-water-shader's highest crest above the plane (upstream metres; `godot_water.wgsl`'s `JKA_GODOT_CREST`).
+pub(super) const GERSTNER_CREST_METRES: f32 = 0.73;
+
+/// The analytic crest height (m) the Hybrid-family vertex stage adds to the FFT: Hybrid's authored swell, or
+/// `r_oceanType 5`'s waves at their scale.
+pub(super) fn hybrid_analytic_height(settings: &OceanSettings, seconds: f32) -> f32 {
+    if settings.gerstner_active() {
+        GERSTNER_CREST_METRES * settings.gerstner_wave_scale
+    } else {
+        hybrid_swell_uniform(settings, seconds)[0][3]
+    }
+}
+
+/// The analytic swell the adaptive mesh plans its curvature for ([direction x, z, radians/m, amplitude m]): Hybrid's
+/// authored swell, or for `r_oceanType 5` its most curved wave (the third: 0.12 m at 2 rad/m, scaled).
+pub(super) fn hybrid_mesh_swell(settings: &OceanSettings, seconds: f32) -> [f32; 4] {
+    if settings.gerstner_active() {
+        let scale = settings.gerstner_wave_scale;
+        let direction = glam::Vec2::new(0.5, 1.0).normalize();
+        [direction.x, direction.y, 2.0 / scale, 0.12 * scale]
+    } else {
+        hybrid_swell_uniform(settings, seconds)[0]
+    }
+}
+
+/// `r_oceanType 5`'s surface uniform (`hybrid_gerstner.wgsl`'s `godot`, `godot_foam` and `godot_color`): [1 on, wave
+/// scale, seconds, foam bits], the persistent foam maps' centres [near x, z, far x, z] (m) and the linear water and
+/// crest colours.
+/// All zero in other modes.
+pub(super) fn gerstner_uniform(settings: &OceanSettings, seconds: f32, foam: [f32; 4]) -> [[f32; 4]; 4] {
+    if !settings.gerstner_active() { return [[0.0; 4]; 4]; }
+    [[1.0, settings.gerstner_wave_scale, seconds, f32::from(settings.gerstner_foam)], foam,
+        linear_color(settings.gerstner_water_color), linear_color(settings.gerstner_crest_color)]
 }
 
 fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform {
@@ -3363,6 +3546,8 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         appearance_c: [settings.visual_fixes as f32, 0.0,
             if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS }, 0.0],
         hybrid_eye: [0.0; 4],
+        native_mesh: NativeOceanMesh::zeroed(),
+        mask_fine_tiles: [[0; 4]; OCEAN_FINE_TILE_VEC4S * OCEAN_MAX_SURFACES],
     };
     if settings.backend != 0 {
         // Temporary JKA surface adapter: sample Blue Water's own 1,024/181/31 m tiles.
@@ -3376,6 +3561,13 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         uniform.swell = swell[0];
         uniform.swell_motion = swell[1];
         uniform.swell_motion[2] = 1.0; // Blue Water FFT already encodes its own horizontal chop.
+        // With no FFT reads there is no adapter scale tag to sample. The
+        // analytic-only budget is known exactly on the CPU.
+        if settings.backend == 2 && settings.hybrid_breaker > 0 && swell[1][2] <= 0.0 {
+            let compression = (swell[0][3] * swell[0][2] * swell[1][1]).abs();
+            let budget = if settings.hybrid_breaker == 1 { 0.9 } else { 1.15 };
+            uniform.swell_motion[1] *= (budget / compression.max(1e-5)).min(1.0);
+        }
         uniform.surface[2] = 0.0;
         uniform.surface[3] = 0.0;
     }
@@ -3485,6 +3677,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mask_tiles_follow_the_outline_not_single_triangles() {
+        // A rectangle split along its diagonal, as BSP water faces are. No tile
+        // across the diagonal fits in one triangle, yet all lie inside the water.
+        let square: [MaskTriangle; 2] = [
+            [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]],
+            [[0.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
+        ];
+        let tiles = build_mask_tiles::<8, 4>(&square, [-50.0, -50.0], [150.0, 150.0]);
+        let code = |x: usize, y: usize| packed_tile_code(&tiles, y * 8 + x);
+        // Tiles are 25 units: 2..=5 lie inside the square, clear of its outline.
+        for y in 3..5 { for x in 3..5 { assert_eq!(code(x, y), MASK_TILE_INSIDE, "({x},{y})"); } }
+        assert_eq!(code(0, 0), MASK_TILE_OUTSIDE);
+        assert_eq!(code(7, 3), MASK_TILE_OUTSIDE);
+        // The outline itself (x = 0 and x = 100) keeps the exact triangle test.
+        assert_eq!(code(2, 4), MASK_TILE_BOUNDARY);
+        assert_eq!(code(5, 4), MASK_TILE_BOUNDARY);
+        // An exact duplicate face must not hide the outline.
+        let doubled = [square[0], square[1], square[0]];
+        assert_eq!(build_mask_tiles::<8, 4>(&doubled, [-50.0, -50.0], [150.0, 150.0]), tiles);
+    }
+
+    #[test]
     fn hybrid_gerstner_default_is_identical_to_fft_only() {
         let mut settings = OceanSettings::default();
         settings.backend = 2;
@@ -3544,6 +3758,27 @@ mod tests {
         settings.hybrid_swell.amplitude *= 1.5;
         let adjusted = hybrid_swell_uniform(&settings, 5.0);
         assert!((adjusted[0][3] - baseline[0][3] * 1.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn hybrid_breaker_analytic_only_adapter_keeps_native_budget() {
+        let mut settings = OceanSettings::default();
+        settings.backend = 2;
+        settings.hybrid_fft_blend = 0.0;
+        settings.blue_water_waves.height = 55.8;
+        settings.hybrid_swell.steepness = 0.8;
+        let raw = hybrid_swell_uniform(&settings, 0.0);
+        let original = make_render_uniform(true, &settings);
+        assert_eq!(original.swell_motion[1], raw[1][1]);
+        for (mode, budget) in [(1, 0.9), (2, 1.15)] {
+            settings.hybrid_breaker = mode;
+            let adapter = make_render_uniform(true, &settings);
+            let compression = (adapter.swell[3] * adapter.swell[2] * adapter.swell_motion[1]).abs();
+            assert!((compression - budget).abs() < 1e-5);
+            assert_eq!(adapter.swell[3], original.swell[3], "limiting must preserve vertical height");
+            assert_eq!(hybrid_swell_uniform(&settings, 0.0), raw,
+                "native mesh/probe must receive the raw swell and apply their shared GPU limiter once");
+        }
     }
 
     #[test]

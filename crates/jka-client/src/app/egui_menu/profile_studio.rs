@@ -19,6 +19,33 @@ const STUDIO_NAV: [(usize, &str); 4] = [
     (PROFILE_EMOTES, "EMOTES"),
 ];
 
+#[derive(Clone, Default)]
+struct BodyEditor { group: String, search: String }
+fn body_editor_id() -> egui::Id { egui::Id::new("studio_anny_editor") }
+
+fn studio_deformation_slider_reset(response: &egui::Response) -> bool {
+    // Match egui_theme::slider_with: Slider rails sense drag only, so read
+    // pointer double-clicks over the actual widget instead of clicked flags.
+    (response.contains_pointer() && response.ctx.input(|input|
+        input.pointer.button_double_clicked(egui::PointerButton::Primary)))
+        || response.clicked_by(egui::PointerButton::Middle)
+}
+
+fn studio_deformation_reset_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Click to restore neutral / default")
+}
+
+fn studio_anny_detail_title(name: &str) -> String {
+    match name {
+        "gender" => "Gender (Anny)".to_owned(),
+        "cupsize" => "Breast size (Anny cup size)".to_owned(),
+        "firmness" => "Breast firmness (Anny)".to_owned(),
+        _ => name.trim_end_matches("-incr").replace('-', " "),
+    }
+}
+
 fn label(ui: &mut egui::Ui, content: impl Into<String>, size: f32, color: egui::Color32) {
     ui.label(egui::RichText::new(content.into()).size(size).color(color));
 }
@@ -152,8 +179,6 @@ impl App {
         // active-variant grid above the model catalog.
         self.studio_multipart_skin(ui, &current_model, &current);
         ui.add_space(8.0);
-        self.studio_body_shape_controls(ui, &current);
-        ui.add_space(11.0);
         cap(ui, "SHOW SKINS", "");
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
@@ -168,22 +193,26 @@ impl App {
             egui::TextEdit::singleline(&mut self.profile_model_search).hint_text("Search models or skins…"));
         ui.add_space(8.0);
         let needle = self.profile_model_search.trim().to_ascii_lowercase();
-        let mut models = BTreeMap::<String, Vec<ProfileModelEntry>>::new();
+        let mut models = BTreeMap::<String, Vec<usize>>::new();
         // Filter *skins* before grouping models. A character with Original,
         // Red and RGB skins remains in the library when one category is hidden,
         // while its hover chooser shows only visible variants. TaystJK does
         // RGB discovery by skin filename, so there is no runtime shader scan.
-        for entry in &self.profile_models {
+        // Only store catalog indices here. The library can contain hundreds
+        // of skins; cloning every entry on every egui frame defeats the row
+        // virtualization below. Clone only entries for rows actually visible.
+        for (index, entry) in self.profile_models.iter().enumerate() {
             if !self.profile_studio_skin_visible[Self::studio_skin_class(entry)] {
                 continue;
             }
-            models.entry(entry.model_name.clone()).or_default().push(entry.clone());
+            models.entry(entry.model_name.clone()).or_default().push(index);
         }
         // Searching for a model leaves its complete set of *visible* variants
         // available in the hover chooser instead of silently trimming them.
         models.retain(|name, variants| {
             needle.is_empty() || name.to_ascii_lowercase().contains(&needle)
-                || variants.iter().any(|entry| {
+                || variants.iter().any(|&index| {
+                    let entry = &self.profile_models[index];
                     entry.skin_name.to_ascii_lowercase().contains(&needle)
                         || entry.value.to_ascii_lowercase().contains(&needle)
                 })
@@ -208,7 +237,11 @@ impl App {
                 for row in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for variants in model_rows.iter().skip(row * columns).take(columns) {
+                        for variant_ids in model_rows.iter().skip(row * columns).take(columns) {
+                            // The tile renderer may populate thumbnail caches,
+                            // so own only this visible cell's catalog entries.
+                            let variants: Vec<ProfileModelEntry> = variant_ids.iter()
+                                .map(|&index| self.profile_models[index].clone()).collect();
                             let parts = ["head_", "torso_", "lower_"].map(|prefix|
                                 variants.iter().find(|entry| entry.skin_name.starts_with(prefix)));
                             let multipart = parts.iter().all(Option::is_some);
@@ -219,7 +252,7 @@ impl App {
                             };
                             if self.studio_model_tile(ui, entry, tile_w,
                                 entry.model_name.eq_ignore_ascii_case(&current_model),
-                                if multipart { None } else { Some(variants) }) {
+                                if multipart { None } else { Some(variants.as_slice()) }) {
                                 selected = Some(if multipart {
                                     format!("{}/{}|{}|{}",entry.model_name,
                                         parts[0].unwrap().skin_name,
@@ -232,7 +265,7 @@ impl App {
                 }
             });
         if let Some(value) = selected {
-            self.studio_stage_model(&value);
+            self.studio_stage_model(&value, ui.ctx());
         }
     }
 
@@ -354,7 +387,7 @@ impl App {
                         }
                     });
             });
-            if let Some(value) = pick { self.studio_stage_model(&value); }
+            if let Some(value) = pick { self.studio_stage_model(&value, ui.ctx()); }
             response.clicked()
         } else {
             response.on_hover_text(format!("{} / {}", entry.model_name, entry.skin_name)).clicked()
@@ -365,10 +398,11 @@ impl App {
     /// The skin loader inserts the leading pipe for `RE_SplitSkins`.
     /// Only advertise combinations represented by genuine installed skin icons.
     fn studio_multipart_skin(&mut self, ui: &mut egui::Ui, model: &str, active: &str) {
-        let mut parts: [Vec<ProfileModelEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // Use references rather than copying every multipart skin on every UI tick.
+        let mut parts: [Vec<&ProfileModelEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for entry in self.profile_models.iter().filter(|e| e.model_name.eq_ignore_ascii_case(model)) {
             for (i, prefix) in ["head_", "torso_", "lower_"].into_iter().enumerate() {
-                if entry.skin_name.starts_with(prefix) { parts[i].push(entry.clone()); }
+                if entry.skin_name.starts_with(prefix) { parts[i].push(entry); }
             }
         }
         if parts.iter().any(Vec::is_empty) { return; }
@@ -402,7 +436,7 @@ impl App {
             });
         }
         if changed {
-            self.studio_stage_model(&format!("{model}/{}|{}|{}", selected[0],selected[1],selected[2]));
+            self.studio_stage_model(&format!("{model}/{}|{}|{}", selected[0],selected[1],selected[2]), ui.ctx());
         }
     }
 
@@ -482,7 +516,11 @@ impl App {
         }
     }
 
-    fn studio_stage_model(&mut self, value: &str) {
+    fn studio_stage_model(&mut self, value: &str, ctx: &egui::Context) {
+        // Selection refers to the old model's anatomy: start the new model
+        // in Whole body so a previous named region cannot leak across rigs.
+        ctx.data_mut(|data| data.remove::<BodyEditor>(body_editor_id()));
+        self.profile_body_highlight = None;
         self.profile_model_staged = if value.eq_ignore_ascii_case(&self.solo_client_info.model_cvar()) {
             None
         } else { Some(value.to_owned()) };
@@ -527,20 +565,21 @@ impl App {
         let (title, cvar, max, current, help) = if glute {
             ("GLUTE SIZE", "r_jiggleGluteSize", 4.0,
              self.video.jiggle_glute_size,
-             "Peak glute mass in JKA units; negative reduces. Middle-click to reset.")
+             "Peak glute mass in JKA units; negative reduces. Double-click or middle-click to reset.")
         } else {
             ("BREAST SIZE", "r_jiggleBreastSize", 3.0,
              self.video.jiggle_breast_size,
-             "Peak chest mass in JKA units; negative reduces. Middle-click to reset.")
+             "Peak chest mass in JKA units; negative reduces. Double-click or middle-click to reset.")
         };
-        label(ui, title, 10.0, SKY_SOFT);
+        let reset_label = studio_deformation_reset_label(ui, egui::RichText::new(title).size(10.0).color(SKY_SOFT));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             let mut size = current;
             let response = ui.add(egui::Slider::new(&mut size, -2.0..=max)
                 .step_by(0.10).show_value(false))
                 .on_hover_text(help);
-            if response.clicked_by(egui::PointerButton::Middle) {
+            let response = response.labelled_by(reset_label.id);
+            if reset_label.clicked() || studio_deformation_slider_reset(&response) {
                 size = 0.0;
             }
             label(ui, format!("{size:+.1} u"), 10.0, theme::TEXT);
@@ -554,25 +593,79 @@ impl App {
         });
     }
 
-    fn studio_body_shape_controls(&mut self, ui: &mut egui::Ui, current: &str) {
+    fn studio_body_shape_controls(&mut self, ui: &mut egui::Ui, current: &str, available_h: f32, stage: egui::Rect) {
+        use jka_assets::body_shape::anny::{Details, EXTRA_CONTROLS, LOCAL_CONTROLS, LOCAL_COUNT, FACIAL_CONTROLS};
         let info = crate::cgame::ClientInfo::solo_model(current);
         let available = self.asset_preview_player_presenter.as_ref()
             .is_some_and(|presenter| presenter.profile_body_shape_available(&info));
-        cap(ui, "BODY", "");
+        let mut editor = ui.ctx().data_mut(|d| d.get_temp::<BodyEditor>(body_editor_id())).unwrap_or_default();
+        cap(ui, "BODY SHAPE", if editor.group.is_empty() { "Whole body" } else { &editor.group });
+        // The two pre-existing jiggle offsets stay on the stage beside Anny,
+        // not in the model browser. Preserve per-model anchor availability.
+        let breast = self.studio_project_anchor(stage, 5).is_some();
+        let glute = self.studio_project_anchor(stage, 6).is_some();
+        if editor.group.is_empty() || editor.group == "all" || editor.group == "breast" || editor.group == "buttocks" {
+            if breast && (editor.group.is_empty() || editor.group == "all" || editor.group == "breast") {
+                self.studio_body_size_slider(ui, false);
+            }
+            if glute && (editor.group.is_empty() || editor.group == "all" || editor.group == "buttocks") {
+                self.studio_body_size_slider(ui, true);
+            }
+        }
+        if !available {
+            label(ui, "Anny shaping needs a mapped humanoid skeleton.", 10.0, MUTED);
+            ui.ctx().data_mut(|d| d.insert_temp(body_editor_id(), editor));
+            return;
+        }
+        let mut groups: Vec<_> = LOCAL_CONTROLS.iter().map(|c|c.1).collect();
+        groups.sort_unstable(); groups.dedup();
+        egui::ComboBox::from_id_salt("anny_body_region")
+            .selected_text(if editor.group.is_empty() { "Whole body" } else { &editor.group })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut editor.group, String::new(), "Whole body");
+                for group in groups { ui.selectable_value(&mut editor.group, group.to_owned(), group); }
+                ui.selectable_value(&mut editor.group, "facial actions".to_owned(), "Facial actions");
+                ui.selectable_value(&mut editor.group, "all".to_owned(), "All controls");
+            });
+        ui.add(egui::TextEdit::singleline(&mut editor.search).hint_text("Find a slider"));
+        let needle = editor.search.to_ascii_lowercase();
+        let searching = !needle.trim().is_empty();
+        let show_global = editor.group.is_empty() || editor.group == "all";
+        let mut details = self.video.body_details;
+        let original = details;
+        let defaults = Details::default();
+        let show_gender = show_global
+            && (!searching || studio_anny_detail_title("gender").to_ascii_lowercase().contains(&needle));
         ui.add_enabled_ui(available, |ui| {
+        // Keep gender visible while the selected part's controls scroll.
+        if show_gender {
+            Self::studio_anny_detail_slider(ui, &mut details, 0, "gender", defaults.0[0]);
+        }
+        egui::ScrollArea::vertical().id_salt("anny_body_sliders")
+            .max_height((available_h - 180.0 - if show_gender { 38.0 } else { 0.0 }).max(80.0))
+            .auto_shrink([false, false]).show(ui, |ui| {
+            if show_global {
+            cap(ui, "PHENOTYPES", "");
             for (title, cvar, current, default) in [
                 ("Muscle", "r_bodyMuscle", self.video.body_muscle, 0.5),
                 ("Weight", "r_bodyWeight", self.video.body_weight, 0.5),
                 ("Proportions", "r_bodyProportions", self.video.body_proportions, 0.5),
+                ("Height", "r_bodyHeight", self.video.body_height, 0.5),
                 ("Age", "r_bodyAge", self.video.body_age, 0.5),
             ] {
-                let id = ui.id().with(cvar);
+                if searching && !title.to_ascii_lowercase().contains(&needle) { continue; }
+                let id = egui::Id::new(("anny_macro", cvar));
                 let mut value = ui.ctx().data_mut(|data| data.get_temp::<f32>(id)).unwrap_or(current);
-                let response = ui.add(egui::Slider::new(&mut value, 0.0..=1.0)
-                    .step_by(0.01).text(title).show_value(false))
-                    .on_hover_text("Release to update the character. Middle-click to reset.");
-                if response.clicked_by(egui::PointerButton::Middle) { value = default; }
-                if response.dragged() {
+                let (response, reset_label) = ui.horizontal(|ui| {
+                    let response = ui.add(egui::Slider::new(&mut value, 0.0..=1.0).step_by(0.05))
+                        .on_hover_text("Release to update the character. Double-click or middle-click to reset.");
+                    let reset_label = studio_deformation_reset_label(ui, title);
+                    let response = response.labelled_by(reset_label.id);
+                    (response, reset_label)
+                }).inner;
+                let reset = reset_label.clicked() || studio_deformation_slider_reset(&response);
+                if reset { value = default; }
+                if response.dragged() && !reset {
                     ui.ctx().data_mut(|data| data.insert_temp(id, value));
                 } else {
                     ui.ctx().data_mut(|data| data.remove::<f32>(id));
@@ -583,8 +676,108 @@ impl App {
                     }
                 }
             }
+            }
+            if editor.group == "breast" || editor.group == "all" {
+            if !show_global { cap(ui, "BREAST PHENOTYPES", "Anny"); }
+            for (i, name) in EXTRA_CONTROLS.iter().enumerate() {
+                if i == 0 {continue;} // Pinned above the part filter.
+                if editor.group != "all" && !matches!(i, 1 | 2) {continue;}
+                if searching && !format!("{name} {}", studio_anny_detail_title(name)).to_ascii_lowercase().contains(&needle) {continue;}
+                Self::studio_anny_detail_slider(ui, &mut details, i, name, defaults.0[i]);
+            }
+            }
+            if !editor.group.is_empty() {
+                let mut previous_group = "";
+                for (i, &(name, group)) in LOCAL_CONTROLS.iter().enumerate() {
+                    if editor.group != "all" && group != editor.group {continue;}
+                    if searching && !format!("{group} {name}").contains(&needle) {continue;}
+                    if previous_group != group {ui.add_space(8.0);cap(ui, &group.to_ascii_uppercase(), "");previous_group=group;}
+                    Self::studio_anny_detail_slider(ui, &mut details, 6+i, name, 0.0);
+                }
+                if editor.group == "facial actions" || editor.group == "all" {
+                    cap(ui, "FACIAL ACTIONS", "");
+                    for (i, &name) in FACIAL_CONTROLS.iter().enumerate() {
+                        if searching && !name.to_ascii_lowercase().contains(&needle) {continue;}
+                        Self::studio_anny_detail_slider(ui, &mut details, 6+LOCAL_COUNT+i, name, 0.0);
+                    }
+                }
+            }
         });
-        if !available { label(ui, "Body shaping is unavailable for this character.", 10.0, MUTED); }
+        });
+        if available && details != original {
+            if let Err(error) = self.set_console_cvar("r_bodyAnny", &details.encode()) {
+                self.console_status = error;
+            } else { self.profile_preview_key = None; }
+        }
+        let mut reset_part = false;
+        let mut reset_body = false;
+        ui.horizontal_wrapped(|ui| {
+            reset_part = ui.add_enabled(available, egui::Button::new("Reset selected part")).clicked();
+            reset_body = ui.add_enabled(available, egui::Button::new("Reset whole body"))
+                .on_hover_text("Restore all Anny controls and breast/glute size offsets to neutral.")
+                .clicked();
+        });
+        if reset_body {
+            self.studio_reset_whole_body_shape(ui.ctx());
+        } else if reset_part {
+            if editor.group.is_empty() || editor.group=="all" {
+                for cvar in ["r_bodyMuscle","r_bodyWeight","r_bodyProportions","r_bodyHeight","r_bodyAge"] {
+                    if let Err(error)=self.set_console_cvar(cvar,"0.5") {self.console_status=error;}
+                    ui.ctx().data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_macro",cvar))));
+                }
+                details.0[..6].copy_from_slice(&defaults.0[..6]);
+            }
+            if editor.group == "breast" {
+                details.0[1..=2].copy_from_slice(&defaults.0[1..=2]);
+                if let Err(error) = self.set_console_cvar("r_jiggleBreastSize", "0") { self.console_status = error; }
+            }
+            if editor.group == "buttocks" {
+                if let Err(error) = self.set_console_cvar("r_jiggleGluteSize", "0") { self.console_status = error; }
+            }
+            for (i,&(_,group)) in LOCAL_CONTROLS.iter().enumerate() {
+                if editor.group=="all" || editor.group==group {details.0[6+i]=0.;}
+            }
+            if editor.group=="all" || editor.group=="facial actions" {details.0[6+LOCAL_COUNT..].fill(0.);}
+            if let Err(error)=self.set_console_cvar("r_bodyAnny",&details.encode()) {self.console_status=error;}
+            self.profile_preview_key=None;
+            // Reset must also clear a slider's uncommitted drag value.
+            for i in 0..details.0.len() {ui.ctx().data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_detail",i))));}
+        }
+        ui.ctx().data_mut(|d|d.insert_temp(body_editor_id(),editor));
+    }
+
+    fn studio_reset_whole_body_shape(&mut self, ctx: &egui::Context) {
+        for cvar in ["r_bodyMuscle", "r_bodyWeight", "r_bodyProportions", "r_bodyHeight", "r_bodyAge"] {
+            if let Err(error) = self.set_console_cvar(cvar, "0.5") { self.console_status = error; }
+            ctx.data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_macro", cvar))));
+        }
+        for (cvar, value) in [("r_bodyAnny", ""), ("r_jiggleBreastSize", "0"), ("r_jiggleGluteSize", "0")] {
+            if let Err(error) = self.set_console_cvar(cvar, value) { self.console_status = error; }
+        }
+        for i in 0..jka_assets::body_shape::anny::DETAIL_COUNT {
+            ctx.data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_detail", i))));
+        }
+        self.profile_preview_key = None;
+    }
+
+    fn studio_anny_detail_slider(ui: &mut egui::Ui, details: &mut jka_assets::body_shape::anny::Details,
+        index: usize, name: &str, default: f32) {
+        use jka_assets::body_shape::anny::Details;
+        let id = egui::Id::new(("anny_detail", index));
+        let current = details.0[index];
+        let mut value = ui.ctx().data_mut(|d|d.get_temp::<f32>(id)).unwrap_or(current);
+        // Keep Anny's exact label in the tooltip; trim only the positive target
+        // suffix in the visible label, since each slider owns both opposites.
+        let title = studio_anny_detail_title(name);
+        let reset_label = studio_deformation_reset_label(ui, title).on_hover_text(name);
+        let response = ui.add(egui::Slider::new(&mut value, Details::range(index))
+            .step_by(0.05))
+            .on_hover_text(format!("{name}\nRelease to update. Double-click or middle-click to reset."));
+        let response = response.labelled_by(reset_label.id);
+        let reset = reset_label.clicked() || studio_deformation_slider_reset(&response);
+        if reset {value=default;}
+        if response.dragged() && !reset {ui.ctx().data_mut(|d|d.insert_temp(id,value));}
+        else {ui.ctx().data_mut(|d|d.remove::<f32>(id));details.0[index]=value;}
     }
 
     /// All saber selection takes place on the character stage. Source of truth:
@@ -730,7 +923,7 @@ impl App {
 
     fn studio_character_stage(&mut self, ui: &mut egui::Ui, width: f32, height: f32, _elapsed: f32) {
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(width, height), egui::Sense::drag());
+            egui::vec2(width, height), egui::Sense::click_and_drag());
         self.set_asset_preview_viewport(rect, ui.ctx().pixels_per_point());
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.profile_studio_last_frame).as_secs_f32().clamp(0.0, 0.08);
@@ -789,8 +982,55 @@ impl App {
         // their dedicated tabs and never cover the emote preview.
         if self.profile_selected_section==PROFILE_EMOTES {
             self.profile_studio_cosmetic_group=0;
+            self.profile_body_highlight=None;
             return;
         }
+
+        // Keep the stage editor out of the model's centre and clear selection
+        // on genuine empty-stage clicks, not on clicks on floating controls.
+        let shape_panel = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 282.0, rect.top() + 137.0),
+            egui::vec2(268.0, (rect.height() - 265.0).max(150.0)));
+        if self.profile_selected_section == PROFILE_MODEL && response.clicked() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let over_ui = shape_panel.contains(pointer)
+                    || (pointer.y < rect.top() + 118.0
+                        && (pointer.x < rect.left() + 250.0 || pointer.x > rect.right() - 280.0))
+                    || pointer.y > rect.bottom() - 123.0;
+                if !over_ui {
+                    let camera = self.asset_preview_camera();
+                    let viewport = [rect.width().max(1.0) as u32, rect.height().max(1.0) as u32];
+                    let ndc = glam::Vec3::new(
+                        2.0*(pointer.x-rect.left())/rect.width()-1.0,
+                        1.0-2.0*(pointer.y-rect.top())/rect.height(), 0.5);
+                    let point = camera.view_projection(viewport[0], viewport[1]).inverse().project_point3(ndc);
+                    let direction = (point-camera.position).normalize_or_zero();
+                    let info = crate::cgame::ClientInfo::solo_model(&display);
+                    let picked = self.asset_preview_player_presenter.as_ref().and_then(|p|
+                        p.pick_profile_body(&info, crate::scene::jka_position(camera.position.to_array()),
+                            crate::scene::jka_position(direction.to_array())));
+                    let mut editor = ui.ctx().data_mut(|d|d.get_temp::<BodyEditor>(body_editor_id())).unwrap_or_default();
+                    // Empty space is Global. Only reset the search when the
+                    // selection actually changes; clicking a part twice is stable.
+                    let group = picked.unwrap_or_default();
+                    if editor.group != group {
+                        editor.group = group.to_owned();
+                        editor.search.clear();
+                    }
+                    ui.ctx().data_mut(|d|d.insert_temp(body_editor_id(),editor));
+                    if picked.is_some() { self.profile_studio_spin_velocity=0.0; }
+                }
+            }
+        }
+        if self.profile_selected_section == PROFILE_MODEL {
+            let editor=ui.ctx().data_mut(|d|d.get_temp::<BodyEditor>(body_editor_id())).unwrap_or_default();
+            self.profile_body_highlight = (!editor.group.is_empty()
+                && editor.group != "all" && editor.group != "facial actions").then(||editor.group.clone());
+            let hint = if !editor.group.is_empty() { format!("Editing: {} · click empty space for Global",editor.group) }
+                else { "Click a body part to edit · empty space = Global".to_owned() };
+            p.text(frame.left_bottom()+egui::vec2(18.0,-43.0),egui::Align2::LEFT_BOTTOM,
+                hint,egui::FontId::proportional(11.0),SKY_SOFT);
+        } else { self.profile_body_highlight = None; }
 
         // Name editing lives in the stage header, not a separate navigation tab.
         let name_area = egui::Rect::from_min_size(frame.left_top() + egui::vec2(17.0, 13.0),
@@ -866,33 +1106,35 @@ impl App {
         }
 
         }
-        // Anatomy sliders use the same animated-profile anchor projection as
-        // saber/cosmetic callouts, with endpoints fitted to the actual model's
-        // soft-tissue regions (including Source 1 imports) rather than guessing
-        // fixed body heights. No marker is shown when a model has no region.
-        for (glute, joint, relative_y) in [(false, 5usize, 0.35f32), (true, 6, 0.57)] {
-            // Missing region means this model has nothing for the slider to
-            // deform. Keep both the slider and its line completely absent.
-            let Some(anchor) = self.studio_project_anchor(rect, joint) else {
-                continue;
-            };
-            let panel = egui::Rect::from_min_size(
-                egui::pos2(rect.right() - 202.0,
-                    rect.top() + rect.height() * relative_y),
-                egui::vec2(188.0, 68.0));
-            p.line_segment([panel.left_center(), anchor],
-                egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
-            p.circle_filled(anchor, 3.0, SKY);
+        // One floating anatomy editor. Region picking uses the already skinned
+        // Ghoul2 body; breast/glute offsets remain the original cvars and only
+        // appear when their existing mesh anchors are available.
+        if self.profile_selected_section == PROFILE_MODEL {
+            let editor = ui.ctx().data_mut(|d|d.get_temp::<BodyEditor>(body_editor_id())).unwrap_or_default();
+            // Retain the original model-space breast/glute callouts, now
+            // connecting to their rows in the combined stage editor.
+            for (joint, selected, row) in [
+                (5usize, editor.group.is_empty() || editor.group == "all" || editor.group == "breast", 0usize),
+                (6usize, editor.group.is_empty() || editor.group == "all" || editor.group == "buttocks", 1usize),
+            ] {
+                if !selected { continue; }
+                if let Some(anchor) = self.studio_project_anchor(rect, joint) {
+                    let endpoint = egui::pos2(shape_panel.left(), shape_panel.top() + 47.0 + row as f32 * 39.0);
+                    p.line_segment([anchor, endpoint], egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
+                    p.circle_filled(anchor, 3.0, SKY);
+                }
+            }
+            let current = display.clone();
             ui.scope_builder(egui::UiBuilder::new()
-                .id_salt(("studio_body_size", glute)).max_rect(panel), |ui| {
+                .id_salt("studio_anny_stage_panel").max_rect(shape_panel), |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
                     .corner_radius(egui::CornerRadius::same(5))
                     .stroke(egui::Stroke::new(1.0, EDGE))
-                    .inner_margin(egui::Margin::same(7))
+                    .inner_margin(egui::Margin::same(9))
                     .show(ui, |ui| {
-                        ui.set_width(174.0);
-                        self.studio_body_size_slider(ui, glute);
+                        ui.set_width((shape_panel.width() - 18.0).max(1.0));
+                        self.studio_body_shape_controls(ui, &current, shape_panel.height()-18.0, rect);
                     });
             });
         }

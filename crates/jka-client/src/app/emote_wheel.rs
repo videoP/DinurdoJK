@@ -1,5 +1,5 @@
 //! Local emote favorites, personal categories and saved variants. Starred
-//! emotes populate the LIBRARY tier of the built-in `/emote` wheel.
+//! emotes populate the FAVORITES tier of the built-in `/emote` wheel.
 use super::*;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -172,6 +172,17 @@ impl EmoteWheel {
         picked.into_iter().map(|(_, emote)| emote).collect()
     }
 
+    /// All installed emotes in a personal category, including unstarred ones.
+    /// Categorize the catalogue root before choosing its saved variation.
+    pub(super) fn catalog_emotes(&self, catalog: &[crate::emotes::Emote], category: Option<&str>) -> Vec<crate::emotes::Emote> {
+        catalog.iter().filter(|emote| category.is_none_or(|id| self.category_for(emote) == id))
+            .map(|emote| {
+                let variant = self.variants.get(&emote.id).copied()
+                    .unwrap_or_else(|| crate::emotes::default_variant_index(emote));
+                emote.variants.get(variant).unwrap_or(emote).clone()
+            }).collect()
+    }
+
     pub fn load(base: &std::path::Path) -> Self {
         let data = std::fs::read(base.join("emotes/favorites.json"))
             .ok()
@@ -182,6 +193,27 @@ impl EmoteWheel {
 }
 
 impl App {
+    pub(in crate::app) fn stop_game_emote(&mut self) {
+        if self.live_connected() { self.live_input.queue_emote_stop(); }
+        crate::emotes::stop();
+    }
+
+    /// In-game selections share the same taunt transport; Profile previews stay local.
+    pub(in crate::app) fn play_game_emote(&mut self, emote: crate::emotes::Emote) {
+        if self.live_connected() {
+            if let Some(id) = crate::emotes::network::wire_id(&emote) {
+                self.live_input.queue_emote_taunt(id);
+            } else {
+                self.live_input.queue_generic_command(27);
+                self.live_input.queue_emote_stop();
+                self.push_console_line(format!("^3Emote {} / {} has no permanent network ID; playing locally with a normal taunt.", emote.id, emote.variant_name));
+            }
+        } else {
+            self.execute_game_command("taunt");
+        }
+        crate::emotes::play_world(emote);
+    }
+
     pub(super) fn save_emote_favorites(&mut self) {
         if let Ok(catalog) = crate::emotes::catalog(&self.base) {
             crate::emotes::update_favorite_assets(&catalog, &self.emote_wheel.favorites);
@@ -200,7 +232,7 @@ impl App {
         }
     }
 
-    /// The `/emote` wheel's LIBRARY tier. `Err` explains an empty tier.
+    /// The `/emote` wheel's FAVORITES tier. `Err` explains an empty tier.
     pub(super) fn wheel_favorite_emotes(&self) -> Result<Vec<crate::emotes::Emote>, &'static str> {
         let catalog = crate::emotes::catalog(&self.base).map_err(|_| "NO EMOTE LIBRARY")?;
         if catalog.is_empty() {
@@ -225,14 +257,17 @@ impl App {
         }
     }
 
-    pub(super) fn play_favorite_emote(&mut self, id: &str) {
+    pub(super) fn play_wheel_emote(&mut self, id: &str) {
         if self.front_end || self.game_session.is_none() {
             self.console_status = "Emotes play in game".to_owned();
             return;
         }
-        let Ok(emotes) = self.wheel_favorite_emotes() else { return };
-        if let Some(emote) = emotes.into_iter().find(|e| e.id == id) {
-            crate::emotes::play_world(emote);
+        let Ok(catalog) = crate::emotes::catalog(&self.base) else { return };
+        let emote = self.emote_wheel.wheel_emotes(&catalog).into_iter()
+            .chain(self.emote_wheel.catalog_emotes(&catalog, None))
+            .find(|emote| emote.id == id);
+        if let Some(emote) = emote {
+            self.play_game_emote(emote);
         }
     }
 }
@@ -240,6 +275,26 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn library_includes_unstarred_emotes_and_honors_categories_and_variants() {
+        let mut catalog = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[
+            {"id":"laugh","name":"Laugh","gla":"models/a.gla","first_frame":0,"end_frame":30,"fps":30},
+            {"id":"floss","name":"Floss","gla":"models/b.gla","first_frame":0,"end_frame":30,"fps":30}
+        ]})).unwrap();
+        let mut alternate = catalog[1].clone();
+        alternate.id = "floss-alt".into();
+        catalog[1].variants = vec![catalog[1].clone(), alternate];
+        let wheel = EmoteWheel::from_settings(&serde_json::json!({
+            "favorites":["laugh"], "variants":{"floss":1}, "assignments":{"laugh":"flex"}
+        }));
+        let ids = |emotes: Vec<crate::emotes::Emote>| emotes.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(wheel.wheel_emotes(&catalog)), ["laugh"]);
+        assert_eq!(ids(wheel.catalog_emotes(&catalog, Some("dance"))), ["floss-alt"]);
+        assert_eq!(ids(wheel.catalog_emotes(&catalog, Some("flex"))), ["laugh"]);
+        assert!(wheel.catalog_emotes(&catalog, Some("taunt")).is_empty());
+        assert_eq!(ids(wheel.catalog_emotes(&catalog, None)), ["laugh", "floss-alt"]);
+    }
+
     #[test]
     fn legacy_favorites_and_category_renames_preserve_assignments() {
         let legacy = serde_json::json!({"favorites":["EID_Floss","EID_Floss"],"variants":{"EID_Floss":2},"opacity":0.3});

@@ -2,6 +2,74 @@ use super::{create_ssr_visibility_bind_group, create_ssr_visibility_resources};
 use crate::renderer::{create_targets, RenderTargets};
 
 #[test]
+fn inactive_targets_shrink_and_reenable_at_viewport_size() {
+    futures_lite::future::block_on(async {
+        let instance = wgpu::Instance::default();
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device, _queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ] {
+            let make = |ssr, resolved_depth, temporal, clouds| {
+                create_targets(
+                    &device,
+                    64,
+                    32,
+                    format,
+                    1,
+                    false,
+                    false,
+                    false,
+                    false,
+                    ssr,
+                    resolved_depth,
+                    temporal,
+                    clouds,
+                    Default::default(),
+                )
+            };
+            for _ in 0..2 {
+                let off = make(false, false, false, false);
+                assert!(off
+                    ._history_textures
+                    .iter()
+                    .all(|texture| texture.width() == 1 && texture.height() == 1));
+                assert_eq!((off.cloud_width(), off.cloud_height()), (1, 1));
+                assert!(off
+                    ._cloud_transfer_textures
+                    .iter()
+                    .all(|texture| texture.width() == 1 && texture.height() == 1));
+                assert!(off.ssr_history.is_none());
+                assert!(create_ssr_visibility_resources(&device, &off, 1).is_none());
+                let off_bytes: u64 = off.memory_categories().iter().map(|(_, bytes)| bytes).sum();
+                drop(off);
+
+                let on = make(true, true, true, true);
+                assert!(on
+                    ._history_textures
+                    .iter()
+                    .all(|texture| texture.width() == 64 && texture.height() == 32));
+                assert_eq!((on.cloud_width(), on.cloud_height()), (32, 16));
+                assert!(on.ssr_history.is_some());
+                assert!(create_ssr_visibility_resources(&device, &on, 1).is_some());
+                let on_bytes: u64 = on.memory_categories().iter().map(|(_, bytes)| bytes).sum();
+                assert!(on_bytes > off_bytes + 32_000);
+            }
+            // Fog/metering must retain resolved depth even with SSR disabled.
+            let fog = make(false, true, false, false);
+            assert!(fog.ssr_history.is_none());
+            assert!(create_ssr_visibility_resources(&device, &fog, 1).is_some());
+        }
+        assert!(
+            scope.pop().await.is_none(),
+            "target lifecycle GPU validation"
+        );
+    });
+}
+
+#[test]
 fn depth_resolve_rebinds_replaced_targets_without_rebuilding_pipeline() {
     futures_lite::future::block_on(async {
         let instance = wgpu::Instance::default();
@@ -36,6 +104,9 @@ fn depth_resolve_rebinds_replaced_targets_without_rebuilding_pipeline() {
                     false,
                     false,
                     false,
+                    false,
+                    true,
+                    true,
                     false,
                     false,
                     Default::default(),

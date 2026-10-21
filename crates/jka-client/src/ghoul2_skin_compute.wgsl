@@ -30,6 +30,7 @@ struct SkinDraw {
     jiggle1: vec4<f32>,
     jiggle2: vec4<f32>,
     jiggle3: vec4<f32>,
+    jiggle4: vec4<f32>,
     // Same storage-array stride as Ghoul2GpuDrawUniform and ghoul2_skin.wgsl,
     // even though this compute path does not evaluate Source material lighting.
     source_phong: vec4<f32>,
@@ -125,6 +126,7 @@ fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
         case 1u: { return draw.jiggle1.xyz; }
         case 2u: { return draw.jiggle2.xyz; }
         case 3u: { return draw.jiggle3.xyz; }
+        case 4u: { return draw.jiggle4.xyz; }
         default: { return vec3<f32>(0.0); }
     }
 }
@@ -208,7 +210,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let jiggle_weight = bitcast<f32>(input.params.z);
     let jiggle_coord = bitcast<f32>(input.params.w);
-    if (jiggle_weight > 0.0 && input.params.y < 4u) {
+    if (jiggle_weight > 0.0 && input.params.y < 5u) {
         let effective_weight = jiggle_effective_weight(draw, jiggle_weight, jiggle_coord);
         model_position += jiggle_offset(draw, input.params.y) * effective_weight;
     }

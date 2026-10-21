@@ -363,7 +363,12 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
         ).xyz * vec3<f32>(1.0,1.0,-1.0) * scales.z;
     }
     displacement_m *= vec3<f32>(ocean.swell_motion.z, 1.0, ocean.swell_motion.z);
-    let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase);
+    var crest_scale = 1.0;
+    if ocean.swell.w > 0.0 && ocean.map_scales[0].z > 0.0 {
+        let crest_tag = textureLoad(ocean_displacement, vec2<i32>(0), 0, 0).w;
+        if crest_tag < 0.0 { crest_scale = -crest_tag; }
+    }
+    let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase) * crest_scale;
     displacement_m += vec3<f32>(ocean.swell.x * horizontal, ocean.swell.w * sin(phase), ocean.swell.y * horizontal);
     displacement_m += vec3<f32>(ocean.wind_motion.x,0.0,ocean.wind_motion.y) * t * 0.15;
     displacement_m += vec3<f32>(0.0, (-5.0 * pow(2.5 * t - 0.45, 2.0) * scale_factor + 0.5) * activity, 0.0);

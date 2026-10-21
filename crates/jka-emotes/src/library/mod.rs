@@ -21,6 +21,7 @@ pub mod batch;
 pub mod catalog;
 pub mod discovery;
 pub mod loop_audit;
+pub mod pose_pool;
 pub mod presentation_import;
 pub mod reconcile;
 pub mod reground;

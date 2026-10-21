@@ -149,6 +149,7 @@ impl Renderer {
             &self.fast_surface_layout,
             world_pipeline_layout,
             world_shader,
+            &self.world_shader_lean,
             initial_shader_variant,
             self.scene_format(),
             self.msaa_samples,
@@ -187,6 +188,7 @@ impl Renderer {
             if reuse.is_some() { self.world.as_ref() } else { None },
             reuse.unwrap_or(0),
         );
+        world.refresh_pso_slots();
         upload_timings.pre_build_ms = pre_build_ms;
         let post_bind_started = Instant::now();
         world.cull_bind_group = Some(create_gpu_cull_bind_group(

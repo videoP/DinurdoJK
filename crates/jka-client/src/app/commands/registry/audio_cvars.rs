@@ -2,6 +2,138 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_S_VARIOMETERINPUT {
+        runtime: CvarDef::new("s_variometerInput", "0", "0..1", "Variometer input: 0 horizontal acceleration, 1 strafehelper angle error (high = overshooting, low = undershooting).", CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.audio.variometer_input)),
+            |app, value| App::cvar_set_s_variometerinput(app, APP_S_VARIOMETERINPUT.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometerinput, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| { settings.variometer_input = int_in(value, 1).unwrap_or(settings.variometer_input); }),
+            archive: Some((27352, |state| state.audio.variometer_input.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometerinput(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer_input = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0) as u8;
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_S_VARIOMETERDEADZONE {
+        runtime: CvarDef::new("s_variometerDeadZone", "0.5", "0..5", "Strafe-angle variometer dead zone: degrees either side of the strafehelper's optimal angle that stay silent.", CvarType::Float { min: 0.0, max: 5.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.audio.variometer_dead_zone),
+            |app, value| App::cvar_set_s_variometerdeadzone(app, APP_S_VARIOMETERDEADZONE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometerdeadzone, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| {
+                if let Some(degrees) = value.parse::<f32>().ok().filter(|n| n.is_finite()) {
+                    settings.variometer_dead_zone = degrees.clamp(0.0, 5.0);
+                }
+            }),
+            archive: Some((27353, |state| format!("{:.2}", state.audio.variometer_dead_zone))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometerdeadzone(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer_dead_zone = Self::parse_cvar_finite(name, value)?.clamp(0.0, 5.0);
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_S_VARIOMETERSCALE {
+        runtime: CvarDef::new("s_variometerScale", "1", "0.25..8", "Strafe-angle variometer sensitivity multiplier. 1 reaches the full tone range 15 degrees past the dead zone; 4 reaches it in under 4.", CvarType::Float { min: 0.25, max: 8.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.audio.variometer_scale),
+            |app, value| App::cvar_set_s_variometerscale(app, APP_S_VARIOMETERSCALE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometerscale, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| {
+                if let Some(scale) = value.parse::<f32>().ok().filter(|n| n.is_finite()) {
+                    settings.variometer_scale = scale.clamp(0.25, 8.0);
+                }
+            }),
+            archive: Some((27354, |state| format!("{:.2}", state.audio.variometer_scale))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometerscale(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer_scale = Self::parse_cvar_finite(name, value)?.clamp(0.25, 8.0);
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_S_VARIOMETER {
+        runtime: CvarDef::new("s_variometer", "0", "0|1", "Enable the horizontal acceleration variometer.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.audio.variometer),
+            |app, value| App::cvar_set_s_variometer(app, APP_S_VARIOMETER.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometer, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| { settings.variometer = parse_bool(value).unwrap_or(settings.variometer); }),
+            archive: Some((27349, |state| u8::from(state.audio.variometer).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometer(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer = Self::parse_cvar_bool(name, value)?;
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_S_VARIOMETERVOLUME {
+        runtime: CvarDef::new("s_variometerVolume", "0.35", "0..1", "Horizontal variometer volume, scaled by s_volume.", CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.audio.variometer_volume),
+            |app, value| App::cvar_set_s_variometervolume(app, APP_S_VARIOMETERVOLUME.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometervolume, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| {
+                if let Some(level) = value.parse::<f32>().ok().filter(|n| n.is_finite()) {
+                    settings.variometer_volume = level.clamp(0.0, 1.0);
+                }
+            }),
+            archive: Some((27350, |state| format!("{:.3}", state.audio.variometer_volume))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometervolume(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer_volume = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_S_VARIOMETERSTYLE {
+        runtime: CvarDef::new("s_variometerStyle", "0", "0..2", "Variometer sound: 0 Classic, 1 BeatDrop-inspired note pairs, 2 Continuous pitch.", CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.audio.variometer_style)),
+            |app, value| App::cvar_set_s_variometerstyle(app, APP_S_VARIOMETERSTYLE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_variometerstyle, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| { settings.variometer_style = int_in(value, 2).unwrap_or(settings.variometer_style); }),
+            archive: Some((27351, |state| state.audio.variometer_style.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_variometerstyle(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.variometer_style = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0) as u8;
+                self.update_variometer();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
     APP_S_EMOTEMUSICVOLUME {
         runtime: CvarDef::new("s_emoteMusicVolume", "0.5", "0..1", "Emote music level, independent of game effects and map music.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(format!("{:.3}", app.audio.emote_music_volume)),

@@ -63,6 +63,16 @@ on an Intel UHD 630 window the GPU worked ~2 ms per frame while acquire took
 count. TaystJK passes only a semaphore. The patch keeps the fence for FIFO and
 FIFO_RELAXED only. `JKA_VK_ACQUIRE_FENCE=1` restores upstream behaviour.
 
+Third change, diagnostic only, in `src/vulkan/adapter.rs` (`open_with_callback`)
+and `src/vulkan/device.rs` (`create_render_pipeline`, `log_shader_stats`), marked
+"DinurdoJK patch": with `DINURDO_VK_SHADER_STATS=1` the device enables
+`VK_KHR_pipeline_executable_properties`, creates render pipelines with
+`CAPTURE_STATISTICS`, and prints each stage's driver statistics to stderr
+(`[VK SHADER STATS] <label> FS: Register Count=128, Binary Size=...`). This is how
+shader register pressure is measured without Nsight (NVIDIA reports registers;
+it offers no internal representations). Without the variable nothing changes.
+Example: `blue-water-gpu` test `surface_register_stats`.
+
 # winit vendor
 
 `winit-0.30.13` is the crates.io release with one change in

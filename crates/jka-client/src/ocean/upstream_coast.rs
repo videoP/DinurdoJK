@@ -28,6 +28,14 @@ pub struct Source {
     bsp: Arc<jka_assets::bsp::Bsp>,
     footprints: Footprints,
     state: Mutex<State>,
+    /// `r_oceanType 5`'s contact fields (`super::gerstner_contact`), built on first request.
+    contact: Mutex<ContactState>,
+}
+#[derive(Default)]
+struct ContactState {
+    working: bool,
+    failed: bool,
+    ready: Option<super::gerstner_contact::ContactFields>,
 }
 impl Source {
     pub fn report(&self, at: [f64; 2], settings: &super::OceanSettings) -> Vec<String> {
@@ -96,7 +104,51 @@ impl Source {
             bsp,
             footprints,
             state: Mutex::new(State::default()),
+            contact: Mutex::new(ContactState::default()),
         })
+    }
+    /// Nonblocking render-thread request for `r_oceanType 5`'s contact fields; `None` until the worker finishes (or
+    /// for good, if it failed).
+    pub fn request_contact(self: &Arc<Self>) -> Option<super::gerstner_contact::ContactFields> {
+        let mut state = self.contact.try_lock().ok()?;
+        if let Some(ready) = &state.ready {
+            return Some(Arc::clone(ready));
+        }
+        if state.working || state.failed {
+            return None;
+        }
+        state.working = true;
+        let source = Arc::clone(self);
+        if let Err(e) = std::thread::Builder::new()
+            .name("gerstner-contact".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::gerstner_contact::build(&source.bsp, &source.footprints)
+                }));
+                let Ok(mut state) = source.contact.lock() else { return; };
+                state.working = false;
+                match built {
+                    Ok(Ok(fields)) => {
+                        eprintln!("GERSTNER CONTACT: {} pool fields in {:.0} ms", fields.len(),
+                            started.elapsed().as_secs_f64() * 1000.0);
+                        state.ready = Some(Arc::new(fields));
+                    }
+                    failure => {
+                        eprintln!("GERSTNER CONTACT: unavailable, no intersection foam: {}", match failure {
+                            Ok(Err(e)) => e,
+                            _ => "worker panicked".into(),
+                        });
+                        state.failed = true;
+                    }
+                }
+            })
+        {
+            state.working = false;
+            state.failed = true;
+            eprintln!("GERSTNER CONTACT: worker failed: {e}");
+        }
+        None
     }
     /// Nonblocking render-thread request. A changed wind replaces stale exposure; the last request wins.
     pub fn request(self: &Arc<Self>, direction: f32) -> Option<Arc<Maps>> {

@@ -89,11 +89,15 @@ pub struct VideoSettings {
     pub draw_map_models: bool,
     /// Draw inline BSP mover instances (func_rotating, doors, lifts).
     pub draw_inline_models: bool,
+    /// CPU, CPU workers, or GPU compute transforms for inline BSP movers.
+    pub inline_transform_mode: crate::ui::InlineTransformMode,
     /// r_fragmentShaderMode: 0 general world fragment program, 1 TaystJK-style
     /// per-material specialized programs (MaterialFragmentKey).
     pub fragment_shader_mode: u8,
     /// Session-only world submission ordering: 0 authored-sort baseline, 1 safe pipeline-first.
     pub world_sort_mode: u8,
+    /// r_postSpecialize: full post runs a pipeline built for the enabled effects.
+    pub post_specialize: bool,
     /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
     pub color_clear_mode: u8,
     /// Render-only heuristic: keep BSP-authored stages whose shader qpath starts with models/.
@@ -193,6 +197,8 @@ pub struct VideoSettings {
     pub jiggle_strength: f32,
     pub jiggle_breast_strength: f32,
     pub jiggle_glute_strength: f32,
+    /// Optional stomach motion, fitted only when abdominal fullness is present.
+    pub jiggle_stomach_strength: f32,
     pub jiggle_stiffness: f32,
     pub jiggle_damping: f32,
     /// Deprecated legacy normalized remesh control kept for config compatibility.
@@ -218,7 +224,9 @@ pub struct VideoSettings {
     pub body_muscle: f32,
     pub body_weight: f32,
     pub body_proportions: f32,
+    pub body_height: f32,
     pub body_age: f32,
+    pub body_details: jka_assets::body_shape::anny::Details,
     /// Origin-acceleration kick multiplier; steady travel never contributes.
     pub jiggle_locomotion: f32,
     /// Locomotion impulse ceiling per 60 Hz step; scaled for r_physicsHz.
@@ -230,6 +238,8 @@ pub struct VideoSettings {
     pub jiggle_breast_damping: f32,
     pub jiggle_glute_stiffness: f32,
     pub jiggle_glute_damping: f32,
+    pub jiggle_stomach_stiffness: f32,
+    pub jiggle_stomach_damping: f32,
     pub jiggle_jp_stiffness: f32,
     pub jiggle_jp_drag: f32,
     pub jiggle_jp_air_drag: f32,
@@ -460,7 +470,8 @@ pub struct VideoSettings {
     pub rt_samples: u32,
     /// 0 = stock JKA 1 - d^2/r^2, 1 = windowed inverse-square.
     pub dynamic_light_falloff: u32,
-    pub rt_half_resolution: bool,
+    /// Fresh RT visibility rate: 1 = Full, 2 = Half, 4 = Quarter.
+    pub rt_trace_rate: u32,
     /// Source `.map` only: approximate a compiled lighting pass from authored light entities.
     pub map_light_simulation: bool,
     /// Classic world-lighting master. False corresponds to vanilla r_fullbright 1.
@@ -521,6 +532,7 @@ impl VideoSettings {
             muscle: self.body_muscle,
             weight: self.body_weight,
             proportions: self.body_proportions,
+            height: self.body_height,
             age: self.body_age,
         }
     }
@@ -656,8 +668,10 @@ impl Default for VideoSettings {
             debug_world_vertex_alpha_one: false,
             draw_map_models: true,
             draw_inline_models: true,
+            inline_transform_mode: crate::ui::InlineTransformMode::Gpu,
             fragment_shader_mode: 1,
             world_sort_mode: 0,
+            post_specialize: true,
             color_clear_mode: 1,
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
@@ -714,6 +728,7 @@ impl Default for VideoSettings {
             jiggle_strength: 1.0,
             jiggle_breast_strength: 1.0,
             jiggle_glute_strength: 1.0,
+            jiggle_stomach_strength: 0.0,
             jiggle_stiffness: 1.0,
             jiggle_damping: 1.0,
             jiggle_glute_coverage_height: 1.0,
@@ -729,7 +744,9 @@ impl Default for VideoSettings {
             body_muscle: 0.5,
             body_weight: 0.5,
             body_proportions: 0.5,
+            body_height: 0.5,
             body_age: 0.5,
+            body_details: Default::default(),
             jiggle_locomotion: 1.0,
             jiggle_impulse_cap: 0.5,
             jiggle_swirl: 0.35,
@@ -737,6 +754,8 @@ impl Default for VideoSettings {
             jiggle_breast_damping: 1.0,
             jiggle_glute_stiffness: 1.0,
             jiggle_glute_damping: 1.0,
+            jiggle_stomach_stiffness: 1.0,
+            jiggle_stomach_damping: 1.0,
             // Initial body-region preset for naelstrof/JigglePhysics semantics.
             // Gravity intentionally starts at zero for soft tissue; raise it for
             // deliberate sag while the solver controls remain upstream-shaped.
@@ -913,7 +932,7 @@ impl Default for VideoSettings {
             promote_shader_emissive: true,
             rt_samples: 1,
             dynamic_light_falloff: 0,
-            rt_half_resolution: false,
+            rt_trace_rate: 1,
             map_light_simulation: false,
             world_lighting: true,
             vertex_lighting: false,

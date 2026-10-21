@@ -24,6 +24,7 @@ mod menu_look;
 pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage, MenuFx, MenuProp};
 mod geometry;
 mod lighting;
+mod memory;
 mod lightmaps;
 mod material_batches;
 mod prepare;
@@ -1503,7 +1504,7 @@ impl PreparedRemapPlan {
         map.inline_batches = self.inline_batches;
         map.inline_models = self.inline_models;
         map.portal_draw_plan = self.portal_draw_plan;
-        map.textures.extend(self.replacement_textures);
+        Arc::make_mut(&mut map.textures).extend(self.replacement_textures);
         map.texture_hashes.extend(self.replacement_texture_hashes);
         map.videos.extend(self.replacement_videos);
         map.warnings.extend(self.warnings);
@@ -1573,16 +1574,18 @@ pub struct PreparedMap {
     /// decided by the entity being in the snapshot, not by the world clusters.
     pub inline_batches: Vec<DrawBatch>,
     pub inline_models: Vec<InlineModelGeometry>,
-    pub textures: Vec<TextureData>,
+    /// Immutable decoded images shared by restart/remap copies and upload workers.
+    /// Only material edits that add images detach this collection.
+    pub textures: Arc<Vec<TextureData>>,
     /// `videoMap` cinematics streamed into entries of `textures`.
     pub videos: Vec<materials::VideoSource>,
     pub footprint_mark_textures: [Option<usize>; 2],
     pub footprint_mark_blend_modes: [u8; 2],
-    pub lightmaps: Vec<TextureData>,
+    pub lightmaps: Arc<Vec<TextureData>>,
     /// Directional q3map2/Rend2 companion for each effective lightmap page.
     /// Missing pages are represented by a neutral direction texture so runtime
     /// shaders can fall back to the BSP lightgrid without changing bindings.
-    pub deluxemaps: Vec<TextureData>,
+    pub deluxemaps: Arc<Vec<TextureData>>,
     /// Metadata only; cached AO generation itself is deferred to a dedicated
     /// runtime worker and therefore never blocks map preparation when disabled.
     pub static_bsp_ao_cache: Option<StaticBspAoCacheInfo>,

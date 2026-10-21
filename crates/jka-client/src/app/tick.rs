@@ -194,12 +194,14 @@ impl App {
             let command_buttons = crate::net::CommandButtons {
                 active: &self.live_buttons,
                 forced_moveup: self.japro_flipkick_moveup,
+                idrive: self.network.idrive,
                 any_key: !self.keys.is_empty() || !self.mouse_buttons_down.is_empty(),
                 talking: false,
             };
             let local_cmd = crate::net::movement_cmd(&self.live_input.create_cmd(&command_buttons));
 
             if let Some(server) = &mut self.local_server {
+                server.set_idrive(self.network.idrive);
                 server.set_mouse_input_settings(self.mouse_input);
                 match server.update(dt, &self.movement_keys, (0.0, 0.0), local_cmd) {
                     Ok(stamps) => deformation_stamps = stamps,
@@ -378,6 +380,7 @@ impl App {
         let vote_line = self.vote_hud_line();
         let team_overlay = self.team_overlay_ui();
         self.update_speedometer(now);
+        self.update_variometer();
         self.update_lagometer();
         if follow_name != self.follow_name_shown
             || game_timer != self.game_timer_shown

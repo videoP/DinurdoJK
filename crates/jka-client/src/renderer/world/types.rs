@@ -192,6 +192,11 @@ pub(in crate::renderer) struct WorldBatch {
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
     /// Fixed at upload from the material uniform (r_fragmentShaderMode 1).
     pub(in crate::renderer) fragment_key: MaterialFragmentKey,
+    /// Index of this batch's `(source.pipeline, fragment_key)` in
+    /// `WorldGpu::pso_slot_keys`, so `base_pipeline` reads a Vec instead of
+    /// searching maps per batch per frame. `u32::MAX` = unassigned; anything
+    /// that changes either key must reset it (`WorldGpu::refresh_pso_slots`).
+    pub(in crate::renderer) pso_slot: u32,
     pub(in crate::renderer) animation: Option<WorldBatchAnimation>,
     /// Same authored stage resources as `bind_group`, but with OpenJK's
     /// Dynamic Glow fog override: glow stages fog toward black during replay.
@@ -270,6 +275,10 @@ pub(in crate::renderer) struct WorldPipelineVariant {
     pub(in crate::renderer) pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     /// Compiled asynchronously only on first use of r_oceanSkyExtend 2.
     pub(in crate::renderer) ocean_far_pipeline: Option<wgpu::RenderPipeline>,
+    /// Submerged Hybrid: Blue Water's clipmap through the Godot ocean material
+    /// (`vs_ocean_native`), and its r_showtris overlay. Compiled on first use.
+    pub(in crate::renderer) ocean_native_mesh_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) ocean_native_mesh_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     /// OpenJK-style projected-light redraw. The normal world material pipelines
     /// compile with Legacy dlights disabled; only touched BSP triangles enter
     /// these additive depth-equal pipelines.
@@ -285,10 +294,10 @@ pub(in crate::renderer) struct WorldPipelineVariant {
     /// r_fragmentShaderMode 1: base-pass PSOs per material, keyed by the batch's
     /// full key; the value carries the narrowed key the PSO was built with, which
     /// identifies the program for redundant-bind checks. Empty in mode 0.
-    pub(in crate::renderer) specialized_pipelines: std::collections::HashMap<
-        (PipelineKey, MaterialFragmentKey),
-        (MaterialFragmentKey, wgpu::RenderPipeline),
-    >,
+    pub(in crate::renderer) specialized_pipelines: super::pipelines::SpecializedWorldPipelines,
+    /// `base_pipeline` resolved once per `WorldGpu::pso_slot_keys` entry.
+    /// Empty until `WorldGpu::refresh_pso_slots` runs for this variant.
+    pub(in crate::renderer) slot_pipelines: Vec<Option<(WorldPipelineBinding, wgpu::RenderPipeline)>>,
 }
 
 /// Which base-pass program is bound: the general one (`None`) or a specialized one.
@@ -301,15 +310,38 @@ impl WorldPipelineVariant {
         &self,
         batch: &WorldBatch,
     ) -> (WorldPipelineBinding, &wgpu::RenderPipeline) {
-        let key = batch.source.pipeline;
+        if let Some((binding, pipeline)) = self.slot_pipelines.get(batch.pso_slot as usize).and_then(Option::as_ref) {
+            debug_assert_eq!(binding.0, batch.source.pipeline, "stale world PSO slot");
+            return (*binding, pipeline);
+        }
+        self.lookup_base_pipeline(batch.source.pipeline, batch.fragment_key)
+    }
+
+    fn lookup_base_pipeline(
+        &self,
+        key: PipelineKey,
+        fragment_key: MaterialFragmentKey,
+    ) -> (WorldPipelineBinding, &wgpu::RenderPipeline) {
         if !self.specialized_pipelines.is_empty() {
             if let Some((narrowed, pipeline)) =
-                self.specialized_pipelines.get(&(key, batch.fragment_key))
+                self.specialized_pipelines.get(&(key, fragment_key))
             {
                 return ((key, Some(*narrowed)), pipeline);
             }
         }
         ((key, None), &self.pipelines[&key])
+    }
+
+    /// Resolve every slot key once. A key this variant has no general PSO for
+    /// stays `None`, and those batches take the map lookup exactly as before.
+    pub(in crate::renderer) fn build_slot_pipelines(&mut self, keys: &[(PipelineKey, MaterialFragmentKey)]) {
+        let resolved: Vec<_> = keys.iter()
+            .map(|&(key, fragment_key)| self.pipelines.contains_key(&key).then(|| {
+                let (binding, pipeline) = self.lookup_base_pipeline(key, fragment_key);
+                (binding, pipeline.clone())
+            }))
+            .collect();
+        self.slot_pipelines = resolved;
     }
 }
 
@@ -429,6 +461,26 @@ pub(in crate::renderer) struct AnimatedBatches {
 }
 
 impl WorldGpu {
+    /// Number the distinct `(pipeline, fragment)` keys of every world batch and
+    /// rebuild each variant's slot table. Call after batches are created or
+    /// their keys change, and after a variant is inserted.
+    pub(in crate::renderer) fn refresh_pso_slots(&mut self) {
+        let mut slots: std::collections::HashMap<(PipelineKey, MaterialFragmentKey), u32,
+            std::hash::BuildHasherDefault<crate::scene::FoldHasher>> = Default::default();
+        let mut keys = Vec::new();
+        for batch in self.coarse_batches.iter_mut().chain(&mut self.full_batches).chain(&mut self.auto4_batches) {
+            let key = (batch.source.pipeline, batch.fragment_key);
+            batch.pso_slot = *slots.entry(key).or_insert_with(|| {
+                keys.push(key);
+                (keys.len() - 1) as u32
+            });
+        }
+        for variant in self.pipeline_variants.values_mut() {
+            variant.build_slot_pipelines(&keys);
+        }
+        self.pso_slot_keys = keys;
+    }
+
     /// Every uploaded world batch representation (MINIMAL, FULL and AUTO).
     pub(in crate::renderer) fn all_world_batches(&self) -> impl Iterator<Item = &WorldBatch> {
         self.coarse_batches.iter().chain(&self.full_batches).chain(&self.auto4_batches)
@@ -499,6 +551,7 @@ pub(in crate::renderer) struct WorldGpu {
     /// snapped centre or the camera's BSP cluster changes.
     pub(in crate::renderer) runtime_ocean_clipmaps: Vec<RuntimeOceanClipmap>,
     pub(in crate::renderer) inline_models: Vec<InlineModelGpu>,
+    pub(in crate::renderer) inline_transform: Option<super::inline_transform::InlineTransformGpu>,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
     /// Opaque, static-world index ranges eligible for the ray-query BLAS.
@@ -564,6 +617,7 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) sun: Option<DirectionalSun>,
     /// Direct irradiance measured from paired sunlit/shadowed BSP surfaces.
     pub(in crate::renderer) baked_sun_radiance: Option<[f32; 3]>,
+    pub(in crate::renderer) sun_bake: crate::renderer::lighting::sun_bake::SunBake,
     pub(in crate::renderer) baked_sun_encoding: Option<scene::BakedSunEncoding>,
     pub(in crate::renderer) baked_sun_cache: Option<crate::renderer::lighting::baked_sun_cache::LightmapCache>,
     pub(in crate::renderer) grass: Option<GrassMapGpu>,
@@ -573,6 +627,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) active_pipeline_variant: WorldShaderVariantKey,
     pub(in crate::renderer) pipeline_variants:
         BTreeMap<WorldShaderVariantKey, WorldPipelineVariant>,
+    /// Distinct `(pipeline, fragment)` keys; `WorldBatch::pso_slot` indexes it.
+    pub(in crate::renderer) pso_slot_keys: Vec<(PipelineKey, MaterialFragmentKey)>,
     pub(in crate::renderer) fast_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     pub(in crate::renderer) fast_complexity_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     pub(in crate::renderer) complexity_pipelines: BTreeMap<WorldShaderVariantKey, BTreeMap<PipelineKey, wgpu::RenderPipeline>>,
@@ -618,7 +674,7 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) footprint_mark_textures: [Option<usize>; 2],
     pub(in crate::renderer) lightmaps: Vec<GpuImage>,
     pub(in crate::renderer) deluxemaps: Vec<GpuImage>,
-    pub(in crate::renderer) lightmap_base_data: Vec<TextureData>,
+    pub(in crate::renderer) lightmap_base_data: Arc<Vec<TextureData>>,
     pub(in crate::renderer) static_ao_source: Option<StaticAoWorldSource>,
     pub(in crate::renderer) static_ao_source_to_gpu: Vec<u32>,
     pub(in crate::renderer) static_ao_gpu_vertices: Vec<GpuVertex>,

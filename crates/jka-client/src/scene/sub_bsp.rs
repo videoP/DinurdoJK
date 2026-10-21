@@ -145,10 +145,10 @@ fn append_sub_bsp(map: &mut PreparedMap, mut child: PreparedMap) -> Result<(), S
     let lightmap_offset = map.lightmaps.len();
     let debug_offset = u32::try_from(map.material_debug.entries.len())
         .map_err(|_| "Material count exceeds u32")?;
-    map.textures.append(&mut child.textures);
+    Arc::make_mut(&mut map.textures).append(Arc::make_mut(&mut child.textures));
     map.texture_hashes.append(&mut child.texture_hashes);
-    map.lightmaps.append(&mut child.lightmaps);
-    map.deluxemaps.append(&mut child.deluxemaps);
+    Arc::make_mut(&mut map.lightmaps).append(Arc::make_mut(&mut child.lightmaps));
+    Arc::make_mut(&mut map.deluxemaps).append(Arc::make_mut(&mut child.deluxemaps));
     for video in &mut child.videos {
         video.texture += texture_offset;
     }

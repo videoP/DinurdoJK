@@ -632,53 +632,52 @@ app_cvars! {
         ]
     }
 
-    APP_R_RTRESOLUTION {
-        runtime: CvarDef::new("r_rtResolution", "", "full|half", "RT sun shadow rate. half = reduced rate: retraces each pixel every 4th frame and carries the rest by motion vectors; shadow edges and disocclusions still trace every frame. Always full screen resolution; local lights are always traced directly.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rtresolution(app)), |app, value| App::cvar_set_r_rtresolution(app, APP_R_RTRESOLUTION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rtresolution, None),
+    APP_R_RTTRACERATE {
+        runtime: CvarDef::new("r_rtTraceRate", "", "1|2|4", "RT sun and local-light update rate: 1 Full, 2 Half, 4 Quarter. Retains full output resolution and reuses validated visibility history between fresh traces. Changes, edges and disocclusions may trace more often; colored glass uses direct rays.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.video.rt_trace_rate.to_string()), |app, value| App::cvar_set_r_rttracerate(app, APP_R_RTTRACERATE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rttracerate, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    match value.to_ascii_lowercase().as_str() {
-                        "full" | "1" => settings.rt_half_resolution = false,
-                        "half" | "0.5" => settings.rt_half_resolution = true,
-                        _ => {}
-                    }
-                }),
-                archive: Some((165, |state| {
-                    let settings = state.video;
-                    format!(
-                        "{}",
-                        if settings.rt_half_resolution {
-                            "half"
-                        } else {
-                            "full"
-                        }
-                    )
-                })),
-                ..CvarBinding::NONE
-            },
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(rate @ (1 | 2 | 4)) = value.parse::<u32>() { settings.rt_trace_rate = rate; }
+            }),
+            archive: Some((165, |state| state.video.rt_trace_rate.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [
             impl App {
-                fn cvar_get_r_rtresolution(&self) -> String {
-                    if self.video.rt_half_resolution {
-                        "half"
-                    } else {
-                        "full"
-                    }
-                    .to_owned()
-                }
-                fn cvar_set_r_rtresolution(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.video.rt_half_resolution = match value.to_ascii_lowercase().as_str() {
-                            "full" | "1" => false,
-                            "half" | "0.5" => true,
-                            _ => return Err(format!("{name}: expected full|half")),
-                        };
-                        self.render_command(RenderCommand::SetRtHalfResolution(
-                            self.video.rt_half_resolution,
-                        ));
-                        self.mark_config_dirty();
-                        self.publish_ui();
-                    }
+                fn cvar_set_r_rttracerate(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let rate = value.parse::<u32>().ok().filter(|n| matches!(n, 1 | 2 | 4))
+                        .ok_or_else(|| format!("{name}: expected 1|2|4"))?;
+                    self.video.rt_trace_rate = rate;
+                    self.render_command(RenderCommand::SetRtTraceRate(rate));
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
+                }
+            }
+        ]
+    }
+
+    // Preserve old configs: historical "half" actually retraced one quarter per frame.
+    APP_R_RTRESOLUTION {
+        runtime: CvarDef::new("r_rtResolution", "", "full|half", "Legacy alias: full selects r_rtTraceRate 1; half selects 4. Prefer r_rtTraceRate 1|2|4.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app: &App| CvarValue::String(if app.video.rt_trace_rate == 1 { "full" } else { "half" }.to_owned()), |app, value| App::cvar_set_r_rtresolution(app, APP_R_RTRESOLUTION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rtresolution, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                match value.to_ascii_lowercase().as_str() {
+                    "full" | "1" => settings.rt_trace_rate = 1,
+                    "half" | "0.5" => settings.rt_trace_rate = 4,
+                    _ => {}
+                }
+            }),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_rtresolution(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let rate = match value.to_ascii_lowercase().as_str() {
+                        "full" | "1" => "1",
+                        "half" | "0.5" => "4",
+                        _ => return Err(format!("{name}: expected full|half (prefer r_rtTraceRate 1|2|4)")),
+                    };
+                    self.cvar_set_r_rttracerate("r_rtTraceRate", rate)
                 }
             }
         ]

@@ -53,6 +53,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace("interaction_lifetime: 2.5, interaction_fade: 1.0, interaction_damping: 2.0, interaction_edge_fade: 81.92, ", "")
         // The prediction backend/rounding cvars were deleted. Preserve the old
         // NetworkSettings Debug-layout for unrelated frozen compatibility hashes.
+        .replace(", idrive: true", "")
+        .replace(", idrive: false", "")
         .replace(", prediction_miss_threshold: ", ", snap_mode: -1, predict_backend: -1, prediction_miss_threshold: ")
         .replace(", third_person_flag_alpha: 1.0", "")
         .replace(", console_notify_lines: 3", "")
@@ -74,6 +76,9 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", jiggle_breast_damping: 1.0", "")
         .replace(", jiggle_glute_stiffness: 1.0", "")
         .replace(", jiggle_glute_damping: 1.0", "")
+        .replace(", jiggle_stomach_strength: 0.0", "")
+        .replace(", jiggle_stomach_stiffness: 1.0", "")
+        .replace(", jiggle_stomach_damping: 1.0", "")
         // New flare settings did not exist in the frozen pre-registry settings.
         .replace(", world_flares: false", "")
         .replace(", saber_flares: true", "")
@@ -131,7 +136,8 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
         projected_archive = actual
             .lines()
             .filter(|line| {
-                !line.starts_with("seta cg_swimTilt ")
+                !line.starts_with("seta cl_idrive ")
+                    && !line.starts_with("seta cg_swimTilt ")
                     && !line.starts_with("seta r_bakedSunRemoval ")
                     && !line.starts_with("seta r_bakedSunCache ")
                     && !line.starts_with("seta r_sunShadowStrength ")
@@ -157,6 +163,9 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_jiggleBreastDamping ")
                     && !line.starts_with("seta r_jiggleGluteStiffness ")
                     && !line.starts_with("seta r_jiggleGluteDamping ")
+                    && !line.starts_with("seta r_jiggleStomachStrength ")
+                    && !line.starts_with("seta r_jiggleStomachStiffness ")
+                    && !line.starts_with("seta r_jiggleStomachDamping ")
                     && !line.starts_with("seta cl_serverFilters ")
                     // New controls are outside the frozen pre-registry archive.
                     && !line.starts_with("seta r_worldFlares ")
@@ -477,6 +486,31 @@ fn jiggle_glute_coverage_height_cvar_addition_loads_and_archives() {
     assert!(fs::read_to_string(&path)
         .unwrap()
         .contains("seta r_jiggleGluteCoverageHeight \"0.720\""));
+}
+
+#[test]
+fn stomach_jiggle_is_opt_in_and_loads_and_archives_independently() {
+    assert_eq!(crate::ui::VideoSettings::default().jiggle_stomach_strength, 0.0);
+    let fixture = Fixture::new();
+    let path = fixture.0.join("stomach.cfg");
+    fs::write(&path, "seta r_jiggleStomachStrength 1.25\nseta r_jiggleStomachStiffness 0.6\nseta r_jiggleStomachDamping 1.8\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert_eq!(settings.jiggle_stomach_strength, 1.25);
+    assert_eq!(settings.jiggle_stomach_stiffness, 0.6);
+    assert_eq!(settings.jiggle_stomach_damping, 1.8);
+    assert_eq!(settings.jiggle_breast_strength, 1.0);
+    assert_eq!(settings.jiggle_glute_strength, 1.0);
+    config::save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    for line in ["seta r_jiggleStomachStrength \"1.250\"", "seta r_jiggleStomachStiffness \"0.600\"",
+        "seta r_jiggleStomachDamping \"1.800\""] {
+        assert!(saved.contains(line), "{line}");
+    }
+    let reloaded = config::load_video_settings(&path);
+    assert_eq!(reloaded.jiggle_stomach_strength, 1.25);
+    assert_eq!(reloaded.jiggle_stomach_stiffness, 0.6);
+    assert_eq!(reloaded.jiggle_stomach_damping, 1.8);
 }
 
 #[test]

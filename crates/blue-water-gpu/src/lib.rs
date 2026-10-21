@@ -15,7 +15,9 @@ pub mod geometry;
 pub mod foam_texture;
 pub mod shader_composer;
 pub mod original_surface;
+pub mod submerged_mesh;
 pub mod scene_copy;
+pub mod reflection_tiles;
 pub mod map_environment;
 pub mod underwater;
 pub mod caustics;
@@ -23,11 +25,13 @@ pub mod rain_heights;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/environment.rs"]
 pub mod sky_environment;
 pub mod surface_waves;
+mod crest_limits;
 #[path = "../../../vendor/blue-water-sea-and-sky/ocean/src/shore.rs"]
 pub mod shore;
 #[path = "../../../vendor/blue-water-sea-and-sky/ocean/src/hull_sea.rs"]
 pub mod hull_sea;
 pub mod lakes;
+pub mod godot_water;
 use blue_water_core::{sea_state, spectrum, whitecaps, CascadeInfo, QualityTier, WaveParameters};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -94,6 +98,7 @@ pub struct WaveField {
     current: usize,
     last_phase: f32,
     spectrum_fresh: bool,
+    crest_limits: crest_limits::CrestLimits,
 }
 
 fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -443,7 +448,9 @@ impl WaveField {
                 })
                 .collect()
         });
+        let crest_limits = crest_limits::CrestLimits::new(device, &sets, &field_params, n, count);
         Self {
+            crest_limits,
             tier: tier.clone(),
             cascades: tier,
             n,
@@ -470,6 +477,19 @@ impl WaveField {
 
     pub fn current_index(&self) -> usize {
         self.current
+    }
+    pub fn set_crest_limits(&mut self, enabled: bool) {
+        if enabled && !self.crest_limits.enabled { self.spectrum_fresh = true; }
+        self.crest_limits.enabled = enabled;
+    }
+    pub fn request_update(&mut self) {
+        self.spectrum_fresh = true;
+    }
+    pub fn crest_limits_buffer(&self) -> &wgpu::Buffer {
+        &self.crest_limits.buffer
+    }
+    pub fn prepare_composite_crest_limits(&mut self, device: &wgpu::Device, waves: &surface_waves::SurfaceWaves) {
+        self.crest_limits.prepare_composite(device, waves, &self.field_params);
     }
     pub fn views_for(&self, set: usize) -> &[wgpu::TextureView; 3] {
         &self.sets[set].views
@@ -551,6 +571,7 @@ impl WaveField {
         foam_lifetime: f64,
     ) -> bool {
         self.rebuild_spectrum(queue, params, realistic);
+        if self.spectrum_fresh && self.crest_limits.enabled { self.crest_limits.reset(encoder); }
         let phase = time.rem_euclid(spectrum::FOLD_PERIOD) / spectrum::FOLD_PERIOD;
         if !self.spectrum_fresh && dt <= 0.0 && phase as f32 == self.last_phase {
             return false;
@@ -654,6 +675,7 @@ impl WaveField {
             pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), self.count);
         }
         drop(pass);
+        self.crest_limits.encode(encoder, next, n, self.count);
         self.current = next;
         true
     }

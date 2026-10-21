@@ -1650,6 +1650,7 @@ fn ghoul2_draw_uniform_matches_the_skin_draw_wgsl_struct() {
         ("uv_xform", offset_of!(Ghoul2GpuDrawUniform, uv_xform)),
         ("uv_cross", offset_of!(Ghoul2GpuDrawUniform, uv_cross)),
         ("jiggle3", offset_of!(Ghoul2GpuDrawUniform, jiggle3)),
+        ("jiggle4", offset_of!(Ghoul2GpuDrawUniform, jiggle4)),
         (
             "source_phong",
             offset_of!(Ghoul2GpuDrawUniform, source_phong),
@@ -2004,4 +2005,59 @@ fn additive_parity_has_no_runtime_debug_mode() {
     assert!(!include_str!("../../ui/settings/video.rs").contains("additive_blend_debug"));
     assert!(!include_str!("../api.rs").contains("SetAdditiveBlendDebug"));
     assert!(!include_str!("../../app/commands/registry/renderer_cvars.rs").contains("r_additiveBlendDebug"));
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn specialized_post_pipelines_validate() {
+    // r_postSpecialize compiles fs_main with POST_FEATURES masks. Every mask,
+    // including "nothing", must survive naga override processing and backend
+    // compilation exactly like the general pipeline.
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device, _queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }).await.unwrap();
+        let source = crate::weather::with_weather_surface(&crate::weather::with_post_settings(
+            include_str!("../../post.wgsl"),
+        ));
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("post specialization test"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        for features in [Some(0), Some(256 | 512), Some(u32::MAX), None] {
+            let constants = features.map(|mask| [("POST_FEATURES", f64::from(mask))]);
+            let _ = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("post specialization test"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: constants.as_ref().map_or(&[][..], |c| &c[..]),
+                        ..Default::default()
+                    },
+                    targets: &[Some(wgpu::TextureFormat::Bgra8UnormSrgb.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        }
+        assert!(block_on(scope.pop()).is_none(), "specialized post pipelines must validate");
+    });
 }

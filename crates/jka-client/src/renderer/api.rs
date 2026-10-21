@@ -255,9 +255,9 @@ pub struct Ghoul2GpuSkinning {
     /// replaces `uv_xform`'s mapping of the base mesh UVs with q3's reflection-
     /// vector environment mapping (`RB_CalcEnvironmentTexCoords`).
     pub env_map: bool,
-    /// Up to four model-space post-skin region offsets. Ordinary Ghoul2 draws
+    /// Up to five model-space post-skin region offsets. Ordinary Ghoul2 draws
     /// keep these zero; jiggle vertices select one through `jiggle_region`.
-    pub jiggle_offsets: [[f32; 4]; 4],
+    pub jiggle_offsets: [[f32; 4]; crate::cgame::jiggle::MAX_GPU_JIGGLE_REGIONS],
     /// Source 1 bump/phong material, if this surface came from a VMT. `None` for
     /// every JKA surface, and the renderer keys its pipeline choice off that.
     pub source_material: Option<SourceMaterialParams>,
@@ -994,11 +994,29 @@ pub enum ScreenshotFormat {
     Png,
 }
 
+/// `gputilecost` console command: measured per-tile GPU cost.
+pub enum TileCostCommand {
+    /// Sweep a `cols` x `rows` grid with `samples` timings per tile; write `stem`.csv/.json.
+    Start { stem: PathBuf, cols: u32, rows: u32, samples: usize },
+    /// Show the finished heatmap of one GPU pass (report label, e.g. `ocean_surface`).
+    Show(String),
+    /// Hide the heatmap.
+    Hide,
+    /// Stop a running sweep without a report.
+    Cancel,
+    /// Log the passes the finished report has data for.
+    ListPasses,
+}
+
 pub enum RenderCommand {
+    /// On-demand accounting; no polling or resource walking in ordinary frames.
+    MemoryInfo,
     /// Arm a bounded, off-by-default per-frame command-encoding capture.
-    StartPerfCapture { stem: PathBuf, frames: usize },
+    /// `seconds` makes the capture time-bounded (frames is then only a cap).
+    StartPerfCapture { stem: PathBuf, frames: usize, seconds: Option<f64> },
     /// One-command six-phase GPU sky sweep on the existing Unified renderer.
     StartSkyPerfSweep { stem: PathBuf, frames: usize },
+    TileCost(TileCostCommand),
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
     SetMaxFrameLatency(u32),
@@ -1044,9 +1062,11 @@ pub enum RenderCommand {
     SetFacePlaneCull(bool),
     SetWorldFlares(bool),
     SetDrawInlineModels(bool),
+    SetInlineTransformMode(ui::InlineTransformMode),
     /// r_fragmentShaderMode: 0 general world fragment program, 1 per-material specialized.
     SetFragmentShaderMode(u8),
     SetWorldSortMode(u8),
+    SetPostSpecialize(bool),
     /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
     SetColorClearMode(u8),
     /// Render-only controls for compiled model-path world stages and GPU A/B stage isolation.
@@ -1120,7 +1140,7 @@ pub enum RenderCommand {
     SetDynamicLightDebug(bool),
     SetRtSamples(u32),
     SetDynamicLightFalloff(u32),
-    SetRtHalfResolution(bool),
+    SetRtTraceRate(u32),
     SetMapLightSimulation(bool),
     SetClassicWorldLighting {
         fullbright: bool,
@@ -1385,6 +1405,8 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_specialized_binds: u32,
     pub(in crate::renderer) world_general_binds: u32,
     pub(in crate::renderer) world_shader_programs: crate::runtime::WorldShaderPrograms,
+    /// Active world variant PSOs: general + per-material specialized (not total cache).
+    pub(in crate::renderer) world_pipeline_counts: (u32, u32),
     /// Sort A/B: estimated pipeline transitions for eligible runs only.
     /// These are NOT actual bind counts (compaction/fog may change them).
     pub(in crate::renderer) world_sort_candidates: u32,

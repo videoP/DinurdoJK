@@ -276,6 +276,17 @@ commands! {
         }
     }
 
+    cmd_setviewpos_exact ["setviewpos_exact", ] ("setviewpos_exact <x> <y> <z> <yaw> [pitch]", "Local game: setviewpos without the 400 u/s teleport push, so the view rests exactly there (benchmarks).", CommandScope::Connected) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb, arguments @ ..] if self.local_server.is_some() => {
+                self.local_setviewpos_with_push(arguments, 1);
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
     cmd_cycle_spawn ["cycle_spawn", ] ("cycle_spawn", "Cycle the local spawn point.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -577,7 +588,7 @@ commands! {
             Some(id) if self.live_connected() && self.live_input.queue_emote_taunt(id) => {
                 self.push_console_line(format!("^5[DJK EMOTE NET] transmitting ID {id} with immediate taunt (experimental)"));
             }
-            _ => self.push_console_line("^3Usage: emote_net_test <0..2047> while connected to a server".to_owned()),
+            _ => self.push_console_line("^3Usage: emote_net_test <0..8191> while connected to a server (8191 = stop)".to_owned()),
         }
         CommandResult::Handled
     }

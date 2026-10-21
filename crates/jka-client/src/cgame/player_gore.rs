@@ -18,7 +18,7 @@ pub(crate) struct GpuSnap {
     pub vertices: Arc<Vec<Ghoul2GpuVertex>>,
     pub indices: Arc<Vec<u32>>,
     pub bones: Arc<Vec<Ghoul2GpuBone>>,
-    pub jiggle_offsets: [[f32; 4]; 4],
+    pub jiggle_offsets: [[f32; 4]; crate::cgame::jiggle::MAX_GPU_JIGGLE_REGIONS],
     pub axis: [[f32; 3]; 3],
     pub origin: [f32; 3],
 }
@@ -74,7 +74,7 @@ pub(crate) fn skin_vertex(vertex: &Ghoul2GpuVertex, snap: &GpuSnap) -> ([f32; 3]
         3 => lerp3(&[(point(0), w[0]), (point(1), w[1]), (point(2), 1.0 - w[0] - w[1])]),
         _ => lerp3(&[(point(0), w[0]), (point(1), w[1]), (point(2), w[2]), (point(3), 1.0 - w[0] - w[1] - w[2])]),
     };
-    if vertex.jiggle_weight > 0.0 && vertex.jiggle_region < 4 {
+    if vertex.jiggle_weight > 0.0 && (vertex.jiggle_region as usize) < snap.jiggle_offsets.len() {
         let offset = snap.jiggle_offsets[vertex.jiggle_region as usize];
         let effective_weight = if vertex.jiggle_coord.abs() < 2.0 {
             let bottom = snap.jiggle_offsets[0][3];
@@ -287,7 +287,7 @@ mod tests {
             ]),
             indices: Arc::new(vec![0, 1, 2, 0, 2, 3]),
             bones: Arc::new(vec![bone]),
-            jiggle_offsets: [[0.0; 4]; 4],
+            jiggle_offsets: Default::default(),
             axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             origin: [0.0, 0.0, 0.0],
         }

@@ -105,7 +105,7 @@ impl DeferredWorldBundles {
                 use super::programs::StageProgram;
                 let kind = match command.binding.1.map(|key| key.program) {
                     None => 0,
-                    Some(StageProgram::Specialized) => 1,
+                    Some(StageProgram::Specialized | StageProgram::SpecializedLean) => 1,
                     Some(StageProgram::Minimal) => 2,
                     Some(StageProgram::SharedBasic | StageProgram::SharedEnhanced) => 3,
                     Some(StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced) => 4,

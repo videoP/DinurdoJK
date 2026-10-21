@@ -281,48 +281,6 @@ fn offline_speed_rage_and_regeneration_are_separate_from_prediction() {
 }
 
 #[test]
-fn offline_force_regenerates_from_exactly_zero_at_50ms_cadence() {
-    use jka_movement::{MovementPower, TICK_MSEC};
-    let movement = animations();
-    let mut world = Map::floor().world();
-    let mut p = player(24.125);
-
-    // Two level-three Force Speed activations cost 50 each. Advance Pmove
-    // without an authority tick between toggles so regeneration cannot mask
-    // the exhausted-resource boundary being tested here.
-    p.offline_force_tick(TICK_MSEC, Some(MovementPower::Speed)).unwrap();
-    assert_eq!(p.view().force_power, 50);
-    tick(&movement, &mut p, &mut world, 0, 0, 0);
-    for _ in 0..200 {
-        tick(&movement, &mut p, &mut world, 0, 0, 0);
-    }
-    p.offline_force_tick(p.view().command_time + TICK_MSEC, Some(MovementPower::Speed)).unwrap();
-    assert_eq!(p.view().active_powers & (1 << 2), 0);
-    tick(&movement, &mut p, &mut world, 0, 0, 0);
-    p.offline_force_tick(p.view().command_time + TICK_MSEC, Some(MovementPower::Speed)).unwrap();
-    assert_eq!(p.view().force_power, 0);
-    tick(&movement, &mut p, &mut world, 0, 0, 0);
-
-    // Speed is allowed to stay active at zero (stock behaviour) until it is
-    // toggled off or expires; after stopping, power must recover from zero.
-    for _ in 0..200 {
-        tick(&movement, &mut p, &mut world, 0, 0, 0);
-    }
-    p.offline_force_tick(p.view().command_time + TICK_MSEC, Some(MovementPower::Speed)).unwrap();
-    assert_eq!(p.view().active_powers & (1 << 2), 0);
-    tick(&movement, &mut p, &mut world, 0, 0, 0);
-
-    for _ in 0..125 {
-        let next = p.view().command_time + TICK_MSEC;
-        p.offline_force_tick(next, None).unwrap();
-        tick(&movement, &mut p, &mut world, 0, 0, 0);
-    }
-    // 1000ms of idle server time should restore ~20 points, not the 5
-    // points from the old hardcoded 200ms regeneration interval.
-    assert!((19..=22).contains(&p.view().force_power), "{:?}", p.view());
-}
-
-#[test]
 fn invalid_collision_references_are_rejected_even_without_pvs() {
     let bytes = Map::floor().bytes();
     let offset = |lump: usize| {

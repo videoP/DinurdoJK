@@ -12,7 +12,8 @@ use crate::app::egui_settings::{
     PHYS_JIGGLE_JP_SOFTEN, PHYS_JIGGLE_JP_STIFFNESS, PHYS_JIGGLE_JP_STRETCH, PHYS_JIGGLE_SOLVER,
     PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH,
     PHYS_JIGGLE_LOCOMOTION, PHYS_JIGGLE_SWIRL, PHYS_JIGGLE_BREAST_STIFFNESS,
-    PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS, PHYS_JIGGLE_GLUTE_DAMPING,
+    PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS, PHYS_JIGGLE_GLUTE_DAMPING, PHYS_JIGGLE_STOMACH,
+    PHYS_JIGGLE_STOMACH_STIFFNESS, PHYS_JIGGLE_STOMACH_DAMPING,
     PHYS_MAX_SUBSTEPS, PHYS_PLAYER_PUSH, PHYS_PROPS,
     PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME, PHYS_RAGDOLL_MAX,
     PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS, PHYS_WEAPON_IMPULSES,
@@ -183,7 +184,7 @@ impl App {
         if let Some(mode) = segmented_row(
             ui,
             "Jiggle physics",
-            "Choose which players receive breast/glute size and secondary motion, using the loaded model's authored sex. Client physics must also be enabled.",
+            "Choose which players receive breast/glute size and breast/glute/stomach secondary motion, using the loaded model's authored sex. Client physics must also be enabled.",
             theme::Reset::Physics(PHYS_JIGGLE),
             self.video.jiggle_physics,
             &JIGGLE_TARGETS,
@@ -205,6 +206,7 @@ impl App {
         for (label, tip, field, current, min, max, cvar) in [
             ("Overall motion", "Global multiplier for all soft-tissue displacement.", PHYS_JIGGLE_STRENGTH, self.video.jiggle_strength, 0.0, 2.0, "r_jiggleStrength"),
             ("Breast motion", "Multiplier for chest-region displacement only.", PHYS_JIGGLE_BREAST, self.video.jiggle_breast_strength, 0.0, 2.0, "r_jiggleBreastStrength"),
+            ("Stomach motion", "Optional belly displacement, only on models with detected abdominal fullness. Zero disables it.", PHYS_JIGGLE_STOMACH, self.video.jiggle_stomach_strength, 0.0, 2.0, "r_jiggleStomachStrength"),
             ("Glute motion", "Multiplier for glute-region displacement only.", PHYS_JIGGLE_GLUTE, self.video.jiggle_glute_strength, 0.0, 2.0, "r_jiggleGluteStrength"),
             ("Locomotion kick", "How strongly your own acceleration (start/stop, jumps, landings, direction changes) throws the tissue. Steady running never adds lag; walk/run bounce comes from the animated body.", PHYS_JIGGLE_LOCOMOTION, self.video.jiggle_locomotion, 0.0, 2.0, "r_jiggleLocomotion"),
             ("Swirl", "Bends straight bounces into mirrored elliptical/circular orbits. Energy-neutral, so damping still settles the motion. 0 = straight bounce.", PHYS_JIGGLE_SWIRL, self.video.jiggle_swirl, 0.0, 1.0, "r_jiggleSwirl"),
@@ -249,12 +251,14 @@ impl App {
         }
 
         if self.video.jiggle_solver == 0 {
-            theme::section(ui, "KAWAIIPHYSICS", "Overall multipliers apply to every region; breast/glute multipliers stack on top.");
+            theme::section(ui, "KAWAIIPHYSICS", "Overall multipliers apply to every region; breast/glute/stomach multipliers stack on top.");
             for (label, tip, field, current, cvar) in [
                 ("Overall stiffness", "KawaiiPhysics stiffness multiplier for all regions. Higher values pull the virtual soft point toward the animated pose faster.", PHYS_JIGGLE_STIFFNESS, self.video.jiggle_stiffness, "r_jiggleStiffness"),
                 ("Overall damping", "KawaiiPhysics damping multiplier for all regions. Higher values remove secondary velocity faster.", PHYS_JIGGLE_DAMPING, self.video.jiggle_damping, "r_jiggleDamping"),
                 ("Breast stiffness", "Breast-only stiffness multiplier. Lower = slower, heavier bounce; higher = quicker and tighter.", PHYS_JIGGLE_BREAST_STIFFNESS, self.video.jiggle_breast_stiffness, "r_jiggleBreastStiffness"),
                 ("Breast damping", "Breast-only damping multiplier. Lower = bounces longer; higher = settles sooner.", PHYS_JIGGLE_BREAST_DAMPING, self.video.jiggle_breast_damping, "r_jiggleBreastDamping"),
+                ("Stomach stiffness", "Stomach-only stiffness multiplier. Lower gives a slower, heavier bounce.", PHYS_JIGGLE_STOMACH_STIFFNESS, self.video.jiggle_stomach_stiffness, "r_jiggleStomachStiffness"),
+                ("Stomach damping", "Stomach-only damping multiplier. Higher settles motion sooner.", PHYS_JIGGLE_STOMACH_DAMPING, self.video.jiggle_stomach_damping, "r_jiggleStomachDamping"),
                 ("Glute stiffness", "Glute-only stiffness multiplier. Lower = slower, heavier bounce; higher = quicker and tighter.", PHYS_JIGGLE_GLUTE_STIFFNESS, self.video.jiggle_glute_stiffness, "r_jiggleGluteStiffness"),
                 ("Glute damping", "Glute-only damping multiplier. Lower = bounces longer; higher = settles sooner.", PHYS_JIGGLE_GLUTE_DAMPING, self.video.jiggle_glute_damping, "r_jiggleGluteDamping"),
             ] {

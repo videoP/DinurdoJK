@@ -17,8 +17,10 @@ mod pose;
 mod powerups;
 mod presentation;
 mod previews;
+mod profile_selection;
 mod emote_props;
 mod emote_effects;
+mod emote_taunt;
 mod sabers;
 mod state;
 mod submission;
@@ -320,6 +322,8 @@ pub struct PlayerPresenter {
     skinning_mode: Ghoul2SkinningMode,
     /// Profile-only CPU skinning of the *promoted* mesh; never affects live drawing.
     preview_cpu_remesh: bool,
+    profile_body_pick: Option<previews::BodyPick>,
+    profile_selection: profile_selection::ProfileSelection,
     early_frustum_cull: bool,
     /// When true, camera-culled Ghoul2 models may still be submitted as
     /// shadow-only RT casters. Normal RT-off presentation is unchanged.

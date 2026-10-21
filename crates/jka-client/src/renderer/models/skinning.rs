@@ -504,6 +504,7 @@ impl DynamicModelRenderer {
                     jiggle1: skin.jiggle_offsets[1],
                     jiggle2: skin.jiggle_offsets[2],
                     jiggle3: skin.jiggle_offsets[3],
+                    jiggle4: skin.jiggle_offsets[4],
                     // See the ensure_texture call above: this path never selects
                     // a Source material pipeline.
                     source_phong: [0.0; 4],

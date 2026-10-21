@@ -284,6 +284,48 @@ impl MemoryProperties {
 }
 
 impl super::Device {
+    /// DinurdoJK patch: with `DINURDO_VK_SHADER_STATS=1` (which enables
+    /// VK_KHR_pipeline_executable_properties at device creation), print the
+    /// driver's statistics for each stage of a new render pipeline to stderr,
+    /// one line per stage: `[VK SHADER STATS] <label> <stage>: <name>=<value>, ...`.
+    /// Diagnostic only (register counts for occupancy work).
+    unsafe fn log_shader_stats(&self, pipeline: vk::Pipeline, label: Option<&str>) {
+        let ext = ash::khr::pipeline_executable_properties::Device::new(
+            &self.shared.instance.raw,
+            &self.shared.raw,
+        );
+        let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
+        let Ok(executables) = (unsafe { ext.get_pipeline_executable_properties(&info) }) else {
+            return;
+        };
+        for (index, executable) in executables.iter().enumerate() {
+            let exec_info = vk::PipelineExecutableInfoKHR::default()
+                .pipeline(pipeline)
+                .executable_index(index as u32);
+            let Ok(stats) = (unsafe { ext.get_pipeline_executable_statistics(&exec_info) }) else {
+                continue;
+            };
+            let values = stats
+                .iter()
+                .map(|stat| {
+                    let name = stat.name_as_c_str().map(|n| n.to_string_lossy()).unwrap_or_default();
+                    let value = unsafe {
+                        match stat.format {
+                            vk::PipelineExecutableStatisticFormatKHR::BOOL32 => alloc::format!("{}", stat.value.b32),
+                            vk::PipelineExecutableStatisticFormatKHR::INT64 => alloc::format!("{}", stat.value.i64),
+                            vk::PipelineExecutableStatisticFormatKHR::UINT64 => alloc::format!("{}", stat.value.u64),
+                            _ => alloc::format!("{}", stat.value.f64),
+                        }
+                    };
+                    alloc::format!("{name}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let stage = executable.name_as_c_str().map(|n| n.to_string_lossy()).unwrap_or_default();
+            std::eprintln!("[VK SHADER STATS] {} {stage}: {values}", label.unwrap_or("?"));
+        }
+    }
+
     /// # Safety
     ///
     /// - `vk_image` must be created respecting `desc`
@@ -2146,8 +2188,18 @@ impl crate::Device for super::Device {
 
         let raw_pass = self.shared.make_render_pass(compatible_rp_key)?;
 
+        // DinurdoJK patch: see `log_shader_stats`.
+        let shader_stats = self
+            .shared
+            .enabled_extensions
+            .contains(&ash::khr::pipeline_executable_properties::NAME);
         let vk_infos = [{
             vk::GraphicsPipelineCreateInfo::default()
+                .flags(if shader_stats {
+                    vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR
+                } else {
+                    vk::PipelineCreateFlags::empty()
+                })
                 .layout(desc.layout.raw)
                 .stages(&stages)
                 .vertex_input_state(&vk_vertex_input)
@@ -2179,6 +2231,9 @@ impl crate::Device for super::Device {
         let raw = raw_vec.pop().unwrap();
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
+        }
+        if shader_stats {
+            unsafe { self.log_shader_stats(raw, desc.label) };
         }
 
         if let Some(CompiledStage {

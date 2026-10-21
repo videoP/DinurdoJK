@@ -289,7 +289,7 @@ impl App {
         let key = (
             format!(
                 "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}:{:.2}:{:.2}:{:?}",
-                format!("{animation_name}:{:?}", crate::emotes::active_preview().map(|p| p.emote.id)),
+                format!("{animation_name}:{:?}:{:?}", crate::emotes::active_preview().map(|p| p.emote.id), self.profile_body_highlight),
                 preview_model,
                 self.network.saber1,
                 self.network.saber2,
@@ -304,7 +304,7 @@ impl App {
                 self.profile_studio_head_look[1],
                 self.video.jiggle_breast_size,
                 self.video.jiggle_glute_size,
-                self.video.body_shape_params(),
+                (self.video.body_shape_params(), jka_assets::body_shape::anny::fingerprint(self.video.body_shape_params(), self.video.body_details)),
             ),
             (self.profile_preview_yaw * 10.0).round() as i32,
             (self.profile_preview_zoom * 1000.0).round() as i32,
@@ -371,6 +371,7 @@ impl App {
                         overall_strength: self.video.jiggle_strength,
                         breast_strength: self.video.jiggle_breast_strength,
                         glute_strength: self.video.jiggle_glute_strength,
+                        stomach_strength: self.video.jiggle_stomach_strength,
                         stiffness_scale: self.video.jiggle_stiffness,
                         damping_scale: self.video.jiggle_damping,
                         glute_jiggle_bottom_z: self.video.jiggle_glute_jiggle_bottom_z,
@@ -388,11 +389,14 @@ impl App {
                         breast_damping: self.video.jiggle_breast_damping,
                         glute_stiffness: self.video.jiggle_glute_stiffness,
                         glute_damping: self.video.jiggle_glute_damping,
+                        stomach_damping: self.video.jiggle_stomach_damping,
+                        stomach_stiffness: self.video.jiggle_stomach_stiffness,
                         breast_size: self.video.jiggle_breast_size,
                         glute_size: self.video.jiggle_glute_size,
                     },
                     crate::cgame::jiggle::JiggleRemeshTuning {
                         body_shape: self.video.body_shape_params(),
+                        body_details: self.video.body_details,
                         breast_bottom_z: self.video.jiggle_breast_remesh_bottom_z,
                         breast_top_z: self.video.jiggle_breast_remesh_top_z,
                         glute_bottom_z: self.video.jiggle_glute_remesh_bottom_z,
@@ -404,6 +408,7 @@ impl App {
                 // No stale requests from a prior Profile frame should leak into
                 // the current isolated saber preview.
                 let _ = presenter.drain_fx_requests();
+                presenter.set_profile_body_highlight(self.profile_body_highlight.as_deref());
                 let (draws, anchors) = presenter.present_profile_player_preview(
                     &info,
                     origin,

@@ -189,6 +189,41 @@ impl Ghoul2SkinningMode {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InlineTransformMode {
+    #[default]
+    Cpu,
+    CpuWorkers,
+    Gpu,
+}
+
+impl InlineTransformMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::CpuWorkers => "CPU WORKERS",
+            Self::Gpu => "GPU",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::CpuWorkers => "workers",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "0" => Some(Self::Cpu),
+            "workers" | "cpu_workers" | "cpu-workers" | "1" => Some(Self::CpuWorkers),
+            "gpu" | "2" => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Ghoul2BatchMode {
     Off,
     #[default]

@@ -4,7 +4,7 @@ use blue_water_gpu::{
     foam_texture::FoamMap,
     original_surface::{
         OriginalClipmap, OriginalSurfaceBindings, OriginalSurfacePipeline, SurfaceAppearance,
-        SurfaceBoundary, SurfaceCamera,
+        SurfaceBoundary, SurfaceCamera, LocalWaveHint, LocalTileState, PruneSegmentCache, PruneSource,
     },
     scene_copy::SceneCopy,
     underwater::{UnderwaterBindings, UnderwaterPipelines},
@@ -20,11 +20,19 @@ struct ReducedOcean {
     color_view: wgpu::TextureView,
     _depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// The glitter's mean/density and the glint share the reconstruction draws full-resolution glints from
+    /// (`shader_composer::jka_reduced_glints`).
+    _glitter: [wgpu::Texture; 2],
+    glitter_views: [wgpu::TextureView; 2],
     binding: wgpu::BindGroup,
+    /// `r_oceanPixelDetail` 5: the classifier's parameters (x `r_oceanPixelContrast`), its bind group and tile counts.
+    adaptive_params: wgpu::Buffer,
+    adaptive: Option<(wgpu::BindGroup, (u32, u32))>,
 }
 
 impl ReducedOcean {
-    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, width: u32, height: u32, factor: u32) -> Self {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, classify: Option<&wgpu::BindGroupLayout>,
+        width: u32, height: u32, factor: u32) -> Self {
         let extent = wgpu::Extent3d {
             width: width.max(1).div_ceil(factor),
             height: height.max(1).div_ceil(factor),
@@ -48,14 +56,50 @@ impl ReducedOcean {
             view_formats: &[],
         });
         let depth_view = _depth.create_view(&Default::default());
+        let _glitter = ["Blue Water reduced glitter mean/density", "Blue Water reduced glint share"].map(|label|
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent, mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
+        let glitter_views = _glitter.each_ref().map(|texture| texture.create_view(&Default::default()));
+        // One decision per 16x16-pixel tile (`adaptive_tiles.wgsl`); unread outside mode 5.
+        let tiles = blue_water_gpu::shader_composer::adaptive_tile_counts(width, height);
+        let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blue Water adaptive tile decisions"),
+            size: u64::from(tiles.0 * tiles.1).max(1) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let adaptive_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blue Water adaptive tile parameters"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water reduced shaded color/depth"), layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&color_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: tile_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&glitter_views[0]) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&glitter_views[1]) },
             ],
         });
-        Self { _color, color_view, _depth, depth_view, binding }
+        let adaptive = classify.map(|classify| (device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blue Water adaptive tiles"), layout: classify,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&color_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: tile_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: adaptive_params.as_entire_binding() },
+            ],
+        }), tiles));
+        Self { _color, color_view, _depth, depth_view, _glitter, glitter_views, binding, adaptive_params, adaptive }
     }
 }
 
@@ -136,7 +180,7 @@ mod automatic_foam_tests {
 }
 
 fn pixel_factor(mode: u8) -> u32 {
-    match mode { 1 | 3 => 2, 2 | 4 => 4, _ => 1 }
+    match mode { 1 | 3 | 5 => 2, 2 | 4 => 4, _ => 1 }
 }
 
 /// Per-ring LOD for Blue Water, retaining the upstream full-density clipmap
@@ -233,10 +277,27 @@ fn curvature_mesh_steps(
     (steps, fill_step)
 }
 
+/// Combine independent screen-projected and curvature LOD requests.
+/// Neither control is allowed to silently override or disable the other.
+/// Screen LOD=0 supplies all ones; adaptive Off skips this combination.
+fn combined_native_ring_steps(screen: [u8; 10], curvature: [u8; 10]) -> [u8; 10] {
+    std::array::from_fn(|i| screen[i].max(curvature[i]))
+}
+
 #[cfg(test)]
 mod projected_lod_tests {
     use super::projected_ring_steps;
     use blue_water_gpu::geometry::Clipmap;
+
+    #[test]
+    fn screen_lod_and_adaptive_curvature_coexist() {
+        // Screen LOD can further coarsen a ring even when curvature is on.
+        let screen = [1, 1, 1, 2, 4, 8, 16, 1, 1, 1];
+        let curvature = [16, 8, 4, 1, 1, 1, 1, 1, 1, 1];
+        let merged = super::combined_native_ring_steps(screen, curvature);
+        assert_eq!(merged, [16, 8, 4, 2, 4, 8, 16, 1, 1, 1]);
+        assert_eq!(super::combined_native_ring_steps([1; 10], curvature), curvature);
+    }
 
     #[test]
     fn curvature_lod_flat_water_reaches_coarsest_fill_and_ring_stride() {
@@ -293,18 +354,127 @@ struct NativePruneKey {
     fill_step: u8,
     horizon: bool,
     sky_extension: bool,
+    mesh_mode: u8,
     pvs: Option<OceanPvsTileMask>,
+    /// Cells past the sky walls are split into their own range for `r_oceanFarShader`.
+    far_split: bool,
 }
 
 struct NativePrunedGeometry {
     buffer: wgpu::Buffer,
     count: u32,
+    /// Where the far range (water past the sky walls, `r_oceanFarShader`) starts; `count` without a split.
+    far_start: u32,
+    local_vertices: Option<wgpu::Buffer>,
+    local_vertex_capacity: usize,
+    index_capacity: usize,
+    local_counts: [u32; 5],
+    last_local_upload: f32,
     /// Full-density triangles for the SAME wet-area/PVS and sky-extension admission.
     /// Only computed when r_oceanAdaptiveMeshDebug=1.
     baseline_count: Option<u32>,
     upload_generation: u64,
     key: Option<NativePruneKey>,
+    /// Per-level prune memo; `None` while a worker owns it.
+    prune_cache: Option<PruneSegmentCache>,
+    /// Background re-prune. The current indices keep drawing until it lands.
+    prune_job: Option<std::sync::mpsc::Receiver<NativePruneResult>>,
 }
+
+impl NativePrunedGeometry {
+    fn apply_pruned(&mut self, queue: &wgpu::Queue, indices: &[u32], far_start: u32, key: NativePruneKey) {
+        if !indices.is_empty() {
+            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(indices));
+        }
+        self.count = indices.len() as u32;
+        self.far_start = far_start;
+        self.local_vertices = None;
+        self.local_vertex_capacity = 0;
+        self.local_counts = [0; 5];
+        self.baseline_count = None; // PVS, ring LOD or fill changed.
+        self.upload_generation += 1;
+        self.key = Some(key);
+    }
+}
+
+/// Everything one native pool prune reads, owned so it can run off the render
+/// thread. `run` admits cells exactly as Godot's footprint/PVS/sky test does.
+struct NativePruneJob {
+    source: PruneSource,
+    surface: super::OceanSurface,
+    masks: std::sync::Arc<super::OceanMasks>,
+    index: usize,
+    pvs_tiles: Option<OceanPvsTileMask>,
+    extension: Option<super::sky_extend::SkyExtension>,
+    frames: [[f32; 4]; 10],
+    extra_pad: f32,
+    context: u64,
+    key: NativePruneKey,
+}
+
+struct NativePruneResult {
+    indices: Vec<u32>,
+    far_start: u32,
+    cache: PruneSegmentCache,
+    key: NativePruneKey,
+    build_ms: f64,
+}
+
+impl NativePruneJob {
+    fn run(self, mut cache: PruneSegmentCache) -> NativePruneResult {
+        let started = std::time::Instant::now();
+        let Self { source, surface, masks, index, pvs_tiles, extension, frames, extra_pad, context, key } = self;
+        // `r_oceanFarShader`: cells admitted only by the sky extension (past the walls, nothing of the map's
+        // own water footprint in them) and the horizon skirt go to the far range.
+        let far_split = key.far_split;
+        let (indices, far_start, _) = source.pruned_indices_classified_cached(
+            &mut cache, context, key.first, key.outer, &key.steps, key.fill_step, key.horizon, far_split,
+            &frames, extra_pad,
+            |lo, hi| {
+                let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER);
+                let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER);
+                if !super::promoted_ocean_cell_may_contain(
+                    surface, &masks, Some(index), pvs_tiles.as_ref(), extension.as_ref(), lo, hi,
+                ) {
+                    blue_water_gpu::original_surface::CELL_REJECTED
+                } else if far_split
+                    && !super::promoted_ocean_cell_may_contain(surface, &masks, Some(index), None, None, lo, hi)
+                {
+                    blue_water_gpu::original_surface::CELL_FAR
+                } else {
+                    blue_water_gpu::original_surface::CELL_NEAR
+                }
+            },
+        );
+        NativePruneResult { indices, far_start, cache, key, build_ms: started.elapsed().as_secs_f64() * 1000.0 }
+    }
+}
+
+/// Submerged Hybrid: the sparse native index set the Godot material draws
+/// (`blue_water_gpu::submerged_mesh`). Rebuilt only when its key changes.
+#[derive(Clone, PartialEq)]
+struct SubmergedKey {
+    frames: [[u32; 2]; 10],
+    first: usize,
+    outer: usize,
+    near: u32,
+    opaque: u32,
+    sky_extension: bool,
+    pvs: Option<OceanPvsTileMask>,
+}
+
+struct SubmergedGeometry {
+    buffer: wgpu::Buffer,
+    capacity: usize,
+    count: u32,
+    key: Option<SubmergedKey>,
+}
+
+/// tan of Snell's window half-angle, asin(1 / 1.333): from below, the sky
+/// shows through the surface only within this cone overhead.
+const SNELL_WINDOW_TAN: f32 = 1.134;
+/// Past the window a submerged block is about this share of its distance across.
+const SUBMERGED_GROWTH: f32 = 0.75;
 
 struct SurfaceSlot {
     bindings: OriginalSurfaceBindings,
@@ -313,6 +483,8 @@ struct SurfaceSlot {
     ring_steps: [u8; 10],
     fill_step: u8,
     pruned: Option<NativePrunedGeometry>,
+    submerged: Option<SubmergedGeometry>,
+    local_state: LocalTileState,
     ready: bool,
     horizon: bool,
     underwater: UnderwaterBindings,
@@ -330,6 +502,10 @@ struct SurfaceConfig {
     target: (u32, u32, u32, wgpu::TextureFormat),
     reflection_steps: u32,
     pixel_detail_mode: u8,
+    cost_probe: u32,
+    ssr_tiles: bool,
+    /// `r_oceanFarShader` stubs for water past the sky walls (0: no split).
+    far_variant: u32,
     segments: u32,
     levels: u8,
 }
@@ -337,8 +513,62 @@ struct SurfaceConfig {
 impl SurfaceConfig {
     fn new(target: (u32, u32, u32, wgpu::TextureFormat), settings: super::OceanSettings) -> Self {
         Self { target, reflection_steps: settings.blue_water_ssr_steps,
-            pixel_detail_mode: settings.pixel_detail_mode,
+            pixel_detail_mode: settings.pixel_detail_mode, cost_probe: settings.surface_cost_probe
+                | if settings.skip_faded_cascades { blue_water_gpu::shader_composer::SURFACE_SKIP_FADED_CASCADES } else { 0 }
+                | match settings.wave_statistics {
+                    0 => 0,
+                    1 => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS,
+                    2 => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
+                        | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_FOAM,
+                    _ => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
+                        | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_DEBUG,
+                }
+                | if settings.gerstner_active() { blue_water_gpu::shader_composer::SURFACE_GODOT_WATER } else { 0 },
+            ssr_tiles: settings.blue_water_ssr_tiles,
+            far_variant: match settings.far_shader {
+                0 => 0,
+                1 => blue_water_gpu::shader_composer::FAR_SHADER_DEFAULT,
+                mask => mask,
+            },
             segments: settings.blue_water_mesh_segments, levels: settings.blue_water_mesh_levels }
+    }
+}
+
+/// `r_oceanType 5`'s textures and persistent foam (`blue_water_gpu::godot_water`).
+struct GerstnerResources {
+    foam: blue_water_gpu::godot_water::GodotFoam,
+    /// The contact fields and the field bound to the foam (`Arc` address, index), and its plane (map units).
+    contact_key: Option<(usize, usize)>,
+    contact_level: Option<f32>,
+}
+
+impl GerstnerResources {
+    /// Bind the contact field of the pool at `plane` (map units) under the camera (grid xz, m): the field on that
+    /// plane whose extent holds the camera, else the nearest such one. None when no field lies on the plane.
+    fn select_contact(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        fields: Option<&super::gerstner_contact::ContactFields>, plane: Option<f32>, camera_xz: [f32; 2]) {
+        let chosen = fields.zip(plane).and_then(|(fields, plane)| {
+            let outside = |field: &super::gerstner_contact::ContactField| (0..2).map(|axis| {
+                let low = field.origin[axis];
+                let high = low + (field.size[axis].max(1) - 1) as f32 * field.cell;
+                (low - camera_xz[axis]).max(camera_xz[axis] - high).max(0.0)
+            }).fold(0.0f32, f32::max);
+            fields.iter().enumerate()
+                .filter(|(_, field)| (field.level - plane).abs() < 1.0)
+                .min_by(|(_, a), (_, b)| outside(a).total_cmp(&outside(b)))
+                .map(|(index, field)| ((std::sync::Arc::as_ptr(fields) as usize, index), field))
+        });
+        let key = chosen.as_ref().map(|(key, _)| *key);
+        if key == self.contact_key { return; }
+        self.contact_key = key;
+        let field = chosen.map(|(_, field)| field);
+        self.contact_level = field.map(|field| field.level);
+        self.foam.set_contact(device, queue, field.map(|field| blue_water_gpu::godot_water::ContactField {
+            texels: &field.texels,
+            size: field.size,
+            origin: field.origin,
+            cell: field.cell,
+        }));
     }
 }
 
@@ -349,6 +579,8 @@ pub(super) struct SurfaceRenderer {
     clipmap: OriginalClipmap,
     reduced: Option<ReducedOcean>,
     scene: SceneCopy,
+    /// Upstream's reflection tile table over `scene.depth` (`r_blueWaterSSRTiles`), rebuilt after each scene capture.
+    reflection_tiles: Option<blue_water_gpu::reflection_tiles::ReflectionTiles>,
     map_environment: Option<blue_water_gpu::map_environment::MapEnvironment>,
     sky_faces: Option<[wgpu::TextureView; 6]>,
     external_sky: Option<wgpu::TextureView>,
@@ -363,6 +595,7 @@ pub(super) struct SurfaceRenderer {
     /// This frame's camera x, z (m) and whether the aerial volume is live, for the spindrift draw later in the frame.
     eye: [f64; 2],
     aerial: bool,
+    gerstner: Option<GerstnerResources>,
 }
 
 impl SurfaceRenderer {
@@ -370,14 +603,28 @@ impl SurfaceRenderer {
         sky_faces: Option<[wgpu::TextureView; 6]>) -> Self {
         let key = config.target;
         let pipeline = OriginalSurfacePipeline::new_with_wave_layout(
-            device, waves, key.3, key.2, config.reflection_steps, config.pixel_detail_mode);
+            device, waves, key.3, key.2, config.reflection_steps, config.pixel_detail_mode, config.cost_probe)
+            .with_far_variant(device, key.3, key.2, config.reflection_steps, config.pixel_detail_mode,
+                config.cost_probe, config.far_variant);
         let underwater = UnderwaterPipelines::new(device, waves, key.3, key.2);
         let caustics = blue_water_gpu::caustics::Caustics::new(device, waves, key.3, key.2);
         let clipmap = OriginalClipmap::new(device, config.segments, config.levels as usize);
         let scene = SceneCopy::new(device, key.0, key.1, key.2);
+        let reflection_tiles = config.ssr_tiles.then(|| {
+            blue_water_gpu::reflection_tiles::ReflectionTiles::new(device, &scene.depth, (key.0, key.1))
+        });
         let foam = FoamMap::new(device, queue);
+        let gerstner = (config.cost_probe & blue_water_gpu::shader_composer::SURFACE_GODOT_WATER != 0).then(|| {
+            let patterns = blue_water_gpu::godot_water::GodotPatterns::new(device, queue, &super::gerstner_patterns::patterns());
+            GerstnerResources {
+                foam: blue_water_gpu::godot_water::GodotFoam::new(device, &patterns),
+                contact_key: None,
+                contact_level: None,
+            }
+        });
         let reduced = (config.pixel_detail_mode != 0).then(|| ReducedOcean::new(
             device, pipeline.reconstruct_layout.as_ref().expect("reconstruction layout"),
+            pipeline.adaptive_classify.as_ref().map(|(_, layout)| layout),
             key.0, key.1, pixel_factor(config.pixel_detail_mode)));
         let map_environment = sky_faces.as_ref().map(|faces| {
             let mut environment = blue_water_gpu::map_environment::MapEnvironment::new(device);
@@ -388,9 +635,9 @@ impl SurfaceRenderer {
             queue.submit([encoder.finish()]);
             environment
         });
-        Self { config, key, pipeline, underwater, caustics, clipmap, scene, foam, reduced,
+        Self { config, key, pipeline, underwater, caustics, clipmap, scene, reflection_tiles, foam, reduced,
             underwater_slot: None, rain_heights: None, spindrift: None, eye: [0.0; 2],
-            aerial: false, map_environment, sky_faces, external_sky: None,
+            aerial: false, map_environment, sky_faces, external_sky: None, gerstner,
             slots: std::array::from_fn(|_| None) }
     }
 }
@@ -530,6 +777,8 @@ impl OceanGpu {
         godot_receiver_color: Option<&wgpu::TextureView>,
         legacy_fog: Option<([f32; 4], [f32; 4])>,
         rain: f32,
+        mesh_perf: &mut super::NativeMeshCpuStats,
+        profile_cpu: bool,
     ) {
         if self.settings.backend == 3 {
             self.prepare_lakes(device, queue, encoder, camera, key, jitter, dt, frame, pvs,
@@ -601,6 +850,39 @@ impl OceanGpu {
             }
         }
         let mut wake_stepped = false;
+        // Hybrid r_hybridUnderwaterMode 4 below the surface: every pool's mesh is
+        // this clipmap with `submerged_mesh`'s sparse indices, shaded by Godot.
+        let hybrid_submerged = self.settings.backend == 2 && self.settings.blue_water_underwater_mode == 4
+            && camera_water_surface > crate::renderer::NO_WATER_SURFACE;
+        // Past this the water has absorbed everything (metres): the culling distance, as world geometry uses.
+        let absorbed = match self.settings.underwater_cull_distance() {
+            distance if distance > 0.0 => distance,
+            _ => self.settings.optics.absorption_distance() * 2.0 * super::optics::MIN_CULL_MULTIPLE,
+        } / OCEAN_UNITS_PER_METER;
+        // `r_oceanType 5`'s persistent foam: one capture around the camera, against the nearest pool's plane.
+        let gerstner_foam = renderer.gerstner.as_mut().map(|gerstner| {
+            let nearest = self.promoted_surfaces.iter()
+                .filter(|promoted| promoted.descriptor.index < OCEAN_MAX_SURFACES)
+                .min_by(|a, b| (camera.position.y - a.descriptor.surface.plane_height).abs()
+                    .total_cmp(&(camera.position.y - b.descriptor.surface.plane_height).abs()));
+            let plane = nearest.map(|promoted| promoted.descriptor.surface.plane_height);
+            let camera_xz = [camera.position.x / OCEAN_UNITS_PER_METER, camera.position.z / OCEAN_UNITS_PER_METER];
+            gerstner.select_contact(device, queue, self.gerstner_contact.as_ref(), plane, camera_xz);
+            gerstner.foam.update(queue, encoder, &blue_water_gpu::godot_water::FoamFrame {
+                camera_xz,
+                seconds: self.elapsed,
+                delta: dt,
+                scale: self.settings.gerstner_wave_scale,
+                enabled: [self.settings.gerstner_foam & 1 != 0, self.settings.gerstner_foam & 2 != 0],
+                rate: self.settings.gerstner_foam_rate,
+                plane_above_field: plane.zip(gerstner.contact_level)
+                    .map(|(plane, level)| (plane - level) / OCEAN_UNITS_PER_METER),
+            })
+        });
+        let gerstner_views = renderer.gerstner.as_ref().map(|gerstner| gerstner.foam.views());
+        // The reflection tiles' floor (`reflection_tiles::ReflectionTiles::set_floor`): the first drawn pool's camera
+        // (its ocean space the depth copy is read in), its plane, and the lowest plane less its trough bound (units).
+        let mut tile_floor: Option<([[f32; 4]; 4], f32, f32)> = None;
         for promoted in &self.promoted_surfaces {
             let index = promoted.descriptor.index;
             if index >= OCEAN_MAX_SURFACES {
@@ -700,6 +982,9 @@ impl OceanGpu {
                     &renderer.pipeline,
                     renderer.foam.clone(),
                 );
+                if let Some(tiles) = renderer.reflection_tiles.as_ref() {
+                    bindings.set_reflection_table(device, &renderer.pipeline, tiles.table());
+                }
                 bindings.set_scene(
                     device,
                     &renderer.pipeline,
@@ -731,6 +1016,8 @@ impl OceanGpu {
                     ring_steps: [1; 10],
                     fill_step: 1,
                     pruned: None,
+                    submerged: None,
+                    local_state: LocalTileState::default(),
                     ready: false,
                     horizon: false,
                 }
@@ -782,6 +1069,7 @@ impl OceanGpu {
                     }
                 }),
             );
+            slot.bindings.set_godot_water(device, &renderer.pipeline, gerstner_views.as_ref());
             if slot.wake_generation != slot.bindings.wake_generation() {
                 slot.wake_generation = slot.bindings.wake_generation();
                 slot.underwater = UnderwaterBindings::new(
@@ -805,7 +1093,14 @@ impl OceanGpu {
                 OCEAN_UNITS_PER_METER,
                 0.75,
                 self.settings.pixel_detail_mode.min(5) as f32,
-                self.settings.pixel_detail_distance.max(1.0),
+                // Mode 5 reads its block threshold here (`jka_adaptive_full`); 3 and 4 their falloff distance.
+                // Negative: `r_oceanPixelDebug`'s tint (the shader takes the magnitude).
+                if self.settings.pixel_detail_mode == 5 {
+                    self.settings.pixel_detail_contrast.clamp(0.001, 0.5)
+                        * if self.settings.pixel_detail_debug { -1.0 } else { 1.0 }
+                } else {
+                    self.settings.pixel_detail_distance.max(1.0)
+                },
             ];
             let first = self.masks.ranges[index][0] as usize * 2;
             let count = self.masks.ranges[index][1] as usize;
@@ -879,8 +1174,13 @@ impl OceanGpu {
             // still checks each ray against the exact GPU admission mask.
             let near_reach = camera.near_distance()
                 * (1.0 + surface_view.tan_half_fov_y * (1.0 + surface_view.aspect.powi(2)).sqrt());
-            let analytic_height = f64::from(super::hybrid_swell_uniform(&promoted.settings, self.elapsed)[0][3]);
+            let analytic_height = f64::from(super::hybrid_analytic_height(&promoted.settings, self.elapsed));
             let crest_bound = (2.0 * blue.field.input_parameters().significant_height + analytic_height + 8.1) as f32;
+            let trough = source.plane_height - crest_bound * OCEAN_UNITS_PER_METER;
+            tile_floor = Some(match tile_floor {
+                None => (surface_view.inverse_view_projection, source.plane_height, trough),
+                Some((matrix, plane, lowest)) => (matrix, plane, lowest.min(trough)),
+            });
             let near_surface = surface_view.position_time[1]
                 <= crest_bound + near_reach / OCEAN_UNITS_PER_METER
                 && (horizontal <= near_reach || extension.is_some_and(|sky| sky.contains(point)));
@@ -893,6 +1193,12 @@ impl OceanGpu {
                 0.0,
             ];
             prefix[23][3] = if near_surface { 1.0 } else { 0.0 };
+            if promoted.settings.backend == 2 && (promoted.settings.hybrid_breaker > 0 || promoted.settings.gerstner_active()) {
+                // The original GPU probe inverts the unlimited field. Once
+                // the horizontal map changes, use Hybrid's native eye solve
+                // (the same classifier as tint/mesh choice) for the underside.
+                prefix[23][3] = if (source.plane_height - camera_water_surface).abs() < 0.75 { 2.0 } else { 0.0 };
+            }
             // High tier's original 16-step reflection trace reads the same
             // opaque color and reversed depth as surface transmission.
             prefix[22] = [
@@ -907,6 +1213,10 @@ impl OceanGpu {
             slot.bindings.write_surface_prefix(queue, &prefix);
             slot.bindings.write_hybrid_swell(queue,
                 &super::hybrid_swell_uniform(&promoted.settings, self.elapsed));
+            slot.bindings.write_breaker_mode(queue,
+                if promoted.settings.backend == 2 { promoted.settings.hybrid_breaker } else { 0 });
+            slot.bindings.write_godot_water(queue,
+                &super::gerstner_uniform(&promoted.settings, self.elapsed, gerstner_foam.unwrap_or([0.0; 4])));
             let sun = self.environment.sun_direction_intensity;
             let tint = self.environment.sun_color;
             let (direction, color) = sky_light.map_or(
@@ -973,8 +1283,8 @@ impl OceanGpu {
                 self.settings.screen_lod_pixels,
             );
             slot.fill_step = 1;
-            if self.settings.adaptive_mesh {
-                let analytic = super::hybrid_swell_uniform(&promoted.settings, self.elapsed)[0];
+            if self.settings.adaptive_mesh == 1 {
+                let analytic = super::hybrid_mesh_swell(&promoted.settings, self.elapsed);
                 let waves = self.settings.blue_water_waves;
                 // Only the FFT component can drive the FFT curvature bound;
                 // at a pure Gerstner blend use the analytic curvature instead.
@@ -988,10 +1298,12 @@ impl OceanGpu {
                     waves.height * fft_weight, waves.wavelength,
                     waves.choppiness, waves.wind_speed, analytic,
                 );
-                // Curvature drives all drawn rings including the nearest
-                // three. The independent screen LOD is used only when this
-                // experiment is Off, for an unambiguous A/B comparison.
-                slot.ring_steps = steps;
+                // Combine independent geometry policies instead of silently
+                // discarding r_oceanScreenLodPixels when adaptive meshing is on.
+                // Taking the coarser *requested* stride makes the screen-space
+                // control work in both A/B modes; screenLOD=0 retains the
+                // curvature choice exactly. The fill remains curvature-driven.
+                slot.ring_steps = combined_native_ring_steps(slot.ring_steps, steps);
                 slot.fill_step = fill_step;
             }
             // The Godot clipmap never uploads dry/PVS-invisible cells. Use
@@ -1013,6 +1325,7 @@ impl OceanGpu {
                 let snap = |v: f32| (v / PRUNE_QUANTUM_METRES).round() * PRUNE_QUANTUM_METRES;
                 [snap(frame[0]), snap(frame[1]), frame[2], frame[3]]
             });
+            let view_focal = key_view_height_focal(key.1, camera.fov_y_for_viewport(key.0,key.1));
             let key = NativePruneKey {
                 centres: frames.map(|frame| [frame[0].to_bits(), frame[1].to_bits()]),
                 first: slot.first,
@@ -1021,7 +1334,9 @@ impl OceanGpu {
                 fill_step: slot.fill_step,
                 horizon: slot.horizon,
                 sky_extension: extension.is_some(),
+                mesh_mode: self.settings.adaptive_mesh,
                 pvs: if extension.is_none() { pvs[index] } else { None },
+                far_split: renderer.config.far_variant != 0 && extension.is_some(),
             };
             let geometry = slot.pruned.get_or_insert_with(|| NativePrunedGeometry {
                 buffer: device.create_buffer(&wgpu::BufferDescriptor {
@@ -1031,14 +1346,133 @@ impl OceanGpu {
                     mapped_at_creation: false,
                 }),
                 count: 0,
+                far_start: 0,
+                local_vertices: None,
+                local_vertex_capacity: 0,
+                index_capacity: renderer.clipmap.pruned_index_capacity(),
+                local_counts: [0; 5],
+                last_local_upload: -1.0,
                 baseline_count: None,
                 upload_generation: 0,
                 key: None,
+                prune_cache: Some(PruneSegmentCache::default()),
+                prune_job: None,
             });
-            if geometry.key.as_ref() != Some(&key) {
-                let indices = renderer.clipmap.pruned_indices_with_fill(
-                    slot.first, slot.outer, &slot.ring_steps, slot.fill_step, slot.horizon,
-                    &frames, PRUNE_QUANTUM_METRES,
+            // A finished background prune lands here, before deciding on a new one.
+            if let Some(job) = geometry.prune_job.as_ref() {
+                match job.try_recv() {
+                    // r_oceanAdaptiveMesh 2 owns the buffers now; drop a stale pruned set.
+                    Ok(result) if self.settings.adaptive_mesh == 2 => {
+                        geometry.prune_job = None;
+                        geometry.prune_cache = Some(result.cache);
+                    }
+                    Ok(result) => {
+                        geometry.prune_job = None;
+                        debug_assert!(result.indices.len() <= renderer.clipmap.pruned_index_capacity());
+                        if profile_cpu {
+                            mesh_perf.rebuilds += 1;
+                            mesh_perf.indices += result.indices.len() as u64;
+                            mesh_perf.upload_bytes += (result.indices.len() * std::mem::size_of::<u32>()) as u64;
+                        }
+                        let upload_started = profile_cpu.then(std::time::Instant::now);
+                        geometry.apply_pruned(queue, &result.indices, result.far_start, result.key);
+                        if let Some(started) = upload_started {
+                            mesh_perf.upload_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        geometry.prune_cache = Some(result.cache);
+                        let _ = result.build_ms;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        geometry.prune_job = None;
+                        geometry.prune_cache = Some(PruneSegmentCache::default());
+                    }
+                }
+            }
+            if self.settings.adaptive_mesh != 2 && geometry.key.as_ref() != Some(&key) && geometry.prune_job.is_none() {
+                // Only levels whose snapped frame moved are re-pruned (`PruneSegmentCache`); the cell test
+                // itself is keyed by everything else it reads.
+                let context = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    (index, key.pvs, key.far_split, key.sky_extension).hash(&mut hasher);
+                    (std::sync::Arc::as_ptr(&self.masks) as usize).hash(&mut hasher);
+                    format!("{source:?}{extension:?}").hash(&mut hasher);
+                    hasher.finish()
+                };
+                let job = NativePruneJob {
+                    source: renderer.clipmap.prune_source(),
+                    surface: source,
+                    masks: self.masks.clone(),
+                    index,
+                    pvs_tiles: if extension.is_some() { None } else { pvs[index] },
+                    extension,
+                    frames,
+                    extra_pad: PRUNE_QUANTUM_METRES,
+                    context,
+                    key: key.clone(),
+                };
+                let cache = geometry.prune_cache.take().unwrap_or_default();
+                // The first prune has nothing to keep drawing, so it runs here. Later ones (a coarse
+                // level re-snapping as a third-person camera swings round) run on a worker while the
+                // current indices, padded by PRUNE_QUANTUM_METRES, keep drawing for the frame or two.
+                if geometry.key.is_none() {
+                    let result = job.run(cache);
+                    if profile_cpu {
+                        mesh_perf.build_ms += result.build_ms;
+                        mesh_perf.rebuilds += 1;
+                        mesh_perf.indices += result.indices.len() as u64;
+                        mesh_perf.upload_bytes += (result.indices.len() * std::mem::size_of::<u32>()) as u64;
+                    }
+                    let upload_started = profile_cpu.then(std::time::Instant::now);
+                    geometry.apply_pruned(queue, &result.indices, result.far_start, result.key);
+                    if let Some(started) = upload_started {
+                        mesh_perf.upload_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    geometry.prune_cache = Some(result.cache);
+                } else {
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    let spawned = std::thread::Builder::new()
+                        .name("ocean-prune".into())
+                        .spawn(move || { let _ = sender.send(job.run(cache)); });
+                    match spawned {
+                        Ok(_) => geometry.prune_job = Some(receiver),
+                        Err(_) => geometry.prune_cache = Some(PruneSegmentCache::default()),
+                    }
+                }
+            }
+            if self.settings.adaptive_mesh == 2 &&
+                (geometry.key.as_ref() != Some(&key)
+                    || self.elapsed < geometry.last_local_upload
+                    || self.elapsed - geometry.last_local_upload >= 1.0/60.0)
+            {
+                // The upstream vertex stage receives a separate per-pool tile
+                // vertex buffer so each patch can carry an independent parent
+                // LOD/morph weight. The exact same buffer is used for shaded,
+                // wireframe, reflections and low-res reconstruction passes.
+                let waves = self.settings.blue_water_waves;
+                let swell = super::hybrid_mesh_swell(&promoted.settings, self.elapsed);
+                let fft_weight = if self.settings.backend == 2 {
+                    self.settings.hybrid_fft_blend.clamp(0.0, 1.0)
+                } else { 1.0 };
+                let hint = LocalWaveHint {
+                    height: waves.height,
+                    wavelength: waves.wavelength,
+                    choppiness: waves.choppiness,
+                    wind_speed: waves.wind_speed,
+                    fft_weight,
+                    swell,
+                    tolerance: self.settings.adaptive_mesh_tolerance,
+                    seconds: self.elapsed,
+                    focal_pixels: view_focal,
+                    eye: [camera.position.x / OCEAN_UNITS_PER_METER,
+                        (camera.position.y-source.plane_height) / OCEAN_UNITS_PER_METER,
+                        camera.position.z / OCEAN_UNITS_PER_METER],
+                };
+                let build_started = profile_cpu.then(std::time::Instant::now);
+                let (vertices, indices, counts) = renderer.clipmap.local_adaptive_mesh(
+                    slot.first, slot.outer, slot.horizon, &frames,
+                    &slot.ring_steps, hint, &mut slot.local_state,
                     |lo, hi| {
                         let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER);
                         let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER);
@@ -1049,14 +1483,53 @@ impl OceanGpu {
                         )
                     },
                 );
-                debug_assert!(indices.len() <= renderer.clipmap.pruned_index_capacity());
+                if let Some(started) = build_started {
+                    mesh_perf.build_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    mesh_perf.rebuilds += 1;
+                    mesh_perf.vertices += vertices.len() as u64;
+                    mesh_perf.indices += indices.len() as u64;
+                    mesh_perf.upload_bytes += (indices.len() * std::mem::size_of::<u32>()
+                        + vertices.len() * std::mem::size_of::<blue_water_gpu::geometry::OceanVertex>()) as u64;
+                }
+                let upload_started = profile_cpu.then(std::time::Instant::now);
+                if indices.len() > geometry.index_capacity {
+                    geometry.index_capacity = indices.len().next_power_of_two();
+                    geometry.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Blue Water local-tile indices"),
+                        size: (geometry.index_capacity * std::mem::size_of::<u32>()) as u64,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                }
+                if vertices.len() > geometry.local_vertex_capacity {
+                    geometry.local_vertex_capacity = vertices.len().next_power_of_two();
+                    geometry.local_vertices = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Blue Water adaptive tile vertices and morph weights"),
+                        size: (geometry.local_vertex_capacity * std::mem::size_of::<blue_water_gpu::geometry::OceanVertex>()) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
                 if !indices.is_empty() {
                     queue.write_buffer(&geometry.buffer, 0, bytemuck::cast_slice(&indices));
                 }
+                if let Some(buffer) = geometry.local_vertices.as_ref() {
+                    if !vertices.is_empty() {
+                        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
+                    }
+                }
+                if let Some(started) = upload_started {
+                    mesh_perf.upload_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
                 geometry.count = indices.len() as u32;
-                geometry.baseline_count = None; // PVS, ring LOD or fill changed.
-                geometry.upload_generation += 1;
+                geometry.far_start = geometry.count;
+                geometry.local_counts = counts;
+                if geometry.key.as_ref() != Some(&key) {
+                    geometry.baseline_count = None;
+                }
                 geometry.key = Some(key);
+                geometry.upload_generation += 1;
+                geometry.last_local_upload = self.elapsed;
             }
             // Measure the FULL-DETAIL reference using the identical snapped
             // frames, PVS mask and admission predicate as the actual index upload.
@@ -1077,7 +1550,101 @@ impl OceanGpu {
                 );
                 geometry.baseline_count = Some(baseline.len() as u32);
             }
+            if hybrid_submerged {
+                let clipmap = renderer.clipmap.clipmap();
+                let cell = clipmap.cell(slot.first) as f32;
+                // Detail is measured from the first level's snapped centre, so the
+                // indices change only when that lattice moves; the camera is
+                // within a cell of it on each axis.
+                let margin = 2.0 * cell;
+                let depth = ((source.plane_height - camera.position.y) / OCEAN_UNITS_PER_METER).max(0.0);
+                let near = ((SNELL_WINDOW_TAN * depth + cell) / cell).ceil() * cell + margin;
+                let detail = blue_water_gpu::submerged_mesh::SubmergedDetail {
+                    eye: [prefix[slot.first][0], prefix[slot.first][1]],
+                    near,
+                    opaque: (absorbed - margin).max(near),
+                    growth: SUBMERGED_GROWTH,
+                };
+                let frames: [[f32; 4]; 10] = std::array::from_fn(|level| prefix[level]);
+                let mesh_key = SubmergedKey {
+                    frames: frames.map(|frame| [frame[0].to_bits(), frame[1].to_bits()]),
+                    first: slot.first,
+                    outer: slot.outer,
+                    near: detail.near.to_bits(),
+                    opaque: detail.opaque.to_bits(),
+                    sky_extension: extension.is_some(),
+                    pvs: if extension.is_none() { pvs[index] } else { None },
+                };
+                let submerged = slot.submerged.get_or_insert_with(|| SubmergedGeometry {
+                    buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Blue Water submerged indices"),
+                        size: 4,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    capacity: 1,
+                    count: 0,
+                    key: None,
+                });
+                if submerged.key.as_ref() != Some(&mesh_key) {
+                    let build_started = profile_cpu.then(std::time::Instant::now);
+                    let indices = blue_water_gpu::submerged_mesh::submerged_indices(
+                        clipmap, slot.first, slot.outer, &frames, detail,
+                        |lo, hi| super::promoted_ocean_cell_may_contain(
+                            source, &self.masks, Some(index),
+                            if extension.is_some() { None } else { pvs[index].as_ref() },
+                            extension.as_ref(),
+                            lo.map(|v| v * OCEAN_UNITS_PER_METER), hi.map(|v| v * OCEAN_UNITS_PER_METER),
+                        ),
+                    );
+                    if indices.len() > submerged.capacity {
+                        submerged.capacity = indices.len().next_power_of_two();
+                        submerged.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("Blue Water submerged indices"),
+                            size: (submerged.capacity * std::mem::size_of::<u32>()) as u64,
+                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    }
+                    if !indices.is_empty() {
+                        queue.write_buffer(&submerged.buffer, 0, bytemuck::cast_slice(&indices));
+                    }
+                    if let Some(started) = build_started {
+                        mesh_perf.build_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        mesh_perf.rebuilds += 1;
+                        mesh_perf.indices += indices.len() as u64;
+                        mesh_perf.upload_bytes += (indices.len() * std::mem::size_of::<u32>()) as u64;
+                    }
+                    submerged.count = indices.len() as u32;
+                    submerged.key = Some(mesh_key);
+                }
+                // The frames `vs_ocean_native` places the mesh with: only the
+                // pool uniform's tail, and only when they move.
+                let mesh = super::NativeOceanMesh {
+                    frames,
+                    clipmap: prefix[10],
+                    detail: [prefix[11][0], prefix[11][1], source.plane_height, index as f32],
+                };
+                if self.native_meshes[index] != Some(mesh) {
+                    self.native_meshes[index] = Some(mesh);
+                    queue.write_buffer(&promoted.buffer,
+                        std::mem::offset_of!(super::OceanRenderUniform, native_mesh) as u64,
+                        bytemuck::bytes_of(&mesh));
+                }
+            } else if let Some(submerged) = slot.submerged.as_mut() {
+                submerged.key = None;
+            }
             slot.ready = true;
+        }
+        if let Some(reduced) = renderer.reduced.as_ref().filter(|reduced| reduced.adaptive.is_some()) {
+            let contrast = self.settings.pixel_detail_contrast.clamp(0.001, 0.5);
+            queue.write_buffer(&reduced.adaptive_params, 0, bytemuck::cast_slice(&[contrast, 0.0f32, 0.0, 0.0]));
+        }
+        if let Some(tiles) = renderer.reflection_tiles.as_ref() {
+            // Only while the eye is above the floor (see `reflection_tiles`); otherwise every surface is marked.
+            tiles.set_floor(queue, tile_floor
+                .filter(|&(_, _, lowest)| camera.position.y >= lowest)
+                .map(|(matrix, plane, lowest)| (matrix, (lowest - plane) / OCEAN_UNITS_PER_METER)));
         }
     }
 
@@ -1113,7 +1680,8 @@ impl OceanGpu {
             let Some(slot) = slot.as_ref().filter(|slot| slot.ready) else { continue; };
             let generation = slot.pruned.as_ref().map_or(0, |geometry| geometry.upload_generation);
             let active = &slot.ring_steps[slot.first..=slot.outer];
-            out.push_str(&format!(" pool{index}[rings={}-{} fill={} steps={active:?} upload={generation}]",
+            let local = slot.pruned.as_ref().map_or([0; 5], |g| g.local_counts);
+            out.push_str(&format!(" pool{index}[rings={}-{} fill={} steps={active:?} tiles[1/2/4/8/16]={local:?} upload={generation}]",
                 slot.first, slot.outer, slot.fill_step));
         }
         if out.is_empty() { "no ready native water pools".to_owned() } else { out }
@@ -1170,6 +1738,7 @@ impl OceanGpu {
                         })],
                         ..Default::default()
                     });
+                    crate::renderer::tile_probe_scissor_surface(&mut pass);
                     for (index, slot) in renderer.slots.iter().enumerate().filter_map(|(i,s)|s.as_ref().filter(|s|s.ready).map(|s|(i,s))) {
                         renderer.caustics.draw(
                             &mut pass,
@@ -1279,6 +1848,7 @@ impl OceanGpu {
             }),
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         renderer.spindrift.as_ref().expect("spindrift").draw(
             device,
             queue,
@@ -1309,6 +1879,9 @@ impl OceanGpu {
             .and_then(|blue| blue.original_surface.as_ref())
         {
             renderer.scene.capture(device, encoder, color, depth);
+            if let Some(tiles) = renderer.reflection_tiles.as_ref() {
+                tiles.encode(encoder);
+            }
         }
     }
 
@@ -1415,6 +1988,7 @@ impl OceanGpu {
             }),
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         slot.underwater.draw(&mut pass, &renderer.underwater, self.settings.blue_water_underwater_mode != 1);
     }
 
@@ -1426,8 +2000,39 @@ impl OceanGpu {
         slot: &'a SurfaceSlot,
     ) {
         if let Some(geometry) = slot.pruned.as_ref() {
-            renderer.clipmap.draw_pruned(pass, &geometry.buffer, geometry.count);
+            renderer.clipmap.draw_pruned(pass, &geometry.buffer, geometry.count, geometry.local_vertices.as_ref());
         }
+    }
+
+    /// `draw_native_slot`, with the far range (water past the sky walls) drawn through `far` when it is built
+    /// (`r_oceanFarShader`); the caller's bind groups carry over, as the far pipeline shares the layout.
+    fn draw_native_slot_split<'a>(
+        renderer: &'a SurfaceRenderer,
+        pass: &mut wgpu::RenderPass<'a>,
+        slot: &'a SurfaceSlot,
+        far: Option<&'a wgpu::RenderPipeline>,
+    ) {
+        let Some(geometry) = slot.pruned.as_ref() else { return; };
+        let vertices = geometry.local_vertices.as_ref();
+        match far.filter(|_| geometry.far_start < geometry.count) {
+            Some(far) => {
+                renderer.clipmap.draw_pruned_range(pass, &geometry.buffer, 0..geometry.far_start, vertices);
+                pass.set_pipeline(far);
+                renderer.clipmap.draw_pruned_range(pass, &geometry.buffer, geometry.far_start..geometry.count, vertices);
+            }
+            None => renderer.clipmap.draw_pruned(pass, &geometry.buffer, geometry.count, vertices),
+        }
+    }
+
+    /// Submerged Hybrid: pool `index`'s sparse native mesh, with the pipeline
+    /// (`vs_ocean_native`) and Godot bind groups the caller set. Its triangles,
+    /// or `None` when this frame prepared none for it.
+    pub fn draw_submerged_native_mesh<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, index: usize) -> Option<u64> {
+        let renderer = self.blue_water.as_ref()?.original_surface.as_ref()?;
+        let slot = renderer.slots.get(index)?.as_ref().filter(|slot| slot.ready)?;
+        let mesh = slot.submerged.as_ref().filter(|mesh| mesh.key.is_some() && mesh.count > 0)?;
+        renderer.clipmap.draw_pruned(pass, &mesh.buffer, mesh.count, None);
+        Some(u64::from(mesh.count / 3))
     }
 
     /// r_showtris OCEAN: draw the REAL Blue Water clipmap, not the host's
@@ -1475,10 +2080,11 @@ impl OceanGpu {
         let (Some(target), Some(pipeline)) = (renderer.reduced.as_ref(), renderer.pipeline.reduced_pipeline.as_ref()) else { return; };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blue Water original material / true reduced pixels"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.color_view, depth_slice: None, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-            })],
+            color_attachments: &[&target.color_view, &target.glitter_views[0], &target.glitter_views[1]].map(|view|
+                Some(wgpu::RenderPassColorAttachment {
+                    view, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })),
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
@@ -1493,7 +2099,20 @@ impl OceanGpu {
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
             pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
             pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
-            Self::draw_native_slot(renderer, &mut pass, slot);
+            Self::draw_native_slot_split(renderer, &mut pass, slot, renderer.pipeline.far_pipeline.as_ref());
+        }
+        drop(pass);
+        // Mode 5: decide each 16x16 tile from the reduced shading before the full-resolution passes read it.
+        if let (Some((classify, _)), Some((group, tiles))) =
+            (renderer.pipeline.adaptive_classify.as_ref(), target.adaptive.as_ref())
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Blue Water adaptive tiles"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(classify);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(tiles.0, tiles.1, 1);
         }
     }
 
@@ -1508,6 +2127,12 @@ impl OceanGpu {
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
             pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
             pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
+            // Mode 5's detail pass reads the same per-tile decisions as the reconstruction (`adaptive_tiles.wgsl`).
+            if renderer.config.pixel_detail_mode == 5 {
+                if let Some(target) = renderer.reduced.as_ref() {
+                    pass.set_bind_group(4, &target.binding, &[]);
+                }
+            }
             Self::draw_native_slot(renderer, pass, slot);
         }
     }
@@ -1550,7 +2175,9 @@ impl OceanGpu {
             if let Some(target) = renderer.reduced.as_ref() {
                 pass.set_bind_group(4, &target.binding, &[]);
             }
-            Self::draw_native_slot(renderer, pass, slot);
+            // Full resolution shades here; the reduced modes shade in `encode_reduced_original_surface`.
+            let far = renderer.pipeline.far_pipeline.as_ref().filter(|_| renderer.config.pixel_detail_mode == 0);
+            Self::draw_native_slot_split(renderer, pass, slot, far);
             drawn += 1;
         }
         (drawn, horizon_only, horizon_triangles)
@@ -1598,4 +2225,8 @@ mod tests {
             }
         }
     }
+}
+
+fn key_view_height_focal(viewport: u32, fovy: f32) -> f32 {
+    viewport.max(1) as f32 / (2.0 * (fovy * 0.5).tan().max(0.001))
 }

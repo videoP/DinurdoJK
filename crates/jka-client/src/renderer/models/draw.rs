@@ -371,6 +371,7 @@ impl DynamicModelRenderer {
                     jiggle1: skin.jiggle_offsets[1],
                     jiggle2: skin.jiggle_offsets[2],
                     jiggle3: skin.jiggle_offsets[3],
+                    jiggle4: skin.jiggle_offsets[4],
                     source_phong: source_phong(source_material),
                     source_fresnel: source_fresnel(source_material),
                     water_bands0: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[0],p.bands[1],p.bands[2],p.bands[3]]),

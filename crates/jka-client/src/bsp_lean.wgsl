@@ -3626,7 +3626,10 @@ struct MinimalVertexOut {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
-    let source_sample = textureSample(base_texture, base_sampler, input.uv);
+    var source_sample = textureSample(base_texture, base_sampler, input.uv);
+    // As in shade_surface: lightmap alpha carries sun flux, but an explicit
+    // $lightmap stage must blend as an opaque lightmap.
+    if ((material_flags() & MATERIAL_EXPLICIT_LIGHTMAP) != 0u) { source_sample.a = 1.0; }
     var base = source_sample * stage_color;
     let mask_alpha = select(base.a, source_sample.a * material.color.a,
         (material_flags() & 1073741824u) != 0u);

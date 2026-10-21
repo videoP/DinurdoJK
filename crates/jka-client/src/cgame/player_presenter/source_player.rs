@@ -516,36 +516,30 @@ fn finish_source_player_model(
     retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
     jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
-    let mut body_shape_available = false;
+    // Converted Source meshes use the same restored whole-body deformation as
+    // native GLMs. Preserve native pivots as the SOURCE baseline for rebasing.
+    let body_shape_available = jka_assets::body_shape::procedural::supports(
+        &rig.glm, &gla, rig.native_pivots.as_deref(),
+    );
     let mut body_shape_binding = None;
-    let shape_qpath = format!("models/players/{model_name}/model.bodyshape");
-    if let Some(bytes) = source.read_optional(&shape_qpath, 64 * 1024 * 1024)? {
-        let fingerprint_path = descriptor.ue_parts.first().map_or(descriptor.model.as_str(), |part| part.mesh.as_str());
-        let model_bytes = read_required(source, fingerprint_path, MAX_UE_MESH_BYTES)?;
-        match jka_assets::body_shape::BodyShapeGrid::parse(
-            &bytes, &rig.glm, jka_assets::body_shape::model_fingerprint(&model_bytes),
-        ) {
-            Ok(grid) => {
-                body_shape_available = true;
-                if let Some(pivots) = grid.apply(&mut rig.glm, &gla, jiggle_remesh.body_shape, rig.native_pivots.as_deref())? {
-                    body_shape_binding = Some(Arc::new(jka_assets::body_shape::BodyShapeBinding::new(
-                        &gla, rig.native_pivots.as_deref(), &pivots,
-                    )?));
-                    // Match the procedural hair pivots to the shaped native
-                    // cranium/parent pivot, just as the ordinary GLA bone
-                    // matrices are rebound by BodyShapeBinding.
-                    if let Some(original) = rig.native_pivots.as_deref() {
-                        for jiggle_bone in &mut rig.source_jiggles {
-                            let parent = jiggle_bone.parent_gla;
-                            for k in 0..3 {
-                                jiggle_bone.rest_frame[k][3] += pivots[parent][k] - original[parent][k];
-                            }
-                        }
+    if body_shape_available && (!jiggle_remesh.body_shape.is_neutral() || !jiggle_remesh.body_details.is_neutral()) {
+        let original = rig.native_pivots.clone();
+        if let Some(pivots) = jka_assets::body_shape::anny::apply_profile(
+            &mut rig.glm, &gla, jiggle_remesh.body_shape, jiggle_remesh.body_details, original.as_deref(),
+        )? {
+            body_shape_binding = Some(Arc::new(jka_assets::body_shape::BodyShapeBinding::new(
+                &gla, original.as_deref(), &pivots,
+            )?));
+            // Hair jiggle bones inherit the shifted Ghoul2 anatomical anchor.
+            if let Some(before) = original.as_deref() {
+                for jiggle_bone in &mut rig.source_jiggles {
+                    let parent = jiggle_bone.parent_gla;
+                    for k in 0..3 {
+                        jiggle_bone.rest_frame[k][3] += pivots[parent][k] - before[parent][k];
                     }
-                    rig.native_pivots = Some(pivots);
                 }
             }
-            Err(error) => rverbose!(1, "SOURCE BODY SHAPE WARNING: {model_name}: {error}"),
+            rig.native_pivots = Some(pivots);
         }
     }
     // A Source `.mdl` has no Ghoul2 tag surfaces, so without these the character

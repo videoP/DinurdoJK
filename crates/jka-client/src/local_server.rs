@@ -451,6 +451,10 @@ impl LocalServer {
         Ok(())
     }
 
+    pub fn set_idrive(&mut self, enabled: bool) {
+        self.player.set_idrive(enabled);
+    }
+
     pub fn set_mouse_input_settings(&mut self, settings: MouseInputSettings) {
         self.player.set_mouse_input_settings(settings);
     }
@@ -489,6 +493,10 @@ impl LocalServer {
 
     pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
         self.player.teleport(origin, angles)
+    }
+
+    pub fn teleport_with_push(&mut self, origin: [f32; 3], angles: [f32; 3], speed: i32) -> Result<(), String> {
+        self.player.teleport_with_push(origin, angles, speed)
     }
 
     /// `/trace` menu's "USE / TOGGLE" action: fires a mover/trigger-logic

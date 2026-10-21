@@ -128,6 +128,30 @@ commands! {
         }
     }
 
+    cmd_demo_seek ["demo_seek", ] ("demo_seek <seconds>", "Seek demo playback to <seconds> after the demo's first active snapshot.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb, seconds] => {
+                let Some(target_ms) = seconds.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0)
+                    .map(|s| (s * 1000.0).round() as i32) else {
+                    self.console_status = "USAGE: demo_seek <seconds>".into();
+                    return CommandResult::Status;
+                };
+                let current = self.game_session.as_ref().filter(|session| !session.live)
+                    .and_then(|session| session.demo_elapsed_ms(Instant::now()));
+                match current {
+                    Some(current) => {
+                        self.seek_demo_relative(target_ms.saturating_sub(current.round() as i32));
+                        self.push_console_line(format!("DEMO SEEK: {:.3}s", f64::from(target_ms) / 1000.0));
+                    }
+                    None => self.push_console_line("demo_seek: no demo is playing".to_owned()),
+                }
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
     cmd_demo_speed ["demo_speed", ] ("demo_speed <0..100>", "Set demo playback speed.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

@@ -11,6 +11,7 @@ use std::time::Instant;
 mod cache;
 mod bands;
 mod upstream_shore;
+mod contact_band;
 mod promotion;
 mod report;
 pub use cache::fingerprint;

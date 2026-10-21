@@ -3,6 +3,64 @@ use crate::cvar_compatibility::{assert_snapshot, digest, Fixture, INPUTS};
 use std::fs;
 
 #[test]
+fn hybrid_breaker_applies_live_and_round_trips_without_changing_sea_state() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    let waves = app.video.ocean_settings.blue_water_waves;
+    assert_eq!(app.video.ocean_settings.hybrid_breaker, 0);
+    assert_eq!(crate::app::cvar_registry().find("r_hybridBreaker").unwrap().entry.latch,
+        crate::console::LatchScope::None);
+    for mode in [2, 1, 0] {
+        app.set_console_cvar("r_hybridBreaker", &mode.to_string()).unwrap();
+        assert_eq!(app.video.ocean_settings.hybrid_breaker, mode);
+        assert_eq!(app.video.ocean_settings.blue_water_waves, waves);
+        app.flush_config();
+        assert_eq!(crate::config::load_video_settings(&path).ocean_settings.hybrid_breaker, mode);
+    }
+    assert!(app.set_console_cvar("r_hybridBreaker", "3").is_err());
+}
+
+#[test]
+fn inline_transform_modes_apply_live_and_round_trip() {
+    use crate::ui::InlineTransformMode;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    assert_eq!(app.video.inline_transform_mode, InlineTransformMode::Gpu);
+    let definition = crate::app::cvar_registry().find("r_inlineTransform").unwrap();
+    assert_eq!(definition.entry.latch, crate::console::LatchScope::None);
+    for (value, expected) in [
+        ("workers", InlineTransformMode::CpuWorkers),
+        ("gpu", InlineTransformMode::Gpu),
+        ("cpu", InlineTransformMode::Cpu),
+    ] {
+        app.set_console_cvar("r_inlineTransform", value).unwrap();
+        assert_eq!(app.video.inline_transform_mode, expected);
+        assert_eq!(app.console_cvar_value("r_inlineTransform").as_deref(), Some(value));
+        app.flush_config();
+        assert_eq!(crate::config::load_video_settings(&path).inline_transform_mode, expected);
+    }
+    app.set_console_cvar("r_inlineGpuTransform", "1").unwrap();
+    assert_eq!(app.video.inline_transform_mode, InlineTransformMode::Gpu);
+    app.set_console_cvar("r_inlineGpuTransform", "0").unwrap();
+    assert_eq!(app.video.inline_transform_mode, InlineTransformMode::Cpu);
+    app.set_console_cvar("r_inlineTransform", "workers").unwrap();
+    assert!(app.set_console_cvar("r_inlineTransform", "invalid").is_err());
+    assert_eq!(app.video.inline_transform_mode, InlineTransformMode::CpuWorkers);
+}
+
+#[test]
 fn upstream_coast_is_saved_separately_and_preserves_jka_solver_choice() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop=winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()

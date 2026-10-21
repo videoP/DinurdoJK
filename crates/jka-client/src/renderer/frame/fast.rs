@@ -304,6 +304,7 @@ impl Renderer {
         let perf_pre_world_started = perf_timing.then(Instant::now);
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
+        self.encode_inline_transforms(&mut encoder);
         // A transmissive snapshot needs a sampleable scene attachment. The
         // swapchain view is renderable but is not guaranteed TEXTURE_BINDING.
         let use_gamma_post = self.frame_plan.use_post || glass_capture_needed;

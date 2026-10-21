@@ -988,6 +988,25 @@ pub fn wishspeed(hud: &MovementHudState, settings: &StrafeHelperSettings, fps_ca
     model.wishspeed(model.cmd, false)
 }
 
+/// Signed difference from the held key's optimal guide, in degrees.
+/// Positive is overshooting (wish direction too far from velocity); negative
+/// is undershooting. Uses the same physics, FPS and offset as the drawn lines,
+/// independently of their visibility flags and the side being strafed.
+pub fn angle_error(hud: &MovementHudState, settings: &StrafeHelperSettings, fps_cap: u32) -> Option<f32> {
+    let model = Model::new(hud, settings, frametime(settings, fps_cap));
+    if hud.in_vehicle || hud.spectator_free_roam || model.v < 1.0
+        || model.style == mv::SIEGE || center_only(model.style)
+        || !hud.view_yaw.is_finite() || !model.v.is_finite() {
+        return None;
+    }
+    Key::from_axes(model.cmd.forward, model.cmd.right)?;
+    let wish = model.wish_dir(model.cmd);
+    let actual = (model.velocity_dot(wish) / model.v).clamp(-1.0, 1.0).acos().to_degrees();
+    let optimal = 45.0 + model.delta(Gaz::Opt, model.cmd);
+    let error = actual - optimal;
+    error.is_finite().then_some(error)
+}
+
 /// Strafehelper segments for this frame, in virtual HUD space.
 ///
 /// `fps_cap` is `com_maxfps` (0 = uncapped); `aspect` is window width / height.
@@ -1032,6 +1051,44 @@ mod tests {
             player_speed: 250.0,
             ..MovementHudState::default()
         }
+    }
+
+    #[test]
+    fn variometer_angle_error_matches_guides_on_both_sides_and_all_keys() {
+        let settings = settings(0); // audio still works with every guide hidden
+        for key in Key::ALL {
+            for rear in [false, true] {
+                let (forward, right) = key.axes();
+                let mut state = air_state(forward as i8, right as i8);
+                let model = Model::new(&state, &settings, 1.0 / 125.0);
+                let target = key.angle(rear, model.delta(Gaz::Opt, model.cmd));
+                state.view_yaw = target;
+                assert!(angle_error(&state, &settings, 125).unwrap().abs() < 0.001);
+                let model = Model::new(&state, &settings, 1.0 / 125.0);
+                let side = model.wish_dir(model.cmd)[1].signum();
+                state.view_yaw = target + side * 3.0;
+                assert!((angle_error(&state, &settings, 125).unwrap() - 3.0).abs() < 0.001);
+                state.view_yaw = target - side * 3.0;
+                assert!((angle_error(&state, &settings, 125).unwrap() + 3.0).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn variometer_angle_error_uses_offset_wraps_yaw_and_ignores_vertical_speed() {
+        let mut settings = settings(0);
+        settings.offset = 200.0; // two degrees, as in the line model
+        let mut state = air_state(127, -127);
+        let model = Model::new(&state, &settings, 1.0 / 125.0);
+        state.view_yaw = model.delta(Gaz::Opt, model.cmd) + 360.0;
+        state.velocity[2] = 900.0;
+        assert!(angle_error(&state, &settings, 125).unwrap().abs() < 0.001);
+        state.forward_move = 0;
+        state.right_move = 0;
+        assert_eq!(angle_error(&state, &settings, 125), None);
+        state.forward_move = 127;
+        state.velocity = [0.0; 3];
+        assert_eq!(angle_error(&state, &settings, 125), None);
     }
 
     #[test]

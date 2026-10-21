@@ -1,15 +1,22 @@
-//! Offline-authored Anny deformation grids for an exact native GLM revision.
+//! Anny body shaping and legacy offline deformation-grid support.
 //!
 //! Shape interpolation happens during asset registration. Mesh topology, UVs,
 //! skin weights, animation definitions and gameplay bounds are retained.
 use crate::ghoul2::{GlaAnimation, GlmModel, Matrix3x4};
 use std::collections::HashMap;
 
+// Keep the earlier procedural implementation for its existing tools/tests.
+// Player registration uses the authored Anny targets and retopology adapter.
+pub mod procedural;
+pub mod anny;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BodyShapeParams {
     pub muscle: f32,
     pub weight: f32,
     pub proportions: f32,
+    /// Overall height, independent of the relative limb/torso proportions.
+    pub height: f32,
     /// Normalized within the age range recorded in the exported bundle.
     pub age: f32,
 }
@@ -20,6 +27,7 @@ impl Default for BodyShapeParams {
             muscle: 0.5,
             weight: 0.5,
             proportions: 0.5,
+            height: 0.5,
             age: 0.5,
         }
     }
@@ -40,6 +48,7 @@ impl BodyShapeParams {
             muscle: values[0],
             weight: values[1],
             proportions: values[2],
+            height: if self.height.is_finite() { self.height.clamp(0.0, 1.0) } else { 0.5 },
             age: values[3],
         }
     }
@@ -566,6 +575,7 @@ mod tests {
             weight: f32::INFINITY,
             proportions: -2.0,
             age: 4.0,
+            height: f32::NAN,
         }
         .clamped();
         assert_eq!(p.values(), [0.5, 0.5, 0.0, 1.0]);
@@ -586,6 +596,7 @@ mod tests {
             weight: 0.8,
             proportions: 0.4,
             age: 0.2,
+            height: 0.5,
         });
         assert!((corners.iter().map(|x| x.1).sum::<f32>() - 1.0).abs() < 1e-6);
         // Sample values for a multilinear function include a muscle*weight term.
@@ -699,6 +710,7 @@ mod tests {
                     weight: values[1],
                     proportions: values[2],
                     age: values[3],
+                    height: 0.5,
                 };
                 let expected: Vec<[f32; 3]> = (0..grid.points_per_sample)
                     .map(|_| std::array::from_fn(|_| r.float().unwrap()))
@@ -830,6 +842,7 @@ mod tests {
                 weight: values[1],
                 proportions: values[2],
                 age: values[3],
+                height: 0.5,
             };
             let expected: Vec<[f32; 3]> = (0..grid.points_per_sample)
                 .map(|_| std::array::from_fn(|_| r.float().unwrap()))

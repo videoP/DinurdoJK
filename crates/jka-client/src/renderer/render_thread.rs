@@ -1,6 +1,8 @@
 //! Thread.
-use crate::renderer::diagnostics::perf_capture::PerfCapture;
+use crate::renderer::diagnostics::perf_capture::{LoopSections, PerfCapture};
 use crate::renderer::diagnostics::sky_sweep::SkyPerfSweep;
+use crate::renderer::diagnostics::tile_cost::{parse_pass, TileCostOverlay, TileCostProbe};
+use crate::renderer::TileCostCommand;
 use crate::renderer::{
     block_on, mpsc, sample_view_rotation, scene, thread, Arc, CompanionId, CompanionRenderThread,
     Duration, DynamicLightsMode, EventLoopProxy, FrameInfo, GpuPass, HashMap, InputLatencySample,
@@ -10,6 +12,14 @@ use crate::renderer::{
     RendererBackend, Sender, TryRecvError, UiSnapshot, UserEvent, Window, WorldRenderPath,
     WorldUploadTimings, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
 };
+
+/// Newest app snapshot plus a publish counter, so the render loop can skip the
+/// clone and every mailbox setter when no new snapshot arrived since the last
+/// frame (the renderer often runs faster than the app publishes).
+pub(in crate::renderer) struct SnapshotMailbox {
+    pub(in crate::renderer) generation: u64,
+    pub(in crate::renderer) snapshot: RenderSnapshot,
+}
 
 /// Panic payloads are `&str` or `String` in practice; anything else is reported
 /// as an unknown panic rather than being dropped silently.
@@ -120,8 +130,10 @@ fn print_r_speeds(
 #[allow(unreachable_patterns)]
 fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
     match command {
+        RenderCommand::MemoryInfo => "MemoryInfo",
         RenderCommand::StartPerfCapture { .. } => "StartPerfCapture",
         RenderCommand::StartSkyPerfSweep { .. } => "StartSkyPerfSweep",
+        RenderCommand::TileCost(..) => "TileCost",
         RenderCommand::BatchBegin(..) => "BatchBegin",
         RenderCommand::BatchLabel(..) => "BatchLabel",
         RenderCommand::BatchEnd => "BatchEnd",
@@ -148,8 +160,10 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetPvsMode(..) => "SetPvsMode",
         RenderCommand::SetFacePlaneCull(..) => "SetFacePlaneCull",
         RenderCommand::SetDrawInlineModels(..) => "SetDrawInlineModels",
+        RenderCommand::SetInlineTransformMode(..) => "SetInlineTransformMode",
         RenderCommand::SetFragmentShaderMode(..) => "SetFragmentShaderMode",
         RenderCommand::SetWorldSortMode(..) => "SetWorldSortMode",
+        RenderCommand::SetPostSpecialize(..) => "SetPostSpecialize",
         RenderCommand::SetColorClearMode(..) => "SetColorClearMode",
         RenderCommand::SetWorldStageDebug { .. } => "SetWorldStageDebug",
         RenderCommand::SetFastSky(..) => "SetFastSky",
@@ -200,7 +214,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetDynamicLightDebug(..) => "SetDynamicLightDebug",
         RenderCommand::SetRtSamples(..) => "SetRtSamples",
         RenderCommand::SetDynamicLightFalloff(..) => "SetDynamicLightFalloff",
-        RenderCommand::SetRtHalfResolution(..) => "SetRtHalfResolution",
+        RenderCommand::SetRtTraceRate(..) => "SetRtTraceRate",
         RenderCommand::SetMapLightSimulation(..) => "SetMapLightSimulation",
         RenderCommand::SetClassicWorldLighting { .. } => "SetClassicWorldLighting",
         RenderCommand::SetEmissiveAreaLights(..) => "SetEmissiveAreaLights",
@@ -253,7 +267,7 @@ pub struct RenderThread {
     /// Kept on the Winit/app side so auxiliary surfaces are created on the
     /// native window's origin thread before being handed to render workers.
     pub(in crate::renderer) instance: wgpu::Instance,
-    pub(in crate::renderer) latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    pub(in crate::renderer) latest_snapshot: Arc<Mutex<SnapshotMailbox>>,
     pub(in crate::renderer) latest_view: Arc<LatestViewState>,
     pub(in crate::renderer) input_diagnostic: Arc<InputDiagnostic>,
     pub(in crate::renderer) join: Option<JoinHandle<()>>,
@@ -275,7 +289,7 @@ impl RenderThread {
         // needs the newest camera/input state available when a frame begins.
         // A shared latest snapshot avoids retaining stale mouse samples when input
         // arrives faster than rendering (for example 1000 Hz input at 240-500 FPS).
-        let latest_snapshot = Arc::new(Mutex::new(initial.clone()));
+        let latest_snapshot = Arc::new(Mutex::new(SnapshotMailbox { generation: 0, snapshot: initial.clone() }));
         let mut initial_view_camera = initial.camera;
         if let Some([yaw, pitch]) = initial.input_view_rotation {
             initial_view_camera.yaw = yaw;
@@ -433,10 +447,12 @@ impl RenderThread {
                 snapshot.input_latency,
             );
         }
-        match self.latest_snapshot.lock() {
-            Ok(mut latest) => *latest = snapshot,
-            Err(poisoned) => *poisoned.into_inner() = snapshot,
-        }
+        let mut latest = match self.latest_snapshot.lock() {
+            Ok(latest) => latest,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        latest.snapshot = snapshot;
+        latest.generation = latest.generation.wrapping_add(1);
     }
 
     pub fn publish_subframe_view_rotation(
@@ -451,8 +467,13 @@ impl RenderThread {
     }
 
     /// Request a bounded renderer CPU recording after map/shader warmup.
-    pub fn start_render_perf_capture(&self, stem: PathBuf, frames: usize) -> Result<(), &'static str> {
-        self.command_tx.send(RenderCommand::StartPerfCapture { stem, frames })
+    pub fn start_render_perf_capture(&self, stem: PathBuf, frames: usize, seconds: Option<f64>) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::StartPerfCapture { stem, frames, seconds })
+            .map_err(|_| "renderer command channel closed")
+    }
+
+    pub fn tile_cost(&self, command: TileCostCommand) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::TileCost(command))
             .map_err(|_| "renderer command channel closed")
     }
 
@@ -561,7 +582,7 @@ pub(in crate::renderer) fn render_thread_main(
     surface: wgpu::Surface<'static>,
     proxy: EventLoopProxy<UserEvent>,
     command_rx: Receiver<RenderCommand>,
-    latest_snapshot: Arc<Mutex<RenderSnapshot>>,
+    latest_snapshot: Arc<Mutex<SnapshotMailbox>>,
     latest_view: Arc<LatestViewState>,
     input_diagnostic: Arc<InputDiagnostic>,
     mut snapshot: RenderSnapshot,
@@ -804,15 +825,17 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.present_copy_enabled = initial_ui.video.present_copy;
     renderer.texture_compression = initial_ui.video.texture_compression.min(2);
     renderer.set_draw_inline_models(initial_ui.video.draw_inline_models);
+    renderer.set_inline_transform_mode(initial_ui.video.inline_transform_mode);
     renderer.set_fragment_shader_mode(initial_ui.video.fragment_shader_mode);
     renderer.world_sort_mode = initial_ui.video.world_sort_mode.min(1);
+    renderer.post_specialize = initial_ui.video.post_specialize;
     renderer.color_clear_mode = initial_ui.video.color_clear_mode.min(1);
     renderer.set_world_stage_debug(initial_ui.video.draw_bsp_model_surfaces, initial_ui.video.world_stage_probe);
     renderer.set_fast_sky(initial_ui.video.fast_sky);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
     renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
-    renderer.set_rt_half_resolution(initial_ui.video.rt_half_resolution);
+    renderer.set_rt_trace_rate(initial_ui.video.rt_trace_rate);
     renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
     renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
     let mut shader_light_mask = 0_u32;
@@ -921,6 +944,12 @@ pub(in crate::renderer) fn render_thread_main(
     // and each successful frame adds one small, allocation-free PerfRow.
     let mut perf_capture: Option<PerfCapture> = None;
     let mut sky_sweep: Option<SkyPerfSweep> = None;
+    let mut tile_probe: Option<TileCostProbe> = None;
+    // Loop-section timing for render_perf_capture only (no clock reads otherwise).
+    let mut last_render_returned: Option<Instant> = None;
+    // Mailbox generation already applied; MAX forces the first frame to apply.
+    let mut applied_snapshot_generation = u64::MAX;
+    let mut tile_probe_reported_at = Instant::now();
 
     // Opt-in console diagnostics. Keep the normal maximum-FPS path free of
     // per-frame formatting/printing, and only aggregate when explicitly asked.
@@ -985,6 +1014,23 @@ pub(in crate::renderer) fn render_thread_main(
     let mut hdr_capabilities_last_checked = Instant::now();
 
     loop {
+        let loop_clock = perf_capture.is_some().then(Instant::now);
+        let mut loop_sections = LoopSections::default();
+        if let (Some(now), Some(returned)) = (loop_clock, last_render_returned.take()) {
+            loop_sections.post_render_prev_ms = now.saturating_duration_since(returned).as_secs_f64() * 1000.0;
+        }
+        let lap = |mark: &mut Option<Instant>| -> f64 {
+            match mark {
+                Some(previous) => {
+                    let now = Instant::now();
+                    let ms = now.saturating_duration_since(*previous).as_secs_f64() * 1000.0;
+                    *previous = now;
+                    ms
+                }
+                None => f64::NAN,
+            }
+        };
+        let mut loop_mark = loop_clock;
         // HDR availability can change with Windows HDR or a display move,
         // including while running in SDR. Never query per frame.
         let hdr_output_changed = renderer.poll_hdr_display();
@@ -1027,6 +1073,7 @@ pub(in crate::renderer) fn render_thread_main(
             stop_for_device_loss(&proxy, renderer, companion_renderers);
             return;
         }
+        loop_sections.top_ms = lap(&mut loop_mark);
         {
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
@@ -1067,6 +1114,11 @@ pub(in crate::renderer) fn render_thread_main(
                 pending_world_uploaded.is_some().then(Instant::now);
             loop {
                 let received = command_rx.try_recv();
+                if received.is_ok() {
+                    // A command may have replaced state the mailbox setters own;
+                    // re-apply the current snapshot this frame.
+                    applied_snapshot_generation = u64::MAX;
+                }
                 if diag_command_drain_started.is_some() && received.is_ok() {
                     diag_command_drain_count = diag_command_drain_count.saturating_add(1);
                 }
@@ -1080,7 +1132,8 @@ pub(in crate::renderer) fn render_thread_main(
                 };
                 let command_started = Instant::now();
                 match received {
-                    Ok(RenderCommand::StartPerfCapture { stem, frames }) => {
+                    Ok(RenderCommand::MemoryInfo) => renderer.print_memory_report(),
+                    Ok(RenderCommand::StartPerfCapture { stem, frames, seconds }) => {
                         if let Some(mut sweep) = sky_sweep.take() {
                             sweep.restore(&mut renderer);
                             renderer.set_gpu_timings(user_gpu_timings || diag_forced_gpu_timings);
@@ -1089,10 +1142,51 @@ pub(in crate::renderer) fn render_thread_main(
                         // Re-arming discards an incomplete run. Drop clears the
                         // global hook flag before the new capture enables it.
                         drop(perf_capture.take());
-                        eprintln!("[RENDER PERF] armed {} samples -> {} (2s delay + 120 warmup frames)",
-                            frames.clamp(30, 6_000), stem.display());
-                        perf_capture = Some(PerfCapture::arm(stem, frames, &renderer));
+                        match seconds {
+                            Some(seconds) => eprintln!("[RENDER PERF] armed {seconds:.1}s -> {} (2s delay + 120 warmup frames)",
+                                stem.display()),
+                            None => eprintln!("[RENDER PERF] armed {} samples -> {} (2s delay + 120 warmup frames)",
+                                frames.clamp(30, 6_000), stem.display()),
+                        }
+                        perf_capture = Some(PerfCapture::arm(stem, frames, seconds, &renderer));
                     }
+                    Ok(RenderCommand::TileCost(command)) => match command {
+                        TileCostCommand::Start { stem, cols, rows, samples } => {
+                            if let Some(mut sweep) = sky_sweep.take() { sweep.restore(&mut renderer); }
+                            drop(perf_capture.take());
+                            if let Some(probe) = tile_probe.take() { probe.restore(&mut renderer); }
+                            renderer.tile_cost_overlay = None;
+                            renderer.set_gpu_timings(true);
+                            let probe = TileCostProbe::new(stem.clone(), cols, rows, samples, &mut renderer);
+                            let (_, total) = probe.progress();
+                            eprintln!("[TILE COST] armed {cols}x{rows} grid, {total} timings -> {} (2s delay; hold still)",
+                                stem.display());
+                            tile_probe = Some(probe);
+                            tile_probe_reported_at = Instant::now();
+                        }
+                        TileCostCommand::Cancel => {
+                            if let Some(probe) = tile_probe.take() {
+                                probe.restore(&mut renderer);
+                                renderer.set_gpu_timings(user_gpu_timings || diag_forced_gpu_timings);
+                                eprintln!("[TILE COST] cancelled");
+                            }
+                        }
+                        TileCostCommand::Hide => {
+                            if let Some(overlay) = renderer.tile_cost_overlay.as_mut() { overlay.visible = false; }
+                        }
+                        TileCostCommand::Show(name) => match renderer.tile_cost_overlay.as_mut() {
+                            None => eprintln!("[TILE COST] no finished report; run gputilecost first"),
+                            Some(overlay) => {
+                                if !parse_pass(&name).is_some_and(|pass| overlay.show(pass)) {
+                                    eprintln!("[TILE COST] no data for '{name}'. Passes: {}", overlay.available_passes());
+                                }
+                            }
+                        },
+                        TileCostCommand::ListPasses => match renderer.tile_cost_overlay.as_ref() {
+                            Some(overlay) => eprintln!("[TILE COST] passes: {}", overlay.available_passes()),
+                            None => eprintln!("[TILE COST] no finished report; run gputilecost first"),
+                        },
+                    },
                     Ok(RenderCommand::StartSkyPerfSweep { stem, frames }) => {
                         if let Some(mut sweep) = sky_sweep.take() { sweep.restore(&mut renderer); }
                         drop(perf_capture.take());
@@ -1189,8 +1283,10 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
                     Ok(RenderCommand::SetFacePlaneCull(enabled)) => renderer.set_face_plane_cull(enabled),
                     Ok(RenderCommand::SetDrawInlineModels(enabled)) => renderer.set_draw_inline_models(enabled),
+                    Ok(RenderCommand::SetInlineTransformMode(mode)) => renderer.set_inline_transform_mode(mode),
                     Ok(RenderCommand::SetFragmentShaderMode(mode)) => renderer.set_fragment_shader_mode(mode),
                     Ok(RenderCommand::SetWorldSortMode(mode)) => renderer.world_sort_mode = mode.min(1),
+                    Ok(RenderCommand::SetPostSpecialize(enabled)) => renderer.post_specialize = enabled,
                     Ok(RenderCommand::SetColorClearMode(mode)) => renderer.color_clear_mode = mode.min(1),
                     Ok(RenderCommand::SetWorldStageDebug { draw_bsp_model_surfaces, probe }) => {
                         renderer.set_world_stage_debug(draw_bsp_model_surfaces, probe);
@@ -1323,7 +1419,7 @@ pub(in crate::renderer) fn render_thread_main(
                         user_gpu_timings = enabled;
                         // A capture owns the profiler until it finishes; the new
                         // preference is applied when it restores.
-                        if !diag_forced_gpu_timings && sky_sweep.is_none() {
+                        if !diag_forced_gpu_timings && sky_sweep.is_none() && tile_probe.is_none() {
                             renderer.set_gpu_timings(enabled);
                         }
                     }
@@ -1402,8 +1498,8 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetDynamicLightFalloff(mode)) => {
                         renderer.set_dynamic_light_falloff(mode)
                     }
-                    Ok(RenderCommand::SetRtHalfResolution(enabled)) => {
-                        renderer.set_rt_half_resolution(enabled)
+                    Ok(RenderCommand::SetRtTraceRate(rate)) => {
+                        renderer.set_rt_trace_rate(rate)
                     }
                     Ok(RenderCommand::SetMapLightSimulation(enabled)) => {
                         renderer.set_map_light_simulation(enabled);
@@ -1748,50 +1844,63 @@ pub(in crate::renderer) fn render_thread_main(
             diag_command_drain_ms = diag_command_drain_started
                 .map(|started| started.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
+            loop_sections.drain_ms = lap(&mut loop_mark);
             if let Some((completed, total)) = renderer.poll_static_ao_progress() {
                 let _ = proxy.send_event(UserEvent::StaticAoProgress { completed, total });
             }
             renderer.poll_static_ao_updates();
             renderer.poll_static_ao_worker();
-            let next = match latest_snapshot.lock() {
-                Ok(latest) => latest.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
+            let next = {
+                let latest = match latest_snapshot.lock() {
+                    Ok(latest) => latest,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                (latest.generation != applied_snapshot_generation).then(|| {
+                    applied_snapshot_generation = latest.generation;
+                    latest.snapshot.clone()
+                })
             };
-            let position_delta = next.camera.position - snapshot.camera.position;
-            let yaw_delta = (next.camera.yaw - snapshot.camera.yaw).abs();
-            let pitch_delta = (next.camera.pitch - snapshot.camera.pitch).abs();
-            let camera_changed = position_delta.length_squared() > 1.0e-10
-                || yaw_delta > 1.0e-7
-                || pitch_delta > 1.0e-7;
-            if camera_changed {
-                let now = Instant::now();
-                let elapsed = now.duration_since(motion_camera_changed_at).as_secs_f32();
-                // Large position discontinuities are camera cuts/teleports, not shutter
-                // motion. Reset the reference instead of smearing the whole image.
-                let camera_cut = position_delta.length_squared() > 256.0 * 256.0;
-                if camera_cut {
-                    motion_reference_camera = next.camera;
-                    motion_camera_sample_dt = 1.0 / 120.0;
-                } else {
-                    // After an idle period, don't interpret the idle time as the camera's
-                    // sample interval. The first new input sample should still blur.
-                    motion_camera_sample_dt = if elapsed > 0.0 && elapsed <= 0.05 {
-                        elapsed.max(1.0 / 10_000.0)
+            // No new snapshot and no command since the last frame: everything
+            // below would recompute the same state (and set_screen_fx would
+            // re-upload identical vertices).
+            if let Some(next) = next {
+                let position_delta = next.camera.position - snapshot.camera.position;
+                let yaw_delta = (next.camera.yaw - snapshot.camera.yaw).abs();
+                let pitch_delta = (next.camera.pitch - snapshot.camera.pitch).abs();
+                let camera_changed = position_delta.length_squared() > 1.0e-10
+                    || yaw_delta > 1.0e-7
+                    || pitch_delta > 1.0e-7;
+                if camera_changed {
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(motion_camera_changed_at).as_secs_f32();
+                    // Large position discontinuities are camera cuts/teleports, not shutter
+                    // motion. Reset the reference instead of smearing the whole image.
+                    let camera_cut = position_delta.length_squared() > 256.0 * 256.0;
+                    if camera_cut {
+                        motion_reference_camera = next.camera;
+                        motion_camera_sample_dt = 1.0 / 120.0;
                     } else {
-                        1.0 / 120.0
-                    };
-                    motion_reference_camera = snapshot.camera;
+                        // After an idle period, don't interpret the idle time as the camera's
+                        // sample interval. The first new input sample should still blur.
+                        motion_camera_sample_dt = if elapsed > 0.0 && elapsed <= 0.05 {
+                            elapsed.max(1.0 / 10_000.0)
+                        } else {
+                            1.0 / 120.0
+                        };
+                        motion_reference_camera = snapshot.camera;
+                    }
+                    motion_camera_changed_at = now;
                 }
-                motion_camera_changed_at = now;
+                // HUD input/velocity/health are mailbox state just like the camera:
+                // update only the tiny hot vertex buffer when they actually change.
+                renderer.set_dynamic_hud(next.hud, next.movement_hud);
+                renderer.set_player_names(next.player_names.clone());
+                renderer.set_jump_shade(next.jump_shade);
+                renderer.set_screen_fx(&next.screen_fx);
+                renderer.set_cloud_foreground(&next.cloud_foreground);
+                snapshot = next;
             }
-            // HUD input/velocity/health are mailbox state just like the camera:
-            // update only the tiny hot vertex buffer when they actually change.
-            renderer.set_dynamic_hud(next.hud, next.movement_hud);
-            renderer.set_player_names(next.player_names.clone());
-            renderer.set_jump_shade(next.jump_shade);
-            renderer.set_screen_fx(&next.screen_fx);
-            renderer.set_cloud_foreground(&next.cloud_foreground);
-            snapshot = next;
+            loop_sections.mailbox_ms = lap(&mut loop_mark);
         }
         if renderer.size.width == 0 || renderer.size.height == 0 {
             thread::sleep(Duration::from_millis(8));
@@ -1800,14 +1909,18 @@ pub(in crate::renderer) fn render_thread_main(
 
         // Every settings command for this frame has been drained, so a burst that
         // asked for the scene rebuild several times over pays for it once.
+        let pre_started = loop_mark;
         let first_world_rebuild_started = pending_world_uploaded.is_some().then(Instant::now);
         renderer.apply_pending_scene_rebuild();
+        let mut pre_mark = pre_started;
+        loop_sections.pre_scene_rebuild_ms = lap(&mut pre_mark);
         let first_world_rebuild_ms = first_world_rebuild_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
 
         let first_world_inline_started = pending_world_uploaded.is_some().then(Instant::now);
         renderer.update_inline_models(snapshot.inline_models.as_deref().map(Vec::as_slice));
+        loop_sections.pre_inline_models_ms = lap(&mut pre_mark);
         let first_world_inline_ms = first_world_inline_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
@@ -1831,6 +1944,8 @@ pub(in crate::renderer) fn render_thread_main(
             renderer.gpu_profiler.latest,
             &renderer.device, &renderer.queue,
             renderer.size.width, renderer.size.height,
+            renderer.world.as_ref(),
+            renderer.ocean_visibility.latest_samples,
         );
         previous_graph_frame_complete = false;
         if let Some((_, _, _, uploaded_at)) = pending_first_world_phases.as_ref() {
@@ -1895,6 +2010,9 @@ pub(in crate::renderer) fn render_thread_main(
             renderer.model_frame_log.set_source(model_source);
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
             renderer.dynamic_model_renderer.entity_water = Arc::clone(&snapshot.player_water);
+            if let Some(probe) = tile_probe.as_mut() {
+                probe.begin_frame(&mut renderer);
+            }
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderFrame,
@@ -1907,6 +2025,7 @@ pub(in crate::renderer) fn render_thread_main(
             // use by a SurfaceTexture"), and a panic during a panic aborts the
             // process through __fastfail - no minidump, no log tail, and the
             // original message buried under the fallout.
+            loop_sections.pre_render_ms = lap(&mut loop_mark);
             let frame_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if shader_progress_polled_at.elapsed() >= Duration::from_millis(90) {
                     shader_progress_polled_at = Instant::now();
@@ -1929,6 +2048,8 @@ pub(in crate::renderer) fn render_thread_main(
                     input_latelatch.then_some(latest_view.as_ref()),
                 )
             }));
+            loop_sections.render_call_ms = lap(&mut loop_mark);
+            last_render_returned = loop_mark;
             if first_world_profile {
                 crate::renderer::diagnostics::perf_capture::set_first_world_frame_trace(false);
             }
@@ -1947,6 +2068,9 @@ pub(in crate::renderer) fn render_thread_main(
         if gamma_preparation.is_some() && render_result.is_ok() && !renderer.baked_brightness.busy {
             let generation = gamma_preparation.take().unwrap();
             let _ = proxy.send_event(UserEvent::GammaPrepared(generation));
+        }
+        if render_result.is_err() {
+            renderer.retry_inline_transforms();
         }
         match render_result {
             Ok(info) => {
@@ -1989,8 +2113,8 @@ pub(in crate::renderer) fn render_thread_main(
                         else if baseline == selected { "NO REDUCTION (identical selected index count)" }
                         else if selected > baseline { "MESH INCREASED (more triangles than reference)" }
                         else { "native indexed mesh reduction confirmed" };
-                    println!("[OCEAN ADAPTIVE DEBUG] A/B={} backend={} native_draws={} measured_pools={} pending={} full={} submitted={} saved={:+} ({:+.2}%) waves[height={:.3}m wavelength={:.1}m chop={:.2} wind={:.2}m/s blend={:.2}] screenLOD={:.1} status={} {}",
-                        u8::from(renderer.ocean_settings.adaptive_mesh), renderer.ocean_settings.backend,
+                    println!("[OCEAN ADAPTIVE DEBUG] A/B={} backend={} native_draws={} measured_pools={} pending={} full={} submitted={} saved={:+} ({:+.2}%) waves[height={:.3}m wavelength={:.1}m chop={:.2} wind={:.2}m/s blend={:.2}] screenLOD={:.1} localTol={:.2} status={} {}",
+                        renderer.ocean_settings.adaptive_mesh, renderer.ocean_settings.backend,
                         stats.original_surfaces, stats.adaptive_mesh_counted_slots, stats.adaptive_mesh_uncounted_slots,
                         baseline, selected, removed, percentage,
                         renderer.ocean_settings.blue_water_waves.height,
@@ -1999,11 +2123,35 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.ocean_settings.blue_water_waves.wind_speed,
                         renderer.ocean_settings.hybrid_fft_blend,
                         renderer.ocean_settings.screen_lod_pixels,
+                        renderer.ocean_settings.adaptive_mesh_tolerance,
                         reason, details);
                 }
-                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf)) {
+                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf, loop_sections)) {
                     if let Some(completed) = perf_capture.take() {
                         completed.finish();
+                    }
+                }
+                if let Some(probe) = tile_probe.as_mut() {
+                    let outcome = probe.record(&info, &mut renderer);
+                    if matches!(outcome, Ok(false)) && tile_probe_reported_at.elapsed() >= Duration::from_secs(2) {
+                        tile_probe_reported_at = Instant::now();
+                        let (done, total) = probe.progress();
+                        eprintln!("[TILE COST] {done}/{total} timings");
+                    }
+                    if !matches!(outcome, Ok(false)) {
+                        if let Some(probe) = tile_probe.take() {
+                            probe.restore(&mut renderer);
+                            match outcome {
+                                Ok(_) => {
+                                    renderer.tile_cost_overlay = TileCostOverlay::new(probe.finish());
+                                    if renderer.tile_cost_overlay.is_none() {
+                                        eprintln!("[TILE COST] finished without frame or world GPU timings");
+                                    }
+                                }
+                                Err(error) => eprintln!("[TILE COST] stopped: {error}"),
+                            }
+                        }
+                        renderer.set_gpu_timings(user_gpu_timings || diag_forced_gpu_timings);
                     }
                 }
                 if let Some(sweep) = sky_sweep.as_mut() {
@@ -2572,13 +2720,13 @@ pub(in crate::renderer) fn render_thread_main(
             if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
                     println!(
-                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms rt_taa={} sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms rt_taa={} rt_trace_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
                     gpu_ms(GpuPass::RtBuild),
                     gpu_ms(GpuPass::RtSkin),
                     gpu_ms(GpuPass::RtAcceleration),
                     gpu_ms(GpuPass::RtVisibility),
                     renderer.rt_taa_mode,
-                    if renderer.rt_reduced_shadows { "quarter" } else { "full" },
+                    renderer.rt_trace_rate,
                     rt.geometry_count,
                     rt.triangle_count,
                     rt.masked_geometry_count,

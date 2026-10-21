@@ -1,6 +1,6 @@
 //! Frame plan.
 use crate::renderer::{
-    weather, CullDebugMode, DynamicLightsMode, DynamicShadowsMode,
+    weather, CullDebugMode, DofMode, DynamicLightsMode,
     PlanarReflectionDebugMode, Renderer, WorldRenderPath,
 };
 
@@ -125,6 +125,17 @@ mod transparency_order_tests {
 }
 
 impl Renderer {
+    /// DOF is drawn under this plan: `Off` never draws, underwater-only draws
+    /// only while the camera is below a water surface (`dof_plan_underwater`).
+    pub(in crate::renderer) fn dof_draws_this_plan(&self) -> bool {
+        self.depth_of_field_strength > 0.001
+            && match self.dof_mode {
+                DofMode::Off => false,
+                DofMode::On => true,
+                DofMode::UnderwaterOnly => self.dof_plan_underwater,
+            }
+    }
+
     pub(in crate::renderer) fn rebuild_frame_plan(&mut self) {
         let fog_enabled = self.weather.fog.volumetric_effective();
         let legacy_fog_enabled = self.weather.fog.legacy_effective();
@@ -148,7 +159,7 @@ impl Renderer {
             && self.weather.rain.glass_enabled
             && self.weather.rain.fast_post;
         let other_full_post_effects = self.ocean_enabled
-            || (self.native_atmosphere_active() && self.blue_water_environment.filmic)
+            || (self.sky_backend == 1 && self.blue_water_environment.filmic)
             || self.tone_mapping_enabled
             || self.glow_mode.enabled()
             || self.halation_enabled
@@ -166,7 +177,7 @@ impl Renderer {
             || self.chromatic_aberration_strength > 0.001
             || self.film_grain_strength > 0.001
             || self.motion_blur_strength > 0.001
-            || self.depth_of_field_strength > 0.001;
+            || self.dof_draws_this_plan();
         let rain_full_post_effects = rain_spatial_post
             || (self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON
                 && !self.weather.rain.fast_post);
@@ -194,7 +205,7 @@ impl Renderer {
         // hundreds of times per frame/per draw. This path intentionally matches
         // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
         // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
-        let fast_baseline = self.sky_backend == 0 && !self.blue_water_environment.world_lighting && self.blue_water_environment.weather_backend != 1 && !self.force_unified_world
+        let fast_baseline = self.sky_backend == 0 && self.blue_water_environment.world_lighting <= 0.0 && self.blue_water_environment.weather_backend != 1 && !self.force_unified_world
             // bsp_fast has no baked-light adjustment or authored-sun cache pass.
             && !self.baked_lighting_shader_needed()
             // Curved-grid LOD belongs to the Unified packed BSP path.
@@ -250,9 +261,7 @@ impl Renderer {
         // linear-depth prepass: with no other consumer it runs a cheaper
         // depth-only early pass instead (see `FramePlan::hiz_early`).
         let other_linear_depth = self.ssao_enabled
-            || (self.rt_reduced_shadows
-                && self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-                && self.ray_tracing_supported)
+            || (self.rt_sun_cache_wanted() || self.rt_local_cache_wanted())
             || self.temporal_resolve_active()
             || self.contact_shadows_enabled
             || fog_enabled
@@ -263,8 +272,26 @@ impl Renderer {
             || self.ssr_enabled
             || self.reflection_debug_enabled
             || self.motion_blur_strength > 0.001
-            || self.depth_of_field_strength > 0.001;
+            || self.dof_draws_this_plan();
         let needs_linear_depth = other_linear_depth || rain_spatial_post;
+        // Which consumers asked for the full prepass (bit order matches the
+        // `other_linear_depth` terms, then rain); recorded by render_perf_capture.
+        let linear_depth_reasons = [
+            self.ssao_enabled,
+            self.rt_sun_cache_wanted() || self.rt_local_cache_wanted(),
+            self.temporal_resolve_active(),
+            self.contact_shadows_enabled,
+            fog_enabled,
+            legacy1_global_post,
+            self.clouds_enabled,
+            self.weather.snow.enabled,
+            self.weather.atmosphere.active(),
+            self.ssr_enabled,
+            self.reflection_debug_enabled,
+            self.motion_blur_strength > 0.001,
+            self.dof_draws_this_plan(),
+            rain_spatial_post,
+        ].iter().enumerate().fold(0u32, |bits, (bit, &on)| bits | (u32::from(on) << bit));
         let rain_only_linear_depth = rain_spatial_post && !other_linear_depth;
         self.frame_plan = FramePlan {
             world_path: if fast_baseline {
@@ -285,6 +312,7 @@ impl Renderer {
             // the full depth-aware post shader when no effect actually needs it.
             gamma_only_post: compact_post_reason && !full_post_effects,
             needs_linear_depth,
+            linear_depth_reasons,
             rain_only_linear_depth,
             rain_only_post,
             use_hiz,
@@ -298,7 +326,12 @@ impl Renderer {
                 || self.any_area_lights_enabled(),
         };
         let plan = self.frame_plan;
-        self.ensure_post_pipeline(plan.use_post && !plan.gamma_only_post && !plan.rain_only_post);
+        // Underwater-only DOF: compile the full post PSO up front so the first
+        // dive does not wait for it.
+        let dof_may_need_post = self.depth_of_field_strength > 0.001 && self.dof_mode == DofMode::UnderwaterOnly;
+        self.ensure_post_pipeline(
+            (plan.use_post && !plan.gamma_only_post && !plan.rain_only_post) || dof_may_need_post,
+        );
         self.ensure_rain_post_pipeline(plan.rain_only_post);
         self.ensure_cloud_shadow_opaque_pipeline();
     }
@@ -313,6 +346,11 @@ pub(in crate::renderer) struct FramePlan {
     pub(in crate::renderer) lut_post: bool,
     pub(in crate::renderer) gamma_only_post: bool,
     pub(in crate::renderer) needs_linear_depth: bool,
+    /// Bitmask of the consumers behind `needs_linear_depth`: 0 SSAO, 1 RT reduced
+    /// shadows, 2 temporal resolve, 3 contact shadows, 4 fog, 5 legacy global
+    /// post, 6 clouds, 7 snow, 8 atmosphere, 9 SSR, 10 reflection debug,
+    /// 11 motion blur, 12 depth of field, 13 rain spatial post.
+    pub(in crate::renderer) linear_depth_reasons: u32,
     /// Rain is the sole consumer of the full-resolution linear-depth prepass.
     pub(in crate::renderer) rain_only_linear_depth: bool,
     /// Rain is the only spatial post effect and the rain-only PSO is requested.

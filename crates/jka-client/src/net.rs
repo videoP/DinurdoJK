@@ -122,6 +122,8 @@ pub struct NetworkSettings {
     /// Pace usercmds on `cl.serverTime` so their spacing is exactly 1000/cl_commandRate
     /// ms (race physics steps by the command interval); false = wall-clock pacing.
     pub command_pacing: bool,
+    /// `cl_idrive`: 0 = cancel opposite directions; 1 = latest press wins.
+    pub idrive: bool,
     /// JAPRO userinfo bitfield, also consumed by the native predictor.
     pub plugin_disable: i32,
     /// jaPRO `cl_chatBubbleSelf`: send BUTTON_TALK (the chat balloon over your
@@ -181,6 +183,7 @@ impl Default for NetworkSettings {
             allow_legacy_downloads: true,
             command_rate: 125,
             command_pacing: true,
+            idrive: true,
             plugin_disable: 1536,
             chat_bubble_self: true,
             chat_bubble_unfocused: true,
@@ -637,6 +640,8 @@ pub struct LiveInput {
     /// Last authoritative delta_angles; cmd angles are relative to these.
     delta_angles: [i32; 3],
     emote_tx: Option<(u16, Instant)>,
+    /// Per-axis latest press of the semantic +movement buttons.
+    move_priority: [i8; 3],
 }
 
 pub struct CommandButtons<'a> {
@@ -645,6 +650,8 @@ pub struct CommandButtons<'a> {
     /// TaystJK CG_DoAsync flipkick injection. Kept separate from physical
     /// bindings so a synthetic -moveup cannot erase a genuinely held jump key.
     pub forced_moveup: bool,
+    /// Use most-recently pressed movement direction when both sides are held.
+    pub idrive: bool,
     /// Any key held outside menus (BUTTON_ANY).
     pub any_key: bool,
     /// cl_run 1 semantics: +speed walks.
@@ -652,6 +659,20 @@ pub struct CommandButtons<'a> {
 }
 
 impl LiveInput {
+    /// Called only on a transition from an inactive to active +movement command.
+    /// This is independent of keycodes, so remapped keys and console +commands work.
+    pub(crate) fn note_movement_button_press(&mut self, command: &str) {
+        match command {
+            "+forward" => self.move_priority[0] = 1,
+            "+back" => self.move_priority[0] = -1,
+            "+moveright" => self.move_priority[1] = 1,
+            "+moveleft" => self.move_priority[1] = -1,
+            "+moveup" => self.move_priority[2] = 1,
+            "+movedown" => self.move_priority[2] = -1,
+            _ => {}
+        }
+    }
+
     pub fn queue_generic_command(&mut self, value: u8) {
         // Ordinary taunts must never inherit a stale custom-emote signature.
         self.emote_tx = None;
@@ -664,6 +685,13 @@ impl LiveInput {
         self.generic_command = Some(27); // stock GENCMD_TAUNT
         self.emote_tx = Some((id, Instant::now()));
         true
+    }
+
+    pub fn queue_emote_stop(&mut self) {
+        if self.emote_tx.is_some() && self.generic_command == Some(27) {
+            self.generic_command = None;
+        }
+        self.emote_tx = Some((crate::emotes::network::STOP_ID, Instant::now()));
     }
 
     /// IN_KeyDown's wasPressed: a button tapped between frames still fires.
@@ -754,13 +782,15 @@ impl LiveInput {
         } else {
             127
         };
-        let axis = |positive: &str, negative: &str| -> i8 {
-            let value = movespeed * i32::from(held(positive)) - movespeed * i32::from(held(negative));
-            value.clamp(-128, 127) as i8
-        };
-        cmd.forward_move = axis("+forward", "+back");
-        cmd.right_move = axis("+moveright", "+moveleft");
-        cmd.up_move = axis("+moveup", "+movedown");
+        cmd.forward_move = crate::player::idrive_axis(
+            buttons.idrive, held("+forward"), held("+back"), self.move_priority[0], movespeed as i8,
+        );
+        cmd.right_move = crate::player::idrive_axis(
+            buttons.idrive, held("+moveright"), held("+moveleft"), self.move_priority[1], movespeed as i8,
+        );
+        cmd.up_move = crate::player::idrive_axis(
+            buttons.idrive, held("+moveup"), held("+movedown"), self.move_priority[2], movespeed as i8,
+        );
         // CL_FinishMove
         cmd.weapon = self.weapon_select;
         cmd.force_selection = self.force_select;
@@ -2618,7 +2648,7 @@ mod tests {
                 if std::env::var_os("JKA_LIVE_NOJUMP").is_none() && t.fract() < 0.15 {
                     held.insert("+moveup".into());
                 }
-                let buttons = CommandButtons { active: &held, forced_moveup: false, any_key: true, talking: false };
+                let buttons = CommandButtons { active: &held, forced_moveup: false, idrive: true, any_key: true, talking: false };
                 if last_command.is_none_or(|last| last.elapsed().as_millis() >= command_ms) {
                     last_command = Some(std::time::Instant::now());
                     let cmd = input.create_cmd(&buttons);
@@ -2698,6 +2728,18 @@ mod tests {
         assert_eq!(resolve_server("127.0.0.1").unwrap(), "127.0.0.1:29070".parse().unwrap());
         assert_eq!(resolve_server("127.0.0.1:29071").unwrap(), "127.0.0.1:29071".parse().unwrap());
         assert!(resolve_server("").is_err());
+    }
+
+    #[test]
+    fn idrive_cvar_defaults_on_and_is_archived() {
+        let mut settings = NetworkSettings::default();
+        assert_eq!(settings.cvar_value("cl_idrive").as_deref(), Some("1"));
+        assert_eq!(settings.set_cvar("cl_idrive", "0").unwrap().unwrap(), false);
+        assert!(!settings.idrive);
+        assert!(settings.set_cvar("cl_idrive", "2").unwrap().is_err());
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta cl_idrive \"0\""));
     }
 
     #[test]
@@ -3078,15 +3120,51 @@ mod tests {
         input.view_angles = [10.0, -90.0, 0.0];
         input.note_pressed("+attack");
         let active: HashSet<String> = ["+forward", "+moveleft", "+speed", "+altattack"].into_iter().map(String::from).collect();
-        let cmd = input.create_cmd(&CommandButtons { active: &active, forced_moveup: false, any_key: true, talking: false });
+        let cmd = input.create_cmd(&CommandButtons { active: &active, forced_moveup: false, idrive: true, any_key: true, talking: false });
         assert_eq!(cmd.forward_move, 64);
         assert_eq!(cmd.right_move, -64);
         assert_eq!(cmd.buttons & (1 | 128 | BUTTON_WALKING | BUTTON_ANY), 1 | 128 | BUTTON_WALKING | BUTTON_ANY);
         assert_eq!(cmd.angles[1], jka_movement::angle_to_short(270.0));
         // wasPressed is consumed by one command.
-        let cmd = input.create_cmd(&CommandButtons { active: &HashSet::new(), forced_moveup: false, any_key: false, talking: false });
+        let cmd = input.create_cmd(&CommandButtons { active: &HashSet::new(), forced_moveup: false, idrive: true, any_key: false, talking: false });
         assert_eq!(cmd.buttons, 0);
         assert_eq!(cmd.forward_move, 0);
+    }
+
+    #[test]
+    fn idrive_multiplayer_commands_obey_press_order_and_release() {
+        let mut input = LiveInput::default();
+        let mut held: HashSet<String> = HashSet::new();
+        fn buttons(held: &HashSet<String>, idrive: bool) -> CommandButtons<'_> {
+            CommandButtons { active: held, forced_moveup: false, idrive, any_key: true, talking: false }
+        }
+        input.note_movement_button_press("+moveleft");
+        held.insert("+moveleft".into());
+        assert_eq!(input.create_cmd(&buttons(&held, true)).right_move, -127);
+        input.note_movement_button_press("+moveright");
+        held.insert("+moveright".into());
+        assert_eq!(input.create_cmd(&buttons(&held, true)).right_move, 127);
+        assert_eq!(input.preview_cmd(&buttons(&held, true)).right_move, 127);
+        // Toggling off affects the very next authored or provisional command.
+        assert_eq!(input.create_cmd(&buttons(&held, false)).right_move, 0);
+        // Toggling back on remembers the latest press.
+        assert_eq!(input.create_cmd(&buttons(&held, true)).right_move, 127);
+        held.remove("+moveright");
+        assert_eq!(input.create_cmd(&buttons(&held, true)).right_move, -127);
+        input.note_movement_button_press("+moveright");
+        held.insert("+moveright".into());
+        input.note_movement_button_press("+moveleft");
+        assert_eq!(input.create_cmd(&buttons(&held, true)).right_move, -127);
+        assert_eq!(input.create_cmd(&buttons(&held, false)).right_move, 0);
+        // Same rule for forward/back and vertical movement.
+        held.clear();
+        held.extend(["+forward", "+back", "+moveup", "+movedown"].map(str::to_owned));
+        input.note_movement_button_press("+back");
+        input.note_movement_button_press("+moveup");
+        assert_eq!(input.create_cmd(&buttons(&held, true)).forward_move, -127);
+        assert_eq!(input.preview_cmd(&buttons(&held, true)).up_move, 127);
+        assert_eq!(input.create_cmd(&buttons(&held, false)).forward_move, 0);
+        assert_eq!(input.create_cmd(&buttons(&held, false)).up_move, 0);
     }
 
     #[test]
@@ -3131,7 +3209,7 @@ mod tests {
         let mut input = LiveInput::default();
         input.queue_generic_command(generic_command("force_throw").unwrap());
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
         assert_eq!(input.create_cmd(&buttons).generic_command, 5);
         assert_eq!(input.create_cmd(&buttons).generic_command, 0);
     }
@@ -3145,7 +3223,7 @@ mod tests {
         ps.set_field_bits("delta_angles[1]", 28000);
         input.sync_selection(&ps);
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
         assert!(input.queue_emote_taunt(1799));
         let cmd = input.create_cmd(&buttons);
         assert_eq!(cmd.generic_command, 27);
@@ -3161,7 +3239,7 @@ mod tests {
         let mut input = LiveInput::default();
         input.view_angles = [10.0, 120.0, 0.0];
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
         let original = input.preview_cmd(&buttons).angles;
         assert!(input.queue_emote_taunt(42));
         input.queue_generic_command(27);
@@ -3175,10 +3253,10 @@ mod tests {
     #[test]
     fn emote_pitch_clamp_and_expiry_preserve_normal_taunt() {
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
         for expired in [false, true] {
             let mut input = LiveInput::default();
-            input.view_angles = [89.0, 120.0, 0.0];
+            input.view_angles = [-89.0, 120.0, 0.0];
             let original = input.preview_cmd(&buttons).angles;
             assert!(input.queue_emote_taunt(42));
             if expired {
@@ -3197,7 +3275,24 @@ mod tests {
         input.queue_generic_command(5);
         assert!(!input.queue_emote_taunt(crate::emote_net_codec::EMOTE_CAPACITY));
         let none = HashSet::new();
-        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
+        assert_eq!(input.create_cmd(&buttons).generic_command, 5);
+        assert!(input.emote_tx.is_none());
+    }
+
+    #[test]
+    fn emote_stop_cancels_unsent_start_and_transmits_without_another_taunt() {
+        let mut input = LiveInput::default();
+        let none = HashSet::new();
+        let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
+        assert!(input.queue_emote_taunt(876));
+        input.queue_emote_stop();
+        let cmd = input.create_cmd(&buttons);
+        assert_eq!(cmd.generic_command, 0);
+        let pitch = (cmd.angles[0] as i16) as f32 * (360.0 / 65536.0);
+        let yaw = (cmd.angles[1] as i16) as f32 * (360.0 / 65536.0);
+        assert_eq!(crate::emote_net_codec::decode_snapshot_angles(yaw, pitch), Some(crate::emotes::network::STOP_ID));
+        input.queue_generic_command(5);
         assert_eq!(input.create_cmd(&buttons).generic_command, 5);
         assert!(input.emote_tx.is_none());
     }

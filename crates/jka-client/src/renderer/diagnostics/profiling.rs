@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 40;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 44;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -86,6 +86,13 @@ pub(in crate::renderer) enum GpuPass {
     BlueWaterSceneCapture = 38,
     // Sub-timing inside World: native surfaceSprites (CPU or resident path).
     SurfaceSprites = 39,
+    // Sub-timings inside Post; never independent frame costs.
+    PostDof = 40,
+    PostBloom = 41,
+    // TAA/post resolve plus the brightness/gamma (or compact) presentation pass.
+    PostFinal = 42,
+    // Independent pre-world compute, before every mover geometry consumer.
+    InlineTransform = 43,
 }
 
 impl GpuPass {
@@ -136,6 +143,10 @@ impl GpuPass {
         Self::BlueWaterCausticsReceiver,
         Self::BlueWaterSceneCapture,
         Self::SurfaceSprites,
+        Self::PostDof,
+        Self::PostBloom,
+        Self::PostFinal,
+        Self::InlineTransform,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -180,6 +191,10 @@ impl GpuPass {
             Self::BlueWaterCausticsReceiver => "blue_water_caustics_receiver",
             Self::BlueWaterSceneCapture => "blue_water_scene_capture",
             Self::SurfaceSprites => "surface_sprites",
+            Self::PostDof => "post_dof",
+            Self::PostBloom => "post_bloom",
+            Self::PostFinal => "post_final",
+            Self::InlineTransform => "inline_transform",
         }
     }
 }
@@ -222,6 +237,7 @@ impl GpuTiming {
         let mut any = false;
         for pass in [
             GpuPass::Depth,
+            GpuPass::InlineTransform,
             GpuPass::HiZ,
             GpuPass::Cull,
             GpuPass::Cluster,
@@ -257,6 +273,8 @@ pub(in crate::renderer) struct GpuProfilerSlot {
     // true only for passes with both real endpoints, so dummy values are ignored.
     pub(in crate::renderer) written: [bool; GPU_PASS_COUNT * 2],
     pub(in crate::renderer) active: [bool; GPU_PASS_COUNT],
+    /// `GpuProfiler::frame_tag` of the frame this slot measured.
+    pub(in crate::renderer) tag: u32,
 }
 
 pub(in crate::renderer) struct GpuProfiler {
@@ -272,6 +290,12 @@ pub(in crate::renderer) struct GpuProfiler {
     /// that record per render frame need this to tell a new measurement from
     /// the previous one repeated.
     pub(in crate::renderer) latest_generation: u64,
+    /// Copied into the slot claimed by the next `begin_frame`, so a consumer can
+    /// tell which frame configuration an asynchronous readback measured.
+    pub(in crate::renderer) frame_tag: u32,
+    /// When `Some`, every resolved readback is appended with its tag, not only
+    /// the newest one kept in `latest` (several slots can land in one frame).
+    pub(in crate::renderer) completed: Option<Vec<(u32, GpuTiming)>>,
 }
 
 impl GpuProfiler {
@@ -292,6 +316,8 @@ impl GpuProfiler {
                 timestamp_inside_passes: false,
                 latest: None,
                 latest_generation: 0,
+                frame_tag: 0,
+                completed: None,
             };
         }
 
@@ -321,6 +347,7 @@ impl GpuProfiler {
                     pending: None,
                     written: [false; GPU_PASS_COUNT * 2],
                     active: [false; GPU_PASS_COUNT],
+                    tag: 0,
                 }
             })
             .collect();
@@ -334,6 +361,8 @@ impl GpuProfiler {
             timestamp_inside_passes,
             latest: None,
             latest_generation: 0,
+            frame_tag: 0,
+            completed: None,
         }
     }
 
@@ -383,6 +412,9 @@ impl GpuProfiler {
                 }
             };
             slot.pending = None;
+            if let (Some(timing), Some(log)) = (completed, self.completed.as_mut()) {
+                log.push((slot.tag, timing));
+            }
             if completed.is_some() {
                 self.latest = completed;
                 self.latest_generation = self.latest_generation.wrapping_add(1);
@@ -393,6 +425,7 @@ impl GpuProfiler {
         if let Some(current) = self.current {
             self.slots[current].written = [false; GPU_PASS_COUNT * 2];
             self.slots[current].active = [false; GPU_PASS_COUNT];
+            self.slots[current].tag = self.frame_tag;
         }
     }
 

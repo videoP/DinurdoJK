@@ -64,7 +64,7 @@ fn skin_profile_promoted_mesh(
 /// would leave those new vertices undeformed (and misassign other weights).
 fn deform_profile_promoted_jiggle(
     mesh: &Ghoul2GpuMeshSource,
-    offsets: &[[f32; 4]; 4],
+    offsets: &[[f32; 4]; crate::cgame::jiggle::MAX_GPU_JIGGLE_REGIONS],
     skinned: &mut Ghoul2SkinnedSurface,
 ) {
     fn smoothstep(lo: f32, hi: f32, value: f32) -> f32 {
@@ -236,10 +236,10 @@ impl PlayerPresenter {
                 if profile.gpu_supported() {
                     profile.gpu_offsets(offsets, self.jiggle.tuning())
                 } else {
-                    [[0.0; 4]; 4]
+                    Default::default()
                 }
             } else {
-                [[0.0; 4]; 4]
+                Default::default()
             };
 
         if self.skinning_mode == Ghoul2SkinningMode::Gpu {
@@ -570,6 +570,8 @@ impl PlayerPresenter {
                 texture,
                 alpha_mode,
             });
+            self.push_profile_selection(&mut draws, overlay_at - 1, gpu_mesh,
+                preview_remesh && gpu_mesh.key != gpu_mesh.base_key);
             if tinted && asset.entity_tint {
                 Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3]);
             }

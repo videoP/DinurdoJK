@@ -13,6 +13,9 @@ impl Renderer {
         let old_ssao_enabled = self.ssao_enabled;
         let old_static_bsp_ao_enabled = self.static_bsp_ao_enabled;
         let old_ssr_enabled = self.ssr_enabled;
+        let old_resolved_depth_target = self.targets._ssr_visibility_texture.is_some();
+        let old_temporal_targets = self.taa_enabled || self.rt_taa_mode > 0;
+        let old_cloud_targets = self.clouds_enabled && self.cloud_backend == 0;
         let old_reflection_quality = self.reflection_quality;
         let old_reflection_debug = self.reflection_debug_enabled;
         let old_dof_enabled = self.depth_of_field_strength > 0.001;
@@ -155,6 +158,11 @@ impl Renderer {
         }
         self.sky_backend = effects.sky_backend.min(1);
         self.blue_water_environment = effects.blue_water_environment.sanitize();
+        // Sky world lighting is derived from the Blue Water sky; with the JKA
+        // skybox on screen it would light the map from a sky nobody sees.
+        if self.sky_backend != 1 {
+            self.blue_water_environment.world_lighting = 0.0;
+        }
         self.cloud_backend = effects.cloud_backend.min(1);
         let cloud_portal_depth = effects.cloud_portal_depth.min(2);
         if self.cloud_portal_depth != cloud_portal_depth {
@@ -370,6 +378,12 @@ impl Renderer {
         let authored_glow_resources_changed = old_authored_glow != self.glow_mode.authored();
         let ssao_resources_changed = old_ssao_enabled != self.ssao_enabled;
         let ssr_resources_changed = old_ssr_enabled != self.ssr_enabled;
+        let resolved_depth_changed =
+            old_resolved_depth_target != self.needs_resolved_depth_target();
+        let temporal_resources_changed =
+            old_temporal_targets != (self.taa_enabled || self.rt_taa_mode > 0);
+        let cloud_targets_changed =
+            old_cloud_targets != (self.clouds_enabled && self.cloud_backend == 0);
         let reflection_policy_changed = old_reflection_quality != self.reflection_quality;
         let reflection_debug_changed = old_reflection_debug != self.reflection_debug_enabled;
         if reflection_policy_changed {
@@ -394,6 +408,9 @@ impl Renderer {
             || dof_resources_changed
             || ssao_resources_changed
             || ssr_resources_changed
+            || resolved_depth_changed
+            || temporal_resources_changed
+            || cloud_targets_changed
             || cloud_resolution_changed
         {
             self.request_scene_rebuild();

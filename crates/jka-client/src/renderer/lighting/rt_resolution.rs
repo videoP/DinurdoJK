@@ -1,24 +1,14 @@
-//! Full-resolution sun shadow tracing, temporally rate-limited by a rotating
-//! 2x2 dither schedule instead of spatial downsampling.
-//!
-//! A prior implementation traced sun and local-light visibility into a
-//! quarter-pixel-count cache and spatially reconstructed it for every
-//! full-resolution receiver. Measurement showed that reconstruction cost
-//! (an unconditional per-fragment neighbor scan, paid even where no light was
-//! nearby) plus a depth prepass forced only for that mode outweighed the rays
-//! it saved. This version keeps the same target ray-count reduction (each
-//! pixel is freshly traced once every 4 frames) but pays for it with a
-//! same-pixel history lookup instead of a spatial search, and removes local
-//! lights from the scheme entirely: they are already gated by actual cluster
-//! membership in the ordinary ray-traced path, so caching them only added
-//! unconditional overhead without a matching miss-rate problem to fix.
+//! Full-resolution, reduced-rate scalar sun shadow visibility. The schedule
+//! refreshes one half or one quarter of stable pixels per frame; disocclusions
+//! and shadow edges request fresh queries. Local lights use the separate compact
+//! per-light/per-sample cache in rt_local_rate, controlled by the same setting.
 use super::*;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RtSunShadowSettings {
     inverse_view_proj: [[f32; 4]; 4],
-    dimensions: [u32; 4], // width, height, frame index, dither phase (unused, derived in shader)
+    dimensions: [u32; 4], // width, height, frame index, rate divisor (1/2/4)
     flags: [u32; 4],      // enabled, history valid, reserved, reserved
     prev_camera_pos: [f32; 4], // previous frame's eye, to predict where a history texel's distance should land
 }
@@ -26,11 +16,12 @@ struct RtSunShadowSettings {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RtShadowReceiverFlags {
-    flags: [u32; 4], // enabled, reserved, reserved, reserved
+    flags: [u32; 4], // sun enabled, local enabled, local map-light mode, reserved
 }
 
 pub(super) struct RtSunShadowHistory {
     uniform: wgpu::Buffer,
+    pub local: rt_local_rate::RtLocalRateHistory,
     pub flags_uniform: wgpu::Buffer,
     pub published: wgpu::TextureView,
     _published_texture: wgpu::Texture,
@@ -89,6 +80,7 @@ impl RtSunShadowHistory {
         let (t1, v1) = target(device, [1, 1], "RT sun shadow ping 1");
         let (published_texture, published) = target(device, [1, 1], "RT sun shadow (published)");
         Self {
+            local: rt_local_rate::RtLocalRateHistory::new(device),
             uniform: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("RT sun shadow settings"),
                 contents: bytemuck::bytes_of(&RtSunShadowSettings::zeroed()),
@@ -110,6 +102,11 @@ impl RtSunShadowHistory {
             enabled: false,
             compute: None,
         }
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.history_valid = false;
+        self.local.invalidate();
     }
 
     fn resize(&mut self, device: &wgpu::Device, size: [u32; 2]) -> bool {
@@ -134,10 +131,11 @@ impl RtSunShadowHistory {
     }
 }
 
-pub(super) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+pub(super) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
     [
         uniform_entry(15, wgpu::ShaderStages::FRAGMENT),
         unfilterable_texture_entry_stages(16, wgpu::ShaderStages::FRAGMENT),
+        rt_local_rate::receiver_entry(),
     ]
 }
 
@@ -150,11 +148,9 @@ impl Renderer {
         }
     }
 
-    /// The cache only serves the sun. With RT local lights alone the receivers
-    /// never read it (their `ENABLE_RAY_TRACED_SUN` override is off), so tracing
-    /// it, and forcing the depth prepass for it, would be pure waste.
+    /// Request the scalar sun cache independently of local-light visibility.
     pub(super) fn rt_sun_cache_wanted(&self) -> bool {
-        self.rt_reduced_shadows && !self.tinted_glass_enabled
+        self.rt_trace_rate > 1 && !self.tinted_glass_enabled
             && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun)
     }
 
@@ -162,23 +158,26 @@ impl Renderer {
 
     pub(super) fn prepare_rt_sun_shadow(&mut self, view_proj: Mat4, eye: Vec3) {
         let enabled = self.rt_sun_cache_wanted();
+        let local_enabled = self.rt_local_cache_wanted();
+        let map_lights = self.world.as_ref().is_some_and(|w| w.active_pipeline_variant.map_light_simulation);
+        let rate = self.rt_trace_rate;
         let previous_eye = self.previous_camera_position;
         let size = [self.config.width.max(1), self.config.height.max(1)];
         let Some(rt) = self.ray_traced_shadows.as_mut() else { return; };
         let history = &mut rt.sun_shadow_history;
-        if !enabled && !history.enabled { return; }
+
         let just_enabled = enabled && !history.enabled;
         let resized = enabled && history.resize(&self.device, size);
         if just_enabled { history.history_valid = false; history.frame_index = 0; }
         if eye.distance(previous_eye) > 96.0 { history.history_valid = false; }
         self.queue.write_buffer(&history.uniform, 0, bytemuck::bytes_of(&RtSunShadowSettings {
             inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
-            dimensions: [size[0], size[1], history.frame_index, 0],
+            dimensions: [size[0], size[1], history.frame_index, rate],
             flags: [u32::from(enabled), u32::from(history.history_valid), 0, 0],
             prev_camera_pos: previous_eye.extend(0.0).to_array(),
         }));
         self.queue.write_buffer(&history.flags_uniform, 0, bytemuck::bytes_of(&RtShadowReceiverFlags {
-            flags: [u32::from(enabled), 0, 0, 0],
+            flags: [u32::from(enabled), u32::from(local_enabled), u32::from(map_lights), 0],
         }));
         history.enabled = enabled;
         if resized { self.rebuild_weather_surface_receiver_bind_group(); }
@@ -323,8 +322,6 @@ impl Renderer {
         }
         if sun_enabled {
         let write_index = 1 - history.read_index;
-        self.gpu_profiler
-            .write_encoder_timestamp(encoder, GpuPass::RtVisibility, false);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("RT sun shadow"),
@@ -340,8 +337,6 @@ impl Renderer {
                 1,
             );
         }
-        self.gpu_profiler
-            .write_encoder_timestamp(encoder, GpuPass::RtVisibility, true);
         history.read_index = write_index;
         }
         history.history_valid = true;

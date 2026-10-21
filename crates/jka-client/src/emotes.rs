@@ -1,8 +1,10 @@
-//! Local-only emote catalogue and preview playback: compiled `.djk_fnemote` bundles retargeted to Ghoul2 player models.
+//! Emote catalogue and cosmetic playback, retargeted to Ghoul2 player models.
 //!
 //! Loads compiled .djk_fnemote bundles and legacy GLA manifests. Nothing here
 //! writes userinfo, reliable commands or authoritative entityState animations.
 use serde_json::{Value, json};
+pub mod network;
+mod taunt;
 use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -186,6 +188,8 @@ struct Playing {
 
 #[derive(Default)]
 struct PlaybackState {
+    requested_mode: Option<AudioMode>,
+    world_taunt: Option<taunt::Taunt>,
     playing: Option<Playing>,
     stop_pending: bool,
     generation: u64,
@@ -404,7 +408,7 @@ fn playing() -> &'static Mutex<PlaybackState> {
 pub fn play(emote: Emote) {
     play_mode(emote, AudioMode::Preview);
 }
-/// Wheel caller uses player-positioned (3P) WAVs; no multiplayer messages.
+/// Cosmetic world playback; App owns the associated game taunt transmission.
 pub fn play_world(emote: Emote) {
     play_mode(emote, AudioMode::World);
 }
@@ -433,6 +437,8 @@ fn play_mode(mut emote: Emote, mode: AudioMode) {
             let Ok(mut state) = playing().lock() else {
                 return;
             };
+            state.requested_mode = Some(mode);
+            state.world_taunt = None;
             state.generation = state.generation.wrapping_add(1);
             state.playing = None;
             state.prepared = None;
@@ -443,6 +449,8 @@ fn play_mode(mut emote: Emote, mode: AudioMode) {
         return;
     }
     if let Ok(mut state) = playing().lock() {
+        state.requested_mode = Some(mode);
+        state.world_taunt = None;
         state.generation = state.generation.wrapping_add(1);
         state.prepared = None;
         let next_audio_ms = emote.audio.iter().map(|cue| cue.at_ms).collect();
@@ -456,13 +464,59 @@ fn play_mode(mut emote: Emote, mode: AudioMode) {
     }
 }
 
+impl PlaybackState {
+    fn stop(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.requested_mode = None;
+        self.world_taunt = None;
+        self.prepared = None;
+        self.playing = None;
+        self.stop_pending = true;
+    }
+
+    fn cancel_world_taunt(&mut self, torso: i32, legs: i32, buttons: i32, up_move: i8) -> bool {
+        if self.requested_mode != Some(AudioMode::World) {
+            return false;
+        }
+        // Wait for the actual server/Pmove animation rather than guessing from
+        // saber equipment. Keep this binding when that taunt returns to idle.
+        if self.world_taunt.is_none() {
+            self.world_taunt = taunt::Taunt::from_animations(torso, legs);
+        }
+        if self.world_taunt.as_mut().is_some_and(|taunt|
+            taunt.interrupted(torso, legs) || taunt.cancel_input(buttons, up_move)) {
+            self.stop();
+            return true;
+        }
+        false
+    }
+}
+
+/// World emotes retain the accepted native taunt's animation channels and cancel rule.
+/// Menu previews do not bind to game animations.
+/// Invalidating the generation also prevents an in-flight preparation restarting it.
+pub fn cancel_world_taunt(torso: i32, legs: i32, buttons: i32, up_move: i8) -> bool {
+    if let Ok(mut state) = playing().lock() {
+        return state.cancel_world_taunt(torso, legs, buttons, up_move);
+    }
+    false
+}
+
 pub fn stop() {
     if let Ok(mut state) = playing().lock() {
-        state.generation = state.generation.wrapping_add(1);
-        state.prepared = None;
-        state.playing = None;
-        state.stop_pending = true;
+        state.stop();
     }
+}
+
+/// End an in-game performance without touching a Profile preview.
+pub fn stop_world() -> bool {
+    if let Ok(mut state) = playing().lock() {
+        if state.requested_mode == Some(AudioMode::World) {
+            state.stop();
+            return true;
+        }
+    }
+    false
 }
 
 /// Called by SoundPresenter::frame on the audio-owning thread, using the same
@@ -471,6 +525,11 @@ pub fn poll_audio() -> Vec<AudioCommand> {
     let Ok(mut state) = playing().lock() else {
         return Vec::new();
     };
+    let now = state.playing.as_ref().map_or(0, |active| active.started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    poll_state_audio(&mut state, now)
+}
+
+fn poll_state_audio(state: &mut PlaybackState, now: u64) -> Vec<AudioCommand> {
     let mut commands = Vec::new();
     if state.stop_pending {
         commands.push(AudioCommand::StopAll);
@@ -479,7 +538,6 @@ pub fn poll_audio() -> Vec<AudioCommand> {
     let Some(active) = state.playing.as_mut() else {
         return commands;
     };
-    let now = active.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let duration = clip_duration_ms(&active.emote);
     let period = loop_period_ms(&active.emote);
     let finished = !active.emote.looping && now >= duration;
@@ -546,8 +604,12 @@ fn loop_period_ms(emote: &Emote) -> u64 {
 /// This is a rendering request, not a game-state animation override.
 pub fn active_preview() -> Option<Preview> {
     let mut state = playing().lock().ok()?;
+    let elapsed_ms = state.playing.as_ref()?.started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+    preview_at(&mut state, elapsed_ms)
+}
+
+fn preview_at(state: &mut PlaybackState, elapsed_ms: i32) -> Option<Preview> {
     let playing = state.playing.as_ref()?;
-    let elapsed_ms = playing.started.elapsed().as_millis().min(i32::MAX as u128) as i32;
     let duration_ms = clip_duration_ms(&playing.emote);
     if !playing.emote.looping && u64::try_from(elapsed_ms).unwrap_or(0) >= duration_ms {
         state.playing = None;
@@ -567,6 +629,7 @@ pub fn active_preview() -> Option<Preview> {
 }
 
 pub fn refresh_catalog() {
+    network::reset();
     if let Ok(mut cache) = CATALOG.get_or_init(Default::default).lock() {
         cache.generation = cache.generation.wrapping_add(1);
         cache.pending = false;
@@ -884,6 +947,66 @@ pub fn read_asset(qpath: &str, limit: usize) -> Result<Option<Vec<u8>>, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_taunt_cancellation_invalidates_world_preparation_but_keeps_preview() {
+        use super::*;
+        let dual = jka_assets::animation::animation_index("BOTH_DUAL_TAUNT").unwrap() as i32;
+        let emote = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[{
+            "id":"test", "name":"Test", "gla":"a.gla", "first_frame":0, "end_frame":30, "fps":30
+        }]})).unwrap().remove(0);
+        let mut state = PlaybackState {
+            requested_mode: Some(AudioMode::World), generation: 7,
+            prepared: Some((7, emote.clone(), AudioMode::World, Vec::new())),
+            ..Default::default()
+        };
+        state.cancel_world_taunt(dual, dual, jka_movement::BUTTON_WALKING, 0);
+        assert!(state.prepared.is_some());
+        state.cancel_world_taunt(dual, dual, jka_movement::BUTTON_ATTACK, 0);
+        assert_eq!(state.generation, 8);
+        assert!(state.prepared.is_none());
+        assert!(state.playing.is_none());
+        assert!(state.stop_pending);
+
+        state.requested_mode = Some(AudioMode::Preview);
+        state.prepared = Some((8, emote.clone(), AudioMode::Preview, Vec::new()));
+        state.cancel_world_taunt(dual, dual, jka_movement::BUTTON_ATTACK, 127);
+        assert_eq!(state.generation, 8);
+        assert!(state.prepared.is_some());
+
+        state.requested_mode = Some(AudioMode::World);
+        state.playing = Some(Playing { emote, started: Instant::now(), mode: AudioMode::World, next_audio_ms: Vec::new() });
+        state.cancel_world_taunt(dual, dual, 0, -127);
+        assert!(state.playing.is_none());
+        assert!(state.prepared.is_none());
+    }
+
+    #[test]
+    fn world_taunt_remembers_its_channels_after_native_expiry() {
+        let anim = |name| jka_assets::animation::animation_index(name).unwrap() as i32;
+        let idle = anim("BOTH_STAND1");
+        let crouch = anim("BOTH_CROUCH1");
+        let attack = anim("BOTH_ATTACK1");
+        let engage = anim("BOTH_ENGAGETAUNT");
+        let dual = anim("BOTH_DUAL_TAUNT");
+        let mut torso = PlaybackState { requested_mode: Some(AudioMode::World), ..Default::default() };
+        // Crouch before the server accepts the taunt must not guess a saber style.
+        assert!(!torso.cancel_world_taunt(idle, crouch, 0, -127));
+        assert!(!torso.cancel_world_taunt(engage, idle, 0, 0));
+        assert!(!torso.cancel_world_taunt(engage, crouch, 0, -127));
+        // A torso-locked attack input does not end the native taunt either.
+        assert!(!torso.cancel_world_taunt(engage, crouch, jka_movement::BUTTON_ATTACK, 0));
+        assert!(!torso.cancel_world_taunt(idle, idle, 0, 0));
+        assert!(!torso.cancel_world_taunt(idle, crouch, 0, -127));
+        assert!(torso.cancel_world_taunt(attack, crouch, 0, 0));
+        assert!(torso.world_taunt.is_none());
+
+        let mut full = PlaybackState { requested_mode: Some(AudioMode::World), ..Default::default() };
+        // A sliding dual taunt becomes full-body when the player comes to rest.
+        assert!(!full.cancel_world_taunt(dual, idle, 0, 0));
+        assert!(!full.cancel_world_taunt(dual, dual, 0, 0));
+        assert!(!full.cancel_world_taunt(idle, idle, 0, 0));
+        assert!(full.cancel_world_taunt(idle, idle, 0, -127));
+    }
     use super::*;
     fn wait_for_prepared() {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);

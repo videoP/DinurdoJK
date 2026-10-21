@@ -20,79 +20,128 @@ impl App {
 
     pub(in crate::app::egui_settings) fn egui_blue_water(&mut self, ui: &mut egui::Ui) {
         let hybrid = self.video.ocean_settings.backend == 2;
+        let gerstner = self.video.ocean_settings.gerstner_active();
         theme::section(
             ui,
-            if hybrid { "HYBRID OCEAN" } else { "BLUE WATER OCEAN" },
-            if hybrid { "Native Blue Water surface above; JKA/Godot optics and surface while submerged." }
+            if gerstner { "GERSTNER OCEAN" } else if hybrid { "HYBRID OCEAN" } else { "BLUE WATER OCEAN" },
+            if gerstner { "godot-water-shader's waves, water colour and persistent foam on Hybrid's mesh, lit by Blue Water (sky, screen-space reflections, glints, fog). Hybrid optics while submerged." }
+            else if hybrid { "Native Blue Water surface above; JKA/Godot optics and surface while submerged." }
             else { "Original Blue Water ocean surface, waves and optical material." },
         );
         let mut ocean = self.video.ocean_settings;
         let d = crate::ocean::OceanSettings::default();
         let mut changed = false;
-        theme::section(ui, "WAVES", "Native Blue Water parameters, shared across promoted pools. Changes apply live.");
-        super::ocean_slider_d(ui, "Wave height", if hybrid {
-            "Master wave height: controls Blue Water FFT and proportionally scales the Hybrid Gerstner swell. Zero removes both wave contributions. Gerstner height still sets relative strength."
-        } else {
-            "Significant wave height in metres (4 times the surface height standard deviation). Zero is flat."
-        }, &mut ocean.blue_water_waves.height, d.blue_water_waves.height, 0.0..=60.0, &mut changed);
-        super::ocean_slider_d(ui, "Swell direction", "Direction waves travel, in degrees from +X toward world +Z.", &mut ocean.blue_water_waves.direction, d.blue_water_waves.direction, -180.0..=180.0, &mut changed);
-        super::ocean_slider_d(ui, "Peak wavelength (m)", "Dominant crest spacing in metres. Controls wave speed through the native dispersion relation.", &mut ocean.blue_water_waves.wavelength, d.blue_water_waves.wavelength, 2.0..=512.0, &mut changed);
-        super::ocean_slider_d(ui, "Choppiness", "Horizontal displacement strength. Zero keeps only vertical waves.", &mut ocean.blue_water_waves.choppiness, d.blue_water_waves.choppiness, 0.0..=4.0, &mut changed);
-        super::ocean_slider_d(ui, "Spectrum wind speed", "Reference wind speed in metres per second. Changes the native spectral shape and fine surface roughness; independent of weather wind.", &mut ocean.blue_water_waves.wind_speed, d.blue_water_waves.wind_speed, 0.1..=40.0, &mut changed);
-        if hybrid {
-            theme::section(ui, "GERSTNER / FFT MIX", "Mix Blue Water's spectral waves with the authored directional swell. The FFT simulation stays resident and unchanged.");
-            super::ocean_slider_d(ui, "Cross-sea / FFT blend",
-                "1 = pure Blue Water FFT (original). 0 = authored Gerstner swell. Between them, both displacements contribute. Hybrid only; changing this does not rebuild the FFT.",
-                &mut ocean.hybrid_fft_blend, d.hybrid_fft_blend, 0.0..=1.0, &mut changed);
-            if ocean.hybrid_fft_blend < 1.0 {
-                // Hybrid has independent authored wave controls; no Godot map
-                // wave parameters or linked controls are modified.
-                super::ocean_slider_d(ui, "Gerstner height (units)",
-                    "Base swell amplitude at the default Wave height (40 JKA units = 1 metre). Actual Gerstner displacement also follows Wave height and the FFT blend.",
-                    &mut ocean.hybrid_swell.amplitude, d.hybrid_swell.amplitude, 0.0..=1024.0, &mut changed);
-                super::ocean_slider_metres_d(ui, "Gerstner wavelength (m)", "Distance between crests, in metres (40 JKA units = 1 metre).", &mut ocean.hybrid_swell.wavelength, d.hybrid_swell.wavelength, 256.0, 1.6, &mut changed);
-                super::ocean_slider_d(ui, "Gerstner speed (units/s)", "Travel speed in JKA units per second; negative reverses travel.", &mut ocean.hybrid_swell.speed, d.hybrid_swell.speed, -4096.0..=4096.0, &mut changed);
-                super::ocean_slider_d(ui, "Gerstner steepness", "Controls the authored swell's horizontal choppiness.", &mut ocean.hybrid_swell.steepness, d.hybrid_swell.steepness, 0.0..=1.0, &mut changed);
-            }
-            if theme::ghost_button(ui, "RESET GERSTNER & BLEND").clicked() {
-                ocean.hybrid_fft_blend = 1.0;
-                ocean.hybrid_swell = crate::ocean::OceanAuthoring::default();
+        if gerstner {
+            theme::section(ui, "WAVES & FOAM", "The original's five fixed Gerstner waves and its foam. Changes apply live.");
+            super::ocean_slider_d(ui, "Wave scale", "The original sea this many times larger: 1 is its 0.4 m, 6 m waves. Lengths scale by it and time by its square root, so larger seas keep their shape and roll slower, as real swell does.", &mut ocean.gerstner_wave_scale, d.gerstner_wave_scale, 0.1..=20.0, &mut changed);
+            theme::row(ui, "Foam", "Persistent foam builds where the waves compress or meet the shore, then erodes and fades: near covers 15 m around you, far 30 m (times the wave scale). Distant foam continues the compression foam to the horizon, without persistence. Original is near + far.", theme::Reset::None, |ui| {
+                for (mode, label) in [(7, "All"), (3, "Original"), (4, "Distant only"), (0, "Off")] {
+                    if theme::chip(ui, label, ocean.gerstner_foam == mode).clicked() {
+                        ocean.gerstner_foam = mode;
+                        changed = true;
+                    }
+                }
+            });
+            theme::row(
+                ui,
+                "Foam update rate",
+                "How often each persistent foam cascade advances; the near and far cascades take turns. Zero removes the rate cap (the original steps every frame). Lower is cheaper; the foam's fade follows real time either way.",
+                theme::Reset::None,
+                |ui| {
+                    let mut value = ocean.gerstner_foam_rate;
+                    let readout = if value == 0.0 { "Uncapped".to_owned() } else { format!("{value:.0} Hz") };
+                    if theme::slider_default(ui, &mut value, 0.0..=60.0, &readout, d.gerstner_foam_rate) {
+                        ocean.gerstner_foam_rate = value;
+                        changed = true;
+                    }
+                },
+            );
+            super::color_row(ui, "Water color", "The Gerstner surface's water color in the troughs (the original's deep teal).", theme::Reset::None,
+                &mut ocean.gerstner_water_color, &mut changed);
+            super::color_row(ui, "Crest color", "The color wave tops blend toward from the water color (the original's green).", theme::Reset::None,
+                &mut ocean.gerstner_crest_color, &mut changed);
+            if theme::ghost_button(ui, "RESET WAVES & FOAM").clicked() {
+                ocean.gerstner_wave_scale = d.gerstner_wave_scale;
+                ocean.gerstner_foam = d.gerstner_foam;
+                ocean.gerstner_foam_rate = d.gerstner_foam_rate;
+                ocean.gerstner_water_color = d.gerstner_water_color;
+                ocean.gerstner_crest_color = d.gerstner_crest_color;
                 changed = true;
             }
-        }
-        if theme::ghost_button(ui, "RESET WAVES").clicked() {
-            ocean.blue_water_waves = crate::ocean::BlueWaterWaves::default();
-            changed = true;
-        }
-        theme::row(
-            ui,
-            "FFT update rate",
-            "How often the Blue Water wave field advances. Zero removes the rate cap.",
-            theme::Reset::None,
-            |ui| {
-                let mut value = ocean.updates_per_second;
-                let readout = if value == 0.0 {
-                    "Uncapped".to_owned()
-                } else {
-                    format!("{value:.0} Hz")
-                };
-                if theme::slider_default(ui, &mut value, 0.0..=60.0, &readout, d.updates_per_second) {
-                    ocean.updates_per_second = value;
+        } else {
+            theme::section(ui, "WAVES", "Native Blue Water parameters, shared across promoted pools. Changes apply live.");
+            super::ocean_slider_d(ui, "Wave height", if hybrid {
+                "Master wave height: controls Blue Water FFT and proportionally scales the Hybrid Gerstner swell. Zero removes both wave contributions. Gerstner height still sets relative strength."
+            } else {
+                "Significant wave height in metres (4 times the surface height standard deviation). Zero is flat."
+            }, &mut ocean.blue_water_waves.height, d.blue_water_waves.height, 0.0..=60.0, &mut changed);
+            super::ocean_slider_d(ui, "Swell direction", "Direction waves travel, in degrees from +X toward world +Z.", &mut ocean.blue_water_waves.direction, d.blue_water_waves.direction, -180.0..=180.0, &mut changed);
+            super::ocean_slider_d(ui, "Peak wavelength (m)", "Dominant crest spacing in metres. Controls wave speed through the native dispersion relation.", &mut ocean.blue_water_waves.wavelength, d.blue_water_waves.wavelength, 2.0..=512.0, &mut changed);
+            super::ocean_slider_d(ui, "Choppiness", "Horizontal displacement strength. Zero keeps only vertical waves.", &mut ocean.blue_water_waves.choppiness, d.blue_water_waves.choppiness, 0.0..=4.0, &mut changed);
+            super::ocean_slider_d(ui, "Spectrum wind speed", "Reference wind speed in metres per second. Changes the native spectral shape and fine surface roughness; independent of weather wind.", &mut ocean.blue_water_waves.wind_speed, d.blue_water_waves.wind_speed, 0.1..=40.0, &mut changed);
+            if hybrid {
+                theme::row(ui, "Crest breaking (A/B)", "Original preserves the current waves. Limit is a conservative comparison. Spilling keeps more crest chop, bounds deep folds and uses two-sided crest lighting and whitewater. Experimental; vertical wave height is preserved.", theme::Reset::None, |ui| {
+                    for (mode, label) in [(0, "Original"), (1, "Limit"), (2, "Spilling")] {
+                        if theme::chip(ui, label, ocean.hybrid_breaker == mode).clicked() {
+                            ocean.hybrid_breaker = mode;
+                            changed = true;
+                        }
+                    }
+                });
+                theme::section(ui, "GERSTNER / FFT MIX", "Mix Blue Water's spectral waves with the authored directional swell. The FFT simulation stays resident and unchanged.");
+                super::ocean_slider_d(ui, "Cross-sea / FFT blend",
+                    "1 = pure Blue Water FFT (original). 0 = authored Gerstner swell. Between them, both displacements contribute. Hybrid only; changing this does not rebuild the FFT.",
+                    &mut ocean.hybrid_fft_blend, d.hybrid_fft_blend, 0.0..=1.0, &mut changed);
+                if ocean.hybrid_fft_blend < 1.0 {
+                    // Hybrid has independent authored wave controls; no Godot map
+                    // wave parameters or linked controls are modified.
+                    super::ocean_slider_d(ui, "Gerstner height (units)",
+                        "Base swell amplitude at the default Wave height (40 JKA units = 1 metre). Actual Gerstner displacement also follows Wave height and the FFT blend.",
+                        &mut ocean.hybrid_swell.amplitude, d.hybrid_swell.amplitude, 0.0..=1024.0, &mut changed);
+                    super::ocean_slider_metres_d(ui, "Gerstner wavelength (m)", "Distance between crests, in metres (40 JKA units = 1 metre).", &mut ocean.hybrid_swell.wavelength, d.hybrid_swell.wavelength, 256.0, 1.6, &mut changed);
+                    super::ocean_slider_d(ui, "Gerstner speed (units/s)", "Travel speed in JKA units per second; negative reverses travel.", &mut ocean.hybrid_swell.speed, d.hybrid_swell.speed, -4096.0..=4096.0, &mut changed);
+                    super::ocean_slider_d(ui, "Gerstner steepness", "Controls the authored swell's horizontal choppiness.", &mut ocean.hybrid_swell.steepness, d.hybrid_swell.steepness, 0.0..=1.0, &mut changed);
+                }
+                if theme::ghost_button(ui, "RESET GERSTNER & BLEND").clicked() {
+                    ocean.hybrid_fft_blend = 1.0;
+                    ocean.hybrid_swell = crate::ocean::OceanAuthoring::default();
                     changed = true;
                 }
-            },
-        );
-        theme::section(ui,"COASTAL WAVES & SURF (A/B)","Blue Water's original coast model. Your separate JKA shallow-bank solver remains available through r_coastal.");
-        theme::row(ui,"Upstream coastal waves","Builds per-pool shore depth and wind-fetch maps in the background. Waves shrink in shallow water and behind land; moving surf bands follow the bank. Off restores open-ocean waves. Native / Hybrid only.",theme::Reset::None,|ui| {
-            if ui.checkbox(&mut ocean.blue_water_coast,"Blue Water coast & surf").changed() {changed=true;}
-        });
-        if ocean.blue_water_coast {
-            theme::row(ui,"Physical land shelter (advanced)","Optional upstream wind-fetch and swell shelter. Low wind with long authored waves can become almost flat behind land. Leave off for authored incoming ocean waves with depth breaking and surf at real banks.",theme::Reset::None,|ui| {
-                if ui.checkbox(&mut ocean.blue_water_coast_shelter,"Wind / swell shelter").changed() {changed=true;}
+            }
+            if theme::ghost_button(ui, "RESET WAVES").clicked() {
+                ocean.blue_water_waves = crate::ocean::BlueWaterWaves::default();
+                changed = true;
+            }
+            theme::row(
+                ui,
+                "FFT update rate",
+                "How often the Blue Water wave field advances. Zero removes the rate cap.",
+                theme::Reset::None,
+                |ui| {
+                    let mut value = ocean.updates_per_second;
+                    let readout = if value == 0.0 {
+                        "Uncapped".to_owned()
+                    } else {
+                        format!("{value:.0} Hz")
+                    };
+                    if theme::slider_default(ui, &mut value, 0.0..=60.0, &readout, d.updates_per_second) {
+                        ocean.updates_per_second = value;
+                        changed = true;
+                    }
+                },
+            );
+            theme::section(ui,"COASTAL WAVES & SURF (A/B)","Blue Water's original coast model. Your separate JKA shallow-bank solver remains available through r_coastal.");
+            theme::row(ui,"Upstream coastal waves","Builds per-pool shore depth and wind-fetch maps in the background. Waves shrink in shallow water and behind land; moving surf bands follow the bank. Off restores open-ocean waves. Native / Hybrid only.",theme::Reset::None,|ui| {
+                if ui.checkbox(&mut ocean.blue_water_coast,"Blue Water coast & surf").changed() {changed=true;}
             });
-            let status=self.prepared_map_cache.as_ref().and_then(|c|c.map.coastal_bathymetry.as_ref())
-                .map_or("Load a BSP map with water promotion enabled to prepare its shores.",|j|j.upstream_shore.status());
-            theme::banner(ui,status,theme::TEXT_DIM);
+            if ocean.blue_water_coast {
+                theme::row(ui,"Physical land shelter (advanced)","Optional upstream wind-fetch and swell shelter. Low wind with long authored waves can become almost flat behind land. Leave off for authored incoming ocean waves with depth breaking and surf at real banks.",theme::Reset::None,|ui| {
+                    if ui.checkbox(&mut ocean.blue_water_coast_shelter,"Wind / swell shelter").changed() {changed=true;}
+                });
+                let status=self.prepared_map_cache.as_ref().and_then(|c|c.map.coastal_bathymetry.as_ref())
+                    .map_or("Load a BSP map with water promotion enabled to prepare its shores.",|j|j.upstream_shore.status());
+                theme::banner(ui,status,theme::TEXT_DIM);
+            }
         }
         theme::section(ui, "REFLECTIONS & OPTICS", "Screen-space reflections, caustics, refraction and underwater effects. Each change applies live.");
         theme::row(ui, "Screen-space reflections", "Trace nearby scene reflections. Environment and sky remain when disabled.", theme::Reset::None, |ui| {
@@ -143,8 +192,11 @@ impl App {
             }
         });
         if hybrid {
-            super::color_row(ui, "Water color", "Hybrid surface body tint; does not modify native Blue Water's saved color.", theme::Reset::None,
-                &mut ocean.hybrid_water_color, &mut changed);
+            // The Gerstner surface draws the original's own colour and depth fade.
+            if !gerstner {
+                super::color_row(ui, "Water color", "Hybrid surface body tint; does not modify native Blue Water's saved color.", theme::Reset::None,
+                    &mut ocean.hybrid_water_color, &mut changed);
+            }
             super::color_row(ui, "Underwater fog color", "Hybrid color for both Godot submerged optics and Blue Water scattering; independent of the Godot and native presets.", theme::Reset::None,
                 &mut ocean.hybrid_fog_color, &mut changed);
         } else {

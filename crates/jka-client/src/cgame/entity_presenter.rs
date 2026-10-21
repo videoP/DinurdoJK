@@ -746,7 +746,7 @@ impl EntityPresenter {
                         uv_xform: [1.0, 1.0, 0.0, 0.0],
                         uv_cross: [0.0; 4],
                         specular: None, bulge_height: 0.0, env_map: false,
-                        jiggle_offsets: [[0.0; 4]; 4], source_material: None,
+                        jiggle_offsets: Default::default(), source_material: None,
                     });
                     result[draw_index] = Some(gpu_draw);
                 }
@@ -1351,7 +1351,7 @@ impl EntityPresenter {
             let indices=Arc::new(indices);
             let gpu=if stage==0&&material.tc_mods.is_empty()&&program.is_none(){normal.as_ref().map(|normal|{
                 let vertices=self.prop_gpu_vertices.entry(path.into()).or_insert_with(||Arc::new(mesh.vertices.iter().map(|v|crate::renderer::Ghoul2GpuVertex{position:v.position,normal:v.normal,uv:v.uv,bone_indices:v.bones.map(|n|n as u32),weights:v.weights,weight_count:4,jiggle_region:u32::MAX,jiggle_weight:0.,jiggle_coord:4.}).collect())).clone();
-                crate::renderer::Ghoul2GpuSkinning{mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:[[0.;4];4],source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
+                crate::renderer::Ghoul2GpuSkinning{mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
             })}else{None};
             let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
             draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
@@ -1962,7 +1962,7 @@ impl EntityPresenter {
                 let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
                 let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning {
                     mesh_key:Arc::from(format!("{}#surface{}",asset.key,surface.surface_index)),vertices:gpu.clone(),indices:indices.clone(),
-                    bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:[[0.;4];4],source_material:surface.source_material.clone()
+                    bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:surface.source_material.clone()
                 })}else{None};
                 draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
             }

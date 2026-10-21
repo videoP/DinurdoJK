@@ -94,6 +94,65 @@ impl App {
             "jaPRO / TaystJK voice and feedback options. They apply on every server and are archived to DinurdoJK.cfg.",
         );
         const WHO: [(u8, &str); 4] = [(0, "Off"), (1, "Everyone"), (2, "Others"), (3, "Only me")];
+        theme::row(
+            ui,
+            "Movement variometer",
+            "Audio feedback for horizontal acceleration or strafehelper angle error. Only your living player, in local and online play. Stops in menus, on death and while spectating.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.audio.variometer) {
+                    let _ = self.set_console_cvar("s_variometer", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        self.audio_choice_row(
+            ui,
+            "Variometer input",
+            "Acceleration: changes in horizontal speed only. Strafe angle: difference from the strafehelper's optimal angle, including its offset and physics settings. High/rising = overshooting; low/falling = undershooting; silent inside the dead zone below. Works with the visual strafehelper hidden. Silent with no movement input or no valid guide.",
+            "s_variometerInput",
+            self.audio.variometer_input,
+            &[(0, "Acceleration"), (1, "Strafe angle")],
+        );
+        theme::row(
+            ui,
+            "Variometer dead zone",
+            "s_variometerDeadZone. Strafe angle input only: degrees either side of the optimal angle that stay silent. Default 0.5.",
+            theme::Reset::None,
+            |ui| {
+                let mut degrees = self.audio.variometer_dead_zone;
+                let readout = format!("{degrees:.1}°");
+                if theme::slider(ui, &mut degrees, 0.0..=5.0, &readout) {
+                    let _ = self.set_console_cvar("s_variometerDeadZone", &format!("{degrees:.2}"));
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Variometer angle scale",
+            "s_variometerScale. Strafe angle input only: sensitivity multiplier. 1 reaches the full pitch range 15 degrees past the dead zone; 2 reaches it in 7.5, 4 in 3.75. Default 1.",
+            theme::Reset::None,
+            |ui| {
+                let mut scale = self.audio.variometer_scale;
+                let readout = format!("{scale:.2}x");
+                if theme::slider(ui, &mut scale, 0.25..=8.0, &readout) {
+                    let _ = self.set_console_cvar("s_variometerScale", &format!("{scale:.2}"));
+                }
+            },
+        );
+        self.audio_choice_row(
+            ui,
+            "Variometer sound",
+            "Classic: high beeps for gains/undershooting, low steady tone for losses/overshooting. BeatDrop-inspired: rising, falling or flat note pairs. Continuous: pitch feedback without beep gaps. Classic and Continuous are silent in the neutral zone.",
+            "s_variometerStyle",
+            self.audio.variometer_style,
+            &[(0, "A: Classic"), (1, "B: BeatDrop"), (2, "C: Continuous")],
+        );
+        audio_slider!(
+            "Variometer volume",
+            "s_variometerVolume. Variometer level, also scaled by Effects / game volume. Saved between sessions.",
+            variometer_volume,
+            "s_variometerVolume"
+        );
         self.audio_choice_row(
             ui,
             "Jump voice",

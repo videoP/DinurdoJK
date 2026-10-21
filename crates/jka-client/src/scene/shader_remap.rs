@@ -443,7 +443,7 @@ pub(crate) fn apply_shader_remaps_in_place(
     for video in &mut textures.videos {
         video.texture += texture_base;
     }
-    map.textures.extend(textures.images);
+    Arc::make_mut(&mut map.textures).extend(textures.images);
     map.videos.extend(textures.videos);
     map.texture_hashes.extend(hashes);
     map.warnings.extend(

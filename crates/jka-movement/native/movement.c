@@ -5,6 +5,18 @@
 #include "game/bg_local.h"
 #include "bridge.h"
 #include <setjmp.h>
+#include "taunt_cancel.h"
+
+#ifndef JKA_JAPRO
+/* Pure query: no Pmove globals, playerState mutations, or native lock needed. */
+extern qboolean BG_FullBodyTauntAnim(int anim);
+int jka_full_body_taunt(int torso_anim, int legs_anim) {
+    return BG_FullBodyTauntAnim(torso_anim) && BG_FullBodyTauntAnim(legs_anim);
+}
+int jka_taunt_should_cancel(int torso_anim, int legs_anim, int buttons, int upmove) {
+    return jka_full_body_taunt(torso_anim, legs_anim) && jka_taunt_cancel_input(buttons, upmove);
+}
+#endif
 
 cgs_t cgs;
 centity_t cg_entities[MAX_GENTITIES];
@@ -691,24 +703,17 @@ static void clear_player_saber_info(int client_num) {
 }
 
 /* Offline FFA host subset of WP_ForcePowerRun/Update/Regenerate in w_force.c.
- * This runs separately from Pmove: prediction must not regenerate server power.
- * Solo sessions deliberately use a faster 50 ms point regen; this is NOT a cvar. */
-#define LOCAL_FORCE_REGEN_MSEC 50
+ * This runs separately from Pmove: prediction must not regenerate server power. */
 static void stop_offline_power(playerState_t *ps, int power, int time) {
     ps->fd.forcePowersActive &= ~(1 << power);
     if (power == FP_RAGE) ps->fd.forceRageRecoveryTime = time + 10000;
 }
 void jka_player_offline_force_tick(void *player, int time, int requested_power) {
     playerState_t *ps = &((jka_player *)player)->ps;
-    /* The game authority still regenerates Force during noclip (Pmove just
-     * changes movement type). Spectators and other non-player states do not. */
-    if (ps->pm_type != PM_NORMAL && ps->pm_type != PM_NOCLIP) return;
-    /* Defensive: PowerDrain should clamp at zero, but never let a negative
-     * resource propagate or indefinitely delay the next legal regeneration. */
-    if (ps->fd.forcePower < 0) ps->fd.forcePower = 0;
+    if (ps->pm_type != PM_NORMAL) return;
     // ForceSpeed / ForceRage, stock level-three FFA setup. Sound/entity services
     // do not alter these state transitions and are outside the offline host.
-    if (ps->pm_type == PM_NORMAL && (requested_power == FP_SPEED || requested_power == FP_RAGE)) {
+    if (requested_power == FP_SPEED || requested_power == FP_RAGE) {
         int power = requested_power;
         if ((ps->fd.forcePowersActive & (1 << power)) && ps->forceAllowDeactivateTime < time) {
             stop_offline_power(ps, power, time);
@@ -734,17 +739,13 @@ void jka_player_offline_force_tick(void *player, int time, int requested_power) 
         ps->forceRageDrainTime = time + 450;
         if (ps->stats[STAT_HEALTH] < 1) { ps->stats[STAT_HEALTH] = 1; stop_offline_power(ps, FP_RAGE, time); }
     }
-    /* Pmove's own Force Jump cleanup checks ground contact OR falling below
-     * the launch height. The old extra forceJumpZStart==0 requirement here
-     * left LEVITATION active after landing on some movement paths, causing
-     * permanent regen suppression at zero power. Ground contact wins. */
-    if (ps->groundEntityNum != ENTITYNUM_NONE)
+    if (ps->groundEntityNum != ENTITYNUM_NONE && !ps->fd.forceJumpZStart)
         ps->fd.forcePowersActive &= ~(1 << FP_LEVITATION);
     if ((!ps->fd.forcePowersActive || ps->fd.forcePowersActive == (1 << FP_DRAIN)) && !ps->saberInFlight &&
         (ps->weapon != WP_SABER || !BG_SaberInSpecial(ps->saberMove))) {
         while (ps->fd.forcePowerRegenDebounceTime < time) {
             if (ps->fd.forcePower < ps->fd.forcePowerMax) ps->fd.forcePower++;
-            ps->fd.forcePowerRegenDebounceTime += LOCAL_FORCE_REGEN_MSEC;
+            ps->fd.forcePowerRegenDebounceTime += 200; // stock g_forceRegenTime
         }
     } else ps->fd.forcePowerRegenDebounceTime = time;
 }

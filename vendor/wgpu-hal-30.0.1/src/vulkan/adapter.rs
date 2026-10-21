@@ -3008,7 +3008,18 @@ impl super::Adapter {
             .queue_priorities(&[1.0]);
         let mut family_infos = Vec::from([family_info]);
 
+        // DinurdoJK patch: `DINURDO_VK_SHADER_STATS=1` enables
+        // VK_KHR_pipeline_executable_properties so `create_render_pipeline`
+        // can print each stage's driver statistics (register count).
+        let mut executable_info = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+            .pipeline_executable_info(true);
+        let shader_stats = std::env::var_os("DINURDO_VK_SHADER_STATS").is_some_and(|v| v == "1")
+            && self.phd_capabilities.supports_extension(khr::pipeline_executable_properties::NAME);
         let mut pre_info = vk::DeviceCreateInfo::default();
+        if shader_stats {
+            enabled_extensions.push(khr::pipeline_executable_properties::NAME);
+            pre_info = pre_info.push_next(&mut executable_info);
+        }
 
         if let Some(callback) = callback {
             callback(super::CreateDeviceCallbackArgs {

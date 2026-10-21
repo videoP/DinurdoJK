@@ -98,6 +98,7 @@ pub(in crate::renderer) fn build_world(
     fast_surface_layout: &wgpu::BindGroupLayout,
     pipeline_layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    lean_shader: &wgpu::ShaderModule,
     shader_variant: WorldShaderVariantKey,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
@@ -240,25 +241,13 @@ pub(in crate::renderer) fn build_world(
         mark(Some(effect.texture), TEX_USE_COLOR);
     }
     let texture_classify_ms = texture_classify_started.elapsed().as_secs_f64() * 1000.0;
-    // Move the source vectors into Arc without copying texture bytes. Renderer
-    // uploads and BC encoder workers only borrow the same immutable pixels.
-    let texture_data = Arc::new(texture_data);
-    let mut lightmap_data = lightmap_data;
-    let authored_sun_bake = sun.zip(baked_sun_encoding).and_then(|(sun, encoding)| {
-        crate::renderer::lighting::original_sun::bake_authored_sun_masks(
-            &vertices, &coarse_sources, &texture_data, &mut lightmap_data,
-            &legacy_dlight_triangle_surfaces, legacy_dlight_surfaces.len(), sun, encoding,
-        )
-    });
-    let authored_sun_projected = authored_sun_bake.is_some();
-    let lightmap_data = Arc::new(lightmap_data);
-    let baked_sun_calibration = authored_sun_bake.or_else(|| sun.and_then(|sun| {
-        crate::renderer::lighting::original_sun::estimate_baked_sun_radiance(
-            &vertices, &coarse_sources, &lightmap_data,
-            &legacy_dlight_triangle_surfaces, &legacy_dlight_surfaces, sun,
-        )
-    }));
-    let baked_sun_radiance = baked_sun_calibration.as_ref().map(|fit| fit.radiance);
+    // No sunlight tracing, calibration or cache I/O on the upload thread.
+    // Retain cheap material metadata plus shared inputs for a requested bake.
+    let sun_bake_batches = if !source_map && sun.is_some() {
+        coarse_sources.clone()
+    } else { Vec::new() };
+    let may_project_authored_sun = !source_map && sun.is_some() && baked_sun_encoding.is_some()
+        && lightmap_data.iter().all(|image| image.rgba16f.is_none() && image.mip_level_count == 1);
     // Existing GPU textures are safe to alias only when *all* decode/upload
     // inputs agree. In particular, the use classification can change BC
     // format, detail treatment, or picmip eligibility after a remap.
@@ -306,6 +295,7 @@ pub(in crate::renderer) fn build_world(
     // decline the shortcut while a runtime AO replacement is active.
     let reusable_lightmaps = reusable_world.filter(|previous| {
         !previous.static_ao_lightmap_active
+            && !previous.sun_bake.has_masks()
             && !previous.baked_sun_cache.as_ref().is_some_and(|cache| cache.active)
             && previous.lightmaps.len() == lightmap_data.len()
             && previous.lightmap_base_data.len() == lightmap_data.len()
@@ -337,7 +327,7 @@ pub(in crate::renderer) fn build_world(
     };
     // Inverse exposure needs the original bytes and sun-flux alpha. Lossy BC
     // quantization can turn a small byte error into a large photon error.
-    let lightmap_encode_rx = if texture_compression >= 2 && !authored_sun_projected && reusable_lightmaps.is_none() {
+    let lightmap_encode_rx = if texture_compression >= 2 && !may_project_authored_sun && reusable_lightmaps.is_none() {
         let data = Arc::clone(&lightmap_data);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         rayon::spawn(move || {
@@ -704,7 +694,8 @@ pub(in crate::renderer) fn build_world(
         }
         inline_gpu_starts.push(gpu_start);
     }
-    let mut world_vertex_usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+    let mut world_vertex_usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
+        | wgpu::BufferUsages::STORAGE;
     if ray_tracing_supported {
         world_vertex_usage |= wgpu::BufferUsages::BLAS_INPUT;
     }
@@ -1341,6 +1332,7 @@ pub(in crate::renderer) fn build_world(
                 source,
                 bind_group,
                 fragment_key,
+                pso_slot: u32::MAX,
                 animation,
                 authored_glow_bind_group,
                 ocean_surface_bind_group,
@@ -1925,14 +1917,7 @@ pub(in crate::renderer) fn build_world(
     let surface_count = legacy_dlight_surfaces.len().max(1);
     // Keep the writable Legacy masks first. Immutable per-surface fits follow
     // them, so existing partial mask uploads cannot overwrite the calibration.
-    let mut initial_legacy_masks = vec![0u32; surface_count * 5];
-    if let Some(fit) = baked_sun_calibration {
-        for (surface, data) in fit.surfaces.iter().enumerate() {
-            for (component, value) in data.iter().enumerate() {
-                initial_legacy_masks[surface_count + surface * 4 + component] = value.to_bits();
-            }
-        }
-    }
+    let initial_legacy_masks = vec![0u32; surface_count * 5];
     let legacy_dlight_surface_mask_buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA Legacy dlight surface masks"),
@@ -2202,6 +2187,7 @@ pub(in crate::renderer) fn build_world(
             device,
             pipeline_layout,
             shader,
+            lean_shader,
             surface_format,
             msaa_samples,
             &material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
@@ -2212,12 +2198,15 @@ pub(in crate::renderer) fn build_world(
             shader_variant,
             WorldPipelineVariant {
                 ocean_far_pipeline: None,
+                ocean_native_mesh_pipeline: None,
+                ocean_native_mesh_wireframe_pipeline: None,
                 pipelines,
                 legacy_dlight_pipelines,
                 fog_pass_pipelines,
                 reflection_pipelines,
                 reflection_fog_pass_pipelines,
                 specialized_pipelines,
+                slot_pipelines: Vec::new(),
             },
         );
         (pipeline_variants, fast_pipelines)
@@ -2414,6 +2403,11 @@ pub(in crate::renderer) fn build_world(
         lightmap_sizes: Arc::new(static_ao_lightmap_sizes),
         lightmap_bases: Arc::new(static_ao_lightmap_bases),
     });
+    let sun_bake = crate::renderer::lighting::sun_bake::SunBake::new(
+        static_ao_source.as_ref(), sun, baked_sun_encoding, sun_bake_batches,
+        texture_data, Arc::clone(&lightmap_data),
+        &legacy_dlight_triangle_surfaces, &legacy_dlight_surfaces,
+    );
 
     let ocean_sky_representatives = ocean_sky_regions.iter().enumerate()
         .map(|(slot, extension)| extension.and_then(|_| full_batches.iter().position(|batch|
@@ -2459,6 +2453,7 @@ pub(in crate::renderer) fn build_world(
             ocean_pvs_footprints,
             runtime_ocean_clipmaps,
             inline_models,
+            inline_transform: None,
             vertex_buffer,
             index_buffer,
             rt_shadow_ranges,
@@ -2508,15 +2503,16 @@ pub(in crate::renderer) fn build_world(
             light_count,
             local_shadows,
             sun,
-            baked_sun_radiance,
-            baked_sun_encoding: baked_sun_encoding.filter(|_| authored_sun_projected
-                && lightmap_data.iter().all(|image| image.rgba16f.is_none() && image.mip_level_count == 1)),
+            baked_sun_radiance: None,
+            sun_bake,
+            baked_sun_encoding: None,
             baked_sun_cache: None,
             grass,
             surface_sprite_effects,
             surface_sprite_resident,
             active_pipeline_variant: shader_variant,
             pipeline_variants,
+            pso_slot_keys: Vec::new(),
             fast_pipelines,
             fast_complexity_pipelines: BTreeMap::new(),
             complexity_pipelines: BTreeMap::new(),
@@ -2549,10 +2545,7 @@ pub(in crate::renderer) fn build_world(
             footprint_mark_textures,
             lightmaps,
             deluxemaps,
-            // BC workers have joined by this point; recover the original Vec
-            // without copying multi-megabyte lightmap pixels in the common case.
-            lightmap_base_data: Arc::try_unwrap(lightmap_data)
-                .unwrap_or_else(|data| data.as_ref().clone()),
+            lightmap_base_data: lightmap_data,
             static_ao_source,
             static_ao_source_to_gpu,
             static_ao_gpu_vertices,

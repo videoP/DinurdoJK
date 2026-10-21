@@ -2,6 +2,7 @@
 //! WGPU readbacks, device polls, or per-frame disk IO. Frame functions and model
 //! draw phases each read one relaxed boolean while unarmed. File writing runs after capture on a
 //! separate OS thread, never in the render/present critical section.
+use crate::renderer::diagnostics::profiling::{GpuPass, GPU_PASS_COUNT};
 use crate::renderer::{active_batch_selection, FrameInfo, Renderer};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 188] = [
+const FIELDS: [&str; 217] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -147,6 +148,14 @@ const FIELDS: [&str; 188] = [
     "ocean_backend",
     "ocean_original_surfaces",
     "ocean_triangles",
+    "ocean_native_prepare_ms",
+    "ocean_native_mesh_build_ms",
+    "ocean_native_mesh_upload_ms",
+    "ocean_native_mesh_rebuilds",
+    "ocean_native_mesh_vertices",
+    "ocean_native_mesh_indices",
+    "ocean_native_mesh_upload_bytes",
+    "ocean_adaptive_mesh_mode",
     "sky_backend",
     "cloud_backend",
     "gpu_latest_blue_water_sky_prepare_ms",
@@ -216,21 +225,87 @@ const FIELDS: [&str; 188] = [
     "patch_lod_updates",
     "patch_index_upload_bytes",
     "patch_cpu_lod_ms",
+    "world_variant_pending",
+    "world_active_pipelines",
+    "world_active_specialized_pipelines",
+    "bsp_primary_stats_shader_mode_latest",
+    "bsp_primary_vertex_invocations_latest",
+    "bsp_primary_clipped_primitives_latest",
+    "bsp_primary_fragment_invocations_latest",
+    "ocean_surface_vertex_invocations_latest",
+    "ocean_surface_clipped_primitives_latest",
+    "ocean_surface_fragment_invocations_latest",
+    "ocean_samples_passed_latest",
+    "loop_top_ms",
+    "loop_command_drain_ms",
+    "loop_mailbox_ms",
+    "loop_pre_render_ms",
+    "loop_pre_scene_rebuild_ms",
+    "loop_pre_inline_models_ms",
+    "plan_linear_depth_reasons",
+    "loop_render_call_ms",
+    "loop_post_render_prev_ms",
+    "frame_interval_ms",
 ];
+
+/// Render-thread loop sections around `Renderer::render()`, measured only
+/// while a capture is armed. Post-render time belongs to the previous loop
+/// iteration (it ends where this one starts). All in ms; NaN when not measured.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct LoopSections {
+    /// Loop start to command drain: HDR polling, GPU-timing toggles, device check.
+    pub(in crate::renderer) top_ms: f64,
+    /// Deferred map uploads plus the render-command drain.
+    pub(in crate::renderer) drain_ms: f64,
+    /// Static-AO polling, snapshot mailbox clone and HUD/name/FX setters.
+    pub(in crate::renderer) mailbox_ms: f64,
+    /// Scene rebuild, inline models, companion targets, FPS graph, camera/input sampling.
+    pub(in crate::renderer) pre_render_ms: f64,
+    /// Parts of `pre_render_ms`: pending scene rebuild, and inline-model posing/upload.
+    pub(in crate::renderer) pre_scene_rebuild_ms: f64,
+    pub(in crate::renderer) pre_inline_models_ms: f64,
+    /// The `render()` call itself.
+    pub(in crate::renderer) render_call_ms: f64,
+    /// Previous iteration: after `render()` returned until the next loop start.
+    pub(in crate::renderer) post_render_prev_ms: f64,
+}
+
+impl Default for LoopSections {
+    fn default() -> Self {
+        Self {
+            top_ms: f64::NAN,
+            drain_ms: f64::NAN,
+            mailbox_ms: f64::NAN,
+            pre_render_ms: f64::NAN,
+            pre_scene_rebuild_ms: f64::NAN,
+            pre_inline_models_ms: f64::NAN,
+            render_call_ms: f64::NAN,
+            post_render_prev_ms: f64::NAN,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PerfRow {
     path: &'static str,
     numbers: [f64; FIELDS.len()],
+    /// Every `GpuPass` from the newest resolved readback, written after FIELDS
+    /// as `gpu_pass_<label>_ms` (NaN when that pass did not run or no timing).
+    gpu_passes: [f64; GPU_PASS_COUNT],
 }
 
 impl PerfRow {
-    fn from_frame(info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf) -> Self {
+    fn from_frame(info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> Self {
         let models = &renderer.dynamic_model_renderer;
         let model_calls = models.perf_phase_calls.get();
         let prepare = &models.perf_prepare;
         let gpu_timing = renderer.gpu_profiler.enabled()
             .then(|| renderer.gpu_profiler.latest_timing()).flatten();
+        // Asynchronous (about 10 Hz) hardware counts for the primary BSP pass only.
+        let bsp = renderer.frame_time_graph.latest_primary_bsp_stats();
+        // Same cadence, the OceanSurface interval. FS / samples_passed > 1 is
+        // shading spent on helper lanes and late-rejected fragments.
+        let ocean = renderer.frame_time_graph.latest_ocean_surface_stats();
         // Vertex/index bytes come from actual queue writes. Other retained
         // streams are full writes; guard empty-input frames against stale scratch.
         let has_input = info.dynamic_model_surfaces != 0;
@@ -365,6 +440,14 @@ impl PerfRow {
                 f64::from(renderer.ocean_settings.backend),
                 f64::from(info.ocean.original_surfaces),
                 info.ocean.triangles as f64,
+                info.ocean.native_cpu.prepare_ms,
+                info.ocean.native_cpu.build_ms,
+                info.ocean.native_cpu.upload_ms,
+                f64::from(info.ocean.native_cpu.rebuilds),
+                info.ocean.native_cpu.vertices as f64,
+                info.ocean.native_cpu.indices as f64,
+                info.ocean.native_cpu.upload_bytes as f64,
+                f64::from(renderer.ocean_settings.adaptive_mesh),
                 f64::from(renderer.sky_backend),
                 f64::from(renderer.cloud_backend),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::BlueWaterSkyPrepare.index()]).unwrap_or(f64::NAN),
@@ -434,7 +517,31 @@ impl PerfRow {
                 info.patch_lod.lod_updates as f64,
                 info.patch_lod.index_upload_bytes as f64,
                 info.patch_lod.cpu_lod_ms,
+                f64::from(u8::from(info.world_shader_programs.pending)),
+                f64::from(info.world_pipeline_counts.0),
+                f64::from(info.world_pipeline_counts.1),
+                bsp.map_or(f64::NAN, |stats| f64::from(stats.shader_mode)),
+                bsp.map_or(f64::NAN, |stats| stats.vertex_invocations as f64),
+                bsp.map_or(f64::NAN, |stats| stats.clipped_primitives as f64),
+                bsp.map_or(f64::NAN, |stats| stats.fragment_invocations as f64),
+                ocean.map_or(f64::NAN, |stats| stats.vertex_invocations as f64),
+                ocean.map_or(f64::NAN, |stats| stats.clipped_primitives as f64),
+                ocean.map_or(f64::NAN, |stats| stats.fragment_invocations as f64),
+                ocean.map_or(f64::NAN, |_| renderer.ocean_visibility.latest_samples as f64),
+                sections.top_ms,
+                sections.drain_ms,
+                sections.mailbox_ms,
+                sections.pre_render_ms,
+                sections.pre_scene_rebuild_ms,
+                sections.pre_inline_models_ms,
+                f64::from(renderer.frame_plan.linear_depth_reasons),
+                sections.render_call_ms,
+                sections.post_render_prev_ms,
+                f64::NAN,
             ],
+            gpu_passes: std::array::from_fn(|pass| {
+                gpu_timing.and_then(|timing| timing.milliseconds[pass]).unwrap_or(f64::NAN)
+            }),
         }
     }
 }
@@ -444,6 +551,13 @@ pub(in crate::renderer) struct PerfCapture {
     armed_at: Instant,
     frames: Vec<PerfRow>,
     target_frames: usize,
+    /// Time-bounded capture: wall time measured from the first recorded frame.
+    target_duration: Option<Duration>,
+    recording_started: Option<Instant>,
+    recording_wall: Option<Duration>,
+    /// Successive record() calls: the real presented-frame cadence, unlike
+    /// frame_ms which only spans the renderer's own frame function.
+    last_record: Option<Instant>,
     warmup_frames: usize,
     warmup_remaining: usize,
     hooks_owned: bool,
@@ -463,16 +577,22 @@ pub(in crate::renderer) struct PerfCapture {
 }
 
 impl PerfCapture {
-    pub(in crate::renderer) fn arm(stem: PathBuf, frames: usize, renderer: &Renderer) -> Self {
-        let target_frames = frames.clamp(30, 6_000);
+    pub(in crate::renderer) fn arm(stem: PathBuf, frames: usize, seconds: Option<f64>, renderer: &Renderer) -> Self {
+        // Ten seconds at 2-3k FPS exceeds the frame-count limit; time-bounded
+        // captures keep a generous safety cap (~1.6 KB per row).
+        let target_frames = if seconds.is_some() { 200_000 } else { frames.clamp(30, 6_000) };
         let adapter = renderer.adapter.get_info();
         let warmup_frames = 120;
         CAPTURE_ENABLED.store(true, Ordering::Relaxed);
         Self {
             stem,
             armed_at: Instant::now(),
-            frames: Vec::with_capacity(target_frames),
+            frames: Vec::with_capacity(target_frames.min(16_384)),
             target_frames,
+            target_duration: seconds.map(Duration::from_secs_f64),
+            recording_started: None,
+            recording_wall: None,
+            last_record: None,
             warmup_frames,
             warmup_remaining: warmup_frames,
             hooks_owned: true,
@@ -486,7 +606,7 @@ impl PerfCapture {
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             main_view_stages: vec![crate::renderer::api::WorldStagePerf::default(); renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};bsp_model_surfaces={};early_submit={};shader_mode={};world_sort={};active_world={};hdr_output={};present_copy={}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};inline_transform={};bsp_model_surfaces={};early_submit={};shader_mode={};world_sort={};active_world={};hdr_output={};present_copy={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -515,6 +635,7 @@ impl PerfCapture {
                 renderer.world_stage_probe,
                 renderer.fast_sky,
                 renderer.draw_inline_models,
+                renderer.inline_transform_mode.config_value(),
                 renderer.draw_bsp_model_surfaces,
                 renderer.early_submit_enabled,
                 renderer.fragment_shader_mode,
@@ -530,7 +651,7 @@ impl PerfCapture {
     /// users can close the console; then skip 120 additional successful frames
     /// to avoid measuring the first dynamic resource/path warmup. This does not
     /// pretend pipelines are fully prewarmed: repeat the scene before capture.
-    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf) -> bool {
+    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> bool {
         if self.armed_at.elapsed() < Duration::from_secs(2)
             || info.perf_primary_command_buffers == 0
         {
@@ -575,8 +696,19 @@ impl PerfCapture {
                 total.skipped_hidden_indices = total.skipped_hidden_indices.saturating_add(frame.skipped_hidden_indices);
             }
         }
-        self.frames.push(PerfRow::from_frame(info, renderer, client));
-        self.frames.len() >= self.target_frames
+        let now = Instant::now();
+        let started = *self.recording_started.get_or_insert(now);
+        let mut row = PerfRow::from_frame(info, renderer, client, sections);
+        if let Some(previous) = self.last_record.replace(now) {
+            row.numbers[FIELDS.len() - 1] = now.duration_since(previous).as_secs_f64() * 1000.0;
+        }
+        self.frames.push(row);
+        let done = self.frames.len() >= self.target_frames
+            || self.target_duration.is_some_and(|limit| started.elapsed() >= limit);
+        if done {
+            self.recording_wall = Some(started.elapsed());
+        }
+        done
     }
 
     /// Convert the now-complete bounded capture into an off-render-thread
@@ -610,12 +742,21 @@ impl PerfCapture {
     fn csv(&self) -> String {
         let mut out = String::from("frame_index,renderer_path,");
         out.push_str(&FIELDS.join(","));
+        for pass in GpuPass::ALL {
+            out.push_str(",gpu_pass_");
+            out.push_str(pass.label());
+            out.push_str("_ms");
+        }
         out.push('\n');
         for (index, row) in self.frames.iter().enumerate() {
             use std::fmt::Write;
             let _ = write!(&mut out, "{index},{},", row.path);
             for (field, value) in row.numbers.iter().enumerate() {
                 if field != 0 { out.push(','); }
+                if value.is_finite() { let _ = write!(&mut out, "{value:.6}"); }
+            }
+            for value in &row.gpu_passes {
+                out.push(',');
                 if value.is_finite() { let _ = write!(&mut out, "{value:.6}"); }
             }
             out.push('\n');
@@ -699,6 +840,7 @@ impl PerfCapture {
                 serde_json::Value::Null
             } else {
                 serde_json::json!({
+                    "mean": values.iter().sum::<f64>() / values.len() as f64,
                     "p50": percentile(&values, 0.50),
                     "p95": percentile(&values, 0.95),
                     "p99": percentile(&values, 0.99),
@@ -709,8 +851,12 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v9",
+            "schema": "dinurdojk-cpu-renderperf-v10",
             "sample_count": self.frames.len(),
+            "requested_seconds": self.target_duration.map(|d| d.as_secs_f64()),
+            "recording_wall_seconds": self.recording_wall.map(|d| d.as_secs_f64()),
+            "wall_fps": self.recording_wall.filter(|d| !d.is_zero())
+                .map(|d| self.frames.len() as f64 / d.as_secs_f64()),
             "warmup_seconds_before_frame_skip": 2,
             "warmup_skipped_frames": self.warmup_frames,
             "adapter": self.adapter,

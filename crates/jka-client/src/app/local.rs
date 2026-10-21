@@ -39,6 +39,12 @@ impl App {
     /// solo shim instead of a game module. DinurdoJK also accepts an optional
     /// trailing pitch so automated views are reproducible.
     pub(in crate::app) fn local_setviewpos(&mut self, arguments: &[&str]) {
+        self.local_setviewpos_with_push(arguments, 0);
+    }
+
+    /// `push_speed` 0 is OpenJK's 400 u/s TeleportPlayer push; benchmarks pass 1
+    /// (`setviewpos_exact`) so the camera stays on the requested view.
+    pub(in crate::app) fn local_setviewpos_with_push(&mut self, arguments: &[&str], push_speed: i32) {
         if !(4..=5).contains(&arguments.len()) {
             self.push_console_line("usage: setviewpos x y z yaw [pitch]".to_owned());
             return;
@@ -52,12 +58,15 @@ impl App {
                 .unwrap_or(0.0)
         };
         let origin = [value(0), value(1), value(2)];
-        let angles = [value(4), value(3), 0.0];
+        // Pitch into [-180, 180): PM_UpdateViewAngles clamps the unwrapped pitch to +/-16000 shorts (87.9 degrees), so
+        // an equivalent angle such as -339 (= 21) otherwise lands looking straight up, depending on the cmd angles.
+        let pitch = (value(4) + 180.0).rem_euclid(360.0) - 180.0;
+        let angles = [pitch, value(3), 0.0];
         let result = self
             .local_server
             .as_mut()
             .expect("checked by caller")
-            .teleport(origin, angles);
+            .teleport_with_push(origin, angles, push_speed);
         match result {
             Ok(()) => {
                 println!(

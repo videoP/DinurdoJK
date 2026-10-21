@@ -1,7 +1,7 @@
 // Full-resolution, temporally rate-limited sun shadow tracing.
 //
-// Every pixel gets a fresh traced ray exactly once every 4 frames, following a
-// 2x2 ordered-dither schedule so the traced subset is spread evenly across the
+// Stable pixels get a fresh trace once every two or four frames. Half uses a
+// rotating checkerboard; Quarter uses a 2x2 ordered-dither schedule spread over the
 // screen each frame (this replaces an earlier, removed spatial half-resolution
 // cache that traded resolution for rate and never paid for itself: reconstructing
 // a downsampled cache required its own depth prepass and a fixed per-fragment
@@ -88,7 +88,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let cell = vec2<u32>(id.xy) % vec2<u32>(2u);
     let phase = rt_shadow_settings.dimensions.z % 4u;
-    need_trace = need_trace || all(cell == RT_SHADOW_DITHER[phase]);
+    let half_scheduled = (id.x + id.y) % 2u == rt_shadow_settings.dimensions.z % 2u;
+    let scheduled = select(all(cell == RT_SHADOW_DITHER[phase]), half_scheduled, rt_shadow_settings.dimensions.w == 2u);
+    need_trace = need_trace || scheduled;
 
     var visibility = 1.0;
     if (!need_trace) {

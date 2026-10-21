@@ -757,6 +757,8 @@ impl Renderer {
         }
         world.has_glass_primary = world.coarse_batches.iter().any(|b| b.source.glass_primary);
         world.material_debug = map.base.material_debug.clone();
+        // Batch keys changed in place: renumber slots before any frame uses them.
+        world.refresh_pso_slots();
         // Shader stage changes may introduce new PSO keys. Rebuild PSOs only
         // on the cold command; unchanged formats/geometry never go through it.
         let needs_pipelines = world.pipeline_variants.values().any(|variant|

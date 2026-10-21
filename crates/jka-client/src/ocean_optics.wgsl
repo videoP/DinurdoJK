@@ -41,6 +41,10 @@ const CAUSTIC_RECEIVER_MARGIN: f32 = 0.75;
 // Replaced at pipeline specialization time; false compiles all extra wave
 // reads and classification out of non-Hybrid optics.
 const JKA_HYBRID_WAVE: bool = false;
+// Replaced for submerged Hybrid mode 4 (`Resources::ensure_submerged_fog_capture`):
+// the eye is in water, so a pixel is fogged over its ray up to the water top
+// over the eye (`optics.eye.w`), and the per-volume span solve compiles out.
+const JKA_SUBMERGED_FOG: bool = false;
 
 // Read the SAME Blue Water simulation adapter passed to the world water
 // material. Sampling varies with the ray's WORLD XZ, NOT one camera height
@@ -342,6 +346,7 @@ fn sky_fog_column(span: vec2<f32>, origin: vec2<f32>, delta: vec2<f32>,
 // columns are semi-infinite below their water surface. Adjacent quadrants
 // are admitted only when both touched sky walls meet at a real corner.
 fn add_sky_ocean_spans(delta: vec3<f32>) {
+    if (JKA_SUBMERGED_FOG) { return; }
     let origin = optics.eye.xz;
     let direction = delta.xz;
     for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
@@ -371,11 +376,66 @@ fn add_sky_ocean_spans(delta: vec3<f32>) {
     }
 }
 
+const MASK_FINE_AXIS: i32 = 32;
+
+// Classifies the tiles of the outline's 32x32 grid (`mask_fine_tiles`, exact
+// against the coastline grown by the mask tolerance) that the ray's xz segment
+// crosses: 1 all outside, 2 all inside, 0 when it touches a coastline tile,
+// both kinds, or more tiles than the walk allows.
+fn mask_segment_class(slot: i32, origin: vec2<f32>, direction: vec2<f32>, span: vec2<f32>) -> u32 {
+    let bounds = ocean.mask_bounds[slot];
+    let axis = f32(MASK_FINE_AXIS);
+    let size = max((bounds.zw - bounds.xy) / axis, vec2<f32>(1.0e-4));
+    let p0 = (origin + direction * span.x - bounds.xy) / size;
+    let p1 = (origin + direction * span.y - bounds.xy) / size;
+    var cell = vec2<i32>(clamp(floor(p0), vec2<f32>(0.0), vec2<f32>(axis - 1.0)));
+    let last = vec2<i32>(clamp(floor(p1), vec2<f32>(0.0), vec2<f32>(axis - 1.0)));
+    let d = p1 - p0;
+    let step = vec2<i32>(select(vec2<f32>(-1.0), vec2<f32>(1.0), d >= vec2<f32>(0.0)));
+    // Segment fraction to the next tile edge on each axis, and per tile.
+    let next_edge = vec2<f32>(cell) + select(vec2<f32>(0.0), vec2<f32>(1.0), d >= vec2<f32>(0.0));
+    let inv = 1.0 / max(abs(d), vec2<f32>(1.0e-6));
+    var t_max = abs(next_edge - p0) * inv;
+    let t_delta = inv;
+    var seen = 0u;
+    for (var i = 0u; i < 64u; i += 1u) {
+        let tile = u32(cell.y * MASK_FINE_AXIS + cell.x);
+        let word = u32(slot) * 64u + (tile >> 4u);
+        let code = (ocean.mask_fine_tiles[word >> 2u][word & 3u] >> ((tile & 15u) * 2u)) & 3u;
+        if (code == 0u) { return 0u; }
+        seen |= code;
+        if (seen == 3u) { return 0u; }
+        if (all(cell == last)) { return seen; }
+        if (t_max.x < t_max.y) {
+            cell.x += step.x;
+            t_max.x += t_delta.x;
+        } else {
+            cell.y += step.y;
+            t_max.y += t_delta.y;
+        }
+        if (any(cell < vec2<i32>(0)) || any(cell >= vec2<i32>(MASK_FINE_AXIS))) { return 0u; }
+    }
+    return 0u;
+}
+
 // Adds the runs of `span` that lie inside the volume's real outline.
 fn add_masked_spans(slot: i32, span: vec2<f32>, top: f32, delta: vec3<f32>) {
     let range = ocean.mask_ranges[slot];
     let count = u32(range.y);
     let first = u32(range.x);
+    // Outside its bounds a masked volume holds no water (as `ocean_mask_contains`).
+    let bounds = ocean.mask_bounds[slot];
+    let origin = optics.eye.xz;
+    var inner = sky_fog_clip(span, -origin.x, -delta.x, -bounds.x);
+    inner = sky_fog_clip(inner, origin.x, delta.x, bounds.z);
+    inner = sky_fog_clip(inner, -origin.y, -delta.z, -bounds.y);
+    inner = sky_fog_clip(inner, origin.y, delta.z, bounds.w);
+    if (inner.y <= inner.x) { return; }
+    // Most rays only cross tiles wholly in or out of the outline; only one that
+    // touches a boundary tile walks every outline triangle.
+    let crossed = mask_segment_class(slot, origin, delta.xz, inner);
+    if (crossed == 2u) { add_span(inner, top, delta.y); return; }
+    if (crossed == 1u) { return; }
     var runs: array<vec2<f32>, 8>;
     var run_count = 0u;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -464,7 +524,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
     let caustic_receiver_in_range = optics.params.z > 0.0 && depth > 0.0 && caustic_sun_eligible &&
         (caustic_limit <= 0.0 || ray_length < caustic_limit);
     var bottom_depth = 0.0;
-    for (var i = 0u; i < min(u32(optics.params.w), 8u); i += 1u) {
+    for (var i = 0u; i < select(min(u32(optics.params.w), 8u), 0u, JKA_SUBMERGED_FOG); i += 1u) {
         let lo = optics.minimum[i].xyz;
         let hi = optics.maximum[i].xyz;
         let slot = i32(round(optics.minimum[i].w)) - 1;
@@ -507,6 +567,16 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
     for (var i = 0u; i < g_span_count; i += 1u) {
         water_fraction += max(g_spans[i].y - max(g_spans[i].x, end), 0.0);
         end = max(end, g_spans[i].y);
+    }
+    if (JKA_SUBMERGED_FOG) {
+        // Water from the eye to the receiver, or to where the ray rises through
+        // the water top; what lies past it is behind the drawn surface.
+        let top = optics.eye.w;
+        water_fraction = select(1.0, clamp((top - optics.eye.y) / delta.y, 0.0, 1.0), delta.y > 0.0);
+        eye_depth = max(top - optics.eye.y, 0.0);
+        if (caustic_receiver_in_range) {
+            bottom_depth = max(top - world.y, 0.0);
+        }
     }
     // Optional low-cost wave-curvature caustics. Approximation, not photon tracing.
     // No caustic-specific normal reconstruction or wave samples when disabled.

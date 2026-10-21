@@ -13,6 +13,18 @@ use std::{
     },
 };
 
+/// Whether both animation channels satisfy Pmove's native full-body taunt gate.
+pub fn is_full_body_taunt(torso_anim: i32, legs_anim: i32) -> bool {
+    // SAFETY: the native animation table query has no mutable state.
+    unsafe { ffi::jka_full_body_taunt(torso_anim & 0x7fff, legs_anim & 0x7fff) != 0 }
+}
+
+/// Pmove's full-body animation gate and input rule, including torso-only exceptions.
+pub fn taunt_should_cancel(torso_anim: i32, legs_anim: i32, buttons: i32, up_move: i8) -> bool {
+    // SAFETY: this native helper is a pure query with no shared mutable state.
+    unsafe { ffi::jka_taunt_should_cancel(torso_anim & 0x7fff, legs_anim & 0x7fff, buttons, i32::from(up_move)) != 0 }
+}
+
 /// One `bg_itemlist` entry from the pinned OpenJK tables (gitem_t subset).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemInfo {
@@ -747,11 +759,16 @@ impl PlayerState {
     /// up, a 400 u/s push along the new view, a 160 ms knockback hold and a
     /// toggled EF_TELEPORT_BIT so presentation does not lerp.
     pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
+        self.teleport_with_push(origin, angles, 0)
+    }
+    /// `teleport` with an explicit push speed (0 = the stock 400 u/s). Benchmarks
+    /// use 1 u/s so the view comes to rest exactly where it was placed.
+    pub fn teleport_with_push(&mut self, origin: [f32; 3], angles: [f32; 3], speed: i32) -> Result<(), String> {
         if !origin.iter().chain(angles.iter()).all(|v| v.is_finite()) {
             return Err("Non-finite teleport".into());
         }
         let _guard = ffi::NativeGuard::new();
-        unsafe { ffi::jka_player_teleport(self.raw.as_ptr(), origin.as_ptr(), angles.as_ptr(), 0) };
+        unsafe { ffi::jka_player_teleport(self.raw.as_ptr(), origin.as_ptr(), angles.as_ptr(), speed) };
         Ok(())
     }
     /// Port of OpenJK game-side `G_Give(ent, "all", ...)` for the local authority.

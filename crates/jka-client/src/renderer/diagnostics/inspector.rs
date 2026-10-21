@@ -487,6 +487,62 @@ impl Renderer {
         self.inspector_vertex_range = Some(hit_range);
         let batch = &world.coarse_batches[batch_index];
         let source = &batch.source;
+        // Trace the *active/installed* world variant, not the requested cvar:
+        // background PSO compilation may still be in flight. We can also
+        // predict the other mode policies without switching modes or drawing.
+        let active_variant = world.active_pipeline_variant;
+        let active_mode = crate::renderer::world::programs::active_mode(active_variant);
+        let mut fragment_report = vec![format!(
+            "REQUESTED MODE {}  ACTIVE MODE {}  WORLD FAMILY {:?}",
+            self.fragment_shader_mode, active_mode, active_variant.family()
+        )];
+        let actual_program = world.pipeline_variants.get(&active_variant)
+            .and_then(|pipelines| pipelines.specialized_pipelines
+                .get(&(source.pipeline, batch.fragment_key)))
+            .map(|(key, _)| key.program);
+        fragment_report.push(format!(
+            "INSTALLED BASE PASS: {}",
+            actual_program.map_or_else(|| "General (no per-material PSO)".to_owned(),
+                |program| format!("{program:?}")),
+        ));
+        fragment_report.push(format!(
+            "MATERIAL KEY: flags={:#010x} flags_w={:#010x} tcGen={} alpha={} tcMods={:?}",
+            batch.fragment_key.flags, batch.fragment_key.flags_w,
+            batch.fragment_key.tc_gen, batch.fragment_key.alpha_func,
+            batch.fragment_key.vertex_recipe.tc_mods,
+        ));
+        for mode in 2..=4 {
+            let mut candidate = active_variant;
+            candidate.material_specialization = true;
+            candidate.minimal_entries = mode == 2;
+            candidate.program_mode = crate::renderer::world::programs::WorldProgramMode::from_console(mode);
+            let reasons = crate::renderer::world::programs::stage_rejection_reasons(
+                candidate, source.pipeline, batch.fragment_key, mode,
+            );
+            if reasons.is_empty() {
+                let predicted = crate::renderer::world::programs::program_key(
+                    candidate, source.pipeline, batch.fragment_key,
+                );
+                fragment_report.push(format!(
+                    "MODE {mode}: ELIGIBLE -> {:?} (if installed)", predicted.program,
+                ));
+                if active_mode == mode && actual_program != Some(predicted.program) {
+                    fragment_report.push(
+                        "  WARNING: installed PSO does not match eligible mode; check compile/job selection or batch variant".to_owned()
+                    );
+                }
+            } else {
+                fragment_report.push(format!(
+                    "MODE {mode}: FALLBACK -> mode-1-style specialized (or general special path)"
+                ));
+                for reason in reasons {
+                    fragment_report.push(format!("  - {reason}"));
+                }
+            }
+        }
+        fragment_report.push(
+            "Scope: primary BSP material pass only; sky, effect, fog and reflection redraws have independent programs.".to_owned()
+        );
 
         let triangle_offset = usize::try_from(triangle_start).unwrap_or(usize::MAX);
         let hit_triangle = triangle_offset
@@ -1134,6 +1190,10 @@ impl Renderer {
             ("LIGHTING".into(), lighting_summary.clone()),
         ];
         let mut sections = vec![
+            SurfaceInspectorSection {
+                title: "FRAGMENT SHADER / PSO ELIGIBILITY".into(),
+                lines: fragment_report,
+            },
             SurfaceInspectorSection {
                 title: "SURFACE".into(),
                 lines: vec![

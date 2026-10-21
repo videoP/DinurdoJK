@@ -79,11 +79,12 @@ fn delta_angle_degrees(delta: i32) -> f32 {
     (delta as i16) as f32 * SHORT_TO_DEGREES
 }
 
-fn idrive_axis(positive_down: bool, negative_down: bool, priority: i8, magnitude: i8) -> i8 {
+pub(crate) fn idrive_axis(enabled: bool, positive_down: bool, negative_down: bool, priority: i8, magnitude: i8) -> i8 {
     match (positive_down, negative_down) {
         (true, false) => magnitude,
         (false, true) => -magnitude,
-        (true, true) => priority * magnitude,
+        (true, true) if enabled => priority * magnitude,
+        (true, true) => 0,
         (false, false) => 0,
     }
 }
@@ -188,6 +189,7 @@ pub struct LocalPlayer {
     // the direction pressed most recently wins. Only one signed winner per
     // axis is needed, so this costs three bytes and needs no timestamp.
     move_priority: [i8; 3],
+    idrive_enabled: bool,
     noclip: bool,
     saber_movement: [SaberMovementInfo; 2],
     /// The viewer's foot bolts from its last posed frame (`pmove_t::ghoul2`).
@@ -241,6 +243,7 @@ impl LocalPlayer {
             pending_cmd_buttons: 0,
             pending_generic_command: 0,
             move_priority: [0; 3],
+            idrive_enabled: true,
             noclip: false,
             saber_movement,
             foot_bolts: None,
@@ -307,11 +310,14 @@ impl LocalPlayer {
     /// OpenJK `Cmd_SetViewpos_f` -> `TeleportPlayer` on the active state
     /// (joined player or free spectator). `origin` is in JKA world units.
     pub fn teleport(&mut self, origin: [f32; 3], angles: [f32; 3]) -> Result<(), String> {
+        self.teleport_with_push(origin, angles, 0)
+    }
+    pub fn teleport_with_push(&mut self, origin: [f32; 3], angles: [f32; 3], speed: i32) -> Result<(), String> {
         let state = match self.mode {
             JoinMode::Player => self.player.as_mut().expect("joined player"),
             JoinMode::Spectator => &mut self.spectator,
         };
-        state.teleport(origin, angles)?;
+        state.teleport_with_push(origin, angles, speed)?;
         self.reset_view();
         Ok(())
     }
@@ -461,6 +467,10 @@ impl LocalPlayer {
             _ => {}
         }
     }
+    pub(crate) fn set_idrive(&mut self, enabled: bool) {
+        self.idrive_enabled = enabled;
+    }
+
     pub fn set_mouse_input_settings(&mut self, settings: MouseInputSettings) {
         self.mouse_input = settings;
     }
@@ -518,6 +528,7 @@ impl LocalPlayer {
             self.accumulated -= command_interval;
             let command_msec = self.next_command_msec();
             let move_priority = self.move_priority;
+            let idrive_enabled = self.idrive_enabled;
             let foot_bolts = self.foot_bolts;
             let state = match self.mode {
                 JoinMode::Player => self.player.as_mut().expect("joined player"),
@@ -547,8 +558,9 @@ impl LocalPlayer {
             } else {
                 buttons &= !BUTTON_WALKING;
             }
+            let native_taunt = state.view();
             let cmd = UserCmd {
-                server_time: state.view().command_time + command_msec,
+                server_time: native_taunt.command_time + command_msec,
                 angles: self.input_angles.map(angle_to_short),
                 buttons,
                 weapon: client_cmd.weapon,
@@ -556,18 +568,21 @@ impl LocalPlayer {
                 inventory_selection: client_cmd.inventory_selection,
                 generic_command,
                 forward_move: idrive_axis(
+                    idrive_enabled,
                     keys.contains(&KeyCode::KeyW),
                     keys.contains(&KeyCode::KeyS),
                     move_priority[0],
                     magnitude,
                 ),
                 right_move: idrive_axis(
+                    idrive_enabled,
                     keys.contains(&KeyCode::KeyD),
                     keys.contains(&KeyCode::KeyA),
                     move_priority[1],
                     magnitude,
                 ),
                 up_move: idrive_axis(
+                    idrive_enabled,
                     keys.contains(&KeyCode::Space),
                     crouch,
                     move_priority[2],
@@ -575,6 +590,7 @@ impl LocalPlayer {
                 ),
                 ..UserCmd::default()
             };
+            crate::emotes::cancel_world_taunt(native_taunt.torso_anim, native_taunt.legs_anim, cmd.buttons, cmd.up_move);
             self.previous_eye = self.current_eye;
             self.previous_origin = self.current_origin;
             self.previous_command_time = self.current_command_time;
@@ -596,6 +612,7 @@ impl LocalPlayer {
                 self.movement
                     .step_command_with_msec(state, cmd, command_msec, &mut self.world)?
             };
+            crate::emotes::cancel_world_taunt(view.torso_anim, view.legs_anim, 0, 0);
             if let Some(collision) = self.world.0.as_mut() {
                 let alive = clipping && view.health > 0;
                 game.after_pmove(cmd.server_time, alive.then_some((&view, cmd.buttons)), collision);
@@ -733,11 +750,15 @@ mod tests {
     }
     #[test]
     fn idrive_axis_uses_the_most_recent_opposite_direction() {
-        assert_eq!(idrive_axis(true, false, -1, 127), 127);
-        assert_eq!(idrive_axis(false, true, 1, 127), -127);
-        assert_eq!(idrive_axis(true, true, 1, 127), 127);
-        assert_eq!(idrive_axis(true, true, -1, 127), -127);
-        assert_eq!(idrive_axis(false, false, 1, 127), 0);
+        assert_eq!(idrive_axis(true, true, false, -1, 127), 127);
+        assert_eq!(idrive_axis(true, false, true, 1, 127), -127);
+        assert_eq!(idrive_axis(true, true, true, 1, 127), 127);
+        assert_eq!(idrive_axis(true, true, true, -1, 127), -127);
+        assert_eq!(idrive_axis(true, false, false, 1, 127), 0);
+        // cl_idrive 0 restores ordinary opposite-key cancellation.
+        assert_eq!(idrive_axis(false, true, true, 1, 127), 0);
+        assert_eq!(idrive_axis(false, true, true, -1, 64), 0);
+        assert_eq!(idrive_axis(false, true, false, -1, 64), 64);
     }
 
     #[test]

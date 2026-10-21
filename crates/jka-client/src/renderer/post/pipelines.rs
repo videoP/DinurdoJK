@@ -351,8 +351,25 @@ pub(in crate::renderer) fn create_post_pipeline(
     shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    create_post_pipeline_for(device, layout, shader, surface_format, None)
+}
+
+/// `features`: the `POST_FEATURES` override of post.wgsl `fs_main` (see
+/// `post_feature_mask`); `None` keeps the shader default, every branch.
+pub(in crate::renderer) fn create_post_pipeline_for(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    features: Option<u32>,
+) -> wgpu::RenderPipeline {
+    let constants = features.map(|mask| [("POST_FEATURES", f64::from(mask))]);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("JKA post-process pipeline"),
+        label: Some(if features.is_some() {
+            "JKA post-process pipeline (specialized)"
+        } else {
+            "JKA post-process pipeline"
+        }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
@@ -366,7 +383,10 @@ pub(in crate::renderer) fn create_post_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: constants.as_ref().map_or(&[][..], |c| &c[..]),
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: None,

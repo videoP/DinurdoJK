@@ -155,8 +155,8 @@ app_cvars! {
     APP_R_BLUESKYWORLDLIGHTING {
         runtime:CvarDef::new("r_blueSkyWorldLighting","","0..1","Sky world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.world_lighting.to_string()),|app,value|App::cvar_set_bluesky_world_lighting(app,APP_R_BLUESKYWORLDLIGHTING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_world_lighting,None),
-        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.world_lighting=parse_bool(value).unwrap_or(settings.blue_water_environment.world_lighting);}),archive:Some((27324,|state|state.video.blue_water_environment.world_lighting.to_string())),..CvarBinding::NONE},
-        implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.world_lighting=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.world_lighting=v.clamp(0.0, 1.0);}}}),archive:Some((27324,|state|state.video.blue_water_environment.world_lighting.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.world_lighting=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0); app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYSTRIKEPREVIEW {
         runtime:CvarDef::new("r_blueSkyStrikePreview","0","0|1","Hold a branched ground strike in front of the camera for inspection",CvarType::String,CvarFlags::NONE,LatchScope::None,
@@ -165,7 +165,7 @@ app_cvars! {
         implementations:[impl App {fn cvar_set_bluesky_strike_preview(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.strike_preview=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYFILMIC {
-        runtime:CvarDef::new("r_blueSkyFilmic","1","0|1","Native atmosphere highlight mapping for sky and lightning",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+        runtime:CvarDef::new("r_blueSkyFilmic","1","0|1","Sky-referenced exposure (eye adaptation, AgX, night readability); active only under the Blue Water sky",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.filmic.to_string()),|app,value|App::cvar_set_bluesky_filmic(app,APP_R_BLUESKYFILMIC.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_filmic,None),
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.filmic=parse_bool(value).unwrap_or(settings.blue_water_environment.filmic);}),archive:Some((27326,|state|state.video.blue_water_environment.filmic.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_filmic(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.filmic=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]

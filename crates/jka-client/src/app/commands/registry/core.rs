@@ -17,14 +17,22 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_djk_emote ["djk_emote"] ("djk_emote [list|refresh|stop|index|EID]", "Play or stop a compiled local emote; never sends a server command.", CommandScope::Always) |self, command| {
+    cmd_djk_emote ["djk_emote"] ("djk_emote [list|refresh|stop|networkID|EID]", "Play a cosmetic emote using a normal game taunt and permanent network ID.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
-            [_, "stop"] => { crate::emotes::stop(); self.console_status = "Emote stopped".into(); }
-            [_, "refresh"] => { crate::emotes::stop(); crate::emotes::refresh_catalog(); self.console_status = "Emote catalog refreshed".into(); }
+            [_, "stop"] => { self.stop_game_emote(); self.console_status = "Emote stopped".into(); }
+            [_, "refresh"] => { self.stop_game_emote(); crate::emotes::refresh_catalog(); self.console_status = "Emote catalog refreshed".into(); }
             [_] | [_, "list"] => {
                 match crate::emotes::catalog(&self.base) {
-                    Ok(emotes) => self.console_status = emotes.iter().enumerate().map(|(i,e)|format!("{} {}",i+1,crate::emotes::display_title(e))).collect::<Vec<_>>().join("\n"),
+                    Ok(emotes) => {
+                        let mut rows = std::collections::BTreeMap::new();
+                        for e in emotes.iter().flat_map(|e| std::iter::once(e).chain(&e.variants)) {
+                            if let Some(id) = crate::emotes::network::wire_id(e) {
+                                rows.entry(id).or_insert_with(|| format!("{id} {} / {}", crate::emotes::display_title(e), e.variant_name));
+                            }
+                        }
+                        self.console_status = rows.into_values().collect::<Vec<_>>().join("\n");
+                    },
                     Err(error) => self.console_status = error,
                 }
             }
@@ -32,18 +40,18 @@ commands! {
                 if self.game_session.is_none() { self.console_status = "Load a game first, or preview in Profile > Emotes".into(); }
                 else {
                     match crate::emotes::catalog(&self.base) {
-                        Ok(emotes) => match emotes.iter().enumerate().find_map(|(i,e)| {
-                            if e.id.eq_ignore_ascii_case(id) || e.catalog_aliases.iter().any(|alias|alias.eq_ignore_ascii_case(id)) || id.parse::<usize>().ok()==Some(i+1) {Some(e.clone())}
+                        Ok(emotes) => match id.parse::<u16>().ok().and_then(|number| crate::emotes::network::resolve(&emotes, number)).or_else(|| emotes.iter().find_map(|e| {
+                            if e.id.eq_ignore_ascii_case(id) || e.catalog_aliases.iter().any(|alias|alias.eq_ignore_ascii_case(id)) {Some(e.clone())}
                             else {e.variants.iter().find(|v|v.id.eq_ignore_ascii_case(id)).cloned()}
-                        }) {
-                            Some(emote) => { crate::emotes::play_world(emote); self.console_status = format!("Playing local emote {id}"); }
+                        })) {
+                            Some(emote) => { self.play_game_emote(emote); self.console_status = format!("Playing emote {id}"); }
                             None => self.console_status = format!("Unknown emote {id}; use djk_emote list"),
                         },
                         Err(error) => self.console_status = error,
                     }
                 }
             }
-            _ => self.console_status = "usage: djk_emote [list|refresh|stop|index|EID]".into(),
+            _ => self.console_status = "usage: djk_emote [list|refresh|stop|networkID|EID]".into(),
         }
         CommandResult::Status
     }

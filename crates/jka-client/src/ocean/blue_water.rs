@@ -9,6 +9,8 @@ const CONVERT: &str = r#"
 @group(0) @binding(2) var extras_in: texture_2d_array<f32>;
 @group(0) @binding(3) var displacement_out: texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(4) var normal_out: texture_storage_2d_array<rgba16float, write>;
+@group(0) @binding(5) var<storage, read> crest_bounds: vec4<f32>;
+@group(0) @binding(6) var<uniform> crest: vec4<f32>; // mode, FFT mix, analytic compression, unused
 @compute @workgroup_size(8, 8, 1)
 fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
     let p = vec2<i32>(id.xy);
@@ -16,10 +18,21 @@ fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
     let d = textureLoad(displacement_in, p, layer, 0);
     let slope = textureLoad(derivatives_in, p, layer, 0);
     let extra = textureLoad(extras_in, p, layer, 0);
+    var horizontal = 1.0;
+    if crest.x > 0.5 {
+        var bound = dot(crest_bounds.xyz, vec3<f32>(1.732051, 1.732051, 1.0));
+        if crest.x > 1.5 && crest_bounds.w > 0.0 { bound = crest_bounds.w; }
+        let fft = bound * crest.y;
+        horizontal = min(1.0, select(0.9, 1.15, crest.x > 1.5) / max(fft + crest.z, 1e-5));
+    }
     // JKA's existing water vertex shader flips the sampled Z displacement;
     // its fragment shader flips the sampled Z slope. Preserve Blue Water's
     // +Z values after those existing operations.
-    textureStore(displacement_out, p, layer, vec4<f32>(d.x, d.y, -d.z, d.w));
+    // Legacy displacement.w is unused (Godot writes zero; ordinary native
+    // streak density is nonnegative). A negative value carries the constant
+    // scale so analytic swell added by legacy consumers gets limited too.
+    let tag = select(d.w, -horizontal, crest.x > 0.5);
+    textureStore(displacement_out, p, layer, vec4<f32>(d.x * horizontal, d.y, -d.z * horizontal, tag));
     textureStore(normal_out, p, layer, vec4<f32>(slope.x, -slope.y, 0.0, extra.y));
 }
 "#;
@@ -40,6 +53,8 @@ pub struct BlueWaterOcean {
     pub normal_view: wgpu::TextureView,
     pipeline: wgpu::ComputePipeline,
     groups: [wgpu::BindGroup; 2],
+    crest_params: wgpu::Buffer,
+    breaker_mode: u8,
     time: f64,
     next_update: f64,
     last_step: f64,
@@ -67,8 +82,9 @@ impl BlueWaterOcean {
         self.shore_maps=maps;
     }
     pub fn new(device: &wgpu::Device) -> Self {
-        let field = blue_water_gpu::WaveField::new(device, QualityTier::High);
+        let mut field = blue_water_gpu::WaveField::new(device, QualityTier::High);
         let surface_waves = blue_water_gpu::surface_waves::SurfaceWaves::new(device, &field);
+        field.prepare_composite_crest_limits(device, &surface_waves);
         let n = field.resolution();
         let create = |label| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -120,7 +136,22 @@ impl BlueWaterOcean {
         };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Blue Water JKA adapter layout"),
-            entries: &[input(0), input(1), input(2), output(3), output(4)],
+            entries: &[input(0), input(1), input(2), output(3), output(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None }, count: None,
+                }],
+        });
+        let crest_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hybrid adapter crest control"), size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blue Water JKA surface adapter"),
@@ -165,6 +196,8 @@ impl BlueWaterOcean {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(&normal_view),
                     },
+                    wgpu::BindGroupEntry { binding: 5, resource: field.crest_limits_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: crest_params.as_entire_binding() },
                 ],
             })
         });
@@ -183,6 +216,8 @@ impl BlueWaterOcean {
             normal_view,
             pipeline,
             groups,
+            crest_params,
+            breaker_mode: 0,
             time: 0.0,
             next_update: 0.0,
             last_step: 0.0,
@@ -205,8 +240,17 @@ impl BlueWaterOcean {
         updates_per_second: f32,
         waves: super::BlueWaterWaves,
         swell: [[f32;4];2],
+        breaker_mode: u8,
     ) {
         self.updated_this_frame = false;
+        if self.breaker_mode != breaker_mode {
+            self.breaker_mode = breaker_mode;
+            self.field.request_update();
+            self.next_update = self.time;
+        }
+        self.field.set_crest_limits(breaker_mode > 0);
+        let control = [f32::from(breaker_mode), swell[1][2], (swell[0][3] * swell[0][2] * swell[1][1]).abs(), 0.0];
+        queue.write_buffer(&self.crest_params, 0, bytemuck::bytes_of(&control));
         let delta = f64::from(delta.max(0.0));
         self.time += delta;
         let period = if updates_per_second > 0.0 {
@@ -269,7 +313,7 @@ mod tests {
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let mut ocean = BlueWaterOcean::new(&device);
             let mut encoder = device.create_command_encoder(&Default::default());
-            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]]);
+            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]], 0);
             let n = ocean.field.resolution();
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Blue Water adapter readback"),

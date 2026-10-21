@@ -3104,6 +3104,28 @@ fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> v
     return color;
 }
 
+// Pipeline-overridable feature mask for fs_main (`PostFeatures` in
+// renderer/post/pipelines.rs). Each bit gates a branch that is already an exact
+// identity when its uniform is off, so a pipeline built for the current uniform
+// draws the same image while unused branches compile out (fewer registers,
+// higher occupancy). The default enables everything: the general pipeline.
+override POST_FEATURES: u32 = 0xffffffffu;
+const POST_FEATURE_FXAA: u32 = 1u;
+const POST_FEATURE_MOTION_BLUR: u32 = 2u;
+const POST_FEATURE_DOF: u32 = 4u;
+const POST_FEATURE_DEPTH_EFFECTS: u32 = 8u;
+const POST_FEATURE_CLOUDS: u32 = 16u;
+const POST_FEATURE_WEATHER_AIR: u32 = 32u;
+const POST_FEATURE_BLOOM: u32 = 64u;
+const POST_FEATURE_HALATION: u32 = 128u;
+const POST_FEATURE_NIGHT: u32 = 256u;
+const POST_FEATURE_LEGACY1_FOG: u32 = 512u;
+const POST_FEATURE_REFLECTION_DEBUG: u32 = 1024u;
+
+fn post_feature(bit: u32) -> bool {
+    return (POST_FEATURES & bit) != 0u;
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
@@ -3126,47 +3148,59 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 
     var color = scene(input.uv);
 
-    if (settings.taa_params.y > 0.5) {
+    if (post_feature(POST_FEATURE_REFLECTION_DEBUG) && settings.taa_params.y > 0.5) {
         color = reflection_debug_color(pixel, centre_depth, color);
         return vec4<f32>(color, 1.0);
     }
 
-    if (fxaa_enabled) {
+    if (post_feature(POST_FEATURE_FXAA) && fxaa_enabled) {
         color = fxaa_color(input.uv, texel);
     }
 
-    color = camera_motion_blur(input.uv, color, centre_depth);
-    color = depth_of_field(input.uv, color, centre_depth);
+    if (post_feature(POST_FEATURE_MOTION_BLUR)) {
+        color = camera_motion_blur(input.uv, color, centre_depth);
+    }
+    if (post_feature(POST_FEATURE_DOF)) {
+        color = depth_of_field(input.uv, color, centre_depth);
+    }
 
-    if (valid_depth(centre_depth)) {
-        let world = world_position(input.uv, centre_depth);
-        let normal = surface_normal(pixel);
-        let puddle = post_puddle_amount(world, normal.y);
-        color = finalize_puddle_film(color, world, puddle);
-        color = temporal_ssr_color(pixel, centre_depth, color, puddle);
-        let contact_factor = contact_shadow_factor(pixel, world, centre_depth);
-        if (settings.scene.x > 1.5) {
-            return vec4<f32>(contact_shadow_debug_color(contact_factor), 1.0);
+    // Without the bit, puddles, SSR, contact shadows, SSAO, volumetric/void
+    // fog and haze are all off, and both branches would return `color`.
+    if (post_feature(POST_FEATURE_DEPTH_EFFECTS)) {
+        if (valid_depth(centre_depth)) {
+            let world = world_position(input.uv, centre_depth);
+            let normal = surface_normal(pixel);
+            let puddle = post_puddle_amount(world, normal.y);
+            color = finalize_puddle_film(color, world, puddle);
+            color = temporal_ssr_color(pixel, centre_depth, color, puddle);
+            let contact_factor = contact_shadow_factor(pixel, world, centre_depth);
+            if (settings.scene.x > 1.5) {
+                return vec4<f32>(contact_shadow_debug_color(contact_factor), 1.0);
+            }
+            color *= contact_factor;
+            if (ssao_enabled) {
+                color *= ssao_factor(pixel, centre_depth);
+            }
+            color = apply_volumetric_fog(color, input.uv, centre_depth);
+            if (settings.legacy_weather.w > 0.5) {
+                color = apply_precipitation_haze(color, input.uv, world, centre_depth);
+            }
+        } else {
+            color = apply_ocean_void_fog(color, input.uv);
         }
-        color *= contact_factor;
-        if (ssao_enabled) {
-            color *= ssao_factor(pixel, centre_depth);
-        }
-        color = apply_volumetric_fog(color, input.uv, centre_depth);
-        if (settings.legacy_weather.w > 0.5) {
-            color = apply_precipitation_haze(color, input.uv, world, centre_depth);
-        }
-    } else {
-        color = apply_ocean_void_fog(color, input.uv);
     }
 
     // The transfer buffer is depth-clipped, so the same composite now handles
     // sky pixels, clouds behind scene geometry, and low clouds physically in
     // front of opaque/alpha-tested surfaces.
-    color = render_clouds(color, input.uv);
-    color = apply_legacy_weather_air(color, input.uv, centre_depth);
+    if (post_feature(POST_FEATURE_CLOUDS)) {
+        color = render_clouds(color, input.uv);
+    }
+    if (post_feature(POST_FEATURE_WEATHER_AIR)) {
+        color = apply_legacy_weather_air(color, input.uv, centre_depth);
+    }
 
-    if (bloom_enabled) {
+    if (post_feature(POST_FEATURE_BLOOM) && bloom_enabled) {
         let levels = bloom_levels(input.uv);
         // Rain scatters light: lamps and signs bloom wider in wet air.
         color += bloom_color(levels) * (0.32 * (1.0 + 0.6 * settings.weather_look.y));
@@ -3174,16 +3208,20 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             let red_return = halation_red_levels(levels);
             color = apply_film_halation(color, red_return);
         }
-    } else if (halation_enabled) {
+    } else if (post_feature(POST_FEATURE_HALATION) && halation_enabled) {
         let red_return = halation_red(input.uv);
         color = apply_film_halation(color, red_return);
     }
 
-    color = native_night_scene(color, input.uv);
+    if (post_feature(POST_FEATURE_NIGHT)) {
+        color = native_night_scene(color, input.uv);
+    }
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     color = display_mapping(color);
 
-    color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
+    if (post_feature(POST_FEATURE_LEGACY1_FOG)) {
+        color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
+    }
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = purple_fringe_color(input.uv, color);
     color = apply_rain_grade(color, settings.weather_look.y);

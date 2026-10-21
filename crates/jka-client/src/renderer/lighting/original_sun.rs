@@ -80,20 +80,38 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     surface_count: usize,
     sun: crate::scene::DirectionalSun,
     encoding: crate::scene::BakedSunEncoding,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Option<BakedSunCalibration> {
-    use crate::renderer::{collect_static_ao_lightmap_triangles,
-        StaticAoBvh, StaticAoRenderTriangle};
+    use crate::renderer::{
+        collect_static_ao_lightmap_triangles, StaticAoBvh, StaticAoRenderTriangle,
+    };
     use rayon::prelude::*;
     let started = std::time::Instant::now();
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let (casters, filters) = authored_sun_casters(vertices, batches);
     let filter_count = filters.iter().filter(|filter| filter.is_some()).count();
     let solid = StaticAoBvh::build(casters.into()).ok()?;
-    println!("[BAKED SUN] {} compiler-filtered caster triangles", filter_count);
+    println!(
+        "[BAKED SUN] {} compiler-filtered caster triangles",
+        filter_count
+    );
     let mut sky_triangles = Vec::new();
-    for batch in batches.iter().filter(|b| b.pipeline.class == DrawClass::Sky
-        && !matches!(b.tc_gen, TcGen::SkyCloud(_))) {
-        for triangle in vertices[batch.vertices.start as usize..batch.vertices.end as usize].chunks_exact(3) {
-            sky_triangles.push(StaticAoRenderTriangle { positions: [triangle[0].position, triangle[1].position, triangle[2].position] });
+    for batch in batches
+        .iter()
+        .filter(|b| b.pipeline.class == DrawClass::Sky && !matches!(b.tc_gen, TcGen::SkyCloud(_)))
+    {
+        for triangle in
+            vertices[batch.vertices.start as usize..batch.vertices.end as usize].chunks_exact(3)
+        {
+            sky_triangles.push(StaticAoRenderTriangle {
+                positions: [
+                    triangle[0].position,
+                    triangle[1].position,
+                    triangle[2].position,
+                ],
+            });
         }
     }
     let sky = StaticAoBvh::build(sky_triangles.into()).ok()?;
@@ -109,83 +127,173 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     let azimuth = (-toward.z).atan2(toward.x);
     let elevation = toward.y.asin();
     let count = encoding.samples.max(1);
-    let directions: Vec<_> = (0..count).map(|i| {
-        if i == 0 || encoding.deviance <= 0.0 { return toward; }
-        // Deterministic disk quadrature in the same azimuth/elevation domain as
-        // q3map_sunExt. The compiler's random seed is not stored in the BSP.
-        let radius = ((i as f32 - 0.5) / (count - 1).max(1) as f32).sqrt() * encoding.deviance.to_radians();
-        let phase = i as f32 * 2.3999632;
-        let a = azimuth + radius * phase.cos();
-        let e = elevation + radius * phase.sin();
-        Vec3::new(a.cos() * e.cos(), e.sin(), -a.sin() * e.cos())
-    }).collect();
-    let traced: usize = lightmaps.par_iter_mut().zip(samples.par_iter()).zip(owners.par_iter()).map(|((image, texels), owners)| {
-        if image.rgba16f.is_some() { return 0; }
-        for pixel in image.rgba.chunks_exact_mut(4) { pixel[3] = 0; }
-        let mut traced = 0;
-        for (index, sample) in texels.iter().enumerate() {
-            let Some(sample) = sample else { continue; };
-            let normal = Vec3::from_array(sample.normal);
-            let position = Vec3::from_array(sample.position);
-            let mut flux = 0.0;
-            for &direction in &directions {
-                let facing = normal.dot(direction).max(0.0);
-                if facing <= 0.0 { continue; }
-                let origin = position + normal * 1.0;
-                let Some(sky_distance) = sky.trace(origin, direction, 131072.0) else { continue; };
-                let mut transmission = Vec3::ONE;
-                let blocked = solid.trace_filtered(origin, direction, (sky_distance - 0.1).max(0.0), |index, bary| {
-                    let Some(filter) = &filters[index] else { return true; };
-                    let Some(image) = textures.get(filter.texture) else { return true; };
-                    let uv = [0, 1].map(|axis| (0..3).map(|i| filter.uv[i][axis] * bary[i]).sum());
-                    transmission *= compiler_sun_transmission(image, uv, filter.alpha, filter.color);
-                    transmission.max_element() <= 0.001
-                }).is_some();
-                if !blocked {
-                    // The lightmap mask stores scalar flux. Preserve the energy
-                    // of colored transmission relative to this authored sun.
-                    flux += facing * (photons * transmission).dot(Vec3::new(0.2126, 0.7152, 0.0722)) / sun_y.max(0.00001);
+    let directions: Vec<_> = (0..count)
+        .map(|i| {
+            if i == 0 || encoding.deviance <= 0.0 {
+                return toward;
+            }
+            // Deterministic disk quadrature in the same azimuth/elevation domain as
+            // q3map_sunExt. The compiler's random seed is not stored in the BSP.
+            let radius = ((i as f32 - 0.5) / (count - 1).max(1) as f32).sqrt()
+                * encoding.deviance.to_radians();
+            let phase = i as f32 * 2.3999632;
+            let a = azimuth + radius * phase.cos();
+            let e = elevation + radius * phase.sin();
+            Vec3::new(a.cos() * e.cos(), e.sin(), -a.sin() * e.cos())
+        })
+        .collect();
+    let traced: usize = lightmaps
+        .par_iter_mut()
+        .zip(samples.par_iter())
+        .zip(owners.par_iter())
+        .map(|((image, texels), owners)| {
+            if image.rgba16f.is_some() {
+                return 0;
+            }
+            // A map commonly has ONE packed atlas. Parallelizing pages alone left
+            // all its sunlight rays on a single core. Independent texel blocks keep
+            // the exact sample sequence/math while sharing immutable BVHs.
+            let traced: usize = image
+                .rgba
+                .par_chunks_mut(256 * 4)
+                .zip(texels.par_chunks(256))
+                .map(|(pixels, texels)| {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return 0;
+                    }
+                    let mut traced = 0;
+                    for (pixel, sample) in pixels.chunks_exact_mut(4).zip(texels) {
+                        pixel[3] = 0;
+                        let Some(sample) = sample else {
+                            continue;
+                        };
+                        let normal = Vec3::from_array(sample.normal);
+                        let position = Vec3::from_array(sample.position);
+                        let mut flux = 0.0;
+                        for &direction in &directions {
+                            let facing = normal.dot(direction).max(0.0);
+                            if facing <= 0.0 {
+                                continue;
+                            }
+                            let origin = position + normal * 1.0;
+                            let Some(sky_distance) = sky.trace(origin, direction, 131072.0) else {
+                                continue;
+                            };
+                            let mut transmission = Vec3::ONE;
+                            let blocked = solid
+                                .trace_filtered(
+                                    origin,
+                                    direction,
+                                    (sky_distance - 0.1).max(0.0),
+                                    |index, bary| {
+                                        let Some(filter) = &filters[index] else {
+                                            return true;
+                                        };
+                                        let Some(image) = textures.get(filter.texture) else {
+                                            return true;
+                                        };
+                                        let uv = [0, 1].map(|axis| {
+                                            (0..3).map(|i| filter.uv[i][axis] * bary[i]).sum()
+                                        });
+                                        transmission *= compiler_sun_transmission(
+                                            image,
+                                            uv,
+                                            filter.alpha,
+                                            filter.color,
+                                        );
+                                        transmission.max_element() <= 0.001
+                                    },
+                                )
+                                .is_some();
+                            if !blocked {
+                                // The lightmap mask stores scalar flux. Preserve the energy
+                                // of colored transmission relative to this authored sun.
+                                flux += facing
+                                    * (photons * transmission)
+                                        .dot(Vec3::new(0.2126, 0.7152, 0.0722))
+                                    / sun_y.max(0.00001);
+                            }
+                        }
+                        pixel[3] = (flux / count as f32 * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                        traced += 1;
+                    }
+                    traced
+                })
+                .sum();
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return 0;
+            }
+            refined.fetch_add(
+                refine_authored_sun_edges(
+                    image, texels, owners, toward, sun_y, encoding, cancelled,
+                ),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // Match bilinear sampling at chart edges without bleeding another chart.
+            let alpha: Vec<_> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
+            for (index, sample) in texels.iter().enumerate() {
+                if sample.is_some() {
+                    continue;
+                }
+                let x = index % image.width as usize;
+                let y = index / image.width as usize;
+                let mut sum = 0u32;
+                let mut count = 0u32;
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= image.width as i32 || ny >= image.height as i32 {
+                        continue;
+                    }
+                    let neighbor = ny as usize * image.width as usize + nx as usize;
+                    if texels[neighbor].is_some() {
+                        sum += alpha[neighbor] as u32;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    image.rgba[index * 4 + 3] = (sum / count) as u8;
                 }
             }
-            image.rgba[index * 4 + 3] = (flux / count as f32 * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            traced += 1;
-        }
-        refined.fetch_add(refine_authored_sun_edges(image, texels, owners, toward, sun_y, encoding), std::sync::atomic::Ordering::Relaxed);
-        // Match bilinear sampling at chart edges without bleeding another chart.
-        let alpha: Vec<_> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
-        for (index, sample) in texels.iter().enumerate() {
-            if sample.is_some() { continue; }
-            let x = index % image.width as usize;
-            let y = index / image.width as usize;
-            let mut sum = 0u32;
-            let mut count = 0u32;
-            for (dx, dy) in [(-1,0),(1,0),(0,-1),(0,1)] {
-                let nx = x as i32 + dx; let ny = y as i32 + dy;
-                if nx < 0 || ny < 0 || nx >= image.width as i32 || ny >= image.height as i32 { continue; }
-                let neighbor = ny as usize * image.width as usize + nx as usize;
-                if texels[neighbor].is_some() { sum += alpha[neighbor] as u32; count += 1; }
-            }
-            if count > 0 { image.rgba[index * 4 + 3] = (sum / count) as u8; }
-        }
-        traced
-    }).sum();
-    if traced == 0 { return None; }
+            traced
+        })
+        .sum();
+    if traced == 0 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let mut surfaces = vec![[0.0; 4]; surface_count];
     for batch in batches {
-        let Some(image) = batch.lightmap.and_then(|page| lightmaps.get(page)).filter(|lm| lm.rgba16f.is_none()) else { continue; };
+        let Some(image) = batch
+            .lightmap
+            .and_then(|page| lightmaps.get(page))
+            .filter(|lm| lm.rgba16f.is_none())
+        else {
+            continue;
+        };
         for start in (batch.vertices.start as usize..batch.vertices.end as usize).step_by(3) {
-            if let Some(fit) = surface_ids.get(start / 3).and_then(|&id| surfaces.get_mut(id as usize)) {
-                *fit = [encoding.exposure, encoding.gamma, 4.0,
-                    encoding.compensate * if image.srgb { 1.0 } else { -1.0 }];
+            if let Some(fit) = surface_ids
+                .get(start / 3)
+                .and_then(|&id| surfaces.get_mut(id as usize))
+            {
+                *fit = [
+                    encoding.exposure,
+                    encoding.gamma,
+                    4.0,
+                    encoding.compensate * if image.srgb { 1.0 } else { -1.0 },
+                ];
             }
         }
     }
     // Q3Map2 ColorNormalize divides by the brightest channel, not vector length.
     let color = Vec3::from_array(sun.color);
-    let radiance = color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness / 255.0;
+    let radiance =
+        color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness / 255.0;
     println!("[BAKED SUN] authored UV projection: {} luxels, {} sun samples, intensity {}, exposure {}, gamma {}, {} edge luxels refined, {:.1} ms",
         traced, count, sun.intensity, encoding.exposure, encoding.gamma, refined.load(std::sync::atomic::Ordering::Relaxed), started.elapsed().as_secs_f64() * 1000.0);
-    Some(BakedSunCalibration { radiance: radiance.to_array(), surfaces })
+    Some(BakedSunCalibration {
+        radiance: radiance.to_array(),
+        surfaces,
+    })
 }
 
 /// Inverse of Q3Map2's exposed or default linear output transform. Input is
@@ -214,17 +322,40 @@ fn refine_authored_sun_edges(
     toward: Vec3,
     sun_y: f32,
     encoding: crate::scene::BakedSunEncoding,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> usize {
-    if sun_y <= 0.0 { return 0; }
-    let width = image.width as i32; let height = image.height as i32;
-    let alpha: Vec<_> = image.rgba.chunks_exact(4).map(|p| p[3] as f32 / 255.0).collect();
-    let raw: Vec<_> = image.rgba.chunks_exact(4).map(|p| compiled_lightmap_photons(p, encoding).dot(Vec3::new(0.2126, 0.7152, 0.0722))).collect();
+    use rayon::prelude::*;
+    if sun_y <= 0.0 {
+        return 0;
+    }
+    let width = image.width as i32;
+    let height = image.height as i32;
+    let alpha: Vec<_> = image
+        .rgba
+        .chunks_exact(4)
+        .map(|p| p[3] as f32 / 255.0)
+        .collect();
+    let raw: Vec<_> = image
+        .rgba
+        .chunks_exact(4)
+        .map(|p| compiled_lightmap_photons(p, encoding).dot(Vec3::new(0.2126, 0.7152, 0.0722)))
+        .collect();
     let mut kinds = vec![-1i8; texels.len()];
     for (index, sample) in texels.iter().enumerate() {
-        let Some(sample) = sample else { continue; };
+        let Some(sample) = sample else {
+            continue;
+        };
         let facing = Vec3::from_array(sample.normal).dot(toward).max(0.0);
-        if facing < 0.1 { continue; }
-        kinds[index] = if alpha[index] < 0.005 { 0 } else if (alpha[index] - facing).abs() < 0.012 { 1 } else { 2 };
+        if facing < 0.1 {
+            continue;
+        }
+        kinds[index] = if alpha[index] < 0.005 {
+            0
+        } else if (alpha[index] - facing).abs() < 0.012 {
+            1
+        } else {
+            2
+        };
     }
     let neighbor = |x: i32, y: i32| -> Option<usize> {
         (x >= 0 && y >= 0 && x < width && y < height).then(|| (y * width + x) as usize)
@@ -232,49 +363,106 @@ fn refine_authored_sun_edges(
     let mut stable = vec![false; texels.len()];
     let mut edge = vec![false; texels.len()];
     for (index, &kind) in kinds.iter().enumerate() {
-        if kind < 0 { continue; }
-        let x = index as i32 % width; let y = index as i32 / width;
+        if kind < 0 {
+            continue;
+        }
+        let x = index as i32 % width;
+        let y = index as i32 / width;
         let mut matching = 0;
         let mut differs = kind == 2;
-        for (dx, dy) in [(-1,0),(1,0),(0,-1),(0,1)] {
-            if let Some(n) = neighbor(x + dx, y + dy).filter(|&n| owners[n] == owners[index] && kinds[n] >= 0) {
-                if kinds[n] == kind { matching += 1; } else { differs = true; }
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            if let Some(n) =
+                neighbor(x + dx, y + dy).filter(|&n| owners[n] == owners[index] && kinds[n] >= 0)
+            {
+                if kinds[n] == kind {
+                    matching += 1;
+                } else {
+                    differs = true;
+                }
             }
         }
         stable[index] = kind != 2 && matching >= 3 && !differs;
         edge[index] = differs;
     }
-    let mut refined = 0;
-    for (index, sample) in texels.iter().enumerate() {
-        let Some(sample) = sample else { continue; };
-        if kinds[index] < 0 { continue; }
-        let x = index as i32 % width; let y = index as i32 / width;
-        if !(-2..=2).any(|dy| (-2..=2).any(|dx| neighbor(x + dx, y + dy).is_some_and(|n| owners[n] == owners[index] && edge[n]))) { continue; }
-        let normal = Vec3::from_array(sample.normal);
-        let position = Vec3::from_array(sample.position);
-        let mut baseline = 0.0; let mut weights = 0.0;
-        let mut lit_count = 0; let mut shade_count = 0;
-        for dy in -6..=6 {
-            for dx in -6..=6 {
-                let Some(n) = neighbor(x + dx, y + dy).filter(|&n| stable[n] && owners[n] == owners[index]) else { continue; };
-                let other = texels[n].as_ref().unwrap();
-                if normal.dot(Vec3::from_array(other.normal)) < 0.99
-                    || normal.dot(Vec3::from_array(other.position) - position).abs() > 0.5 { continue; }
-                let residual = raw[n] - sun_y * alpha[n];
-                if residual < 0.0 { continue; }
-                let weight = 1.0 / (1 + dx * dx + dy * dy) as f32;
-                baseline += residual * weight; weights += weight;
-                if kinds[n] == 0 { shade_count += 1; } else { lit_count += 1; }
+    image
+        .rgba
+        .par_chunks_mut(256 * 4)
+        .enumerate()
+        .map(|(block, pixels)| {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return 0;
             }
-        }
-        if lit_count < 2 || shade_count < 2 { continue; }
-        baseline /= weights;
-        let flux = ((raw[index] - baseline) / sun_y).clamp(0.0, normal.dot(toward).max(0.0));
-        let value = (flux * 255.0).round() as u8;
-        if image.rgba[index * 4 + 3] != value { refined += 1; }
-        image.rgba[index * 4 + 3] = value;
-    }
-    refined
+            let mut refined = 0;
+            for (local, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                let index = block * 256 + local;
+                let sample = &texels[index];
+                let Some(sample) = sample else {
+                    continue;
+                };
+                if kinds[index] < 0 {
+                    continue;
+                }
+                let x = index as i32 % width;
+                let y = index as i32 / width;
+                if !(-2..=2).any(|dy| {
+                    (-2..=2).any(|dx| {
+                        neighbor(x + dx, y + dy)
+                            .is_some_and(|n| owners[n] == owners[index] && edge[n])
+                    })
+                }) {
+                    continue;
+                }
+                let normal = Vec3::from_array(sample.normal);
+                let position = Vec3::from_array(sample.position);
+                let mut baseline = 0.0;
+                let mut weights = 0.0;
+                let mut lit_count = 0;
+                let mut shade_count = 0;
+                for dy in -6..=6 {
+                    for dx in -6..=6 {
+                        let Some(n) = neighbor(x + dx, y + dy)
+                            .filter(|&n| stable[n] && owners[n] == owners[index])
+                        else {
+                            continue;
+                        };
+                        let other = texels[n].as_ref().unwrap();
+                        if normal.dot(Vec3::from_array(other.normal)) < 0.99
+                            || normal
+                                .dot(Vec3::from_array(other.position) - position)
+                                .abs()
+                                > 0.5
+                        {
+                            continue;
+                        }
+                        let residual = raw[n] - sun_y * alpha[n];
+                        if residual < 0.0 {
+                            continue;
+                        }
+                        let weight = 1.0 / (1 + dx * dx + dy * dy) as f32;
+                        baseline += residual * weight;
+                        weights += weight;
+                        if kinds[n] == 0 {
+                            shade_count += 1;
+                        } else {
+                            lit_count += 1;
+                        }
+                    }
+                }
+                if lit_count < 2 || shade_count < 2 {
+                    continue;
+                }
+                baseline /= weights;
+                let flux =
+                    ((raw[index] - baseline) / sun_y).clamp(0.0, normal.dot(toward).max(0.0));
+                let value = (flux * 255.0).round() as u8;
+                if pixel[3] != value {
+                    refined += 1;
+                }
+                pixel[3] = value;
+            }
+            refined
+        })
+        .sum()
 }
 
 /// Estimate the compiled direct term, rather than treating compiler sun units
@@ -289,6 +477,7 @@ pub(in crate::renderer) fn estimate_baked_sun_radiance(
     surface_ids: &[u32],
     surfaces: &[crate::scene::LegacyDlightSurface],
     sun: crate::scene::DirectionalSun,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Option<BakedSunCalibration> {
     use crate::renderer::{collect_static_ao_render_triangles, StaticAoBvh};
     let toward = -Vec3::from_array(sun.direction).normalize_or_zero();
@@ -320,6 +509,7 @@ pub(in crate::renderer) fn estimate_baked_sun_radiance(
     let mut estimates = Vec::new();
     let mut surface_fits = vec![[0.0; 4]; surfaces.len()];
     for (surface, triangles) in faces.iter().enumerate() {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
         let area: f32 = triangles.iter().map(|t| t.2).sum();
         if area < 1024.0 { continue; }
         let normal = Vec3::from_array(surfaces[surface].plane[..3].try_into().unwrap());
@@ -470,13 +660,13 @@ mod calibration_tests {
         let original = rgba.clone();
         let make_image = || crate::materials::TextureData { label: "inverse sun edge fixture".into(), source: None, width: 16, height: 16, rgba: original.clone(), rgba16f: None, mip_level_count: 1, clamp: true, srgb: true };
         let mut image = make_image();
-        assert!(refine_authored_sun_edges(&mut image, &texels, &vec![1; 256], Vec3::Y, 500.0, encoding) > 0);
+        assert!(refine_authored_sun_edges(&mut image, &texels, &vec![1; 256], Vec3::Y, 500.0, encoding, &std::sync::atomic::AtomicBool::new(false)) > 0);
         assert_eq!(image.rgba[(8 * 16 + 7) * 4 + 3], 0, "displaced edge must not subtract direct sun from baked shadow");
         assert_eq!(image.rgba[(8 * 16 + 15) * 4 + 3], 255, "lit interior remains ray traced");
         for (before, after) in original.chunks_exact(4).zip(image.rgba.chunks_exact(4)) { assert_eq!(&before[..3], &after[..3], "original lightmap RGB must be unchanged"); }
         let mut image = make_image();
         let owners: Vec<_> = (0..256).map(|index| if index % 16 < 8 { 1 } else { 2 }).collect();
-        refine_authored_sun_edges(&mut image, &texels, &owners, Vec3::Y, 500.0, encoding);
+        refine_authored_sun_edges(&mut image, &texels, &owners, Vec3::Y, 500.0, encoding, &std::sync::atomic::AtomicBool::new(false));
         assert_eq!(image.rgba[(8 * 16 + 7) * 4 + 3], 255, "another packed chart cannot supply edge-fit anchors");
     }
 

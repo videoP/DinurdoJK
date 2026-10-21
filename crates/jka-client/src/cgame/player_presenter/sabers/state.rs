@@ -114,6 +114,7 @@ pub(in crate::cgame::player_presenter) struct EntityPlayerState {
     pub(in crate::cgame::player_presenter) requested_skin_name: String,
     pub(in crate::cgame::player_presenter) model: Arc<PlayerModelAsset>,
     pub(in crate::cgame::player_presenter) animation: PlayerAnimationState,
+    pub(in crate::cgame::player_presenter) emote_taunt: super::super::emote_taunt::EmoteTauntMask,
     // OpenJK cent->pe + clientInfo angle state consumed by BG_G2PlayerAngles.
     pub(in crate::cgame::player_presenter) player_angles: PlayerAngleState,
     pub(in crate::cgame::player_presenter) last_angle_time: i32,

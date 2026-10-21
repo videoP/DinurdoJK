@@ -71,6 +71,49 @@ pub(crate) fn sampler(
     }
 }
 
+/// `r_oceanPixelDetail` 5's tile classifier: one 8x8 workgroup per 16x16-pixel tile over the reduced shading.
+fn adaptive_classifier(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
+        binding, visibility: compute,
+        ty: wgpu::BindingType::Texture {
+            sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+        }, count: None,
+    };
+    let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding, visibility: compute,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Blue Water adaptive tiles"),
+        entries: &[
+            texture(0, wgpu::TextureSampleType::Float { filterable: true }),
+            texture(1, wgpu::TextureSampleType::Depth),
+            buffer(2, wgpu::BufferBindingType::Storage { read_only: false }),
+            buffer(3, wgpu::BufferBindingType::Uniform),
+        ],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Blue Water adaptive tiles"),
+        source: wgpu::ShaderSource::Wgsl(shader_composer::ADAPTIVE_TILES_WGSL.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Blue Water adaptive tiles"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Blue Water adaptive tiles"),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("classify"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    (pipeline, layout)
+}
+
 pub struct OriginalSurfacePipeline {
     pub camera_layout: wgpu::BindGroupLayout,
     pub surface_layout: wgpu::BindGroupLayout,
@@ -80,6 +123,12 @@ pub struct OriginalSurfacePipeline {
     pub near_pipeline: Option<wgpu::RenderPipeline>,
     pub reconstruct_pipeline: Option<wgpu::RenderPipeline>,
     pub reconstruct_layout: Option<wgpu::BindGroupLayout>,
+    /// `r_oceanPixelDetail` 5: the tile classifier (`shader_composer::ADAPTIVE_TILES_WGSL`) and its bind group layout
+    /// (reduced color, reduced depth, tile buffer, parameters).
+    pub adaptive_classify: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// `r_oceanFarShader`: the expensive material's twin for water past the sky walls (`with_far_variant`), drawn over
+    /// the pruned mesh's far range: of `pipeline` in full-resolution mode, of `reduced_pipeline` otherwise.
+    pub far_pipeline: Option<wgpu::RenderPipeline>,
     pub wireframe: Option<wgpu::RenderPipeline>,
     pub waterline_marker: Option<wgpu::RenderPipeline>,
     // Keep the existing compiled vertex entry to compile the debug overlay
@@ -87,6 +136,11 @@ pub struct OriginalSurfacePipeline {
     vertex_shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
 }
+
+/// Cell classes for `OriginalClipmap::pruned_indices_classified`.
+pub const CELL_REJECTED: u8 = 0;
+pub const CELL_NEAR: u8 = 1;
+pub const CELL_FAR: u8 = 2;
 
 /// Preserved High-tier clipmap vertex and index data. JKA finite pools omit
 /// the upstream horizon/skirt: its exterior belongs to JKA's sky extension
@@ -101,15 +155,187 @@ pub struct OriginalClipmap {
     index_count: u32,
     // Ring index variants for stride 1, 2, 4, 8, 16; all preserve both
     // original inner/outer edge vertices to stitch without T-junctions.
-    ring_lods: Vec<[std::ops::Range<u32>; 5]>,
+    ring_lods: std::sync::Arc<[[std::ops::Range<u32>; 5]]>,
     // Independent centre-fill LODs; without these the nearest flat-water
     // rectangle would remain fully tessellated even as its rings simplify.
-    fill_lods: Vec<[std::ops::Range<u32>; 5]>,
+    fill_lods: std::sync::Arc<[[std::ops::Range<u32>; 5]]>,
     // CPU copy of upstream lattice/index variants for footprint/PVS pruning.
     // The GPU vertex buffer and its wave displacement shader stay unchanged.
-    source_vertices: Vec<geometry::OceanVertex>,
-    source_indices: Vec<u32>,
+    // Shared so `PruneSource` can prune on a worker thread.
+    source_vertices: std::sync::Arc<[geometry::OceanVertex]>,
+    source_indices: std::sync::Arc<[u32]>,
     prune_capacity: usize,
+}
+
+/// CPU-only view of the clipmap's index variants for footprint/PVS pruning.
+/// Cloning shares the source buffers, so a prune can run on a worker thread.
+#[derive(Clone)]
+pub struct PruneSource {
+    levels: usize,
+    segments: u32,
+    horizon_start: u32,
+    index_count: u32,
+    prune_capacity: usize,
+    ring_lods: std::sync::Arc<[[std::ops::Range<u32>; 5]]>,
+    fill_lods: std::sync::Arc<[[std::ops::Range<u32>; 5]]>,
+    source_vertices: std::sync::Arc<[geometry::OceanVertex]>,
+    source_indices: std::sync::Arc<[u32]>,
+}
+
+/// One pruned segment (the centre fill or one ring variant) and its inputs.
+struct PrunedSegment {
+    context: u64,
+    range: std::ops::Range<u32>,
+    extra_pad: u32,
+    /// The segment's vertices read `frames[frame_base..frame_base + frames.len()]`.
+    frame_base: usize,
+    frames: Vec<[u32; 4]>,
+    near: Vec<u32>,
+    far: Vec<u32>,
+}
+
+impl PrunedSegment {
+    fn matches(&self, context: u64, range: &std::ops::Range<u32>, extra_pad: f32, frames: &[[f32; 4]; 10]) -> bool {
+        self.context == context
+            && self.range == *range
+            && self.extra_pad == extra_pad.to_bits()
+            && frames.get(self.frame_base..self.frame_base + self.frames.len()).is_some_and(|current| {
+                current.iter().zip(&self.frames).all(|(frame, bits)| frame.map(f32::to_bits) == *bits)
+            })
+    }
+}
+
+/// Memo for `PruneSource::pruned_indices_classified_cached`. A camera move
+/// that re-snaps one clipmap level re-prunes only the segments whose vertices
+/// read that level's frame; the rest are reused verbatim. `context` names the
+/// admission callback: callers change it whenever `classify` could answer
+/// differently for the same cell.
+#[derive(Default)]
+pub struct PruneSegmentCache {
+    segments: Vec<Option<PrunedSegment>>,
+}
+
+impl PruneSource {
+    /// `OriginalClipmap::pruned_indices_classified`, reusing every segment in
+    /// `cache` whose frames, LOD variant, padding and `context` are unchanged.
+    /// The result is identical to an uncached prune. Also returns how many
+    /// segments were re-pruned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pruned_indices_classified_cached(
+        &self, cache: &mut PruneSegmentCache, context: u64,
+        first: usize, outer: usize, steps: &[u8; 10], fill_step: u8,
+        horizon: bool, horizon_far: bool, frames: &[[f32; 4]; 10], extra_pad: f32,
+        mut classify: impl FnMut([f32; 2], [f32; 2]) -> u8,
+    ) -> (Vec<u32>, u32, usize) {
+        let first = first.min(self.levels - 1);
+        let last = if horizon { self.levels - 1 }
+            else { outer.max(first).min(self.levels - 1) };
+        if cache.segments.len() < self.levels + 1 {
+            cache.segments.resize_with(self.levels + 1, || None);
+        }
+        // Slot 0 is the centre fill, slot 1 + level that level's ring.
+        let fill_variant = fill_step.clamp(1, 16).ilog2().min(4) as usize;
+        let mut wanted = Vec::with_capacity(self.levels + 1);
+        wanted.push((0, self.fill_lods[first][fill_variant].clone(), fill_variant == 0));
+        for level in first..=last {
+            let variant = steps[level].clamp(1, 16).ilog2().min(4) as usize;
+            wanted.push((1 + level, self.ring_lods[level][variant].clone(), variant == 0));
+        }
+        let mut rebuilt = 0;
+        for (slot, range, original_quads) in &wanted {
+            let entry = &mut cache.segments[*slot];
+            if !entry.as_ref().is_some_and(|segment| segment.matches(context, range, extra_pad, frames)) {
+                *entry = Some(self.prune_segment(context, range, *original_quads, frames, extra_pad, &mut classify));
+                rebuilt += 1;
+            }
+        }
+        let segments = || wanted.iter().filter_map(|(slot, ..)| cache.segments[*slot].as_ref());
+        // Horizon/skirt is valid only under the sky-contact gate; the finite
+        // footprint callback cannot bound its far-plane vertices conservatively.
+        let skirt = &self.source_indices[self.horizon_start as usize..self.index_count as usize];
+        let total = segments().map(|segment| segment.near.len() + segment.far.len()).sum::<usize>()
+            + if horizon { skirt.len() } else { 0 };
+        let mut out = Vec::with_capacity(total);
+        for segment in segments() {
+            out.extend_from_slice(&segment.near);
+        }
+        if horizon && !horizon_far {
+            out.extend_from_slice(skirt);
+        }
+        let far_start = out.len() as u32;
+        for segment in segments() {
+            out.extend_from_slice(&segment.far);
+        }
+        if horizon && horizon_far {
+            out.extend_from_slice(skirt);
+        }
+        (out, far_start, rebuilt)
+    }
+
+    fn prune_segment(
+        &self, context: u64, range: &std::ops::Range<u32>, original_quads: bool,
+        frames: &[[f32; 4]; 10], extra_pad: f32,
+        classify: &mut impl FnMut([f32; 2], [f32; 2]) -> u8,
+    ) -> PrunedSegment {
+        // CPU positions match the upstream snapped frame and inner-edge shift.
+        // The shader's continuous 0..1 geomorph moves vertices by at most one
+        // cell, which is covered by the conservative bounds expansion below.
+        let levels = self.levels;
+        let segments = self.segments as f32;
+        let position = |vertex: &geometry::OceanVertex| {
+            let level = (vertex.level[0] as usize).min(levels - 1);
+            let frame = frames[level];
+            let inner = level > 0 && vertex.position.iter().all(|&v|
+                v.abs() <= segments * frame[2] / 4.0 + 1.0e-3);
+            let centre = if inner { frames[level - 1] } else { frame };
+            [centre[0] + vertex.position[0], centre[1] + vertex.position[1]]
+        };
+        // The upstream fill and stride-1 rings are six indices per cell.
+        // Godot admits the entire cell conservatively; test once per
+        // quad, instead of separately discarding half of a wet quad.
+        // Stitched outer LOD variants contain triangle fans, so their
+        // groups must instead be examined triangle-by-triangle.
+        let stride = if original_quads { 6 } else { 3 };
+        let (mut near, mut far) = (Vec::new(), Vec::new());
+        let (mut lowest, mut highest) = (usize::MAX, 0);
+        for indices in self.source_indices[range.start as usize..range.end as usize].chunks_exact(stride) {
+            let mut lo = [f32::INFINITY; 2];
+            let mut hi = [f32::NEG_INFINITY; 2];
+            for &vertex_index in indices {
+                let vertex = &self.source_vertices[vertex_index as usize];
+                let level = (vertex.level[0] as usize).min(levels - 1);
+                lowest = lowest.min(level);
+                highest = highest.max(level);
+                let point = position(vertex);
+                for axis in 0..2 {
+                    lo[axis] = lo[axis].min(point[axis]);
+                    hi[axis] = hi[axis].max(point[axis]);
+                }
+            }
+            let level = (self.source_vertices[indices[0] as usize].level[0] as usize).min(levels - 1);
+            let pad = frames[level][2] * 1.05 + extra_pad;
+            for axis in 0..2 { lo[axis] -= pad; hi[axis] += pad; }
+            match classify(lo, hi) {
+                CELL_NEAR => near.extend_from_slice(indices),
+                CELL_FAR => far.extend_from_slice(indices),
+                _ => {}
+            }
+        }
+        // Inner vertices also read the next finer level's frame.
+        let (frame_base, frame_end) = if lowest == usize::MAX { (0, 0) } else { (lowest.saturating_sub(1), highest + 1) };
+        PrunedSegment {
+            context,
+            range: range.clone(),
+            extra_pad: extra_pad.to_bits(),
+            frame_base,
+            frames: frames[frame_base..frame_end].iter().map(|frame| frame.map(f32::to_bits)).collect(),
+            near,
+            far,
+        }
+    }
+
+    /// Maximum indices across the active fill, per-ring LOD variants and sky horizon.
+    pub fn pruned_index_capacity(&self) -> usize { self.prune_capacity }
 }
 
 /// Material values in the original surface uniform. Colors are linear RGB.
@@ -319,11 +545,26 @@ impl OriginalClipmap {
             rings: mesh.rings,
             horizon_start,
             index_count,
-            ring_lods,
-            fill_lods,
-            source_indices,
-            source_vertices,
+            ring_lods: ring_lods.into(),
+            fill_lods: fill_lods.into(),
+            source_indices: source_indices.into(),
+            source_vertices: source_vertices.into(),
             prune_capacity,
+        }
+    }
+
+    /// Shared CPU data for pruning off the render thread.
+    pub fn prune_source(&self) -> PruneSource {
+        PruneSource {
+            levels: self.clipmap.levels,
+            segments: self.clipmap.segments,
+            horizon_start: self.horizon_start,
+            index_count: self.index_count,
+            prune_capacity: self.prune_capacity,
+            ring_lods: self.ring_lods.clone(),
+            fill_lods: self.fill_lods.clone(),
+            source_vertices: self.source_vertices.clone(),
+            source_indices: self.source_indices.clone(),
         }
     }
 
@@ -358,60 +599,24 @@ impl OriginalClipmap {
         horizon: bool, frames: &[[f32; 4]; 10], extra_pad: f32,
         mut admit: impl FnMut([f32; 2], [f32; 2]) -> bool,
     ) -> Vec<u32> {
-        let first = first.min(self.clipmap.levels - 1);
-        let last = if horizon { self.clipmap.levels - 1 }
-            else { outer.max(first).min(self.clipmap.levels - 1) };
-        let mut out = Vec::with_capacity((self.prune_capacity / 8).max(4096));
-        // Reconstruct the upstream vertex shader's snapped grid once per
-        // lattice crossing, not three times for every triangle. The shader's
-        // continuous 0..1 geomorph moves vertices by at most one cell, which
-        // is covered by the conservative bounds expansion below.
-        let positions: Vec<[f32; 2]> = self.source_vertices.iter().map(|vertex| {
-            let level = (vertex.level[0] as usize).min(self.clipmap.levels - 1);
-            let frame = frames[level];
-            let inner = level > 0 && vertex.position.iter().all(|&v|
-                v.abs() <= self.clipmap.segments as f32 * frame[2] / 4.0 + 1.0e-3);
-            let centre = if inner { frames[level - 1] } else { frame };
-            [centre[0] + vertex.position[0], centre[1] + vertex.position[1]]
-        }).collect();
-        let mut prune_range = |range: &std::ops::Range<u32>, original_quads: bool| {
-            // The upstream fill and stride-1 rings are six indices per cell.
-            // Godot admits the entire cell conservatively; test once per
-            // quad, instead of separately discarding half of a wet quad.
-            // Stitched outer LOD variants contain triangle fans, so their
-            // groups must instead be examined triangle-by-triangle.
-            let stride = if original_quads { 6 } else { 3 };
-            for indices in self.source_indices[range.start as usize..range.end as usize]
-                .chunks_exact(stride)
-            {
-                let mut lo = [f32::INFINITY; 2];
-                let mut hi = [f32::NEG_INFINITY; 2];
-                for &vertex_index in indices {
-                    let point = positions[vertex_index as usize];
-                    for axis in 0..2 {
-                        lo[axis] = lo[axis].min(point[axis]);
-                        hi[axis] = hi[axis].max(point[axis]);
-                    }
-                }
-                let level = (self.source_vertices[indices[0] as usize].level[0] as usize)
-                    .min(self.clipmap.levels - 1);
-                let pad = frames[level][2] * 1.05 + extra_pad;
-                for axis in 0..2 { lo[axis] -= pad; hi[axis] += pad; }
-                if admit(lo, hi) { out.extend_from_slice(indices); }
-            }
-        };
-        let fill_variant = fill_step.clamp(1, 16).ilog2().min(4) as usize;
-        prune_range(&self.fill_lods[first][fill_variant], fill_variant == 0);
-        for level in first..=last {
-            let variant = steps[level].clamp(1, 16).ilog2().min(4) as usize;
-            prune_range(&self.ring_lods[level][variant], variant == 0);
-        }
-        // Horizon/skirt is valid only under the sky-contact gate; the finite
-        // footprint callback cannot bound its far-plane vertices conservatively.
-        if horizon {
-            out.extend_from_slice(&self.source_indices[self.horizon_start as usize..self.index_count as usize]);
-        }
-        out
+        self.pruned_indices_classified(first, outer, steps, fill_step, horizon, false, frames, extra_pad,
+            |lo, hi| if admit(lo, hi) { CELL_NEAR } else { CELL_REJECTED }).0
+    }
+
+    /// `pruned_indices_with_fill` with each admitted cell classed near or far (`classify` returns a `CELL_*`): the
+    /// near cells first, then the far ones (and the horizon/skirt when `horizon_far`), and the index where the far
+    /// part starts. With no far cells the indices are exactly `pruned_indices_with_fill`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pruned_indices_classified(
+        &self,
+        first: usize, outer: usize, steps: &[u8; 10], fill_step: u8,
+        horizon: bool, horizon_far: bool, frames: &[[f32; 4]; 10], extra_pad: f32,
+        classify: impl FnMut([f32; 2], [f32; 2]) -> u8,
+    ) -> (Vec<u32>, u32) {
+        let mut cache = PruneSegmentCache::default();
+        let (indices, far_start, _) = self.prune_source().pruned_indices_classified_cached(
+            &mut cache, 0, first, outer, steps, fill_step, horizon, horizon_far, frames, extra_pad, classify);
+        (indices, far_start)
     }
 
     pub fn clipmap(&self) -> geometry::Clipmap {
@@ -466,11 +671,21 @@ impl OriginalClipmap {
     pub fn draw_pruned<'a>(
         &'a self, pass: &mut wgpu::RenderPass<'a>,
         index_buffer: &'a wgpu::Buffer, index_count: u32,
+        local_vertices: Option<&'a wgpu::Buffer>,
     ) {
-        if index_count == 0 { return; }
-        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        self.draw_pruned_range(pass, index_buffer, 0..index_count, local_vertices);
+    }
+
+    /// `draw_pruned` over `range` of the pruned indices (the near or far part of `pruned_indices_classified`).
+    pub fn draw_pruned_range<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>,
+        index_buffer: &'a wgpu::Buffer, range: std::ops::Range<u32>,
+        local_vertices: Option<&'a wgpu::Buffer>,
+    ) {
+        if range.is_empty() { return; }
+        pass.set_vertex_buffer(0, local_vertices.unwrap_or(&self.vertices).slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..index_count, 0, 0..1);
+        pass.draw_indexed(range, 0, 0..1);
     }
 
     pub fn triangle_count_lod(
@@ -723,6 +938,20 @@ pub(crate) fn entry_sampler(binding: u32, value: &wgpu::Sampler) -> wgpu::BindGr
     }
 }
 
+/// `r_oceanType 5`'s textures (group 1, bindings 18-21, `hybrid_gerstner.wgsl`): the packed pattern texture with its
+/// repeating sampler and the two persistent foam maps (`crate::godot_water`). Cheap to clone (handles).
+#[derive(Clone)]
+pub struct GodotWaterViews {
+    pub patterns: wgpu::TextureView,
+    pub repeat: wgpu::Sampler,
+    pub foam_near: wgpu::TextureView,
+    pub foam_far: wgpu::TextureView,
+}
+
+/// Size of the `JkaHybridSwell` uniform (group 1, binding 17): swell, motion, breaker, Godot water, its foam centres
+/// and its water and crest colours.
+pub const HYBRID_SWELL_BYTES: u64 = 112;
+
 /// The wake sampler's inputs (`naval_ocean::wake`): the `Wake` uniform, the field's two display textures, the trail atlas
 /// and the torpedo field. Cheap to clone (handles).
 #[derive(Clone)]
@@ -748,6 +977,9 @@ pub struct OriginalSurfaceBindings {
     neutral_cloud: (wgpu::TextureView, wgpu::Sampler, wgpu::Buffer),
     surface: wgpu::Buffer,
     hybrid_swell: wgpu::Buffer,
+    /// `r_oceanType 5`'s textures; 1x1 placeholders until `set_godot_water`.
+    godot: GodotWaterViews,
+    neutral_godot: GodotWaterViews,
     environment: wgpu::Buffer,
     ambient_atlas: wgpu::Texture,
     ambient: [f32; 3],
@@ -878,8 +1110,8 @@ impl OriginalSurfaceBindings {
             surface_bytes as u64,
             false,
         );
-        let hybrid_swell = buffer(device, "JKA Hybrid Gerstner", 32, false);
-        let pure_fft: [[f32; 4]; 2] = [[0.0; 4], [0.0, 0.0, 1.0, 0.0]];
+        let hybrid_swell = buffer(device, "JKA Hybrid Gerstner and crest control", HYBRID_SWELL_BYTES, false);
+        let pure_fft: [[f32; 4]; 3] = [[0.0; 4], [0.0, 0.0, 1.0, 0.0], [0.0; 4]];
         queue.write_buffer(&hybrid_swell, 0, bytemuck::bytes_of(&pure_fft));
         let calm_wake = buffer(
             device,
@@ -956,6 +1188,19 @@ impl OriginalSurfaceBindings {
             wgpu::TextureViewDimension::D2,
             1,
         );
+        let blank_godot = placeholder(device, "Godot water blank texture", wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureViewDimension::D2, 1);
+        let neutral_godot = GodotWaterViews {
+            patterns: blank_godot.clone(),
+            repeat: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("Godot water blank repeat"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                ..Default::default()
+            }),
+            foam_near: blank_godot.clone(),
+            foam_far: blank_godot,
+        };
         let material_group = Self::make_material_group(
             device,
             &pipeline.surface_layout,
@@ -975,6 +1220,7 @@ impl OriginalSurfaceBindings {
             &reflection_table,
             &boundary,
             &hybrid_swell,
+            &neutral_godot,
             &color,
             &depth,
         );
@@ -1064,6 +1310,8 @@ impl OriginalSurfaceBindings {
             ),
             surface,
             hybrid_swell,
+            godot: neutral_godot.clone(),
+            neutral_godot,
             environment,
             ambient_atlas: atlas,
             ambient: [117.0 / 255.0, 154.0 / 255.0, 186.0 / 255.0],
@@ -1103,6 +1351,7 @@ impl OriginalSurfaceBindings {
         reflection_table: &wgpu::Buffer,
         boundary: &wgpu::Buffer,
         hybrid_swell: &wgpu::Buffer,
+        godot: &GodotWaterViews,
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
@@ -1128,8 +1377,22 @@ impl OriginalSurfaceBindings {
                 entry_buffer(15, reflection_table),
                 entry_buffer(16, boundary),
                 entry_buffer(17, hybrid_swell),
+                entry_texture(18, &godot.patterns),
+                entry_sampler(19, &godot.repeat),
+                entry_texture(20, &godot.foam_near),
+                entry_texture(21, &godot.foam_far),
             ],
         })
+    }
+
+    /// Read the depth copy's tiles (`crate::reflection_tiles`) instead of the zeroed table that traces every ray.
+    /// Rebuilds the material group against the scene copies already bound.
+    pub fn set_reflection_table(&mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline, table: &wgpu::Buffer) {
+        if self.reflection_table == *table { return; }
+        self.reflection_table = table.clone();
+        if let Some((color, depth)) = self.current_scene.take() {
+            self.set_scene(device, pipeline, &color, &depth);
+        }
     }
 
     pub fn set_scene(
@@ -1155,10 +1418,26 @@ impl OriginalSurfaceBindings {
             &self.reflection_table,
             &self.boundary,
             &self.hybrid_swell,
+            &self.godot,
             color,
             depth,
         );
         self.current_scene = Some(next);
+    }
+
+    /// Bind `r_oceanType 5`'s textures (or the neutral ones again for `None`). Rebuilds the material group against the
+    /// scene copies already bound.
+    pub fn set_godot_water(&mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline,
+        views: Option<&GodotWaterViews>) {
+        let next = views.unwrap_or(&self.neutral_godot);
+        if self.godot.patterns == next.patterns && self.godot.foam_near == next.foam_near
+            && self.godot.foam_far == next.foam_far {
+            return;
+        }
+        self.godot = next.clone();
+        if let Some((color, depth)) = self.current_scene.take() {
+            self.set_scene(device, pipeline, &color, &depth);
+        }
     }
 
     /// Bind live ship-wake resources (or calm ones again for `None`). Rebuilds the material group against the scene
@@ -1344,6 +1623,16 @@ impl OriginalSurfaceBindings {
         queue.write_buffer(&self.hybrid_swell, 0, bytemuck::bytes_of(two_vec4));
     }
 
+    pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8) {
+        queue.write_buffer(&self.hybrid_swell, 32, bytemuck::bytes_of(&[f32::from(mode), 0.0, 0.0, 0.0]));
+    }
+
+    /// `r_oceanType 5`: [1 on, wave scale, seconds, foam bits], the foam maps' centres [near x, z, far x, z] (m) and the
+    /// linear water and crest colours. Zero turns the Godot waves off.
+    pub fn write_godot_water(&self, queue: &wgpu::Queue, godot: &[[f32; 4]; 4]) {
+        queue.write_buffer(&self.hybrid_swell, 48, bytemuck::bytes_of(godot));
+    }
+
     pub fn write_surface_prefix(&self, queue: &wgpu::Queue, first_25_vec4: &[[f32; 4]; 25]) {
         assert!(self.surface_bytes >= 25 * 16);
         queue.write_buffer(&self.surface, 0, bytemuck::bytes_of(first_25_vec4));
@@ -1392,7 +1681,7 @@ impl OriginalSurfacePipeline {
         reflection_steps: u32,
         pixel_detail_mode: u8,
     ) -> Self {
-        Self::new_with_wave_layout(device, waves.layout(), color_format, samples, reflection_steps, pixel_detail_mode)
+        Self::new_with_wave_layout(device, waves.layout(), color_format, samples, reflection_steps, pixel_detail_mode, 0)
     }
 
     /// Pipeline construction needs only the immutable wave layout. Hosts can
@@ -1404,6 +1693,9 @@ impl OriginalSurfacePipeline {
         samples: u32,
         reflection_steps: u32,
         pixel_detail_mode: u8,
+        // Main full-resolution program variant: `shader_composer::COST_PROBE_*` stubs (A/B cost measurement) and
+        // the lossless `SURFACE_SKIP_FADED_CASCADES`; 0 is the original.
+        cost_probe: u32,
     ) -> Self {
         let vertex = wgpu::ShaderStages::VERTEX;
         let fragment = wgpu::ShaderStages::FRAGMENT;
@@ -1446,6 +1738,10 @@ impl OriginalSurfacePipeline {
                 storage(15, fragment),
                 uniform(16, fragment),
                 uniform(17, both),
+                sampled(18, both, t2, false),
+                sampler(19, both, false),
+                sampled(20, fragment, t2, false),
+                sampled(21, fragment, t2, false),
             ],
         });
         let environment_layout =
@@ -1467,9 +1763,15 @@ impl OriginalSurfacePipeline {
             ],
             immediate_size: 0,
         });
-        let mut composer = shader_composer::composer().expect("Blue Water shader modules");
-        let source = shader_composer::jka_surface_module(&mut composer, reflection_steps, pixel_detail_mode)
+        // Reduced modes shade at the full-resolution footprint (`full_resolution_footprint`), modules included.
+        let mut composer = shader_composer::composer_with_footprint(
+            (cost_probe & shader_composer::COST_PROBE_CHEAP_NOISE != 0).then_some(()),
+            shader_composer::pixel_scale(pixel_detail_mode)).expect("Blue Water shader modules");
+        let source = shader_composer::jka_surface_module_with_probe(&mut composer, reflection_steps, pixel_detail_mode, cost_probe)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+        let reduced_targets: [Option<wgpu::ColorTargetState>; 3] =
+            std::array::from_fn(|_| Some(wgpu::TextureFormat::Rgba16Float.into()));
+        let main_targets = [Some(color_format.into())];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blue Water original surface shader"),
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(source)),
@@ -1487,7 +1789,9 @@ impl OriginalSurfacePipeline {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(color_format.into())],
+                // Reduced modes compose the material with the glint outputs (`jka_reduced_glints`); this pipeline is
+                // then unused but must match them.
+                targets: if pixel_detail_mode == 0 { &main_targets[..] } else { &reduced_targets[..] },
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1525,7 +1829,8 @@ impl OriginalSurfacePipeline {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader, entry_point: Some("fragment"),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::TextureFormat::Rgba16Float.into())],
+                    // Colour without glints, glitter mean/density, glint share (`jka_reduced_glints`).
+                    targets: &reduced_targets,
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1558,6 +1863,29 @@ impl OriginalSurfacePipeline {
                             view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
                         }, count: None,
                     },
+                    // The glitter's mean/density and the glint share (`jka_reduced_glints`).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        }, count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        }, count: None,
+                    },
+                    // Mode 5's tile decisions (`adaptive_tiles.wgsl`); bound but unread in modes 1-4.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
+                    },
                 ],
             });
             let reconstruction_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1568,8 +1896,12 @@ impl OriginalSurfacePipeline {
                 ], immediate_size: 0,
             });
             let mut composer = shader_composer::composer().expect("Blue Water composer");
-            let reconstruction = shader_composer::jka_reconstruct_module(&mut composer)
-                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+            let adaptive = pixel_detail_mode == 5;
+            let reconstruction = if adaptive {
+                shader_composer::jka_adaptive_reconstruct_module(&mut composer)
+            } else {
+                shader_composer::jka_reconstruct_module(&mut composer)
+            }.unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
             let reconstruction_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Blue Water full-resolution depth-aware upscaler"),
                 source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(reconstruction)),
@@ -1602,7 +1934,7 @@ impl OriginalSurfacePipeline {
             });
             let near = if matches!(pixel_detail_mode, 3 | 4) {
                 let mut composer = shader_composer::composer().expect("Blue Water composer");
-                let near_module = shader_composer::jka_near_surface_module(&mut composer, reflection_steps)
+                let near_module = shader_composer::jka_near_surface_module(&mut composer, reflection_steps, cost_probe)
                     .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
                 let near_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Blue Water distance-aware near detail"),
@@ -1638,6 +1970,41 @@ impl OriginalSurfacePipeline {
                     multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
                     multiview_mask: None, cache: None,
                 }))
+            } else if adaptive {
+                // Mode 5: the full material on the blocks the reconstruction discards, opaque and depth-writing like
+                // it, so each pixel is drawn by exactly one of the two.
+                let mut composer = shader_composer::composer().expect("Blue Water composer");
+                let full_module = shader_composer::jka_adaptive_surface_module(&mut composer, reflection_steps, cost_probe)
+                    .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+                let full_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Blue Water adaptive full-resolution detail"),
+                    source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(full_module)),
+                });
+                Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Blue Water adaptive full-resolution detail"),
+                    layout: Some(&reconstruction_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &full_shader, entry_point: Some("vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &full_shader, entry_point: Some("fragment"),
+                        compilation_options: Default::default(), targets: &[Some(color_format.into())],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: wgpu::FrontFace::Ccw, cull_mode: None, ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(), bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                    multiview_mask: None, cache: None,
+                }))
             } else { None };
             (Some(reduced), near, Some(reconstructed), Some(reduced_layout))
         };
@@ -1650,11 +2017,72 @@ impl OriginalSurfacePipeline {
             near_pipeline,
             reconstruct_pipeline,
             reconstruct_layout,
+            adaptive_classify: (pixel_detail_mode == 5).then(|| adaptive_classifier(device)),
+            far_pipeline: None,
             wireframe: None,
             waterline_marker: None,
             vertex_shader: shader,
             pipeline_layout: layout,
         }
+    }
+
+    /// Builds `far_pipeline`: the same material composed with `far_variant` stubs on top of `cost_probe`, for the
+    /// pixel-detail mode's expensive pass (full resolution in mode 0, the reduced target otherwise). `far_variant` 0
+    /// leaves it unbuilt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_far_variant(mut self, device: &wgpu::Device, color_format: wgpu::TextureFormat, samples: u32,
+        reflection_steps: u32, pixel_detail_mode: u8, cost_probe: u32, far_variant: u32) -> Self {
+        if far_variant == 0 {
+            return self;
+        }
+        let variant = cost_probe | far_variant;
+        let mut composer = shader_composer::composer_with_footprint(
+            (variant & shader_composer::COST_PROBE_CHEAP_NOISE != 0).then_some(()),
+            shader_composer::pixel_scale(pixel_detail_mode)).expect("Blue Water shader modules");
+        let source = shader_composer::jka_surface_module_with_probe(&mut composer, reflection_steps, pixel_detail_mode, variant)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blue Water far-water surface shader"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(source)),
+        });
+        let reduced_targets: [Option<wgpu::ColorTargetState>; 3] =
+            std::array::from_fn(|_| Some(wgpu::TextureFormat::Rgba16Float.into()));
+        let main_targets = [Some(color_format.into())];
+        let (targets, samples): (&[Option<wgpu::ColorTargetState>], u32) =
+            if pixel_detail_mode == 0 { (&main_targets, samples) } else { (&reduced_targets, 1) };
+        self.far_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blue Water far-water surface"),
+            layout: Some(&self.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                compilation_options: Default::default(),
+                targets,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+            multiview_mask: None,
+            cache: None,
+        }));
+        self
     }
 
     /// Explicit debug mode 3 only: draw the GPU-evaluated wave at a fixed 100 JKA
@@ -2002,6 +2430,50 @@ mod tests {
     }
 
     #[test]
+    fn cached_prune_matches_a_full_prune_and_repeats_only_moved_levels() {
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.expect("GPU adapter");
+            let (device, _queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("GPU device");
+            let (segments, levels) = (256u32, 6usize);
+            let clipmap = OriginalClipmap::new(&device, segments, levels);
+            let source = clipmap.prune_source();
+            let classify = |lo: [f32; 2], hi: [f32; 2]| {
+                if hi[0] < 0.0 || lo[0] > 900.0 || hi[1] < -300.0 || lo[1] > 400.0 { CELL_REJECTED }
+                else if lo[0] > 600.0 { CELL_FAR } else { CELL_NEAR }
+            };
+            let steps = [1u8, 1, 2, 4, 8, 16, 1, 1, 1, 1];
+            let mut cache = PruneSegmentCache::default();
+            let (mut full_ms, mut cached_ms, mut partial) = (0.0, 0.0, 0);
+            // Walk the camera so different levels re-snap on different steps.
+            for step in 0..40 {
+                let x = 120.0 + f64::from(step) * 3.7;
+                let z = -40.0 + f64::from(step) * 1.9;
+                let frames = clipmap.clipmap().frames(x, z);
+                for horizon_far in [false, true] {
+                    let started = std::time::Instant::now();
+                    let expected = clipmap.pruned_indices_classified(0, levels - 1, &steps, 1, true, horizon_far, &frames, 16.0, classify);
+                    full_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    let started = std::time::Instant::now();
+                    let (indices, far_start, rebuilt) = source.pruned_indices_classified_cached(
+                        &mut cache, 7, 0, levels - 1, &steps, 1, true, horizon_far, &frames, 16.0, classify);
+                    cached_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!((indices, far_start), expected, "step {step} horizon_far {horizon_far}");
+                    if step > 0 && rebuilt < levels + 1 { partial += 1; }
+                }
+            }
+            // A different admission context must not reuse segments.
+            let frames = clipmap.clipmap().frames(120.0, -40.0);
+            let (_, _, rebuilt) = source.pruned_indices_classified_cached(
+                &mut cache, 8, 0, levels - 1, &steps, 1, true, false, &frames, 16.0, classify);
+            assert_eq!(rebuilt, levels + 1);
+            assert!(partial > 0, "no step reused any segment");
+            eprintln!("prune {segments}x{levels}: full {:.2} ms, cached {:.2} ms per call; {partial} partial rebuilds",
+                full_ms / 80.0, cached_ms / 80.0);
+        });
+    }
+
+    #[test]
     fn pruned_indices_keep_every_triangle_the_shader_places_over_the_region() {
         futures_lite::future::block_on(async {
             let instance = wgpu::Instance::default();
@@ -2043,6 +2515,93 @@ mod tests {
             }
             eprintln!("triangles over the pool: {over}, missing from the pruned set: {missing}");
             assert!(over > 100 && missing == 0);
+        });
+    }
+
+    /// Every `r_oceanCostProbe` variant must create a valid JKA surface pipeline on the real adapter.
+    #[test]
+    fn cost_probe_pipelines_create_on_gpu() {
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .expect("GPU adapter");
+            eprintln!("adapter: {:?}", adapter.get_info());
+            let (device, _queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                })
+                .await
+                .expect("GPU device");
+            let field = crate::WaveField::new(&device, QualityTier::High);
+            let waves = SurfaceWaves::new(&device, &field);
+            let mut failures = Vec::new();
+            let masks = (0..13).map(|bit| 1u32 << bit)
+                .chain([shader_composer::SURFACE_SKIP_FADED_CASCADES, shader_composer::COST_PROBE_PACK_HALF,
+                    shader_composer::COST_PROBE_PACK_HALF_WIDE, shader_composer::SURFACE_WAVE_STATISTICS,
+                    shader_composer::SURFACE_WAVE_STATISTICS | shader_composer::SURFACE_WAVE_STATISTICS_FOAM]);
+            for mask in masks {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let _pipeline = OriginalSurfacePipeline::new_with_wave_layout(
+                    &device, waves.layout(), wgpu::TextureFormat::Bgra8UnormSrgb, 1, 16, 0, mask);
+                device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                if let Some(error) = scope.pop().await {
+                    eprintln!("probe {mask:#x}: {error}");
+                    failures.push(mask);
+                }
+            }
+            assert!(failures.is_empty(), "cost probe pipelines failed: {failures:x?}");
+            // Every `r_oceanPixelDetail` mode's reduced, reconstruction and detail pipelines.
+            for mode in 1..=5u8 {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let pipeline = OriginalSurfacePipeline::new_with_wave_layout(
+                    &device, waves.layout(), wgpu::TextureFormat::Rgba16Float, 1, 16, mode, 0);
+                device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                assert!(scope.pop().await.is_none(), "pixel detail {mode} pipelines invalid");
+                assert_eq!(pipeline.near_pipeline.is_some(), matches!(mode, 3..=5), "pixel detail {mode} detail pass");
+                assert_eq!(pipeline.adaptive_classify.is_some(), mode == 5, "pixel detail {mode} tile classifier");
+            }
+        });
+    }
+
+    /// Driver register counts for surface variants, read through the vendored wgpu-hal's `DINURDO_VK_SHADER_STATS`
+    /// diagnostic (VK_KHR_pipeline_executable_properties). Prints only; skipped unless that variable is 1. Masks
+    /// beyond the defaults come from `JKA_SURFACE_STATS_MASKS` (comma-separated, hex with 0x or decimal).
+    #[test]
+    fn surface_register_stats() {
+        if std::env::var_os("DINURDO_VK_SHADER_STATS").is_none_or(|v| v != "1") {
+            return;
+        }
+        let parse = |text: &str| match text.trim().strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => text.trim().parse().ok(),
+        };
+        let masks: Vec<u32> = std::env::var("JKA_SURFACE_STATS_MASKS").ok()
+            .map(|list| list.split(',').filter_map(parse).collect())
+            .unwrap_or_else(|| vec![0, shader_composer::COST_PROBE_SSR, shader_composer::COST_PROBE_FOAM,
+                shader_composer::COST_PROBE_WAVES, shader_composer::COST_PROBE_GLINTS, shader_composer::COST_PROBE_REFRACTION,
+                shader_composer::COST_PROBE_SKY, shader_composer::COST_PROBE_FLOOR]);
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.expect("Vulkan adapter");
+            eprintln!("adapter: {:?}", adapter.get_info());
+            let (device, _queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            }).await.expect("GPU device");
+            let field = crate::WaveField::new(&device, QualityTier::High);
+            let waves = SurfaceWaves::new(&device, &field);
+            for mask in masks {
+                eprintln!("[SURFACE MASK] {mask:#x}");
+                let _pipeline = OriginalSurfacePipeline::new_with_wave_layout(
+                    &device, waves.layout(), wgpu::TextureFormat::Rgba16Float, 1, 16, 0, mask);
+                device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
         });
     }
 
@@ -2204,5 +2763,259 @@ mod tests {
                 "original Blue Water surface layout"
             );
         });
+    }
+}
+
+/// One lattice tile may choose a different density from the tile beside it.
+/// Existing Blue Water GPU displacement is used for *both* the old and new
+/// tessellation during a transition; the CPU never attempts to read back FFT.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalWaveHint {
+    pub height: f32,
+    pub wavelength: f32,
+    pub choppiness: f32,
+    pub wind_speed: f32,
+    pub fft_weight: f32,
+    pub swell: [f32; 4],
+    /// Multiplies both geometry-error limits; 1.0 preserves original mode 2.
+    pub tolerance: f32,
+    pub seconds: f32,
+    pub focal_pixels: f32,
+    pub eye: [f32; 3],
+}
+
+#[derive(Default)]
+pub struct LocalTileState {
+    epoch: i64,
+    tiles: std::collections::BTreeMap<(usize, i32, i32), (u8, u8)>,
+}
+
+#[derive(Clone, Copy)]
+struct LocalTile {
+    level: usize,
+    x: i32,
+    y: i32,
+    from: u8,
+    to: u8,
+}
+
+impl OriginalClipmap {
+    /// CPU prototype of adaptive tiled tessellation. Each 16x16 cell tile is
+    /// independently selected, with 2:1 neighbour enforcement. Patch boundaries
+    /// use the finer of their two steps. A vertex encodes its *coarse* parent
+    /// step and morph progress in the normally unused clipmap `level.y`; the
+    /// unchanged JKA vertex layout is shared by all native surface pipelines.
+    ///
+    /// IMPORTANT: the selection is a phase-aware *spectrum estimate*, not a
+    /// GPU FFT curvature readback. The shader performs the actual wave-aware
+    /// geomorph and all JKA PVS/footprint tests are retained.
+    pub fn local_adaptive_mesh(
+        &self, first: usize, outer: usize, horizon: bool,
+        frames: &[[f32; 4]; 10], screen_steps: &[u8; 10],
+        hint: LocalWaveHint, state: &mut LocalTileState,
+        mut admit: impl FnMut([f32; 2], [f32; 2]) -> bool,
+    ) -> (Vec<geometry::OceanVertex>, Vec<u32>, [u32; 5]) {
+        const TILE: i32 = 16;
+        const TRANSITION: f32 = 0.5;
+        let clip = self.clipmap;
+        let first = first.min(clip.levels - 1);
+        let last = if horizon { clip.levels - 1 } else { outer.max(first).min(clip.levels - 1) };
+        let epoch = (hint.seconds.max(0.0) / TRANSITION).floor() as i64;
+        let phase = ((hint.seconds.max(0.0) / TRANSITION).fract()).clamp(0.0, 1.0);
+        let progress = phase * phase * (3.0 - 2.0 * phase);
+        let mut candidate = std::collections::BTreeMap::<(usize,i32,i32),u8>::new();
+        let half = (clip.segments / 2) as i32;
+        let hole = (clip.segments / 4) as i32;
+        for level in first..=last {
+            for y in (-half..half).step_by(TILE as usize) {
+                for x in (-half..half).step_by(TILE as usize) {
+                    if level != first && x >= -hole && x < hole && y >= -hole && y < hole { continue; }
+                    let frame = frames[level];
+                    let cell = frame[2];
+                    let cx = frame[0] + (x as f32 + TILE as f32 * 0.5) * cell;
+                    let cy = frame[1] + (y as f32 + TILE as f32 * 0.5) * cell;
+                    let d = ((cx - hint.eye[0]).hypot(cy - hint.eye[2]))
+                        .hypot(hint.eye[1].abs()).max(cell);
+                    let wl = hint.wavelength.max(2.0) / (1.0 + 0.8 *
+                        (hint.wind_speed.max(0.0) * hint.choppiness.max(0.0) / 12.0).sqrt());
+                    let k = std::f32::consts::TAU / wl;
+                    // This local phase is an inexpensive curvature proxy, NOT
+                    // a claim that we recovered the stochastic FFT phases.
+                    let angle = k * (cx * 0.73 + cy * 0.68) -
+                        hint.seconds * (9.81 * k).sqrt();
+                    let coverage = (k * cell * TILE as f32 * 0.7).min(1.0);
+                    let fft = hint.height.max(0.0) * hint.fft_weight.max(0.0)
+                        * k*k * (angle.sin().abs() + coverage).min(1.0);
+                    let ak = hint.swell[2].abs();
+                    let aphase = ak * (cx * hint.swell[0] + cy * hint.swell[1]) -
+                        hint.seconds * (9.81 * ak).sqrt();
+                    let analytic = hint.swell[3].abs() * ak*ak
+                        * (aphase.sin().abs() + (ak*cell*TILE as f32*0.7).min(1.0)).min(1.0);
+                    let curvature = fft + analytic;
+                    // Expose the existing mode-2 error limits as one predictable
+                    // control. Increasing tolerance chooses coarser quads.
+                    let tolerance = if hint.tolerance.is_finite() {
+                        hint.tolerance.clamp(0.25, 16.0)
+                    } else { 1.0 };
+                    let mut step = screen_steps[level].clamp(1, 16);
+                    if curvature.is_finite() {
+                        while step < 16 {
+                            let test = step * 2;
+                            let width = test as f32 * cell;
+                            let projected_error = hint.focal_pixels * curvature * width * width / (8.0 * d);
+                            let normal_error = curvature * width;
+                            if projected_error > 3.0 * tolerance || normal_error > 0.35 * tolerance { break; }
+                            step = test;
+                        }
+                    }
+                    candidate.insert((level,x,y),step);
+                }
+            }
+        }
+        // Bound neighbouring tessellation steps to 2:1. This guarantees that
+        // the border adapter never has to stitch radically different grids.
+        for _ in 0..5 {
+            let mut changed = false;
+            let old = candidate.clone();
+            for (&(l,x,y), step) in &mut candidate {
+                for nb in [(l,x-TILE,y),(l,x+TILE,y),(l,x,y-TILE),(l,x,y+TILE)] {
+                    if let Some(&n) = old.get(&nb) {
+                        let limited = n.saturating_mul(2).min(16);
+                        if *step > limited { *step = limited; changed = true; }
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+        if epoch != state.epoch || state.tiles.len() != candidate.len() {
+            let mut next = std::collections::BTreeMap::new();
+            for (key, want) in candidate {
+                let from = state.tiles.get(&key).map_or(want, |&(_, to)| to);
+                // Only move one subdivision grade per transition. This avoids
+                // large bursts of new vertices and is more stable on waves.
+                let to = if want > from { (from * 2).min(want) }
+                    else if want < from { (from / 2).max(want) } else { want };
+                next.insert(key, (from, to));
+            }
+            state.tiles = next;
+            state.epoch = epoch;
+        }
+        let tiles: Vec<_> = state.tiles.iter().map(|(&(l,x,y), &(from,to))|
+            LocalTile { level:l, x, y, from, to }).collect();
+        let mut vertices: Vec<geometry::OceanVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut counts = [0u32; 5];
+        for tile in &tiles {
+            let frame = frames[tile.level];
+            let cell = frame[2];
+            let x = tile.x;
+            let y = tile.y;
+            // Conservatively admit the whole tile. Actual coast/PVS shape is
+            // still evaluated in the fragment shader as before.
+            let bounds_pad = cell * 2.0 + 16.0;
+            let lo = [frame[0] + x as f32 * cell - bounds_pad,
+                frame[1] + y as f32 * cell - bounds_pad];
+            let hi = [frame[0] + (x+TILE) as f32 * cell + bounds_pad,
+                frame[1] + (y+TILE) as f32 * cell + bounds_pad];
+            if !admit(lo, hi) { continue; }
+            let key = |nx,ny| (tile.level, nx, ny);
+            let neighbor = |nx,ny| state.tiles.get(&key(nx,ny)).copied();
+            let edges = [neighbor(x-TILE,y), neighbor(x+TILE,y),
+                neighbor(x,y-TILE), neighbor(x,y+TILE)];
+            let edge_levels = edges.map(|other| match other {
+                Some((from,to)) => (tile.from.min(from), tile.to.min(to)),
+                None => (1,1), // clipmap holes / exterior must retain every border vertex
+            });
+            let active = tile.from.min(tile.to) as i32;
+            let parent = tile.from.max(tile.to);
+            counts[(active as u8).ilog2().min(4) as usize] += 1;
+            let blend = if tile.from > tile.to { 1.0-progress }
+                else if tile.from < tile.to { progress } else { 0.0 };
+            // Tile-local vertices: independently varying morph weights must
+            // never be shared between adjacent patches on the GPU.
+            let mut local = std::collections::BTreeMap::<(i32,i32),u32>::new();
+            let mut push_vertex = |vx: i32, vy: i32| -> u32 {
+                if let Some(&id) = local.get(&(vx,vy)) { return id; }
+                let (mut parent_step, mut coarse_blend) = (parent, blend);
+                // Both patches touching an edge encode the *same* old/new
+                // edge step and interpolation, keeping the seam watertight.
+                for (edge, on) in [vy == y, vx == x+TILE, vy == y+TILE, vx == x].iter().enumerate() {
+                    if *on {
+                        let (a,b) = edge_levels[[2,1,3,0][edge]];
+                        let p = a.max(b);
+                        let factor = if a > b { 1.0-progress }
+                            else if a < b { progress } else { 0.0 };
+                        if p > parent_step || parent_step == tile.from.max(tile.to) {
+                            parent_step = p; coarse_blend = factor;
+                        }
+                    }
+                }
+                // Tile corners exist at every supported LOD (1, 2, 4, 8,
+                // 16).  They must therefore NEVER be geomorphed: a corner
+                // is duplicated by up to four independently transitioning
+                // tiles, and their edge-specific parent steps can differ.
+                // Moving that shared corner separately opens cracks even
+                // though all four indices refer to the same grid location.
+                // Keeping it at its exact displaced position is both seamless
+                // and pop-free, since no LOD ever removes a tile corner.
+                let permanent_corner = (vx == x || vx == x + TILE)
+                    && (vy == y || vy == y + TILE);
+                let meta = if !permanent_corner && parent_step > 1 && coarse_blend > 0.0 {
+                    1024.0 + 2.0 * parent_step as f32 + coarse_blend
+                } else { 0.0 };
+                let id = vertices.len() as u32;
+                vertices.push(geometry::OceanVertex {
+                    position:[vx as f32 * cell, vy as f32 * cell],
+                    level:[tile.level as f32, meta],
+                });
+                local.insert((vx,vy), id);
+                id
+            };
+            for by in (y..y+TILE).step_by(active as usize) {
+                for bx in (x..x+TILE).step_by(active as usize) {
+                    if active == 1 {
+                        let a=push_vertex(bx,by);
+                        let b=push_vertex(bx+1,by);
+                        let c=push_vertex(bx+1,by+1);
+                        let d=push_vertex(bx,by+1);
+                        // Match the original upstream clockwise winding.
+                        indices.extend_from_slice(&[a,c,b,a,d,c]);
+                        continue;
+                    }
+                    let left = if bx==x {edge_levels[0].0.min(edge_levels[0].1) as i32} else {active};
+                    let right = if bx+active==x+TILE {edge_levels[1].0.min(edge_levels[1].1) as i32} else {active};
+                    let bottom = if by==y {edge_levels[2].0.min(edge_levels[2].1) as i32} else {active};
+                    let top = if by+active==y+TILE {edge_levels[3].0.min(edge_levels[3].1) as i32} else {active};
+                    // Coarse fan with independently stitched edges, never T-junctions.
+                    let mut edge = Vec::<u32>::with_capacity(4*active as usize+1);
+                    edge.push(push_vertex(bx,by));
+                    for py in (by+left..=by+active).step_by(left as usize) {edge.push(push_vertex(bx,py));}
+                    for px in (bx+top..=bx+active).step_by(top as usize) {edge.push(push_vertex(px,by+active));}
+                    for py in (by..by+active).rev() {
+                        if (by+active-py)%right==0 {edge.push(push_vertex(bx+active,py));}
+                    }
+                    for px in (bx..bx+active).rev() {
+                        if (bx+active-px)%bottom==0 && px>bx {edge.push(push_vertex(px,by));}
+                    }
+                    let centre = push_vertex(bx+active/2,by+active/2);
+                    for k in 0..edge.len() {
+                        indices.extend_from_slice(&[centre,edge[k],edge[(k+1)%edge.len()]]);
+                    }
+                }
+            }
+        }
+        if horizon {
+            // Keep the untouched vendor horizon/skirt vertex geometry.
+            let mut remap = std::collections::BTreeMap::<u32, u32>::new();
+            for &old in &self.source_indices[self.horizon_start as usize..self.index_count as usize] {
+                let new = *remap.entry(old).or_insert_with(|| {
+                    let id = vertices.len() as u32;
+                    vertices.push(self.source_vertices[old as usize]);
+                    id
+                });
+                indices.push(new);
+            }
+        }
+        (vertices, indices, counts)
     }
 }

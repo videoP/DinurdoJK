@@ -14,7 +14,9 @@ use jka_assets::ghoul2::{
 };
 use std::collections::HashMap;
 
+#[path = "jiggle/glute_shape.rs"]
 mod glute_shape;
+#[path = "jiggle/tickrate.rs"]
 mod tickrate;
 pub(crate) use glute_shape::GluteShape;
 
@@ -153,7 +155,7 @@ const SIZE_TRAVEL_PER_UNIT: f32 = 0.15;
 const GLUTE_APEX_CENTER_OFFSET: f32 = 0.8;
 /// Samples within this depth of the most-protruding one define the apex.
 const PROTRUSION_APEX_BAND: f32 = 0.75;
-pub(crate) const MAX_GPU_JIGGLE_REGIONS: usize = 4;
+pub(crate) const MAX_GPU_JIGGLE_REGIONS: usize = 5;
 const NO_GPU_JIGGLE_REGION: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +179,7 @@ pub(crate) struct JiggleTuning {
     pub overall_strength: f32,
     pub breast_strength: f32,
     pub glute_strength: f32,
+    pub stomach_strength: f32,
     pub stiffness_scale: f32,
     pub damping_scale: f32,
     /// Signed model-space Z offsets (JKA units) applied only to the glute motion
@@ -210,6 +213,8 @@ pub(crate) struct JiggleTuning {
     pub breast_damping: f32,
     pub glute_stiffness: f32,
     pub glute_damping: f32,
+    pub stomach_stiffness: f32,
+    pub stomach_damping: f32,
     /// Size sliders (same values as JiggleRemeshTuning); see
     /// SIZE_STIFFNESS_PER_UNIT / SIZE_TRAVEL_PER_UNIT.
     pub breast_size: f32,
@@ -219,8 +224,9 @@ pub(crate) struct JiggleTuning {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct JiggleRemeshTuning {
-    /// Anny v1 shape recipe, applied once before anatomical fitting/promotion.
+    /// Universal bind-space humanoid shape, applied once before anatomical fitting/promotion.
     pub body_shape: jka_assets::body_shape::BodyShapeParams,
+    pub body_details: jka_assets::body_shape::anny::Details,
     /// Signed model-space Z offsets in JKA units from the auto-fitted remesh bounds.
     pub breast_bottom_z: f32,
     pub breast_top_z: f32,
@@ -236,6 +242,7 @@ impl Default for JiggleRemeshTuning {
     fn default() -> Self {
         Self {
             body_shape: Default::default(),
+            body_details: Default::default(),
             breast_bottom_z: 0.0,
             breast_top_z: 0.0,
             glute_bottom_z: 0.0,
@@ -250,6 +257,7 @@ impl JiggleRemeshTuning {
     pub(crate) fn clamped(self) -> Self {
         Self {
             body_shape: self.body_shape.clamped(),
+            body_details: self.body_details.clamped(),
             breast_bottom_z: self.breast_bottom_z.clamp(-8.0, 8.0),
             breast_top_z: self.breast_top_z.clamp(-8.0, 8.0),
             glute_bottom_z: self.glute_bottom_z.clamp(-8.0, 8.0),
@@ -266,6 +274,7 @@ impl Default for JiggleTuning {
             overall_strength: 1.0,
             breast_strength: 1.0,
             glute_strength: 1.0,
+            stomach_strength: 0.0,
             stiffness_scale: 1.0,
             damping_scale: 1.0,
             glute_jiggle_bottom_z: 0.0,
@@ -283,6 +292,8 @@ impl Default for JiggleTuning {
             breast_damping: 1.0,
             glute_stiffness: 1.0,
             glute_damping: 1.0,
+            stomach_stiffness: 1.0,
+            stomach_damping: 1.0,
             breast_size: 0.0,
             glute_size: 0.0,
         }
@@ -293,6 +304,7 @@ impl Default for JiggleTuning {
 enum RegionSide {
     NegativeX,
     PositiveX,
+    Center,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,6 +340,8 @@ struct RegionSpec {
     strength: f32,
     side: RegionSide,
     semantic: SemanticMask,
+    /// Motion-only partition; keep authored breast size geometry unchanged.
+    motion_bottom_z: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,11 +385,71 @@ fn surface_boundary_vertices(surface: &GlmSurface) -> Vec<bool> {
     boundary
 }
 
+/// UV/hard-normal splits and torso/hips material seams are not openings in
+/// the abdomen. Weld positions across its surfaces before finding open edges.
+fn stomach_boundaries(
+    glm: &GlmModel,
+    lod_index: usize,
+    surfaces: &[String],
+) -> HashMap<usize, Vec<bool>> {
+    let mut ids = HashMap::<[i32; 3], u32>::new();
+    let mut bindings = HashMap::new();
+    let mut edges = HashMap::<(u32, u32), usize>::new();
+    let Some(lod) = glm.lods.get(lod_index) else {
+        return HashMap::new();
+    };
+    for surface in &lod.surfaces {
+        let Some(entry) = glm.hierarchy.get(surface.surface_index) else {
+            continue;
+        };
+        if !surfaces
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&entry.name))
+        {
+            continue;
+        }
+        let vertices = surface
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let key = vertex.position.map(|v| (v * 4096.0).round() as i32);
+                let next = ids.len() as u32;
+                *ids.entry(key).or_insert(next)
+            })
+            .collect::<Vec<_>>();
+        for triangle in &surface.triangles {
+            let [a, b, c] = triangle.map(|i| vertices[i as usize]);
+            for (a, b) in [(a, b), (b, c), (c, a)] {
+                if a != b {
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+        }
+        bindings.insert(surface.surface_index, vertices);
+    }
+    let mut open = vec![false; ids.len()];
+    for ((a, b), uses) in edges {
+        if uses == 1 {
+            open[a as usize] = true;
+            open[b as usize] = true;
+        }
+    }
+    bindings
+        .into_iter()
+        .map(|(surface, vertices)| {
+            (
+                surface,
+                vertices.into_iter().map(|id| open[id as usize]).collect(),
+            )
+        })
+        .collect()
+}
+
 /// Where a `_humanoid` model gets its anatomical search landmarks.
 /// The soft-tissue fit and its physics are identical for both variants.
 #[derive(Clone, Copy)]
 enum AnatomyReference<'a> {
-    Raven,
+    Raven { native_pivots: Option<&'a [[f32; 3]]> },
     Source { native_pivots: Option<&'a [[f32; 3]]> },
 }
 
@@ -414,6 +488,7 @@ impl JiggleProfile {
                 solver_root_bone: Some(0), center: [1.0, 0.0, 0.0], radius: [1.0; 3],
                 response: [1.0; 3], stiffness: 0.2, damping: 0.1, max_offset: 4.0,
                 strength: 1.0, side: RegionSide::PositiveX,
+                motion_bottom_z: None,
                 semantic: SemanticMask { allowed_bones: vec![0], facing_y: -1.0 },
             }],
             lod_masks: vec![], gpu_compatible: true, source_anatomy: false,
@@ -424,8 +499,9 @@ impl JiggleProfile {
     pub(crate) fn auto_humanoid(
         glm: &GlmModel,
         gla: &GlaAnimation,
+        native_pivots: Option<&[[f32; 3]]>,
     ) -> Result<Option<Self>, String> {
-        Self::auto_anatomical(glm, gla, AnatomyReference::Raven)
+        Self::auto_anatomical(glm, gla, AnatomyReference::Raven { native_pivots })
     }
 
     /// Source meshes have the same rebound `_humanoid` skin weights but no
@@ -452,7 +528,7 @@ impl JiggleProfile {
             return Ok(None);
         }
         let (chest_surfaces, hip_surfaces) = match reference {
-            AnatomyReference::Raven => (surface_family(glm, "torso"), surface_family(glm, "hips")),
+            AnatomyReference::Raven { .. } => (surface_family(glm, "torso"), surface_family(glm, "hips")),
             AnatomyReference::Source { .. } => {
                 // Generated Source bodypart names are arbitrary. Skin weights,
                 // facing normals and search height reject other anatomy.
@@ -485,7 +561,7 @@ impl JiggleProfile {
         // Source detection needs a complete central spine to place search
         // windows. Raven profiles retain partial-region fallback semantics.
         let source_heights = match reference {
-            AnatomyReference::Raven => None,
+            AnatomyReference::Raven { .. } => None,
             AnatomyReference::Source { native_pivots } => {
                 let (Some(_), Some(upper), Some(chest), Some(hips)) =
                     (lower_lumbar, upper_lumbar, thoracic, pelvis) else {
@@ -515,7 +591,7 @@ impl JiggleProfile {
                 // Only the reference points and (stock-tuned) footprint caps
                 // differ. The actual flesh fitting is exactly the same.
                 let (z_min, z_max, lateral, max_radius) = match reference {
-                    AnatomyReference::Raven => {
+                    AnatomyReference::Raven { .. } => {
                         let (Some(lower), Some(upper)) =
                             (marker_centroid(glm, lower_marker), marker_centroid(glm, upper_marker))
                         else { continue };
@@ -558,6 +634,7 @@ impl JiggleProfile {
                         response: [0.45, 0.80, 1.00],
                         stiffness: 0.10, damping: 0.18, max_offset: 1.15,
                         strength: 1.0, side, semantic,
+                        motion_bottom_z: None,
                     });
                 }
             }
@@ -570,7 +647,7 @@ impl JiggleProfile {
             ] {
                 let (Some(femur_yz), Some(femur_x)) = (femur_yz, femur_x) else { continue };
                 let (z_min, z_max, lateral) = match reference {
-                    AnatomyReference::Raven => {
+                    AnatomyReference::Raven { .. } => {
                         let Some(back) = marker_centroid(glm, back_marker) else { continue };
                         (back[2] - 11.5, back[2] + 1.2,
                          Some((back[0] * 0.85, (back[0].abs() * 1.35).clamp(4.0, 5.5))))
@@ -614,20 +691,77 @@ impl JiggleProfile {
                         response: [0.30, 0.80, 1.00],
                         stiffness: 0.12, damping: 0.20, max_offset: 0.95,
                         strength: 1.0, side, semantic,
+                        motion_bottom_z: None,
                     });
                 }
             }
         }
 
-        if regions.is_empty() { return Ok(None) }
         // Raven helpers can be asymmetrical; both formats use one correction.
         symmetrize_pair(&mut regions, "breast_left", "breast_right");
         symmetrize_pair(&mut regions, "glute_left", "glute_right");
 
-        if matches!(reference, AnatomyReference::Source { .. }) {
-            // A Source bodypart may be extremely low-poly: discard regions
-            // without movable interior vertices before compiling the profile.
+        // Fit the whole abdomen up to the lower rib cage, not just the pelvis
+        // to upper-lumbar interval (which omits the upper belly). The
+        // stomach is one centered particle rather than two mirrored halves.
+        if let (Some(pelvis), Some(lower), Some(upper)) = (pelvis, lower_lumbar, upper_lumbar) {
+            let pivots = match reference {
+                AnatomyReference::Source { native_pivots } => native_pivots,
+                AnatomyReference::Raven { native_pivots } => native_pivots,
+            };
+            let bottom = source_joint_z(gla, pivots, pelvis);
+            let top = thoracic.map_or(source_joint_z(gla, pivots, upper), |bone| source_joint_z(gla, pivots, bone));
+            let mut surfaces = chest_surfaces.clone();
+            for surface in &hip_surfaces {
+                if !surfaces.contains(surface) {
+                    surfaces.push(surface.clone());
+                }
+            }
+            surfaces.retain(|name| !name.contains("_cap_") && !name.ends_with("_off"));
+            let mut allowed_bones = vec![pelvis, lower, upper];
+            if let Some(thoracic) = thoracic { allowed_bones.push(thoracic); }
+            if let Some(region) = fit_stomach_region(
+                glm,
+                surfaces,
+                allowed_bones,
+                lower,
+                bottom,
+                top,
+            ) {
+                let boundaries = stomach_boundaries(glm, 0, &region.surfaces);
+                let has_interior = glm.lods[0].surfaces.iter().any(|surface| {
+                    let name = &glm.hierarchy[surface.surface_index].name;
+                    if !region
+                        .surfaces
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+                    {
+                        return false;
+                    }
+                    let Some(boundary) = boundaries.get(&surface.surface_index) else { return false; };
+                    surface.vertices.iter().enumerate().any(|(i, vertex)| {
+                        !boundary[i] && region_vertex_weight(&region, surface, vertex) > 0.0001
+                    })
+                });
+                if has_interior {
+                    // Fullness can pull the chest fitter downward on merged
+                    // Source meshes. Reserve the abdomen for its own particle,
+                    // keeping disjoint GPU masks and the chest's upper extent.
+                    for chest in regions.iter_mut().filter(|r| r.name.contains("breast")) {
+                        chest.motion_bottom_z = Some(top);
+                    }
+                    regions.push(region);
+                }
+            }
+        }
+
+        if regions.is_empty() { return Ok(None) }
+        if matches!(reference, AnatomyReference::Source { .. })
+            || regions.iter().any(|region| region.name == "stomach") {
+            // Discard empty masks on low-poly bodyparts or after reserving
+            // abdominal geometry for the stomach particle.
             regions.retain(|region| {
+                let stomach = (region.name == "stomach").then(|| stomach_boundaries(glm, 0, &region.surfaces));
                 glm.lods.first().is_some_and(|lod| lod.surfaces.iter().any(|surface| {
                     glm.hierarchy.get(surface.surface_index).is_some_and(|entry| {
                         region.surfaces.iter().any(|name| entry.name.eq_ignore_ascii_case(name))
@@ -636,6 +770,7 @@ impl JiggleProfile {
                             .then(|| surface_boundary_vertices(surface));
                         surface.vertices.iter().enumerate().any(|(index, vertex)| {
                             !boundary.as_ref().is_some_and(|boundary| boundary[index])
+                                && !stomach.as_ref().and_then(|masks| masks.get(&surface.surface_index)).is_some_and(|mask| mask[index])
                                 && region_vertex_weight(region, surface, vertex) > 0.0001
                         })
                     }
@@ -655,7 +790,9 @@ impl JiggleProfile {
         let mut lod_masks = Vec::with_capacity(glm.lods.len());
         let mut gpu_compatible = regions.len() <= MAX_GPU_JIGGLE_REGIONS;
         let mut region_selected = vec![false; regions.len()];
-        for lod in &glm.lods {
+        for (lod_index, lod) in glm.lods.iter().enumerate() {
+            let stomach = regions.iter().find(|region| region.name == "stomach")
+                .map(|region| stomach_boundaries(glm, lod_index, &region.surfaces));
             let mut masks = HashMap::<usize, SurfaceMask>::new();
             for surface in &lod.surfaces {
                 let Some(hierarchy) = glm.hierarchy.get(surface.surface_index) else {
@@ -673,7 +810,9 @@ impl JiggleProfile {
                         for (index, vertex) in surface.vertices.iter().enumerate() {
                             // A neighbouring surface may have no glute motion. Keep
                             // their shared authored edge on the skinned position.
-                            let weight = if region.name.contains("glute") && boundary[index] {
+                            let pinned = (region.name.contains("glute") && boundary[index])
+                                || (region.name == "stomach" && stomach.as_ref().and_then(|masks| masks.get(&surface.surface_index)).is_some_and(|mask| mask[index]));
+                            let weight = if pinned {
                                 0.0
                             } else {
                                 region_vertex_weight(region, surface, vertex)
@@ -805,7 +944,7 @@ impl JiggleProfile {
 
     /// GPU skinning keeps one dominant region per vertex so the existing
     /// 80-byte Ghoul2 vertex can reuse its padding without growing every player
-    /// vertex. Four regions cover the stock breasts/glutes profile.
+    /// vertex. Five regions cover paired breasts/glutes and a centered stomach.
     pub(crate) fn gpu_vertex_binding(
         &self,
         lod_index: usize,
@@ -880,6 +1019,8 @@ impl JiggleProfile {
         let regional = self.regions.get(region_index).map_or(1.0, |region| {
             if region.name.to_ascii_lowercase().contains("glute") {
                 tuning.glute_strength
+            } else if region.name == "stomach" {
+                tuning.stomach_strength
             } else {
                 tuning.breast_strength
             }
@@ -919,6 +1060,7 @@ impl JiggleProfile {
         tuning: JiggleRemeshTuning,
     ) -> f32 {
         let Some(region) = self.regions.get(region_index as usize) else { return 0.0 };
+        if region.name == "stomach" { return 1.0; }
         let radius = region.radius[2].max(0.0001);
         let local_z = model_z - region.center[2];
         let glute = region.name.to_ascii_lowercase().contains("glute");
@@ -954,6 +1096,8 @@ impl JiggleProfile {
         tuning: JiggleRemeshTuning,
     ) -> [f32; 3] {
         let Some(region) = self.regions.get(region_index as usize) else { return [0.0; 3] };
+        // Breast/glute size controls must never inflate the abdomen.
+        if region.name == "stomach" { return [0.0; 3]; }
         if weight <= 0.0 {
             return [0.0; 3];
         }
@@ -1009,6 +1153,7 @@ impl JiggleProfile {
         let side_sign = match region.side {
             RegionSide::PositiveX => 1.0,
             RegionSide::NegativeX => -1.0,
+            RegionSide::Center => 0.0,
         };
         // Widen about the region's own center: the outer half pushes outward,
         // the inner half toward the midline (fills the cleavage gap). The
@@ -1072,6 +1217,7 @@ impl JiggleProfile {
         target[0] = match egg.side {
             RegionSide::PositiveX => target[0].max(position[0].min(BreastEgg::MIDLINE)),
             RegionSide::NegativeX => target[0].min(position[0].max(-BreastEgg::MIDLINE)),
+            RegionSide::Center => target[0],
         };
         let height = (target[2] - egg.center[2]) / egg.rz_upper.max(0.0001);
         let top_fade = 1.0 - smoothstep(BreastEgg::TOP_FADE, 1.0, height);
@@ -1089,6 +1235,7 @@ impl JiggleProfile {
         let side = match egg.side {
             RegionSide::PositiveX => 1.0,
             RegionSide::NegativeX => -1.0,
+            RegionSide::Center => 0.0,
         };
         let tip = [BreastEgg::TIP_OUT * side, -1.0, -BreastEgg::TIP_DOWN];
         let tip = mul(tip, 1.0 / length(tip));
@@ -1323,6 +1470,7 @@ impl JiggleSystem {
             overall_strength: tuning.overall_strength.clamp(0.0, 2.0),
             breast_strength: tuning.breast_strength.clamp(0.0, 2.0),
             glute_strength: tuning.glute_strength.clamp(0.0, 2.0),
+            stomach_strength: tuning.stomach_strength.clamp(0.0, 2.0),
             stiffness_scale: tuning.stiffness_scale.clamp(0.0, 3.0),
             damping_scale: tuning.damping_scale.clamp(0.0, 3.0),
             glute_jiggle_bottom_z: tuning.glute_jiggle_bottom_z.clamp(-8.0, 8.0),
@@ -1340,6 +1488,8 @@ impl JiggleSystem {
             breast_damping: tuning.breast_damping.clamp(0.0, 3.0),
             glute_stiffness: tuning.glute_stiffness.clamp(0.0, 3.0),
             glute_damping: tuning.glute_damping.clamp(0.0, 3.0),
+            stomach_stiffness: tuning.stomach_stiffness.clamp(0.0, 3.0),
+            stomach_damping: tuning.stomach_damping.clamp(0.0, 3.0),
             breast_size: tuning.breast_size.clamp(-2.0, 3.0),
             glute_size: tuning.glute_size.clamp(-2.0, 4.0),
         };
@@ -1490,6 +1640,7 @@ impl JiggleSystem {
                 let side_sign = match region.side {
                     RegionSide::PositiveX => 1.0,
                     RegionSide::NegativeX => -1.0,
+                    RegionSide::Center => 0.0,
                 };
                 let swirl_angle = tuning.swirl * SWIRL_RATE * fixed_step * side_sign;
                 let (region_stiffness, region_damping, region_size) =
@@ -1499,6 +1650,8 @@ impl JiggleSystem {
                             tuning.glute_damping,
                             tuning.glute_size,
                         )
+                    } else if region.name == "stomach" {
+                        (tuning.stomach_stiffness, tuning.stomach_damping, 0.0)
                     } else {
                         (
                             tuning.breast_stiffness,
@@ -1745,6 +1898,7 @@ fn symmetrize_pair(regions: &mut [RegionSpec], left: &str, right: &str) {
         let sign = match regions[index].side {
             RegionSide::PositiveX => 1.0,
             RegionSide::NegativeX => -1.0,
+            RegionSide::Center => 0.0,
         };
         regions[index].center = [center_x * sign, center_y, center_z];
         regions[index].radius = radius;
@@ -1861,8 +2015,21 @@ fn region_vertex_weight(region: &RegionSpec, surface: &GlmSurface, vertex: &GlmV
     // opposite side of the torso/hips. The geometry falloff still reaches
     // zero with zero derivative at the region boundary.
     let facing_weight = ((facing - 0.03) / 0.55).clamp(0.0, 1.0);
-    let base = 1.0 - q;
-    (base * base * (0.30 + 0.70 * facing_weight) * bone_weight.clamp(0.0, 1.0) * region.strength)
+    let footprint = if region.name == "stomach" {
+        // A broad moving volume, with a soft perimeter, rather than a small
+        // point of motion centered on the lower abdomen.
+        1.0 - smoothstep(0.55, 1.0, q.sqrt())
+    } else {
+        (1.0 - q).powi(2)
+    };
+    let partition = region
+        .motion_bottom_z
+        .map_or(1.0, |bottom| smoothstep(bottom, bottom + 1.0, position[2]));
+    (footprint
+        * partition
+        * (0.30 + 0.70 * facing_weight)
+        * bone_weight.clamp(0.0, 1.0)
+        * region.strength)
         .clamp(0.0, 1.0)
 }
 
@@ -2119,10 +2286,134 @@ fn fit_semantic_region(
     Some((mean, [radius_x, 1.0, radius_z], apex_z))
 }
 
+/// Conservative geometry-only belly detector. Compare central front vertices
+/// against a line between lower/upper abdominal bands, so thickness, posture,
+/// and a flat or sloping stomach alone cannot enable motion. Require broad
+/// fullness on both sides, rather than a single protruding vertex/accessory.
+fn fit_stomach_region(
+    glm: &GlmModel,
+    surfaces: Vec<String>,
+    allowed_bones: Vec<usize>,
+    root: usize,
+    bottom: f32,
+    top: f32,
+) -> Option<RegionSpec> {
+    let height = top - bottom;
+    if !height.is_finite() || height < 4.0 {
+        return None;
+    }
+    let scale = height / 10.0;
+    let width = height * 0.65;
+    let semantic = SemanticMask {
+        allowed_bones,
+        facing_y: -1.0,
+    };
+    let mut samples = Vec::new();
+    for surface in &glm.lods.first()?.surfaces {
+        let name = &glm.hierarchy.get(surface.surface_index)?.name;
+        if !surfaces
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        for vertex in &surface.vertices {
+            let [x, y, z] = vertex.position;
+            let t = (z - bottom) / height;
+            if !(0.0..=1.0).contains(&t)
+                || x.abs() > width * 0.6
+                || vertex.normal[1] > -0.25
+                || semantic_bone_weight(surface, vertex, &semantic.allowed_bones) < 0.6
+            {
+                continue;
+            }
+            samples.push((x, -y, t));
+        }
+    }
+    // Reference the mesh's actual end rows. Low-poly GLMs often have no
+    // vertices in the fixed 20% bands of the skeleton's abdominal interval.
+    let min_t = samples.iter().map(|s| s.2).fold(f32::INFINITY, f32::min);
+    let max_t = samples
+        .iter()
+        .map(|s| s.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_t - min_t < 0.4 {
+        return None;
+    }
+    // Medians tolerate isolated belt buckles and overlapping garment vertices.
+    let band = |upper: bool| -> Option<(f32, f32)> {
+        let mut values = samples
+            .iter()
+            .filter(|s| {
+                if upper {
+                    s.2 >= max_t - 0.18 * (max_t - min_t)
+                } else {
+                    s.2 <= min_t + 0.18 * (max_t - min_t)
+                }
+            })
+            .map(|s| (s.1, s.2))
+            .collect::<Vec<_>>();
+        if values.len() < 3 {
+            return None;
+        }
+        values.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Some(values[values.len() / 2])
+    };
+    let (lower_depth, lower_t) = band(false)?;
+    let (upper_depth, upper_t) = band(true)?;
+    let mut fullness = samples
+        .iter()
+        .filter_map(|&(x, depth, t)| {
+            if !(0.2..0.8).contains(&t) {
+                return None;
+            }
+            let baseline =
+                lower_depth + (upper_depth - lower_depth) * (t - lower_t) / (upper_t - lower_t);
+            let bulge = depth - baseline;
+            (bulge > 0.75 * scale).then_some((x, bulge, depth, t))
+        })
+        .collect::<Vec<_>>();
+    // Sparse stock GLMs may have just two belly rows per side. Require
+    // bilateral, vertically distributed fullness rather than six dense points.
+    let fullness_min_t = fullness.iter().map(|s| s.3).fold(f32::INFINITY, f32::min);
+    let fullness_max_t = fullness
+        .iter()
+        .map(|s| s.3)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if fullness.len() < 4
+        || fullness_max_t - fullness_min_t < 0.10
+        || !fullness.iter().any(|s| s.0 < -scale)
+        || !fullness.iter().any(|s| s.0 > scale)
+    {
+        return None;
+    }
+    fullness.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let (_, bulge, depth, _) = fullness[fullness.len() / 2];
+    Some(RegionSpec {
+        name: "stomach".into(),
+        surfaces,
+        anchor_terms: Vec::new(),
+        solver_root_bone: Some(root),
+        center: [0.0, -depth, (bottom + top) * 0.5],
+        radius: [width, 1.0, height * 0.5],
+        response: [0.25, 0.85, 1.0],
+        stiffness: 0.12,
+        damping: 0.22,
+        max_offset: 0.85 * scale,
+        // Detection already establishes fullness. Do not almost mute valid
+        // sparse bellies a second time at the detection threshold.
+        strength: smoothstep(0.0, 1.5 * scale, bulge),
+        side: RegionSide::Center,
+        semantic,
+        motion_bottom_z: None,
+    })
+}
+
 fn region_side_matches(side: RegionSide, x: f32) -> bool {
     match side {
         RegionSide::NegativeX => x < 0.0,
         RegionSide::PositiveX => x >= 0.0,
+        RegionSide::Center => true,
     }
 }
 
@@ -2360,7 +2651,7 @@ mod tests {
     fn stock_jka_still_fits_from_raven_markers() {
         let gla = synthetic_source_gla();
         let glm = synthetic_raven_glm();
-        let profile = JiggleProfile::auto_humanoid(&glm, &gla)
+        let profile = JiggleProfile::auto_humanoid(&glm, &gla, None)
             .unwrap().expect("Raven fixture should have four regions");
         assert_eq!(profile.region_count(), 4);
         assert!(profile.affects_surface(0, 0));
@@ -2374,10 +2665,355 @@ mod tests {
         assert!((glute.radius[0] - 4.725).abs() < 0.001);
     }
 
+    fn add_test_abdomen(glm: &mut GlmModel, bulge: f32, slope: f32) -> usize {
+        use jka_assets::ghoul2::GlmWeight;
+        // The larger anatomical window now includes the lower chest; keep a
+        // sloping flat fixture planar there as well as over its abdomen.
+        for surface in &mut glm.lods[0].surfaces {
+            for vertex in &mut surface.vertices {
+                if vertex.normal[1] < 0.0 && vertex.position[2] >= 49.0 {
+                    vertex.position[1] -= slope * (vertex.position[2] - 39.0) / 10.0;
+                }
+            }
+        }
+        let body = &mut glm.lods[0].surfaces[0];
+        let bone = body.bone_references.len();
+        body.bone_references.push(1); // lower_lumbar
+        let start = body.vertices.len();
+        for row in 0..9 {
+            let t = row as f32 / 8.0;
+            for col in 0..9 {
+                let x = col as f32 - 4.0;
+                let dome = (std::f32::consts::PI * t).sin().powi(2) * (1.0 - (x / 5.0).powi(2));
+                body.vertices.push(GlmVertex {
+                    position: [x, -(4.0 + slope * t + bulge * dome), 39.0 + t * 10.0],
+                    normal: [0.0, -1.0, 0.0],
+                    weights: vec![GlmWeight {
+                        local_bone_index: bone,
+                        weight: 1.0,
+                    }],
+                });
+                body.texcoords.push([col as f32 / 8.0, t]);
+            }
+        }
+        for row in 0..8 {
+            for col in 0..8 {
+                let i = (start + row * 9 + col) as u32;
+                body.triangles
+                    .extend([[i, i + 1, i + 9], [i + 1, i + 10, i + 9]]);
+            }
+        }
+        start
+    }
+
+    #[test]
+    fn stomach_requires_broad_abdominal_fullness_for_raven_and_source() {
+        let gla = synthetic_source_gla();
+        for source in [false, true] {
+            for (bulge, slope, expected) in [
+                (0.0, 0.0, false),
+                (0.0, 5.0, false),
+                (0.3, 0.0, false),
+                (3.0, 0.0, true),
+                (3.0, 3.0, true),
+            ] {
+                let mut glm = if source {
+                    synthetic_source_glm()
+                } else {
+                    synthetic_raven_glm()
+                };
+                let start = add_test_abdomen(&mut glm, bulge, slope);
+                let profile = if source {
+                    JiggleProfile::auto_source_humanoid(&glm, &gla, None)
+                } else {
+                    JiggleProfile::auto_humanoid(&glm, &gla, None)
+                }
+                .unwrap()
+                .unwrap();
+                let stomach = profile.regions.iter().position(|r| r.name == "stomach");
+                assert_eq!(
+                    stomach.is_some(),
+                    expected,
+                    "source={source} bulge={bulge} slope={slope}"
+                );
+                assert!(profile.gpu_supported());
+                if let Some(index) = stomach {
+                    assert_eq!(index, 4);
+                    let (region, weight, coord) = profile.gpu_vertex_binding(0, 0, start + 40);
+                    assert_eq!(region, index as u32);
+                    assert!(weight > 0.1);
+                    assert_eq!(coord, 4.0); // never uses glute height controls
+                    let base = JiggleTuning::default();
+                    assert_eq!(profile.gpu_offsets(&[[1.0; 3]; 5], base)[index], [0.0; 4]);
+                    let enabled = JiggleTuning {
+                        stomach_strength: 1.0,
+                        breast_strength: 0.0,
+                        glute_strength: 0.0,
+                        ..base
+                    };
+                    assert_eq!(
+                        profile.gpu_offsets(&[[1.0; 3]; 5], enabled)[index],
+                        [1.0, 1.0, 1.0, 0.0]
+                    );
+                    assert_eq!(
+                        profile.size_displacement(
+                            region,
+                            weight,
+                            [0.0, -7.0, 44.0],
+                            [0.0, -1.0, 0.0],
+                            JiggleRemeshTuning {
+                                breast_size: 3.0,
+                                glute_size: 4.0,
+                                ..Default::default()
+                            }
+                        ),
+                        [0.0; 3]
+                    );
+                    assert_eq!(profile.gpu_vertex_binding(0, 0, start).1, 0.0); // open edge pinned
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_belly_rows_need_no_vertices_at_skeleton_band_edges() {
+        use jka_assets::ghoul2::GlmWeight;
+        let gla = synthetic_source_gla();
+        let mut glm = synthetic_raven_glm();
+        let body = &mut glm.lods[0].surfaces[0];
+        let bone = body.bone_references.len();
+        body.bone_references.push(1);
+        let start = body.vertices.len();
+        for row in 0..4 {
+            let t = row as f32 / 3.0;
+            for x in [-4.0f32, -2.0, 2.0, 4.0] {
+                let bulge = 3.0 * (std::f32::consts::PI * t).sin().powi(2) * (1.0 - (x / 5.0).powi(2));
+                body.vertices.push(GlmVertex {
+                    position: [x, -4.0 - bulge, 41.5 + t * 10.0],
+                    normal: [0.0, -1.0, 0.0],
+                    weights: vec![GlmWeight {
+                        local_bone_index: bone,
+                        weight: 1.0,
+                    }],
+                });
+                body.texcoords.push([0.0; 2]);
+            }
+        }
+        for row in 0..3 {
+            for col in 0..3 {
+                let i = (start + row * 4 + col) as u32;
+                body.triangles
+                    .extend([[i, i + 1, i + 4], [i + 1, i + 5, i + 4]]);
+            }
+        }
+        let profile = JiggleProfile::auto_humanoid(&glm, &gla, None)
+            .unwrap()
+            .unwrap();
+        let stomach = profile
+            .regions
+            .iter()
+            .position(|r| r.name == "stomach")
+            .expect("sparse belly should fit");
+        assert!(profile.gpu_supported());
+        let (index, weight, _) = profile.gpu_vertex_binding(0, 0, start + 9);
+        assert_eq!(index as usize, stomach);
+        assert!(
+            weight > 0.3,
+            "upper belly should have visible motion: {weight}"
+        );
+    }
+
+    #[test]
+    fn stomach_motion_crosses_uv_and_material_seams_without_changing_breast_shape() {
+        let gla = synthetic_source_gla();
+        let mut glm = synthetic_raven_glm();
+        let baseline = JiggleProfile::auto_humanoid(&glm, &gla, None)
+            .unwrap()
+            .unwrap();
+        add_test_abdomen(&mut glm, 3.0, 0.0);
+        let original = glm.lods[0].surfaces[0].clone();
+        let mut lower = original.clone();
+        lower.vertices.clear();
+        lower.texcoords.clear();
+        lower.triangles.clear();
+        let mut upper = lower.clone();
+        upper.surface_index = glm.hierarchy.len();
+        let mut hierarchy = glm.hierarchy[0].clone();
+        hierarchy.name = "torso_material_seam".into();
+        glm.hierarchy.push(hierarchy);
+        // Separate every triangle's vertices, then split across two materials.
+        for triangle in &original.triangles {
+            let mean_z = triangle
+                .iter()
+                .map(|&i| original.vertices[i as usize].position[2])
+                .sum::<f32>()
+                / 3.0;
+            let out = if mean_z > 44.0 {
+                &mut upper
+            } else {
+                &mut lower
+            };
+            let first = out.vertices.len() as u32;
+            for &index in triangle {
+                out.vertices.push(original.vertices[index as usize].clone());
+                out.texcoords.push(original.texcoords[index as usize]);
+            }
+            out.triangles.push([first, first + 1, first + 2]);
+        }
+        glm.lods[0].surfaces[0] = lower;
+        glm.lods[0].surfaces.push(upper);
+        let profile = JiggleProfile::auto_humanoid(&glm, &gla, None)
+            .unwrap()
+            .unwrap();
+        let stomach = profile
+            .regions
+            .iter()
+            .position(|r| r.name == "stomach")
+            .unwrap();
+        let mut seam_weights = Vec::new();
+        for surface in &glm.lods[0].surfaces {
+            for (i, v) in surface.vertices.iter().enumerate() {
+                if v.position[0] == 0.0 && v.position[2] == 44.0 {
+                    let (region, weight, _) = profile.gpu_vertex_binding(0, surface.surface_index, i);
+                    assert_eq!(region as usize, stomach);
+                    seam_weights.push(weight);
+                }
+            }
+        }
+        assert!(seam_weights.len() > 2);
+        assert!(seam_weights.iter().all(|w| *w > 0.5));
+        for breast in baseline
+            .regions
+            .iter()
+            .filter(|r| r.name.contains("breast"))
+        {
+            let fitted = profile
+                .regions
+                .iter()
+                .find(|r| r.name == breast.name)
+                .unwrap();
+            assert_eq!(fitted.center, breast.center);
+            assert_eq!(fitted.radius, breast.radius);
+        }
+    }
+
+    #[test]
+    fn stomach_fit_tracks_shaped_raven_and_source_pivots() {
+        let gla = synthetic_source_gla();
+        for source in [false, true] {
+            let mut glm = if source {
+                synthetic_source_glm()
+            } else {
+                synthetic_raven_glm()
+            };
+            add_test_abdomen(&mut glm, 3.0, 0.0);
+            for surface in &mut glm.lods[0].surfaces {
+                for vertex in &mut surface.vertices {
+                    vertex.position[2] += 20.0;
+                }
+            }
+            let pivots = gla
+                .skeleton
+                .iter()
+                .map(|bone| [0.0, 0.0, bone.base_pose[2][3] + 20.0])
+                .collect::<Vec<_>>();
+            let profile = if source {
+                JiggleProfile::auto_source_humanoid(&glm, &gla, Some(&pivots))
+            } else {
+                JiggleProfile::auto_humanoid(&glm, &gla, Some(&pivots))
+            }
+            .unwrap()
+            .unwrap();
+            let stomach = profile
+                .regions
+                .iter()
+                .find(|region| region.name == "stomach")
+                .unwrap();
+            assert!((stomach.center[2] - 66.0).abs() < 0.001);
+            assert!(profile.gpu_supported());
+        }
+    }
+
+    #[test]
+    fn stomach_rejects_back_unrelated_skin_and_isolated_protrusions() {
+        let gla = synthetic_source_gla();
+        for rejection in 0..3 {
+            let mut glm = synthetic_source_glm();
+            let start = add_test_abdomen(&mut glm, 3.0, 0.0);
+            let body = &mut glm.lods[0].surfaces[0];
+            body.bone_references.push(10); // unrelated head/appendage
+            for (i, vertex) in body.vertices[start..].iter_mut().enumerate() {
+                match rejection {
+                    0 => vertex.normal = [0.0, 1.0, 0.0],
+                    1 => vertex.weights[0].local_bone_index = 3,
+                    _ if i != 40 => vertex.position[1] = -4.0,
+                    _ => vertex.position[1] = -15.0,
+                }
+            }
+            let profile = JiggleProfile::auto_source_humanoid(&glm, &gla, None)
+                .unwrap()
+                .unwrap();
+            assert!(!profile.regions.iter().any(|r| r.name == "stomach"));
+        }
+    }
+
+    #[test]
+    fn stomach_both_solvers_respond_to_acceleration_and_pack_cpu_gpu_equally() {
+        let gla = synthetic_source_gla();
+        let mut glm = synthetic_source_glm();
+        let start = add_test_abdomen(&mut glm, 3.0, 0.0);
+        let profile = JiggleProfile::auto_source_humanoid(&glm, &gla, None)
+            .unwrap()
+            .unwrap();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let pose = vec![identity; gla.skeleton.len()];
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        for solver in [JiggleSolver::KawaiiPhysics, JiggleSolver::JigglePhysics] {
+            let tuning = JiggleTuning {
+                solver,
+                stomach_strength: 1.25,
+                breast_strength: 0.0,
+                glute_strength: 0.0,
+                ..Default::default()
+            };
+            let mut system = JiggleSystem::default();
+            system.set_config(true, 60, 4, tuning);
+            for (time, x) in [(0, 0.0), (17, 0.0), (34, 1.0)] {
+                system.simulate_snapshot(1, "belly", &profile, &pose, axis, [x, 0.0, 0.0], time);
+            }
+            let snapshot =
+                system.simulate_snapshot(1, "belly", &profile, &pose, axis, [3.0, 0.0, 0.0], 51);
+            assert!(length(snapshot.offsets[4]) > 0.001, "{solver:?}");
+            assert!(snapshot.offsets.iter().flatten().all(|v| v.is_finite()));
+            let surface = &glm.lods[0].surfaces[0];
+            let mut skinned = jka_assets::ghoul2::skin_glm_surface(surface, &pose).unwrap();
+            let original = skinned.vertices[start + 40].position;
+            profile.deform_surface(0, 0, &snapshot.offsets, tuning, &mut skinned);
+            let (region, weight, _) = profile.gpu_vertex_binding(0, 0, start + 40);
+            let packed = profile.gpu_offsets(&snapshot.offsets, tuning);
+            let expected = add(
+                original,
+                mul(
+                    [
+                        packed[region as usize][0],
+                        packed[region as usize][1],
+                        packed[region as usize][2],
+                    ],
+                    weight,
+                ),
+            );
+            assert!(distance(skinned.vertices[start + 40].position, expected) < 0.00001);
+        }
+    }
+
     #[test]
     fn source_and_raven_share_anatomical_motion_parameters() {
         let gla = synthetic_source_gla();
-        let raven = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla)
+        let raven = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla, None)
             .unwrap().unwrap();
         let source = JiggleProfile::auto_source_humanoid(&synthetic_source_glm(), &gla, None)
             .unwrap().unwrap();
@@ -2397,7 +3033,7 @@ mod tests {
     fn source_jiggle_uses_geometry_not_raven_surface_names() {
         let gla = synthetic_source_gla();
         let glm = synthetic_source_glm();
-        assert!(JiggleProfile::auto_humanoid(&glm, &gla).unwrap().is_none());
+        assert!(JiggleProfile::auto_humanoid(&glm, &gla, None).unwrap().is_none());
         let profile = JiggleProfile::auto_source_humanoid(&glm, &gla, None)
             .expect("Source profile compilation")
             .expect("Source profile should detect weighted torso and hips");
@@ -2418,7 +3054,7 @@ mod tests {
         let gla = synthetic_source_gla();
         let source = JiggleProfile::auto_source_humanoid(&synthetic_source_glm(), &gla, None)
             .unwrap().unwrap();
-        let stock = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla)
+        let stock = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla, None)
             .unwrap().unwrap();
         // Synthetic model's pelvis (0) and thoracic (3) share one Source
         // body mesh with unrelated vertices (10 stands in for a hand bone).

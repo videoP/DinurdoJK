@@ -195,7 +195,7 @@ second timings {:?}",
         second
             .textures
             .iter()
-            .zip(&fresh.textures)
+            .zip(fresh.textures.iter())
             .all(|(a, b)| a.rgba == b.rgba && a.label == b.label),
         "texture pixels"
     );
@@ -1269,6 +1269,30 @@ fn utility_face_is_hidden_but_still_clips_the_brush() {
         prepared.collision.is_some(),
         "caulk must stay in gameplay collision"
     );
+}
+
+#[test]
+fn prepared_restart_images_are_shared_and_lighting_edits_preserve_the_cache() {
+    let document = jka_assets::map::parse(&legacy_box_source("system/caulk")).unwrap();
+    let root = std::env::temp_dir().join(format!("jka-map-scene-test-{}", std::process::id()));
+    let mut prepared = prepare_map_document(&root, None, Path::new("fixture.map"), document).unwrap();
+    let mut lightmap = materials::missing_texture_data();
+    lightmap.rgba16f = Some(vec![0; lightmap.rgba.len()]);
+    prepared.lightmaps = Arc::new(vec![lightmap.clone()]);
+    prepared.deluxemaps = Arc::new(vec![lightmap]);
+    let mut upload = prepared.clone();
+    assert!(Arc::ptr_eq(&prepared.textures, &upload.textures));
+    assert!(Arc::ptr_eq(&prepared.lightmaps, &upload.lightmaps));
+    assert!(Arc::ptr_eq(&prepared.deluxemaps, &upload.deluxemaps));
+    let authored = prepared.lightmaps[0].rgba[0];
+    Arc::make_mut(&mut upload.lightmaps)[0].rgba[0] = authored ^ 255;
+    assert_eq!(prepared.lightmaps[0].rgba[0], authored);
+    assert_ne!(upload.lightmaps[0].rgba[0], authored);
+    Arc::make_mut(&mut upload.lightmaps)[0].rgba16f.as_mut().unwrap()[0] = 123;
+    assert_eq!(prepared.lightmaps[0].rgba16f.as_ref().unwrap()[0], 0);
+    Arc::make_mut(&mut upload.textures).push(materials::missing_texture_data());
+    assert_eq!(upload.textures.len(), prepared.textures.len() + 1);
+    assert!(Arc::ptr_eq(&prepared.deluxemaps, &upload.deluxemaps));
 }
 
 #[test]

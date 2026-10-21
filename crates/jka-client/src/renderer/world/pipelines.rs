@@ -16,7 +16,10 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn native_display_mapping_active(&self) -> bool {
-        self.native_atmosphere_active() && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
+        // The meter reads the Blue Water sky's environment map, so it is only
+        // meaningful when that sky is the one on screen (native clouds alone
+        // leave the JKA skybox visible).
+        self.sky_backend == 1 && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
     }
 
     pub(in crate::renderer) fn effective_auto_exposure_strength(&self) -> f32 {
@@ -191,6 +194,7 @@ impl Renderer {
                 &self.device,
                 layout,
                 shader,
+                &self.world_shader_lean,
                 scene_format,
                 samples,
                 &material_specialization_jobs(world.all_world_batches()),
@@ -213,15 +217,19 @@ impl Renderer {
                 key,
                 WorldPipelineVariant {
                     ocean_far_pipeline: None,
+                    ocean_native_mesh_pipeline: None,
+                    ocean_native_mesh_wireframe_pipeline: None,
                     pipelines,
                     legacy_dlight_pipelines,
                     fog_pass_pipelines,
                     reflection_pipelines,
                     reflection_fog_pass_pipelines,
                     specialized_pipelines,
+                    slot_pipelines: Vec::new(),
                 },
             );
             world.active_pipeline_variant = key;
+            world.refresh_pso_slots();
             // MSAA/scene-format changed: drop the fast set, it is recompiled on
             // demand the next time the frame plan selects FastBaseline.
             world.fast_pipelines.clear();
@@ -341,6 +349,9 @@ impl Renderer {
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
             self.ssr_enabled,
+            self.needs_resolved_depth_target(),
+            self.taa_enabled || self.rt_taa_mode > 0,
+            self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
         );
         self.world_flares.invalidate_depth_binding();
@@ -974,6 +985,115 @@ impl Renderer {
     }
 }
 
+/// Submerged Hybrid: Blue Water's own clipmap vertices (`OceanVertex`) through
+/// the Godot ocean material, `vs_ocean_native` with the ocean key's `fs_main`
+/// state, so only the mesh differs from the Godot water drawn above. With
+/// `wireframe`, its r_showtris overlay (`fs_wireframe`, lines, no depth test).
+pub(in crate::renderer) fn create_ocean_native_mesh_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    variant: WorldShaderVariantKey,
+    wireframe: bool,
+) -> wgpu::RenderPipeline {
+    // Exactly what `create_world_pipeline` gives `ocean_pipeline_key()`: the
+    // base-pass constants, alpha test on (a Transparent class), no RT in the VS.
+    let mut constants = variant.base_pass_key().compilation_constants();
+    constants.push(("ENABLE_ALPHA_TEST", 1.0));
+    let vertex_constants = constants.iter().copied()
+        .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+        .collect::<Vec<_>>();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if wireframe { "JKA submerged native ocean wireframe" } else { "JKA submerged native ocean mesh" }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader, entry_point: Some("vs_ocean_native"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &vertex_constants, ..Default::default()
+            },
+            buffers: &[Some(blue_water_gpu::geometry::OceanVertex::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: if wireframe { wgpu::PolygonMode::Line } else { wgpu::PolygonMode::Fill },
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(!wireframe),
+            depth_compare: Some(if wireframe { wgpu::CompareFunction::Always } else { camera_depth_compare() }),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples, ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader, entry_point: Some(if wireframe { "fs_wireframe" } else { "fs_main" }),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: if wireframe { &[] } else { constants.as_slice() }, ..Default::default()
+            },
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: None, write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: crate::pipeline_cache::get().as_ref(),
+    })
+}
+
+impl Renderer {
+    /// Hybrid r_hybridUnderwaterMode 4 draws the native mesh with the Godot
+    /// material while submerged. Compile it as soon as that mode is live, so it
+    /// is ready before the camera first dives; the overlay only on r_showtris.
+    /// The submerged Hybrid native mesh can draw: its pipeline is compiled and
+    /// the native surface, whose slots build its indices, exists.
+    pub(in crate::renderer) fn native_submerged_mesh_ready(&self) -> bool {
+        self.world.as_ref()
+            .and_then(|world| world.pipeline_variants.get(&world.active_pipeline_variant))
+            .is_some_and(|variant| variant.ocean_native_mesh_pipeline.is_some())
+            && self.ocean.as_ref().is_some_and(|gpu| gpu.original_surface_prepared())
+    }
+
+    pub(in crate::renderer) fn ensure_ocean_native_mesh_pipelines(&mut self, wireframe: bool) {
+        let Some(world) = self.world.as_ref() else { return; };
+        let variant = world.active_pipeline_variant;
+        if !variant.ocean || variant.family() != WorldShaderFamily::Enhanced { return; }
+        let Some(compiled) = world.pipeline_variants.get(&variant) else { return; };
+        let wanted = [compiled.ocean_native_mesh_pipeline.is_none(),
+            wireframe && self.wireframe_supported && compiled.ocean_native_mesh_wireframe_pipeline.is_none()];
+        let format = self.scene_format();
+        let samples = self.msaa_samples;
+        for (wire, needed) in [false, true].into_iter().zip(wanted) {
+            if !needed { continue; }
+            let key = PipelineJobKey::new("ocean-native-mesh", u32::from(wire),
+                pipeline_hash(&(variant, format, samples, wire)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready::<wgpu::RenderPipeline>(key) {
+                if let Some(pipelines) = self.world.as_mut()
+                    .and_then(|world| world.pipeline_variants.get_mut(&variant)) {
+                    if wire { pipelines.ocean_native_mesh_wireframe_pipeline = Some(pipeline); }
+                    else { pipelines.ocean_native_mesh_pipeline = Some(pipeline); }
+                }
+                continue;
+            }
+            let (layout, shader) = if variant.ray_traced_shadows {
+                let Some(rt) = self.ray_traced_shadows.as_ref() else { return; };
+                (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone())
+            } else {
+                (self.world_pipeline_layout.clone(), self.world_shader.clone())
+            };
+            let device = self.device.clone();
+            self.pipeline_jobs.request(key, "submerged native ocean mesh", move || {
+                create_ocean_native_mesh_pipeline(&device, &layout, &shader, format, samples, variant, wire)
+            });
+        }
+    }
+}
+
 pub(in crate::renderer) fn create_sky_box_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1157,9 +1277,12 @@ pub(in crate::renderer) fn material_specialization_jobs<'a>(
         .collect()
 }
 
+/// Looked up for every world batch every frame (`base_pipeline`): use the fold
+/// hasher, not SipHash, for the ~60-byte key.
 pub(in crate::renderer) type SpecializedWorldPipelines = std::collections::HashMap<
     (PipelineKey, MaterialFragmentKey),
     (MaterialFragmentKey, wgpu::RenderPipeline),
+    std::hash::BuildHasherDefault<crate::scene::FoldHasher>,
 >;
 
 /// Narrows each (pipeline, full material key) job for `variant` and returns the
@@ -1201,6 +1324,7 @@ pub(in crate::renderer) fn create_specialized_world_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    lean_shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
     jobs: &[(PipelineKey, MaterialFragmentKey)],
@@ -1213,7 +1337,7 @@ pub(in crate::renderer) fn create_specialized_world_pipelines(
     let (unique, slots) = specialized_pipeline_plan(jobs, variant);
     let modules = super::programs::ProgramModules::default();
     let pipelines = compile_pipeline_jobs("world-specialized", unique.clone(), |&(key, material)| {
-        modules.pipeline(device, layout, shader, surface_format, msaa_samples, variant, key, material)
+        modules.pipeline(device, layout, shader, lean_shader, surface_format, msaa_samples, variant, key, material)
     });
     log_material_specialization(jobs, &unique, variant, started);
     specialized_pipeline_map(jobs, &unique, &slots, pipelines)
@@ -1236,7 +1360,7 @@ fn log_material_specialization(
         for &(pipeline, raw) in jobs {
             let choice = program_key(variant, pipeline, raw);
             *families.entry(choice.program).or_default() += 1;
-            if choice.program == StageProgram::Specialized {
+            if matches!(choice.program, StageProgram::Specialized | StageProgram::SpecializedLean) {
                 *fallbacks.entry(super::programs::fallback_reason(variant, pipeline, raw)).or_default() += 1;
             }
         }
@@ -1380,6 +1504,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    lean_shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
     shader_variant: WorldShaderVariantKey,
@@ -1473,7 +1598,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 shader_variant, shader_variant.legacy_fog, key, material,
                 super::programs::uses_minimal_entry(material), surface_format, msaa_samples),
             |&(key, material)| modules.pipeline(
-                device, layout, shader, surface_format, msaa_samples, shader_variant, key, material))?;
+                device, layout, shader, lean_shader, surface_format, msaa_samples, shader_variant, key, material))?;
         log_material_specialization(&plan.material_jobs, &unique, shader_variant, started);
         specialized_pipeline_map(&plan.material_jobs, &unique, &slots, compiled)
     } else {
@@ -1482,12 +1607,15 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
 
     Some(WorldPipelineVariant {
         ocean_far_pipeline: None,
+        ocean_native_mesh_pipeline: None,
+        ocean_native_mesh_wireframe_pipeline: None,
         pipelines,
         legacy_dlight_pipelines,
         fog_pass_pipelines,
         reflection_pipelines,
         reflection_fog_pass_pipelines,
         specialized_pipelines,
+        slot_pipelines: Vec::new(),
     })
 }
 

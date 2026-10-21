@@ -3,6 +3,26 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_memory_info ["memory_info"] ("memory_info", "Report retained map CPU pixels and GPU live/reserved allocations.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("usage: memory_info".to_owned());
+            return CommandResult::Handled;
+        }
+        if let Some(cache) = self.prepared_map_cache.as_ref() {
+            let label = cache.label.clone();
+            let lines = cache.map.memory_report_lines();
+            self.push_console_line(format!("MEMORY prepared map: {label}"));
+            for line in lines { self.push_console_line(line); }
+        } else {
+            self.push_console_line("MEMORY CPU: no prepared map cache".to_owned());
+        }
+        if self.render.is_some() {
+            self.render_command(RenderCommand::MemoryInfo);
+        } else {
+            self.push_console_line("MEMORY GPU: renderer unavailable".to_owned());
+        }
+        CommandResult::Handled
+    }
     cmd_baked_sun_debug ["baked_sun_debug"] ("baked_sun_debug <0|1|2>", "Baked sunlight diagnostic: 0 normal, 1 removed amount, 2 sun visibility.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let mode = match words.as_slice() {
@@ -207,18 +227,30 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_render_perf_capture ["render_perf_capture", "renderperfcapture"] ("render_perf_capture [frames=600] [label]", "Record per-frame renderer CPU stage timings to CSV/JSON after a 2s delay and 120 warmup frames. Opt-in; no GPU stalls.", CommandScope::Always) |self, command| {
+    cmd_render_perf_capture ["render_perf_capture", "renderperfcapture"] ("render_perf_capture [frames=600|<seconds>s] [label]", "Record per-frame renderer CPU stage timings to CSV/JSON after a 2s delay and 120 warmup frames. A count ending in s (e.g. 10s) records for that long instead. Opt-in; no GPU stalls.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         if words.len() > 3 {
-            self.push_console_line("^3usage:^7 render_perf_capture [frames=600] [label]".to_owned());
+            self.push_console_line("^3usage:^7 render_perf_capture [frames=600|<seconds>s] [label]".to_owned());
             return CommandResult::Handled;
         }
+        let mut seconds = None;
         let frames = if let Some(arg) = words.get(1) {
-            match arg.parse::<usize>() {
-                Ok(value) if (30..=6000).contains(&value) => value,
-                _ => {
-                    self.push_console_line("^1render_perf_capture:^7 frames must be 30..6000".to_owned());
-                    return CommandResult::Handled;
+            if let Some(value) = arg.strip_suffix('s') {
+                match value.parse::<f64>() {
+                    Ok(value) if (1.0..=120.0).contains(&value) => seconds = Some(value),
+                    _ => {
+                        self.push_console_line("^1render_perf_capture:^7 seconds must be 1..120".to_owned());
+                        return CommandResult::Handled;
+                    }
+                }
+                0
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(value) if (30..=6000).contains(&value) => value,
+                    _ => {
+                        self.push_console_line("^1render_perf_capture:^7 frames must be 30..6000".to_owned());
+                        return CommandResult::Handled;
+                    }
                 }
             }
         } else { 600 };
@@ -234,13 +266,76 @@ commands! {
         };
         let stem = self.game_write_path(std::path::PathBuf::from("renderperf").join(stem_name));
         let result = self.render.as_ref().ok_or("renderer is unavailable")
-            .and_then(|render| render.start_render_perf_capture(stem.clone(), frames));
+            .and_then(|render| render.start_render_perf_capture(stem.clone(), frames, seconds));
+        let span = seconds.map_or_else(|| format!("{frames} samples"), |seconds| format!("{seconds}s"));
         match result {
             Ok(()) => self.push_console_line(format!(
-                "^2RENDER PERF ARMED^7 {frames} samples after 2s + 120-frame warmup. Close console; output: {}.csv/.json",
+                "^2RENDER PERF ARMED^7 {span} after 2s + 120-frame warmup. Close console; output: {}.csv/.json",
                 stem.display()
             )),
             Err(error) => self.push_console_line(format!("^1render_perf_capture:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_gputilecost ["gputilecost", "gpu_tile_cost"] ("gputilecost [<cols>x<rows>] [samples] [label] | show <pass> | passes | off | cancel", "Measure real GPU cost per screen tile: scissors every screen-space pass to one tile per frame, subtracts a 1x1 baseline, then overlays a heatmap and writes CSV/JSON. Hold the camera still.", CommandScope::Always) |self, command| {
+        use crate::renderer::TileCostCommand;
+        let words: Vec<_> = command.split_whitespace().collect();
+        let usage = "^3usage:^7 gputilecost [<cols>x<rows>=32x18] [samples=8] [label] | show <pass> | passes | off | cancel";
+        let request = match words.get(1).map(|word| word.to_ascii_lowercase()).as_deref() {
+            Some("show") => match words.get(2) {
+                Some(pass) => TileCostCommand::Show((*pass).to_owned()),
+                None => {
+                    self.push_console_line(usage.to_owned());
+                    return CommandResult::Handled;
+                }
+            },
+            Some("passes") => TileCostCommand::ListPasses,
+            Some("off") | Some("hide") => TileCostCommand::Hide,
+            Some("cancel") | Some("stop") => TileCostCommand::Cancel,
+            _ => {
+                let mut rest = &words[1..];
+                let (mut cols, mut rows) = (32u32, 18u32);
+                if let Some((c, r)) = rest.first().and_then(|word| word.split_once(['x', 'X'])) {
+                    match (c.parse::<u32>(), r.parse::<u32>()) {
+                        (Ok(c), Ok(r)) if (1..=64).contains(&c) && (1..=64).contains(&r) => (cols, rows) = (c, r),
+                        _ => {
+                            self.push_console_line(usage.to_owned());
+                            return CommandResult::Handled;
+                        }
+                    }
+                    rest = &rest[1..];
+                }
+                let mut samples = 8usize;
+                if let Some(value) = rest.first().and_then(|word| word.parse::<usize>().ok()) {
+                    if !(3..=64).contains(&value) {
+                        self.push_console_line("^1gputilecost:^7 samples must be 3..64".to_owned());
+                        return CommandResult::Handled;
+                    }
+                    samples = value;
+                    rest = &rest[1..];
+                }
+                let label: String = rest.first().copied().unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .take(32)
+                    .collect();
+                let stem_name = if label.is_empty() {
+                    format!("tilecost-{}", demo_recording_timestamp())
+                } else {
+                    format!("tilecost-{}-{label}", demo_recording_timestamp())
+                };
+                let stem = self.game_write_path(std::path::PathBuf::from("renderperf").join(stem_name));
+                self.push_console_line(format!(
+                    "^2GPU TILE COST ARMED^7 {cols}x{rows}, {samples} samples/tile after 2s. Close console, hold still; heatmap appears when done. Output: {}.csv/.json",
+                    stem.display()
+                ));
+                TileCostCommand::Start { stem, cols, rows, samples }
+            }
+        };
+        if let Err(error) = self.render.as_ref().ok_or("renderer is unavailable")
+            .and_then(|render| render.tile_cost(request)) {
+            self.push_console_line(format!("^1gputilecost:^7 {error}"));
         }
         CommandResult::Handled
     }
@@ -347,7 +442,17 @@ commands! {
         }
     }
 
-    cmd_viewpos ["viewpos", ] ("viewpos", "Print the view origin and angles: (x y z) : yaw (pitch p).", CommandScope::Always) |self, command| {
+    cmd_benchturn ["benchturn", ] ("benchturn [counts] [period]", "Benchmarks: inject a synthetic raw mouse-motion event of <counts> along X every event-loop turn (through the real mouse path); with <period>, reverse direction every <period> turns (a wiggle). 0 or no argument stops.", CommandScope::Always) |self, command| {
+        let mut words = command.split_whitespace().skip(1).map(|v| v.parse::<i32>().ok());
+        let counts = words.next().flatten().unwrap_or(0);
+        let period = words.next().flatten().unwrap_or(0).max(0);
+        crate::app::lifecycle::BENCH_TURN_COUNTS.store(counts, std::sync::atomic::Ordering::Relaxed);
+        crate::app::lifecycle::BENCH_TURN_PERIOD.store(period, std::sync::atomic::Ordering::Relaxed);
+        self.push_console_line(format!("benchturn {counts} {period}"));
+        CommandResult::Handled
+    }
+
+    cmd_viewpos ["viewpos", ] ("viewpos","Print the view origin and angles: (x y z) : yaw (pitch p).", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb] => {
@@ -478,6 +583,17 @@ commands! {
         match words.as_slice() {
             [_verb, arguments @ ..] => {
                 self.begin_perf_sample(arguments);
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_waitshadermode ["waitshadermode", ] ("waitshadermode <mode> [timeout]", "Hold the command buffer until r_fragmentShaderMode <mode> is active and no world variant is compiling; logs READY/TIMEOUT with the wait time.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb, arguments @ ..] => {
+                self.begin_shader_mode_wait(arguments);
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,

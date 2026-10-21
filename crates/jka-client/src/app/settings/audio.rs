@@ -3,6 +3,51 @@ use crate::{app::{App, FootprintMode}, runtime::UserEvent, scene};
 use std::{sync::Arc, thread, time::Instant};
 
 impl App {
+    pub(in crate::app) fn update_variometer(&mut self) {
+        use crate::audio::variometer::MotionSample;
+        use crate::app::{playerstate_vec3, OverlayMode, SessionPhase};
+
+        // Read movement directly: this must work with every movement HUD off.
+        // Local sessions supply the same predicted playerstate as online play.
+        let active = self.audio.variometer
+            && !self.front_end
+            && self.overlay == OverlayMode::None
+            && !(self.audio.mute_when_unfocused && !self.window_focused)
+            && self.game_session.as_ref().is_some_and(|session| {
+                (session.local || session.live) && session.phase == SessionPhase::Playing
+            });
+        let mut sample = active.then(|| self.current_player_state()).flatten().and_then(|ps| {
+            let pm_type = ps.field_i32("pm_type")?;
+            // PM_NORMAL / PM_JETPACK only; exclude death, spectators and noclip.
+            if !matches!(pm_type, 0 | 1) || ps.stats[0] <= 0
+                || ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0 {
+                return None;
+            }
+            Some(MotionSample {
+                time_ms: ps.field_i32("commandTime")?,
+                velocity: playerstate_vec3(ps, "velocity")?,
+                origin: playerstate_vec3(ps, "origin")?,
+                client: ps.field_i32("clientNum").unwrap_or(0),
+                teleport_bit: ps.field_i32("eFlags").unwrap_or(0) & 8,
+                angle_error: None,
+                angle_dead_zone: self.audio.variometer_dead_zone,
+                angle_scale: self.audio.variometer_scale,
+            })
+        });
+        if self.audio.variometer_input == 1 {
+            sample = sample.and_then(|mut sample| {
+                sample.angle_error = Some(crate::strafehelper::angle_error(
+                    &self.current_movement_state(true), &self.strafe_helper, self.video.fps_cap,
+                )?);
+                Some(sample)
+            });
+        }
+        let volume = self.effective_audio_mix().0 * self.audio.variometer_volume;
+        if let Some(sound) = self.game_session.as_mut().and_then(|s| s.sound_presenter.as_mut()) {
+            sound.update_variometer(sample, volume, self.audio.variometer_style);
+        }
+    }
+
     pub(in crate::app) fn effective_audio_mix(&self) -> (f32, f32, f32) {
         let muted = self.audio.mute_when_unfocused && !self.window_focused;
         (
@@ -50,6 +95,7 @@ impl App {
     }
 
     pub(in crate::app) fn apply_audio_mix(&mut self) {
+        self.update_variometer();
         let (effects, voice, separation) = self.effective_audio_mix();
         let music = self.effective_music_volume();
         let emote_music = self.effective_emote_music_volume();

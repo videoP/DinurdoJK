@@ -10171,6 +10171,8 @@ void PM_MoveForKata(usercmd_t *ucmd)
 	}
 }
 
+#include "taunt_cancel.h"
+
 void PmoveSingle (pmove_t *pmove) {
 	qboolean stiffenedUp = qfalse;
 	float gDist = 0;
@@ -10325,13 +10327,7 @@ void PmoveSingle (pmove_t *pmove) {
 	else if ( BG_FullBodyTauntAnim( pm->ps->legsAnim )
 		&& BG_FullBodyTauntAnim( pm->ps->torsoAnim ) )
 	{
-		if ( (pm->cmd.buttons&BUTTON_ATTACK)
-			|| (pm->cmd.buttons&BUTTON_ALT_ATTACK)
-			|| (pm->cmd.buttons&BUTTON_FORCEPOWER)
-			|| (pm->cmd.buttons&BUTTON_FORCEGRIP)
-			|| (pm->cmd.buttons&BUTTON_FORCE_LIGHTNING)
-			|| (pm->cmd.buttons&BUTTON_FORCE_DRAIN)
-			|| pm->cmd.upmove )
+		if ( jka_taunt_cancel_input(pm->cmd.buttons, pm->cmd.upmove) )
 		{//stop the anim
 			if ( pm->ps->legsAnim == BOTH_MEDITATE
 				&& pm->ps->torsoAnim == BOTH_MEDITATE )

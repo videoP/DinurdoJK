@@ -49,6 +49,9 @@ pub(in crate::app) struct PerfSample {
     /// Last window's main world program binds: specialized, general.
     pub(in crate::app) world_program_binds: (u32, u32),
     pub(in crate::app) world_shader_programs: crate::runtime::WorldShaderPrograms,
+    /// `waitshadermode`: hold until this r_fragmentShaderMode is requested and
+    /// active with no variant compiling; `duration` is then the timeout.
+    pub(in crate::app) ready_mode: Option<u8>,
 }
 
 pub(in crate::app) struct MapLoadingState {

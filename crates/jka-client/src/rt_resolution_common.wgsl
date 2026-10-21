@@ -1,6 +1,6 @@
 struct RtSunShadowSettings {
     inverse_view_proj: mat4x4<f32>,
-    dimensions: vec4<u32>, // width, height, frame index, dither phase (frame index % 4)
+    dimensions: vec4<u32>, // width, height, frame index, rate divisor (1/2/4)
     flags: vec4<u32>, // enabled, history valid, reserved, reserved
     prev_camera_pos: vec4<f32>, // previous frame's eye position
 };

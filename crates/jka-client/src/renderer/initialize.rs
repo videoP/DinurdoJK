@@ -166,6 +166,9 @@ impl Renderer {
         }
         // Vulkan only (DX12/GL adapters never report it): persisted pipeline cache.
         required_features |= adapter_features & wgpu::Features::PIPELINE_CACHE;
+        // Query support is optional and only used while the FPS diagnostic graph
+        // is enabled. Requesting the capability does not execute queries.
+        required_features |= adapter_features & wgpu::Features::PIPELINE_STATISTICS_QUERY;
         rverbose!(
             1,
             "Wireframe polygon mode: {}",
@@ -219,6 +222,18 @@ impl Renderer {
             }
         );
         let device_started = Instant::now();
+        // Diagnostic A/B switch: compare allocator policies with the same binary
+        // and settings, without keeping a second executable or build cache.
+        let memory_hints = if std::env::var("JKA_GPU_MEMORY_HINTS").as_deref() == Ok("performance") {
+            wgpu::MemoryHints::Performance
+        } else {
+            // Smaller blocks reduce stranded reservations after map changes.
+            // Resource sizes and rendering quality are unchanged.
+            wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: (4 << 20)..(16 << 20),
+            }
+        };
+        println!("GPU memory allocator policy: {memory_hints:?}");
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("DinurdoJK renderer"),
@@ -231,7 +246,7 @@ impl Renderer {
                 } else {
                     wgpu::ExperimentalFeatures::disabled()
                 },
-                memory_hints: wgpu::MemoryHints::Performance,
+                memory_hints,
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -407,6 +422,9 @@ impl Renderer {
             config.height,
             config.format,
             msaa_samples,
+            false,
+            false,
+            false,
             false,
             false,
             false,
@@ -2472,6 +2490,7 @@ impl Renderer {
             ui_small_font_metrics,
             _ui_font_sampler: ui_font_sampler,
             frame_time_graph: FrameTimeGraph::default(),
+            tile_cost_overlay: None,
             ui_vertex_buffer,
             ui_vertex_count: 0,
             ui_dynamic_vertex_buffer,
@@ -2633,6 +2652,7 @@ impl Renderer {
             dof_quality: DofQuality::Adaptive,
             dof_focus_distance: 4096.0,
             dof_focus_valid: false,
+            dof_plan_underwater: false,
             motion_blur_runtime_scale: 0.0,
             previous_frame_time: 0.0,
             color_lut_preset: ColorLutPreset::Off,
@@ -2661,10 +2681,14 @@ impl Renderer {
             post_ocean_transparent_scratch: Vec::new(),
             pre_optics_overlay_scratch: Vec::new(),
             inline_pose_scratch: Vec::new(),
+            inline_cull_bounds_stale: false,
             inline_draw_scratch: InlineDrawScratch::default(),
             deferred_world_bundles: DeferredWorldBundles::default(),
             gpu_driven_enabled: false,
             draw_inline_models: true,
+            inline_transform_mode: crate::ui::InlineTransformMode::Cpu,
+            inline_transform_workers: None,
+            inline_vertex_scratch: Vec::new(),
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
             fast_sky: 0,
@@ -2687,7 +2711,7 @@ impl Renderer {
             tinted_glass_debug: 0,
             rt_samples: 1,
             dynamic_light_falloff: 0,
-            rt_reduced_shadows: false,
+            rt_trace_rate: 1,
             clustered_lighting_enabled: false,
             map_light_simulation_enabled: false,
             debug_world_vertex_alpha_one: false,
@@ -2771,6 +2795,8 @@ impl Renderer {
             post_shader,
             post_pipeline_layout,
             post_pipeline: None,
+            post_specialize: true,
+            post_specialized: HashMap::new(),
             cloud_shadow_opaque_pipeline: None,
             cloud_shadow_opaque_bind_group,
             rain_post_pipeline: None,

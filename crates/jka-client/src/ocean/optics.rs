@@ -183,6 +183,10 @@ pub struct Resources {
     capture_receiver: wgpu::RenderPipeline,
     // Lazily specialized: non-Hybrid shaders compile the wave path OUT.
     hybrid_capture: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    // Lazily specialized: submerged Hybrid mode 4 fogs by ray length alone.
+    submerged_capture: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    // Lazily built: the receiver output alone (`receiver_only_source`), for frames where nothing reads the rest.
+    receiver_only: Option<wgpu::RenderPipeline>,
     blit: wgpu::RenderPipeline,
 }
 impl Resources {
@@ -303,7 +307,7 @@ impl Resources {
         }
         Self { key, bind_group, uniform, glass_uniform, edges, capture_color, receiver_color, background,
             background_ready: false, color, background_capture, blur_first, blur_next, blur_groups,
-            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, capture_receiver, hybrid_capture: None, blit,
+            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, capture_receiver, hybrid_capture: None, submerged_capture: None, receiver_only: None, blit,
             water_distance, water_distance_capture, distance_params, distance_group,
             procedural: procedural::Pattern::new(device) }
     }
@@ -342,6 +346,7 @@ impl Resources {
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
             })], ..Default::default()
         });
+        crate::renderer::tile_probe_scissor(&mut pass, self.key.0, self.key.1);
         pass.set_pipeline(&self.background_capture);
         pass.set_bind_group(0, &input, &[]);
         pass.set_bind_group(1, ocean, &[]);
@@ -356,7 +361,49 @@ impl Resources {
     pub fn capture(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
         scissor: Option<(u32, u32, u32, u32)>) {
-        self.capture_with_receiver(device, encoder, scene, depth, ocean, scissor, false, false);
+        self.capture_with_receiver(device, encoder, scene, depth, ocean, scissor, false, false, false);
+    }
+
+    /// Build the receiver-only capture on first use (`receiver_only_source`).
+    pub fn ensure_receiver_only_capture(&mut self, device: &wgpu::Device, ocean_layout: &wgpu::BindGroupLayout) {
+        if self.receiver_only.is_some() { return; }
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ocean optical capture, receiver only"),
+            source: wgpu::ShaderSource::Wgsl(receiver_only_source(self.key.2 > 1).into()),
+        });
+        self.receiver_only = Some(pipeline(device, &shader, &[&self.capture_layout, ocean_layout],
+            "fs_capture_receiver_only", &[wgpu::TextureFormat::Rgba16Float], 1));
+    }
+
+    /// Writes only `receiver_color` (Godot caustics on the opaque scene, before any absorption), the one capture
+    /// output the native Blue Water surface reads. The fogged colour and linear depth targets keep their last
+    /// contents, so the caller uses this only on frames where nothing else reads them.
+    pub fn capture_receiver_only(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
+        scissor: Option<(u32, u32, u32, u32)>) {
+        let pipeline = self.receiver_only.as_ref().expect("ensure_receiver_only_capture");
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None,
+            Some((&self.procedural.view, &self.procedural.sampler)));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Ocean optical capture, receiver only"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.receiver_color, depth_slice: None, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })], ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &input, &[]);
+        pass.set_bind_group(1, ocean, &[]);
+        if let Some((x, y, width, height)) = scissor {
+            if width == 0 || height == 0 {
+                return;
+            }
+            let [x, y, width, height] = crate::renderer::tile_probe_constrain([x, y, width, height], self.key.0, self.key.1);
+            pass.set_scissor_rect(x, y, width, height);
+        } else {
+            crate::renderer::tile_probe_scissor(&mut pass, self.key.0, self.key.1);
+        }
+        pass.draw(0..3, 0..1);
     }
 
     /// Only Hybrid mode 4 compiles this shader. Non-Hybrid capture retains its
@@ -380,9 +427,31 @@ impl Resources {
         ));
     }
 
+    /// Submerged Hybrid mode 4: the eye is in water, so the capture fogs each
+    /// pixel over its ray up to the water top over the eye (`Uniform::eye` w)
+    /// instead of solving every volume, wave crossing, outline and sky column.
+    pub fn ensure_submerged_fog_capture(&mut self, device: &wgpu::Device,
+        ocean_layout: &wgpu::BindGroupLayout) {
+        if self.submerged_capture.is_some() { return; }
+        let source = shader_source(self.key.2 > 1).replace(
+            "const JKA_SUBMERGED_FOG: bool = false;",
+            "const JKA_SUBMERGED_FOG: bool = true;");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA submerged fog optics"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let color = wgpu::TextureFormat::Rgba16Float;
+        let depth = wgpu::TextureFormat::R32Float;
+        self.submerged_capture = Some((
+            pipeline(device, &shader, &[&self.capture_layout, ocean_layout],
+                "fs_capture", &[color, depth], 1),
+            pipeline(device, &shader, &[&self.capture_layout, ocean_layout],
+                "fs_capture_receiver", &[color, depth, color], 1),
+        ));
+    }
+
     pub fn capture_with_receiver(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
-        scissor: Option<(u32, u32, u32, u32)>, receiver: bool, hybrid_wave: bool) {
+        scissor: Option<(u32, u32, u32, u32)>, receiver: bool, hybrid_wave: bool, submerged_fog: bool) {
         let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None,
             Some((&self.procedural.view, &self.procedural.sampler)));
         let views: &[_] = if receiver { &[&self.capture_color, &self.depth, &self.receiver_color] }
@@ -394,7 +463,12 @@ impl Resources {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Ocean optical capture"), color_attachments: &attachments, ..Default::default()
         });
+        let submerged = self.submerged_capture.as_ref().filter(|_| submerged_fog);
         pass.set_pipeline(match (hybrid_wave, receiver) {
+            _ if submerged.is_some() => {
+                let (plain, with_receiver) = submerged.expect("submerged fog pipeline");
+                if receiver { with_receiver } else { plain }
+            }
             (true, true) => &self.hybrid_capture.as_ref().expect("hybrid wave pipeline").1,
             (true, false) => &self.hybrid_capture.as_ref().expect("hybrid wave pipeline").0,
             (false, true) => &self.capture_receiver,
@@ -406,7 +480,10 @@ impl Resources {
             if width == 0 || height == 0 {
                 return;
             }
+            let [x, y, width, height] = crate::renderer::tile_probe_constrain([x, y, width, height], self.key.0, self.key.1);
             pass.set_scissor_rect(x, y, width, height);
+        } else {
+            crate::renderer::tile_probe_scissor(&mut pass, self.key.0, self.key.1);
         }
         pass.draw(0..3, 0..1);
     }
@@ -444,6 +521,7 @@ impl Resources {
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
             })], ..Default::default()
         });
+        crate::renderer::tile_probe_scissor(&mut pass, self.key.0, self.key.1);
         pass.set_pipeline(&self.water_distance_capture);
         pass.set_bind_group(0, &input, &[]);
         pass.set_bind_group(1, ocean, &[]);
@@ -457,6 +535,7 @@ impl Resources {
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
             })], ..Default::default()
         });
+        crate::renderer::tile_probe_scissor(&mut pass, self.key.0, self.key.1);
         pass.set_pipeline(&self.blit);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
@@ -510,6 +589,27 @@ fn pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, layouts: &[&wgpu
             targets: &formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect::<Vec<_>>() }),
         multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
     })
+}
+
+/// The capture shader reduced to its `receiver` output: the scene colour times the Godot caustics, which needs only
+/// each box's receiver test (`bottom_depth`) and the caustic block. The water spans (`g_spans`, mask and sky spans), the
+/// water fraction and the fog only feed the fogged colour, depth and water distance, so they are removed. The kept code
+/// is the same text in the same order, so `receiver` is the full shader's.
+pub fn receiver_only_source(msaa: bool) -> String {
+    let source = shader_source(msaa).replace("\r\n", "\n");
+    let cut = |source: String, from: &str, to: &str, with: &str| {
+        assert_eq!(source.matches(from).count(), 1, "optics receiver-only anchor changed: {from}");
+        let start = source.find(from).unwrap();
+        let end = start + source[start..].find(to).unwrap_or_else(|| panic!("optics receiver-only end missing: {to}"));
+        format!("{}{}{}", &source[..start], with, &source[end..])
+    };
+    let source = cut(source, "        let candidate = interval(", "        let receiver_margin", "");
+    let source = cut(source, "    if (depth > 0.0) {\n        add_sky_ocean_spans(delta);", "    // Optional low-cost wave-curvature caustics.", "");
+    let source = cut(source, "    // BlueWater applies its own column absorption.", "    var out: OpticalSample;",
+        "    let receiver_color = vec4<f32>(color, 1.0);\n");
+    assert_eq!(source.matches("out.water_distance = ray_length * water_fraction;").count(), 1);
+    let source = source.replace("out.water_distance = ray_length * water_fraction;", "out.water_distance = 0.0;");
+    format!("{source}\n@fragment fn fs_capture_receiver_only(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{\n    return capture_pixel(p).receiver;\n}}\n")
 }
 
 pub fn shader_source(msaa: bool) -> String {
@@ -598,12 +698,16 @@ mod tests {
 
     #[test]
     fn optics_shaders_validate() {
-        for source in [shader_source(false), shader_source(true), include_str!("../ocean_composite.wgsl").to_owned()] {
+        let submerged = |msaa| shader_source(msaa).replace("const JKA_SUBMERGED_FOG: bool = false;",
+            "const JKA_SUBMERGED_FOG: bool = true;");
+        for source in [shader_source(false), shader_source(true), receiver_only_source(false), receiver_only_source(true),
+            submerged(false), submerged(true),
+            include_str!("../ocean_composite.wgsl").to_owned()] {
             let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
         }
-        assert_eq!(std::mem::size_of::<Uniform>(), 2720);
+        assert_eq!(std::mem::size_of::<Uniform>(), 2752);
         let procedural = include_str!("optics/procedural.wgsl");
         let module = naga::front::wgsl::parse_str(procedural).unwrap_or_else(|e| panic!("{}", e.emit_to_string(procedural)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
@@ -694,7 +798,7 @@ mod tests {
                         });
                     }
                     let capture_color = if samples == 1 { &color_view } else { &msaa_view };
-                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true, false);
+                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true, false, false);
                     resources.capture_water_distance(&device, &queue, &mut encoder, capture_color, &depth_view, &ocean, [top, crest, 0.0, 0.0]);
                     resources.composite(&mut encoder, output, resolve);
                     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,

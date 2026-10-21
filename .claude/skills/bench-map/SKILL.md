@@ -66,6 +66,14 @@ for GPU pass timings.
 
 ## Rules (each one cost a real mistake)
 
+- **Disk space on D: is a hard limit.** Build only with `build.ps1 -Fast`. Never
+  create folders, copied exes/pdbs, baselines, harness exes, zips or log files
+  under `target/` (or anywhere on D:). Put logs, scripts and analysis in the
+  session scratchpad. Never override the target dir, and never put Cargo
+  build output or incremental caches in the scratchpad or on any other drive:
+  builds use only the existing `target/fast`. In 2026-10 about 4.4 GB of
+  such per-task folders filled D: and broke linking.
+
 - **Config safety.** Any `set` rewrites `target/release/base/DinurdoJK.cfg`.
   The script backs it up and restores it on exit. `r_backend` and
   `r_reflectionQuality` are restart-latched: change them by passing a cfg file

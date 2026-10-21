@@ -112,16 +112,16 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         // is active, matching the other dependent rows on this page.
         let rt_sun = self.video.dynamic_shadows == DynamicShadowsMode::RayTraced;
         let rt_lights = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
-        const RT_RESOLUTION: [(bool, &str, &str); 2] = [
-            (true, "Reduced", "Traces each pixel's sun shadow once every four frames and carries the rest forward by motion vectors. Shadow edges and newly revealed pixels still trace every frame."),
-            (false, "Full", "Trace sun visibility at every shaded pixel, every frame. Reference quality; highest ray cost."),
+        const RT_TRACE_RATE: [(u32, &str, &str); 3] = [
+            (1, "Full", "Fresh sun and local-light shadow rays every frame."),
+            (2, "Half", "Refresh roughly half of stable pixels each frame, reusing validated history elsewhere."),
+            (4, "Quarter", "Refresh roughly one quarter of stable pixels each frame. More history reuse; changes may need extra rays."),
         ];
-        // The reduced schedule only exists for the sun; local lights are always traced directly.
-        ui.add_enabled_ui(rt_sun, |ui| {
-            let note = if rt_sun { "" } else { "\n\nNot used: set Dynamic shadows to RT Shadows." };
-            if let Some(index) = mode_row(ui, "RT sun rate", &format!("How often the ray-traced sun shadow is retraced. Runs at full screen resolution either way; this trades ray count against how quickly a moving shadow caster's interior updates. Needs a depth pass.{note}"),
-                theme::Reset::None, self.video.rt_half_resolution, &RT_RESOLUTION) {
-                let _ = self.set_console_cvar("r_rtResolution", if RT_RESOLUTION[index].0 { "half" } else { "full" });
+        ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
+            let note = if rt_sun || rt_lights { "" } else { "\n\nNeeds RT Shadows or Ray traced dynamic lights." };
+            if let Some(index) = mode_row(ui, "RT update rate", &format!("Fresh tracing rate for sun and local-light shadows at full output resolution. Newly exposed surfaces, changing lights and shadow edges refresh sooner. Colored-glass transmission uses full-rate direct rays. FPS gains depend on the scene.{note}"),
+                theme::Reset::None, self.video.rt_trace_rate, &RT_TRACE_RATE) {
+                let _ = self.set_console_cvar("r_rtTraceRate", &RT_TRACE_RATE[index].0.to_string());
             }
         });
         const RT_SAMPLES: [(u32, &str, &str); 3] = [

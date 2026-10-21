@@ -62,7 +62,7 @@ pub use api::{
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
-    RenderSnapshot, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
+    RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
     PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
     PBR_PROFILE_POM_ADAPTIVE_STEPS, PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL,
@@ -89,6 +89,10 @@ use diagnostics::debug_geometry::{sun_ray_vertices, SUN_RAY_LENGTH};
 use diagnostics::inspector::{inspector_texture_meta, InspectorTextureMeta, InspectorVertex};
 use diagnostics::profiling::{
     GpuPass, GpuProfiler, CULL_DIAGNOSTIC_COUNTER_BYTES, CULL_DIAGNOSTIC_READBACK_SLOTS,
+};
+/// `gputilecost` scissor hooks for passes encoded outside `crate::renderer`.
+pub(crate) use diagnostics::tile_cost::{
+    constrain as tile_probe_constrain, scissor as tile_probe_scissor, scissor_surface as tile_probe_scissor_surface,
 };
 use environment::clouds::{create_cloud_fallback_resources, CloudNoiseResources};
 use environment::fog::create_world_froxel_bind_group;
@@ -174,7 +178,7 @@ use post::crt::CrtResources;
 use post::pipelines::{
     create_bloom_pipeline, create_cloud_pass_pipeline, create_cloud_resolve_bind_group,
     create_cull_debug_pipeline, create_dof_pipeline, create_gamma_post_pipeline,
-    create_planar_debug_pipeline, create_post_pipeline, create_rain_post_pipeline,
+    create_planar_debug_pipeline, create_post_pipeline, create_post_pipeline_for, create_rain_post_pipeline,
     create_cloud_shadow_opaque_pipeline,
     create_ssao_temporal_pipeline,
     create_ssr_temporal_pipeline, create_ssr_visibility_resources, create_taa_post_pipeline,
@@ -307,6 +311,8 @@ use world::variants::{
 mod rt_models;
 #[path = "renderer/lighting/rt_resolution.rs"]
 mod rt_resolution;
+#[path = "renderer/lighting/rt_local_rate.rs"]
+mod rt_local_rate;
 #[cfg(test)]
 #[path = "renderer/tests/shader_audit.rs"]
 mod shader_audit;
@@ -388,7 +394,7 @@ const MAX_LOCAL_SHADOW_LIGHTS: usize = 4;
 const LOCAL_SHADOW_CACHE_SLOTS: usize = 8;
 const LOCAL_SHADOW_MAP_SIZE: u32 = 512;
 /// `camera_water_surface` / `PostUniform::underwater` value for a camera that is not submerged.
-const NO_WATER_SURFACE: f32 = -1.0e30;
+pub(crate) const NO_WATER_SURFACE: f32 = -1.0e30;
 const LOCAL_SHADOW_NEAR: f32 = 4.0;
 const LOCAL_SHADOW_RESELECT_DISTANCE: f32 = 192.0;
 const LOCAL_SHADOW_HYSTERESIS: f32 = 1.35;
@@ -787,6 +793,8 @@ struct Renderer {
     ui_small_font_metrics: Option<ui::ProportionalFont>,
     _ui_font_sampler: wgpu::Sampler,
     frame_time_graph: FrameTimeGraph,
+    /// Finished `gputilecost` heatmap; None until a probe completes.
+    tile_cost_overlay: Option<diagnostics::tile_cost::TileCostOverlay>,
     ui_vertex_buffer: wgpu::Buffer,
     ui_vertex_count: u32,
     ui_dynamic_vertex_buffer: wgpu::Buffer,
@@ -965,6 +973,10 @@ struct Renderer {
     dof_quality: DofQuality,
     dof_focus_distance: f32,
     dof_focus_valid: bool,
+    /// Camera-underwater state the frame plan was built for. Underwater-only DOF
+    /// needs the depth prepass and full post only below the surface; the plan
+    /// is rebuilt when the camera crosses it.
+    dof_plan_underwater: bool,
     motion_blur_runtime_scale: f32,
     previous_frame_time: f32,
     color_lut_preset: ColorLutPreset,
@@ -1009,11 +1021,17 @@ struct Renderer {
     /// optics capture (reused across frames).
     pre_optics_overlay_scratch: Vec<usize>,
     inline_pose_scratch: Vec<Vec<InlineModelInstance>>,
+    /// Inline mover cull-record bounds skipped while GPU culling was off.
+    inline_cull_bounds_stale: bool,
     inline_draw_scratch: InlineDrawScratch,
     deferred_world_bundles: DeferredWorldBundles,
     gpu_driven_enabled: bool,
     /// Debug A/B: omit inline BSP mover geometry, never gameplay entities.
     draw_inline_models: bool,
+    /// Pose inline BSP geometry on CPU, CPU workers, or GPU compute.
+    inline_transform_mode: ui::InlineTransformMode,
+    inline_transform_workers: Option<rayon::ThreadPool>,
+    inline_vertex_scratch: Vec<GpuVertex>,
     /// Render-only classification by BSP shader qpath (not original model provenance).
     draw_bsp_model_surfaces: bool,
     /// 0 all, 1 opaque/masked only, 2 transparent only (diagnostic).
@@ -1049,7 +1067,7 @@ struct Renderer {
     tinted_glass_debug: u32,
     rt_samples: u32,
     dynamic_light_falloff: u32,
-    rt_reduced_shadows: bool,
+    rt_trace_rate: u32,
     clustered_lighting_enabled: bool,
     map_light_simulation_enabled: bool,
     classic_fullbright: bool,
@@ -1143,6 +1161,10 @@ struct Renderer {
     /// `None` until the background compile finishes and a frame needs it; see
     /// `ensure_post_pipeline`.
     post_pipeline: Option<wgpu::RenderPipeline>,
+    /// r_postSpecialize: full-post pipelines keyed by `POST_FEATURES` mask,
+    /// compiled on the pipeline workers the first time a mask is used.
+    post_specialize: bool,
+    post_specialized: HashMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
     /// Deferred cloud-shadow multiplier for opaque light only. No work when disabled.
     cloud_shadow_opaque_pipeline: Option<wgpu::RenderPipeline>,
     /// Like the post bindings, but never samples the scene attachment being written.

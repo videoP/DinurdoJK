@@ -254,6 +254,10 @@ pub(in crate::renderer) struct LegacyDlightState {
     /// Surfaces whose mask is non-zero.
     lit: Vec<u32>,
     light_boxes: Vec<(Vec3, Vec3)>,
+    // Only position and radius affect the per-surface Legacy bitmask.
+    // Cache their exact bits to skip unchanged BVH walks and GPU uploads.
+    last_mask_light_count: usize,
+    last_mask_light_bits: [[u32; 4]; 32],
 }
 
 #[derive(Clone)]
@@ -318,10 +322,31 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
     world: &WorldGpu,
     lights: &[TransientLight],
 ) {
-    let index = index_for(world);
-    let surfaces = &world.legacy_dlight_surfaces;
+    // A paused scene or stationary FX lights used to rewalk the entire
+    // surface BVH, clear all lit masks, and re-upload them every frame.
+    // The mask test below depends only on the first 32 positions/radii;
+    // color, intensity, beam geometry, etc. never enter the intersection.
+    let mut light_bits = [[0u32; 4]; 32];
+    let light_count = lights.len().min(32);
+    for (key, light) in light_bits.iter_mut().zip(lights.iter().take(light_count)) {
+        *key = [
+            light.position[0].to_bits(),
+            light.position[1].to_bits(),
+            light.position[2].to_bits(),
+            light.radius.max(0.0).to_bits(),
+        ];
+    }
     let mut guard = world.legacy_dlight.state.lock().unwrap_or_else(PoisonError::into_inner);
     let state = &mut *guard;
+    if state.last_mask_light_count == light_count
+        && state.last_mask_light_bits[..light_count] == light_bits[..light_count]
+    {
+        return;
+    }
+    state.last_mask_light_count = light_count;
+    state.last_mask_light_bits = light_bits;
+    let index = index_for(world);
+    let surfaces = &world.legacy_dlight_surfaces;
     let mut dirty = usize::MAX..0;
     for &surface in &state.lit {
         let surface = surface as usize;

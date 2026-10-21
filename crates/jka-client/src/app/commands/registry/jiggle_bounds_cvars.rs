@@ -62,24 +62,47 @@ macro_rules! jiggle_float_cvars {
 }
 
 jiggle_float_cvars! {
+    SETTINGS_R_JIGGLESTOMACHSTRENGTH, APP_R_JIGGLESTOMACHSTRENGTH => (
+        "r_jiggleStomachStrength", jiggle_stomach_strength,
+        "0", "0..2", 0.0, 2.0,
+        "Optional stomach motion; only fitted abdominal fullness jiggles. Zero disables it. Works with either solver.",
+        10435
+    );
+    SETTINGS_R_JIGGLESTOMACHSTIFFNESS, APP_R_JIGGLESTOMACHSTIFFNESS => (
+        "r_jiggleStomachStiffness", jiggle_stomach_stiffness,
+        "1", "0..3", 0.0, 3.0,
+        "KawaiiPhysics stomach stiffness multiplier (stacks with r_jiggleStiffness).",
+        10436
+    );
+    SETTINGS_R_JIGGLESTOMACHDAMPING, APP_R_JIGGLESTOMACHDAMPING => (
+        "r_jiggleStomachDamping", jiggle_stomach_damping,
+        "1", "0..3", 0.0, 3.0,
+        "KawaiiPhysics stomach damping multiplier (stacks with r_jiggleDamping).",
+        10437
+    );
     SETTINGS_R_BODYMUSCLE, APP_R_BODYMUSCLE => (
         "r_bodyMuscle", body_muscle, "0.5", "0..1", 0.0, 1.0,
-        "Body muscle shape for characters with Anny v1 shape data; 0.5 preserves the authored body.",
+        "Anny muscle phenotype; 0.5 preserves the original body.",
         10440
     );
     SETTINGS_R_BODYWEIGHT, APP_R_BODYWEIGHT => (
         "r_bodyWeight", body_weight, "0.5", "0..1", 0.0, 1.0,
-        "Body weight shape for characters with Anny v1 shape data; 0.5 preserves the authored body.",
+        "Anny weight phenotype; 0.5 preserves the original body.",
         10441
     );
     SETTINGS_R_BODYPROPORTIONS, APP_R_BODYPROPORTIONS => (
         "r_bodyProportions", body_proportions, "0.5", "0..1", 0.0, 1.0,
-        "Body proportions for characters with Anny v1 shape data; 0.5 preserves the authored body.",
+        "Anny proportions phenotype; 0.5 preserves the original body.",
         10442
+    );
+    SETTINGS_R_BODYHEIGHT, APP_R_BODYHEIGHT => (
+        "r_bodyHeight", body_height, "0.5", "0..1", 0.0, 1.0,
+        "Anny height phenotype; 0.5 original. Cosmetic, collision bounds unchanged.",
+        10444
     );
     SETTINGS_R_BODYAGE, APP_R_BODYAGE => (
         "r_bodyAge", body_age, "0.5", "0..1", 0.0, 1.0,
-        "Anny v1 age shape: 0 child, 0.5 authored adult, 1 elder. Cosmetic; gameplay bounds remain server-defined.",
+        "Anny age phenotype in the demo's 0..1 range; 0.5 preserves the original body. Cosmetic; gameplay bounds unchanged.",
         10443
     );
     SETTINGS_R_JIGGLEBREASTREMESHBOTTOMZ, APP_R_JIGGLEBREASTREMESHBOTTOMZ => (

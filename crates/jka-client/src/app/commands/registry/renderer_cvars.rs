@@ -1,5 +1,6 @@
 //! Renderer cvars: declarative runtime and config bindings.
 use super::cvar_prelude::*;
+use crate::ui::InlineTransformMode;
 
 // All runtime definitions in this registry are App cvars. Fix the state type
 // before closure inference for setters and dynamic cvar bindings.
@@ -855,6 +856,54 @@ app_cvars! {
         ]
     }
 
+    APP_R_INLINETRANSFORM {
+        runtime: CvarDef::new("r_inlineTransform", "", "cpu|workers|gpu", "Inline BSP mover transforms: scalar CPU reference, CPU worker pool, or GPU compute (default). Applies immediately; compare pre.inline CPU time and gpu_pass_inline_transform_ms in captures.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.inline_transform_mode.config_value().to_owned()),
+            |app, value| App::cvar_set_r_inlinetransform(app, APP_R_INLINETRANSFORM.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_inlinetransform, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.inline_transform_mode = InlineTransformMode::from_config(value)
+                    .unwrap_or(settings.inline_transform_mode);
+            }),
+            archive: Some((431, |state| state.video.inline_transform_mode.config_value().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_inlinetransform(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = InlineTransformMode::from_config(value)
+                        .ok_or_else(|| format!("{name}: expected cpu|workers|gpu"))?;
+                    if self.video.inline_transform_mode != mode {
+                        self.video.inline_transform_mode = mode;
+                        self.render_command(RenderCommand::SetInlineTransformMode(mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("INLINE MOVER TRANSFORMS: {}", mode.label());
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_INLINEGPUTRANSFORM {
+        runtime: CvarDef::new("r_inlineGpuTransform", "", "0..1", "Compatibility A/B switch: 0 selects CPU, 1 selects GPU. Use r_inlineTransform cpu|workers|gpu for all three modes.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.inline_transform_mode == InlineTransformMode::Gpu)),
+            |app, value| App::cvar_set_r_inlinegputransform(app, APP_R_INLINEGPUTRANSFORM.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_inlinegputransform, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_r_inlinegputransform(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    let mode = if enabled { "gpu" } else { "cpu" };
+                    self.cvar_set_r_inlinetransform(name, mode)
+                }
+            }
+        ]
+    }
+
     APP_R_WORLDSORTMODE {
         runtime: CvarDef::new("r_worldSortMode", "", "0|1", "Session A/B: 0 authored-sort baseline; 1 additionally group independent opaque/masked stages by their ACTUAL compiled pipeline inside the same authored shader sort bucket. Never reorders blended, sky, depth-equal, multi-stage, mover, water, mirror or ocean stages. Sort estimates appear in renderperf captures and JKA PERF logs.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.world_sort_mode.to_string()),
@@ -870,6 +919,29 @@ app_cvars! {
                     self.video.world_sort_mode = mode;
                     self.render_command(RenderCommand::SetWorldSortMode(mode));
                     self.console_status = format!("WORLD SORT: {}", if mode == 0 { "AUTHORED SORT" } else { "AUTHORED + SAFE PIPELINE" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_POSTSPECIALIZE {
+        runtime: CvarDef::new("r_postSpecialize", "", "0|1", "Session A/B: 1 (default) draws full post with a pipeline compiled for the effects currently enabled, so disabled effects cost no registers; 0 always uses the general post pipeline. Same image either way.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(u8::from(app.video.post_specialize).to_string()),
+            |app, value| App::cvar_set_r_postspecialize(app, APP_R_POSTSPECIALIZE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_postspecialize, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_r_postspecialize(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = match value.trim() {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err(format!("{name}: expected 0 or 1")),
+                    };
+                    self.video.post_specialize = enabled;
+                    self.render_command(RenderCommand::SetPostSpecialize(enabled));
+                    self.console_status = format!("POST SPECIALIZE: {}", if enabled { "ON" } else { "OFF" });
                     Ok(())
                 }
             }

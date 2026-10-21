@@ -20,6 +20,8 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let command = args.first().and_then(|s| s.to_str()).unwrap_or("help");
     match command {
+        "pool-poses" if args.len() == 3 => jka_emotes::library::pose_pool::run(
+            Path::new(&args[1]), Path::new(&args[2])),
         "pack-library" if (4..=5).contains(&args.len()) => {
             let native = if args[2] == "-" {
                 None
@@ -266,6 +268,7 @@ const USAGE: &str = "djk-fnemote: compile self-contained emote bundles
   skeleton <GameData/base> [target model.glm]     bones of a target model's rig
   pack-library <emotes dir> <native.pk3 or -> <fresh output.pk3> [overrides dir]
   compact-library <input dir> <fresh output dir> [GameData/base to recalibrate]
+  pool-poses <input.pk3> <fresh output.pk3>      lossless local TRS pooling; writes a JSON report
 
 Library tooling for Fortnite-style source exports (see crates/jka-emotes/LIBRARY.md):
   batch <export> <GameData/base> <out/emotes> [jobs] [IDs or -] [target model.glm] [supplement dir]

@@ -2,12 +2,13 @@
 //!
 //! This uses *existing* 16-bit usercmd view angles and server-replicated
 //! `entityState_t.apos.trBase`. No wire changes, server patches, or userinfo.
-//! Its 11-bit magic is only a probabilistic check, NOT peer authentication.
+//! Version 2 uses 13 ID bits and 9 signature bits in the same 22 angle bits.
+//! Its magic is only a probabilistic check, NOT peer authentication.
 
-pub const EMOTE_ID_BITS: u32 = 11;
+pub const EMOTE_ID_BITS: u32 = 13;
 pub const ANGLE_PAYLOAD_BITS: u32 = 11;
 pub const EMOTE_CAPACITY: u16 = 1 << EMOTE_ID_BITS;
-pub const SIGNATURE: u16 = 0x6d5; // version 1; immutable once deployed
+pub const SIGNATURE: u16 = 0x16d; // version 2; immutable once deployed
 const MASK: u16 = (1 << ANGLE_PAYLOAD_BITS) - 1;
 const PERIOD: i32 = 1 << ANGLE_PAYLOAD_BITS;
 
@@ -96,7 +97,7 @@ mod tests {
     #[test]
     fn invalid_ids_and_clamped_pitch_are_safe() {
         assert_eq!(payload(EMOTE_CAPACITY), None);
-        let mut cmd = [16000, 0, 0];
+        let mut cmd = [-16000, 0, 0];
         assert!(!encode_cmd_angles(&mut cmd, [0; 3], 23));
     }
 

@@ -1414,6 +1414,33 @@ settings_cvars! { NetworkSettings;
         ]
     }
 
+    APP_CL_IDRIVE {
+        runtime: CvarDef::new("cl_idrive", "1", "0|1", "Opposite movement keys: 0 cancel, 1 most recently pressed direction wins (solo and multiplayer).", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Bool(app.network.idrive),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                app.network.idrive = enabled;
+                app.mark_config_dirty();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(enabled) = parse_bool(value) { settings.network.idrive = enabled; }
+            }),
+            archive: Some((3500, |state| format!("{}", u8::from(state.presentation.network.idrive)))),
+            ..CvarBinding::NONE
+        },
+        settings: SETTINGS_CL_IDRIVE = APP_CL_IDRIVE.bind(
+            |state: &NetworkSettings| CvarValue::Bool(state.idrive),
+            |state, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                state.idrive = enabled;
+                Ok(())
+            },
+        ),
+        implementations: []
+    }
+
     APP_CL_MAXPACKETS {
         runtime: CvarDef::new(
                 "cl_maxpackets",

@@ -32,6 +32,7 @@ pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
     pub(in crate::renderer) jiggle1: [f32; 4],
     pub(in crate::renderer) jiggle2: [f32; 4],
     pub(in crate::renderer) jiggle3: [f32; 4],
+    pub(in crate::renderer) jiggle4: [f32; 4],
     /// Source 1 `$phong`: boost, exponent, `$rimlightboost`, `$rimlightexponent`.
     /// A zero boost switches that term off. Read only by the
     /// `ENABLE_SOURCE_MATERIAL` fragment variants.

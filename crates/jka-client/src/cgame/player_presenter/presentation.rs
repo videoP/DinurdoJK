@@ -39,6 +39,7 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        crate::emotes::network::set_render_time(current_time);
         self.japro_cinfo2 = game.japro_cinfo2();
         self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
@@ -659,10 +660,9 @@ impl PlayerPresenter {
             }
         };
         let local_emote = if entity.entity_type == ET_PLAYER
-            && i32::from(entity.number) == self.viewer_client
             && npc_model_request.is_none()
         {
-            if let Some(active) = crate::emotes::active_preview() {
+            if let Some(active) = crate::emotes::network::player_preview(entity.number, self.viewer_client, current_time) {
                 match self.load_emote_gla(&active.emote.gla) {
                     Ok(gla) if crate::emotes::pose_plan(&gla, &model.gla).is_ok()
                         && active.emote.end_frame as usize <= active.emote.pose.as_ref().map_or(gla.num_frames, |p| p.frames) => Some((active, gla)),
@@ -725,6 +725,7 @@ impl PlayerPresenter {
                     requested_skin_name: requested_skin_name.to_owned(),
                     model: Arc::clone(&model),
                     animation,
+                    emote_taunt: Default::default(),
                     player_angles: PlayerAngleState::reset_from_angles(entity.angles),
                     last_angle_time: current_time,
                     head_look_yaw: None,
@@ -804,6 +805,7 @@ impl PlayerPresenter {
             // CG_ResetPlayerEntity when interpolation is broken.  This resets
             // the lerp frames and the persistent torso/legs angle swing state.
             runtime.animation.reset_player_entity();
+            runtime.emote_taunt = Default::default();
             // OpenJK CG_ResetPlayerEntity clears/reseeds cent->pe torso/legs
             // swing state, but preserves clientInfo corrTime/lookTime/
             // lastHeadAngles. Only superSmoothTime is reset there.
@@ -1204,14 +1206,19 @@ impl PlayerPresenter {
             Some(&self.anim_events)
         };
 
+        // Cosmetic playback can be shorter than the accepted native taunt.
+        // Keep that exact taunt instance masked after the clip ends; only this
+        // animation input copy changes, never Pmove or the received entity.
+        let emote_animation_state = runtime.emote_taunt.animation_state(&entity.state, local_emote.is_some());
         runtime.animation.update(
-            &entity.state,
+            emote_animation_state.as_ref().unwrap_or(&entity.state),
             animations,
             &model.animation_gla,
             info,
             &self.saber_scales,
             current_time,
-            true,
+            // Never blend idle through the hidden native taunt's bone state.
+            emote_animation_state.is_none(),
             model.humanoid,
         )?;
 

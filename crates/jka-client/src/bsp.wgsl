@@ -153,6 +153,13 @@ struct OceanRenderSettings {
     appearance_b: vec4<f32>, // body color mode, foam brightness, sun gain, foam debug
     appearance_c: vec4<f32>, // x visual fixes; y dynamic LOD ready; z mesh spacing; w analytic far radius
     hybrid_eye: vec4<f32>, // x Godot-mesh lift near the camera (metres); y active
+    // Submerged Hybrid: Blue Water's own clipmap through `vs_ocean_native`.
+    // Its upstream `Surface` prefix: per level xy snapped centre (m), z cell (m), w 1 / cell.
+    native_frames: array<vec4<f32>, 10>,
+    native_clipmap: vec4<f32>, // segments, levels, clipmap centre x, z (m)
+    native_detail: vec4<f32>, // finest level drawn, its morph, plane height (units), mask slot
+    // The outline's 2-bit 32x32 tile classification (0 boundary, 1 outside, 2 inside), 16 vec4 per slot.
+    mask_fine_tiles: array<vec4<u32>, 128>,
 };
 struct SkyFogRegion {
     bounds: vec4<f32>,
@@ -827,6 +834,7 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool, mesh_center: v
     let distance_factor = min(exp(-(camera_distance_m - 150.0) * 0.007), 1.0);
     let world_m = position.xz / units_per_meter;
     var displacement_m = vec3<f32>(0.0);
+    var crest_scale = 1.0;
     // The clipping rings are concentric squares. Position-only selection
     // means the exact shared edge vertices of adjacent LODs use identical
     // displacement, rather than opening a crack from mismatched wave ages.
@@ -869,12 +877,13 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool, mesh_center: v
             }
         }
         displacement_m += sample.xyz * vec3<f32>(1.0,1.0,-1.0) * scale.z;
+        if sample.w < 0.0 { crest_scale = -sample.w; }
     }
     }
     displacement_m.x *= ocean.swell_motion.z;
     displacement_m.z *= ocean.swell_motion.z;
     let phase = dot(world_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
-    let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase);
+    let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase) * crest_scale;
     displacement_m += vec3<f32>(ocean.swell.x * horizontal, ocean.swell.w * sin(phase), ocean.swell.y * horizontal);
     let coastal=sample_coastal(position);
     // Incoming FFT has already forced the coastal solution. Replace that wave
@@ -1170,6 +1179,77 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOut {
     return world_vertex(input, instance_index, legacy_dlight_surface_id);
+}
+
+// Submerged Hybrid draws Blue Water's own clipmap (`OceanVertex`: offset from
+// its level's frame in metres, level) with this shader, so only the mesh comes
+// from Blue Water while the displacement and material stay the Godot ones.
+struct NativeOceanVertexIn {
+    @location(0) position: vec2<f32>,
+    @location(1) level: vec2<f32>,
+};
+
+fn native_ocean_mod2(x: vec2<f32>) -> vec2<f32> {
+    return x - 2.0 * floor(x * 0.5);
+}
+
+// Blue Water's `surface.wgsl` vertex placement, verbatim: each level snapped to
+// its own lattice, a ring's inner edge on the finer level's frame, and the
+// geomorph that closes the 2:1 seam at a level's outer row. Returns metres.
+fn native_ocean_grid(input: NativeOceanVertexIn) -> vec2<f32> {
+    let levels = i32(ocean.native_clipmap.y);
+    let segments = ocean.native_clipmap.x;
+    let level = i32(clamp(input.level.x, 0.0, f32(levels - 1)));
+    let frame = ocean.native_frames[level];
+    let finer = ocean.native_frames[max(level - 1, 0)];
+    let cell = frame.z;
+    let lattice = input.position * frame.w;
+    let inner = max(abs(lattice.x), abs(lattice.y)) <= segments / 4.0 && level > 0;
+    let index = lattice + select(vec2<f32>(0.0), (finer.xy - frame.xy) * frame.w, inner);
+    let snapped = frame.xy + index * cell;
+    let reach = max(abs(snapped.x - ocean.native_clipmap.z), abs(snapped.y - ocean.native_clipmap.w))
+        / (cell * (segments / 2.0));
+    let receding = select(0.0, ocean.native_detail.y, level == i32(ocean.native_detail.x));
+    let morph = max(smoothstep(0.6, 0.85, reach), receding);
+    return snapped - native_ocean_mod2(index) * morph * cell;
+}
+
+@vertex fn vs_ocean_native(input: NativeOceanVertexIn) -> VertexOut {
+    var output: VertexOut;
+    let units_per_meter = max(ocean.ocean_info.z, 0.001);
+    let unfolded = native_ocean_grid(input) * units_per_meter;
+    // The Godot clipmap's fold onto the pool rectangle (`ocean_clipmap_position`):
+    // an unmasked pool has no fragment outline test, only this clamp.
+    let promoted_dynamic = ocean.authored_plane.w > 0.5;
+    let sky_enabled = promoted_dynamic && ocean.authored_plane.w > 1.5;
+    let folded = select(unfolded, clamp(unfolded, ocean.authored_bounds.xy, ocean.authored_bounds.zw),
+        promoted_dynamic && !sky_enabled);
+    let source_position = vec3<f32>(folded.x, ocean.native_detail.z, folded.y);
+    let ocean_sample = sample_ocean_displacement(source_position, true,
+        ocean.native_clipmap.zw * units_per_meter);
+    let world_position = source_position + ocean_sample.xyz * units_per_meter;
+    output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
+    if (output.clip_position.w > 0.0) {
+        // As `world_vertex`: water past the far plane keeps its screen position.
+        output.clip_position.z = max(output.clip_position.z, output.clip_position.w * 0.000001);
+    }
+    output.uv = vec2<f32>(0.0);
+    output.lightmap_uv = vec2<f32>(0.0);
+    output.color = vec4<f32>(1.0);
+    output.sky_dir_ao = vec4<f32>(world_position - camera.camera_pos_time.xyz, -1.0);
+    output.world_position = world_position;
+    output.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    output.shell_kind = 0u;
+    output.shell_coverage = 0.0;
+    output.ocean_wave_height = ocean_sample.w;
+    output.ocean_uv_m = source_position.xz / units_per_meter;
+    output.ocean_vertex = 2.0 + ocean.native_detail.w;
+    output.pbr_lightgrid_direction = vec4<f32>(0.0);
+    output.pbr_lightgrid_lighting = vec4<f32>(0.0);
+    output.vertex_dlight = vec3<f32>(0.0);
+    output.legacy_dlight_bits = 0u;
+    output.baked_sun_fit = vec4<f32>(0.0);
+    return output;
 }
 
 // OpenJK does not rasterize the authored sky brush at its literal world-space

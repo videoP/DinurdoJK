@@ -8,11 +8,13 @@ struct EyeParams {
     // xz metres, x/z of the grid spacing the mesh uses at the eye, unused
     eye: vec4<f32>,
     swell: array<vec4<f32>, 2>,
+    // `r_oceanType 5` (godot_water.wgsl): x 1 on, y wave scale, z seconds.
+    godot: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> probe: EyeParams;
 @group(0) @binding(1) var<storage, read_write> result: array<vec4<f32>, 2>;
 
-fn jka_native_offset(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
+fn jka_native_raw_offset(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
     var base = vec3<f32>(0.0);
     if probe.swell[1].z > 0.0 {
         base = displacement(grid, spacing) * probe.swell[1].z;
@@ -24,6 +26,15 @@ fn jka_native_offset(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
     let horizontal = amplitude * probe.swell[1].y * cos(phase);
     return base + vec3<f32>(probe.swell[0].x * horizontal,
         amplitude * sin(phase), probe.swell[0].y * horizontal);
+}
+
+fn jka_native_offset(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
+    if probe.godot.x > 0.5 {
+        return jka_godot_displacement(grid, spacing, probe.godot.y, probe.godot.z);
+    }
+    let raw = jka_native_raw_offset(grid, spacing);
+    let scale = jka_crest_scale(probe.swell[0], probe.swell[1], probe.eye.w);
+    return raw * vec3<f32>(scale, 1.0, scale);
 }
 
 @compute @workgroup_size(1)

@@ -214,7 +214,7 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 /// after calling `write` for the field's current frame.
 pub struct SurfaceWaves {
     layout: wgpu::BindGroupLayout,
-    groups: [wgpu::BindGroup; 2],
+    pub(crate) groups: [wgpu::BindGroup; 2],
     uniforms: wgpu::Buffer,
     _hull_sea: wgpu::Buffer,
     _shore: wgpu::Texture,
@@ -237,6 +237,14 @@ impl SurfaceWaves {
                 texture_entry(6, false),
                 texture_entry(7, false),
                 sampler_entry(8),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -295,6 +303,7 @@ impl SurfaceWaves {
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&shore_view) },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&shore_view) },
                     wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&shore_sampler) },
+                    wgpu::BindGroupEntry { binding: 9, resource: field.crest_limits_buffer().as_entire_binding() },
                 ],
             })
         });
@@ -339,6 +348,7 @@ impl SurfaceWaves {
                     wgpu::BindGroupEntry {binding:6,resource:wgpu::BindingResource::TextureView(&textures.heights)},
                     wgpu::BindGroupEntry {binding:7,resource:wgpu::BindingResource::TextureView(&textures.exposure)},
                     wgpu::BindGroupEntry {binding:8,resource:wgpu::BindingResource::Sampler(&waves._shore_sampler)},
+                    wgpu::BindGroupEntry {binding:9,resource:field.crest_limits_buffer().as_entire_binding()},
                 ],
             })
         });

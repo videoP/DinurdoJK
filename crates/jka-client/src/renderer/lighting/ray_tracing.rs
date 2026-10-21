@@ -1889,13 +1889,17 @@ pub(in crate::renderer) fn rt_sampled_light_loops(source: &str) -> Result<String
         if original.matches(LIGHT).count() != 1 {
             return Err("RT light lookup anchor changed".into());
         }
-        // Local lights are always traced directly (never cached): they are
-        // already gated by real cluster membership, so most receivers pay
-        // nothing for lights that aren't nearby. Only the per-sample area-light
-        // loop (independent of caching) is introduced here.
-        let sampled = original.replace(LIGHT,
-            "let light = rt_sample_local_emitter(rt_source, input, cluster.indices[i], rt_sample_index, rt_count);");
-        result.replace_range(start..end, &format!("{LOOP}\n        let rt_source = dynamic_lights[cluster.indices[i]];\n        let rt_count = rt_local_sample_count(rt_source);\n        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{{sampled}\n        }}\n    "));
+        let mut sampled = original.replace(LIGHT,
+            "let light = rt_sample_local_emitter_seed(rt_source, input, cluster.indices[i], rt_sample_index, rt_count, rt_seed);");
+        for normal in ["normal", "n"] {
+            sampled = sampled.replace(
+                &format!("local_light_shadow_rgb(light, input.world_position, {normal})"),
+                &format!("rt_rate_local_shadow_rgb(light, input, {normal}, i, rt_sample_index)"));
+            sampled = sampled.replace(
+                &format!("rt_local_shadow_rgb(light, input.world_position, {normal})"),
+                &format!("rt_rate_local_shadow_rgb(light, input, {normal}, i, rt_sample_index)"));
+        }
+        result.replace_range(start..end, &format!("{LOOP}\n        let rt_source = dynamic_lights[cluster.indices[i]];\n        let rt_count = rt_local_sample_count(rt_source);\n        let rt_seed = rt_rate_emitter_seed(input);\n        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{{sampled}\n        }}\n    "));
     }
     Ok(result)
 }
@@ -2047,6 +2051,9 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     }
     source = rt_sampled_light_loops(&source)?;
     source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+    source.push_str(include_str!("../../rt_local_rate_surface.wgsl"));
+    source.push_str(include_str!("../../rt_local_rate_read.wgsl"));
+    source.push_str("\nfn rt_rate_local_shadow_rgb(light: PointLight, input: VertexOut, normal: vec3<f32>, slot: u32, sample_index: u32) -> vec3<f32> {\n    let cached = rt_rate_local_visibility(input, normal, slot, sample_index);\n    if (cached >= 0.0 && ((rt_shadow_flags.flags.z != 0u) == ENABLE_MAP_LIGHT_SIMULATION)) { return vec3<f32>(cached); }\n    return rt_local_shadow_rgb(light, input.world_position, normal);\n}\n");
     if features.glass {
         for n in ["normal", "n"] {
             source = source.replace(
@@ -2127,7 +2134,7 @@ pub(in crate::renderer) fn rt_receiver_layout_entries(_features: ReceiverFeature
             },
             alpha_entries[0], alpha_entries[1], alpha_entries[2],
             alpha_entries[3], alpha_entries[4], alpha_entries[5],
-            cache_entries[0], cache_entries[1],
+            cache_entries[0], cache_entries[1], cache_entries[2],
     ];
     entries.to_vec()
 }
@@ -2264,6 +2271,10 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
             wgpu::BindGroupEntry {
                 binding: 16,
                 resource: wgpu::BindingResource::TextureView(&sun_shadow_history.published),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local.published),
             },
     ];
     device.create_bind_group(&wgpu::BindGroupDescriptor {

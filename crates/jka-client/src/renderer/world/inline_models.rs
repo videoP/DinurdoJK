@@ -55,8 +55,15 @@ impl Renderer {
         let Some(world) = self.world.as_mut() else {
             return;
         };
+        if self.inline_transform_mode == crate::ui::InlineTransformMode::Gpu
+            && world.inline_transform.is_none() && !world.inline_models.is_empty() {
+            world.inline_transform = Some(super::inline_transform::InlineTransformGpu::new(
+                &self.device, &world.vertex_buffer, &world.inline_models,
+            ));
+        }
         let WorldGpu {
             inline_models,
+            inline_transform,
             coarse_batches,
             full_batches,
             auto4_batches,
@@ -72,6 +79,25 @@ impl Renderer {
         } = world;
         let stride = std::mem::size_of::<GpuVertex>() as u64;
         let record_stride = std::mem::size_of::<GpuCullRecord>() as u64;
+        // Only GPU culling (and its debug view) reads cull-record bounds. Moving
+        // fish otherwise cost one tiny write_buffer per stage per frame (~350 on
+        // costadelsol, 0.3 ms). CPU culling reads `batch.bounds_*` instead, so
+        // defer the records and rewrite them all once when GPU culling returns.
+        let cull_records_read =
+            self.gpu_driven_enabled || self.cull_debug_mode != crate::renderer::CullDebugMode::Off;
+        if cull_records_read && std::mem::take(&mut self.inline_cull_bounds_stale) {
+            for model in inline_models.iter() {
+                for (set, indices) in [
+                    (&*coarse_batches, &model.coarse_batches),
+                    (&*full_batches, &model.full_batches),
+                ] {
+                    for &index in indices {
+                        let Some(batch) = set.get(index) else { continue; };
+                        write_cull_bounds(&self.queue, cull_records_buffer, record_stride, batch);
+                    }
+                }
+            }
+        }
         let poses = &mut self.inline_pose_scratch;
         collect_inline_poses(
             poses,
@@ -79,7 +105,7 @@ impl Renderer {
             instances,
         );
         let mut glass_poses_changed = false;
-        for model in inline_models.iter_mut() {
+        for (slot, model) in inline_models.iter_mut().enumerate() {
             let target = poses.get_mut(model.model as usize).and_then(Vec::pop);
             // Portal membership can change without a pose change. Retain its
             // current per-instance flag, but avoid a needless vertex upload or
@@ -128,19 +154,39 @@ impl Renderer {
                 }
             }
             let Some(pose) = target else {
+                if let Some(resource) = inline_transform.as_mut()
+                    .and_then(|gpu| gpu.models.get_mut(slot)).and_then(Option::as_mut) {
+                    resource.cancel();
+                }
                 // No geometry upload, CPU bounds mutation or collapsed triangles.
                 // Preserve compiled/last-active vertices for instant reappearance.
                 continue;
             };
-            let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, pose);
-            self.queue.write_buffer(
-                vertex_buffer,
-                u64::from(model.gpu_vertex_start) * stride,
-                bytemuck::cast_slice(&vertices),
-            );
-            let bounds: [f32; 8] = [
-                minimum[0], minimum[1], minimum[2], 0.0, maximum[0], maximum[1], maximum[2], 0.0,
-            ];
+            let gpu_model = inline_transform.as_mut()
+                .filter(|_| self.inline_transform_mode == crate::ui::InlineTransformMode::Gpu)
+                .and_then(|gpu| gpu.models.get_mut(slot)).and_then(Option::as_mut);
+            let (minimum, maximum) = if let Some(gpu_model) = gpu_model {
+                gpu_model.update(&self.queue, pose)
+            } else if let Some(pool) = self.inline_transform_workers.as_ref()
+                .filter(|_| self.inline_transform_mode == crate::ui::InlineTransformMode::CpuWorkers) {
+                let bounds = super::geometry::posed_inline_vertices_workers(
+                    &model.base, pose, &mut self.inline_vertex_scratch, pool,
+                );
+                self.queue.write_buffer(
+                    vertex_buffer,
+                    u64::from(model.gpu_vertex_start) * stride,
+                    bytemuck::cast_slice(&self.inline_vertex_scratch),
+                );
+                bounds
+            } else {
+                let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, pose);
+                self.queue.write_buffer(
+                    vertex_buffer,
+                    u64::from(model.gpu_vertex_start) * stride,
+                    bytemuck::cast_slice(&vertices),
+                );
+                (minimum, maximum)
+            };
             for (set, indices) in [
                 (&mut *coarse_batches, &model.coarse_batches),
                 (&mut *full_batches, &model.full_batches),
@@ -149,11 +195,11 @@ impl Renderer {
                     let Some(batch) = set.get_mut(index) else { continue; };
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
-                    self.queue.write_buffer(
-                        cull_records_buffer,
-                        u64::from(batch.cull_index) * record_stride,
-                        bytemuck::cast_slice(&bounds),
-                    );
+                    if cull_records_read {
+                        write_cull_bounds(&self.queue, cull_records_buffer, record_stride, batch);
+                    } else {
+                        self.inline_cull_bounds_stale = true;
+                    }
                 }
             }
             // AUTO 4 is a shallow alias of FULL: the GPU cull-record flag
@@ -199,6 +245,15 @@ impl Renderer {
             }
         }
     }
+}
+
+/// Upload a batch's CPU bounds into its GPU cull record (min/max, w padded).
+fn write_cull_bounds(queue: &wgpu::Queue, records: &wgpu::Buffer, record_stride: u64, batch: &WorldBatch) {
+    let (minimum, maximum) = (batch.bounds_min, batch.bounds_max);
+    let bounds: [f32; 8] = [
+        minimum[0], minimum[1], minimum[2], 0.0, maximum[0], maximum[1], maximum[2], 0.0,
+    ];
+    queue.write_buffer(records, u64::from(batch.cull_index) * record_stride, bytemuck::cast_slice(&bounds));
 }
 
 /// One pose per render slot, preserving every server submission for a shared

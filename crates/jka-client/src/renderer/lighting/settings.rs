@@ -59,6 +59,7 @@ impl Renderer {
             return;
         }
         self.rt_samples = samples;
+        if let Some(rt) = self.ray_traced_shadows.as_mut() { rt.sun_shadow_history.invalidate(); }
         if self.hardware_rt_requested() {
             self.update_lighting_settings();
             self.history_valid = false;
@@ -67,11 +68,15 @@ impl Renderer {
 
 
 
-    pub(in crate::renderer) fn set_rt_half_resolution(&mut self, enabled: bool) {
-        if self.rt_reduced_shadows == enabled {
+    pub(in crate::renderer) fn set_rt_trace_rate(&mut self, rate: u32) {
+        let rate = if matches!(rate, 1 | 2 | 4) { rate } else { 1 };
+        if self.rt_trace_rate == rate {
             return;
         }
-        self.rt_reduced_shadows = enabled;
+        self.rt_trace_rate = rate;
+        if let Some(rt) = self.ray_traced_shadows.as_mut() {
+            rt.sun_shadow_history.invalidate();
+        }
         self.history_valid = false;
         self.rebuild_frame_plan();
     }

@@ -15,7 +15,8 @@ use crate::app::egui_settings::{
     PHYS_JIGGLE_JP_STRETCH, PHYS_JIGGLE_SOLVER, PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH,
     PHYS_JIGGLE_BREAST_SIZE, PHYS_JIGGLE_GLUTE_SIZE, PHYS_JIGGLE_LOCOMOTION, PHYS_JIGGLE_SWIRL,
     PHYS_JIGGLE_BREAST_STIFFNESS, PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS,
-    PHYS_JIGGLE_GLUTE_DAMPING,
+    PHYS_JIGGLE_GLUTE_DAMPING, PHYS_JIGGLE_STOMACH,
+    PHYS_JIGGLE_STOMACH_STIFFNESS, PHYS_JIGGLE_STOMACH_DAMPING,
     PHYS_MAX_SUBSTEPS,
     PHYS_PLAYER_PUSH, PHYS_PROPS, PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME,
     PHYS_RAGDOLL_MAX, PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS,
@@ -611,6 +612,9 @@ impl App {
             PHYS_JIGGLE_BREAST => {
                 self.video.jiggle_breast_strength = defaults.jiggle_breast_strength
             }
+            PHYS_JIGGLE_STOMACH => self.video.jiggle_stomach_strength = defaults.jiggle_stomach_strength,
+            PHYS_JIGGLE_STOMACH_STIFFNESS => self.video.jiggle_stomach_stiffness = defaults.jiggle_stomach_stiffness,
+            PHYS_JIGGLE_STOMACH_DAMPING => self.video.jiggle_stomach_damping = defaults.jiggle_stomach_damping,
             PHYS_JIGGLE_GLUTE => self.video.jiggle_glute_strength = defaults.jiggle_glute_strength,
             PHYS_JIGGLE_STIFFNESS => self.video.jiggle_stiffness = defaults.jiggle_stiffness,
             PHYS_JIGGLE_DAMPING => self.video.jiggle_damping = defaults.jiggle_damping,

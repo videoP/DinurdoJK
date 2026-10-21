@@ -178,6 +178,21 @@ impl App {
         self.publish_ui();
     }
 
+    /// 0 off, 1 balanced (whole-image metering), 2 sky-referenced (Blue Water eye).
+    /// Off and balanced clear the sky-referenced flag, so the choice survives
+    /// switching skies instead of being re-enabled by the default.
+    pub(in crate::app) fn set_auto_exposure_mode(&mut self, mode: u8) {
+        self.video.blue_water_environment.filmic = mode == 2;
+        match mode {
+            0 => self.video.auto_exposure = 0.0,
+            1 if self.video.auto_exposure <= 0.0 => self.video.auto_exposure = 1.0,
+            _ => {}
+        }
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn set_motion_blur_strength(&mut self, strength: f32) {
         self.video.motion_blur_strength = strength.clamp(0.0, 1.0);
         self.sync_post_effects();
@@ -757,8 +772,8 @@ impl App {
         self.render_command(RenderCommand::SetDynamicLightFalloff(
             self.video.dynamic_light_falloff,
         ));
-        self.render_command(RenderCommand::SetRtHalfResolution(
-            self.video.rt_half_resolution,
+        self.render_command(RenderCommand::SetRtTraceRate(
+            self.video.rt_trace_rate,
         ));
     }
 
@@ -1688,12 +1703,20 @@ impl App {
 
     /// Single ocean selector. No promotion uses the existing resource-off path,
     /// so stock BSP/JKA water returns rather than an invisible promoted mesh.
+    /// `r_oceanType`: 0 off, backend + 1, or 5 for Hybrid with the Gerstner surface.
+    pub(in crate::app) fn ocean_type(&self) -> u8 {
+        if !self.video.ocean { 0 }
+        else if self.video.ocean_settings.gerstner_active() { 5 }
+        else { self.video.ocean_settings.backend + 1 }
+    }
+
     pub(in crate::app) fn set_ocean_type(&mut self, ocean_type: u8) {
-        let ocean_type = ocean_type.min(4);
+        let ocean_type = ocean_type.min(5);
         let enabled = ocean_type != 0;
-        let backend = ocean_type.saturating_sub(1);
+        let backend = if ocean_type == 5 { 2 } else { ocean_type.saturating_sub(1) };
         if enabled {
             self.video.ocean_settings.backend = backend;
+            self.video.ocean_settings.gerstner_water = ocean_type == 5;
         }
         self.video.ocean = enabled;
         if let Some(session) = self.game_session.as_mut() {

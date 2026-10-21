@@ -3067,6 +3067,17 @@ impl ApplicationHandler<UserEvent> for App {
         self.tick_emote_gallery();
         self.tick();
         self.tick_companion_ui();
+        let bench_turn = BENCH_TURN_COUNTS.load(std::sync::atomic::Ordering::Relaxed);
+        if bench_turn != 0 {
+            let period = BENCH_TURN_PERIOD.load(std::sync::atomic::Ordering::Relaxed) as u32;
+            let step = BENCH_TURN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bench_turn = if period != 0 && (step / period) % 2 == 1 { -bench_turn } else { bench_turn };
+            let captured = std::mem::replace(&mut self.captured, true);
+            // SAFETY: dummy ids are only compared/hashed by the handler.
+            let device = unsafe { winit::event::DeviceId::dummy() };
+            self.device_event(event_loop, device, DeviceEvent::MouseMotion { delta: (bench_turn as f64, 0.0) });
+            self.captured = captured;
+        }
         if self.quit_requested {
             self.flush_config();
             if !self.background_jobs.flush_io(Duration::from_millis(500)) {
@@ -3084,6 +3095,14 @@ impl ApplicationHandler<UserEvent> for App {
         self.exit_process();
     }
 }
+
+/// `benchturn` synthetic mouse counts per event-loop turn (0 = off).
+pub(in crate::app) static BENCH_TURN_COUNTS: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+/// `benchturn` reversal period in event-loop turns (0 = keep turning).
+pub(in crate::app) static BENCH_TURN_PERIOD: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+static BENCH_TURN_STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl App {
     /// Flush what must survive and end the process without orderly teardown.

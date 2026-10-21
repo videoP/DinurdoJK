@@ -224,7 +224,11 @@ impl App {
                 let local_supported = local_active && self.local_server.as_ref()
                     .is_some_and(|server| server.supports_generic_command(value));
                 if self.live_connected() || local_supported {
-                    self.live_input.queue_generic_command(value); return true;
+                    self.live_input.queue_generic_command(value);
+                    if (27..=31).contains(&value) && crate::emotes::stop_world() {
+                        self.live_input.queue_emote_stop();
+                    }
+                    return true;
                 }
             }
             Some(GameCommand::InventoryFree) => {

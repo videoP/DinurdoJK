@@ -101,6 +101,9 @@ impl Renderer {
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
             self.ssr_enabled,
+            self.needs_resolved_depth_target(),
+            self.taa_enabled || self.rt_taa_mode > 0,
+            self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
         );
         self.world_flares.invalidate_depth_binding();
@@ -158,6 +161,9 @@ impl Renderer {
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
             self.ssr_enabled,
+            self.needs_resolved_depth_target(),
+            self.taa_enabled || self.rt_taa_mode > 0,
+            self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
         );
         self.world_flares.invalidate_depth_binding();

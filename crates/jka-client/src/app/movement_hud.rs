@@ -210,9 +210,13 @@ impl App {
     }
 
     pub(in crate::app) fn current_movement_hud_state(&self) -> ui::MovementHudState {
+        self.current_movement_state(false)
+    }
+
+    pub(in crate::app) fn current_movement_state(&self, require_physics: bool) -> ui::MovementHudState {
         let movement_keys_active = self.movement_keys_hud.mode != 0;
         let strafe_helper_active =
-            self.strafe_helper.flags & ui::SHELPER_STYLE_MASK != 0 || self.speedometer_active();
+            require_physics || self.strafe_helper.flags & ui::SHELPER_STYLE_MASK != 0 || self.speedometer_active();
         if !movement_keys_active && !strafe_helper_active {
             // Keep the mailbox value completely stable when neither feature is
             // visible. In particular, do not let view yaw/velocity turn into a

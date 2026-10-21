@@ -385,6 +385,14 @@ pub struct TextureData {
     pub srgb: bool,
 }
 
+impl TextureData {
+    /// Retained CPU pixel allocations, including all mips and the FP16 copy.
+    pub(crate) fn pixel_storage_bytes(&self) -> usize {
+        self.rgba.capacity()
+            + self.rgba16f.as_ref().map_or(0, |pixels| pixels.capacity() * 2)
+    }
+}
+
 /// Shared missing-material placeholder used by renderer paths that resolve a
 /// real shader/image qpath. Missing assets must remain visibly broken instead
 /// of silently turning into the white fallback used for intentional $whiteimage.
@@ -1617,12 +1625,26 @@ fn decode_texture_data_profiled(
     ))
 }
 
+/// Exact packed storage, including thin/odd mip tails that exceed base / 3.
+fn mip_chain_byte_len(mut width: u32, mut height: u32) -> usize {
+    let mut bytes = 0;
+    loop {
+        bytes += width as usize * height as usize * 4;
+        if width <= 1 && height <= 1 {
+            return bytes;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+}
+
 fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
     let decode = |value: u8| f32::from(value) * (2.0 / 255.0) - 1.0;
     let encode = |value: f32| -> u8 {
         ((value * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8
     };
-    let mut all = base.clone();
+    let mut all = Vec::with_capacity(mip_chain_byte_len(width, height));
+    all.extend_from_slice(&base);
     let mut previous = base;
     let mut previous_width = width;
     let mut previous_height = height;
@@ -1688,8 +1710,10 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
 /// previous one in a single buffer, so nothing is cloned.
 fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
     let mut all = base;
-    // A full chain adds a third of the base again.
-    all.reserve(all.len() / 3 + 64);
+    // reserve() grows geometrically (often 2x the base), retaining roughly 50%
+    // slack after a square mip chain. Shared restart images keep this allocation
+    // alive, so reserve the actual chain size rather than a growth heuristic.
+    all.reserve_exact(mip_chain_byte_len(width, height).saturating_sub(all.len()));
     let mut previous_offset = 0_usize;
     let mut previous_width = width as usize;
     let mut previous_height = height as usize;
@@ -1723,6 +1747,8 @@ fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
         levels += 1;
     }
 
+    // Also trim any spare capacity supplied by an image decoder.
+    all.shrink_to_fit();
     (all, levels)
 }
 
@@ -3092,8 +3118,10 @@ mod tests {
                     (state >> 8) as u8
                 })
                 .collect();
+            let actual = build_mip_chain(width, height, base.clone());
+            assert_eq!(actual.0.capacity(), actual.0.len(), "retained {width}x{height} mip allocation");
             assert_eq!(
-                build_mip_chain(width, height, base.clone()),
+                actual,
                 build_mip_chain_reference(width, height, base),
                 "{width}x{height}"
             );

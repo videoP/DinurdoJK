@@ -241,6 +241,10 @@ impl Renderer {
             .iter()
             .map(|base| upload_texture(&self.device, &self.queue, base))
             .collect();
+        if let Some(images) = world.sun_bake.mask_images(&self.device, &self.queue,
+            &world.lightmaps, &world.lightmap_base_data) {
+            world.lightmaps = images;
+        }
         self.rebuild_world_surface_bind_groups(&mut world);
         world.static_ao_lightmap_active = false;
         self.world = Some(world);
@@ -315,7 +319,9 @@ impl Renderer {
                 );
             }
             let mut lightmaps = Vec::with_capacity(images.len());
-            for image in images {
+            for (texture, mut image) in images.into_iter().enumerate() {
+                world.sun_bake.patch_alpha(texture, &mut image.rgba,
+                    [image.width, image.height], [0, 0, image.width, image.height]);
                 let data = TextureData {
                     label: image.label,
                     source: None,
@@ -368,6 +374,13 @@ impl Renderer {
         if rgba.len() != width as usize * height as usize * 4 {
             return Err("AO tile byte count is invalid".into());
         }
+        let mut patched;
+        let rgba = if world.sun_bake.has_masks() {
+            patched = rgba.to_vec();
+            world.sun_bake.patch_alpha(texture, &mut patched,
+                [lightmap._texture.width(), lightmap._texture.height()], [x, y, width, height]);
+            &patched[..]
+        } else { rgba };
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &lightmap._texture,

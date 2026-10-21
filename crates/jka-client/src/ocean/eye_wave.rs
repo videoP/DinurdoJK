@@ -35,18 +35,21 @@ struct Params {
 // level: every cascade, the Z flip, the horizontal scale and the swell term.
 fn displacement_m(world_m: vec2<f32>) -> vec3<f32> {
     var d = vec3<f32>(0.0);
+    var crest_scale = 1.0;
     if params.map_scales[0].z > 0.0 {
     for (var i = 0u; i < 3u; i = i + 1u) {
         let scale = params.map_scales[i];
         let uv = world_m * vec2<f32>(1.0, -1.0) * scale.xy;
-        d += textureSampleLevel(displacement, wave_sampler, uv, i32(i), 0.0).xyz
+        let sample = textureSampleLevel(displacement, wave_sampler, uv, i32(i), 0.0);
+        if sample.w < 0.0 { crest_scale = -sample.w; }
+        d += sample.xyz
             * vec3<f32>(1.0, 1.0, -1.0) * scale.z;
     }
     }
     d.x *= params.swell_motion.z;
     d.z *= params.swell_motion.z;
     let phase = dot(world_m, params.swell.xy) * params.swell.z - params.swell_motion.x * params.swell_motion.w;
-    let horizontal = params.swell.w * params.swell_motion.y * cos(phase);
+    let horizontal = params.swell.w * params.swell_motion.y * cos(phase) * crest_scale;
     d += vec3<f32>(params.swell.x * horizontal, params.swell.w * sin(phase), params.swell.y * horizontal);
     return d;
 }
@@ -96,11 +99,15 @@ pub struct EyeWaveParams {
 pub struct NativeEyeParams {
     pub eye: [f32; 4],
     pub swell: [[f32; 4]; 2],
+    /// `r_oceanType 5`: [1 on, wave scale, seconds, 0] (`super::gerstner_uniform`).
+    pub godot: [f32; 4],
 }
 
 /// Everything the native solve needs from the Blue Water ocean.
 pub struct NativeProbeInput<'a> {
     pub swell: [[f32; 4]; 2],
+    pub breaker_mode: u8,
+    pub godot: [f32; 4],
     pub waves_group: &'a wgpu::BindGroup,
     pub eye_xz_metres: [f32; 2],
     /// Grid spacing the mesh uses at the eye, metres (the finest ring).
@@ -475,8 +482,9 @@ impl EyeWaveProbe {
         let mut native_ran = false;
         if let (Some(native_pipeline), Some(input)) = (self.native.as_ref(), native) {
             let eye = NativeEyeParams {
-                eye: [input.eye_xz_metres[0], input.eye_xz_metres[1], input.spacing_metres, 0.0],
+                eye: [input.eye_xz_metres[0], input.eye_xz_metres[1], input.spacing_metres, f32::from(input.breaker_mode)],
                 swell: input.swell,
+                godot: input.godot,
             };
             queue.write_buffer(&native_pipeline.params, 0, bytemuck::bytes_of(&eye));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

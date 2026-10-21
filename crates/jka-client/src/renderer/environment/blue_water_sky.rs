@@ -18,7 +18,7 @@ impl crate::renderer::Renderer {
     /// absence of a compatible result means the authored sky keeps drawing.
     pub(in crate::renderer) fn ensure_native_atmosphere(&mut self, camera: &Camera) {
         use crate::pipeline_jobs::{hash_config, PipelineJobKey};
-        let requested = self.sky_backend == 1 || self.blue_water_environment.world_lighting
+        let requested = self.sky_backend == 1 || self.blue_water_environment.world_lighting > 0.0
             || self.blue_water_environment.weather_backend == 1
             || (self.cloud_backend == 1 && self.clouds_enabled);
         if !requested {
@@ -642,6 +642,7 @@ impl AtmosphereRenderer {
             })],
             ..Default::default()
         });
+        crate::renderer::tile_probe_scissor_surface(&mut pass);
         if self.show_atmosphere {
             self.sky.draw_dome(&mut pass);
         }
@@ -667,7 +668,7 @@ impl AtmosphereRenderer {
             } else {
                 0.0
             };
-            if self.settings.world_lighting || (self.clouds_active && shadows) || flash > 0.0 {
+            if self.settings.world_lighting > 0.0 || (self.clouds_active && shadows) || flash > 0.0 {
                 self.scene.light(
                     device,
                     queue,
@@ -708,6 +709,7 @@ impl AtmosphereRenderer {
                     })],
                     ..Default::default()
                 });
+                crate::renderer::tile_probe_scissor_surface(&mut pass);
                 self.clouds.draw_composite(&mut pass);
             }
             self.scene
@@ -761,6 +763,7 @@ impl AtmosphereRenderer {
                 }),
                 ..Default::default()
             });
+            crate::renderer::tile_probe_scissor_surface(&mut pass);
             self.weather.draw(&mut pass, self.sky.bind_group());
         }
         if let Some(motion) = motion {
@@ -772,6 +775,7 @@ impl AtmosphereRenderer {
                     depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),
                 ..Default::default()
             });
+            crate::renderer::tile_probe_scissor_surface(&mut pass);
             self.weather.draw_reactive(&mut pass, self.sky.bind_group(),
                 &self.weather_reactive.as_ref().expect("prepared native weather").0);
         }
@@ -882,7 +886,7 @@ mod native_tests {
                     weather_backend: u8::from(weather),
                     rain: 1.,
                     rain_speed: 2.,
-                    world_lighting: true,
+                    world_lighting: 1.0,
                     ..Default::default()
                 };
                 let config = AtmosphereConfig { target: key, quality: settings.quality,

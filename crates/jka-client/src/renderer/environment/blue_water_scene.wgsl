@@ -42,12 +42,13 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let incidence=max(dot(normal,env.light_direction),0.);
  let shade=select(1.,cloud_shadow(shadow_map,shadow_sampler,shadow,world),frame.options.y>0.5);
  var gain=vec3<f32>(mix(1.,shade,incidence*0.7));
- if frame.options.x>0.5 {
+ if frame.options.x>0. {
   // The input holds baked illumination. This opt-in estimate retains its
   // material detail and dark interiors; it cannot recover separate albedo/GI.
   let ambient=env_irradiance(env_map,env_sampler,env,normal)/3.14159265;
   let direct=env.light_color*env.light_intensity*incidence*shade;
-  gain=clamp(ambient*0.5+direct*0.2,vec3<f32>(0.03),vec3<f32>(4.));
+  // options.x is the strength: 0 keeps the cloud-shadow-only gain, 1 replaces it.
+  gain=mix(gain,clamp(ambient*0.5+direct*0.2,vec3<f32>(0.03),vec3<f32>(4.)),frame.options.x);
  }
  let footprint=max(length(dx),length(dy));let expected=max(distance(world,frame.eye.xyz)*4./min(frame.viewport.x,frame.viewport.y),0.01);
  gain=mix(vec3<f32>(1.),gain,1.-smoothstep(expected*4.,expected*12.,footprint));

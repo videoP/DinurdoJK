@@ -17,6 +17,8 @@ pub(crate) type TraceFn = unsafe extern "C" fn(
 );
 pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) -> i32;
 unsafe extern "C" {
+    pub fn jka_full_body_taunt(torso_anim: i32, legs_anim: i32) -> i32;
+    pub fn jka_taunt_should_cancel(torso_anim: i32, legs_anim: i32, buttons: i32, upmove: i32) -> i32;
     fn jka_lock();
     fn jka_unlock();
     #[cfg(test)]

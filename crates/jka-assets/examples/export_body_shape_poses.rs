@@ -201,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 weight: v[1],
                 proportions: v[2],
                 age: v[3],
+                height: 0.5,
             };
             let mut shaped = original.clone();
             let shaped_pivots =
