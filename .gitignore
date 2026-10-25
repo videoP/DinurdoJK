@@ -4,16 +4,18 @@
 /.ocean-work/
 /.codex/
 *.zip
-!/crates/jka-assets/src/body_shape/anny/anny_targets.zip
 /tools/
 /docs/
 /artifacts/
 /target-glass-check/
 /glass-preview-base/
+*.md
+*.log
 
 # Keep the Anny v1 authoring tool reproducible; generated data stays local.
 !/tools/
 /tools/*
+!/tools/dinurdojk_release.py
 !/tools/jiggle-shape-preview/
 /tools/jiggle-shape-preview/*
 !/tools/jiggle-shape-preview/anny/
