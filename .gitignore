@@ -13,6 +13,8 @@
 /target-glass-check/
 /glass-preview-base/
 *.md
+!README.md
+!readme.md
 *.log
 
 # Keep the Anny v1 authoring tool reproducible; generated data stays local.
