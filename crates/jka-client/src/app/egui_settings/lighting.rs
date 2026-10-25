@@ -108,7 +108,7 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
-        theme::section(ui, "SUN & ENTITY SHADOWS", "Static BSP shadows use CSM; ray queries can optionally cover moving entities. Inferred original-lighting lamp shadows are available only in CSM/Hybrid CSM.");
+        theme::section(ui, "SUN & ENTITY SHADOWS", "Sun shadows use raster maps, with CSM as the highest setting. Inferred original-lighting lamp shadows are available only in CSM.");
         self.egui_shadows(ui);
 
         self.egui_toggle_row(
@@ -119,9 +119,9 @@ impl App {
             self.video.dynamic_light_debug,
         );
 
-        theme::section(ui, "LAMP SHADOWS", "No master switch: inferred moving-object shadows follow the individual lamp-source toggles. Only CSM and Hybrid CSM use them; original map lightmaps remain intact.");
+        theme::section(ui, "LAMP SHADOWS", "No master switch: inferred moving-object shadows follow the individual lamp-source toggles. Only CSM uses them; original map lightmaps remain intact.");
         let lamp_shadow_mode = matches!(self.video.dynamic_shadows,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+            DynamicShadowsMode::CascadedShadowMaps);
         ui.add_enabled_ui(lamp_shadow_mode, |ui| {
             self.egui_toggle_row(ui, "Source: glow stages", "Use static shader glow emitters as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_GLOW, self.video.baked_local_sources & 1 != 0);
             self.egui_toggle_row(ui, "Source: additive stages", "Infer lamps from additive stages; broad inference, disabled by default.", ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE, self.video.baked_local_sources & 2 != 0);
@@ -130,7 +130,7 @@ impl App {
             self.egui_toggle_row(ui, "Source: fixed continuous EFX", "Use fixed continuously active EFX lamps. Moving, triggered and intermittent effects are excluded.", ui::VIDEO_ROW_BAKED_LOCAL_FX, self.video.baked_local_sources & 16 != 0);
         });
         if !lamp_shadow_mode {
-            ui.small("Select Cascaded maps (CSM) or Hybrid CSM + RT entities to use these lamp shadows.");
+            ui.small("Select Cascaded maps (CSM) to use these lamp shadows.");
         }
         const LAMP_SHADOW_AB: [(u8, &str, &str); 5] = [
             (0, "A: Cubes", "Original six-face cubemap generation and sampling (reference)."),

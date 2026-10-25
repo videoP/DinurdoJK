@@ -138,9 +138,9 @@ use lighting::ray_tracing::{
 };
 #[cfg(test)]
 use lighting::ray_tracing::{
-    create_ray_traced_shadow_receiver_layout, create_rt_alpha_buffer, create_rt_triangle_blas,
+    create_ray_traced_shadow_receiver_layout,
     rt_alpha_dynamic_material, rt_alpha_empty_buffer_descriptor, rt_alpha_ensure_dynamic_texture,
-    rt_alpha_texture_key, rt_triangle_blas_build_entry, RtAlphaGeometryGpu, RtAlphaMaterialGpu,
+    rt_alpha_texture_key, RtAlphaGeometryGpu, RtAlphaMaterialGpu,
     RtAlphaTextureGpu,
 };
 use lighting::shadow_resources::{
@@ -310,8 +310,8 @@ use world::variants::{
 
 #[path = "renderer/lighting/rt_models.rs"]
 mod rt_models;
-#[path = "renderer/lighting/rt_resolution.rs"]
-mod rt_resolution;
+#[path = "renderer/lighting/rt_receiver.rs"]
+mod rt_receiver;
 #[path = "renderer/lighting/rt_local_rate.rs"]
 mod rt_local_rate;
 #[cfg(test)]
@@ -416,11 +416,6 @@ const BEVY_CSM_MAXIMUM_DISTANCE: f32 = 150.0 * JKA_UNITS_PER_METER;
 const BEVY_CSM_OVERLAP_PROPORTION: f32 = 0.20;
 const BEVY_CSM_SHADOW_DEPTH_BIAS: f32 = 0.02;
 const BEVY_CSM_SHADOW_NORMAL_BIAS: f32 = 1.8;
-// Bevy Solari samples directional-light visibility across a finite cone. JKA's
-// authored sun has no angular-radius field, so RT Shadows uses Earth's measured
-// apparent solar diameter as its default emitter extent. The shader receives
-// cos(half-angle), matching Bevy's DirectionalLight representation.
-const RT_SUN_ANGULAR_DIAMETER_RADIANS: f32 = 0.00930842;
 // Dynamic RT casters are deliberately bounded. Static BSP plus inline movers
 // occupy fixed slots first; ordinary rigid entities use the remaining tail.
 // This avoids allowing an effects-heavy custom server to turn one shadow mode
@@ -1088,6 +1083,7 @@ struct Renderer {
     baked_local_had_casters: bool,
     /// Session-only lamp-shadow experiment: 0 baseline, 1 receiver octants, 2 caster prefilter, 3 both.
     lamp_shadow_ab: u8,
+    csm_coverage_ab: bool,
     shader_light_promotion_mask: u32,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,

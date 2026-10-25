@@ -1224,7 +1224,7 @@ impl App {
                     (current + direction).rem_euclid(DynamicShadowsMode::ALL.len() as i32) as usize;
                 self.video.dynamic_shadows = DynamicShadowsMode::ALL[next];
                 self.video.cascaded_shadows =
-                    matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
                 if self.video.dynamic_shadows == DynamicShadowsMode::Blob {
@@ -1233,11 +1233,6 @@ impl App {
                 } else if self.video.dynamic_shadows == DynamicShadowsMode::EntityMap {
                     self.console_status =
                         "DYNAMIC SHADOWS: ENTITY MAP - PLAYERS/NPCS CAST FROM THE BAKED LIGHTGRID DIRECTION".to_string();
-                } else if self.video.dynamic_shadows == DynamicShadowsMode::HybridCsmRtEntities {
-                    self.console_status = "SUN SHADOWS: HYBRID - CSM STATIC CASTERS + RT MOVING CASTERS".to_string();
-                } else if self.video.dynamic_shadows == DynamicShadowsMode::RayTraced {
-                    self.console_status =
-                        "DYNAMIC SHADOWS: RAY TRACED SHADOWS - HARDWARE RAY QUERY (BSP + MOVING CASTERS)".to_string();
                 }
             }
             ui::VIDEO_ROW_ENTITY_SHADOW_LIGHT => {

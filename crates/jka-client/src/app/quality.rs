@@ -63,7 +63,7 @@ impl QualityPreset {
                     "r_grass" => *value = "1",
                     "r_reflectionQuality" => *value = "low",
                     "r_glow" => *value = "authored",
-                    "fx_physics" => *value = "3",
+                    "fx_physics" => *value = "2",
                     "r_promoteFxLights" => *value = "1",
                     "r_detailTextures" => *value = "1",
                     "r_pbr" => *value = "1",
@@ -85,6 +85,7 @@ impl QualityPreset {
             for (name, value) in &mut settings {
                 match *name {
                     "r_ext_multisample" => *value = "4",
+                    "fx_physics" => *value = "3",
                     "r_promoteFxLights" => *value = "2",
                     "r_dynamicLights" => *value = "clustered_lite",
                     "r_deluxeSpecular" => *value = "1",
@@ -98,16 +99,15 @@ impl QualityPreset {
             return settings;
         }
 
-        // Ultra is High with ray-traced lights, hybrid CSM/RT shadows and TAA.
+        // Ultra is High with ray-traced lights, CSM shadows, RT regional TAA and 4x MSAA.
         if self == Self::Ultra {
             let mut settings = Self::High.settings();
             for (name, value) in &mut settings {
                 match *name {
-                    // TAA intentionally disables MSAA; the preset must match that state.
-                    "r_ext_multisample" => *value = "0",
-                    "r_taa" => *value = "1",
+                    "r_ext_multisample" => *value = "4",
+                    "r_taa" => *value = "0",
                     "r_dynamicLights" => *value = "ray_traced",
-                    "r_dynamicShadows" => *value = "hybrid_csm_rt_entities",
+                    "r_dynamicShadows" => *value = "csm",
                     "r_hdr" => *value = "1",
                     _ => {}
                 }
@@ -178,7 +178,7 @@ impl QualityPreset {
                 ("r_ext_multisample", "2"),
                 ("r_maxFrameLatency", "2"),
                 ("r_picmip", "0"),
-                ("fx_physics", "2"),
+                ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
                 ("r_detailTextures", "off"),
@@ -444,6 +444,9 @@ mod tests {
                 assert_eq!(value("r_lodCurveError"), "2500");
                 assert_eq!(value("r_lodbias"), "0");
                 assert_eq!(value("r_lodScale").parse::<f32>().unwrap(), crate::fx::LOD_SCALE_MAX);
+            }
+            if preset == QualityPreset::Ultra {
+                assert_eq!(value("r_dynamicShadows"), "csm");
             }
             let mut names = std::collections::BTreeSet::new();
             assert!(settings.iter().all(|(name, _)| names.insert(*name)), "duplicate preset setting");

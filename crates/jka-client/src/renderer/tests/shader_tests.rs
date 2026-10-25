@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn csm_coverage_ab_variants_specialize_and_emit_spirv() {
+    use wgpu::naga;
+    for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
+        let source = compose_world_shader(base);
+        let module = naga::front::wgsl::parse_str(&source).unwrap();
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all()).validate(&module).unwrap();
+        for enabled in [false, true] {
+            let key = WorldShaderVariantKey { cascaded_shadows: true,
+                csm_coverage: enabled, baked_sun_relight: true, ..Default::default() };
+            let constants = key.compilation_constants().into_iter()
+                .map(|(name, value)| (name.to_owned(), value)).collect();
+            let (specialized, info) = naga::back::pipeline_constants::process_overrides(
+                &module, &info, None, &constants).unwrap();
+            naga::back::spv::write_vec(&specialized, &info, &naga::back::spv::Options {
+                lang_version: (1, 4), ..Default::default()
+            }, None).unwrap();
+        }
+    }
+}
+
+#[test]
 fn promoted_glass_shader_variants_validate() {
     for (name, source) in [
         ("glass", crate::glass::world_shader()),
@@ -158,19 +180,19 @@ fn rt_isolation_world_gpu_pipelines() {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(family), source: wgpu::ShaderSource::Wgsl(source.into()),
             });
-            // Same local/sun and legacy fragment entry points as BSP pipelines.
+            // Exercise RT local lighting with optional CSM and legacy fragment entries.
             // Inferred layouts make this a headless compiler probe; it is not a
             // substitute for the exact map's recorded key and explicit layout.
             for pbr in [0.0, 1.0] {
                 if minimal && pbr != 0.0 { continue; }
-                for sun in [0.0, 1.0] {
-                    if minimal && sun != 0.0 { continue; }
+                for cascades in [0.0, 1.0] {
+                    if minimal && cascades != 0.0 { continue; }
                     for entry in ["fs_main", "fs_main_legacy_fog", "fs_legacy_fog_pass"] {
                         if minimal && entry != "fs_main" { continue; }
                         let constants = [("ENABLE_RAY_TRACED_SHADOWS", 1.0),
-                            ("ENABLE_RAY_TRACED_SUN", sun), ("ENABLE_LOCAL_SHADOWS", 1.0),
+                            ("ENABLE_CASCADED_SHADOWS", cascades), ("ENABLE_LOCAL_SHADOWS", 1.0),
                             ("ENABLE_POINT_LIGHTS", 1.0), ("ENABLE_PBR", pbr)];
-                        println!("[RT GPU probe BEGIN] family={family} pbr={pbr} sun={sun} fs={entry}");
+                        println!("[RT GPU probe BEGIN] family={family} pbr={pbr} cascades={cascades} fs={entry}");
                         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                         let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                             label: Some("RT world isolation probe"), layout: None,
@@ -204,7 +226,7 @@ fn rt_isolation_world_gpu_pipelines() {
                         if let Some(error) = error_scope.pop().await {
                             panic!("RT GPU probe validation failed: {error}");
                         }
-                        println!("[RT GPU probe END] family={family} pbr={pbr} sun={sun} fs={entry}");
+                        println!("[RT GPU probe END] family={family} pbr={pbr} cascades={cascades} fs={entry}");
                     }
                 }
             }
@@ -843,20 +865,16 @@ fn rt_shader_variants_specialize_and_emit_spirv() {
         )
         .validate(&module)
         .unwrap();
-        // Exercise both lighting branches with local shadows enabled. The
-        // sun-only permutation verifies the independent local-shadow switch.
-        for (pbr, local, sun, cascades) in [
-            (0.0, 1.0, 1.0, 0.0),
-            (1.0, 1.0, 1.0, 0.0),
-            (0.0, 0.0, 1.0, 0.0), // Sun only.
-            (0.0, 1.0, 0.0, 0.0),
-            (1.0, 1.0, 0.0, 0.0), // Local only.
-            (0.0, 1.0, 0.0, 1.0),
-            (1.0, 1.0, 0.0, 1.0), // Raster sun + RT local.
+        // Exercise RT dynamic lights with optional raster sun and PBR.
+        for (pbr, local, cascades) in [
+            (0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 1.0),
+            (1.0, 1.0, 1.0),
         ] {
             let constants = [
                 ("ENABLE_RAY_TRACED_SHADOWS".into(), 1.0),
-                ("ENABLE_RAY_TRACED_SUN".into(), sun),
                 ("ENABLE_CASCADED_SHADOWS".into(), cascades),
                 ("ENABLE_LOCAL_SHADOWS".into(), local),
                 ("ENABLE_POINT_LIGHTS".into(), 1.0),

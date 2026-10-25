@@ -620,7 +620,7 @@ impl Renderer {
                 0,
                 (u32::from(self.static_bsp_ao_enabled)
                     | (u32::from(self.sky_fractal_override) << 1)
-                    | (u32::from(self.temporal_resolve_active() || self.rt_local_cache_wanted() || self.rt_sun_cache_wanted()) << 2)
+                    | (u32::from(self.temporal_resolve_active() || self.rt_local_cache_wanted()) << 2)
                     | (u32::from(self.sky_perf_probe) << 8)
                     | self.ocean_sky_horizon_flag()),
                 self.classic_world_render_flags(),
@@ -716,7 +716,7 @@ impl Renderer {
         self.ensure_shader_complexity_pipelines();
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_local_rate(view_proj, camera.position);
-        self.prepare_rt_sun_shadow(view_proj, camera.position);
+        self.prepare_rt_receiver_flags();
         if self.blue_water_environment.weather_backend==1 {self.ensure_weather_occlusion();}
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
@@ -837,21 +837,6 @@ impl Renderer {
                 true,
             );
             Some(matrices)
-        } else if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-            && self.ray_traced_shadows.is_some()
-        {
-            // RT uses the same authoritative map sun direction/intensity data as
-            // CSM, but does not render or sample any cascade shadow maps.
-            self.write_shadow_uniforms(
-                &[Mat4::IDENTITY; SHADOW_CASCADES],
-                &[0.0; SHADOW_CASCADES],
-                &[0.0; SHADOW_CASCADES],
-                true,
-                camera.forward(),
-                camera_pos_time,
-                false,
-            );
-            None
         } else {
             None
         };
@@ -1576,17 +1561,12 @@ impl Renderer {
         // of the user's current sun angle and of the four runtime cascades.
         self.encode_original_sun_shadow(&mut encoder, camera_pos_time);
         self.encode_baked_local_moving_shadows(&mut encoder, dynamic_models);
-        // Keep legacy CSM entity casters while the asynchronous hybrid RT
-        // shader is compiling, or if RT allocation/compilation has failed.
-        let hybrid_sun = self.cascaded_shadow_mode == DynamicShadowsMode::HybridCsmRtEntities
-            && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun);
         let csm_entity_casters = match shadow_matrices.as_ref() {
-            _ if hybrid_sun => false,
             Some(matrices) => self.prepare_entity_cascade_casters(matrices),
             None => false,
         };
 
-        let mut live_csm_regions = [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES];
+        let mut live_csm_coverage = [[0;4]; SHADOW_CASCADES];
         if let Some(shadow_matrices) = shadow_matrices.as_ref() {
             self.shadow_resources.ensure_sky_snapshot(&self.device);
             if let Some(world) = &self.world {
@@ -1601,17 +1581,26 @@ impl Renderer {
                             && !hidden_inline_batch(batch, &world.inline_models)
                             && aabb_intersects_shadow_frustum(batch.bounds_min, batch.bounds_max,
                                 shadow_matrices[cascade], true));
-                    let inline_sky_casters = !hybrid_sun && self.draw_inline_models && self.sun_visibility != SunVisibilityMode::Legacy
+                    let inline_sky_casters = self.draw_inline_models && self.sun_visibility != SunVisibilityMode::Legacy
                         && world.coarse_batches.iter().any(|b| b.is_inline_entity
                             && b.source.pipeline.class == DrawClass::Sky
                             && !matches!(b.source.tc_gen, TcGen::SkyCloud(_))
                             && !hidden_inline_batch(b, &world.inline_models));
-                    let models_in_cascade = !hybrid_sun && csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS;
+                    let models_in_cascade = csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS;
                     let grass_in_cascade = cascade == 0 && self.grass_enabled
                         && world.grass.is_some() && prepared_grass.is_some();
-                    let dynamic_overlay = (!hybrid_sun && (inline_casters || models_in_cascade)) || grass_in_cascade;
-                    live_csm_regions[cascade] = crate::renderer::lighting::entity_shadows::live_csm_region(
-                        world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models, models_in_cascade, !hybrid_sun && inline_casters, grass_in_cascade);
+                    let dynamic_overlay = inline_casters || models_in_cascade || grass_in_cascade;
+                    // Use the ACTIVE shader key: a requested variant may still be compiling.
+                    let coverage_enabled = world.active_pipeline_variant.csm_coverage;
+                    live_csm_coverage[cascade] = if coverage_enabled {
+                        crate::renderer::lighting::entity_shadows::live_csm_coverage(
+                            world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models,
+                            models_in_cascade, inline_casters, grass_in_cascade)
+                    } else {
+                        crate::renderer::lighting::entity_shadows::live_csm_region(
+                            world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models,
+                            models_in_cascade, inline_casters, grass_in_cascade).map(f32::to_bits)
+                    };
                     // Static world depth and live caster depth have separate layers.
 
                     if rebuild_static && self.sun_visibility != SunVisibilityMode::Legacy {
@@ -1753,8 +1742,7 @@ impl Renderer {
                             || hidden_inline_batch(batch, &world.inline_models) {
                             continue;
                         }
-                        // In hybrid the CSM is a static-only atlas. Moving inline
-                        // BSP objects are represented by TLAS dynamic instances.
+                        // Cache static casters here; movers render into the live layer.
                         if batch.is_inline_entity || crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility) { continue; }
                         // A depthFunc equal stage is only an overlay on pixels admitted
                         // by an earlier stage. Rendering it as an independent caster
@@ -1816,7 +1804,13 @@ impl Renderer {
                     self.shadow_resources.rendered_generations[cascade] = cache_generation;
                 }
 
-                    {
+                    // A always clears/renders like the original path. Keep state current
+                    // so A -> B -> A transitions cannot leave stale depth behind.
+                    let has_live_casters = if coverage_enabled { live_csm_coverage[cascade] != [0; 4] } else { dynamic_overlay };
+                    let render_live_layer = crate::renderer::lighting::shadow_coverage::update_live_layer(
+                        &mut self.shadow_resources.live_layers_initialized,
+                        &mut self.shadow_resources.live_layers_occupied, cascade, has_live_casters);
+                    if !coverage_enabled || render_live_layer {
                         if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("JKA CSM live casters"),
@@ -1836,7 +1830,7 @@ impl Renderer {
                         pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         // Inline BSP movers are *not* baked, even in regular CSM.
                         // They have to be redrawn over the static snapshot.
-                        if dynamic_overlay && !hybrid_sun && inline_casters {
+                        if dynamic_overlay && inline_casters {
                             let mut mask_pipeline_active = false;
                             for batch in &world.coarse_batches {
                                 if (!batch.is_inline_entity && !crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility))
@@ -1898,8 +1892,8 @@ impl Renderer {
                 }
             }
             self.queue.write_buffer(&self.shadow_resources.receiver_buffer,
-                std::mem::offset_of!(crate::renderer::ShadowReceiverUniform, dynamic_regions) as u64,
-                bytemuck::cast_slice(&live_csm_regions));
+                std::mem::offset_of!(crate::renderer::ShadowReceiverUniform, dynamic_coverage) as u64,
+                bytemuck::cast_slice(&live_csm_coverage));
             self.shadow_resources.last_csm_mode = Some(self.cascaded_shadow_mode);
             self.shadow_resources.cache_debug_frames += 1;
             static CSM_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2339,9 +2333,8 @@ impl Renderer {
             }
         }
 
-        let rt_visibility_cache = self.rt_sun_cache_wanted() || self.rt_local_cache_wanted();
+        let rt_visibility_cache = self.rt_local_cache_wanted();
         if rt_visibility_cache { self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RtVisibility, false); }
-        self.encode_rt_sun_shadow(&mut encoder);
         self.encode_rt_local_rate(&mut encoder);
         if rt_visibility_cache { self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RtVisibility, true); }
 

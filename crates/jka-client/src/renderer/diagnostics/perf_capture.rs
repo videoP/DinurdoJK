@@ -28,7 +28,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 225] = [
+const FIELDS: [&str; 227] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -146,6 +146,8 @@ const FIELDS: [&str; 225] = [
     "gpu_latest_ocean_optics_ms",
     "gpu_latest_blue_water_underwater_ms",
     "lamp_shadow_ab_mode",
+    "csm_coverage_ab_requested",
+    "csm_coverage_ab_active",
     "gpu_latest_lamp_static_ms",
     "gpu_latest_lamp_moving_ms",
     "cpu_lamp_moving_encode_ms",
@@ -446,6 +448,8 @@ impl PerfRow {
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::OceanOptics.index()]).unwrap_or(f64::NAN),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::BlueWaterUnderwater.index()]).unwrap_or(f64::NAN),
                 f64::from(renderer.lamp_shadow_ab),
+                f64::from(u8::from(renderer.csm_coverage_ab)),
+                f64::from(u8::from(renderer.world.as_ref().is_some_and(|world| world.active_pipeline_variant.csm_coverage))),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::LocalShadowStatic.index()]).unwrap_or(f64::NAN),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::LocalShadowMoving.index()]).unwrap_or(f64::NAN),
                 renderer.world.as_ref().map_or(f64::NAN, |world| world.local_shadows.ab_last_cpu_ms),

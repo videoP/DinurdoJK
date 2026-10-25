@@ -89,7 +89,7 @@ mod tests {
 }
 
 /// An inferred static lamp is never an independent shadow mode. The source
-/// toggles are the only user-facing on/off controls, while CSM/Hybrid is the
+/// toggles are the only user-facing on/off controls, while CSM is the
 /// renderer permission gate (including during live mode switches).
 pub(super) fn inferred_lamp_shadows_allowed(
     sources: u32,
@@ -97,8 +97,7 @@ pub(super) fn inferred_lamp_shadows_allowed(
 ) -> bool {
     sources & ALL != 0
         && matches!(mode,
-            crate::renderer::DynamicShadowsMode::CascadedShadowMaps
-            | crate::renderer::DynamicShadowsMode::HybridCsmRtEntities)
+            crate::renderer::DynamicShadowsMode::CascadedShadowMaps)
 }
 
 #[cfg(test)]
@@ -106,11 +105,11 @@ mod lamp_shadow_gate_tests {
     use super::*;
     use crate::renderer::DynamicShadowsMode;
     #[test]
-    fn lamp_shadows_require_a_source_and_csm_or_hybrid() {
+    fn lamp_shadows_require_a_source_and_csm() {
         for mode in DynamicShadowsMode::ALL {
             assert!(!inferred_lamp_shadows_allowed(0, mode));
             assert_eq!(inferred_lamp_shadows_allowed(AUTHORED, mode), matches!(
-                mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities));
+                mode, DynamicShadowsMode::CascadedShadowMaps));
         }
         assert!(inferred_lamp_shadows_allowed(FX | AUTHORED, DynamicShadowsMode::CascadedShadowMaps));
     }

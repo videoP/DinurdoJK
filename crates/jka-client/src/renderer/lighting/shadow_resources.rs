@@ -104,6 +104,8 @@ pub(in crate::renderer) struct ShadowResources {
     pub(in crate::renderer) next_generation: u64,
     pub(in crate::renderer) last_csm_mode: Option<DynamicShadowsMode>,
     pub(in crate::renderer) dynamic_sky_layers: u32,
+    pub(in crate::renderer) live_layers_initialized: u32,
+    pub(in crate::renderer) live_layers_occupied: u32,
     /// One-second diagnostic counters, enabled with JKA_CSM_CACHE_DEBUG=1.
     pub(in crate::renderer) cache_debug_epoch: std::time::Instant,
     pub(in crate::renderer) cache_debug_frames: u32,
@@ -539,7 +541,7 @@ pub(in crate::renderer) fn create_shadow_resources(
         ..Default::default()
     });
     let receiver = ShadowReceiverUniform {
-        dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
+        dynamic_coverage: [[0;4]; SHADOW_CASCADES],
         view_proj: [Mat4::IDENTITY.to_cols_array_2d(); SHADOW_CASCADES],
         split_depths: bevy_cascade_bounds(),
         light_direction_enabled: [
@@ -650,6 +652,8 @@ pub(in crate::renderer) fn create_shadow_resources(
         next_generation: 0,
         last_csm_mode: None,
         dynamic_sky_layers: 0,
+        live_layers_initialized: 0,
+        live_layers_occupied: 0,
         cache_debug_epoch: std::time::Instant::now(),
         cache_debug_frames: 0,
         cache_debug_captures: 0,

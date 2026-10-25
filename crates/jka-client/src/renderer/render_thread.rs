@@ -228,6 +228,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetEntityShadowLight(..) => "SetEntityShadowLight",
         RenderCommand::SetPbrSettings { .. } => "SetPbrSettings",
         RenderCommand::SetCascadedShadows(..) => "SetCascadedShadows",
+        RenderCommand::SetCsmCoverageAB(..) => "SetCsmCoverageAB",
         RenderCommand::SetCullDebug(..) => "SetCullDebug",
         RenderCommand::SetForceUnifiedWorld(..) => "SetForceUnifiedWorld",
         RenderCommand::SetPom(..) => "SetPom",
@@ -857,6 +858,7 @@ pub(in crate::renderer) fn render_thread_main(
     );
     renderer.set_baked_local_lights(initial_ui.video.baked_local_lights, initial_ui.video.baked_local_sources);
     renderer.set_lamp_shadow_ab(initial_ui.video.lamp_shadow_ab);
+    renderer.set_csm_coverage_ab(initial_ui.video.csm_coverage_ab);
     renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
     renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
     renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
@@ -1526,6 +1528,9 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetBakedLocalLights { enabled, sources }) => {
                         renderer.set_baked_local_lights(enabled, sources);
+                    }
+                    Ok(RenderCommand::SetCsmCoverageAB(enabled)) => {
+                        renderer.set_csm_coverage_ab(enabled);
                     }
                     Ok(RenderCommand::SetLampShadowAB(mode)) => {
                         renderer.set_lamp_shadow_ab(mode);
@@ -2747,7 +2752,7 @@ pub(in crate::renderer) fn render_thread_main(
             if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
                     println!(
-                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms rt_taa={} rt_trace_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms rt_taa={} rt_trace_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] local_rays={} (budget_per_light_evaluation; not_measured)",
                     gpu_ms(GpuPass::RtBuild),
                     gpu_ms(GpuPass::RtSkin),
                     gpu_ms(GpuPass::RtAcceleration),
@@ -2768,7 +2773,6 @@ pub(in crate::renderer) fn render_thread_main(
                     rt.alpha_textures.len(),
                     rt.alpha_texels.len(),
                         rt.alpha_buffers_generation,
-                        if renderer.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun) { renderer.rt_samples } else { 0 },
                         if renderer.ray_traced_local_shadows_active() { format!("up_to_{}_per_finite_emitter_1_per_hard_point", renderer.rt_samples) } else { "0".into() },
                     );
                 }

@@ -139,11 +139,27 @@ fn transient_rt_gpu_routes_static_lights_to_raster() {
                 else { [0.25; 4] };
             for (index, record) in bytes[..64].chunks_exact(16).enumerate() {
                 let actual = bytemuck::pod_read_unaligned::<[f32; 4]>(record);
-                assert_eq!(actual, if index == 3 { [0.75, 0.75, 0.75, 0.125] }
+                assert_eq!(actual, if index == 3 { [0.75; 4] }
                     else { expected_static }, "glass={glass} light={index}");
             }
-            assert_eq!(bytemuck::pod_read_unaligned::<[u32; 2]>(&bytes[64..72]), [1, 1],
-                "only the transient light traces or reads RT history; glass={glass}");
+            assert_eq!(bytemuck::pod_read_unaligned::<[u32; 2]>(&bytes[64..72]), [2, 0],
+                "only transient light calls trace; visibility history is bypassed; glass={glass}");
         }
     });
+}
+
+#[test]
+fn rt_dynamic_lights_preserve_raster_sun_receivers() {
+    for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
+        let base = base.replace("\r\n", "\n");
+        let source = ray_traced_world_shader_source_with_features(&base, ReceiverFeatures { glass: true }).unwrap();
+        for name in ["cascaded_shadow_visibility", "sun_shadow_transmission"] {
+            let anchor = format!("fn {name}(");
+            assert_eq!(rt_models::declaration(&source, &anchor).unwrap(),
+                rt_models::declaration(&base, &anchor).unwrap());
+        }
+        assert!(!source.contains("ENABLE_RAY_TRACED_SUN"));
+        assert!(!source.contains("rt_sun_shadow"));
+        assert!(!source.contains("rt_cached_sun_visibility"));
+    }
 }

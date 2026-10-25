@@ -126,7 +126,7 @@ impl Renderer {
         initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0
             && !source_map && map.sun.is_some();
         initial_shader_variant.ray_traced_shadows = false;
-        initial_shader_variant.ray_traced_sun = false;
+
         let detail_texture_by_base = build_auto_detail_by_base_texture(
             map.textures.len(),
             map.batches

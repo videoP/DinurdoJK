@@ -5,7 +5,7 @@ use crate::renderer::{
     DynamicShadowsMode, DynamicWireframeClass, InspectorEntityHint, Mat4, PathBuf, Renderer,
     SurfaceInspectorInfo, SurfaceInspectorSection, TcGen, TextureData, Vec2, Vec3, Vec4,
     WorldShaderFamily, OceanPromotionDecision, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
-    RT_SUN_ANGULAR_DIAMETER_RADIANS, SHADOW_CASCADES,
+    SHADOW_CASCADES,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1453,34 +1453,14 @@ impl Renderer {
         // shader variant, one cascade), so it shares the enabled flag.
         self.cascaded_shadows_enabled = matches!(
             mode,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities | DynamicShadowsMode::EntityMap
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::EntityMap
         );
         // Re-aim on entry instead of easing from a stale light.
         self.entity_shadow.initialized = false;
-        let rt_active = if matches!(mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities) {
-            let active = self.ensure_ray_traced_shadow_resources();
-            if active {
-                if let Some(rt) = self.ray_traced_shadows.as_ref() {
-                    println!(
-                        "RT Shadows: active - hardware ray queries, {} BLAS geometries / {} static opaque BSP triangles; soft directional emitter {:.2} deg, {} spp{}",
-                        rt.geometry_count,
-                        rt.triangle_count,
-                        RT_SUN_ANGULAR_DIAMETER_RADIANS.to_degrees(),
-                        self.rt_samples,
-                        if self.taa_enabled { " + temporal TAA" } else { " (stable spatial sample)" }
-                    );
-                }
-            } else if !self.ray_tracing_supported {
-                println!("RT Shadows: requested but unsupported on the current adapter/backend");
-            }
-            active
-        } else {
-            false
-        };
         self.rebuild_weather_surface_receiver_bind_group();
         self.rebuild_frame_plan();
         self.activate_world_pipeline_variant();
-        if !self.cascaded_shadows_enabled && !rt_active {
+        if !self.cascaded_shadows_enabled {
             self.write_shadow_uniforms(
                 &[Mat4::IDENTITY; SHADOW_CASCADES],
                 &[0.0; SHADOW_CASCADES],

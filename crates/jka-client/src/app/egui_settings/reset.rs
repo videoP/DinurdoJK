@@ -398,7 +398,7 @@ impl App {
             ui::VIDEO_ROW_DYNAMIC_SHADOWS => {
                 self.video.dynamic_shadows = defaults.dynamic_shadows;
                 self.video.cascaded_shadows =
-                    matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
             }

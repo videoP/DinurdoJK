@@ -75,7 +75,6 @@ pub(in crate::renderer) fn supported_variant(v: WorldShaderVariantKey) -> bool {
         && !v.local_shadows
         && !v.cascaded_shadows
         && !v.ray_traced_shadows
-        && !v.ray_traced_sun
         && !v.weather_surface
         && !v.classic_render_flags
         && !v.planar_debug
@@ -296,7 +295,6 @@ pub(in crate::renderer) fn stage_rejection_reasons(
         exclude!(local_shadows, "local shadows enabled");
         exclude!(cascaded_shadows, "cascaded shadows enabled");
         exclude!(ray_traced_shadows, "ray-traced shadows enabled");
-        exclude!(ray_traced_sun, "ray-traced sun enabled");
         exclude!(weather_surface, "weather surface shading enabled");
         exclude!(classic_render_flags, "classic render flags enabled");
         exclude!(planar_debug, "planar reflection debug enabled");

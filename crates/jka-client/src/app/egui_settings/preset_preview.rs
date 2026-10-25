@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn row_target_labels_match_widget_labels() {
-        assert_eq!(preview_target_label_for_row(QualityPreset::Ultra, theme::Reset::Video(ui::VIDEO_ROW_ANTI_ALIASING)).as_deref(), Some("TAA"));
+        assert_eq!(preview_target_label_for_row(QualityPreset::Ultra, theme::Reset::Video(ui::VIDEO_ROW_ANTI_ALIASING)).as_deref(), Some("4Ã— MSAA"));
         assert_eq!(preview_target_label_for_row(QualityPreset::Low, theme::Reset::Video(ui::VIDEO_ROW_TEXTURE_FILTER)).as_deref(), Some("16× AF"));
         assert_eq!(preview_target_label_for_row(QualityPreset::Minimal, theme::Reset::Environment(ui::ENV_ROW_FOG_MODE)).as_deref(), Some("Legacy 2"));
     }

@@ -115,7 +115,7 @@ struct ShadowSettings {
     camera_forward: vec4<f32>,
     cascade_texel_sizes: vec4<f32>,
     bevy_params: vec4<f32>, // depth bias, normal bias, overlap proportion, cascade count
-    dynamic_regions: array<vec4<f32>, 4>,
+    dynamic_coverage: array<vec4<u32>, 4>,
 };
 struct SurfaceFogSettings {
     color_depth: vec4<f32>,
@@ -3915,9 +3915,18 @@ fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f3
 // Runtime sunlight is evaluated AFTER cached subtraction/filtering and indirect
 // tone controls. Its direction/intensity never modify the original-sun cache.
 fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
-    if static_sun_lightmap_receiver(input) { return shade_baked_local(shade_composed_sun(lightmap,flux,input),input); }
-    let remaining = shade_baked_local(select(remove_baked_sun(lightmap, flux, input),lightmap,composed_lightmap_receiver(input)),input);
-    if (lighting_settings.baked_sun_debug_mode.x != 0u || lighting_settings.runtime_sun_radiance.w < 0.5) {
+    // ONE shade_baked_local call site: under hardware RT its lamp loop inlines
+    // ray queries, and the driver compiles every call site into each world PSO.
+    let static_receiver = static_sun_lightmap_receiver(input);
+    var unshadowed: vec3<f32>;
+    if static_receiver {
+        unshadowed = shade_composed_sun(lightmap, flux, input);
+    } else {
+        unshadowed = select(remove_baked_sun(lightmap, flux, input), lightmap, composed_lightmap_receiver(input));
+    }
+    let remaining = shade_baked_local(unshadowed, input);
+    if (static_receiver || lighting_settings.baked_sun_debug_mode.x != 0u
+        || lighting_settings.runtime_sun_radiance.w < 0.5) {
         return remaining;
     }
     let facing = max(dot(normalize(input.world_normal), normalize(lighting_settings.runtime_sun_direction.xyz)), 0.0);
@@ -4160,24 +4169,27 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
 
     // Explicit $lightmap stages use the stage's source sample, not the
     // synthesized implicit lightmap multiply below. Preserve blending order.
-    if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u && explicit_lightmap_stage
-        && input.lightmap_uv.x >= 0.0) {
-        let baked = light_bsp_surface(source_sample.rgb, source_sample.a, input);
-        if (lighting_settings.baked_sun_debug_mode.x != 0u) {
-            return vec4<f32>(baked, source_sample.a);
-        }
-        source_sample = vec4<f32>(baked, select(source_sample.a, 1.0, input.baked_sun_fit.z == 4.0 || composed_lightmap_receiver(input)));
-    }
     // q3map vertex-lit faces have no lightmap. Only touch the authored vertex
     // color path, never unrelated animated/non-lightmapped shader stages.
-    if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
+    // The two cases exclude each other (explicit_lightmap_stage), so they share
+    // ONE light_bsp_surface call site: every call site inlines the whole
+    // runtime relight, including hardware-RT traversals, into each world PSO.
+    let relight_explicit = ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
+        && explicit_lightmap_stage && input.lightmap_uv.x >= 0.0;
+    let relight_vertex_lit = ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
         && (material_flags() & 131072u) != 0u && (material_flags() & 1u) != 0u
-        && !explicit_lightmap_stage) {
-        let baked = light_bsp_surface(input.color.rgb, 0.0, input);
+        && !explicit_lightmap_stage;
+    if (relight_explicit || relight_vertex_lit) {
+        let baked = light_bsp_surface(select(input.color.rgb, source_sample.rgb, relight_explicit),
+            select(0.0, source_sample.a, relight_explicit), input);
         if (lighting_settings.baked_sun_debug_mode.x != 0u) {
-            return vec4<f32>(baked, stage_color.a);
+            return vec4<f32>(baked, select(stage_color.a, source_sample.a, relight_explicit));
         }
-        stage_color = vec4<f32>(material.color.rgb * baked, stage_color.a);
+        if (relight_explicit) {
+            source_sample = vec4<f32>(baked, select(source_sample.a, 1.0, input.baked_sun_fit.z == 4.0 || composed_lightmap_receiver(input)));
+        } else {
+            stage_color = vec4<f32>(material.color.rgb * baked, stage_color.a);
+        }
     }
     var base = source_sample * stage_color;
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot

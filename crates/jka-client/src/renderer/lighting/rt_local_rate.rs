@@ -125,16 +125,9 @@ impl RtLocalRateHistory {
 
 impl Renderer {
     pub(super) fn rt_local_cache_wanted(&self) -> bool {
-        self.rt_trace_rate > 1
-            && !self.tinted_glass_enabled
-            && self.ray_tracing_supported
-            && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
-            && !self.asset_preview_mode
-            && self.active_transient_light_count() > 0
-            && self
-                .world
-                .as_ref()
-                .is_some_and(|w| w.active_pipeline_variant.ray_traced_shadows)
+        // The Solari RIS port evaluates actual receiver materials and traces
+        // selected candidates directly. No full-screen visibility history.
+        false
     }
 
     pub(super) fn prepare_rt_local_rate(&mut self, view_proj: Mat4, eye: Vec3) {
@@ -146,7 +139,7 @@ impl Renderer {
         let Some(rt) = self.ray_traced_shadows.as_mut() else {
             return;
         };
-        let h = &mut rt.sun_shadow_history.local;
+        let h = &mut rt.receiver.local;
         let resized = enabled
             && h.resize(
                 &self.device,
@@ -189,7 +182,7 @@ impl Renderer {
         let Some(rt) = self.ray_traced_shadows.as_mut() else {
             return;
         };
-        let h = &mut rt.sun_shadow_history.local;
+        let h = &mut rt.receiver.local;
         if h.compute.is_none() {
             h.compute = Some(Compute::new(&self.device, &self.camera_layout));
         }
@@ -423,7 +416,6 @@ fn shader_source() -> Result<String, String> {
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
         "rt_trace_shadow_query",
-        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_visibility",
         "rt_trace_local_visibility",
         "ray_traced_local_shadow_visibility",
@@ -447,7 +439,7 @@ fn shader_source() -> Result<String, String> {
         ));
         source.push('\n');
     }
-    source.push_str(include_str!("../../rt_resolution_common.wgsl"));
+    source.push_str(include_str!("../../rt_local_rate_common.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_surface.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_trace.wgsl"));
     Ok(source)

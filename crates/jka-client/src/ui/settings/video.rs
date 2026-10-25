@@ -481,13 +481,14 @@ pub struct VideoSettings {
     /// Session-only experiment: 0 baseline, 1 octant receiver, 2 caster prefilter,
     /// 3 combined, 4 conservative receiver early-rejection (all work at frame rate).
     pub lamp_shadow_ab: u8,
+    pub csm_coverage_ab: bool,
     pub promote_shader_glow: bool,
     pub promote_shader_additive: bool,
     pub promote_shader_emissive: bool,
     pub rt_samples: u32,
     /// 0 = stock JKA 1 - d^2/r^2, 1 = windowed inverse-square.
     pub dynamic_light_falloff: u32,
-    /// Fresh RT visibility rate: 1 = Full, 2 = Half, 4 = Quarter.
+    /// Solari RT ray-budget divisor: 1 = Full, 2 = Half, 4 = Quarter.
     pub rt_trace_rate: u32,
     /// Source `.map` only: approximate a compiled lighting pass from authored light entities.
     pub map_light_simulation: bool,
@@ -837,7 +838,7 @@ impl Default for VideoSettings {
             fxaa: false,
             smaa: false,
             taa: false,
-            rt_taa: 0,
+            rt_taa: 1,
             contact_shadows: false,
             fog_mode: FogMode::Off,
             fog_strength: 0.0,
@@ -961,12 +962,13 @@ impl Default for VideoSettings {
             // No inferred lamp shadows until a source is explicitly selected.
             baked_local_sources: 0,
             lamp_shadow_ab: 0,
+            csm_coverage_ab: false,
             promote_shader_glow: true,
             promote_shader_additive: true,
             promote_shader_emissive: true,
-            rt_samples: 1,
+            rt_samples: 2,
             dynamic_light_falloff: 0,
-            rt_trace_rate: 1,
+            rt_trace_rate: 2,
             map_light_simulation: false,
             world_lighting: true,
             vertex_lighting: false,

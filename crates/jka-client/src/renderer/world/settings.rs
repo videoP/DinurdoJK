@@ -590,9 +590,8 @@ impl Renderer {
                 || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)
                 && shadowable_local_lights,
             cascaded_shadows: self.cascaded_shadows_enabled,
+            csm_coverage: self.cascaded_shadows_enabled && self.csm_coverage_ab,
             ray_traced_shadows: self.hardware_rt_requested() && self.ray_tracing_supported,
-            ray_traced_sun: matches!(self.cascaded_shadow_mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
-                && self.ray_tracing_supported,
             rt_receiver_glass: self.hardware_rt_requested() && self.ray_tracing_supported
                 && crate::renderer::lighting::rt_diagnostics::config().receiver.glass,
             planar_reflections: self.planar_reflection.active,
@@ -751,7 +750,7 @@ impl Renderer {
             // Preserve a valid raster pipeline if the adapter exposes the feature
             // but this particular map exceeds an acceleration-structure limit.
             key.ray_traced_shadows = false;
-            key.ray_traced_sun = false;
+
             key.rt_receiver_glass = false;
         }
         let Some(current_key) = self

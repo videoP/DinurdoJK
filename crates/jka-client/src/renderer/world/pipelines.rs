@@ -93,7 +93,7 @@ impl Renderer {
         let rt_requested = key.ray_traced_shadows;
         if rt_requested {
             key.ray_traced_shadows = false;
-            key.ray_traced_sun = false;
+
             key.rt_receiver_glass = false;
         }
         let scene_format = self.scene_format();
@@ -333,7 +333,6 @@ impl Renderer {
                 self.dynamic_model_renderer.fx_sprite_surface_format,
                 self.dynamic_model_renderer.fx_sprite_samples);
         }
-        self.invalidate_rt_sun_shadow_depth();
         // Companion scene textures/pipelines share the gameplay scene format and
         // MSAA count. Recreate them lazily after this rebuild; the presentation
         // worker keeps showing its last safe texture until the new ring arrives.
@@ -912,7 +911,7 @@ pub(in crate::renderer) fn create_ocean_far_pipeline(
         | "ENABLE_LEGACY_DLIGHTS" | "ENABLE_VERTEX_DLIGHTS"
         | "ENABLE_CLUSTERED_LITE_DLIGHTS" | "ENABLE_AREA_LIGHTS"
         | "ENABLE_IRRADIANCE_VOLUME" | "ENABLE_VOXEL_GI"
-        | "ENABLE_LOCAL_SHADOWS" | "ENABLE_CASCADED_SHADOWS"
+        | "ENABLE_LOCAL_SHADOWS" | "ENABLE_CASCADED_SHADOWS" | "ENABLE_CSM_COVERAGE"
         | "ENABLE_PLANAR_REFLECTIONS" | "ENABLE_LEGACY_FOG"
         | "ENABLE_JUMP_SHADE"));
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1004,7 +1003,7 @@ pub(in crate::renderer) fn create_ocean_native_mesh_pipeline(
     let mut constants = variant.base_pass_key().compilation_constants();
     constants.push(("ENABLE_ALPHA_TEST", 1.0));
     let vertex_constants = constants.iter().copied()
-        .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+        .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
         .collect::<Vec<_>>();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if wireframe { "JKA submerged native ocean wireframe" } else { "JKA submerged native ocean mesh" }),

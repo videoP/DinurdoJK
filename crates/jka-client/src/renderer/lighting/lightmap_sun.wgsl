@@ -1,3 +1,5 @@
+override ENABLE_CSM_COVERAGE: bool = false;
+
 // Shared by both world shader families. Static receivers already contain the
 // composed sunlight; only the moving-caster footprint needs a live comparison.
 fn static_sun_lightmap_receiver(input: VertexOut) -> bool {
@@ -7,13 +9,20 @@ fn static_sun_lightmap_receiver(input: VertexOut) -> bool {
 
 fn sample_dynamic_cascade(world_position: vec3<f32>, normal: vec3<f32>, cascade: i32) -> f32 {
     if textureNumLayers(shadow_texture) < 9u { return 1.0; }
+    let coverage = shadow_settings.dynamic_coverage[u32(cascade)];
+    if ENABLE_CSM_COVERAGE && all(coverage == vec4<u32>(0u)) { return 1.0; }
     let texel = shadow_settings.cascade_texel_sizes[u32(cascade)];
     let offset = normal * (shadow_settings.bevy_params.y * texel)
         - normalize(shadow_settings.light_direction_enabled.xyz) * shadow_settings.bevy_params.x;
     let clip = shadow_settings.view_proj[u32(cascade)] * vec4(world_position + offset, 1.0);
     let ndc = clip.xyz / clip.w;
-    let region = shadow_settings.dynamic_regions[u32(cascade)];
-    if any(ndc.xy < region.xy) || any(ndc.xy > region.zw) || ndc.z < 0.0 || ndc.z > 1.0 {
+    if ENABLE_CSM_COVERAGE {
+        if !shadow_coverage_contains(coverage, ndc.xy) { return 1.0; }
+    } else {
+        let region = bitcast<vec4<f32>>(coverage);
+        if any(ndc.xy < region.xy) || any(ndc.xy > region.zw) { return 1.0; }
+    }
+    if ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
     let uv = ndc.xy * vec2(0.5,-0.5) + vec2(0.5);

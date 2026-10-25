@@ -1,12 +1,20 @@
 //! Lighting entity shadows.
 use crate::renderer::{
-    sample_entity_classic_light, scene, Camera, CameraUniform, DynamicShadowsMode,
+    sample_entity_classic_light, scene, Camera, CameraUniform,
     EntityShadowLight, Mat4, Renderer, ShadowCasterUniform, ShadowReceiverUniform, Vec3,
     BEVY_CSM_OVERLAP_PROPORTION, BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS,
     ENTITY_SHADOW_CAMERAS, ENTITY_SHADOW_LIGHT_RANGE, ENTITY_SHADOW_MAX_STRENGTH,
     ENTITY_SHADOW_MIN_ELEVATION, ENTITY_SHADOW_RADIUS, ENTITY_SHADOW_SMOOTHING_SECONDS,
-    RT_SUN_ANGULAR_DIAMETER_RADIANS, SHADOW_CASCADES, SHADOW_MAP_SIZE,
+    SHADOW_CASCADES, SHADOW_MAP_SIZE,
 };
+
+impl Renderer {
+    pub(in crate::renderer) fn set_csm_coverage_ab(&mut self, enabled: bool) {
+        if self.csm_coverage_ab == enabled { return; }
+        self.csm_coverage_ab = enabled;
+        self.activate_world_pipeline_variant();
+    }
+}
 
 /// Conservative light-space footprint of the live caster pass. Empty regions
 /// skip all PCF reads on baked static receivers. GPU skinning uses conservative
@@ -51,6 +59,48 @@ pub(in crate::renderer) fn live_csm_region(
     if !low.is_finite() {return [1.0,1.0,-1.0,-1.0];}
     let pad=0.02;
     [low.x-pad,low.y-pad,high.x+pad,high.y+pad]
+}
+
+/// Conservative caster tiles, padded for the unchanged PCF filter.
+pub(in crate::renderer) fn live_csm_coverage(
+    world: &crate::renderer::world::types::WorldGpu,
+    renderer: &crate::renderer::DynamicModelRenderer,
+    matrix: Mat4,
+    models: &[crate::renderer::DynamicModelSurface],
+    include_models: bool,
+    include_inline: bool,
+    include_grass: bool,
+) -> [u32; 4] {
+    use super::shadow_coverage::{add_caster, FULL_COVERAGE};
+    if include_grass { return FULL_COVERAGE; }
+    let mut mask = [0; 4];
+    let mut add_box = |min, max| add_caster(&mut mask, matrix, min, max, 0.02);
+    if include_inline {
+        for batch in &world.coarse_batches {
+            if (batch.is_inline_entity || super::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered))
+                && !crate::renderer::hidden_inline_batch(batch, &world.inline_models)
+                && crate::renderer::aabb_intersects_shadow_frustum(batch.bounds_min, batch.bounds_max, matrix, true) {
+                add_box(batch.bounds_min, batch.bounds_max);
+            }
+        }
+    }
+    if include_models {
+        for model in models.iter().filter(|m| m.raster_visible && matches!(m.alpha_mode,
+            crate::renderer::DynamicModelAlphaMode::Opaque | crate::renderer::DynamicModelAlphaMode::Mask)) {
+            if let Some(skin) = model.ghoul2_gpu.as_ref() {
+                let Some((origin, radius)) = renderer.shadow_skin_sphere(skin) else { return FULL_COVERAGE; };
+                add_box((origin-Vec3::splat(radius)).to_array(), (origin+Vec3::splat(radius)).to_array());
+                continue;
+            }
+            if model.fx_gpu_sprites.is_some() { return FULL_COVERAGE; }
+            let (mut min, mut max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for vertex in model.vertices.iter() {
+                let p = Vec3::from_array(vertex.position); min = min.min(p); max = max.max(p);
+            }
+            if min.is_finite() { add_box(min.to_array(), max.to_array()); }
+        }
+    }
+    mask
 }
 
 /// Entity shadow state: per-cascade light-camera uniforms (the entity shaders take
@@ -308,7 +358,7 @@ impl Renderer {
         let forward = camera.forward();
         let texel_size = (2.0 * ENTITY_SHADOW_RADIUS) / SHADOW_MAP_SIZE as f32;
         let receiver = ShadowReceiverUniform {
-            dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
+            dynamic_coverage: [[0;4]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| {
                 if index == 0 {
                     frame.view_proj
@@ -436,7 +486,7 @@ impl Renderer {
         let light_direction = Vec3::from_array(sun.direction).normalize_or_zero();
         let intensity_scale = (sun.intensity / 250.0).max(0.0).sqrt().clamp(0.0, 1.5);
         let receiver = ShadowReceiverUniform {
-            dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
+            dynamic_coverage: [[0;4]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
             split_depths: *splits,
             light_direction_enabled: [
@@ -458,22 +508,12 @@ impl Renderer {
                 self.sun_visibility.shader_value(),
             ],
             cascade_texel_sizes: *texel_sizes,
-            bevy_params: if self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced {
-                // RT interpretation: only x is read, as cos(max directional-light
-                // cone half-angle), matching Bevy Solari. y/z/w stay zero; w in
-                // particular is the CSM cascade count other receivers (grass)
-                // read, and zero makes them skip the unrendered shadow maps.
-                // The visibility ray count comes from LightingSettings.
-                let half_angle_radians = 0.5 * RT_SUN_ANGULAR_DIAMETER_RADIANS;
-                [half_angle_radians.cos(), 0.0, 0.0, 0.0]
-            } else {
-                [
-                    BEVY_CSM_SHADOW_DEPTH_BIAS,
-                    BEVY_CSM_SHADOW_NORMAL_BIAS,
-                    BEVY_CSM_OVERLAP_PROPORTION,
-                    SHADOW_CASCADES as f32,
-                ]
-            },
+            bevy_params: [
+                BEVY_CSM_SHADOW_DEPTH_BIAS,
+                BEVY_CSM_SHADOW_NORMAL_BIAS,
+                BEVY_CSM_OVERLAP_PROPORTION,
+                SHADOW_CASCADES as f32,
+            ],
         };
         self.queue.write_buffer(
             &self.shadow_resources.receiver_buffer,

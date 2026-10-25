@@ -3,7 +3,7 @@ use crate::app::{
     charset_glyph_uv, generic_timer_bar, offset_third_person_view, playerstate_vec3,
     probe_demo_gamestate, rendering_third_person, scene, ui, ActiveReward, App, ApplyLatchedScope,
     Arc, ClientGameState, ClothConfig, Cursor, DemoAdvance, DemoCameraSample, DemoFakeView,
-    DemoIndex, DemoReader, DemoViewMode, Duration, DynamicLightsMode, DynamicShadowsMode,
+    DemoIndex, DemoReader, DemoViewMode, Duration, DynamicLightsMode,
     EntityEvent, FrontendPage, FxGeometryMode, GameSession, Ghoul2PresentationView, Instant,
     KeyCode, LivePredictionFrame, MapLoadingState, MissingMapPrompt, OverlayMode, Path,
     PresentationViewer, PresentedEntity, ProtocolSnapshot, RagdollConfig, ServerMessageDecoder,
@@ -1496,8 +1496,7 @@ impl App {
                 debug: self.video.physics_debug_draw,
                 stats: self.video.physics_stats,
             });
-            let rt_rigid_casters_enabled = matches!(self.video.dynamic_shadows, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
-                || self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
+            let rt_rigid_casters_enabled = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
             let blob_shadow_opacity = self.video.player_blob_shadow_opacity();
             playback
                 .weapon_fx

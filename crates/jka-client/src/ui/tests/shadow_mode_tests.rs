@@ -36,19 +36,12 @@ fn dynamic_shadow_modes_round_trip_and_keep_old_stencil_configs() {
 }
 
 #[test]
-fn hybrid_sun_shadows_have_distinct_persistent_name() {
-    assert_eq!(
-        DynamicShadowsMode::from_config("hybrid_csm_rt_entities"),
-        Some(DynamicShadowsMode::HybridCsmRtEntities)
-    );
-    assert_eq!(
-        DynamicShadowsMode::from_config("3"),
-        Some(DynamicShadowsMode::RayTraced),
-        "legacy RT numeric alias must not change"
-    );
-    assert_eq!(
-        DynamicShadowsMode::from_config("2"),
-        Some(DynamicShadowsMode::CascadedShadowMaps),
-        "legacy CSM numeric alias must not change"
-    );
+fn removed_rt_sun_modes_migrate_to_csm() {
+    assert_eq!(DynamicShadowsMode::ALL, [DynamicShadowsMode::Off, DynamicShadowsMode::Blob,
+        DynamicShadowsMode::EntityMap, DynamicShadowsMode::CascadedShadowMaps]);
+    for legacy in ["hybrid_csm_rt_entities", "hybrid", "csm_rt_entities", "5",
+        "ray_traced", "raytraced", "3", "4", "2"] {
+        assert_eq!(DynamicShadowsMode::from_config(legacy), Some(DynamicShadowsMode::CascadedShadowMaps));
+    }
+    assert_eq!(DynamicLightsMode::from_config("ray_traced"), Some(DynamicLightsMode::RayTracedHardware));
 }

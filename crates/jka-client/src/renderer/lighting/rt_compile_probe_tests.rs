@@ -8,13 +8,12 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use wgpu::naga;
 
-fn hybrid_variant() -> WorldShaderVariantKey {
+fn rt_local_csm_variant() -> WorldShaderVariantKey {
     WorldShaderVariantKey {
         point_lights: true,
         local_shadows: true,
         cascaded_shadows: true,
         ray_traced_shadows: true,
-        ray_traced_sun: true,
         rt_receiver_glass: true,
         material_specialization: true,
         ..WorldShaderVariantKey::default()
@@ -27,7 +26,7 @@ fn rt_source(nonce: u32) -> String {
     let source = ray_traced_world_shader_source(include_str!("../../bsp.wgsl")).unwrap();
     let source = compose_world_shader(&source);
     let tmin = format!("{:.7}", 0.25 + f64::from(nonce % 997 + 1) * 1e-6);
-    source.replace("RayDesc(ray_flags, instance_mask, 0.25,", &format!("RayDesc(ray_flags, instance_mask, {tmin},"))
+    source.replace("RayDesc(ray_flags, 0x03u, 0.25,", &format!("RayDesc(ray_flags, 0x03u, {tmin},"))
 }
 
 fn raster_source() -> String {
@@ -131,13 +130,12 @@ fn rt_world_fragment_inlines_traversals_offline() {
     let started = Instant::now();
     let (module, info) = parse(&source);
     println!("RT enhanced: {} bytes WGSL, parse+validate {:.0} ms", source.len(), started.elapsed().as_secs_f64() * 1000.0);
-    let variant = hybrid_variant();
+    let variant = rt_local_csm_variant();
     let cases: Vec<(&str, WorldShaderVariantKey, Option<MaterialFragmentKey>)> = vec![
-        ("hybrid general", variant, None),
-        ("hybrid lightmapped", variant, Some(opaque_lightmapped_material(variant))),
-        ("hybrid vertex-lit", variant, Some(vertex_lit_material(variant))),
-        ("rt local only", WorldShaderVariantKey { ray_traced_sun: false, ..variant }, None),
-        ("rt sun only (no point lights)", WorldShaderVariantKey { point_lights: false, local_shadows: false, ..variant }, None),
+        ("RT local + CSM general", variant, None),
+        ("RT local + CSM lightmapped", variant, Some(opaque_lightmapped_material(variant))),
+        ("RT local + CSM vertex-lit", variant, Some(vertex_lit_material(variant))),
+        ("rt local only", WorldShaderVariantKey { cascaded_shadows: false, ..variant }, None),
     ];
     for (name, v, material) in cases {
         let probe = naga_probe(&module, &info, &constants(v, material));
@@ -202,8 +200,8 @@ fn rt_world_pipeline_compile_probe() {
             ..Default::default()
         }).await.unwrap();
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
-        let variant = hybrid_variant();
-        let raster = WorldShaderVariantKey { ray_traced_shadows: false, ray_traced_sun: false, rt_receiver_glass: false, ..variant };
+        let variant = rt_local_csm_variant();
+        let raster = WorldShaderVariantKey { ray_traced_shadows: false, rt_receiver_glass: false, ..variant };
         let lit = Some(opaque_lightmapped_material(variant));
         let vlit = Some(vertex_lit_material(variant));
         // (label, source, trusted, variant, material)
@@ -212,15 +210,14 @@ fn rt_world_pipeline_compile_probe() {
         let mut next = || { n = n.wrapping_add(1); n };
         cases.push(("raster CSM general".into(), raster_source(), false, raster, None));
         cases.push(("raster CSM lightmapped".into(), raster_source(), false, raster, lit));
-        cases.push(("RT hybrid general".into(), rt_source(next()), false, variant, None));
-        cases.push(("RT hybrid lightmapped".into(), rt_source(next()), false, variant, lit));
-        cases.push(("RT hybrid vertex-lit".into(), rt_source(next()), false, variant, vlit));
+        cases.push(("RT local + CSM general".into(), rt_source(next()), false, variant, None));
+        cases.push(("RT local + CSM lightmapped".into(), rt_source(next()), false, variant, lit));
+        cases.push(("RT local + CSM vertex-lit".into(), rt_source(next()), false, variant, vlit));
         let warm = rt_source(next());
-        cases.push(("RT hybrid lightmapped (cold)".into(), warm.clone(), false, variant, lit));
-        cases.push(("RT hybrid lightmapped (warm)".into(), warm, false, variant, lit));
-        cases.push(("RT hybrid lightmapped UNCHECKED".into(), rt_source(next()), true, variant, lit));
-        cases.push(("RT local only".into(), rt_source(next()), false, WorldShaderVariantKey { ray_traced_sun: false, ..variant }, lit));
-        cases.push(("RT sun only".into(), rt_source(next()), false, WorldShaderVariantKey { point_lights: false, local_shadows: false, ..variant }, lit));
+        cases.push(("RT local + CSM lightmapped (cold)".into(), warm.clone(), false, variant, lit));
+        cases.push(("RT local + CSM lightmapped (warm)".into(), warm, false, variant, lit));
+        cases.push(("RT local + CSM lightmapped UNCHECKED".into(), rt_source(next()), true, variant, lit));
+        cases.push(("RT local only".into(), rt_source(next()), false, WorldShaderVariantKey { cascaded_shadows: false, ..variant }, lit));
         let parsed = std::cell::RefCell::new(HashMap::<String, (naga::Module, naga::valid::ModuleInfo)>::new());
         for (label, source, trusted, v, material) in cases {
             let constants = constants(v, material);
@@ -238,7 +235,7 @@ fn rt_world_pipeline_compile_probe() {
             };
             let module_ms = module_started.elapsed().as_secs_f64() * 1000.0;
             let vertex_constants = constants.iter().copied()
-                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
                 .collect::<Vec<_>>();
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -293,7 +290,7 @@ fn rt_world_pipeline_levers_probe() {
             ..Default::default()
         }).await.unwrap();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
-        let variant = hybrid_variant();
+        let variant = rt_local_csm_variant();
         let lit = Some(opaque_lightmapped_material(variant));
         let compile = |source: &str, v: WorldShaderVariantKey, material: Option<MaterialFragmentKey>,
                        cull: Option<wgpu::Face>, cache: Option<&wgpu::PipelineCache>| -> f64 {
@@ -301,7 +298,7 @@ fn rt_world_pipeline_levers_probe() {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("rt probe"), source: wgpu::ShaderSource::Wgsl(source.to_string().into()) });
             let vertex_constants = constants.iter().copied()
-                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
                 .collect::<Vec<_>>();
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -328,7 +325,7 @@ fn rt_world_pipeline_levers_probe() {
         let nonce_glass_off = |nonce: u32| {
             let source = ray_traced_world_shader_source_with_features(include_str!("../../bsp.wgsl"), ReceiverFeatures { glass: false }).unwrap();
             let tmin = format!("{:.7}", 0.25 + f64::from(nonce % 997 + 1) * 1e-6);
-            compose_world_shader(&source).replace("RayDesc(ray_flags, instance_mask, 0.25,", &format!("RayDesc(ray_flags, instance_mask, {tmin},"))
+            compose_world_shader(&source).replace("RayDesc(ray_flags, 0x03u, 0.25,", &format!("RayDesc(ray_flags, 0x03u, {tmin},"))
         };
         // Warm the device/driver once so the first measurement is not an outlier.
         compile(&rt_source(seed), variant, lit, Some(wgpu::Face::Back), None);
@@ -347,7 +344,7 @@ fn rt_world_pipeline_levers_probe() {
         let after = cache.get_data().map_or(0, |d| d.len());
         let warm = compile(&cached, variant, lit, Some(wgpu::Face::Back), Some(&cache));
         let raster_before = after;
-        compile(&raster_source(), WorldShaderVariantKey { ray_traced_shadows: false, ray_traced_sun: false, rt_receiver_glass: false, ..variant }, lit, Some(wgpu::Face::Back), Some(&cache));
+        compile(&raster_source(), WorldShaderVariantKey { ray_traced_shadows: false, rt_receiver_glass: false, ..variant }, lit, Some(wgpu::Face::Back), Some(&cache));
         let raster_after = cache.get_data().map_or(0, |d| d.len());
         println!("pipeline cache: RT cold {cold:.1} ms, warm {warm:.1} ms, RT entry {} KiB, raster entry {} KiB",
             (after - before) / 1024, (raster_after - raster_before) / 1024);
@@ -391,7 +388,7 @@ fn rt_world_pipeline_disk_cache_probe() {
             experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         }).await.unwrap();
-        let variant = hybrid_variant();
+        let variant = rt_local_csm_variant();
         let lit = Some(opaque_lightmapped_material(variant));
         let source = rt_source(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32);
         let files = || std::fs::read_dir(&dir).map_or(0, |entries| entries.filter_map(Result::ok)
@@ -402,7 +399,7 @@ fn rt_world_pipeline_disk_cache_probe() {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("rt cache probe"), source: wgpu::ShaderSource::Wgsl(source.clone().into()) });
             let vertex_constants = constants.iter().copied()
-                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
                 .collect::<Vec<_>>();
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -438,9 +435,9 @@ fn rt_world_pipeline_disk_cache_probe() {
 }
 
 /// The user's 2026-10-24 config (mode 0 general PSO): PBR + deluxe specular,
-/// Hybrid Ocean, rain-wet surfaces, detail textures, RT lights + hybrid sun.
+/// Hybrid Ocean, rain-wet surfaces, detail textures, RT lights + CSM sun.
 fn user_variant() -> WorldShaderVariantKey {
-    // From the in-game label: pbr+pom+pom-mip+local-shadow+sun-shadow+rt-shadow
+    // From the in-game label: pbr+pom+pom-mip+local-shadow+sun-shadow+rt-local
     // +ocean+baked-sun+deluxe+spec+detail (no point lights, no wet surfaces).
     WorldShaderVariantKey {
         pbr: true,
@@ -456,7 +453,7 @@ fn user_variant() -> WorldShaderVariantKey {
         detail_textures_enabled: true,
         point_lights: false,
         material_specialization: false,
-        ..hybrid_variant()
+        ..rt_local_csm_variant()
     }
 }
 
@@ -478,12 +475,11 @@ fn rt_user_variant_feature_cost_probe() {
         }).await.unwrap();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
         let user = user_variant();
-        let no_rt = WorldShaderVariantKey { ray_traced_shadows: false, ray_traced_sun: false, rt_receiver_glass: false, ..user };
+        let no_rt = WorldShaderVariantKey { ray_traced_shadows: false, rt_receiver_glass: false, ..user };
         let cases: Vec<(&str, WorldShaderVariantKey, bool, Option<MaterialFragmentKey>)> = vec![
             ("user general (mode 0)", user, true, None),
-            ("user, RT dyn lights only (CSM sun)", WorldShaderVariantKey { ray_traced_sun: false, ..user }, true, None),
-            ("user, RT lights only, mode 1 LM PSO", WorldShaderVariantKey { ray_traced_sun: false, material_specialization: true, ..user }, true,
-                Some(opaque_lightmapped_material(WorldShaderVariantKey { ray_traced_sun: false, material_specialization: true, ..user }))),
+            ("user, RT lights only, mode 1 LM PSO", WorldShaderVariantKey { material_specialization: true, ..user }, true,
+                Some(opaque_lightmapped_material(WorldShaderVariantKey { material_specialization: true, ..user }))),
             ("user without POM", WorldShaderVariantKey { pom: false, pom_mip_aware: false, ..user }, true, None),
             ("user without baked-sun relight", WorldShaderVariantKey { baked_sun_relight: false, ..user }, true, None),
             ("user without POM and baked-sun", WorldShaderVariantKey { pom: false, pom_mip_aware: false, baked_sun_relight: false, ..user }, true, None),
@@ -503,7 +499,7 @@ fn rt_user_variant_feature_cost_probe() {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("user probe"), source: wgpu::ShaderSource::Wgsl(source.clone().into()) });
             let vertex_constants = constants.iter().copied()
-                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN"))
+                .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
                 .collect::<Vec<_>>();
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,

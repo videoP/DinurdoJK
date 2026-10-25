@@ -43,8 +43,9 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) voxel_gi: bool,
     pub(in crate::renderer) local_shadows: bool,
     pub(in crate::renderer) cascaded_shadows: bool,
+    pub(in crate::renderer) csm_coverage: bool,
     pub(in crate::renderer) ray_traced_shadows: bool,
-    pub(in crate::renderer) ray_traced_sun: bool,
+
     /// Shader source/interface identity, frozen for the lifetime of the process.
     pub(in crate::renderer) rt_receiver_glass: bool,
     pub(in crate::renderer) planar_reflections: bool,
@@ -375,6 +376,10 @@ impl WorldShaderVariantKey {
                 f64::from(u8::from(self.local_shadows)),
             ),
             (
+                "ENABLE_CSM_COVERAGE",
+                f64::from(u8::from(self.csm_coverage)),
+            ),
+            (
                 "ENABLE_CASCADED_SHADOWS",
                 f64::from(u8::from(self.cascaded_shadows)),
             ),
@@ -424,10 +429,6 @@ impl WorldShaderVariantKey {
         // as it was before hardware RT support existed.
         if self.ray_traced_shadows {
             constants.push(("ENABLE_RAY_TRACED_SHADOWS", 1.0));
-            constants.push((
-                "ENABLE_RAY_TRACED_SUN",
-                f64::from(u8::from(self.ray_traced_sun)),
-            ));
         }
         constants
     }
@@ -487,13 +488,10 @@ impl WorldShaderVariantKey {
         }
         if self.cascaded_shadows {
             enabled.push("sun-shadow");
+            if self.csm_coverage { enabled.push("csm-coverage-b"); }
         }
         if self.ray_traced_shadows {
-            enabled.push(if self.ray_traced_sun {
-                "rt-shadow"
-            } else {
-                "rt-local"
-            });
+            enabled.push("rt-local");
         }
         if self.planar_reflections {
             enabled.push("planar");
@@ -513,7 +511,7 @@ impl WorldShaderVariantKey {
         if self.classic_render_flags {
             enabled.push("classic");
         }
-        if self.baked_sun_relight { enabled.push("baked-sun"); }
+        if self.baked_sun_relight { enabled.push("baked-light"); }
         if self.static_bsp_ao {
             enabled.push("static-ao");
         }

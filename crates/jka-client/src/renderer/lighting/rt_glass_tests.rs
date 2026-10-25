@@ -70,7 +70,6 @@ struct TestRay { origin: vec4<f32>, direction: vec4<f32> };
         "rt_alpha_generated_uv",
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
-        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_query",
         "rt_trace_shadow_visibility",
         "rt_trace_shadow_throughput",
@@ -478,6 +477,7 @@ struct TestLighting { feature_flags: vec4<u32>, local_shadows: vec4<u32>, baked_
         );
         for name in [
             "sample_local_shadow_visibility",
+            "baked_local_moving_maybe",
             "baked_local_moving_visibility",
             "local_light_shadow_visibility",
             "raster_glass_throughput",

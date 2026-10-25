@@ -54,10 +54,10 @@ reconstruction or its current visual limitations.
 
 `r_sunLighting 1` adds the live sun to BSP lighting after baked-sun subtraction,
 using the current direction, color and intensity independently of removal strength
-and its cache. Enable `r_dynamicShadows csm` (or RT) for occlusion. It defaults to
+and its cache. Enable `r_dynamicShadows csm` for occlusion. It defaults to
 `0`, which preserves legacy baked lighting. This light is evaluated during rendering.
 
-`r_sunShadowStrength` controls legacy CSM/RT shadow darkening from `0` to `1`
+`r_sunShadowStrength` controls legacy CSM shadow darkening from `0` to `1`
 when `r_sunLighting` is off.
 Its default `0.3` preserves the previous strength. Sun intensity and surface
 orientation still affect the result. Live sun shadows also work while baked-sun
@@ -67,4 +67,5 @@ removal, its cache, or other baked-light adjustments are enabled.
 Static map point lights, authored surface lights, promoted shader emitters and
 inferred lamp shadows use raster visibility. `r_localLightShadows` controls
 cached cubemap shadows for static local lights, including in RT dynamic-light
-mode. Sun shadows remain controlled by `r_dynamicShadows`.
+mode. Sun shadows use `r_dynamicShadows off|blob|entity|csm`; CSM is the highest
+sun setting. Saved RT/hybrid sun settings migrate to CSM.

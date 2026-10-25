@@ -1801,7 +1801,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             .iter()
             .copied()
             .filter(|(name, _)| {
-                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "ENABLE_RAY_TRACED_SUN")
+                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS")
             })
             .collect::<Vec<_>>()
     });

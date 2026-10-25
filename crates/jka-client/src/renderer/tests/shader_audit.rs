@@ -623,8 +623,9 @@ fn minimal_key() -> WorldShaderVariantKey {
         voxel_gi: false,
         local_shadows: false,
         cascaded_shadows: false,
+        csm_coverage: false,
         ray_traced_shadows: false,
-        ray_traced_sun: false,
+
         rt_receiver_glass: false,
         planar_reflections: false,
         legacy_fog: false,

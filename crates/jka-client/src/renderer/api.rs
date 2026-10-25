@@ -1151,6 +1151,7 @@ pub enum RenderCommand {
     SetShaderLightPromotion { enabled: bool, mask: u32 },
     SetBakedLocalLights { enabled: bool, sources: u32 },
     SetLampShadowAB(u8),
+    SetCsmCoverageAB(bool),
     SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
     SetLocalLightShadows(bool),

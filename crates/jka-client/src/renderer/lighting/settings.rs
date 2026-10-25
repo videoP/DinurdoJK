@@ -59,7 +59,7 @@ impl Renderer {
             return;
         }
         self.rt_samples = samples;
-        if let Some(rt) = self.ray_traced_shadows.as_mut() { rt.sun_shadow_history.invalidate(); }
+        if let Some(rt) = self.ray_traced_shadows.as_mut() { rt.receiver.invalidate(); }
         if self.hardware_rt_requested() {
             self.update_lighting_settings();
             self.history_valid = false;
@@ -75,7 +75,7 @@ impl Renderer {
         }
         self.rt_trace_rate = rate;
         if let Some(rt) = self.ray_traced_shadows.as_mut() {
-            rt.sun_shadow_history.invalidate();
+            rt.receiver.invalidate();
         }
         self.history_valid = false;
         self.rebuild_frame_plan();
@@ -282,8 +282,8 @@ impl Renderer {
                 }
             }
             self.update_lighting_settings();
-            // Local RT light queries are traced every frame; no sun-shadow
-            // history is used for this RGB signal, so no cache flush is needed.
+            // Local RT light queries are traced every frame, so no
+            // visibility-history flush is needed for this RGB signal.
         }
     }
 

@@ -16,6 +16,7 @@ pub(in crate::renderer) mod ray_tracing;
 pub(in crate::renderer) mod rt_diagnostics;
 pub(in crate::renderer) mod settings;
 pub(in crate::renderer) mod shadow_resources;
+pub(in crate::renderer) mod shadow_coverage;
 pub(in crate::renderer) mod state;
 pub(in crate::renderer) mod sun;
 pub(in crate::renderer) mod upload;

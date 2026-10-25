@@ -15,22 +15,10 @@ fn rt_tc_stretch_wave(kind: u32, phase: f32) -> f32 {
     return mix(a, b, t*t*(3.0 - 2.0*t));
 }
 
-// Ported from Bevy Solari directional-light sampling:
-// - bevy_solari/src/scene/sampling.wesl::resolve_light_sample
-// - bevy_pbr/src/render/utils.wesl::{rand_f, rand_vec2f}
-// - bevy_render/src/maths.wesl::orthonormalize
-//
-// The sampler itself is generic for finite angular directional emitters. The
-// current RT Shadows caller supplies the JKA authored sun direction and an
-// Earth-like angular extent through shadow_settings.bevy_params.x.
 fn rt_rand_f(state: ptr<function, u32>) -> f32 {
     *state = *state * 747796405u + 2891336453u;
     let word = ((*state >> ((*state >> 28u) + 4u)) ^ *state) * 277803737u;
     return f32((word >> 22u) ^ word) * bitcast<f32>(0x2f800004u);
-}
-
-fn rt_rand_vec2f(state: ptr<function, u32>) -> vec2<f32> {
-    return vec2<f32>(rt_rand_f(state), rt_rand_f(state));
 }
 
 fn rt_sample_count() -> u32 {
@@ -125,40 +113,6 @@ fn rt_sample_local_emitter_seed(light: PointLight, input: VertexOut, light_index
     sampled.shadow.z = 0.0;
     sampled.color_intensity = vec4<f32>(light.color_intensity.rgb / f32(sample_count), light.color_intensity.a);
     return sampled;
-}
-
-fn rt_copysign(a: f32, b: f32) -> f32 {
-    return bitcast<f32>((bitcast<u32>(a) & 0x7fffffffu) | (bitcast<u32>(b) & 0x80000000u));
-}
-
-fn rt_orthonormalize(z_basis: vec3<f32>) -> mat3x3<f32> {
-    let sign = rt_copysign(1.0, z_basis.z);
-    let a = -1.0 / (sign + z_basis.z);
-    let b = z_basis.x * z_basis.y * a;
-    let x_basis = vec3<f32>(1.0 + sign * z_basis.x * z_basis.x * a, sign * b, -sign * z_basis.x);
-    let y_basis = vec3<f32>(b, sign + z_basis.y * z_basis.y * a, -z_basis.y);
-    return mat3x3<f32>(x_basis, y_basis, z_basis);
-}
-
-fn rt_sample_directional_emitter(
-    direction_to_light: vec3<f32>,
-    cos_theta_max: f32,
-    rng: ptr<function, u32>,
-    sample_index: u32,
-    sample_count: u32,
-) -> vec3<f32> {
-    // Bevy Solari: sample uniformly in solid angle inside the directional
-    // light's cone, then rotate that local +Z cone onto the light direction.
-    var random = rt_rand_vec2f(rng);
-    let columns = select(1u, 2u, sample_count > 1u);
-    let rows = max(sample_count / columns, 1u);
-    random = (vec2<f32>(f32(sample_index % columns), f32(sample_index / columns)) + random)
-        / vec2<f32>(f32(columns), f32(rows));
-    let cos_theta = (1.0 - random.x) + random.x * cos_theta_max;
-    let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
-    let phi = random.y * 6.28318530717958647692;
-    let local_direction = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-    return rt_orthonormalize(direction_to_light) * local_direction;
 }
 
 fn rt_alpha_repeat_coord(value: i32, size: i32) -> i32 {
@@ -398,7 +352,7 @@ fn rt_trace_shadow_visibility(origin: vec3<f32>, direction_to_light: vec3<f32>, 
 
 fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
     // RT local visibility is reserved for transient FX/weapon lights. Static
-    // map emitters use raster visibility at the caller, even with RT sun shadows.
+    // map emitters use raster visibility at the caller, even while transient lights use RT.
     if (!ENABLE_LOCAL_SHADOWS || camera.render_flags.x != 0u || light.shadow.w < 0.5) {
         return 1.0;
     }
@@ -454,11 +408,11 @@ fn rt_trace_local_visibility(light: PointLight, world_position: vec3<f32>, norma
 // multiplies their transmission, while every opaque/masked blocker wins.
 // Candidate order is unspecified: multiplying thin-pane RGB is commutative,
 // and a committed blocker returns zero regardless of when panes were visited.
-fn rt_trace_shadow_query_mask(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32, colored: bool, instance_mask: u32) -> vec3<f32> {
+fn rt_trace_shadow_query(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32, colored: bool) -> vec3<f32> {
     if (max_distance <= 0.25) { return vec3<f32>(1.0); }
     var query: ray_query;
     let ray_flags = select(0x204u, 0x200u, colored);
-    rayQueryInitialize(&query, rt_shadow_scene, RayDesc(ray_flags, instance_mask, 0.25, max_distance, origin, direction_to_light));
+    rayQueryInitialize(&query, rt_shadow_scene, RayDesc(ray_flags, 0x03u, 0.25, max_distance, origin, direction_to_light));
     var throughput = vec3<f32>(1.0);
     loop {
         let has_candidate = rayQueryProceed(&query);
@@ -482,16 +436,6 @@ fn rt_trace_shadow_query_mask(origin: vec3<f32>, direction_to_light: vec3<f32>, 
     }
     let hit = rayQueryGetCommittedIntersection(&query);
     return select(throughput, vec3<f32>(0.0), hit.kind != 0u);
-}
-
-// Default path: both static BSP (bit 0) and moving entities (bit 1).
-// A hybrid sun ray selects only bit 1; local-light rays must still see both.
-fn rt_trace_shadow_query(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32, colored: bool) -> vec3<f32> {
-    return rt_trace_shadow_query_mask(origin, direction_to_light, max_distance, colored, 0x03u);
-}
-
-fn rt_sun_trace_mask() -> u32 {
-    return select(0x03u, 0x02u, ENABLE_CASCADED_SHADOWS && ENABLE_RAY_TRACED_SUN);
 }
 
 fn rt_trace_shadow_throughput(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> vec3<f32> {
@@ -528,105 +472,6 @@ fn rt_local_shadow_rgb(light: PointLight, world_position: vec3<f32>, normal: vec
     if (remaining <= 0.5) { return vec3<f32>(1.0); }
     // Scalar mode returns equal channels: only a coloured query multiplies glass.
     let transmission = rt_trace_shadow_query(origin, to_emitter / remaining, remaining - 0.25, colored);
-    if (!colored) {
-        return transmission;
-    }
-    if ((lighting_settings.feature_flags.z & 0x400u) != 0u) {
-        return select(vec3<f32>(1.0), vec3<f32>(1.0, 0.05, 0.8),
-            any(transmission < vec3<f32>(0.995)));
-    }
-    if ((lighting_settings.feature_flags.z & 0x800u) != 0u) {
-        return vec3<f32>(1.0) - transmission;
-    }
-    return transmission;
-}
-
-fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
-    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) { return 1.0; }
-    let cached = rt_cached_sun_visibility(input);
-    if (cached >= 0.0) { return cached; }
-    return rt_uncached_sun_visibility(input, normal);
-}
-
-fn rt_uncached_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
-    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) {
-        return 1.0;
-    }
-
-    // ShadowSettings stores the direction the authored light travels. Receiver
-    // rays travel in the opposite direction, toward the finite emitter.
-    let toward_light = -shadow_settings.light_direction_enabled.xyz;
-    let light_len_sq = dot(toward_light, toward_light);
-    if (light_len_sq < 1e-8) {
-        return 1.0;
-    }
-    let direction_to_light = toward_light * inverseSqrt(light_len_sq);
-    let normal_len_sq = max(dot(normal, normal), 1e-12);
-    let surface_normal = normal * inverseSqrt(normal_len_sq);
-    let oriented_normal = select(-surface_normal, surface_normal, dot(surface_normal, direction_to_light) >= 0.0);
-    let origin = input.world_position + oriented_normal * 0.5;
-
-    // Seed layout follows Bevy's per-pixel/per-frame stochastic approach. With
-    // TAA enabled render_flags.w advances every frame so the existing temporal
-    // resolve integrates a new sun-disc sample. Without TAA the frame term is
-    // held at zero: each pixel keeps one deterministic sample, avoiding temporal
-    // sparkle without multiplying hardware ray traversal cost.
-    let px = u32(max(input.clip_position.x, 0.0));
-    let py = u32(max(input.clip_position.y, 0.0));
-    let viewport_width = max(lighting_settings.values.z, 1u);
-    let pixel_index = px + py * viewport_width;
-    var rng = pixel_index + camera.render_flags.w;
-    // Hybrid needs Bevy CSM bias parameters in the same uniform; use the
-    // normal authored sun-disc half-angle for its dynamic-only ray samples.
-    let cos_theta_max = select(clamp(shadow_settings.bevy_params.x, 0.0, 1.0),
-        cos(0.5 * 0.00930842), ENABLE_CASCADED_SHADOWS);
-    let samples = rt_sample_count();
-    var visibility = 0.0;
-    for (var sample_index = 0u; sample_index < samples; sample_index += 1u) {
-        let sampled_direction = rt_sample_directional_emitter(direction_to_light, cos_theta_max, &rng, sample_index, samples);
-        visibility += rt_trace_shadow_query_mask(origin, sampled_direction, 1000000.0, false, rt_sun_trace_mask()).x;
-    }
-    return visibility / f32(samples);
-}
-
-
-// Uncached directional RGB visibility while glass filtering is enabled. The
-// scalar screen-space cache remains used unchanged when tint is OFF; it cannot
-// represent three independent wavelength throughputs in its rg32float texel.
-// Using the actual traced direction preserves shaderSun's angular softening.
-// The scalar OFF mode is ray_traced_shadow_visibility (cache, then the same
-// samples) through this function's single traversal call site; see
-// rt_local_shadow_rgb for why the two modes must not each inline a query.
-fn rt_sun_shadow_rgb(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {
-    let colored = (lighting_settings.feature_flags.z & 0x200u) != 0u;
-    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u
-        || shadow_settings.light_direction_enabled.w < 0.5) {
-        return vec3<f32>(1.0);
-    }
-    if (!colored) {
-        let cached = rt_cached_sun_visibility(input);
-        if (cached >= 0.0) { return vec3<f32>(cached); }
-    }
-    let toward_light = -shadow_settings.light_direction_enabled.xyz;
-    let length_sq = dot(toward_light, toward_light);
-    if (length_sq < 1.0e-8) { return vec3<f32>(1.0); }
-    let direction = toward_light * inverseSqrt(length_sq);
-    let n = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
-    let oriented = select(-n, n, dot(n, direction) >= 0.0);
-    let origin = input.world_position + oriented * 0.5;
-    let px = u32(max(input.clip_position.x, 0.0));
-    let py = u32(max(input.clip_position.y, 0.0));
-    var rng = px + py * max(lighting_settings.values.z, 1u) + camera.render_flags.w;
-    let samples = rt_sample_count();
-    var transmission = vec3<f32>(0.0);
-    for (var sample_index = 0u; sample_index < samples; sample_index += 1u) {
-        let sun_disc = select(clamp(shadow_settings.bevy_params.x, 0.0, 1.0),
-            cos(0.5 * 0.00930842), ENABLE_CASCADED_SHADOWS);
-        let sampled_direction = rt_sample_directional_emitter(direction,
-            sun_disc, &rng, sample_index, samples);
-        transmission += rt_trace_shadow_query_mask(origin, sampled_direction, 1000000.0, colored, rt_sun_trace_mask());
-    }
-    transmission /= f32(samples);
     if (!colored) {
         return transmission;
     }

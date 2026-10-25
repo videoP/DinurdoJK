@@ -1336,6 +1336,24 @@ app_cvars! {
         } ]
     }
 
+    APP_R_CSMCOVERAGEAB {
+        runtime: CvarDef::new("r_csmCoverageAB", "", "0..1", "Session-only CSM A/B: 0 original receiver bounds and live passes (default), 1 tiled receiver coverage and empty live-pass skipping. Switch compiles/caches a shader variant; wait for it to settle before capture.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.csm_coverage_ab)),
+            |app, value| App::cvar_set_r_csmcoverageab(app, APP_R_CSMCOVERAGEAB.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_csmcoverageab, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_csmcoverageab(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.csm_coverage_ab = enabled;
+                self.render_command(RenderCommand::SetCsmCoverageAB(enabled));
+                self.console_status = format!("CSM coverage A/B: {} (0=original; 1=tiles + empty-pass skipping). Wait for shader compilation before capture.", u8::from(enabled));
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
     APP_R_LAMPSHADOWAB {
         runtime: CvarDef::new("r_lampShadowAB", "", "0..4", "Session-only, no update-rate cap: 0 original cubemaps, 1 receiver octant rejection, 2 per-lamp caster prefilter, 3 combined, 4 conservative receiver early-out. Use perfcapture and r_gpuTimings to compare.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.video.lamp_shadow_ab.to_string()),
@@ -1592,7 +1610,7 @@ app_cvars! {
     }
 
     APP_R_DYNAMICSHADOWS {
-        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|ray_traced", "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
+        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm", "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, context| {
                     if let Some(mode) = DynamicShadowsMode::from_config(value) {
@@ -1614,9 +1632,9 @@ app_cvars! {
                 fn cvar_set_r_dynamicshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.dynamic_shadows = DynamicShadowsMode::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected off|blob|entity|csm|ray_traced"))?;
+                            .ok_or_else(|| format!("{name}: expected off|blob|entity|csm"))?;
                         self.video.cascaded_shadows =
-                            matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+                            self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
                         self.sync_cascaded_shadows();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -1781,7 +1799,7 @@ app_cvars! {
     }
 
     APP_R_SUNLIGHTING {
-        runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM or RT sun shadows for occlusion. Default 0 preserves legacy baked lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
+        runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM sun shadows for occlusion. Default 0 preserves legacy baked lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Some(v) = parse_bool(value) { settings.sun_lighting = v; }
@@ -1803,7 +1821,7 @@ app_cvars! {
     }
 
     APP_R_SUNSHADOWSTRENGTH {
-        runtime: CvarDef::new("r_sunShadowStrength", "", "0..1", "Live sun shadow contrast before surface-facing attenuation. Default 0.3 preserves the existing response; 1 strengthens CSM/RT sun shadows. Intensity scaling still applies, with final strength capped at 1. Does not change baked-sun removal.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(format!("{:.3}", app.video.sun_shadow_strength)), |app, value| App::cvar_set_r_sunshadowstrength(app, APP_R_SUNSHADOWSTRENGTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunshadowstrength, None),
+        runtime: CvarDef::new("r_sunShadowStrength", "", "0..1", "Live sun shadow contrast before surface-facing attenuation. Default 0.3 preserves the existing response; 1 strengthens CSM sun shadows. Intensity scaling still applies, with final strength capped at 1. Does not change baked-sun removal.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(format!("{:.3}", app.video.sun_shadow_strength)), |app, value| App::cvar_set_r_sunshadowstrength(app, APP_R_SUNSHADOWSTRENGTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunshadowstrength, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(v) = value.parse::<f32>() {

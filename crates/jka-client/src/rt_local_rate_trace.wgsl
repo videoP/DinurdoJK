@@ -1,5 +1,5 @@
 @group(0) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(0) var<uniform> rt_shadow_settings: RtSunShadowSettings;
+@group(1) @binding(0) var<uniform> rt_shadow_settings: RtLocalRateSettings;
 @group(1) @binding(1) var rt_full_depth: texture_2d<f32>;
 @group(1) @binding(2) var rt_motion_vectors: texture_2d<f32>;
 @group(1) @binding(3) var rt_local_prev: texture_2d_array<u32>;
@@ -51,8 +51,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let right = rt_local_point(pixel + vec2<i32>(1, 0)) - position;
     let up = position - rt_local_point(pixel - vec2<i32>(0, 1));
     let down = rt_local_point(pixel + vec2<i32>(0, 1)) - position;
-    let dx = select(right, left, dot(left, left) < dot(right, right) && dot(left, left) > 1e-10);
-    let dy = select(down, up, dot(up, up) < dot(down, down) && dot(up, up) > 1e-10);
+    // At the screen edge one neighbour clamps to this pixel. Prefer the valid
+    // derivative there instead of making the cache reject the entire border.
+    let dx = select(right, left, dot(left, left) > 1e-10
+        && (dot(right, right) <= 1e-10 || dot(left, left) < dot(right, right)));
+    let dy = select(down, up, dot(up, up) > 1e-10
+        && (dot(down, down) <= 1e-10 || dot(up, up) < dot(down, down)));
     let cross_normal = cross(dx, dy);
     if (dot(cross_normal, cross_normal) <= 1e-12) {
         // Receiver performs direct queries at degenerate silhouettes.

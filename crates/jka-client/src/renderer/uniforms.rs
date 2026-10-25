@@ -595,7 +595,7 @@ pub(in crate::renderer) struct ShadowReceiverUniform {
     pub(in crate::renderer) camera_forward: [f32; 4],
     pub(in crate::renderer) cascade_texel_sizes: [f32; 4],
     pub(in crate::renderer) bevy_params: [f32; 4], // depth bias, normal bias, overlap proportion, cascade count
-    pub(in crate::renderer) dynamic_regions: [[f32; 4]; SHADOW_CASCADES], // light XY min/max; empty is min > max
+    pub(in crate::renderer) dynamic_coverage: [[u32; 4]; SHADOW_CASCADES], // A: float rectangle bits; B: 16 x 8 caster tiles per cascade
 }
 
 #[repr(C)]

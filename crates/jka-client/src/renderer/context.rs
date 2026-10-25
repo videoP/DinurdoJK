@@ -80,7 +80,6 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn resize(&mut self, size: PhysicalSize<u32>) {
-        self.invalidate_rt_sun_shadow_depth();
         self.size = size;
         if size.width == 0 || size.height == 0 {
             return;
@@ -143,7 +142,6 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn reconfigure(&mut self, reason: &'static str) {
-        self.invalidate_rt_sun_shadow_depth();
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }

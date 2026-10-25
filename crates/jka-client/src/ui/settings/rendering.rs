@@ -524,19 +524,14 @@ pub enum DynamicShadowsMode {
     EntityMap,
     /// Bevy-style directional-light cascades (the only CSM implementation).
     CascadedShadowMaps,
-    /// Static BSP CSM casters plus moving-entity sun occlusion via ray query.
-    HybridCsmRtEntities,
-    RayTraced,
 }
 
 impl DynamicShadowsMode {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 4] = [
         Self::Off,
         Self::Blob,
         Self::EntityMap,
         Self::CascadedShadowMaps,
-        Self::HybridCsmRtEntities,
-        Self::RayTraced,
     ];
 
     pub fn config_value(self) -> &'static str {
@@ -545,8 +540,6 @@ impl DynamicShadowsMode {
             Self::Blob => "blob",
             Self::EntityMap => "entity",
             Self::CascadedShadowMaps => "csm",
-            Self::HybridCsmRtEntities => "hybrid_csm_rt_entities",
-            Self::RayTraced => "ray_traced",
         }
     }
 
@@ -569,8 +562,9 @@ impl DynamicShadowsMode {
             | "csm_bevy"
             | "bevy_csm"
             | "cascaded_shadow_maps_bevy" => Some(Self::CascadedShadowMaps),
-            "hybrid_csm_rt_entities" | "hybrid" | "csm_rt_entities" | "5" => Some(Self::HybridCsmRtEntities),
-            "ray_traced" | "raytraced" | "3" | "4" => Some(Self::RayTraced),
+            // Removed RT sun modes migrate to the highest supported sun method.
+            "hybrid_csm_rt_entities" | "hybrid" | "csm_rt_entities" | "5" => Some(Self::CascadedShadowMaps),
+            "ray_traced" | "raytraced" | "3" | "4" => Some(Self::CascadedShadowMaps),
             _ => None,
         }
     }

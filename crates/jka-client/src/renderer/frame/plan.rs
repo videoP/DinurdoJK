@@ -261,7 +261,7 @@ impl Renderer {
         // linear-depth prepass: with no other consumer it runs a cheaper
         // depth-only early pass instead (see `FramePlan::hiz_early`).
         let other_linear_depth = self.ssao_enabled
-            || (self.rt_sun_cache_wanted() || self.rt_local_cache_wanted())
+            || self.rt_local_cache_wanted()
             || self.temporal_resolve_active()
             || self.contact_shadows_enabled
             || fog_enabled
@@ -278,7 +278,7 @@ impl Renderer {
         // `other_linear_depth` terms, then rain); recorded by render_perf_capture.
         let linear_depth_reasons = [
             self.ssao_enabled,
-            self.rt_sun_cache_wanted() || self.rt_local_cache_wanted(),
+            self.rt_local_cache_wanted(),
             self.temporal_resolve_active(),
             self.contact_shadows_enabled,
             fog_enabled,

@@ -11,7 +11,7 @@ impl Renderer {
             &self.device,
             &self.shadow_receiver_layout,
             &self.shadow_resources._array_view,
-            if matches!(self.cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities) {
+            if matches!(self.cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps) {
                 &self.shadow_resources.bevy_sampler
             } else {
                 &self.shadow_resources.legacy_sampler
@@ -31,7 +31,7 @@ impl Renderer {
                 self.cascaded_shadow_mode,
                 &rt.receiver_layout,
                 rt.scene(),
-                &rt.sun_shadow_history,
+                &rt.receiver,
             );
         }
     }

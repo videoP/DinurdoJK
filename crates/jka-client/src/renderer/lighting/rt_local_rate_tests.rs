@@ -20,7 +20,6 @@ fn counted_source() -> String {
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
         "rt_trace_shadow_query",
-        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_visibility",
     ] {
         let anchor = format!("fn {name}(");
@@ -196,7 +195,7 @@ fn rt_local_rate_gpu_counts_rays_and_rejects_invalid_history() {
                 let mut history = RtLocalRateHistory::new(&device);
                 history.resize(&device, size, samples);
                 let mut lighting = LightingSettings::zeroed();
-                lighting.values = [1, 1, 8, 8];
+                lighting.values = [1, 3, 8, 8];
                 lighting.map_ambient[3] = samples as f32;
                 let lighting = buffer(bytemuck::bytes_of(&lighting), wgpu::BufferUsages::UNIFORM);
                 let mut settings = Settings {

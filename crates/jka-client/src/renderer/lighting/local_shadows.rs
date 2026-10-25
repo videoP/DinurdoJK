@@ -1,6 +1,6 @@
 //! Lighting local shadows.
 use crate::renderer::{
-    hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
+    hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode,
     GpuPointLight, LocalShadowCacheEntry, LocalShadowResources, Mat4, Renderer,
     ShadowCasterUniform, Vec3, WorldGpu, GpuPass, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
     LOCAL_SHADOW_HYSTERESIS, LOCAL_SHADOW_MAP_SIZE, LOCAL_SHADOW_NEAR,
@@ -36,8 +36,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn hardware_rt_requested(&self) -> bool {
-        matches!(self.cascaded_shadow_mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
-            || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
+        self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
     }
 
     pub(in crate::renderer) fn hardware_rt_active(&self) -> bool {

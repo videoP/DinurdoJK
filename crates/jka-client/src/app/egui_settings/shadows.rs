@@ -6,7 +6,7 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_shadows(&mut self, ui: &mut egui::Ui) {
-        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 6] = [
+        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 4] = [
             (
                 DynamicShadowsMode::Off,
                 "Off",
@@ -27,21 +27,11 @@ impl App {
                 "Cascaded maps (CSM)",
                 "Bevy 0.19.1 directional-light CSM: four exponential cascades, stable texel snapping, reverse-Z and Bevy shadow filtering.",
             ),
-            (
-                DynamicShadowsMode::HybridCsmRtEntities,
-                "Hybrid: CSM + RT entities",
-                "CSM renders static BSP sun blockers. Hardware ray queries handle moving inline BSPs, player/NPC meshes and eligible movable models. Falls back to CSM-only if hardware RT is unavailable; does not ray-trace static world blockers for the sun.",
-            ),
-            (
-                DynamicShadowsMode::RayTraced,
-                "Ray traced",
-                "Hardware ray-query sunlight shadows from static BSP, moving BSP models, eligible rigid MD3s and skinned Ghoul2 casters. Requires hardware ray queries.",
-            ),
         ];
         if let Some(target) = mode_row(
             ui,
             "Sun & entity shadow method",
-            "Shadowing for sunlight and legacy entity drop-shadows. These are shadow techniques, not additional static light sources. Hybrid combines static BSP CSM with ray-traced moving blockers.",
+            "Shadowing for sunlight and legacy entity drop-shadows. These are shadow techniques, not additional static light sources.",
             theme::Reset::Video(ui::VIDEO_ROW_DYNAMIC_SHADOWS),
             self.video.dynamic_shadows,
             &SHADOW_OPTIONS,
@@ -121,16 +111,15 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
 
         // Grey out (rather than hide) the RT tuning rows when nothing ray-traced
         // is active, matching the other dependent rows on this page.
-        let rt_sun = matches!(self.video.dynamic_shadows, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities);
         let rt_lights = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
         const RT_TRACE_RATE: [(u32, &str, &str); 3] = [
-            (1, "Full", "Fresh sun and local-light shadow rays every frame."),
-            (2, "Half", "Refresh roughly half of stable pixels each frame, reusing validated history elsewhere."),
-            (4, "Quarter", "Refresh roughly one quarter of stable pixels each frame. More history reuse; changes may need extra rays."),
+            (1, "Full", "Fresh dynamic-light shadow rays every frame."),
+            (2, "Half", "Solari importance resampling: trace one local-light sample per two candidates. More noise."),
+            (4, "Quarter", "Solari importance resampling: trace one local-light sample per four candidates. More noise."),
         ];
-        ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
-            let note = if rt_sun || rt_lights { "" } else { "\n\nNeeds ray-traced sun/entity shadows or ray-traced local lights." };
-            if let Some(index) = mode_row(ui, "RT update rate", &format!("Fresh tracing rate for full sun RT and local-light shadows. Hybrid sun/entity rays run at full rate (no shared sun history); local-light tracing can still be reduced. FPS gains depend on the scene.{note}"),
+        ui.add_enabled_ui(rt_lights, |ui| {
+            let note = if rt_lights { "" } else { "\n\nNeeds ray-traced dynamic lights." };
+            if let Some(index) = mode_row(ui, "RT ray budget", &format!("Solari weighted light sampling reduces shadow rays at the material receiver, without a visibility-history pass. Full traces every candidate; lower budgets add sampling noise. Dynamic lights have a one-sample floor, so a lone point light cannot become cheaper. RT samples sets the starting budget; temporal filtering can smooth noise. FPS gains depend on the scene.{note}"),
                 theme::Reset::None, self.video.rt_trace_rate, &RT_TRACE_RATE) {
                 let _ = self.set_console_cvar("r_rtTraceRate", &RT_TRACE_RATE[index].0.to_string());
             }
@@ -154,17 +143,24 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
             (1, "On", "Temporal filtering inside runtime-light influence volumes. Retains MSAA; no extra shadow rays. Also filters textures and FX inside those regions."),
             (2, "Mask", "Green marks conservative RT light influence volumes; black stays unfiltered. Includes surfaces behind shadow blockers."),
         ];
-        ui.add_enabled_ui(rt_lights, |ui| {
+        let rt_taa_note = if self.video.taa {
+            "\n\nInactive while global TAA is enabled: global TAA already filters the scene."
+        } else if !rt_lights {
+            "\n\nNeeds ray-traced local lights."
+        } else {
+            ""
+        };
+        ui.add_enabled_ui(rt_lights && !self.video.taa, |ui| {
             if let Some(index) = mode_row(ui, "RT regional TAA",
-                "A/B option for MSAA plus regional temporal filtering. Enabling turns off global TAA. Performance depends on how much of the view is affected.",
+                &format!("Adds temporal filtering to the final scene color inside RT light volumes. Retains MSAA; enabling disables FXAA and SMAA. Uses full-screen history and depth/motion data, so savings depend on scene coverage.{rt_taa_note}"),
                 theme::Reset::None, self.video.rt_taa, &RT_TAA) {
                 let _ = self.set_console_cvar("r_rtTaa", &RT_TAA[index].0.to_string());
             }
         });
 
-        ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
-            let note = if rt_sun || rt_lights { "" } else { "\n\nNot used: needs ray-traced sun/entity shadows or ray-traced local lights." };
-            if let Some(index) = mode_row(ui, "RT samples", &format!("Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.{note}"),
+        ui.add_enabled_ui(rt_lights, |ui| {
+            let note = if rt_lights { "" } else { "\n\nNot used: needs ray-traced dynamic lights." };
+            if let Some(index) = mode_row(ui, "RT samples", &format!("Samples per soft dynamic light. Point lights stay at one ray. TAA can further reduce noise.{note}"),
                 theme::Reset::None, self.video.rt_samples, &RT_SAMPLES) {
                 let _ = self.set_console_cvar("r_rtSamples", &RT_SAMPLES[index].0.to_string());
             }

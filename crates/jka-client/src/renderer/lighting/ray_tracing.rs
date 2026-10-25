@@ -1,7 +1,7 @@
 //! Lighting ray tracing.
 use crate::renderer::{
     comparison_sampler_entry, depth_array_texture_entry, material_uniform,
-    nonfiltering_sampler_entry, rt_models, rt_resolution, unfilterable_texture_entry_stages,
+    nonfiltering_sampler_entry, rt_models, rt_receiver, unfilterable_texture_entry_stages,
     uniform_entry, weather, Arc, DrawBatch, DynamicModelAlphaMode, DynamicModelSurface,
     DynamicModelVertex, DynamicShadowsMode, Ghoul2GpuVertex, GpuVertex, Hash, HashMap, HashSet,
     Hasher, InlineModelGpu, InlineModelInstance, MaterialUniform, Pod, RayTracedRigidInstance,
@@ -315,14 +315,14 @@ pub(in crate::renderer) struct RayTracedSkinnedBlas {
     pub(in crate::renderer) blas: wgpu::Blas,
 }
 
-/// Hardware ray-query resources for the BSP sun-shadow visibility path.
+/// Hardware ray-query resources for dynamic-light shadow visibility.
 ///
 /// This is deliberately separate from the normal cascaded-shadow bind group and
 /// pipeline layouts.  The ordinary raster shaders/layouts remain byte-for-byte
 /// unchanged until Ray Traced Shadows is selected, preserving the renderer's
 /// lazy-pipeline/zero-overhead-off principle.
 pub(in crate::renderer) struct RayTracedShadowResources {
-    pub(in crate::renderer) sun_shadow_history: rt_resolution::RtSunShadowHistory,
+    pub(in crate::renderer) receiver: rt_receiver::RtReceiverResources,
     pub(in crate::renderer) model_receivers: Option<rt_models::RtModelReceivers>,
     pub(in crate::renderer) receiver_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) world_pipeline_layout: wgpu::PipelineLayout,
@@ -1147,7 +1147,7 @@ impl Renderer {
                     world_shader_lean_source.into(),
                 ),
             });
-        let sun_shadow_history = rt_resolution::RtSunShadowHistory::new(&self.device);
+        let receiver = rt_receiver::RtReceiverResources::new(&self.device);
         let receiver_bind_group = create_rt_receiver_bind_group(
             &self.device,
             &self.shadow_resources,
@@ -1163,7 +1163,7 @@ impl Renderer {
                 alpha_textures: &alpha_texture_buffer,
                 alpha_texels: &alpha_texel_buffer,
             },
-            &sun_shadow_history,
+            &receiver,
         );
 
         let static_mask_geometry_count =
@@ -1175,7 +1175,7 @@ impl Renderer {
         let masked_triangle_count = static_mask_triangle_count + inline_mask_triangle_count;
 
         self.ray_traced_shadows = Some(RayTracedShadowResources {
-            sun_shadow_history,
+            receiver,
             model_receivers: None,
             receiver_layout,
             world_pipeline_layout,
@@ -1292,7 +1292,7 @@ impl Renderer {
             self.cascaded_shadow_mode,
             &rt.receiver_layout,
             rt.scene(),
-            &rt.sun_shadow_history,
+            &rt.receiver,
         );
         self.ray_traced_shadows = Some(rt);
     }
@@ -1860,8 +1860,9 @@ impl Renderer {
 /// every JKA lighting/material rule with the normal shader; sun and local-light
 /// visibility are replaced. The stock WGSL is still what all raster modes
 /// compile.
-/// Wrap the full light evaluation so attenuation, BRDF and visibility use the
-/// same sample. In particular, `continue` must reject only the current sample.
+/// Port Solari's select-before-visibility sampling into the authoritative JKA
+/// light evaluations. Full traces each candidate. Reduced budgets evaluate
+/// material contributions before selecting one shadow ray per 2/4 candidates.
 pub(in crate::renderer) fn rt_sampled_light_loops(source: &str) -> Result<String, String> {
     const LOOP: &str = "for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {";
     const LIGHT: &str = "let light = dynamic_lights[cluster.indices[i]];";
@@ -1902,7 +1903,70 @@ pub(in crate::renderer) fn rt_sampled_light_loops(source: &str) -> Result<String
                 &format!("rt_local_shadow_rgb(light, input.world_position, {normal})"),
                 &format!("rt_rate_local_shadow_rgb(light, input, {normal}, i, rt_sample_index)"));
         }
-        result.replace_range(start..end, &format!("{LOOP}\n        let rt_source = dynamic_lights[cluster.indices[i]];\n        let rt_count = rt_local_sample_count(rt_source);\n        let rt_seed = rt_rate_emitter_seed(input);\n        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{{sampled}\n        }}\n    "));
+        let accumulators: &[&str] = if original.contains("result.diffuse_factor +=") {
+            &["result.diffuse_factor", "result.wet_specular"]
+        } else if original.contains("illumination +=") {
+            &["illumination"]
+        } else if original.contains("irradiance +=") {
+            &["irradiance"]
+        } else if original.contains("result +=") {
+            &["result"]
+        } else {
+            return Err("RT RIS contribution accumulator changed".into());
+        };
+        let normal = if original.contains("input.world_position, n)") { "n" } else { "normal" };
+        let mut candidate = sampled.replace("continue;", "break;")
+            .replace("let light = rt_sample_local_emitter_seed(rt_source, input, cluster.indices[i], rt_sample_index, rt_count, rt_seed);", "let light = rt_light;")
+            .replace("rt_rate_local_shadow_rgb(light, input, normal, i, rt_sample_index)",
+                "rt_ris_candidate_shadow_rgb(light, input.world_position, normal)")
+            .replace("rt_rate_local_shadow_rgb(light, input, n, i, rt_sample_index)",
+                "rt_ris_candidate_shadow_rgb(light, input.world_position, n)");
+        for (index, accumulator) in accumulators.iter().enumerate() {
+            candidate = candidate.replace(&format!("{accumulator} +="), &format!("rt_candidate_{index} +="));
+        }
+        let contribution = |index: usize| if index < accumulators.len() {
+            format!("rt_candidate_{index}")
+        } else { "vec3<f32>(0.0)".into() };
+        let mut static_add = String::new();
+        let mut selected_add = String::new();
+        for (index, accumulator) in accumulators.iter().enumerate() {
+            static_add.push_str(&format!("{accumulator} += rt_candidate_{index};\n"));
+            let field = if index == 0 { "contribution" } else { "specular" };
+            selected_add.push_str(&format!("{accumulator} += rt_reservoir.{field} * rt_visibility;\n"));
+        }
+        let reduced = format!(r#"
+    var rt_reservoir: RtRisReservoir;
+    var rt_rng = rt_emitter_seed(input) ^ 0x6A09E667u;
+    {LOOP}
+        let rt_source = dynamic_lights[cluster.indices[i]];
+        let rt_count = rt_local_sample_count(rt_source);
+        let rt_seed = rt_emitter_seed(input);
+        for (var rt_sample_index = 0u; rt_sample_index < rt_count; rt_sample_index += 1u) {{
+            let rt_light = rt_sample_local_emitter_seed(rt_source, input, cluster.indices[i], rt_sample_index, rt_count, rt_seed);
+            var rt_candidate_0 = vec3<f32>(0.0);
+            var rt_candidate_1 = vec3<f32>(0.0);
+            // A rejection exits this candidate, not the reservoir flush below.
+            loop {{ {candidate}
+                break;
+            }}
+            if (!ENABLE_RAY_TRACED_SHADOWS || rt_source.shadow.w < 0.5) {{ {static_add} }} else {{
+                rt_ris_update(&rt_reservoir, rt_light, {c0}, {c1}, &rt_rng);
+            }}
+            let rt_last = i + 1u == min(cluster.count, 32u) && rt_sample_index + 1u == rt_count;
+            if (rt_reservoir.count >= rt_ray_rate() || rt_last) {{
+                if (rt_reservoir.selected_target_function > 0.0) {{
+                    let rt_visibility = rt_local_shadow_rgb(rt_reservoir.light, input.world_position, {normal})
+                        * rt_ris_unbiased_weight(rt_reservoir);
+                    {selected_add}
+                }}
+                rt_reservoir.count = 0u;
+                rt_reservoir.weight_sum = 0.0;
+                rt_reservoir.selected_target_function = 0.0;
+            }}
+        }}
+    }}
+"#, c0 = contribution(0), c1 = contribution(1));
+        result.replace_range(start..end + 1, &reduced);
     }
     Ok(result)
 }
@@ -1916,17 +1980,18 @@ pub(in crate::renderer) fn compose_world_shader(base: &str) -> String {
     // assembling the shared lamp-shadow receiver module. A runtime `if` cannot
     // hide an undeclared WGSL identifier from the shader parser.
     // Inferred map lamps always use raster moving-caster visibility, including
-    // when transient lights or the sun use RT.
+    // when transient lights use RT.
     let raster_receiver_guard =
         "fn lamp_raster_receiver_culling_safe() -> bool { return true; }";
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         weather::with_world_weather(base),
         include_str!("../../surface_deformation.wgsl"),
         include_str!("../../sky_fractal.wgsl"),
         include_str!("lightmap_sun.wgsl"),
         raster_receiver_guard,
-        include_str!("lightmap_local.wgsl")
+        include_str!("lightmap_local.wgsl"),
+        include_str!("shadow_coverage.wgsl")
     )
 }
 
@@ -1943,7 +2008,6 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     const CASCADE_FN: &str =
         "fn cascaded_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {";
     const LOCAL_FN: &str = "fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {";
-    const SURFACE_SUN: &str = "        let shadow_rgb = sun_shadow_transmission(input, input.world_normal);\n        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);";
 
     if !base.contains(BINDING) {
         return Err("group-3 sky-admission binding anchor not found".to_string());
@@ -1957,14 +2021,10 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     // Both checked-in shaders can have CRLF on Windows. Normalize only the
     // generated RT variant so multiline source anchors are platform-independent.
     let base = base.replace("\r\n", "\n");
-    if !base.contains(SURFACE_SUN) {
-        return Err("surface sun contribution anchor not found".to_string());
-    }
-
     let mut source = format!("enable wgpu_ray_query;\n{base}");
     source = source.replacen(
         "override ENABLE_CASCADED_SHADOWS: bool = false;",
-        "override ENABLE_CASCADED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SUN: bool = false;",
+        "override ENABLE_CASCADED_SHADOWS: bool = false;\noverride ENABLE_RAY_TRACED_SHADOWS: bool = false;",
         1,
     );
     source = source.replacen(
@@ -1978,8 +2038,8 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     );
 
     // The shared ray-query core (sampling, alpha-tested candidate handling,
-    // shadow-ray helpers). Lives in its own file so the world shader, the sun
-    // compute pass and the model receivers all read one reviewable source.
+    // shadow-ray helpers). World/model receivers and the local visibility
+    // compute pass share the same source.
     let mut rt_visibility = include_str!("../../rt_core.wgsl").replace("\r\n", "\n");
     if !features.glass {
         // Remove RGB traversal from the module itself. A runtime uniform branch
@@ -1998,8 +2058,6 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
         rt_visibility = rt_visibility.replace("select(0x204u, 0x200u, colored)", "0x204u");
         replace_rt_declaration(&mut rt_visibility, "fn rt_local_shadow_rgb(",
             "fn rt_local_shadow_rgb(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(ray_traced_local_shadow_visibility(light, world_position, normal)); }")?;
-        replace_rt_declaration(&mut rt_visibility, "fn rt_sun_shadow_rgb(",
-            "fn rt_sun_shadow_rgb(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(ray_traced_shadow_visibility(input, normal)); }")?;
         // Keep the RGBA/alpha decoding and legacy glass-candidate classification:
         // they match the CPU tables, even with RGB transmission compiled out.
         let start = source.find("struct RasterGlassTriangle {")
@@ -2012,14 +2070,7 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
         replace_rt_declaration(&mut source, "fn local_light_shadow_rgb(",
             "fn local_light_shadow_rgb(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(local_light_shadow_visibility(light, world_position, receiver_normal)); }")?;
     }
-    source = source.replacen(
-        CASCADE_FN,
-        &format!(
-            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SUN && !ENABLE_CASCADED_SHADOWS) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
-        ),
-        1,
-    );
-
+    source = source.replacen(CASCADE_FN, &format!("{rt_visibility}{CASCADE_FN}"), 1);
     source = source.replacen(
         LOCAL_FN,
         &format!(
@@ -2034,43 +2085,6 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     source = source.replacen(LOCAL_RGB_FN,
         &format!("{LOCAL_RGB_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS && light.shadow.w >= 0.5) {{\n        return rt_local_shadow_rgb(light, world_position, receiver_normal);\n    }}"), 1);
 
-    // Preserve the authored CSM + glass response in hybrid, then multiply by
-    // RT visibility for dynamic blockers. Calling the original function via a
-    // cloned declaration avoids bypassing static glass/Bevy filtering.
-    const SUN_RECEIVER: &str = "fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {";
-    let csm_receiver = rt_models::declaration(&source, SUN_RECEIVER)?;
-    source = source.replacen(SUN_RECEIVER,
-        &format!("{}\n{SUN_RECEIVER}", csm_receiver.replacen("fn sun_shadow_transmission(", "fn csm_sun_shadow_transmission(", 1)), 1);
-
-    // RGB sun queries go through the same RT BLAS/TLAS and material flags as
-    // local shadows. Enabled mode bypasses the scalar sun cache because its
-    // RG texel cannot encode RGB transmission; OFF keeps the cached fast path.
-    const SUN_RGB_FN: &str = "fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {";
-    if !source.contains(SUN_RGB_FN) {
-        return Err("RGB sunlight receiver hook not found".to_string());
-    }
-    source = source.replacen(SUN_RGB_FN,
-        &format!("{SUN_RGB_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{\n        if (ENABLE_CASCADED_SHADOWS) {{\n            let static_visibility = csm_sun_shadow_transmission(input, normal);\n            if (all(static_visibility <= vec3<f32>(0.0))) {{ return static_visibility; }}\n            return static_visibility * rt_sun_shadow_rgb(input, normal);\n        }}\n        return rt_sun_shadow_rgb(input, normal);\n    }}"), 1);
-
-    // The lean shader compiles the sun-shadow darkening out unless a cascade is
-    // enabled. The RT sun is not a cascade, so open that gate for it. Absent in
-    // bsp.wgsl, which keeps the block unconditional; the no-op replace is fine.
-    source = source.replacen(
-        "    if (ENABLE_CASCADED_SHADOWS && (material_flags() & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
-        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material_flags() & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
-        1,
-    );
-
-    // Ordinary BSP sun visibility is multiplied by sun_facing and strength.
-    // Avoid a full traversal when that multiplier is zero. Keep this at the
-    // contribution site: ocean specular uses the shared visibility helper too,
-    // and must retain its own receiver rules.
-    source = source.replacen(
-        SURFACE_SUN,
-        "        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);\n        var shadow_rgb = vec3<f32>(1.0);\n        if (sun_facing > 0.0 && shadow_settings.params.z != 0.0) {\n            shadow_rgb = sun_shadow_transmission(input, input.world_normal);\n        }",
-        1,
-    );
-
     // Sample before radius rejection and BRDF evaluation in every clustered
     // receiver path (legacy, PBR and ocean). Stock shaders keep point lighting.
     const CLUSTER_LIGHT: &str = "let light = dynamic_lights[cluster.indices[i]];";
@@ -2078,17 +2092,12 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
         return Err("clustered emitter sampling anchors not found".to_string());
     }
     source = rt_sampled_light_loops(&source)?;
-    source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+    source.push_str(include_str!("../../rt_receiver_flags.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_surface.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_read.wgsl"));
-    source.push_str("\nfn rt_rate_local_shadow_rgb(light: PointLight, input: VertexOut, normal: vec3<f32>, slot: u32, sample_index: u32) -> vec3<f32> {\n    if (light.shadow.w < 0.5) { return local_light_shadow_rgb(light, input.world_position, normal); }\n    let cached = rt_rate_local_visibility(input, normal, slot, sample_index);\n    if (cached >= 0.0 && ((rt_shadow_flags.flags.z != 0u) == ENABLE_MAP_LIGHT_SIMULATION)) { return vec3<f32>(cached); }\n    return rt_local_shadow_rgb(light, input.world_position, normal);\n}\n");
+    source.push_str(include_str!("../../rt_solari_ris.wgsl"));
+    source.push_str("\nfn rt_rate_local_shadow_rgb(light: PointLight, input: VertexOut, normal: vec3<f32>, slot: u32, sample_index: u32) -> vec3<f32> {\n    if (light.shadow.w < 0.5) { return local_light_shadow_rgb(light, input.world_position, normal); }\n    return rt_local_shadow_rgb(light, input.world_position, normal);\n}\n");
 
-    // The enhanced ocean path has one outer guard that bypasses the common
-    // visibility helper. Let the RT variant enter that same authoritative path.
-    source = source.replace(
-        "ENABLE_CASCADED_SHADOWS && shadow_settings.light_direction_enabled.w > 0.5",
-        "(ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && shadow_settings.light_direction_enabled.w > 0.5",
-    );
     Ok(source)
 }
 
@@ -2131,14 +2140,14 @@ pub(in crate::renderer) fn create_ray_traced_shadow_receiver_layout(
     device: &wgpu::Device,
 ) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("JKA hardware ray-traced sun/weather receiver layout"),
+        label: Some("JKA hardware ray-traced lighting/weather receiver layout"),
         entries: &rt_receiver_layout_entries(rt_diagnostics::config().receiver),
     })
 }
 
 pub(in crate::renderer) fn rt_receiver_layout_entries(_features: ReceiverFeatures) -> Vec<wgpu::BindGroupLayoutEntry> {
     let alpha_entries = rt_alpha_storage_entries();
-    let cache_entries = rt_resolution::receiver_entries();
+    let cache_entries = rt_receiver::receiver_entries();
     let entries = [
             depth_array_texture_entry(0),
             comparison_sampler_entry(1),
@@ -2154,7 +2163,7 @@ pub(in crate::renderer) fn rt_receiver_layout_entries(_features: ReceiverFeature
             },
             alpha_entries[0], alpha_entries[1], alpha_entries[2],
             alpha_entries[3], alpha_entries[4], alpha_entries[5],
-            cache_entries[0], cache_entries[1], cache_entries[2],
+            cache_entries[0], cache_entries[1],
     ];
     entries.to_vec()
 }
@@ -2179,7 +2188,7 @@ impl RayTracedShadowResources {
     }
 }
 
-/// The ray-query scene the receivers (and the sun compute pass) trace against.
+/// The ray-query scene the dynamic-light receivers trace against.
 pub(in crate::renderer) struct RtReceiverScene<'a> {
     pub(in crate::renderer) tlas: &'a wgpu::Tlas,
     pub(in crate::renderer) alpha_vertices: &'a wgpu::Buffer,
@@ -2201,9 +2210,9 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
     cascaded_shadow_mode: DynamicShadowsMode,
     layout: &wgpu::BindGroupLayout,
     scene: RtReceiverScene<'_>,
-    sun_shadow_history: &rt_resolution::RtSunShadowHistory,
+    receiver: &rt_receiver::RtReceiverResources,
 ) -> wgpu::BindGroup {
-    let shadow_sampler = if matches!(cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities) {
+    let shadow_sampler = if matches!(cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps) {
         &shadow.bevy_sampler
     } else {
         &shadow.legacy_sampler
@@ -2286,19 +2295,15 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 15,
-                resource: sun_shadow_history.flags_uniform.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 16,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.published),
+                resource: receiver.flags_uniform.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 17,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local.published),
+                resource: wgpu::BindingResource::TextureView(&receiver.local.published),
             },
     ];
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
+        label: Some("JKA hardware ray-traced lighting/weather receiver bind group"),
         layout,
         entries: &entries,
     })
@@ -2357,20 +2362,9 @@ pub(in crate::renderer) fn create_shadow_receiver_bind_group(
 }
 
 #[cfg(test)]
-mod hybrid_sun_tests {
-    use super::*;
-
-    #[test]
-    fn hybrid_world_shader_retains_csm_and_dynamic_ray_query() {
-        let source = ray_traced_world_shader_source(include_str!("../../bsp.wgsl"))
-            .expect("hybrid RT shader generation must preserve CSM receiver");
-        assert!(source.contains("fn csm_sun_shadow_transmission("));
-        assert!(source.contains("static_visibility * rt_sun_shadow_rgb(input, normal)"));
-        assert!(source.contains("fn rt_sun_trace_mask() -> u32"));
-        assert!(source.contains("RayDesc(ray_flags, instance_mask,"));
-    }
-}
-
-#[cfg(test)]
 #[path = "transient_rt_tests.rs"]
 mod transient_rt_tests;
+
+#[cfg(test)]
+#[path = "rt_solari_tests.rs"]
+mod rt_solari_tests;

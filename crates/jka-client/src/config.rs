@@ -482,7 +482,7 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     // r_dynamicLights is the source of truth for all runtime-light techniques.
     if context.dynamic_shadows_mode_seen {
         settings.cascaded_shadows =
-            matches!(settings.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+            matches!(settings.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps);
     } else {
         settings.dynamic_shadows = if settings.cascaded_shadows {
             DynamicShadowsMode::CascadedShadowMaps
@@ -1395,19 +1395,19 @@ mod tests {
         assert!(!text.contains("r_rtResolution"));
         for value in ["0", "3", "999", "-1", "NaN"] {
             std::fs::write(&path, format!("seta r_rtSamples \"{value}\"\n")).unwrap();
-            assert_eq!(load_video_settings(&path).rt_samples, 1);
+            assert_eq!(load_video_settings(&path).rt_samples, 2);
         }
         for value in ["0", "3", "-1", "0.5", "NaN"] {
             std::fs::write(&path, format!("seta r_rtTraceRate \"{value}\"\n")).unwrap();
-            assert_eq!(load_video_settings(&path).rt_trace_rate, 1);
+            assert_eq!(load_video_settings(&path).rt_trace_rate, 2);
         }
         for (value, rate) in [
             ("full", 1),
             ("half", 4),
             ("1", 1),
             ("0.5", 4),
-            ("0.25", 1),
-            ("invalid", 1),
+            ("0.25", 2),
+            ("invalid", 2),
         ] {
             std::fs::write(&path, format!("seta r_rtResolution \"{value}\"\n")).unwrap();
             assert_eq!(load_video_settings(&path).rt_trace_rate, rate);

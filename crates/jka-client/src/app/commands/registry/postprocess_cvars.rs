@@ -633,7 +633,7 @@ app_cvars! {
     }
 
     APP_R_RTTRACERATE {
-        runtime: CvarDef::new("r_rtTraceRate", "", "1|2|4", "RT sun and local-light update rate: 1 Full, 2 Half, 4 Quarter. Retains full output resolution and reuses validated visibility history between fresh traces. Changes, edges and disocclusions may trace more often; colored glass uses direct rays.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.video.rt_trace_rate.to_string()), |app, value| App::cvar_set_r_rttracerate(app, APP_R_RTTRACERATE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rttracerate, None),
+        runtime: CvarDef::new("r_rtTraceRate", "", "1|2|4", "RT ray budget: 1 Full, 2 Half, 4 Quarter. Solari importance resampling selects one local shadow ray per 1/2/4 candidates. Lower budgets add noise, without a visibility-history pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.video.rt_trace_rate.to_string()), |app, value| App::cvar_set_r_rttracerate(app, APP_R_RTTRACERATE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rttracerate, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(rate @ (1 | 2 | 4)) = value.parse::<u32>() { settings.rt_trace_rate = rate; }
@@ -684,7 +684,7 @@ app_cvars! {
     }
 
     APP_R_RTSAMPLES {
-        runtime: CvarDef::new("r_rtSamples", "", "1|2|4", "Samples per finite-emitter RT sun/local light. 1 is stochastic (best with TAA); 2/4 reduce noise at proportional ray cost; hard point lights use one ray.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rtsamples(app)), |app, value| App::cvar_set_r_rtsamples(app, APP_R_RTSAMPLES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rtsamples, None),
+        runtime: CvarDef::new("r_rtSamples", "", "1|2|4", "Samples per finite-emitter RT dynamic light. 1 is stochastic (best with TAA); 2/4 reduce noise at proportional ray cost; hard point lights use one ray.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rtsamples(app)), |app, value| App::cvar_set_r_rtsamples(app, APP_R_RTSAMPLES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rtsamples, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     if let Ok(samples @ (1 | 2 | 4)) = value.parse::<u32>() {

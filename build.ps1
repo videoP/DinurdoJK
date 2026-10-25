@@ -131,6 +131,7 @@ try {
     New-Item -ItemType Directory -Force -Path $runtimeLicenses | Out-Null
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination $runtimeLicenses -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\bevy-solari-ris\LICENSE-MIT') -Destination (Join-Path $runtimeLicenses 'Bevy-Solari-MIT.txt') -Force
     # Refresh the dependency graph once when upgrading an older checkout.
     $lockfile = Join-Path $PSScriptRoot 'Cargo.lock'
     $lockText = if (Test-Path -LiteralPath $lockfile) { [System.IO.File]::ReadAllText($lockfile) } else { '' }
